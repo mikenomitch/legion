@@ -123,6 +123,7 @@ fn job(name: &str, band: Band, count: u32, resources: serde_json::Value) -> JobC
             ..TaskConfig::new(format!("{name}-task"), "service")
         }],
         version: None,
+        pending_extensions: Default::default(),
     }
 }
 

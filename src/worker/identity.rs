@@ -1368,6 +1368,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: path.to_string_lossy().to_string(),
                 mode: None,
+                unknown_fields: Default::default(),
             }),
             change_mode,
             ..Default::default()
@@ -1498,6 +1499,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: path.to_string_lossy().to_string(),
                 mode: Some("0440".into()),
+                unknown_fields: Default::default(),
             }),
             ..file_identity(&path, ChangeMode::Noop)
         };

@@ -76,6 +76,7 @@ fn test_job(name: &str) -> JobConfig {
         name: name.to_string(),
         tasks: vec![TaskConfig::new("svc", "noop")],
         version: None,
+        pending_extensions: Default::default(),
     }
 }
 
@@ -455,6 +456,7 @@ fn concurrent_planners_cannot_oversubscribe(topology: &str) -> R<()> {
             name: name.to_string(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
         };
         let outcome = store.handle_job_submit(&job, &[submission(name)])?;
         config_ids.push(outcome.job_config_id().to_string());

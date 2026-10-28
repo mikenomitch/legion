@@ -95,6 +95,7 @@ fn truncated_index_candidates_span_the_fleet_under_spread() -> R<()> {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -150,6 +151,7 @@ fn truncated_index_candidates_span_the_fleet_under_spread() -> R<()> {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(
             &probe,

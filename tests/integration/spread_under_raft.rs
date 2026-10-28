@@ -76,6 +76,7 @@ fn spread_under_raft_does_not_concentrate_on_low_node_ids() -> R<()> {
             ..TaskConfig::new("api", "noop")
         }],
         version: None,
+        pending_extensions: Default::default(),
     };
     store.handle_job_submit(
         &job,

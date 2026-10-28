@@ -66,7 +66,7 @@ pub fn session_claim_id(session_id: &str) -> String {
 /// The per-node capacity reservation a session task's sessions fill
 /// (`stateful.envelope`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionEnvelopeConfig {
     /// What one envelope reserves on its node, in the units of a task's
     /// `resources` (`cpu` in MHz, `memory` in MiB). Must set `cpu` and
@@ -91,6 +91,10 @@ pub struct SessionEnvelopeConfig {
     /// least [`MIN_SHRINK_AFTER`]. Only with `max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shrink_after: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// Default `stateful.envelope.shrinkAfter`.
@@ -179,7 +183,7 @@ pub enum SessionPlacement {
 
 /// When a session becomes a keyed instance (`stateful.promote`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionPromoteConfig {
     /// Whether a caller-chosen id is accepted, on `instance create --id` (a
     /// keyed create) or `instance promote --id` (a rename). Default true.
@@ -187,11 +191,18 @@ pub struct SessionPromoteConfig {
     /// keeps the session's own id.
     #[serde(default = "default_true")]
     pub on_name: bool,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl Default for SessionPromoteConfig {
     fn default() -> Self {
-        SessionPromoteConfig { on_name: true }
+        SessionPromoteConfig {
+            on_name: true,
+            unknown_fields: Default::default(),
+        }
     }
 }
 
@@ -694,6 +705,13 @@ fn validate_elastic_envelope(
     Ok(())
 }
 
+// Unknown-field capture (`structs::spec_fields`).
+crate::structs::spec_fields::spec_block!(
+    SessionEnvelopeConfig,
+    ["resources", "constraints", "max", "shrinkAfter"]
+);
+crate::structs::spec_fields::spec_block!(SessionPromoteConfig, ["onName"]);
+
 #[cfg(test)]
 mod session_test {
     use super::*;
@@ -717,6 +735,7 @@ mod session_test {
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         });
         task
     }
@@ -729,6 +748,7 @@ mod session_test {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
         }
     }
 

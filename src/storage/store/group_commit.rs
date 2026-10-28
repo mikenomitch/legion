@@ -194,6 +194,7 @@ mod group_commit_test {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("workspace", "noop")
         };
@@ -205,6 +206,7 @@ mod group_commit_test {
                 name: "agents".into(),
                 tasks: vec![task],
                 version: None,
+                pending_extensions: Default::default(),
             },
             &[Submission {
                 path: "agents.json".into(),

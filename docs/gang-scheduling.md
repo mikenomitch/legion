@@ -173,7 +173,7 @@ where an operator or a pipeline should decide what to do next.
 A **loss** is one of:
 
 - a member **failing**: its process exits and the worker gives up restarting
-  it, or `on_unhealthy` moves it for being unhealthy;
+  it, or `onUnhealthy` moves it for being unhealthy;
 - its node being **lost** or **drained**;
 - a **memory-pressure** eviction.
 
@@ -184,14 +184,14 @@ goes below the quorum), or a batch member exiting successfully is not a loss.
 stop grace (`stop.killAfter`, default 30s) has passed, so new members never
 start beside old ones still shutting down. A restart caused by a failed
 member also waits out that member's
-[move backoff](jobs-tasks-and-scheduling.md) (`on_unhealthy`'s `moveDelay`,
+[move backoff](jobs-tasks-and-scheduling.md) (`onUnhealthy`'s `moveDelay`,
 doubling per repeated failure), whichever is longer: the hold on one member
 holds the whole gang. A `replace` top-up waits for the backoff the same way;
 the other missing members are not placed ahead of a held one, so a backoff
 can never leave the gang split.
 
 **The budget.** Restarts and replacements caused by a member failing spend
-the task's existing move budget, `on_unhealthy.moveCount` moves per
+the task's existing move budget, `onUnhealthy.moveCount` moves per
 `movePeriod`. When it runs out the job fails, survivors included, whatever
 `onMemberLoss` says: the gang cannot be whole again without help. Node loss,
 drain, and eviction spend nothing; they are the infrastructure's failures, not

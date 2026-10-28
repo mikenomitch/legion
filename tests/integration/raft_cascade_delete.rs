@@ -71,6 +71,7 @@ fn cascade_reliant_deletes_survive_raft_apply() -> R<()> {
         name: "cascade-job".to_string(),
         tasks: vec![TaskConfig::new("svc", "noop")],
         version: None,
+        pending_extensions: Default::default(),
     };
     let outcome = store.handle_job_submit(
         &job,

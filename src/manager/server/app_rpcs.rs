@@ -229,6 +229,9 @@ impl ManagerDaemonService {
                 granted_by: format!("{} (app {})", record.grant.granted_by, record.name),
                 managed_by,
             },
+            // The render is Legion's own output: an unknown key in it is a
+            // manifest bug, so the reconciler submits strictly.
+            crate::structs::spec_fields::UnknownFieldMode::Reject,
         )?;
         let message = submitted.message_with_warnings();
         self.store

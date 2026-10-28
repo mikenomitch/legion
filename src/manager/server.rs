@@ -27,6 +27,7 @@ use crate::storage::store::{
 };
 use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
+use crate::structs::spec_fields::{UnknownFieldMode, UnknownFieldsRecord};
 // KV encryption keyring surface (docs/kv-encryption.md).
 use crate::structs::{
     validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
@@ -473,6 +474,17 @@ impl SubmittedJob {
         }
         message
     }
+}
+
+/// The `warning: ` lines of a reply message, without the prefix: how a
+/// replayed (`deduplicated`) reply rebuilds its `warnings` from the
+/// recorded message, which is all an idempotency record keeps.
+fn warnings_from_message(message: &str) -> Vec<String> {
+    message
+        .lines()
+        .filter_map(|line| line.strip_prefix("warning: "))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Store record -> proto message for one template version.
@@ -1493,7 +1505,15 @@ enum MissingKvBehavior {
     KeepExisting,
 }
 
-fn resolve_jobspec_kv_references(store: &Store, jobspec: &str) -> R<(JobConfig, Vec<KvReference>)> {
+/// Parse a submitted jobspec: resolve its `$path/key` KV references, then
+/// check its keys the way `mode` (the request's `allow_unknown_fields`)
+/// says (docs/jobs-tasks-and-scheduling.md, "Unknown fields"). Returns the
+/// record of what the flag kept and dropped.
+fn resolve_jobspec_kv_references(
+    store: &Store,
+    jobspec: &str,
+    mode: UnknownFieldMode,
+) -> R<(JobConfig, Vec<KvReference>, UnknownFieldsRecord)> {
     let mut value: Value = serde_json::from_str(jobspec)?;
     let mut refs = Vec::new();
     resolve_kv_references_in_value(store, &mut value, &mut refs, "")?;
@@ -1507,13 +1527,13 @@ fn resolve_jobspec_kv_references(store: &Store, jobspec: &str) -> R<(JobConfig, 
             })
         })
         .collect::<R<Vec<_>>>()?;
-    let mut config: JobConfig = serde_json::from_value(value)?;
+    let (mut config, unknown_fields) = JobConfig::parse_submitted(value, mode)?;
     refs.extend(apply_job_kv_injections(
         store,
         &mut config,
         MissingKvBehavior::Error,
     )?);
-    Ok((config, refs))
+    Ok((config, refs, unknown_fields))
 }
 
 /// Re-materialize a stored job config from the current KV state. Returns the
@@ -2249,6 +2269,7 @@ impl ManagerDaemonService {
         force_reschedule: bool,
         template: Option<&JobTemplateProvenance>,
         namespace: Option<&str>,
+        unknown_field_mode: UnknownFieldMode,
     ) -> Result<SubmittedJob, Status> {
         self.submit_rendered_job_from(
             identity,
@@ -2259,6 +2280,7 @@ impl ManagerDaemonService {
             template,
             namespace,
             SubmitOrigin::Principal,
+            unknown_field_mode,
         )
     }
 
@@ -2284,6 +2306,8 @@ impl ManagerDaemonService {
         namespace: Option<&str>,
         // Who the stored version is recorded as coming from.
         origin: SubmitOrigin,
+        // The request's `allow_unknown_fields`.
+        unknown_field_mode: UnknownFieldMode,
     ) -> Result<SubmittedJob, Status> {
         if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
             subs.push(Submission {
@@ -2293,8 +2317,8 @@ impl ManagerDaemonService {
             });
         }
 
-        let (mut config, kv_refs) =
-            resolve_jobspec_kv_references(&self.store, js).map_err(|e| {
+        let (mut config, kv_refs, unknown_fields) =
+            resolve_jobspec_kv_references(&self.store, js, unknown_field_mode).map_err(|e| {
                 error!("Error parsing jobspec: {:?}", e);
                 Status::invalid_argument(format!("Error parsing jobspec: {e}"))
             })?;
@@ -2397,10 +2421,13 @@ impl ManagerDaemonService {
         // same entry as the version (`enforce_identity_grants` above checked
         // they hold it).
         let submit_outcome = match origin {
-            SubmitOrigin::Principal => {
-                self.store
-                    .handle_job_submit_as(&config, &subs, template, &identity.principal)
-            }
+            SubmitOrigin::Principal => self.store.handle_job_submit_as(
+                &config,
+                &subs,
+                template,
+                &identity.principal,
+                Some(&unknown_fields),
+            ),
             SubmitOrigin::App {
                 granted_by,
                 managed_by,
@@ -2409,6 +2436,14 @@ impl ManagerDaemonService {
                 .handle_job_submit_managed(&config, &subs, &granted_by, managed_by),
         }
         .map_err(|e| map_store_error("Error running job", e))?;
+        if !unknown_fields.is_empty() {
+            info!(
+                job = %config.name,
+                pending = unknown_fields.pending.len(),
+                dropped = unknown_fields.dropped.len(),
+                "job submitted with allow_unknown_fields"
+            );
+        }
         crate::manager::telemetry::metrics()
             .job_submits_total
             .inc(&[&namespace]);
@@ -2619,9 +2654,11 @@ impl ManagerDaemonService {
             message,
             job_name: config.name.clone(),
             job_config_id,
-            warnings: self
-                .band_submit_warnings(&config)
+            // Unknown keys first: a dropped key is intent the submit lost.
+            warnings: unknown_fields
+                .warnings()
                 .into_iter()
+                .chain(self.band_submit_warnings(&config))
                 .chain(crate::task_plugins::resource_submit_warnings(&config))
                 .chain(crate::structs::suspend::sandbox_submit_warnings(&config))
                 .chain(self.gated_egress_submit_warnings(&config))
@@ -2737,6 +2774,7 @@ impl ManagerDaemonService {
             .map_err(|e| map_store_error("Error checking idempotency", e))?
         {
             return Ok(Response::new(RunJobReply {
+                warnings: warnings_from_message(&message),
                 message,
                 deduplicated: true,
             }));
@@ -2750,6 +2788,7 @@ impl ManagerDaemonService {
             inner.force_reschedule,
             None,
             inner.namespace.as_deref(),
+            UnknownFieldMode::from_allow(inner.allow_unknown_fields),
         )?;
 
         let message = submitted.message_with_warnings();
@@ -2778,6 +2817,7 @@ impl ManagerDaemonService {
         };
 
         Ok(Response::new(RunJobReply {
+            warnings: warnings_from_message(&message),
             message,
             deduplicated,
         }))
@@ -4889,8 +4929,11 @@ impl Manager for ManagerDaemonService {
             .await
             .map_err(template_eval_status)?;
 
-        let (mut config, kv_refs) = resolve_jobspec_kv_references(&self.store, &rendered)
-            .map_err(|e| Status::invalid_argument(format!("rendered jobspec is invalid: {e}")))?;
+        let (mut config, kv_refs, _) =
+            resolve_jobspec_kv_references(&self.store, &rendered, UnknownFieldMode::Reject)
+                .map_err(|e| {
+                    Status::invalid_argument(format!("rendered jobspec is invalid: {e}"))
+                })?;
         let namespace =
             self.admit_job_namespace(&mut config, &rendered, inner.namespace.as_deref())?;
         acl::enforce(
@@ -4950,6 +4993,7 @@ impl Manager for ManagerDaemonService {
                     job_config_id: String::new(),
                 });
             return Ok(Response::new(RunJobTemplateReply {
+                warnings: warnings_from_message(&record.message),
                 message: record.message,
                 deduplicated: true,
                 job_name: record.job_name,
@@ -4997,6 +5041,7 @@ impl Manager for ManagerDaemonService {
                 inner.force_reschedule,
                 Some(&provenance),
                 inner.namespace.as_deref(),
+                UnknownFieldMode::from_allow(inner.allow_unknown_fields),
             )?;
             info!(
                 template = %template.name,
@@ -5022,8 +5067,9 @@ impl Manager for ManagerDaemonService {
         })?;
 
         Ok(Response::new(RunJobTemplateReply {
-            message: submitted.message.into(),
+            message: submitted.message_with_warnings(),
             deduplicated: false,
+            warnings: submitted.warnings,
             job_name: submitted.job_name,
             job_config_id: submitted.job_config_id,
         }))
@@ -5068,10 +5114,16 @@ impl Manager for ManagerDaemonService {
                 app: stamp.app,
                 digest: stamp.digest,
             });
+        let unknown_fields = self
+            .store
+            .job_unknown_fields_record(&name)
+            .map_err(|e| map_store_error("Error loading job provenance", e))?
+            .map(crate::structs::UnknownFieldsRecord::from);
         let reply = GetJobInfoReply {
             job: Some(job),
             template,
             managed_by,
+            unknown_fields,
         };
 
         Ok(Response::new(reply))
@@ -5709,11 +5761,15 @@ impl Manager for ManagerDaemonService {
             return Err(Status::invalid_argument("Plan request missing jobspec"));
         }
 
-        let (mut config, kv_refs) =
-            resolve_jobspec_kv_references(&self.store, &jobspec).map_err(|e| {
-                error!("Error parsing jobspec for plan: {:?}", e);
-                Status::invalid_argument(format!("Error parsing jobspec: {e}"))
-            })?;
+        let (mut config, kv_refs, unknown_fields) = resolve_jobspec_kv_references(
+            &self.store,
+            &jobspec,
+            UnknownFieldMode::from_allow(inner.allow_unknown_fields),
+        )
+        .map_err(|e| {
+            error!("Error parsing jobspec for plan: {:?}", e);
+            Status::invalid_argument(format!("Error parsing jobspec: {e}"))
+        })?;
         let namespace =
             self.admit_job_namespace(&mut config, &jobspec, inner.namespace.as_deref())?;
         acl::enforce(
@@ -5942,9 +5998,10 @@ impl Manager for ManagerDaemonService {
             index_usage,
             preemptions,
             preemption_mode: scheduler.preemption_settings().mode.as_str().to_string(),
-            warnings: self
-                .gated_egress_submit_warnings(&config)
+            warnings: unknown_fields
+                .warnings()
                 .into_iter()
+                .chain(self.gated_egress_submit_warnings(&config))
                 .chain(self.tcp_upstream_submit_warnings(&config))
                 .chain(crate::task_plugins::container_security_warnings(&config))
                 .collect(),
@@ -15338,6 +15395,7 @@ mod tests {
                 file: Some(WorkloadIdentityFile {
                     path: "/var/run/legion/identity/aws/token".into(),
                     mode: Some("0400".into()),
+                    unknown_fields: Default::default(),
                 }),
                 ..Default::default()
             }],
@@ -15359,6 +15417,7 @@ mod tests {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(job_name)?.id();
@@ -15435,6 +15494,7 @@ mod tests {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         Ok(())
@@ -15517,6 +15577,7 @@ mod tests {
                 rollout: None,
                 rollout_by_group: Default::default(),
                 version: None,
+                pending_extensions: Default::default(),
             })
         };
         store.handle_job_submit(
@@ -15584,6 +15645,7 @@ mod tests {
                 rollout: None,
                 rollout_by_group: Default::default(),
                 version: None,
+                pending_extensions: Default::default(),
             },
             &[submission()],
         )?;
@@ -15720,6 +15782,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..aws_identity_task("db")
         };
@@ -15985,11 +16048,13 @@ mod tests {
                     path: "/var/lib/db".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -16000,6 +16065,7 @@ mod tests {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(job_name)?.id();
@@ -16211,6 +16277,7 @@ mod tests {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
         };
         let launch = build_rollout_launch_config(&config)?;
         assert_eq!(launch.strategy.as_deref(), Some("default"));
@@ -16236,6 +16303,7 @@ mod tests {
             }),
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
         };
         let launch = build_rollout_launch_config(&config)?;
         assert_eq!(launch.progression.as_deref(), Some("manual"));
@@ -16613,6 +16681,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
             .await?;
 
@@ -16694,6 +16763,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
             .await?;
 
@@ -16754,6 +16824,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
             .await?;
 
@@ -16810,6 +16881,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
             .await?;
         Ok(())
@@ -18267,6 +18339,7 @@ mod tests {
                 ..TaskConfig::new("api", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -18284,6 +18357,7 @@ mod tests {
                 ..TaskConfig::new("api", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -18322,6 +18396,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
             .await?;
 
@@ -18360,6 +18435,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -18377,6 +18453,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -18457,6 +18534,7 @@ mod tests {
             name: job_name.clone(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job_name)?.id();
@@ -18531,6 +18609,7 @@ mod tests {
                 ..TaskConfig::new("task", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -18626,6 +18705,7 @@ mod tests {
             name: "job".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -18692,6 +18772,7 @@ mod tests {
             name: "flaky".into(),
             tasks: vec![TaskConfig::new("store", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19034,6 +19115,7 @@ mod tests {
                 ..TaskConfig::new("hog", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19132,6 +19214,7 @@ mod tests {
             name: "artifact-fail-job".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19201,6 +19284,7 @@ mod tests {
             name: "job-non-owner".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19239,6 +19323,7 @@ mod tests {
             name: "health-upsert".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19310,6 +19395,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -19327,6 +19413,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -19404,6 +19491,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -19439,6 +19527,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -19570,6 +19659,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -19585,6 +19675,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -19753,6 +19844,7 @@ mod tests {
                 ..TaskConfig::new("task", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19786,6 +19878,7 @@ mod tests {
                 ..TaskConfig::new("prep", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19864,6 +19957,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19956,6 +20050,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: Some("off-runtime-1".into()),
+                allow_unknown_fields: Default::default(),
             }))
             .await?
             .into_inner();
@@ -19986,6 +20081,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
         };
 
@@ -20027,6 +20123,7 @@ mod tests {
             name: "status-job".into(),
             tasks: vec![TaskConfig::new("api", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         async fn status_of(manager: &ManagerDaemonService) -> R<String> {
@@ -20086,6 +20183,7 @@ mod tests {
             name: format!("svc-{name}"),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -20322,11 +20420,13 @@ mod tests {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new(name, "noop")
         }
@@ -20340,6 +20440,7 @@ mod tests {
             name: name.into(),
             tasks,
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(name)?.id();

@@ -498,6 +498,7 @@ fn ab_job(name: &str) -> JobConfig {
         name: name.to_string(),
         tasks: vec![task],
         version: None,
+        pending_extensions: Default::default(),
     }
 }
 

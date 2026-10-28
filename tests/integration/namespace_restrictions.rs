@@ -113,6 +113,7 @@ impl Cluster {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: false,
             })))?;
         Ok(())
     }
@@ -124,6 +125,7 @@ impl Cluster {
             .block_on(self.svc.plan_job(Request::new(PlanJobRequest {
                 namespace: Some(namespace.to_string()),
                 parsed_jobspec: spec,
+                allow_unknown_fields: false,
             })))
             .map(|reply| {
                 let reply = reply.into_inner();

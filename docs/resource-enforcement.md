@@ -524,7 +524,7 @@ instead of stopped.
 A stopped task is rescheduled, and its stop reason says `node_pressure`,
 with the numbers. A task stopped for bursting above its reservation is
 treated like a failed allocation: its replacement waits the task's
-`on_unhealthy.move_delay` and counts toward `move_count` (see
+`onUnhealthy.moveDelay` and counts toward `moveCount` (see
 [task supervision](task-supervision.md)). A suspended one waits, holding no
 memory, until `legion instance start` resumes it (see
 [suspend and resume](suspend-and-resume.md#under-memory-pressure)).
@@ -544,7 +544,7 @@ that was enough before it takes another.
 | --- | --- | --- | --- |
 | `reclaim` | Writes the bytes above the reservation to the cgroup's `memory.reclaim`, or for a sandbox with a balloon, inflates the balloon by that much | Allocations above their reservation | Yes, nothing stops. A balloon deflates when the episode ends |
 | `suspend` | Checkpoints and stops the instance, keeping its state. The node acts first and the manager records it | Instances whose task sets `suspend.onPressure = true`, most idle first | Yes, `instance start` resumes it |
-| `evict-bursting` | Stops allocations above their reservation | Allocations above their reservation | Rescheduled after `on_unhealthy.move_delay`, counted toward `move_count`, `cause = node_pressure` |
+| `evict-bursting` | Stops allocations above their reservation | Allocations above their reservation | Rescheduled after `onUnhealthy.moveDelay`, counted toward `moveCount`, `cause = node_pressure` |
 | `evict-reserved` | Stops allocations within their reservation. Only when `oversubscribe.memory > 1` | Anyone below `critical` | Rescheduled at once, `cause = node_pressure` |
 
 Within a step, candidates go **lowest band first** (the preemption order,
@@ -718,9 +718,9 @@ Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
   of pressure, so an evicted allocation may be placed back on the node that
   evicted it if it is the best fit by reservations.
 - **A task that always outgrows its reservation keeps coming back.** Each
-  `evict-bursting` stop is a move, so the replacement waits `move_delay`
-  first, but `move_count` is unlimited by default. Set
-  `on_unhealthy.move_count` to fail the job instead, or raise
+  `evict-bursting` stop is a move, so the replacement waits `moveDelay`
+  first, but `moveCount` is unlimited by default. Set
+  `onUnhealthy.moveCount` to fail the job instead, or raise
   `resources.memory` toward real usage.
 - **Only governed allocations are candidates.** Tasks on `noop` and on
   plugins that haven't opted in are never measured, never reclaimed, and
@@ -732,7 +732,7 @@ Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
 | --- | --- | --- |
 | Startup warning "no cgroup v2 unified hierarchy; tasks run unconfined" | The node runs cgroup v1, or the unified hierarchy isn't mounted | Boot with `systemd.unified_cgroup_hierarchy=1` (or your distro's equivalent), or leave enforcement off on that node |
 | Startup warning "could not fingerprint any usable CPUs" | The worker's `cpuset.cpus.effective` is unreadable or empty | Check the worker's own cgroup placement. Enforcement stays off until the file is readable |
-| Allocation fails: "cannot reserve N exclusive core(s) … this node has M free" | The scheduler's count said yes, but whole cores aren't actually free (fingerprint drift, offlined CPUs) | The message lists the free, reserved, and usable sets. The allocation goes through the normal `on_unhealthy` move handling instead of getting stuck |
+| Allocation fails: "cannot reserve N exclusive core(s) … this node has M free" | The scheduler's count said yes, but whole cores aren't actually free (fingerprint drift, offlined CPUs) | The message lists the free, reserved, and usable sets. The allocation goes through the normal `onUnhealthy` move handling instead of getting stuck |
 | Allocation fails: "reserving N core(s) … would leave the share slice empty" | The reservation would take every usable CPU | Leave at least one core unreserved, or lower the reservation |
 | Submit fails: "resources.cores … must be a whole number" | Fractional `cores` on a governed runtime | Round it, or declare `cpu` in MHz (for example `cpu = 500`) for a proportional share |
 | Submit warns: "sets resources.cpus = 1, which is 1 MHz, not 1 CPU(s)" | `cpu` and its alias `cpus` are in MHz, and the value reads like a CPU count | Declare `cpu` in MHz (`cpu = 1000`), or `cores` for whole CPUs |

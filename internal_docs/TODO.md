@@ -4360,8 +4360,8 @@ replicas is one command on day N. The shared substrate is
 [legion-apps-plan.md](plans/legion-apps-plan.md); each app still needs its own
 plan.
 
-- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (IN EXECUTION; A1, A2
-      and A3 shipped, in Done) · [calls](calls/legion-apps-plan_calls.md)
+- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (IN EXECUTION; A1, A2,
+      A3 and A6a shipped, in Done) · [calls](calls/legion-apps-plan_calls.md)
   - [ ] A1 follow-ups, found while building it:
     - [ ] **A manager's system worker and a standalone worker on one Linux
           host overwrite each other's host guard.** The kernel host guard is
@@ -4444,26 +4444,29 @@ plan.
         `legion app view` and `legion_app_view`
   - [ ] A5: UI tier 2, sandboxed single-file pages with a postMessage bridge
         (RPC allowlist, viewer identity, strict CSP)
-  - [ ] A6: jobspec extensions and strict fields, in two halves.
-        (a) Unknown jobspec fields become submit errors with a
-        did-you-mean, and `--allow-unknown-fields` keeps unknown keys at
-        extension points as `pending` and drops unknown keys elsewhere. Today
-        `TaskConfigInput` ignores unknown keys (`src/structs/job.rs:2404`),
-        so a typo, or `autoscale` sent to an old manager, is silently
-        dropped. It needs a capture-then-validate parser (replacing
-        `deny_unknown_fields` on `VolumeSpec` and friends) and tasks parsed
-        by shape rather than through the untagged `TaskConfigList`. No
-        dependency; can ship first.
-        (b) Natural extension keys that apps declare at fixed points (job,
-        group via a task, task, volume, port, service), validated against the
-        app's JSON Schema (the task-runtime schema pattern). Collisions are
-        refused at install, `--key` renames, and `apps.<app>` is a qualified
-        spelling that never collides. Plus an optional validate call that
-        fails open, `WatchAppExtensions`, a new `GetJobSchema` RPC (today
+  - [ ] A6b: jobspec extensions. Natural extension keys that apps declare
+        at fixed points (job, group via a task, task, volume, port,
+        service), validated against the app's JSON Schema (the task-runtime
+        schema pattern). Collisions are refused at install, `--key`
+        renames, and `apps.<app>` is a qualified spelling that never
+        collides. Plus an optional validate call that fails open,
+        `WatchAppExtensions`, a new `GetJobSchema` RPC (today
         `job schema`/`job validate` are CLI-local), live schema defaults,
-        and in-place version moves for extension-only changes (a new check
-        in `run_job`'s `Updated` branch, which today always rolls out).
-        Needs A3.
+        did-you-mean over installed app keys, adoption of `pendingExtensions`
+        when an app declaring the key is installed, and in-place version
+        moves for extension-only changes (a new check in `run_job`'s
+        `Updated` branch, which today always rolls out; a pending-only
+        change rolls out too, [calls entry 62](calls/legion-apps-plan_calls.md)).
+  - [ ] A6a follow-ups:
+    - [ ] **Free-form maps are not checked**: `resources = { memroy = 512 }`
+          is accepted and blocks the job on a dimension no node offers,
+          rather than failing the submit
+          ([calls entry 60](calls/legion-apps-plan_calls.md),
+          [docs](../docs/jobs-tasks-and-scheduling.md#unknown-fields)).
+    - [ ] **A field missing from its block's `FIELDS` list loses its
+          did-you-mean** unless an example uses it; the check only covers
+          `configs/jobs`
+          ([calls entry 63](calls/legion-apps-plan_calls.md)).
   - [ ] Deferred: install apps from a registry (waits on a registry plan
         that doesn't exist yet), tenant-owned apps, and pre-approved
         per-namespace grants, so GitOps needn't hold the union of what its
@@ -6249,6 +6252,25 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         config_changed|reconciled|reconcile_failed`), `legion_apps{status}`,
         the `legion_app_list` and `legion_app_status` MCP tools, capability
         entries
+- [x] **Legion apps A6a: strict jobspec fields** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §6.6, §8 ·
+      [calls 58-67](calls/legion-apps-plan_calls.md) · docs:
+      [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#unknown-fields),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] Unknown keys anywhere in a jobspec fail the submit, one error per
+        key with its path and a did-you-mean (`structs::spec_fields`, a
+        capture-then-validate parser; no `deny_unknown_fields` left), and
+        tasks, artifacts and `count` parse by shape, so a task typo shows
+        the task's own error
+  - [x] `allow_unknown_fields` on `RunJob`, `PlanJob` and `RunJobTemplate`,
+        `--allow-unknown-fields` on `job run|plan|validate` and
+        `template run`, and on the MCP tools: keys at extension points kept
+        in `pendingExtensions`, the rest dropped, each reported in the new
+        `warnings`, and recorded on the version (`GetJobInfoReply.unknown_fields`,
+        shown by `job info`)
+  - [x] Fixed on the way: KV re-renders dropped per-group rollout overrides
+        (`rolloutByGroup` was serialized snake_case), and seven example
+        jobspecs carried snake_case keys that never took effect
 
 ## Auth & ACLs
 

@@ -2306,6 +2306,7 @@ dependencies = [
  "serde_json",
  "serde_rusqlite",
  "sha2",
+ "strsim",
  "sysinfo",
  "tabled",
  "tar",

@@ -64,7 +64,7 @@ psql "postgres://postgres:legion-demo@10.0.0.4:29315/legion"
     },
     network = { mode = "auto", ports = [{ name = "pg" }] },
     service = { name = "postgres", port = "pg" },
-    checks = [{ type = "health", kind = "tcp", port = "pg", every = "10s", timeout = "5s", boot_grace_time = "60s" }],
+    checks = [{ type = "health", kind = "tcp", port = "pg", every = "10s", timeout = "5s", bootGraceTime = "60s" }],
   }],
 }
 ```

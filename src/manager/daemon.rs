@@ -1575,6 +1575,7 @@ fn seed_ui_test_data(store: &Store) -> R<()> {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
     };
 
     let submit_outcome = store.handle_job_submit(
@@ -4812,6 +4813,7 @@ mod tests {
             name: "restart-survivor".into(),
             tasks: vec![TaskConfig::new("svc", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,

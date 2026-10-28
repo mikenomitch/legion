@@ -271,10 +271,13 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_validate",
-            description: "Validate a rendered jobspec (JSON) without submitting it.",
+            description: "Validate a rendered jobspec (JSON) without submitting it. An unknown key is an error that names its path and the closest known key (`web: task web: unknown field `cuont` (did you mean `count`?)`); fix it, or pass `allow_unknown_fields` to see what a submit with the flag would keep and drop.",
             input_schema: || json!({
                 "type": "object",
-                "properties": { "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." } },
+                "properties": {
+                    "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." },
+                    "allow_unknown_fields": { "type": "boolean", "description": "Accept keys Legion does not know (default false: each one is an error naming it and the closest known key). When true, keys on the job, a task, a volume, a port, or a service are kept as pending and the rest are dropped; each is listed in `warnings`." }
+                },
                 "required": ["spec_json"],
                 "additionalProperties": false
             }),
@@ -285,7 +288,10 @@ fn tool_defs() -> Vec<ToolDef> {
             description: "Dry-run a rendered jobspec: which nodes its allocations would land on, and — the reason to run this before submitting — which RUNNING allocations the submit would preempt, with their job, task, priority band and grace window. A non-empty `preemptions` list means the submit costs somebody else something; treat it as requiring confirmation. `preemptionMode` says whether an empty list means \"nothing would be displaced\" or \"preemption is off\". `gangReports` has one entry per task that sets `gang`: `wouldPlace: false` means the job would place NOTHING and wait (blocked, holding nothing) until `min - running` replicas fit together, with `placeable`, `eligibleNodes` and `reason` saying how far it got — resize the gang, wait, or add capacity (docs/gang-scheduling.md).",
             input_schema: || json!({
                 "type": "object",
-                "properties": { "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." } },
+                "properties": {
+                    "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." },
+                    "allow_unknown_fields": { "type": "boolean", "description": "Accept keys Legion does not know (default false: each one is an error naming it and the closest known key). When true, keys on the job, a task, a volume, a port, or a service are kept as pending and the rest are dropped; each is listed in `warnings`." }
+                },
                 "required": ["spec_json"],
                 "additionalProperties": false
             }),
@@ -979,7 +985,8 @@ fn tool_defs() -> Vec<ToolDef> {
                 "properties": {
                     "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." },
-                    "force_reschedule": { "type": "boolean", "description": "Reschedule even if unchanged." }
+                    "force_reschedule": { "type": "boolean", "description": "Reschedule even if unchanged." },
+                    "allow_unknown_fields": { "type": "boolean", "description": "Accept keys Legion does not know (default false: each one is an error naming it and the closest known key). When true, keys on the job, a task, a volume, a port, or a service are kept as pending and the rest are dropped; each is listed in `warnings`." }
                 },
                 "required": ["spec_json"],
                 "additionalProperties": false
@@ -1049,7 +1056,8 @@ fn tool_defs() -> Vec<ToolDef> {
                     "version": { "type": "integer", "description": "Version to render (default: latest)." },
                     "variables": { "type": "object", "description": "Variable values keyed by variable key." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." },
-                    "force_reschedule": { "type": "boolean", "description": "Reschedule even if unchanged." }
+                    "force_reschedule": { "type": "boolean", "description": "Reschedule even if unchanged." },
+                    "allow_unknown_fields": { "type": "boolean", "description": "Accept keys Legion does not know (default false: each one is an error naming it and the closest known key). When true, keys on the job, a task, a volume, a port, or a service are kept as pending and the rest are dropped; each is listed in `warnings`." }
                 },
                 "required": ["name"],
                 "additionalProperties": false
@@ -1449,6 +1457,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             grpc(client.plan_job(PlanJobRequest {
                 parsed_jobspec,
                 namespace: opt_str_arg(&args, "namespace"),
+                allow_unknown_fields: allow_unknown_fields_arg(&args),
             }))
             .await
         }
@@ -2606,6 +2615,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 force_reschedule,
                 idempotency_key,
                 namespace: opt_str_arg(&args, "namespace"),
+                allow_unknown_fields: allow_unknown_fields_arg(&args),
             }))
             .await
         }
@@ -2639,6 +2649,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 force_reschedule,
                 idempotency_key,
                 namespace: opt_str_arg(&args, "namespace"),
+                allow_unknown_fields: allow_unknown_fields_arg(&args),
             }))
             .await
         }
@@ -2696,16 +2707,28 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
     }
 }
 
-/// Validate a rendered jobspec locally (no manager required).
+/// The `allow_unknown_fields` argument of the job-submitting tools.
+fn allow_unknown_fields_arg(args: &Value) -> bool {
+    args.get("allow_unknown_fields")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Validate a rendered jobspec locally (no manager required), with the
+/// unknown-key rules a submit applies.
 fn validate_tool(args: Value) -> Result<Value, String> {
     let spec_json = str_arg(&args, "spec_json")?;
-    let config: JobConfig = serde_json::from_str(&spec_json)
-        .map_err(|e| format!("jobspec is not a valid job configuration: {e}"))?;
+    let mode =
+        crate::structs::spec_fields::UnknownFieldMode::from_allow(allow_unknown_fields_arg(&args));
+    let (config, unknown_fields) = JobConfig::parse_submitted_str(&spec_json, mode)
+        .map_err(|e| format!("jobspec is not a valid job configuration: {e:#}"))?;
     validate_job_config(&config).map_err(|e| format!("jobspec failed validation: {e}"))?;
     Ok(json!({
         "valid": true,
         "job": config.name,
         "tasks": config.tasks.len(),
+        "warnings": unknown_fields.warnings(),
+        "unknownFields": unknown_fields,
     }))
 }
 

@@ -70,12 +70,14 @@ fn keyed_job(pool: Option<&str>) -> JobConfig {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new(TASK, "noop")
         }],
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
     }
 }
 
@@ -290,6 +292,7 @@ fn an_escaped_job_wakes_on_any_node() -> R<()> {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
     };
     submit(store, &job)?;
     // `RunJob` queues the submit's eval after the job row.
@@ -497,6 +500,7 @@ fn a_claim_waiting_on_young_victims_retries_on_the_clock_instead_of_blocking() -
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
     };
     // What `RunJob` does: store the config, then queue its submit eval.
     let run = |job: &JobConfig| -> R<String> {

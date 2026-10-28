@@ -342,11 +342,11 @@ lazy_static! {
 //
 
 pub const TASK_CONFIG_ATTRS: &str = r#"
-id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang
+id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions
 "#;
 
 pub const TASK_CONFIG_INSERT_ATTRS: &str = r#"
-name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang
+name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_id, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions
 "#;
 
 // pub const TASK_CONFIG_PARAM_SET: &str = r#"
@@ -354,7 +354,7 @@ name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, co
 // "#;
 
 pub const TASK_CONFIG_ATTRS_VALS: &str = r#"
-:name, :runtime, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes, :connect, :restart, :stop, :disruption, :speculative_start, :snapshots, :suspend, :gang
+:name, :runtime, :count, :count_per, :group_name, :lifecycle, :schedule, :depends_on, :config, :resources, :constraints, :permit, :affinities, :checks, :on_unhealthy, :kv_injections, :job_id, :job_config_id, :identities, :stateful, :artifacts, :network, :service, :actions, :volumes, :connect, :restart, :stop, :disruption, :speculative_start, :snapshots, :suspend, :gang, :pending_extensions
 "#;
 
 lazy_static! {

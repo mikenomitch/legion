@@ -407,6 +407,7 @@ mod tests {
                 ..TaskConfig::new("api".to_string(), "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         }
     }
 

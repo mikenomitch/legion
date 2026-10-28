@@ -487,6 +487,7 @@ async fn call_endpoint(
                     priority: None,
                     force_reschedule: false,
                     idempotency_key: None,
+                    allow_unknown_fields: Default::default(),
                 },
                 token,
             ))
@@ -583,6 +584,7 @@ async fn call_endpoint(
             .plan_job(req(
                 PlanJobRequest { namespace: Default::default(),
                     parsed_jobspec: jobspec(JOB_NAME),
+                    allow_unknown_fields: Default::default(),
                 },
                 token,
             ))
@@ -2818,6 +2820,7 @@ async fn template_scoped_policy_gates_submission_channel() -> R<()> {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             },
             Some(&secret),
         ))
@@ -2884,6 +2887,7 @@ async fn host_level_jobs_need_the_host_grant_test() -> R<()> {
                     priority: None,
                     force_reschedule: false,
                     idempotency_key: None,
+                    allow_unknown_fields: Default::default(),
                 },
                 Some(&secret),
             ))
@@ -2992,6 +2996,7 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
                     priority: None,
                     force_reschedule: false,
                     idempotency_key: None,
+                    allow_unknown_fields: Default::default(),
                 },
                 Some(&secret),
             ))
@@ -3077,6 +3082,7 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             },
             Some(&template_secret),
         ))
@@ -3223,6 +3229,7 @@ async fn star_policies_do_not_reach_legion_system_or_legion_kv_test() -> R<()> {
                     priority: None,
                     force_reschedule: false,
                     idempotency_key: None,
+                    allow_unknown_fields: false,
                 },
                 Some(&secret),
             ))
@@ -3347,6 +3354,7 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
                     priority: None,
                     force_reschedule: false,
                     idempotency_key: None,
+                    allow_unknown_fields: Default::default(),
                 },
                 Some(&token),
             ))
@@ -3429,6 +3437,7 @@ async fn upstream_credential_needs_kv_read_on_the_path() -> R<()> {
                     priority: None,
                     force_reschedule: false,
                     idempotency_key: None,
+                    allow_unknown_fields: Default::default(),
                 },
                 Some(&token),
             ))

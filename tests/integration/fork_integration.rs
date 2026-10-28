@@ -250,11 +250,13 @@ fn task(runtime: &str, storage: bool) -> TaskConfig {
                 params: None,
                 retain_on_scale_in: None,
                 retain_on_stop: None,
+                unknown_fields: Default::default(),
             }),
             envelope: None,
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         ..TaskConfig::new(TASK, runtime)
     }
@@ -268,6 +270,7 @@ fn job(task: TaskConfig) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
     }
 }
 

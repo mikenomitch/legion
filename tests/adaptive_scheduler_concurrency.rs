@@ -111,6 +111,7 @@ fn submit_job(store: &Store, name: &str) -> R<String> {
         }],
         priority: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
     };
     store.handle_job_submit(
         &job,

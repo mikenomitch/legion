@@ -70,6 +70,7 @@ fn job(name: &str, msg: &str, count: u32) -> JobConfig {
             ..TaskConfig::new("svc", "noop")
         }],
         version: None,
+        pending_extensions: Default::default(),
     }
 }
 

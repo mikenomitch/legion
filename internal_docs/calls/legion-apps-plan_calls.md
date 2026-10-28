@@ -4,9 +4,10 @@ Decisions made while designing
 [`plans/legion-apps-plan.md`](../plans/legion-apps-plan.md). **Entries are
 ordered by project impact, highest first, and an entry's number is its
 rank.** Entries 1-17 are design-time calls. Implementation calls start at
-18 (phase A1, entries 18-28) and continue at 29 (phase A2, entries 29-41)
-and 42 (phase A3, entries 42-57), appended after the design calls, since
-none outranks them; each phase's entries are ranked among themselves.
+18 (phase A1, entries 18-28) and continue at 29 (phase A2, entries 29-41),
+42 (phase A3, entries 42-57), and 58 (phase A6a, strict fields, entries
+58-67), appended after the design calls, since none outranks them; each
+phase's entries are ranked among themselves.
 Autoscaler-specific calls are in
 [autoscaler-v2-plan_calls.md](autoscaler-v2-plan_calls.md).
 
@@ -1616,3 +1617,188 @@ shape, not the plan's `command`/`args` pair.
 input for every Nickel-reading command. Keeping the bundled manifest in
 Nickel keeps it reviewable next to the docs, and a unit test evaluates and
 validates it.
+
+## 58. Every `JobConfig` parse is strict, not only the submit paths (A6a)
+
+**Call.** No jobspec block uses `deny_unknown_fields` any more. Each one
+captures unknown keys in a `#[serde(flatten)] unknown_fields` map, and
+`JobConfig::parse_submitted(value, mode)` turns them into errors (or keeps
+or drops them under `allow_unknown_fields`). The plain `Deserialize` for
+`JobConfig` is strict as well, and accepts only the stored
+`pendingExtensions` maps, so a config read back from the store, a KV
+re-render, or a template render fails loudly on a key it doesn't know.
+
+**Alternatives.** A lenient default `Deserialize`, with strictness applied
+only on the `RunJob`, `PlanJob`, and `RunJobTemplate` paths.
+
+**Trade-off.** Internal round-trips must never carry an unknown key: a
+renamed field in a stored config is an error on read rather than a silent
+drop, so a rename needs its stored rows rewritten. Two shipped bugs fell out
+of this at once (below).
+
+**Why (simplicity).** The point of the phase is that no path accepts a key
+silently. With a lenient default, every new parse site would have to opt
+in, and the first one that forgot would reintroduce the failure. Going
+strict found that `JobConfig` serialized `rollout_by_group` in snake_case,
+so KV re-renders silently dropped per-group rollout overrides (now
+`rolloutByGroup`), and that seven example jobspecs (`fullstack`,
+`connect-demo`, `mac-container-service`, `mac-dag`, `maximal`, `postgres`,
+`service-demo`) used snake_case keys (`on_unhealthy`,
+`unhealthy_after_count`, `boot_grace_time`, `restart_*`) that had never
+taken effect.
+
+## 59. Some blocks stay strict under `--allow-unknown-fields` (A6a, deviates from plan §6.6)
+
+**Call.** The plan says the flag keeps unknown keys at extension points and
+drops them everywhere else. A few blocks refuse an unknown key even with
+the flag:
+- network policy blocks (`egress`, `ingress`, `handlers`), which are shared
+  with `legion net policy` objects;
+- value sources (`{ kv | identity | file }`);
+- the runtime's `config` (checked against the runtime's own schema);
+- the hand-parsed `count`, `gang`, and `schedule` shapes.
+
+**Alternatives.** Drop unknown keys in these blocks too, as the plan says.
+
+**Trade-off.** The flag doesn't get every spec through: a typo in one of
+these blocks still fails the submit.
+
+**Why (safety).** Dropping a misspelled key in a network policy weakens the
+policy that gets applied, and dropping one in a value source or a count
+shape changes what the task runs with. The flag exists for version skew
+and uninstalled apps, and neither ever adds keys to these blocks.
+
+## 60. Free-form maps are not checked, so a typo inside `resources` is not caught (A6a)
+
+**Call.** Maps whose keys are data rather than fields take any key:
+`resources` (its keys are resource dimensions, including a cluster's custom
+ones), `constraints`, `permit`, `affinities`, `network.labels`,
+`service.meta`, volume `params`, and identity `extraClaims`. The plan's own
+example, `resources.memoryMax2`, therefore can't be caught, and the plan's
+example now uses `stop.signall`.
+
+**Alternatives.** Check `resources` against the cluster's known dimensions
+at submit.
+
+**Trade-off.** `resources = { memroy = 512 }` is still accepted. It asks
+for a dimension no node offers, so the job blocks rather than running with
+the wrong size, and the blocked reason names it.
+
+**Why (simplicity).** The parser can't know a cluster's custom dimensions,
+and checking them at submit would make a jobspec's validity depend on which
+nodes are registered. The list is in the public doc
+(docs/jobs-tasks-and-scheduling.md, "Unknown Fields").
+
+## 61. Pending keys are stored under an explicit `pendingExtensions` map, not inline (A6a)
+
+**Call.** A key kept by the flag is stored in its block's
+`pendingExtensions` map: in `job_config.meta` for the job, in a new
+`task_config.pending_extensions` column for a task, and inside the existing
+JSON for volumes, ports, and services. A strict submit that carries a
+hand-written `pendingExtensions` is refused; with the flag it is accepted.
+
+**Alternatives.** Store pending keys inline, next to the core fields, as
+they were written.
+
+**Trade-off.** One more name in the stored and `job info -j` shapes, and a
+column migration on `task_config`.
+
+**Why (extensibility).** Inline, a pending `backup` would be reinterpreted
+by any future core field named `backup`, and nothing could tell a pending
+value from a validated one. The explicit map keeps them apart until an app
+adopts the key (A6b).
+
+## 62. A change to pending keys alone creates a version and a rollout (A6a, until A6b)
+
+**Call.** Resubmitting a spec whose only difference is a pending key makes
+a new version and rolls it out, like any other change.
+
+**Alternatives.** Move allocations to the new version in place, since no
+runtime reads a pending value.
+
+**Trade-off.** A pending-only change restarts the job's allocations.
+
+**Why (scope).** In-place version moves for extension values are A6b's
+lifecycle work (plan §8), and A6b needs the same predicate for an
+installed app's keys. Until then, a restart is correct, only slower.
+
+## 63. Suggestion lists are hand-written per block, and a test checks them (A6a)
+
+**Call.** Each block's known keys (`FIELDS`) are listed by hand next to the
+struct with `spec_block!` or `extension_point!`. Detection itself is
+serde's: a key no field consumes lands in the flatten map whatever the
+list says. A unit test serializes every `configs/jobs` example and fails
+when a serialized key is missing from its block's list.
+
+**Alternatives.** Derive the list from serde (it exposes none with
+`flatten`), or a proc macro.
+
+**Trade-off.** A new field needs a second edit. Forgetting it only loses
+the did-you-mean suggestion, and only if no example uses the field. The
+merge with A2 had to add `permissions` and `policies` to the identity list.
+
+**Why (simplicity).** No proc-macro crate for one list per struct, and the
+failure mode is a missing hint, never a missed key.
+
+## 64. The unknown-fields record describes the submit that created the version (A6a)
+
+**Call.** What the flag kept and dropped is recorded on the version
+(`job_config.meta.unknownFields`) and shown by `job info`. It is not part
+of `is_same_as`, so resubmitting a spec that renders to the same config is
+`unchanged` and keeps the old record, even when the resubmit no longer
+carries the dropped keys. KV re-renders carry pending keys forward but
+write no record.
+
+**Alternatives.** Make the record part of the version's identity, so a
+resubmit without the dropped keys makes a new version.
+
+**Trade-off.** `job info` can show a dropped key that the latest submit no
+longer sent.
+
+**Why (simplicity).** A new version, and a rollout, for a change that
+alters nothing the job runs would be worse than a stale note. The proto
+comment on `GetJobInfoReply.unknown_fields` says so.
+
+## 65. `warnings` carries every warning, and the message still has them (A6a)
+
+**Call.** `RunJobReply.warnings` and `RunJobTemplateReply.warnings` list
+every submit warning, not only unknown-key ones, and the reply's `message`
+still has them appended for older clients. A deduplicated replay rebuilds
+`warnings` from the stored message.
+
+**Alternatives.** A field for unknown-key warnings alone.
+
+**Trade-off.** Clients that print both see warnings twice; the CLI prints
+`warnings` and not the appended text.
+
+**Why (agent-friendliness).** One structured list is what an agent checks,
+and a replay answers like the original.
+
+## 66. `template render` takes no flag, and `job info -j` adds `unknownFields` (A6a)
+
+**Call.** `legion template render` prints a rendered spec without
+submitting it, so it has no `--allow-unknown-fields`; the submit that
+follows takes it. `legion job info -j` adds an `unknownFields` key to the
+job object only when the latest version has a record.
+
+**Alternatives.** The flag on `render` too, as a no-op or a filter.
+
+**Trade-off.** None worth noting; the JSON change is additive.
+
+**Why (simplicity).** A flag that changes nothing would only mislead.
+
+## 67. The app reconciler's submits are always strict (merge of A3 and A6a)
+
+**Call.** The reconciler submits an app's render with
+`UnknownFieldMode::Reject`; an app cannot ask for `allow_unknown_fields`.
+
+**Alternatives.** Let a manifest mark its job as lenient.
+
+**Trade-off.** A manifest written for a newer Legion fails its reconcile
+instead of running with keys dropped. The failure is in `legion app
+status` and the reconcile event.
+
+**Why (safety).** The render is Legion's own output from a manifest that
+was validated at install. An unknown key in it is a manifest bug or real
+version skew, and the build marker (calls entry 45) already keeps a new
+manifest from running on an older manager.

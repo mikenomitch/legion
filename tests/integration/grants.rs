@@ -589,7 +589,7 @@ fn a_rerender_carries_an_unchanged_grant_forward_test() -> R<()> {
     let parse = |spec: Value| -> R<JobConfig> { Ok(serde_json::from_value(spec)?) };
     let v1 = parse(job("rerendered", certs_writer()))?;
     fx.store
-        .handle_job_submit_as(&v1, &[submission("v1")], None, "holder")?;
+        .handle_job_submit_as(&v1, &[submission("v1")], None, "holder", None)?;
     let mut v2 = v1.clone();
     v2.tasks[0].count = TaskCount::new(2);
     fx.store.handle_job_submit(&v2, &[submission("v2")])?;

@@ -537,7 +537,7 @@
                     port = "http",  # port label -> resolved to the assigned host port
                     every = "5s",
                     timeout = "2s",
-                    unhealthy_after_count = 1,
+                    unhealthyAfterCount = 1,
                 },
                 {
                     type = "health",
@@ -546,18 +546,18 @@
                     port = "http",  # port label -> resolved to the assigned host port
                     every = "10s",
                     timeout = "2s",
-                    unhealthy_after_count = 1,
+                    unhealthyAfterCount = 1,
                 },
             ],
-            on_unhealthy = {
-                restart_count = 3,
-                restart_period = "30m",
-                restart_delay = "30s",
-                move_count = 3,
-                move_period = "30m",
+            onUnhealthy = {
+                restartCount = 3,
+                restartPeriod = "30m",
+                restartDelay = "30s",
+                moveCount = 3,
+                movePeriod = "30m",
                 # The first reschedule's wait. It doubles for each earlier
-                # move within move_period, capped at 30m.
-                move_delay = "30s",
+                # move within movePeriod, capped at 30m.
+                moveDelay = "30s",
             },
             # What happens when the task PROCESS exits, as opposed to a health
             # check failing (see docs/task-supervision.md). Both paths spend
@@ -568,7 +568,7 @@
                 # service/sidecar, "onFailure" for batch.
                 policy = "always",
                 # Wait before relaunching. Defaults to
-                # on_unhealthy.restart_delay when omitted.
+                # onUnhealthy.restartDelay when omitted.
                 delay = "5s",
                 # Exit codes counted as success. Default [0].
                 successExitCodes = [0],
@@ -1296,7 +1296,7 @@
                 #             members together once they fit;
                 #   "fail"    fails the job and stops every member.
                 # A loss that leaves the quorum running is always replaced
-                # alone. Restarts after a failure spend on_unhealthy's move
+                # alone. Restarts after a failure spend onUnhealthy's move
                 # budget; once it is spent the job fails.
                 onMemberLoss = "restart",
             },

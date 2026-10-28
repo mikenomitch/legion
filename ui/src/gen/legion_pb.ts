@@ -1001,6 +1001,43 @@ export class RunJobRequest extends Message<RunJobRequest> {
    */
   namespace?: string;
 
+  /**
+   * Accept a jobspec that carries keys Legion does not know
+   * (`legion job run --allow-unknown-fields`).
+   *
+   * Default `false`: every unknown key, at the job level, in a task, or in
+   * any nested block, fails the request with INVALID_ARGUMENT. The message
+   * names each key with its path and, when one is close, the known key it
+   * most likely meant: `web: task web: unknown field `cuont` (did you mean
+   * `count`?)`.
+   *
+   * When `true`:
+   * - a key directly on an extension point (the job's top level, a task, an
+   *   entry in a task's `volumes`, an entry in `network.ports`, or a task's
+   *   `service` block) is kept, unvalidated, in that block's
+   *   `pendingExtensions` map, and stored with the version. Nothing acts on
+   *   it. These are the places where apps will declare their own keys, so a
+   *   key there may belong to an app that is not installed yet;
+   * - a key anywhere else is dropped;
+   * - each kept or dropped key is listed in `RunJobReply.warnings`, and the
+   *   set is recorded on the job config version this request creates
+   *   (`GetJobInfoReply.unknown_fields`, `legion job info`).
+   *
+   * The flag is about keys Legion does not know. A value Legion knows is
+   * wrong (a bad type, an out-of-range number, an unknown runtime) is still
+   * an error. It does not relax blocks that are strict on their own: the
+   * network policy blocks (`network.egress`, `network.ingress`, an
+   * upstream's `handlers`), value sources (`{ kv = … }`), the runtime's
+   * `config`, and the `count`, `gang`, and `schedule` shorthands.
+   *
+   * A resubmit with the same flag and spec is `unchanged` and keeps the
+   * record of the version it matched. A manager that predates this field
+   * ignores it and drops every unknown key silently.
+   *
+   * @generated from field: bool allow_unknown_fields = 7;
+   */
+  allowUnknownFields = false;
+
   constructor(data?: PartialMessage<RunJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1015,6 +1052,7 @@ export class RunJobRequest extends Message<RunJobRequest> {
     { no: 4, name: "force_reschedule", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 6, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "allow_unknown_fields", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobRequest {
@@ -1080,6 +1118,25 @@ export class RunJobReply extends Message<RunJobReply> {
    */
   deduplicated = false;
 
+  /**
+   * Advisory lines, one per warning, without the `warning: ` prefix. The
+   * same lines are appended to `message`, each after `warning: `, for
+   * clients that print only the message.
+   *
+   * They start with every unknown key `allow_unknown_fields` kept or
+   * dropped, dropped keys first (`task web: dropped unknown field
+   * `stop.signall``, `task postgres: volume data: kept `backup` as pending
+   * (no installed app declares it)`), then the submit's other warnings: a
+   * priority band preemption cannot honor, `resources` a runtime cannot
+   * enforce as written, a gated task with no egress, and the like (the lines
+   * `PlanJobReply.warnings` carries).
+   *
+   * A `deduplicated` reply rebuilds this list from the recorded `message`.
+   *
+   * @generated from field: repeated string warnings = 3;
+   */
+  warnings: string[] = [];
+
   constructor(data?: PartialMessage<RunJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1090,6 +1147,7 @@ export class RunJobReply extends Message<RunJobReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobReply {
@@ -2019,6 +2077,18 @@ export class RunJobTemplateRequest extends Message<RunJobTemplateRequest> {
    */
   namespace?: string;
 
+  /**
+   * Accept a rendered spec that carries keys Legion does not know
+   * (`legion template run --allow-unknown-fields`). Default `false`: every
+   * unknown key fails the run with INVALID_ARGUMENT. When `true`, keys on
+   * extension points are kept as pending and the rest are dropped, exactly
+   * as RunJobRequest.allow_unknown_fields describes, and each one is listed
+   * in `RunJobTemplateReply.warnings` and recorded on the version.
+   *
+   * @generated from field: bool allow_unknown_fields = 8;
+   */
+  allowUnknownFields = false;
+
   constructor(data?: PartialMessage<RunJobTemplateRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2034,6 +2104,7 @@ export class RunJobTemplateRequest extends Message<RunJobTemplateRequest> {
     { no: 5, name: "force_reschedule", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 7, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 8, name: "allow_unknown_fields", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobTemplateRequest {
@@ -2087,6 +2158,16 @@ export class RunJobTemplateReply extends Message<RunJobTemplateReply> {
    */
   jobConfigId = "";
 
+  /**
+   * Advisory lines, one per warning, without the `warning: ` prefix: the
+   * same lines RunJobReply.warnings carries (unknown keys the run kept or
+   * dropped under `allow_unknown_fields` among them). Also appended to
+   * `message`, each after `warning: `.
+   *
+   * @generated from field: repeated string warnings = 5;
+   */
+  warnings: string[] = [];
+
   constructor(data?: PartialMessage<RunJobTemplateReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2099,6 +2180,7 @@ export class RunJobTemplateReply extends Message<RunJobTemplateReply> {
     { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 3, name: "job_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobTemplateReply {
@@ -2193,6 +2275,21 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
    */
   managedBy?: ManagedByInfo;
 
+  /**
+   * What `allow_unknown_fields` kept and dropped when the job's latest
+   * config version was submitted. Unset when that submit kept and dropped
+   * nothing (every submit without the flag, and one with the flag whose
+   * spec had no unknown keys). `legion job info` prints it as
+   * `submitted with --allow-unknown-fields: dropped …; … pending`.
+   *
+   * It describes the submit that created the version. Resubmitting a spec
+   * that renders to the same config is `unchanged` and leaves it in place,
+   * even when the resubmit no longer carries the dropped keys.
+   *
+   * @generated from field: optional legion.UnknownFieldsRecord unknown_fields = 4;
+   */
+  unknownFields?: UnknownFieldsRecord;
+
   constructor(data?: PartialMessage<GetJobInfoReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2204,6 +2301,7 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
     { no: 1, name: "job", kind: "message", T: Job },
     { no: 2, name: "template", kind: "message", T: JobTemplateProvenance, opt: true },
     { no: 3, name: "managed_by", kind: "message", T: ManagedByInfo, opt: true },
+    { no: 4, name: "unknown_fields", kind: "message", T: UnknownFieldsRecord, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobInfoReply {
@@ -2271,6 +2369,119 @@ export class ManagedByInfo extends Message<ManagedByInfo> {
 
   static equals(a: ManagedByInfo | PlainMessage<ManagedByInfo> | undefined, b: ManagedByInfo | PlainMessage<ManagedByInfo> | undefined): boolean {
     return proto3.util.equals(ManagedByInfo, a, b);
+  }
+}
+
+/**
+ * One jobspec key Legion did not know, as `allow_unknown_fields` handled it.
+ *
+ * @generated from message legion.UnknownJobspecField
+ */
+export class UnknownJobspecField extends Message<UnknownJobspecField> {
+  /**
+   * Where the key's block sits, as error messages name it: `task postgres`,
+   * `task postgres: volume data`, `task web: port http`. Empty for a key at
+   * the job's top level.
+   *
+   * @generated from field: string scope = 1;
+   */
+  scope = "";
+
+  /**
+   * The key, dotted from its scope: `backup`, `stop.signall`,
+   * `checks[0].everyy`.
+   *
+   * @generated from field: string path = 2;
+   */
+  path = "";
+
+  /**
+   * For a kept key, the extension point it sits on: `job`, `task`,
+   * `volume`, `port`, or `service`. Empty for a dropped key.
+   *
+   * @generated from field: string point = 3;
+   */
+  point = "";
+
+  constructor(data?: PartialMessage<UnknownJobspecField>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UnknownJobspecField";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "scope", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "point", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UnknownJobspecField {
+    return new UnknownJobspecField().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UnknownJobspecField {
+    return new UnknownJobspecField().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UnknownJobspecField {
+    return new UnknownJobspecField().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UnknownJobspecField | PlainMessage<UnknownJobspecField> | undefined, b: UnknownJobspecField | PlainMessage<UnknownJobspecField> | undefined): boolean {
+    return proto3.util.equals(UnknownJobspecField, a, b);
+  }
+}
+
+/**
+ * The unknown keys one submit kept and dropped under
+ * `allow_unknown_fields`, recorded on the job config version it created.
+ *
+ * @generated from message legion.UnknownFieldsRecord
+ */
+export class UnknownFieldsRecord extends Message<UnknownFieldsRecord> {
+  /**
+   * Keys on extension points, kept unvalidated in the block's
+   * `pendingExtensions` map. Nothing acts on them; they stay with every
+   * version whose spec still carries them.
+   *
+   * @generated from field: repeated legion.UnknownJobspecField pending = 1;
+   */
+  pending: UnknownJobspecField[] = [];
+
+  /**
+   * Keys elsewhere, dropped: the version does not carry them.
+   *
+   * @generated from field: repeated legion.UnknownJobspecField dropped = 2;
+   */
+  dropped: UnknownJobspecField[] = [];
+
+  constructor(data?: PartialMessage<UnknownFieldsRecord>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UnknownFieldsRecord";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "pending", kind: "message", T: UnknownJobspecField, repeated: true },
+    { no: 2, name: "dropped", kind: "message", T: UnknownJobspecField, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UnknownFieldsRecord {
+    return new UnknownFieldsRecord().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UnknownFieldsRecord {
+    return new UnknownFieldsRecord().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UnknownFieldsRecord {
+    return new UnknownFieldsRecord().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UnknownFieldsRecord | PlainMessage<UnknownFieldsRecord> | undefined, b: UnknownFieldsRecord | PlainMessage<UnknownFieldsRecord> | undefined): boolean {
+    return proto3.util.equals(UnknownFieldsRecord, a, b);
   }
 }
 
@@ -3715,6 +3926,19 @@ export class PlanJobRequest extends Message<PlanJobRequest> {
    */
   namespace?: string;
 
+  /**
+   * Plan a jobspec that carries keys Legion does not know
+   * (`legion job plan --allow-unknown-fields`), as a submit with
+   * RunJobRequest.allow_unknown_fields would take it: keys on extension
+   * points kept as pending, the rest dropped, each listed in
+   * `PlanJobReply.warnings`. Default `false`: every unknown key fails the
+   * plan with INVALID_ARGUMENT, as it would fail the submit. Nothing is
+   * recorded; a plan stores nothing.
+   *
+   * @generated from field: bool allow_unknown_fields = 3;
+   */
+  allowUnknownFields = false;
+
   constructor(data?: PartialMessage<PlanJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3725,6 +3949,7 @@ export class PlanJobRequest extends Message<PlanJobRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "parsed_jobspec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "allow_unknown_fields", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobRequest {
@@ -3828,6 +4053,11 @@ export class PlanJobReply extends Message<PlanJobReply> {
    * stored policy object covering it, whose outbound connections would all
    * be refused with `gated-default`. Each line ends with a `hint:` naming the
    * fix. Empty when there is nothing to say.
+   *
+   * Under `allow_unknown_fields`, the list starts with one line per unknown
+   * key the submit would drop (`task web: dropped unknown field
+   * `stop.signall``) or keep as pending (`task postgres: volume data: kept
+   * `backup` as pending (no installed app declares it)`).
    *
    * @generated from field: repeated string warnings = 8;
    */

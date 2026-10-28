@@ -4408,6 +4408,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,

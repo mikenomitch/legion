@@ -127,6 +127,7 @@ fn submit_keyed(store: &Store) -> R<()> {
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         ..TaskConfig::new(TASK, "noop")
     };
@@ -138,6 +139,7 @@ fn submit_keyed(store: &Store) -> R<()> {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
         },
         &[Submission {
             path: format!("{JOB}.json"),
@@ -923,6 +925,7 @@ fn a_job_volume_change_reaches_a_streaming_worker_under_raft() -> R<()> {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
     };
     let submission = [Submission {
         path: format!("{VOLUME_JOB}.json"),
@@ -952,6 +955,8 @@ fn a_job_volume_change_reaches_a_streaming_worker_under_raft() -> R<()> {
             params: None,
             path: Some("/mnt/data".into()),
             read_only: None,
+            pending_extensions: Default::default(),
+            unknown_fields: Default::default(),
         }]),
         &submission,
     )?;
@@ -1114,6 +1119,7 @@ fn checkpoint_work_reaches_a_streaming_worker_without_a_heartbeat() -> R<()> {
                     promote: None,
                     placement: None,
                     fence_after: None,
+                    unknown_fields: Default::default(),
                 }),
                 suspend: Some(SuspendConfig {
                     checkpoint: Some("memory".into()),
@@ -1124,6 +1130,7 @@ fn checkpoint_work_reaches_a_streaming_worker_without_a_heartbeat() -> R<()> {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
         },
         &[Submission {
             path: format!("{JOB}.json"),

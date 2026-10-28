@@ -33,7 +33,14 @@ differs: the reconciler submits as an identity holding exactly the recorded
 grant (entry 42), bundled apps cannot be uninstalled (entry 43), only
 `artifact = true` code fields become artifacts (entry 46), and workload
 identity stays off by default, so apps hold no credentials until it is on
-(entry 56). A4-A6 are not built. It has six phases (§8),
+(entry 56). **A6a shipped 2026-10-28** (unknown jobspec keys are submit
+errors with a did-you-mean; `--allow-unknown-fields` keeps keys at extension
+points in `pendingExtensions` and drops the rest, recorded on the version;
+docs: [jobs-tasks-and-scheduling.md](../../docs/jobs-tasks-and-scheduling.md#unknown-fields)).
+Calls entries 58-67 record where A6a differs: every `JobConfig` parse is
+strict (entry 58), network policy blocks and value sources stay strict even
+with the flag (entry 59), and free-form maps such as `resources` are not
+checked (entry 60). A4, A5 and A6b are not built. It has six phases (§8),
 and each ships alone. The first consumer is the autoscaler
 ([autoscaler-v2-plan.md](autoscaler-v2-plan.md)). GitOps is the second, and
 this plan checks the substrate against it (§6.8). Deliberately deferred:
@@ -1301,9 +1308,11 @@ on the CLI's `job validate`, and a per-repo setting for GitOps.
   at that point is installed, it validates and adopts the pending values
   (and its install prompt reports them). A pending value no app ever claims
   stays inert, and `job info` shows it.
-- **An unknown key anywhere else is dropped**: inside `resources`, a
-  `rollout` block, and so on. Nothing could ever own it there. Each dropped
-  key is listed in the reply's `warnings`.
+- **An unknown key anywhere else is dropped**: inside `stop`, a `rollout`
+  block, and so on. Nothing could ever own it there. Each dropped key is
+  listed in the reply's `warnings`. (Free-form maps such as `resources`,
+  `meta`, and `constraints` take any key, so they have nothing to check;
+  calls entry 60.)
 - **A value for an installed app's key that fails its schema is still an
   error.** The flag is about keys Legion doesn't know, not values it knows
   are wrong.
@@ -1311,12 +1320,12 @@ on the CLI's `job validate`, and a per-repo setting for GitOps.
 
 ```console
 $ legion job run orders-db.ncl --allow-unknown-fields
-warning: task postgres: dropped unknown field `resources.memoryMax2`
+warning: task postgres: dropped unknown field `stop.signall`
 warning: task postgres: volume data: kept `backup` as pending (no installed app declares it)
 orders-db: submitted version 3
 $ legion job info orders-db
 ...
-submitted with --allow-unknown-fields: dropped resources.memoryMax2; backup on volume data
+submitted with --allow-unknown-fields: dropped stop.signall; backup on volume data
 pending (no installed app declares it)
 ```
 

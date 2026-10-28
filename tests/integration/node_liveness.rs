@@ -603,6 +603,7 @@ fn submit_and_place(store: &Store, name: &str) -> R<usize> {
             ..TaskConfig::new(format!("{name}-task"), "service")
         }],
         version: None,
+        pending_extensions: Default::default(),
     };
     let submissions = vec![Submission {
         path: format!("{name}.json"),

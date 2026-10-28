@@ -151,6 +151,7 @@ fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
     };
     let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
         .pop()
