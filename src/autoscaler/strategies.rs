@@ -731,8 +731,8 @@ mod tests {
         }
         // Any valid plugin name is a strategy plugin; whether it is
         // installed is the manager's question.
-        let plugin = StrategyConfig::from_spec(&spec(json!({ "name": "calendar", "replicas": 6 })))
-            .unwrap();
+        let plugin =
+            StrategyConfig::from_spec(&spec(json!({ "name": "calendar", "replicas": 6 }))).unwrap();
         assert_eq!(plugin.to_string(), "plugin calendar");
         assert!(!plugin.needs_reading());
         assert_eq!(
@@ -749,7 +749,10 @@ mod tests {
     fn strategy_config_errors_table_test() {
         let cases = [
             (json!({ "name": "Magic" }), "unknown strategy 'Magic'"),
-            (json!({ "name": "per_replica" }), "any other name is a strategy plugin"),
+            (
+                json!({ "name": "per_replica" }),
+                "any other name is a strategy plugin",
+            ),
             (json!({ "name": "per-replica" }), "missing field `value`"),
             (
                 json!({ "name": "per-replica", "value": 0 }),

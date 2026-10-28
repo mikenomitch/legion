@@ -144,8 +144,8 @@ mod snapshot_rpcs;
 mod suspend_rpcs;
 mod work_stream;
 pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};
-pub(crate) use snapshot_rpcs::snapshot_restore_payload;
 pub(crate) use scaling_rpcs::scaling_replica_counts;
+pub(crate) use snapshot_rpcs::snapshot_restore_payload;
 pub use snapshot_rpcs::{
     checkpoint_part_keys, expire_snapshots, PartKeyUse, CHECKPOINT_CAPABILITY,
 };

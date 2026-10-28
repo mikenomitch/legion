@@ -1000,8 +1000,12 @@ mod tests {
         );
         let missing: TaskConfig = serde_json::from_value(web(lag("other-prom")))?;
         let err = layers.resolve("payments-prod/api", &missing).unwrap_err();
-        assert!(err.contains("uses source 'other-prom', which is not installed"), "{err}");
-        let strategy: TaskConfig = serde_json::from_value(web(json!({ "autoscale": { "checks": [{
+        assert!(
+            err.contains("uses source 'other-prom', which is not installed"),
+            "{err}"
+        );
+        let strategy: TaskConfig =
+            serde_json::from_value(web(json!({ "autoscale": { "checks": [{
             "name": "batch", "source": "legion",
             "strategy": { "name": "calendar", "replicas": 6 }, "scaleIn": false }] } })))?;
         assert!(layers.resolve("web", &strategy).is_ok());
@@ -1009,7 +1013,10 @@ mod tests {
             "name": "batch", "source": "legion",
             "strategy": { "name": "perreplica", "value": 2 } }] } })))?;
         let err = layers.resolve("web", &unknown).unwrap_err();
-        assert!(err.contains("uses strategy 'perreplica', which is not installed"), "{err}");
+        assert!(
+            err.contains("uses strategy 'perreplica', which is not installed"),
+            "{err}"
+        );
         // Without the catalog (the submit arbitration), plugins are not
         // checked.
         assert!(AutoscaleLayers::default().resolve("web", &missing).is_ok());

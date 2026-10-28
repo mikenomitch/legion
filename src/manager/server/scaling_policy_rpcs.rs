@@ -6,9 +6,7 @@
 use super::*;
 use crate::autoscaler::defaults::ResolvedPolicy;
 use crate::autoscaler::policy::{self as standalone, StandaloneSpec};
-use crate::manager::autoscale::{
-    policy_target_key, summary_line, AutoscaleLayers, TargetPolicy,
-};
+use crate::manager::autoscale::{policy_target_key, summary_line, AutoscaleLayers, TargetPolicy};
 use crate::storage::store::{covering_pause, PauseRow, ScalingPolicyRow};
 use crate::structs::{
     ApplyScalingPolicyReply, ApplyScalingPolicyRequest, DeleteScalingPolicyReply,
@@ -88,7 +86,11 @@ pub(super) fn provenance_rows(resolved: &ResolvedPolicy) -> Vec<ScalingProvenanc
 }
 
 /// The proto a standalone policy streams as.
-pub(super) fn standalone_proto(policy: &LoadedPolicy, pauses: &[PauseRow], now_ms: i64) -> StandaloneScalingPolicy {
+pub(super) fn standalone_proto(
+    policy: &LoadedPolicy,
+    pauses: &[PauseRow],
+    now_ms: i64,
+) -> StandaloneScalingPolicy {
     let id = policy.id();
     let (plugin, config) = policy.target();
     let (state, error, digest, policy_json, summary) = match &policy.resolved {
@@ -127,7 +129,11 @@ pub(super) fn standalone_proto(policy: &LoadedPolicy, pauses: &[PauseRow], now_m
 
 fn task_summary(target: &TargetPolicy) -> ScalingPolicySummary {
     let namespace = crate::structs::namespace::job_namespace(&target.job_id).to_string();
-    let kind = if target.members.len() > 1 { "group" } else { "task" };
+    let kind = if target.members.len() > 1 {
+        "group"
+    } else {
+        "task"
+    };
     let (state, error, mode, min, max, summary) = match &target.resolved {
         Ok(resolved) => (
             "ok".to_string(),
@@ -137,7 +143,14 @@ fn task_summary(target: &TargetPolicy) -> ScalingPolicySummary {
             resolved.policy.max,
             summary_line(&resolved.policy),
         ),
-        Err(err) => ("invalid".to_string(), err.clone(), String::new(), 0, 0, String::new()),
+        Err(err) => (
+            "invalid".to_string(),
+            err.clone(),
+            String::new(),
+            0,
+            0,
+            String::new(),
+        ),
     };
     ScalingPolicySummary {
         id: target.label(),
@@ -166,7 +179,14 @@ fn standalone_summary(policy: &LoadedPolicy, detail: bool) -> ScalingPolicySumma
             resolved.policy.max,
             summary_line(&resolved.policy),
         ),
-        Err(err) => ("invalid".to_string(), err.clone(), String::new(), 0, 0, String::new()),
+        Err(err) => (
+            "invalid".to_string(),
+            err.clone(),
+            String::new(),
+            0,
+            0,
+            String::new(),
+        ),
     };
     ScalingPolicySummary {
         id: policy.id(),
@@ -214,13 +234,33 @@ fn split_policy_ref(name: &str, namespace: &str) -> (String, String) {
 impl ManagerDaemonService {
     /// The ACL a standalone policy's writes need: `scale:write` on its
     /// namespace and name; a node group, `operator:write` and `node:write`.
-    fn enforce_policy_write(&self, identity: &AclIdentity, kind: &str, id: &str) -> Result<(), Status> {
+    fn enforce_policy_write(
+        &self,
+        identity: &AclIdentity,
+        kind: &str,
+        id: &str,
+    ) -> Result<(), Status> {
         if kind == "nodes" {
-            acl::enforce(identity, AclResource::Operator, AclAction::Write, &AclScope::none())?;
-            acl::enforce(identity, AclResource::Node, AclAction::Write, &AclScope::any())?;
+            acl::enforce(
+                identity,
+                AclResource::Operator,
+                AclAction::Write,
+                &AclScope::none(),
+            )?;
+            acl::enforce(
+                identity,
+                AclResource::Node,
+                AclAction::Write,
+                &AclScope::any(),
+            )?;
             Ok(())
         } else {
-            acl::enforce(identity, AclResource::Scale, AclAction::Write, &AclScope::job(id))
+            acl::enforce(
+                identity,
+                AclResource::Scale,
+                AclAction::Write,
+                &AclScope::job(id),
+            )
         }
     }
 
@@ -243,8 +283,9 @@ impl ManagerDaemonService {
         };
         let spec_value: Value = serde_json::from_str(&inner.spec_json)
             .map_err(|err| Status::invalid_argument(format!("the policy is not JSON: {err}")))?;
-        let parsed = standalone::parse(&spec_value, &default_namespace)
-            .map_err(|err| Status::invalid_argument(format!("Error validating scaling policy: {err}")))?;
+        let parsed = standalone::parse(&spec_value, &default_namespace).map_err(|err| {
+            Status::invalid_argument(format!("Error validating scaling policy: {err}"))
+        })?;
         let id = parsed.id();
         self.enforce_policy_write(&identity, parsed.kind().as_str(), &id)?;
 
@@ -284,9 +325,9 @@ impl ManagerDaemonService {
         self.ensure_namespace_exists(&policy.namespace)?;
         let layers = AutoscaleLayers::load(&self.store)
             .map_err(|e| map_store_error("Error loading scaling defaults", e))?;
-        let resolved = layers
-            .resolve_standalone(policy)
-            .map_err(|err| Status::invalid_argument(format!("Error validating scaling policy: {err}")))?;
+        let resolved = layers.resolve_standalone(policy).map_err(|err| {
+            Status::invalid_argument(format!("Error validating scaling policy: {err}"))
+        })?;
         let current = self
             .store
             .scaling_policy(&policy.namespace, &policy.name)
@@ -300,24 +341,25 @@ impl ManagerDaemonService {
             },
             None => Vec::new(),
         };
-        let reply = |version: u64, created: bool, changed: bool, message: String| ApplyScalingPolicyReply {
-            id: id.clone(),
-            kind: "external".to_string(),
-            version,
-            created,
-            changed,
-            diff: diff.clone(),
-            message,
-            deduplicated: false,
-            policy_json: resolved.policy.canonical_json(),
-            digest: resolved.digest.clone(),
-            provenance: provenance_rows(&resolved),
-            dry_run: inner.dry_run,
-        };
+        let reply =
+            |version: u64, created: bool, changed: bool, message: String| ApplyScalingPolicyReply {
+                id: id.clone(),
+                kind: "external".to_string(),
+                version,
+                created,
+                changed,
+                diff: diff.clone(),
+                message,
+                deduplicated: false,
+                policy_json: resolved.policy.canonical_json(),
+                digest: resolved.digest.clone(),
+                provenance: provenance_rows(&resolved),
+                dry_run: inner.dry_run,
+            };
         if inner.dry_run {
-            let unchanged = current.as_ref().is_some_and(|row| {
-                row.spec == canonical && row.description == policy.description
-            });
+            let unchanged = current
+                .as_ref()
+                .is_some_and(|row| row.spec == canonical && row.description == policy.description);
             let (version, verb) = match &current {
                 None => (0, "would be created".to_string()),
                 Some(row) if unchanged => (row.version, format!("unchanged (v{})", row.version)),
@@ -364,7 +406,12 @@ impl ManagerDaemonService {
         self.store
             .idempotency_record(&idempotency_key, "apply_scaling_policy", &message)
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
-        Ok(Response::new(reply(put.version, put.created, put.changed, message)))
+        Ok(Response::new(reply(
+            put.version,
+            put.created,
+            put.changed,
+            message,
+        )))
     }
 
     // ACL: scale:write, coarse; then scale:write on the policy's namespace
@@ -384,13 +431,20 @@ impl ManagerDaemonService {
         )?;
         let inner = request.into_inner();
         if inner.name.trim().is_empty() {
-            return Err(Status::invalid_argument("name the scaling policy to delete"));
+            return Err(Status::invalid_argument(
+                "name the scaling policy to delete",
+            ));
         }
         let (namespace, name) = split_policy_ref(&inner.name, &inner.namespace);
         let id = standalone::policy_id(&namespace, &name);
         // The precise check before the lookup, so a missing policy and a
         // forbidden one read the same to a caller without the grant.
-        acl::enforce(&identity, AclResource::Scale, AclAction::Write, &AclScope::job(&id))?;
+        acl::enforce(
+            &identity,
+            AclResource::Scale,
+            AclAction::Write,
+            &AclScope::job(&id),
+        )?;
         let idempotency_key = scoped_idempotency_key(
             &identity,
             "delete_scaling_policy",
@@ -475,7 +529,11 @@ impl ManagerDaemonService {
                 .iter()
                 .filter(|policy| selection.matches(&policy.row.namespace))
                 .filter(|policy| {
-                    identity.allows(AclResource::Scale, AclAction::Read, &AclScope::job(&policy.id()))
+                    identity.allows(
+                        AclResource::Scale,
+                        AclAction::Read,
+                        &AclScope::job(&policy.id()),
+                    )
                 })
                 .map(|policy| standalone_summary(policy, req.detail)),
         );

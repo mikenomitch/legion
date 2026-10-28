@@ -232,7 +232,8 @@ impl fmt::Display for Builtin {
 
 /// An `http://` or `https://` URL with a host.
 pub fn check_http_url(text: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(text.trim()).map_err(|err| format!("{text:?} is not a URL: {err}"))?;
+    let parsed =
+        url::Url::parse(text.trim()).map_err(|err| format!("{text:?} is not a URL: {err}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!("{text:?} must be an http:// or https:// URL"));
     }
@@ -378,7 +379,10 @@ fn parse_entry(name: &str, value: &Value) -> Result<PluginEntry, String> {
     let object = value
         .as_object()
         .ok_or_else(|| format!("{at} must be a record"))?;
-    if let Some(unknown) = object.keys().find(|key| !ENTRY_FIELDS.contains(&key.as_str())) {
+    if let Some(unknown) = object
+        .keys()
+        .find(|key| !ENTRY_FIELDS.contains(&key.as_str()))
+    {
         return Err(format!(
             "{at}: unknown field `{unknown}`; a plugin takes {}",
             ENTRY_FIELDS.join(", ")
@@ -387,7 +391,9 @@ fn parse_entry(name: &str, value: &Value) -> Result<PluginEntry, String> {
     let text = |key: &str| -> Result<Option<String>, String> {
         match object.get(key) {
             None | Some(Value::Null) => Ok(None),
-            Some(Value::String(text)) if !text.trim().is_empty() => Ok(Some(text.trim().to_string())),
+            Some(Value::String(text)) if !text.trim().is_empty() => {
+                Ok(Some(text.trim().to_string()))
+            }
             Some(_) => Err(format!("{at}.{key} must be a non-empty string")),
         }
     };
@@ -432,7 +438,9 @@ fn parse_entry(name: &str, value: &Value) -> Result<PluginEntry, String> {
         ));
     }
     if checksum.is_some() && source.is_none() {
-        return Err(format!("{at}.checksum needs source: it checks the fetched artifact"));
+        return Err(format!(
+            "{at}.checksum needs source: it checks the fetched artifact"
+        ));
     }
     if let Some(checksum) = &checksum {
         let ok = checksum
@@ -523,7 +531,13 @@ impl PluginCatalog {
     /// target). An installed plugin must allow the namespace, and a builtin
     /// must be of the kind asked for; an external plugin's kinds are checked
     /// when the app starts it.
-    pub fn check_use(&self, name: &str, kind: Kind, namespace: &str, what: &str) -> Result<(), String> {
+    pub fn check_use(
+        &self,
+        name: &str,
+        kind: Kind,
+        namespace: &str,
+        what: &str,
+    ) -> Result<(), String> {
         if (kind == Kind::Source && name == LEGION_SOURCE)
             || (kind == Kind::Target && name == NOOP_TARGET)
         {
@@ -543,9 +557,15 @@ impl PluginCatalog {
                 Kind::Target => "the `noop` target needs no install",
             };
             let listing = if installed.is_empty() {
-                format!("no {} plugin is installed for namespace {namespace}", kind.as_str())
+                format!(
+                    "no {} plugin is installed for namespace {namespace}",
+                    kind.as_str()
+                )
             } else {
-                format!("installed for namespace {namespace}: {}", installed.join(", "))
+                format!(
+                    "installed for namespace {namespace}: {}",
+                    installed.join(", ")
+                )
             };
             return Err(format!(
                 "{what}, which is not installed. Hint: the operator installs plugins in the \
@@ -646,16 +666,25 @@ mod tests {
     #[test]
     fn catalog_refuses_bad_entries_with_named_errors_test() {
         let cases: Vec<(Value, &str)> = vec![
-            (json!({ "Bad_Name": { "builtin": "noop" } }), "lowercase letters"),
+            (
+                json!({ "Bad_Name": { "builtin": "noop" } }),
+                "lowercase letters",
+            ),
             (json!({ "legion": { "builtin": "noop" } }), "is built in"),
-            (json!({ "per-replica": { "url": "http://x/rpc" } }), "is built in"),
+            (
+                json!({ "per-replica": { "url": "http://x/rpc" } }),
+                "is built in",
+            ),
             (json!({ "p": {} }), "exactly one of builtin"),
             (
                 json!({ "p": { "builtin": "noop", "url": "http://x/rpc" } }),
                 "exactly one of builtin",
             ),
             (json!({ "p": { "builtin": "graphite" } }), "unknown builtin"),
-            (json!({ "p": { "builtin": "prometheus" } }), "needs config.address"),
+            (
+                json!({ "p": { "builtin": "prometheus" } }),
+                "needs config.address",
+            ),
             (
                 json!({ "p": { "builtin": "prometheus", "config": { "address": "ftp://x" } } }),
                 "http:// or https://",
@@ -664,12 +693,18 @@ mod tests {
                 json!({ "p": { "builtin": "http", "config": { "url": "http://x", "method": "POST" } } }),
                 "unknown config field `method`",
             ),
-            (json!({ "p": { "builtin": "exec" } }), "needs config.command"),
+            (
+                json!({ "p": { "builtin": "exec" } }),
+                "needs config.command",
+            ),
             (
                 json!({ "p": { "builtin": "exec", "config": { "command": [] } } }),
                 "config.command",
             ),
-            (json!({ "p": { "builtin": "noop", "config": { "x": 1 } } }), "takes no config"),
+            (
+                json!({ "p": { "builtin": "noop", "config": { "x": 1 } } }),
+                "takes no config",
+            ),
             (json!({ "p": { "url": "not a url" } }), "is not a URL"),
             (json!({ "p": { "command": "" } }), "command"),
             (
@@ -680,8 +715,14 @@ mod tests {
                 json!({ "p": { "source": "https://x/a.tgz", "checksum": "md5:00" } }),
                 "must be `sha256:`",
             ),
-            (json!({ "p": { "builtin": "noop", "colour": "red" } }), "unknown field `colour`"),
-            (json!({ "p": { "builtin": "noop", "namespaces": "a" } }), "must be a list"),
+            (
+                json!({ "p": { "builtin": "noop", "colour": "red" } }),
+                "unknown field `colour`",
+            ),
+            (
+                json!({ "p": { "builtin": "noop", "namespaces": "a" } }),
+                "must be a list",
+            ),
             (
                 json!({ "p": { "builtin": "http", "config": { "url": "http://x", "timeout": "soon" } } }),
                 "config.timeout",
@@ -728,9 +769,17 @@ mod tests {
         assert!(err.contains("legion app config set autoscaler"), "{err}");
         // A builtin of the wrong kind.
         let err = catalog
-            .check_use("render", Kind::Source, "web", "check 'x' uses source 'render'")
+            .check_use(
+                "render",
+                Kind::Source,
+                "web",
+                "check 'x' uses source 'render'",
+            )
             .unwrap_err();
-        assert!(err.contains("is a target (builtin exec), not a source"), "{err}");
+        assert!(
+            err.contains("is a target (builtin exec), not a source"),
+            "{err}"
+        );
         // An external plugin's kinds are only known when it starts.
         catalog.check_use("calendar", Kind::Strategy, "web", "x")?;
         catalog.check_use("calendar", Kind::Target, "web", "x")?;

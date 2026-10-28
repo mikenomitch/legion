@@ -34,9 +34,9 @@ const MIB: u64 = 1024 * 1024;
 /// 500 MHz on a 2400 MHz core, in millicores.
 const RESERVED_MILLICORES: f64 = 500.0 / 2400.0 * 1000.0;
 /// One virtual tick: the autoscaler's default interval.
-const TICK_MS: i64 = 15_000;
+pub(crate) const TICK_MS: i64 = 15_000;
 /// Where virtual time starts.
-const T0: i64 = 1_800_000_000_000;
+pub(crate) const T0: i64 = 1_800_000_000_000;
 
 /// A node with two 2400 MHz cores.
 fn node(id: &str) -> NodeMsg {
@@ -76,10 +76,10 @@ fn s1(autoscale: Value, count: u32) -> Value {
     })
 }
 
-struct Harness {
+pub(crate) struct Harness {
     _dir: tempfile::TempDir,
-    store: Store,
-    client: AuthedManagerClient,
+    pub(crate) store: Store,
+    pub(crate) client: AuthedManagerClient,
     usage: Arc<Mutex<UsageTable>>,
     ticker: RollupTicker,
     server: tokio::task::JoinHandle<()>,
@@ -92,7 +92,7 @@ impl Drop for Harness {
 }
 
 impl Harness {
-    async fn start(nodes: usize) -> R<Self> {
+    pub(crate) async fn start(nodes: usize) -> R<Self> {
         let dir = tempfile::tempdir_in(crate::support::scratch_root())?;
         let store = Store::start_storage(&ManagerConfigFull {
             store_path: dir
@@ -134,7 +134,7 @@ impl Harness {
         })
     }
 
-    async fn run(&mut self, spec: Value) -> R<String> {
+    pub(crate) async fn run(&mut self, spec: Value) -> R<String> {
         let reply = self
             .client
             .run_job(RunJobRequest {
@@ -149,7 +149,7 @@ impl Harness {
     }
 
     /// Run every claimable eval, as the daemon's eval workers would.
-    fn drain_evals(&self) -> R<()> {
+    pub(crate) fn drain_evals(&self) -> R<()> {
         while let Some(eval) = self.store.claim_eval()? {
             let ok = eval.handle(&self.store).is_ok();
             self.store.complete_eval(&eval.id, ok)?;
@@ -157,7 +157,7 @@ impl Harness {
         Ok(())
     }
 
-    fn allocation_ids(&self, job: &str) -> R<Vec<i64>> {
+    pub(crate) fn allocation_ids(&self, job: &str) -> R<Vec<i64>> {
         let mut ids: Vec<i64> = self
             .store
             .allocs_for_job(job)?
@@ -168,7 +168,7 @@ impl Harness {
         Ok(ids)
     }
 
-    fn count(&self, job: &str) -> R<u32> {
+    pub(crate) fn count(&self, job: &str) -> R<u32> {
         let config = self.store.get_job_config(job)?;
         let task = &config.tasks[0];
         self.store
@@ -177,7 +177,7 @@ impl Harness {
 
     /// Every allocation of `job` reports `utilization` of its reservation
     /// and healthy; then one rollup tick folds it.
-    async fn report(&mut self, job: &str, utilization: f64, at_ms: i64) -> R<()> {
+    pub(crate) async fn report(&mut self, job: &str, utilization: f64, at_ms: i64) -> R<()> {
         let allocations = self.store.allocs_for_job(job)?;
         let mut nodes: std::collections::BTreeMap<String, Vec<i64>> = Default::default();
         for allocation in &allocations {
@@ -217,11 +217,26 @@ impl Harness {
                 .await
                 .map_err(|status| anyhow::anyhow!("heartbeat: {}", status.message()))?;
         }
-        self.ticker.tick(&self.store, &self.usage).await;
+        self.ticker.tick_at(&self.store, &self.usage, at_ms).await;
         Ok(())
     }
 
-    async fn engine(&self, options: EngineOptions) -> R<(Engine, tokio::task::JoinHandle<()>)> {
+    /// Install the bundled autoscaler app with `config` (its `plugins`), as
+    /// `legion app config set autoscaler` would leave it: submits validate
+    /// plugin use against it.
+    pub(crate) fn install_plugins(&self, config: Value) -> R<()> {
+        let manifest =
+            legion::apps::bundled_manifest("autoscaler").context("the bundled autoscaler")?;
+        let mut record = legion::manager::apps::seed_record(manifest, None);
+        record.config = config;
+        self.store.seed_app(record)?;
+        Ok(())
+    }
+
+    pub(crate) async fn engine(
+        &self,
+        options: EngineOptions,
+    ) -> R<(Engine, tokio::task::JoinHandle<()>)> {
         let engine = Engine::new(self.client.clone(), options, T0);
         let watch = engine.spawn_watch();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -232,7 +247,10 @@ impl Harness {
         Ok((engine, watch))
     }
 
-    async fn history(&mut self, job: &str) -> R<Vec<legion::structs::ScaleHistoryEntry>> {
+    pub(crate) async fn history(
+        &mut self,
+        job: &str,
+    ) -> R<Vec<legion::structs::ScaleHistoryEntry>> {
         Ok(self
             .client
             .get_scale_history(GetScaleHistoryRequest {
@@ -524,6 +542,164 @@ async fn cas_conflicts_and_pause_all_stop_writes_test() -> R<()> {
     assert_eq!(report.scaled, 1, "{report:?}");
     h.drain_evals()?;
     assert!(h.count("web")? > 3);
+    Ok(())
+}
+
+/// The autoscaler's own writes, oldest first: (decision time, from, to).
+fn applied_decisions(history: &[legion::structs::ScaleHistoryEntry]) -> Vec<(i64, u32, u32)> {
+    let mut applied: Vec<(i64, u32, u32)> = history
+        .iter()
+        .filter(|entry| entry.source == "autoscaler" && entry.kind == "scaled")
+        .map(|entry| {
+            let decision: Value = serde_json::from_str(&entry.decision_json).unwrap_or_default();
+            (
+                decision["atMs"].as_i64().unwrap_or_default(),
+                entry.from,
+                entry.to,
+            )
+        })
+        .collect();
+    applied.sort_unstable();
+    applied
+}
+
+/// Acceptance P3: `legion scaling simulate` over the history the manager
+/// kept replays the live autoscaler's decisions. The live engine runs S1's
+/// load (a spike, a lull, a second smaller spike); then the simulator,
+/// given the same policy and the recorded samples, makes the same count
+/// changes at the same evaluations.
+#[tokio::test(flavor = "multi_thread")]
+async fn simulate_over_history_matches_the_live_decisions_test() -> R<()> {
+    let mut h = Harness::start(4).await?;
+    h.run(s1(json!(true), 2)).await?;
+    let (mut engine, watch) = h.engine(EngineOptions::default()).await?;
+    let demand = |tick: i64| match tick {
+        0..=1 => 1.0,
+        2..=19 => 5.6,
+        20..=49 => 0.4,
+        50..=61 => 8.0,
+        _ => 0.4,
+    };
+    for tick in 0..84 {
+        let at = T0 + tick * TICK_MS;
+        let replicas = h.allocation_ids("web")?.len().max(1) as f64;
+        h.report("web", demand(tick) / replicas, at).await?;
+        let report = engine.tick(at).await;
+        assert!(report.errors.is_empty(), "tick {tick}: {:?}", report.errors);
+        h.drain_evals()?;
+    }
+    watch.abort();
+    let live = applied_decisions(&h.history("web").await?);
+    assert!(live.len() >= 8, "{live:?}");
+    assert!(
+        live.windows(2)
+            .any(|pair| pair[0].2 < pair[0].1 && pair[1].2 > pair[1].1),
+        "the run should scale in and then out again: {live:?}"
+    );
+
+    let report = legion::cmd::scaling_simulate::run(
+        &mut h.client,
+        &legion::cmd::scaling_simulate::SimulateArgs {
+            job: Some("web".into()),
+            since: Duration::from_secs(3600),
+            // The live engine started with the history: cold, as it was.
+            cold: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    assert_eq!(
+        (report.input.as_str(), report.mode.as_str()),
+        ("history", "replay")
+    );
+    assert!(report.missing_checks.is_empty(), "{report:?}");
+    let simulated: Vec<(i64, u32, u32)> = report
+        .changes
+        .iter()
+        .filter(|change| change.kind == "applied")
+        .map(|change| (change.at_unix_ms, change.from, change.to))
+        .collect();
+    assert_eq!(simulated, live, "simulated vs live");
+    Ok(())
+}
+
+/// Scale to zero (plan §6.12): a `min = 0` task with an `activation` check
+/// on the `http` source goes idle once the queue is empty for the down
+/// window, stays asleep while the reading is at or below its activation
+/// (though per-replica alone would keep one replica), and wakes when work
+/// arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_min_zero_task_idles_and_wakes_on_its_activation_check_test() -> R<()> {
+    let depth = Arc::new(Mutex::new(0.0_f64));
+    let served = depth.clone();
+    let queue = crate::scaling_plugins::FakeHttp::start(
+        move |_| json!({ "depth": *served.lock().unwrap_or_else(|p| p.into_inner()) }),
+    )
+    .await?;
+    let config = json!({ "plugins": {
+        "queue": { "builtin": "http", "config": { "url": format!("{}/stats", queue.url) } },
+    } });
+    let mut h = Harness::start(2).await?;
+    h.install_plugins(config.clone())?;
+    h.run(s1(
+        json!({
+            "min": 0,
+            "max": 8,
+            "checks": [{
+                "name": "queue", "source": "queue", "query": "/depth",
+                "strategy": { "name": "per-replica", "value": 5 }, "activation": 1,
+            }],
+            "down": { "stabilize": "1m" },
+        }),
+        2,
+    ))
+    .await?;
+    let options = EngineOptions {
+        plugins: legion::autoscaler::plugins::PluginCatalog::from_app_config(&config)
+            .map_err(|err| anyhow::anyhow!(err))?,
+        ..Default::default()
+    };
+    let (mut engine, watch) = h.engine(options).await?;
+    let mut counts = Vec::new();
+    for tick in 0..30 {
+        *depth.lock().unwrap_or_else(|p| p.into_inner()) = match tick {
+            0..=19 => 0.0,
+            20..=24 => 0.5,
+            _ => 22.0,
+        };
+        let at = T0 + tick * TICK_MS;
+        h.report("web", 0.1, at).await?;
+        let report = engine.tick(at).await;
+        assert!(report.errors.is_empty(), "tick {tick}: {:?}", report.errors);
+        h.drain_evals()?;
+        counts.push(h.count("web")?);
+    }
+    watch.abort();
+    assert_eq!(counts[0], 2, "{counts:?}");
+    assert_eq!(counts[19], 0, "idle before the queue fills: {counts:?}");
+    assert!(
+        counts[20..=24].iter().all(|count| *count == 0),
+        "at or below the activation it stays asleep: {counts:?}"
+    );
+    assert!(counts[25] >= 1, "woken by the queue: {counts:?}");
+    assert_eq!(
+        *counts.last().unwrap_or(&0),
+        5,
+        "22 queued at 5 each: {counts:?}"
+    );
+    let history = h.history("web").await?;
+    assert!(
+        history
+            .iter()
+            .any(|entry| entry.to == 0 && entry.summary.contains("idle")),
+        "{history:?}"
+    );
+    assert!(
+        history
+            .iter()
+            .any(|entry| entry.from == 0 && entry.decision_json.contains("woken by queue")),
+        "{history:?}"
+    );
     Ok(())
 }
 

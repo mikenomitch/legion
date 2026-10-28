@@ -2965,7 +2965,10 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_scaling_simulate" => {
-            let spec = args.get("spec").filter(|spec| !spec.is_null()).map(Value::to_string);
+            let spec = args
+                .get("spec")
+                .filter(|spec| !spec.is_null())
+                .map(Value::to_string);
             let job = if spec.is_some() {
                 None
             } else {
@@ -3014,7 +3017,10 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 client.apply_scaling_policy(crate::structs::ApplyScalingPolicyRequest {
                     spec_json: spec.to_string(),
                     namespace: opt_str_arg(&args, "namespace").unwrap_or_default(),
-                    dry_run: args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
+                    dry_run: args
+                        .get("dry_run")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     idempotency_key: opt_str_arg(&args, "idempotency_key"),
                 }),
             )

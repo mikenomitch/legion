@@ -626,7 +626,13 @@ impl Engine {
         let mut valid: Vec<(&ScalingPolicy, EffectivePolicy)> = Vec::new();
         for policy in &cache.tasks {
             if policy.state != "ok" {
-                reports.push(plain_report(task_report(policy), "invalid", 0, &policy.error, now_ms));
+                reports.push(plain_report(
+                    task_report(policy),
+                    "invalid",
+                    0,
+                    &policy.error,
+                    now_ms,
+                ));
                 continue;
             }
             match serde_json::from_str::<EffectivePolicy>(&policy.policy_json) {
@@ -814,7 +820,13 @@ impl Engine {
                 pause: owner.pause.as_ref().map(pause_of),
             };
             let (decision, scale_decision, mut target_report) = match self
-                .decide(&target_inputs, &external, task_report(policy), now_ms, &mut report)
+                .decide(
+                    &target_inputs,
+                    &external,
+                    task_report(policy),
+                    now_ms,
+                    &mut report,
+                )
                 .await
             {
                 Ok(decided) => decided,
@@ -824,8 +836,16 @@ impl Engine {
                     continue;
                 }
             };
-            self.act_task(&key, owner, &decision, scale_decision, &mut target_report, now_ms, &mut report)
-                .await;
+            self.act_task(
+                &key,
+                owner,
+                &decision,
+                scale_decision,
+                &mut target_report,
+                now_ms,
+                &mut report,
+            )
+            .await;
             report.evaluated += 1;
             reports.push(target_report);
         }
@@ -892,7 +912,11 @@ impl Engine {
     ) -> HashMap<QueryKey, Result<SourceReading, String>> {
         let mut wanted: BTreeMap<QueryKey, (String, String)> = BTreeMap::new();
         for (label, effective) in policies {
-            for check in effective.all_checks().iter().filter(|check| reads_external(check)) {
+            for check in effective
+                .all_checks()
+                .iter()
+                .filter(|check| reads_external(check))
+            {
                 wanted
                     .entry(query_key(check))
                     .or_insert_with(|| (label.clone(), check.name.clone()));
@@ -955,22 +979,25 @@ impl Engine {
                     continue;
                 }
                 match check_reading(check, &inputs.members) {
-                    Reading::Value(value) => Reading::Value(state.windows.add(
-                        &check.name,
-                        value,
-                        now_ms,
-                        check.window,
-                    )),
+                    Reading::Value(value) => {
+                        Reading::Value(state.windows.add(&check.name, value, now_ms, check.window))
+                    }
                     // Missing data is missing now: a window of old samples
                     // does not stand in for it.
                     missing => missing,
                 }
             } else if reads_external(check) {
                 match external.get(&query_key(check)) {
-                    Some(Ok(SourceReading::Value { value, windowed: true })) => Reading::Value(*value),
-                    Some(Ok(SourceReading::Value { value, windowed: false })) => Reading::Value(
-                        state.windows.add(&check.name, *value, now_ms, check.window),
-                    ),
+                    Some(Ok(SourceReading::Value {
+                        value,
+                        windowed: true,
+                    })) => Reading::Value(*value),
+                    Some(Ok(SourceReading::Value {
+                        value,
+                        windowed: false,
+                    })) => {
+                        Reading::Value(state.windows.add(&check.name, *value, now_ms, check.window))
+                    }
                     Some(Ok(SourceReading::Missing(why))) => Reading::Missing(why.clone()),
                     Some(Err(err)) => Reading::Missing(err.clone()),
                     None => Reading::Missing("the source was not read".to_string()),
@@ -1003,7 +1030,11 @@ impl Engine {
                 config: config.clone(),
             };
             if let Err(host::Problem::Invalid(err)) = host
-                .check(&plugin.name, crate::autoscaler::plugins::Kind::Strategy, &config)
+                .check(
+                    &plugin.name,
+                    crate::autoscaler::plugins::Kind::Strategy,
+                    &config,
+                )
                 .await
             {
                 invalid = Some(format!("check {}: {err}", check.name));
@@ -1024,7 +1055,9 @@ impl Engine {
                     }
                 }
             };
-            observation.recommendations.insert(check.name.clone(), answer);
+            observation
+                .recommendations
+                .insert(check.name.clone(), answer);
         }
         if let Some(why) = invalid {
             let mut held = base;
@@ -1105,7 +1138,12 @@ impl Engine {
 
     /// Record the reported decision in full only when it changed (ignoring
     /// its time).
-    fn finish_report(&mut self, key: &TargetKey, decision: &Decision, target_report: &mut ScalingTargetReport) {
+    fn finish_report(
+        &mut self,
+        key: &TargetKey,
+        decision: &Decision,
+        target_report: &mut ScalingTargetReport,
+    ) {
         let Some(state) = self.targets.get_mut(key) else {
             return;
         };
@@ -1223,10 +1261,15 @@ impl Engine {
     ) -> ScalingTargetReport {
         let key = standalone_key(&policy.id);
         let base = standalone_report(policy);
-        let config: Value = serde_json::from_str(&policy.target_config_json).unwrap_or_else(|_| json!({}));
+        let config: Value =
+            serde_json::from_str(&policy.target_config_json).unwrap_or_else(|_| json!({}));
         let host = self.host.clone();
         if let Err(problem) = host
-            .check(&policy.target_plugin, crate::autoscaler::plugins::Kind::Target, &config)
+            .check(
+                &policy.target_plugin,
+                crate::autoscaler::plugins::Kind::Target,
+                &config,
+            )
             .await
         {
             let started_ms = self.started_ms;
@@ -1236,7 +1279,8 @@ impl Engine {
                 .or_insert_with(|| TargetState::new(started_ms));
             return match problem {
                 host::Problem::Invalid(err) => {
-                    let mut held = plain_report(base, "invalid", 0, &format!("target: {err}"), now_ms);
+                    let mut held =
+                        plain_report(base, "invalid", 0, &format!("target: {err}"), now_ms);
                     if state.invalid.as_deref() != Some(err.as_str()) {
                         held.events.push(ScalingEventFlag {
                             kind: "check_failed".to_string(),
@@ -1305,14 +1349,22 @@ impl Engine {
                     }
                     Ok(_) => {
                         let scaled = host
-                            .scale(&policy.target_plugin, &policy.id, &config, decision.to, &scale_decision.id)
+                            .scale(
+                                &policy.target_plugin,
+                                &policy.id,
+                                &config,
+                                decision.to,
+                                &scale_decision.id,
+                            )
                             .await;
                         let state = self.targets.get_mut(&key).expect("decided above");
                         match scaled {
                             Ok(()) => {
-                                state
-                                    .policy_state
-                                    .record_applied(now_ms, decision.from, decision.to);
+                                state.policy_state.record_applied(
+                                    now_ms,
+                                    decision.from,
+                                    decision.to,
+                                );
                                 state.expected = Some(decision.to);
                                 report.scaled += 1;
                             }
@@ -1322,7 +1374,8 @@ impl Engine {
                                 target_report.want = decision.from;
                                 report.errors.push(format!("{}: {err}", policy.id));
                                 let mut failed = scale_decision.clone();
-                                failed.summary = format!("target/scale to {} failed: {err}", decision.to);
+                                failed.summary =
+                                    format!("target/scale to {} failed: {err}", decision.to);
                                 let _ = self
                                     .client
                                     .record_scaling_action(RecordScalingActionRequest {
@@ -1378,7 +1431,6 @@ impl Engine {
         self.finish_report(&key, &decision, &mut target_report);
         target_report
     }
-
 }
 
 /// A report that carries no decision: an invalid policy, an error.
@@ -1500,11 +1552,18 @@ mod tests {
     fn changes_by_others_spend_the_step_budget_test() {
         let mut state = TargetState::new(0);
         state.observe_count(2, 1_000);
-        assert_eq!(state.policy_state.applied().count(), 0, "the first sight is not a change");
+        assert_eq!(
+            state.policy_state.applied().count(),
+            0,
+            "the first sight is not a change"
+        );
         state.observe_count(6, 16_000);
         let changes: Vec<_> = state.policy_state.applied().collect();
         assert_eq!(changes.len(), 1);
-        assert_eq!((changes[0].from, changes[0].to, changes[0].at_ms), (2, 6, 16_000));
+        assert_eq!(
+            (changes[0].from, changes[0].to, changes[0].at_ms),
+            (2, 6, 16_000)
+        );
         // The engine's own write is expected, and not counted twice.
         state.policy_state.record_applied(31_000, 6, 8);
         state.expected = Some(8);

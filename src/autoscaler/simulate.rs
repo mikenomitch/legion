@@ -205,10 +205,7 @@ pub fn history_rows(policy: &EffectivePolicy, samples: &[HistorySample]) -> Vec<
                 let reading = if check.source == LEGION_SOURCE {
                     history_reading(sample, &check.query)
                 } else {
-                    Reading::Missing(format!(
-                        "source {} has no history in Legion",
-                        check.source
-                    ))
+                    Reading::Missing(format!("source {} has no history in Legion", check.source))
                 };
                 row.readings.insert(check.name.clone(), reading);
             }
@@ -356,7 +353,6 @@ impl<'a> Simulation<'a> {
         }
         self.count = to;
     }
-
 }
 
 fn check_order(rows: &[SimRow]) -> Result<(), String> {
@@ -441,13 +437,14 @@ pub fn simulate(
                 warming,
                 readings,
                 guards: Guards {
-                    capacity: row.unplaced.filter(|unplaced| *unplaced > 0).map(|unplaced| {
-                        CapacityGuard {
+                    capacity: row
+                        .unplaced
+                        .filter(|unplaced| *unplaced > 0)
+                        .map(|unplaced| CapacityGuard {
                             unplaced,
                             node_group_fits: false,
                             last_scale_out: None,
-                        }
-                    }),
+                        }),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -804,7 +801,12 @@ time,cpu,ready,total
         assert_eq!((decisions[1].ready, decisions[1].warming), (2, 4));
         // At 60s: the step window (1m, exclusive of its start) no longer
         // holds the change made at 0s, so the whole +100% of 6 is free.
-        assert_eq!(decisions[2].kind, DecisionKind::Applied, "{:#?}", decisions[2]);
+        assert_eq!(
+            decisions[2].kind,
+            DecisionKind::Applied,
+            "{:#?}",
+            decisions[2]
+        );
         assert_eq!((decisions[2].ready, decisions[2].to), (6, 12));
     }
 
@@ -840,7 +842,9 @@ time,cpu,ready,total
         assert_eq!(rows[0].healthy, Some(2));
         assert_eq!(rows[0].readings["cpu"], Reading::Value(0.9));
         assert_eq!(rows[0].readings["unplaced"], Reading::Value(1.0));
-        assert!(matches!(&rows[0].readings["lag"], Reading::Missing(why) if why.contains("team-prom")));
+        assert!(
+            matches!(&rows[0].readings["lag"], Reading::Missing(why) if why.contains("team-prom"))
+        );
         // No recorded count: the measured replicas stand in; no usage is
         // missing data, not zero.
         assert_eq!(rows[1].total, Some(0));
@@ -872,7 +876,11 @@ time,cpu,ready,total
             ..conserved
         };
         let decisions = simulate(&policy, &rows, &naive).unwrap();
-        assert!(decisions.last().unwrap().to > 4, "{:?}", changes(&decisions));
+        assert!(
+            decisions.last().unwrap().to > 4,
+            "{:?}",
+            changes(&decisions)
+        );
     }
 
     #[test]

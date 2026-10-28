@@ -72,7 +72,9 @@ pub fn apply_command() -> Command {
 /// `legion scaling list`.
 pub fn list_command() -> Command {
     Command::new("list")
-        .about("Every scaling policy: autoscaled tasks and standalone policies, with mode and bounds")
+        .about(
+            "Every scaling policy: autoscaled tasks and standalone policies, with mode and bounds",
+        )
         .args(list_namespace_flags())
         .arg(
             Arg::new("detail")
@@ -173,7 +175,10 @@ pub async fn apply(matches: &ArgMatches) -> R<()> {
         if let Some((state, summary)) = &verdict {
             data["evaluation"] = json!({ "state": state, "summary": summary });
         }
-        if verdict.as_ref().is_some_and(|(state, _)| state == "invalid") {
+        if verdict
+            .as_ref()
+            .is_some_and(|(state, _)| state == "invalid")
+        {
             return Err(output::fail_local(
                 format,
                 CliError::local(
@@ -223,7 +228,9 @@ async fn wait_for_evaluation(
                 ..Default::default()
             })
             .await
-            .map_err(|status| crate::cmd::helpers::friendly_status("failed to read scaling status", status))?
+            .map_err(|status| {
+                crate::cmd::helpers::friendly_status("failed to read scaling status", status)
+            })?
             .into_inner();
         if let Some(target) = reply.targets.first() {
             let evaluated = target.last_evaluation_unix_ms > 0
@@ -347,7 +354,15 @@ mod tests {
     #[test]
     fn commands_parse_test() {
         let apply = apply_command()
-            .try_get_matches_from(["apply", "p.ncl", "-n", "media", "--wait", "--wait-timeout", "2m"])
+            .try_get_matches_from([
+                "apply",
+                "p.ncl",
+                "-n",
+                "media",
+                "--wait",
+                "--wait-timeout",
+                "2m",
+            ])
             .unwrap();
         assert!(apply.get_flag("wait"));
         assert!(apply_command()

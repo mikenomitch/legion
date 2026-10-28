@@ -609,8 +609,7 @@ impl Store {
         history: NewHistory,
     ) -> R<i64> {
         self.record_scale_history_row(
-            job_id, task_group, task_name, at_ms, from, to, source, principal, kind, false,
-            history,
+            job_id, task_group, task_name, at_ms, from, to, source, principal, kind, false, history,
         )
     }
 

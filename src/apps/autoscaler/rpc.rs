@@ -187,7 +187,9 @@ impl PluginInfo {
             Some(Value::Object(capabilities)) => match capabilities.get("nodes") {
                 None | Some(Value::Null) => false,
                 Some(Value::Bool(nodes)) => *nodes,
-                Some(other) => return Err(format!("capabilities.nodes must be a boolean, got {other}")),
+                Some(other) => {
+                    return Err(format!("capabilities.nodes must be a boolean, got {other}"))
+                }
             },
             Some(other) => return Err(format!("`capabilities` must be an object, got {other}")),
         };
@@ -214,9 +216,21 @@ impl PluginInfo {
 /// and a node group's join token.
 fn secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    ["token", "secret", "password", "passwd", "credential", "apikey", "api_key", "authorization", "privatekey", "private_key", "join"]
-        .iter()
-        .any(|word| key.contains(word))
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "apikey",
+        "api_key",
+        "authorization",
+        "privatekey",
+        "private_key",
+        "join",
+    ]
+    .iter()
+    .any(|word| key.contains(word))
 }
 
 /// A copy of `value` with every value under a secret-looking key replaced
@@ -275,8 +289,8 @@ fn response_result(response: Value, id: u64) -> Result<Value, CallError> {
 }
 
 fn request_line(id: u64, method: &str, params: &Value) -> String {
-    let mut line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
-        .to_string();
+    let mut line =
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
     line.push('\n');
     line
 }
@@ -588,7 +602,8 @@ impl Transport {
         debug!(plugin = %self.name, method, id, params = %redact(params), "plugin call");
         match &self.endpoint {
             Endpoint::Url(url) => {
-                let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+                let body =
+                    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
                 let sent = self.http.post(url).json(&body).timeout(timeout).send();
                 let response = match sent.await {
                     Ok(response) => response,
@@ -744,8 +759,14 @@ mod tests {
             (json!([]), "must be an object"),
             (json!({ "version": "1", "kinds": ["source"] }), "`name`"),
             (json!({ "name": "x", "version": "1" }), "needs `kinds`"),
-            (json!({ "name": "x", "version": "1", "kinds": [] }), "is empty"),
-            (json!({ "name": "x", "version": "1", "kinds": ["metric"] }), "unknown kind"),
+            (
+                json!({ "name": "x", "version": "1", "kinds": [] }),
+                "is empty",
+            ),
+            (
+                json!({ "name": "x", "version": "1", "kinds": ["metric"] }),
+                "unknown kind",
+            ),
             (
                 json!({ "name": "x", "version": "1", "kinds": ["source"], "protocol": "legion-scaling/2" }),
                 "this autoscaler speaks",
@@ -769,7 +790,10 @@ mod tests {
     #[test]
     fn responses_match_their_requests_test() {
         assert_eq!(
-            response_result(json!({ "jsonrpc": "2.0", "id": 3, "result": { "a": 1 } }), 3),
+            response_result(
+                json!({ "jsonrpc": "2.0", "id": 3, "result": { "a": 1 } }),
+                3
+            ),
             Ok(json!({ "a": 1 }))
         );
         assert_eq!(
@@ -850,18 +874,30 @@ done
             transport.call("sleep", json!({})).await,
             Err(CallError::Timeout { .. })
         ));
-        assert!(transport.call("strategy/recommend", json!({})).await.is_ok());
+        assert!(transport
+            .call("strategy/recommend", json!({}))
+            .await
+            .is_ok());
         assert_eq!(transport.starts().await, 2);
         // A malformed reply.
         assert!(matches!(
             transport.call("garbage", json!({})).await,
             Err(CallError::Malformed(_))
         ));
-        assert!(transport.call("strategy/recommend", json!({})).await.is_ok());
+        assert!(transport
+            .call("strategy/recommend", json!({}))
+            .await
+            .is_ok());
         // A crash, reported with the exit status.
         let err = transport.call("exit", json!({})).await.unwrap_err();
-        assert!(matches!(&err, CallError::Crashed(why) if why.contains("exit")), "{err}");
-        assert!(transport.call("strategy/recommend", json!({})).await.is_ok());
+        assert!(
+            matches!(&err, CallError::Crashed(why) if why.contains("exit")),
+            "{err}"
+        );
+        assert!(transport
+            .call("strategy/recommend", json!({}))
+            .await
+            .is_ok());
         assert_eq!(transport.starts().await, 4);
     }
 
@@ -871,9 +907,18 @@ done
         let transport = Transport::new("t", endpoint, json!({}));
         // The first failure restarts at once on the next call; the second
         // waits out a backoff.
-        assert!(transport.call("strategy/recommend", json!({})).await.is_err());
-        assert!(transport.call("strategy/recommend", json!({})).await.is_err());
-        let err = transport.call("strategy/recommend", json!({})).await.unwrap_err();
+        assert!(transport
+            .call("strategy/recommend", json!({}))
+            .await
+            .is_err());
+        assert!(transport
+            .call("strategy/recommend", json!({}))
+            .await
+            .is_err());
+        let err = transport
+            .call("strategy/recommend", json!({}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, CallError::Restarting { .. }), "{err}");
         assert_eq!(transport.starts().await, 2);
     }
@@ -888,7 +933,13 @@ done
             },
             json!({}),
         );
-        let err = transport.call("strategy/recommend", json!({})).await.unwrap_err();
-        assert!(matches!(&err, CallError::Transport(why) if why.contains("cannot start")), "{err}");
+        let err = transport
+            .call("strategy/recommend", json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CallError::Transport(why) if why.contains("cannot start")),
+            "{err}"
+        );
     }
 }

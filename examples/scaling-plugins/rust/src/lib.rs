@@ -534,7 +534,10 @@ mod tests {
         );
         assert_eq!(init["id"], 1);
         assert_eq!(init["result"]["kinds"], json!(["source", "target"]));
-        assert_eq!(init["result"]["policyConfigSchema"], json!({ "type": "object" }));
+        assert_eq!(
+            init["result"]["policyConfigSchema"],
+            json!({ "type": "object" })
+        );
         let status = call(
             &mut plugin,
             json!({ "jsonrpc": "2.0", "id": 2, "method": "target/status", "params": { "policy": "p" } }),
@@ -556,7 +559,10 @@ mod tests {
             &mut plugin,
             json!({ "jsonrpc": "2.0", "id": 5, "method": "source/query", "params": { "query": "empty" } }),
         );
-        assert_eq!(missing["result"], json!({ "value": null, "reason": "no series" }));
+        assert_eq!(
+            missing["result"],
+            json!({ "value": null, "reason": "no series" })
+        );
     }
 
     #[test]
@@ -565,7 +571,10 @@ mod tests {
         let parse = call_raw(&mut plugin, "not json");
         assert_eq!(parse["error"]["code"], -32700);
         assert_eq!(parse["id"], Value::Null);
-        let unknown = call(&mut plugin, json!({ "jsonrpc": "2.0", "id": 7, "method": "nope" }));
+        let unknown = call(
+            &mut plugin,
+            json!({ "jsonrpc": "2.0", "id": 7, "method": "nope" }),
+        );
         assert_eq!(unknown["error"]["code"], -32601);
         assert_eq!(unknown["id"], 7);
         let not_implemented = call(

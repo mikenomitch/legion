@@ -26,7 +26,9 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::autoscaler::simulate::{history_rows, read_csv, simulate, HistorySample, SimOptions, SimRow};
+use crate::autoscaler::simulate::{
+    history_rows, read_csv, simulate, HistorySample, SimOptions, SimRow,
+};
 use crate::autoscaler::{Decision, DecisionKind, EffectivePolicy};
 use crate::cmd::helpers::{
     active_namespace, connect_manager_client, json_flag, namespace_flag, print_table,
@@ -182,18 +184,29 @@ pub fn simulate_command() -> Command {
         .arg(json_flag())
 }
 
-fn local_error(format: OutputFormat, message: impl Into<String>, hint: Option<&str>) -> anyhow::Error {
+fn local_error(
+    format: OutputFormat,
+    message: impl Into<String>,
+    hint: Option<&str>,
+) -> anyhow::Error {
     output::fail_local(format, CliError::local("InvalidArgument", message, hint))
 }
 
 /// `legion scaling simulate`.
 pub async fn handle_simulate(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let target = matches.get_one::<String>("target").expect("required").clone();
+    let target = matches
+        .get_one::<String>("target")
+        .expect("required")
+        .clone();
     let path = Path::new(&target);
     let spec_json = if path.is_file() {
         Some(crate::config_lang::eval_file(path).map_err(|err| {
-            local_error(format, format!("failed to evaluate {}: {err:#}", path.display()), None)
+            local_error(
+                format,
+                format!("failed to evaluate {}: {err:#}", path.display()),
+                None,
+            )
         })?)
     } else {
         None
@@ -207,9 +220,10 @@ pub async fn handle_simulate(matches: &ArgMatches) -> R<()> {
     )
     .map_err(|err| local_error(format, format!("--since: {err}"), Some("write it like 30m")))?;
     let series_csv = match matches.get_one::<String>("series") {
-        Some(file) => Some(std::fs::read_to_string(file).map_err(|err| {
-            local_error(format, format!("cannot read {file}: {err}"), None)
-        })?),
+        Some(file) => Some(
+            std::fs::read_to_string(file)
+                .map_err(|err| local_error(format, format!("cannot read {file}: {err}"), None))?,
+        ),
         None => None,
     };
     // A job replays its own history by default; a file (an edited policy)
@@ -362,12 +376,22 @@ async fn resolve_policy(
             })
             .collect();
         let plan = match matching.as_slice() {
-            [] => bail!("the jobspec has no autoscaled task{}", if args.task_group.is_some() || args.task_name.is_some() { " matching --group/--task" } else { "" }),
+            [] => bail!(
+                "the jobspec has no autoscaled task{}",
+                if args.task_group.is_some() || args.task_name.is_some() {
+                    " matching --group/--task"
+                } else {
+                    ""
+                }
+            ),
             [plan] => *plan,
             many => bail!(
                 "the jobspec has {} autoscaled tasks ({}); pick one with --group/--task",
                 many.len(),
-                many.iter().map(|p| p.target.as_str()).collect::<Vec<_>>().join(", ")
+                many.iter()
+                    .map(|p| p.target.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         };
         let parts: Vec<&str> = plan.target.rsplitn(3, '/').collect();
@@ -416,7 +440,10 @@ async fn resolve_policy(
         );
     }
     Ok((
-        format!("{}/{}/{}", target.job_id, target.task_group, target.task_name),
+        format!(
+            "{}/{}/{}",
+            target.job_id, target.task_group, target.task_name
+        ),
         parse(&target.policy_json)?,
         Some(ScalingTargetSelector {
             job: target.job_id.clone(),
@@ -449,7 +476,10 @@ pub fn samples(points: &[ScalingInputsPoint]) -> Vec<HistorySample> {
 pub async fn run(client: &mut AuthedManagerClient, args: &SimulateArgs) -> R<SimulationReport> {
     let (label, policy, selector) = resolve_policy(client, args).await?;
     let (rows, input): (Vec<SimRow>, &str) = match &args.series_csv {
-        Some(csv) => (read_csv(csv.as_bytes()).map_err(|err| anyhow!("the series: {err}"))?, "series"),
+        Some(csv) => (
+            read_csv(csv.as_bytes()).map_err(|err| anyhow!("the series: {err}"))?,
+            "series",
+        ),
         None => {
             let Some(selector) = selector else {
                 bail!(

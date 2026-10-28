@@ -93,11 +93,23 @@ mod tests {
     fn readiness_counts_warming_replicas_test() {
         let warmup = Duration::from_secs(30);
         let mut readiness = Readiness::default();
-        assert_eq!(readiness.observe(2, 0, warmup), 0, "the first sight is not a rise");
+        assert_eq!(
+            readiness.observe(2, 0, warmup),
+            0,
+            "the first sight is not a rise"
+        );
         assert_eq!(readiness.observe(4, 10_000, warmup), 2);
         assert_eq!(readiness.observe(5, 20_000, warmup), 3);
-        assert_eq!(readiness.observe(5, 40_001, warmup), 1, "the first rise warmed up");
-        assert_eq!(readiness.observe(4, 41_000, warmup), 0, "the newest rise left");
+        assert_eq!(
+            readiness.observe(5, 40_001, warmup),
+            1,
+            "the first rise warmed up"
+        );
+        assert_eq!(
+            readiness.observe(4, 41_000, warmup),
+            0,
+            "the newest rise left"
+        );
         assert_eq!(readiness.observe(4, 60_000, warmup), 0);
     }
 

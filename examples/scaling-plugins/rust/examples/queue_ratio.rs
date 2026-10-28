@@ -41,9 +41,9 @@ impl Plugin for QueueRatio {
     }
 
     fn recommend(&mut self, request: Recommend) -> Result<Recommendation, Error> {
-        let reading = request
-            .reading
-            .ok_or_else(|| Error::invalid_params("queue-ratio reads the queue depth: give the check a query"))?;
+        let reading = request.reading.ok_or_else(|| {
+            Error::invalid_params("queue-ratio reads the queue depth: give the check a query")
+        })?;
         let rate = request.config["rate"].as_f64().unwrap_or(1.0);
         let seconds = request.config["drainWithin"].as_f64().unwrap_or(600.0);
         let per_replica = rate * seconds;

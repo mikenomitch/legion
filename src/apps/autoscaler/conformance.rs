@@ -222,7 +222,12 @@ pub async fn run(endpoint: Endpoint, options: SuiteOptions) -> SuiteReport {
             Duration::ZERO,
         ),
         Some(schema) => match crate::structs::app::compile_config_schema(schema) {
-            Err(err) => suite.record("schema", Outcome::Fail, format!("policyConfigSchema {err}"), Duration::ZERO),
+            Err(err) => suite.record(
+                "schema",
+                Outcome::Fail,
+                format!("policyConfigSchema {err}"),
+                Duration::ZERO,
+            ),
             Ok(compiled) => {
                 if let Err(err) = crate::structs::app::check_config(&compiled, &policy) {
                     suite.record(
@@ -266,8 +271,12 @@ pub async fn run(endpoint: Endpoint, options: SuiteOptions) -> SuiteReport {
                 });
                 let (result, took) = suite.call("source/query", params.clone()).await;
                 match result.map_err(|err| err.to_string()).and_then(|value| {
-                    super::host::parse_reading(&value, Duration::from_secs(60), chrono::Utc::now().timestamp_millis())
-                        .map(|reading| (value, reading))
+                    super::host::parse_reading(
+                        &value,
+                        Duration::from_secs(60),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .map(|reading| (value, reading))
                 }) {
                     Ok((value, _)) => {
                         suite.record("source/query", Outcome::Pass, format!("{value}"), took);
@@ -342,7 +351,9 @@ pub async fn run(endpoint: Endpoint, options: SuiteOptions) -> SuiteReport {
                                 format!("the result must be an object, got {value}"),
                                 took,
                             ),
-                            Err(err) => suite.record("target/scale", Outcome::Fail, err.to_string(), took),
+                            Err(err) => {
+                                suite.record("target/scale", Outcome::Fail, err.to_string(), took)
+                            }
                         }
                     }
                     None => suite.record(
@@ -366,7 +377,9 @@ pub async fn run(endpoint: Endpoint, options: SuiteOptions) -> SuiteReport {
                             "terminating no members succeeded",
                             took,
                         ),
-                        Err(err) => suite.record("target/terminate", Outcome::Fail, err.to_string(), took),
+                        Err(err) => {
+                            suite.record("target/terminate", Outcome::Fail, err.to_string(), took)
+                        }
                     }
                 } else {
                     suite.record(
@@ -413,9 +426,10 @@ pub async fn run(endpoint: Endpoint, options: SuiteOptions) -> SuiteReport {
         };
         let (result, took) = suite.call(method, malformed).await;
         let (outcome, detail) = match result {
-            Err(CallError::Remote { code: -32602, .. }) => {
-                (Outcome::Pass, "answered -32602 (invalid params)".to_string())
-            }
+            Err(CallError::Remote { code: -32602, .. }) => (
+                Outcome::Pass,
+                "answered -32602 (invalid params)".to_string(),
+            ),
             Err(CallError::Remote { code, message }) => (
                 Outcome::Warn,
                 format!("answered error {code} ({message}); -32602 is the code for invalid params"),
@@ -526,7 +540,10 @@ pub async fn run(endpoint: Endpoint, options: SuiteOptions) -> SuiteReport {
         );
     }
 
-    let passed = suite.checks.iter().all(|check| check.outcome != Outcome::Fail);
+    let passed = suite
+        .checks
+        .iter()
+        .all(|check| check.outcome != Outcome::Fail);
     SuiteReport {
         plugin_ref,
         plugin: Some(summary),

@@ -717,7 +717,11 @@ async fn history(matches: &ArgMatches) -> R<()> {
         "failed to read scale history",
         client
             .get_scale_history(GetScaleHistoryRequest {
-                job: if standalone.is_some() { String::new() } else { job },
+                job: if standalone.is_some() {
+                    String::new()
+                } else {
+                    job
+                },
                 task_group: opt(matches, "group"),
                 task_name: opt(matches, "task"),
                 limit: matches.get_one::<u32>("limit").copied().unwrap_or(0),

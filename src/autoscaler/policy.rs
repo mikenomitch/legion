@@ -76,7 +76,9 @@ pub struct ExternalTarget {
 impl ExternalTarget {
     /// The config sent to the plugin (`{}` when unset).
     pub fn config_value(&self) -> Value {
-        self.config.clone().unwrap_or_else(|| Value::Object(Map::new()))
+        self.config
+            .clone()
+            .unwrap_or_else(|| Value::Object(Map::new()))
     }
 }
 
@@ -180,14 +182,16 @@ pub fn parse(spec: &Value, default_namespace: &str) -> Result<StandaloneSpec, St
                  namespace"
             ));
         }
-        let policy: NodeGroupPolicy = serde_json::from_value(spec.clone())
-            .map_err(|err| format!("{name}: {err}"))?;
+        let policy: NodeGroupPolicy =
+            serde_json::from_value(spec.clone()).map_err(|err| format!("{name}: {err}"))?;
         policy.validate().map_err(|err| format!("{name}: {err}"))?;
         return Ok(StandaloneSpec::Nodes(policy));
     }
     let namespace = match object.get("namespace") {
         None | Some(Value::Null) => default_namespace.to_string(),
-        Some(Value::String(namespace)) if !namespace.trim().is_empty() => namespace.trim().to_string(),
+        Some(Value::String(namespace)) if !namespace.trim().is_empty() => {
+            namespace.trim().to_string()
+        }
         Some(_) => return Err(format!("{name}: namespace must be a namespace name")),
     };
     crate::structs::namespace::validate_namespace_name(&namespace)
@@ -200,7 +204,9 @@ pub fn parse(spec: &Value, default_namespace: &str) -> Result<StandaloneSpec, St
     let target: ExternalTarget = serde_json::from_value(Value::Object(target.clone()))
         .map_err(|err| format!("{name}: target: {err}"))?;
     if target.plugin.trim().is_empty() {
-        return Err(format!("{name}: target.plugin must name a target plugin (`noop`, or an installed one)"));
+        return Err(format!(
+            "{name}: target.plugin must name a target plugin (`noop`, or an installed one)"
+        ));
     }
     if let Some(config) = &target.config {
         if !config.is_object() {
@@ -351,7 +357,10 @@ mod tests {
             (json!({ "name": "Render" }), "lowercase letters"),
             (json!({ "target": null }), "target is required"),
             (json!({ "target": { "plugin": "" } }), "target.plugin"),
-            (json!({ "target": { "plugin": "x", "region": "eu" } }), "unknown field `region`"),
+            (
+                json!({ "target": { "plugin": "x", "region": "eu" } }),
+                "unknown field `region`",
+            ),
             (json!({ "max": null }), "max is required"),
             (json!({ "max": "4x" }), "must be a replica count"),
             (json!({ "cpu": 0.7 }), "cpu and memory read a Legion task"),
@@ -400,7 +409,8 @@ mod tests {
             "render": { "builtin": "exec", "config": { "command": "/opt/render.sh" } },
         } }))
         .unwrap();
-        let StandaloneSpec::External(policy) = parse(&external(json!({})), "default").unwrap() else {
+        let StandaloneSpec::External(policy) = parse(&external(json!({})), "default").unwrap()
+        else {
             panic!("external");
         };
         check_external(&policy, &catalog).unwrap();
@@ -414,12 +424,17 @@ mod tests {
             err.contains("check 'queue' uses source 'team-prom', which is not available to namespace payments (allowed: media)"),
             "{err}"
         );
-        let StandaloneSpec::External(missing) =
-            parse(&external(json!({ "target": { "plugin": "asg" } })), "default").unwrap()
-        else {
+        let StandaloneSpec::External(missing) = parse(
+            &external(json!({ "target": { "plugin": "asg" } })),
+            "default",
+        )
+        .unwrap() else {
             panic!("external");
         };
         let err = check_external(&missing, &catalog).unwrap_err();
-        assert!(err.contains("target uses plugin 'asg', which is not installed"), "{err}");
+        assert!(
+            err.contains("target uses plugin 'asg', which is not installed"),
+            "{err}"
+        );
     }
 }

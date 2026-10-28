@@ -862,9 +862,9 @@ impl ManagerDaemonService {
                         Ok(loaded) => loaded
                             .iter()
                             .filter(|policy| {
-                                namespaces
-                                    .as_ref()
-                                    .is_none_or(|selection| selection.matches(&policy.row.namespace))
+                                namespaces.as_ref().is_none_or(|selection| {
+                                    selection.matches(&policy.row.namespace)
+                                })
                             })
                             .filter(|policy| {
                                 identity.allows(
@@ -874,7 +874,9 @@ impl ManagerDaemonService {
                                 )
                             })
                             .map(|policy| {
-                                super::scaling_policy_rpcs::standalone_proto(policy, &pauses, now_ms)
+                                super::scaling_policy_rpcs::standalone_proto(
+                                    policy, &pauses, now_ms,
+                                )
                             })
                             .collect(),
                         Err(err) => {
@@ -1218,9 +1220,11 @@ impl ManagerDaemonService {
                         &flag.message,
                     );
                 } else {
-                    self.store
-                        .events()
-                        .scale_policy_flag(&flag.kind, &target.policy, &flag.message);
+                    self.store.events().scale_policy_flag(
+                        &flag.kind,
+                        &target.policy,
+                        &flag.message,
+                    );
                 }
             }
         }
@@ -1262,7 +1266,11 @@ impl ManagerDaemonService {
         check_decision(&decision)?;
         let now_ms = now_unix_ms();
         let (job_id, task_group, task_name) = if policy.is_empty() {
-            (inner.job_id.clone(), inner.task_group.clone(), inner.task_name.clone())
+            (
+                inner.job_id.clone(),
+                inner.task_group.clone(),
+                inner.task_name.clone(),
+            )
         } else {
             (policy_target_key(&policy), String::new(), String::new())
         };
@@ -1303,9 +1311,12 @@ impl ManagerDaemonService {
             )
             .map_err(|e| map_store_error("Error recording scaling action", e))?;
         if kind == "scaled" {
-            self.store
-                .events()
-                .scale_policy_applied(&policy, inner.from, inner.to, &decision.summary);
+            self.store.events().scale_policy_applied(
+                &policy,
+                inner.from,
+                inner.to,
+                &decision.summary,
+            );
         }
         Ok(Response::new(RecordScalingActionReply {
             history_id: history_id.max(0) as u64,
@@ -1480,7 +1491,8 @@ impl ManagerDaemonService {
                 format!("invalid: {err}"),
             ),
         };
-        let (state, current, want, evaluated, summary, decision) = match (&policy.resolved, &entry) {
+        let (state, current, want, evaluated, summary, decision) = match (&policy.resolved, &entry)
+        {
             (Err(_), _) => ("invalid".to_string(), 0, 0, 0, error.clone(), String::new()),
             (Ok(_), Some(entry)) if board.is_stale(entry.received, now) => (
                 "stale".to_string(),
@@ -1498,7 +1510,14 @@ impl ManagerDaemonService {
                 entry.summary.clone(),
                 entry.decision_json.clone(),
             ),
-            (Ok(_), None) => ("not-evaluated".to_string(), 0, 0, 0, String::new(), String::new()),
+            (Ok(_), None) => (
+                "not-evaluated".to_string(),
+                0,
+                0,
+                0,
+                String::new(),
+                String::new(),
+            ),
         };
         let (policy_rows, policy_json) = match (&policy.resolved, detail) {
             (Ok(resolved), true) => (provenance_proto(resolved), resolved.policy.canonical_json()),

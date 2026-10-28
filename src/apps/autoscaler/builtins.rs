@@ -112,7 +112,9 @@ pub fn prometheus_value(body: &Value) -> Result<SourceReading, String> {
         Some(kind @ ("vector" | "matrix")) => {
             let series = result.as_array().cloned().unwrap_or_default();
             match series.len() {
-                0 => Ok(SourceReading::Missing("the query returned no series".into())),
+                0 => Ok(SourceReading::Missing(
+                    "the query returned no series".into(),
+                )),
                 1 => {
                     let values: Vec<f64> = if kind == "vector" {
                         series[0]
@@ -180,7 +182,12 @@ impl PrometheusSource {
 
     /// Run `query` at `now_ms`: an instant query, or with a `window`, a
     /// range query over it averaged across its points.
-    pub async fn query(&self, query: &str, window: Duration, now_ms: i64) -> Result<SourceReading, String> {
+    pub async fn query(
+        &self,
+        query: &str,
+        window: Duration,
+        now_ms: i64,
+    ) -> Result<SourceReading, String> {
         if query.trim().is_empty() {
             return Err("the prometheus source needs a PromQL query".into());
         }
@@ -258,7 +265,10 @@ impl HttpSource {
     /// readings over the check's window, like the `legion` source's.
     pub async fn query(&self, pointer: &str) -> Result<SourceReading, String> {
         let body = get_json(&self.client, &self.url, &[], &self.headers, self.timeout).await?;
-        Ok(SourceReading::value(json_pointer_value(&body, pointer)?, false))
+        Ok(SourceReading::value(
+            json_pointer_value(&body, pointer)?,
+            false,
+        ))
     }
 }
 
@@ -339,19 +349,36 @@ mod tests {
     fn prometheus_responses_test() {
         let vector = json!({ "status": "success", "data": { "resultType": "vector",
             "result": [{ "metric": {}, "value": [1700000000.0, "2310"] }] } });
-        assert_eq!(prometheus_value(&vector), Ok(SourceReading::value(2310.0, true)));
+        assert_eq!(
+            prometheus_value(&vector),
+            Ok(SourceReading::value(2310.0, true))
+        );
         let matrix = json!({ "status": "success", "data": { "resultType": "matrix",
             "result": [{ "metric": {}, "values": [[1, "1"], [2, "3"], [3, "NaN"]] }] } });
-        assert_eq!(prometheus_value(&matrix), Ok(SourceReading::value(2.0, true)));
-        let scalar = json!({ "status": "success", "data": { "resultType": "scalar", "result": [1, "7"] } });
-        assert_eq!(prometheus_value(&scalar), Ok(SourceReading::value(7.0, true)));
-        let empty = json!({ "status": "success", "data": { "resultType": "vector", "result": [] } });
-        assert!(matches!(prometheus_value(&empty), Ok(SourceReading::Missing(_))));
+        assert_eq!(
+            prometheus_value(&matrix),
+            Ok(SourceReading::value(2.0, true))
+        );
+        let scalar =
+            json!({ "status": "success", "data": { "resultType": "scalar", "result": [1, "7"] } });
+        assert_eq!(
+            prometheus_value(&scalar),
+            Ok(SourceReading::value(7.0, true))
+        );
+        let empty =
+            json!({ "status": "success", "data": { "resultType": "vector", "result": [] } });
+        assert!(matches!(
+            prometheus_value(&empty),
+            Ok(SourceReading::Missing(_))
+        ));
         let two = json!({ "status": "success", "data": { "resultType": "vector",
             "result": [{ "value": [1, "1"] }, { "value": [1, "2"] }] } });
         assert!(prometheus_value(&two).unwrap_err().contains("aggregate"));
-        let error = json!({ "status": "error", "errorType": "bad_data", "error": "parse error at char 4" });
-        assert!(prometheus_value(&error).unwrap_err().contains("parse error at char 4"));
+        let error =
+            json!({ "status": "error", "errorType": "bad_data", "error": "parse error at char 4" });
+        assert!(prometheus_value(&error)
+            .unwrap_err()
+            .contains("parse error at char 4"));
     }
 
     #[test]
@@ -359,9 +386,15 @@ mod tests {
         let body = json!({ "queue": { "depth": 42, "lag": "7.5", "name": "x" } });
         assert_eq!(json_pointer_value(&body, "/queue/depth"), Ok(42.0));
         assert_eq!(json_pointer_value(&body, "/queue/lag"), Ok(7.5));
-        assert!(json_pointer_value(&body, "/queue/name").unwrap_err().contains("not a number"));
-        assert!(json_pointer_value(&body, "/nope").unwrap_err().contains("nothing at"));
-        assert!(json_pointer_value(&body, "queue").unwrap_err().contains("JSON pointer"));
+        assert!(json_pointer_value(&body, "/queue/name")
+            .unwrap_err()
+            .contains("not a number"));
+        assert!(json_pointer_value(&body, "/nope")
+            .unwrap_err()
+            .contains("nothing at"));
+        assert!(json_pointer_value(&body, "queue")
+            .unwrap_err()
+            .contains("JSON pointer"));
         assert_eq!(json_pointer_value(&json!(12), ""), Ok(12.0));
     }
 
@@ -383,14 +416,18 @@ mod tests {
         )
         .expect("write");
         let target = ExecTarget::new(&json!({ "command": ["sh", script.display().to_string()] }));
-        let status = target.run("status", json!({ "policy": "p" })).await.unwrap();
+        let status = target
+            .run("status", json!({ "policy": "p" }))
+            .await
+            .unwrap();
         assert_eq!(status, json!({ "count": 3, "ready": 2 }));
         target
             .run("scale", json!({ "policy": "p", "desired": 4 }))
             .await
             .unwrap();
         let last: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.path().join("last")).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("last")).unwrap())
+                .unwrap();
         assert_eq!(last["op"], "scale");
         assert_eq!(last["apiVersion"], 1);
         assert_eq!(last["desired"], 4);

@@ -83,6 +83,7 @@ mod restore_placement_indexed;
 mod rollout_integration;
 mod sandbox_bridge_placement;
 mod scaling_inputs;
+mod scaling_plugins;
 mod scheduler_benchmark_slo;
 mod scheduler_integration;
 mod scheduler_scale_benchmark;

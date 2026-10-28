@@ -406,7 +406,7 @@ fn standalone_policy_spec(name: &str) -> String {
         "target": { "plugin": "noop" },
         "min": 1,
         "max": 3,
-        "checks": [{ "name": "steady", "strategy": { "name": "fixed", "value": 2 } }],
+        "checks": [{ "name": "steady", "source": "legion", "strategy": { "name": "fixed", "value": 2 } }],
     })
     .to_string()
 }
@@ -2926,7 +2926,13 @@ async fn standalone_policies_are_scoped_like_jobs_test() -> R<()> {
     let (_, secret) = svc
         .auth
         .clone()
-        .mint_token(&svc.store, "render", "client", &["render-scaler".into()], None)
+        .mint_token(
+            &svc.store,
+            "render",
+            "client",
+            &["render-scaler".into()],
+            None,
+        )
         .map_err(|s| anyhow!(s.to_string()))?;
 
     let apply = |name: &str, dry_run: bool| ApplyScalingPolicyRequest {

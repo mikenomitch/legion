@@ -1284,7 +1284,12 @@ pub mod drafts {
 
     /// `scale.applied` for a standalone scaling policy: the autoscaler is
     /// about to move its target from `previous` to `count`.
-    pub fn scale_policy_applied(policy: &str, previous: u32, count: u32, reason: &str) -> EventDraft {
+    pub fn scale_policy_applied(
+        policy: &str,
+        previous: u32,
+        count: u32,
+        reason: &str,
+    ) -> EventDraft {
         EventDraft::info(
             "scale.applied",
             format!("Scaling policy {policy} scaled {previous} -> {count}"),
@@ -2820,7 +2825,9 @@ impl EventRecorder<'_> {
     }
 
     pub fn scale_policy_applied(self, policy: &str, previous: u32, count: u32, reason: &str) {
-        self.emit(drafts::scale_policy_applied(policy, previous, count, reason));
+        self.emit(drafts::scale_policy_applied(
+            policy, previous, count, reason,
+        ));
     }
 
     pub fn rollout_event(

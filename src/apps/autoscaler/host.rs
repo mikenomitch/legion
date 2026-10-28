@@ -162,7 +162,11 @@ impl PluginHost {
     }
 
     /// The same, with one timeout for every plugin call (tests).
-    pub fn with_timeout(catalog: PluginCatalog, code_root: Option<&Path>, timeout: Duration) -> Self {
+    pub fn with_timeout(
+        catalog: PluginCatalog,
+        code_root: Option<&Path>,
+        timeout: Duration,
+    ) -> Self {
         Self::build(catalog, code_root, Some(timeout))
     }
 
@@ -311,9 +315,16 @@ impl PluginHost {
     }
 
     /// Read one source.
-    pub async fn query(&self, source: &str, call: &SourceCall<'_>, now_ms: i64) -> Result<SourceReading, String> {
+    pub async fn query(
+        &self,
+        source: &str,
+        call: &SourceCall<'_>,
+        now_ms: i64,
+    ) -> Result<SourceReading, String> {
         match self.loaded(source)? {
-            Loaded::Prometheus(prometheus) => prometheus.query(call.query, call.window, now_ms).await,
+            Loaded::Prometheus(prometheus) => {
+                prometheus.query(call.query, call.window, now_ms).await
+            }
             Loaded::Http(http) => http.query(call.query).await,
             Loaded::External(transport) => {
                 self.check(source, Kind::Source, &Value::Null)
@@ -338,7 +349,11 @@ impl PluginHost {
     }
 
     /// Ask a strategy plugin for a desired count: `(desired, note)`.
-    pub async fn recommend(&self, strategy: &str, call: &RecommendCall<'_>) -> Result<(u32, String), String> {
+    pub async fn recommend(
+        &self,
+        strategy: &str,
+        call: &RecommendCall<'_>,
+    ) -> Result<(u32, String), String> {
         let Loaded::External(transport) = self.loaded(strategy)? else {
             return Err(format!(
                 "plugin {strategy} is built in, and the builtins are sources and targets"
@@ -359,11 +374,18 @@ impl PluginHost {
             .call("strategy/recommend", params)
             .await
             .map_err(|err| call_error(strategy, "strategy/recommend", err))?;
-        parse_recommendation(&result).map_err(|err| format!("plugin {strategy}: strategy/recommend: {err}"))
+        parse_recommendation(&result)
+            .map_err(|err| format!("plugin {strategy}: strategy/recommend: {err}"))
     }
 
     /// What a target holds. `start` is the noop target's first count.
-    pub async fn status(&self, target: &str, policy: &str, config: &Value, start: u32) -> Result<TargetState, String> {
+    pub async fn status(
+        &self,
+        target: &str,
+        policy: &str,
+        config: &Value,
+        start: u32,
+    ) -> Result<TargetState, String> {
         if target == NOOP_TARGET {
             return Ok(self.noop.status(policy, start));
         }
@@ -381,22 +403,34 @@ impl PluginHost {
                     .await
                     .map_err(|problem| problem.to_string())?;
                 let result = transport
-                    .call("target/status", json!({ "policy": policy, "config": config }))
+                    .call(
+                        "target/status",
+                        json!({ "policy": policy, "config": config }),
+                    )
                     .await
                     .map_err(|err| call_error(target, "target/status", err))?;
-                parse_status(&result).map_err(|err| format!("plugin {target}: target/status: {err}"))
+                parse_status(&result)
+                    .map_err(|err| format!("plugin {target}: target/status: {err}"))
             }
             _ => Err(format!("plugin {target} is a source, not a target")),
         }
     }
 
     /// Move a target to `desired`.
-    pub async fn scale(&self, target: &str, policy: &str, config: &Value, desired: u32, decision: &str) -> Result<(), String> {
+    pub async fn scale(
+        &self,
+        target: &str,
+        policy: &str,
+        config: &Value,
+        desired: u32,
+        decision: &str,
+    ) -> Result<(), String> {
         if target == NOOP_TARGET {
             self.noop.scale(policy, desired);
             return Ok(());
         }
-        let request = json!({ "policy": policy, "config": config, "desired": desired, "decision": decision });
+        let request =
+            json!({ "policy": policy, "config": config, "desired": desired, "decision": decision });
         match self.loaded(target)? {
             Loaded::Noop(noop) => {
                 noop.scale(policy, desired);
@@ -429,7 +463,11 @@ impl PluginHost {
 
 /// A `source/query` result: `{ value }`, `{ series: [[at_ms, value], …] }`
 /// (averaged over the window here), or `{ value: null, reason }`.
-pub fn parse_reading(result: &Value, window: Duration, now_ms: i64) -> Result<SourceReading, String> {
+pub fn parse_reading(
+    result: &Value,
+    window: Duration,
+    now_ms: i64,
+) -> Result<SourceReading, String> {
     let object = result
         .as_object()
         .ok_or_else(|| format!("the result must be an object, got {result}"))?;
@@ -464,7 +502,9 @@ pub fn parse_reading(result: &Value, window: Duration, now_ms: i64) -> Result<So
             });
         }
         if values.is_empty() {
-            return Ok(SourceReading::Missing("no series points inside the window".into()));
+            return Ok(SourceReading::Missing(
+                "no series points inside the window".into(),
+            ));
         }
         return Ok(SourceReading::value(
             values.iter().sum::<f64>() / values.len() as f64,
@@ -550,10 +590,16 @@ mod tests {
         );
         assert_eq!(
             parse_reading(&json!({ "series": [[now - 120_000, 100]] }), window, now),
-            Ok(SourceReading::Missing("no series points inside the window".into()))
+            Ok(SourceReading::Missing(
+                "no series points inside the window".into()
+            ))
         );
         assert_eq!(
-            parse_reading(&json!({ "value": null, "reason": "no series" }), window, now),
+            parse_reading(
+                &json!({ "value": null, "reason": "no series" }),
+                window,
+                now
+            ),
             Ok(SourceReading::Missing("no series".into()))
         );
         assert!(parse_reading(&json!({}), window, now).is_err());
