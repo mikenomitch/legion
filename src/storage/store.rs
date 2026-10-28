@@ -10242,6 +10242,30 @@ impl Store {
         )
     }
 
+    /// [`Self::handle_job_submit_as`] for the app reconciler (apps plan
+    /// §6.3): the version's grant is recorded in `granted_by`'s name (the
+    /// principal who approved the app's grant), and the version is stamped
+    /// `managedBy = { app, digest }`. An unchanged submit stamps the latest
+    /// version in place when its stamp differs, so a job a direct edit left
+    /// byte-identical to the render still reads as managed.
+    pub fn handle_job_submit_managed(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        granted_by: &str,
+        managed_by: crate::structs::app::ManagedBy,
+    ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner(
+            config,
+            subs,
+            None,
+            crate::storage::acl_store::GrantSource::App {
+                granted_by: granted_by.to_string(),
+                managed_by,
+            },
+        )
+    }
+
     /// Like `handle_job_submit`, stamping the template that rendered this
     /// config into the config's meta for provenance (spec history, the
     /// RunJobTemplate collision guard, and template-scoped ACL reads).
@@ -10705,6 +10729,40 @@ impl Store {
         }
     }
 
+    /// A job config version's meta, read through the submit's transaction.
+    fn version_meta_tx(tx: &Connection, job_config_id: &str) -> R<Option<Value>> {
+        Ok(tx
+            .query_row(
+                "SELECT meta FROM job_config WHERE id = ?1;",
+                [job_config_id],
+                |row| row.get::<_, Option<Value>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Set a version's `managedBy` stamp in place, when it differs.
+    fn stamp_managed_by_tx(
+        tx: &Connection,
+        job_config_id: &str,
+        managed_by: &crate::structs::app::ManagedBy,
+    ) -> R<()> {
+        let mut meta = Self::version_meta_tx(tx, job_config_id)?.unwrap_or_else(|| json!({}));
+        let stamp = serde_json::to_value(managed_by)?;
+        if meta.get("managedBy") == Some(&stamp) {
+            return Ok(());
+        }
+        if !meta.is_object() {
+            meta = json!({});
+        }
+        meta["managedBy"] = stamp;
+        tx.execute(
+            "UPDATE job_config SET meta = ?2 WHERE id = ?1;",
+            params![job_config_id, meta],
+        )?;
+        Ok(())
+    }
+
     /// The whole submit write, against a caller-owned transaction, with the
     /// version derivation reading THROUGH that transaction (see
     /// `latest_job_config_tx`). Stages events but does not publish them and
@@ -10734,7 +10792,7 @@ impl Store {
                 // A principal's unchanged resubmit passed the same check, so
                 // it (re)grants; Legion's own re-render of an unchanged
                 // version leaves the grant as it is.
-                if matches!(grant, crate::storage::acl_store::GrantSource::Submitter(_)) {
+                if grant.granter().is_some() {
                     Self::record_job_grant_tx(
                         tx,
                         &config.name,
@@ -10744,6 +10802,13 @@ impl Store {
                         &requested,
                         grant,
                     )?;
+                }
+                // The app reconciler's render equals the stored version but
+                // the version does not carry its stamp (a direct submit left
+                // it identical): stamp it, so the digests compare equal from
+                // here on. Nothing else about the version changes.
+                if let crate::storage::acl_store::GrantSource::App { managed_by, .. } = grant {
+                    Self::stamp_managed_by_tx(tx, &job_config_id, managed_by)?;
                 }
                 return Ok((JobSubmitOutcome::Unchanged { job_config_id }, Vec::new()));
             } else {
@@ -10803,6 +10868,28 @@ impl Store {
         };
         if let Some(template) = template {
             meta["jobTemplate"] = serde_json::to_value(template)?;
+        }
+        // Who stored the version, and the app reconciler's `managedBy`
+        // stamp (apps plan §6.3): set by the reconciler's submits, carried
+        // by Legion's own re-renders, and absent from every other submit's
+        // version, which is how a direct edit to an app's job is noticed.
+        match grant {
+            crate::storage::acl_store::GrantSource::Submitter(principal) => {
+                meta["submittedBy"] = json!(principal);
+            }
+            crate::storage::acl_store::GrantSource::App { managed_by, .. } => {
+                meta["submittedBy"] = json!(crate::structs::app::RECONCILER_PRINCIPAL);
+                meta["managedBy"] = serde_json::to_value(managed_by)?;
+            }
+            crate::storage::acl_store::GrantSource::CarryForward => {
+                if let Some(previous) = last_versions_id.as_deref() {
+                    if let Some(stamp) = Self::version_meta_tx(tx, previous)?
+                        .and_then(|meta| meta.get("managedBy").cloned())
+                    {
+                        meta["managedBy"] = stamp;
+                    }
+                }
+            }
         }
         let config_params = named_params! {
             ":id": format!("{}-{}", config.name, next_version.to_string()),

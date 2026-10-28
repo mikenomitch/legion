@@ -8903,6 +8903,10 @@ impl Manager for ManagerDaemonService {
             } else {
                 request.build_version.as_str()
             },
+            // The hash of the worker's executable (docs/apps.md,
+            // "Upgrades"); empty from a worker that predates it, which keeps
+            // the node out of every bundled app's build marker.
+            "buildId": request.build_id.as_str(),
             "protocolVersion": request.protocol_version,
             // Optional features the worker implements (`checkpoint`, ...).
             // Feature-specific work is only sent to workers that list it.

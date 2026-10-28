@@ -151,6 +151,9 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // Job grants (apps plan §6.4): written by the submit entry that stores
     // the version they grant, and by revocation.
     ("job_grant", Owner::Lane(Lane::Control)),
+    // App records (apps plan §6.3): operator intent, written by the app
+    // RPCs and the app reconciler, next to the jobs it submits.
+    ("app", Owner::Lane(Lane::Control)),
     ("saved_state_query", Owner::Lane(Lane::Control)),
     ("signing_key", Owner::Lane(Lane::Control)),
     // KV encryption keyring (docs/kv-encryption.md): the wrapped data keys.

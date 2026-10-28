@@ -157,6 +157,26 @@ pub enum GrantSource {
     /// version's grant carries forward when the new version asks for exactly
     /// the same and it is not revoked; otherwise the version has none.
     CarryForward,
+    /// The app reconciler submitted an app's job, checked against the grant
+    /// recorded on the app record (apps plan §6.4): recorded like a
+    /// submitter's, in `granted_by`'s name, and the version is stamped
+    /// `managedBy` (§6.3).
+    App {
+        granted_by: String,
+        managed_by: crate::structs::app::ManagedBy,
+    },
+}
+
+impl GrantSource {
+    /// The principal a submit records the grant in the name of; `None` for
+    /// a version Legion stored itself.
+    pub fn granter(&self) -> Option<&str> {
+        match self {
+            GrantSource::Submitter(principal) => Some(principal),
+            GrantSource::App { granted_by, .. } => Some(granted_by),
+            GrantSource::CarryForward => None,
+        }
+    }
 }
 
 const JOB_GRANT_COLUMNS: &str =
@@ -449,7 +469,11 @@ impl Store {
         let tasks_json = serde_json::to_string(tasks)?;
         let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
         match source {
-            GrantSource::Submitter(principal) => {
+            GrantSource::Submitter(principal)
+            | GrantSource::App {
+                granted_by: principal,
+                ..
+            } => {
                 // An unchanged row stays as it is (no write, so a steady
                 // resubmit adds nothing to the log); a revoked one, or one
                 // another principal granted, is granted again by this one.

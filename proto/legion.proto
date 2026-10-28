@@ -2201,6 +2201,121 @@ service Manager {
   // - InvalidArgument: `job` is empty.
   rpc RevokeGrant (RevokeGrantRequest) returns (RevokeGrantReply);
 
+  // Lists installed apps (docs/apps.md): each app's record, settings, grant,
+  // status, and where it runs. Requires `app:read`; the list is filtered to
+  // the apps the caller may read (`names` selector).
+  //
+  // An app is a job in the reserved `legion-system` namespace, a grant (what
+  // that job's `legion` identity may do), and registrations. Its status is
+  // derived when it is read: `stopped` (disabled), `degraded` (the
+  // reconciler's last pass failed, or fewer replicas run than asked for),
+  // `pending` (nothing runs yet, with why), or `running`.
+  rpc ListApps (ListAppsRequest) returns (ListAppsReply);
+
+  // Shows one app: everything ListApps reports, plus its manifest, config,
+  // and the reconciler's last action, error, and build marker. Requires
+  // `app:read` on the app.
+  //
+  // Errors:
+  // - NotFound: no app of that name is installed.
+  rpc GetApp (GetAppRequest) returns (GetAppReply);
+
+  // Installs an app from a manifest (`legion app install <file|url>`).
+  // Requires `app:write` on the app's name, and every permission the
+  // manifest asks for: the same grant check a job submit runs (docs/
+  // workload-identity.md, "Permissions"), against the installer. The grant
+  // is recorded on the app record in the installer's name, and the app
+  // reconciler then submits the app's job in `legion-system`.
+  //
+  // `dry_run` validates the manifest and the installer's coverage and
+  // returns the prompt (`prompt`) without installing, which is how the CLI
+  // shows what the app runs, where, as whom, and with what grant before it
+  // asks. A dry run that the grant check would refuse still answers, with
+  // the refusal in `uncovered`.
+  //
+  // Retry-safe: a repeated `idempotency_key` returns the first reply with
+  // `deduplicated` set.
+  //
+  // Errors:
+  // - InvalidArgument: the manifest does not parse or validate (unknown
+  //   fields, a bad name, a missing `version`, a config schema that does
+  //   not compile or has a remote `$ref`, a default that fails it, a job
+  //   fragment that does not parse), or `config_json` fails the schema.
+  // - PermissionDenied: the caller lacks `app:write`, or a permission the
+  //   manifest asks for.
+  // - AlreadyExists: an app of that name is installed (use UpgradeApp).
+  // - FailedPrecondition: the name is a bundled app's.
+  rpc InstallApp (InstallAppRequest) returns (InstallAppReply);
+
+  // Replaces an installed app's manifest (`legion app upgrade`). Requires
+  // `app:write` and, because a new manifest changes the code the app runs,
+  // every permission the new manifest asks for, checked against the caller
+  // as at install.
+  //
+  // The reply carries the permission diff. When the new manifest asks for a
+  // permission the recorded grant does not hold, nothing changes unless
+  // `approve` is set: the reply has `upgraded = false` and the diff, so the
+  // CLI can ask. A manifest that only keeps or drops permissions upgrades
+  // without `approve`. The stored config is checked against the new
+  // schema; a config that no longer matches refuses the upgrade.
+  //
+  // Retry-safe with `idempotency_key`.
+  //
+  // Errors:
+  // - NotFound: no app of that name.
+  // - InvalidArgument: the manifest is invalid, names another app, or the
+  //   stored config fails its schema.
+  // - PermissionDenied: the caller lacks `app:write` or a permission.
+  // - FailedPrecondition: the app is bundled (bundled apps upgrade with the
+  //   binary).
+  rpc UpgradeApp (UpgradeAppRequest) returns (UpgradeAppReply);
+
+  // Uninstalls an app (`legion app uninstall`): stops its job, revokes the
+  // job's grants, and deletes the record. The stopped job stays in
+  // `legion-system` until someone destroys it. Requires `app:write`.
+  //
+  // Retry-safe with `idempotency_key`; uninstalling an app that is not
+  // installed is NotFound.
+  //
+  // Errors:
+  // - FailedPrecondition: the app is bundled; disable it instead.
+  rpc UninstallApp (UninstallAppRequest) returns (UninstallAppReply);
+
+  // Enables or disables an app (`legion app enable|disable`). Disabling
+  // stops the app's job and keeps its record, config, and grant; enabling
+  // runs it again. Requires `app:write`. Setting the state an app already
+  // has is a write too: it retries a reconcile the last failure parked.
+  //
+  // Retry-safe with `idempotency_key`.
+  rpc SetAppEnabled (SetAppEnabledRequest) returns (SetAppEnabledReply);
+
+  // Changes an app's settings (`legion app set`): replicas, placement, the
+  // pool for worker placement, and CPU and memory per task. The reconciler
+  // re-renders the job and rolls it. Requires `app:write`.
+  //
+  // Retry-safe with `idempotency_key`.
+  //
+  // Errors:
+  // - InvalidArgument: replicas outside 1-32, an unknown placement, a pool
+  //   with `managers` placement, a zero resource.
+  rpc UpdateAppSettings (UpdateAppSettingsRequest) returns (UpdateAppSettingsReply);
+
+  // Replaces an app's config (`legion app config set`), validated against
+  // the manifest's config schema. The reconciler renders it into the job as
+  // a file (`$LEGION_APP_CONFIG`) and rolls the job: the job's version
+  // history is the config's history. Requires `app:write`; a change to any
+  // of the manifest's `codeFields` (plugin sources, endpoints the app runs)
+  // also requires every permission of the app's recorded grant, as install
+  // does, so `app:write` is never a path to the app's grant.
+  //
+  // Retry-safe with `idempotency_key`.
+  //
+  // Errors:
+  // - InvalidArgument: `config_json` is not JSON or fails the schema.
+  // - PermissionDenied: a code field changed and the caller does not hold
+  //   the app's grant.
+  rpc SetAppConfig (SetAppConfigRequest) returns (SetAppConfigReply);
+
   // Lists the auth methods clients may log in with.
   //
   // Open endpoint: login UIs need this before any credential exists. Only
@@ -2568,6 +2683,18 @@ message WorkerRegisterRequest {
   //
   // Default: empty (a worker that predates capabilities).
   repeated string capabilities = 9;
+
+  // A hash of the worker's own executable, computed once at startup (the
+  // first 16 bytes of its SHA-256, as hex). Recorded into the node's
+  // `dynamic_attrs` as `buildId`, next to `buildVersion`. `buildVersion` is
+  // the package version, which a rebuild without a version bump does not
+  // change; together they are the build the app reconciler rolls bundled
+  // apps on (docs/apps.md, "Upgrades"): an app's build marker moves only
+  // when every ready node its placement allows reports the same pair.
+  //
+  // Default: empty (a worker that predates it). Such a node is left out of
+  // every bundled app's build marker.
+  string build_id = 10;
 }
 
 // Reply payload for WorkerRegister.
@@ -2970,6 +3097,24 @@ message GetJobInfoReply {
   // Template that rendered the job's latest config, when it was submitted
   // via RunJobTemplate. Unset for raw RunJob submissions.
   optional JobTemplateProvenance template = 2;
+
+  // Set when the job's latest version was submitted by the app reconciler:
+  // the job belongs to an app (docs/apps.md), and the reconciler reverts
+  // any direct edit to it within seconds. Unset for every other job, and
+  // for an app's job whose latest version someone else submitted (the edit
+  // the reconciler is about to revert).
+  optional ManagedByInfo managed_by = 3;
+}
+
+// The app that manages a job (GetJobInfoReply.managed_by).
+message ManagedByInfo {
+  // The app's name (`legion app status <app>`).
+  string app = 1;
+
+  // The digest of the render the reconciler submitted. The reconciler
+  // compares it with the digest of a fresh render of the app record; a
+  // difference resubmits the job.
+  string digest = 2;
 }
 
 // Request payload for ListRollouts.
@@ -11921,6 +12066,359 @@ message RevokeGrantReply {
   // True when `idempotency_key` matched an earlier call, whose reply this
   // is.
   bool deduplicated = 3;
+}
+
+// === APPS ===
+
+// Request payload for ListApps.
+message ListAppsRequest {
+}
+
+// Reply payload for ListApps.
+message ListAppsReply {
+  // Installed apps the caller may read, by name.
+  repeated App apps = 1;
+}
+
+// An app's settings (`legion app set`).
+message AppSettingsInfo {
+  // Copies of each task. 1-32.
+  uint32 replicas = 1;
+
+  // `managers`, `workers`, or `any` (docs/apps.md, "Placement").
+  string placement = 2;
+
+  // CPU (MHz) for each task, overriding the manifest. Unset keeps the
+  // manifest's.
+  optional uint64 cpu = 3;
+
+  // Memory (MiB) for each task, overriding the manifest.
+  optional uint64 memory = 4;
+
+  // The worker pool for `workers` and `any` placement. Unset is `default`.
+  optional string pool = 5;
+}
+
+// What an app's `legion` identity was granted.
+message AppGrantInfo {
+  // The granted rules, as a JSON array in the shape `legion acl policy
+  // apply` takes.
+  string rules_json = 1;
+
+  // Who approved them: the installer (`userpass:alice`), or
+  // `legion:bootstrap` for a bundled app's seed.
+  string granted_by = 2;
+
+  // When (RFC3339).
+  string granted_at = 3;
+}
+
+// The app reconciler's view of an app.
+message AppReconcileInfo {
+  // The digest of the last render the reconciler submitted or found.
+  string last_digest = 1;
+
+  // What its last pass did: `created the job`, `reverted a direct edit by
+  // userpass:alice`, `stopped (app disabled)`.
+  string last_action = 2;
+
+  // Its last error, empty after a success.
+  string last_error = 3;
+
+  // When the last action or error was recorded (RFC3339).
+  string last_at = 4;
+
+  // The build marker a bundled app's job is rendered for
+  // (`<buildVersion>+<buildId>`), empty for installed apps and before any
+  // eligible node reported its build.
+  string build_marker = 5;
+
+  // What the app waits for, when anything: `upgrade waiting: 2 of 3
+  // eligible nodes on 0.15.0 (waiting for mgr-3)`.
+  string marker_reason = 6;
+
+  // The digest stamped on the job's latest version (`managedBy`). Empty
+  // when the latest version was submitted by someone else.
+  string job_digest = 7;
+}
+
+// An installed app.
+message App {
+  // The app's name; its job is `legion-system/<name>`.
+  string name = 1;
+
+  // The manifest's description.
+  string description = 2;
+
+  // The manifest's version, or a bundled app's build marker version.
+  string version = 3;
+
+  // `bundled`, `file`, or `url`.
+  string source = 4;
+
+  // The file or URL the manifest was installed from; empty for bundled
+  // apps.
+  string source_ref = 5;
+
+  // Whether the app should run.
+  bool enabled = 6;
+
+  AppSettingsInfo settings = 7;
+
+  // `running`, `degraded`, `pending`, or `stopped`.
+  string status = 8;
+
+  // Why, when the status needs one: `2/3 running`, `reconcile failing:
+  // ...`, `waiting for an eligible node to report its build`.
+  string status_detail = 9;
+
+  // The app's job (`legion-system/<name>`).
+  string job_id = 10;
+
+  // Allocations running.
+  uint32 running = 11;
+
+  // Allocations the app should run: replicas times tasks, 0 when disabled.
+  uint32 desired = 12;
+
+  // The digest of the stored manifest.
+  string manifest_digest = 13;
+
+  // The stored manifest, as JSON.
+  string manifest_json = 14;
+
+  // The app's config, as JSON.
+  string config_json = 15;
+
+  AppGrantInfo grant = 16;
+
+  // Who installed it.
+  string installed_by = 17;
+
+  // When it was installed, and last changed (RFC3339).
+  string installed_at = 18;
+  string updated_at = 19;
+
+  AppReconcileInfo reconcile = 20;
+
+  // The UI slots the manifest registers (`nav`, `job`, ...).
+  repeated string ui_slots = 21;
+
+  // Things an operator should know: no system worker on its managers,
+  // workload identity off (the app has no Legion credentials).
+  repeated string notes = 22;
+
+  // The nodes running it.
+  repeated string running_on = 23;
+}
+
+// Request payload for GetApp.
+message GetAppRequest {
+  // The app's name.
+  string name = 1;
+}
+
+// Reply payload for GetApp.
+message GetAppReply {
+  App app = 1;
+}
+
+// Request payload for InstallApp.
+message InstallAppRequest {
+  // The manifest, as JSON (the CLI evaluates a Nickel manifest first).
+  string manifest_json = 1;
+
+  // `file` or `url`: where the manifest came from.
+  string source = 2;
+
+  // The path or URL, recorded for `legion app status`.
+  string source_ref = 3;
+
+  // Validate and check the grant, and return the prompt, without
+  // installing.
+  bool dry_run = 4;
+
+  // The initial config, as JSON. Unset installs the manifest's default.
+  optional string config_json = 5;
+
+  // Optional key to dedupe retries; a repeat returns the first reply with
+  // `deduplicated = true`.
+  optional string idempotency_key = 6;
+}
+
+// Reply payload for InstallApp.
+message InstallAppReply {
+  // The installed app (on a dry run, the record it would be).
+  App app = 1;
+
+  // Human-readable status message.
+  string message = 2;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+
+  // The install prompt: what the app runs, where, as whom, what it asks
+  // for, and its UI, one line each.
+  repeated string prompt = 4;
+
+  // On a dry run, the first permission the caller does not hold, worded as
+  // the refusal would be; empty when the caller holds them all.
+  string uncovered = 5;
+}
+
+// Request payload for UpgradeApp.
+message UpgradeAppRequest {
+  // The app to upgrade.
+  string name = 1;
+
+  // The new manifest, as JSON. Its `name` must be the app's.
+  string manifest_json = 2;
+
+  // The path or URL it came from.
+  string source_ref = 3;
+
+  // Approve permissions the new manifest adds. Without it, an upgrade that
+  // adds any changes nothing and returns the diff.
+  bool approve = 4;
+
+  // Show the diff and the prompt without upgrading.
+  bool dry_run = 5;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 6;
+}
+
+// How an upgrade changes an app's grant.
+message PermissionDiff {
+  // Rules the new manifest adds, as a JSON array.
+  string added_json = 1;
+
+  // Rules it drops.
+  string removed_json = 2;
+
+  // Rules both have.
+  string unchanged_json = 3;
+}
+
+// Reply payload for UpgradeApp.
+message UpgradeAppReply {
+  // The app after the call (unchanged when `upgraded` is false).
+  App app = 1;
+
+  PermissionDiff diff = 2;
+
+  // Whether the manifest was replaced.
+  bool upgraded = 3;
+
+  // Human-readable status message; says why when `upgraded` is false.
+  string message = 4;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 5;
+
+  // The new manifest's install prompt.
+  repeated string prompt = 6;
+}
+
+// Request payload for UninstallApp.
+message UninstallAppRequest {
+  string name = 1;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for UninstallApp.
+message UninstallAppReply {
+  // Human-readable status message.
+  string message = 1;
+
+  // How many job grants were revoked.
+  uint32 revoked_grants = 2;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+}
+
+// Request payload for SetAppEnabled.
+message SetAppEnabledRequest {
+  string name = 1;
+
+  // True runs the app; false stops its job and keeps everything else.
+  bool enabled = 2;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for SetAppEnabled.
+message SetAppEnabledReply {
+  App app = 1;
+
+  // Human-readable status message.
+  string message = 2;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+}
+
+// Request payload for UpdateAppSettings. Unset fields keep their value.
+message UpdateAppSettingsRequest {
+  string name = 1;
+
+  optional uint32 replicas = 2;
+
+  // `managers`, `workers`, or `any`.
+  optional string placement = 3;
+
+  // CPU (MHz) per task; 0 clears the override.
+  optional uint64 cpu = 4;
+
+  // Memory (MiB) per task; 0 clears the override.
+  optional uint64 memory = 5;
+
+  // The worker pool for `workers` and `any` placement; empty clears it.
+  optional string pool = 6;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 7;
+}
+
+// Reply payload for UpdateAppSettings.
+message UpdateAppSettingsReply {
+  App app = 1;
+
+  // Human-readable status message: what changed.
+  string message = 2;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+}
+
+// Request payload for SetAppConfig.
+message SetAppConfigRequest {
+  string name = 1;
+
+  // The whole new config, as JSON.
+  string config_json = 2;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for SetAppConfig.
+message SetAppConfigReply {
+  App app = 1;
+
+  // Human-readable status message.
+  string message = 2;
+
+  // The code fields the change touched (concrete JSON pointers); the
+  // caller's grant was checked when any did.
+  repeated string code_fields_changed = 3;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 4;
 }
 
 // === AUTH METHODS & JOIN TOKENS ===

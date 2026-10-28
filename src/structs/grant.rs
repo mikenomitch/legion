@@ -200,6 +200,7 @@ pub fn resource_named(name: &str) -> Option<AclResource> {
         AclResource::Net,
         AclResource::Snapshot,
         AclResource::Namespace,
+        AclResource::App,
     ];
     ALL.iter()
         .copied()

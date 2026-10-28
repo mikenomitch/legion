@@ -265,6 +265,12 @@ debug = false
 [profile.dev.package.libsqlite3-sys]
 opt-level = 3
 
+# Workers hash their own executable at startup for their build id
+# (docs/apps.md, "Upgrades"). A debug binary is ~400 MB, which SHA-256 at
+# -O0 takes tens of seconds over; optimized, well under one.
+[profile.dev.package.sha2]
+opt-level = 3
+
 # Profile for shipped binaries: `cargo build --profile dist`.
 #
 # Legion is distributed as one binary that is manager, worker, CLI, and MCP

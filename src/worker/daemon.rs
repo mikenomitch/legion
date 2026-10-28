@@ -841,6 +841,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             edge_boot_config.accept_claims,
         ),
     };
+    // The build id hashes this executable (hundreds of MB for a debug
+    // build): computed once, off the runtime, before the first registration
+    // reports it.
+    let build_id = tokio::task::spawn_blocking(crate::util::build_id)
+        .await
+        .unwrap_or("unknown");
+    debug!(build_id, "Computed this worker's build id");
     let reported_managers = register_self(client.clone(), &registration, &credentials).await?;
     managers.learn(&reported_managers);
     info!(worker_name = %name, "Worker registered with manager");
@@ -3771,6 +3778,7 @@ async fn register_self(
         build_version: build_version.to_string(),
         protocol_version: PROTOCOL_VERSION,
         capabilities: registration.capabilities.clone(),
+        build_id: crate::util::build_id().to_string(),
     };
 
     let response = if credentials.has_node_token() {

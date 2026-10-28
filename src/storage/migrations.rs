@@ -2189,6 +2189,39 @@ fn migration_list() -> Vec<M<'static>> {
         // by `CreateJoinToken`, whose worker type supplies both.
         M::up("ALTER TABLE join_token ADD COLUMN pinned_attrs TEXT NOT NULL DEFAULT '';")
             .down(""),
+        // Apps (apps plan §6.3, docs/apps.md): one row per installed app, on
+        // the Control lane with the jobs the app reconciler submits. The
+        // manifest, settings, config and granted rules are JSON; the
+        // reconciler's bookkeeping (last digest, action, error, the build
+        // marker it holds and why, and what the last record write changed)
+        // has its own columns, written without moving `updated_at`, which
+        // operator writes compare-and-set on.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS app (
+            name TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            source_ref TEXT NOT NULL DEFAULT '',
+            manifest TEXT NOT NULL,
+            manifest_digest TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            settings TEXT NOT NULL,
+            config TEXT NOT NULL,
+            grant_rules TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            granted_at TEXT NOT NULL,
+            installed_by TEXT NOT NULL,
+            installed_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_digest TEXT NOT NULL DEFAULT '',
+            last_action TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            last_at TEXT NOT NULL DEFAULT '',
+            build_marker TEXT NOT NULL DEFAULT '',
+            marker_reason TEXT NOT NULL DEFAULT '',
+            pending_change TEXT NOT NULL DEFAULT ''
+        );",
+        )
+        .down("DROP TABLE IF EXISTS app;"),
     ]
 }
 

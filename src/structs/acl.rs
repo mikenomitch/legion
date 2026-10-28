@@ -81,6 +81,13 @@ pub enum AclResource {
     /// from `operator` for the reason `scale` and `boot` are: "may create a
     /// namespace" must not imply "may reconfigure raft".
     Namespace,
+    /// Apps (`legion app`, docs/apps.md): `read` lists and shows them,
+    /// `write` installs, upgrades, uninstalls, enables, disables, and changes
+    /// their settings and config. Cluster-scoped; scope with the `names`
+    /// selector, which matches app names. Holding `app:write` is not holding
+    /// the app's grant: installing, upgrading, and changing an app's code
+    /// fields also need every permission the app asks for.
+    App,
 }
 
 impl AclResource {
@@ -100,6 +107,7 @@ impl AclResource {
             AclResource::Net => "net",
             AclResource::Snapshot => "snapshot",
             AclResource::Namespace => "namespace",
+            AclResource::App => "app",
         }
     }
 
@@ -119,6 +127,7 @@ impl AclResource {
             "net",
             "snapshot",
             "namespace",
+            "app",
         ]
     }
 
@@ -168,7 +177,7 @@ impl AclAction {
 pub struct AclRule {
     /// Resource types: `job`, `node`, `kv`, `state`, `operator`, `acl`,
     /// `exec`, `action`, `template`, `scale`, `boot`, `net`, `snapshot`,
-    /// `namespace`, `*`.
+    /// `namespace`, `app`, `*`.
     pub resources: Vec<String>,
     /// Actions: `read`, `write`, `*`.
     pub actions: Vec<String>,
@@ -363,6 +372,15 @@ impl AclScope {
         AclScope {
             action_name: Some(action_name.to_string()),
             ..Self::job(job_id)
+        }
+    }
+
+    /// Scope for an app (`legion app`): its name, matched by the `names`
+    /// selector. Apps are cluster-scoped, so the scope carries no namespace.
+    pub fn app(name: &str) -> Self {
+        AclScope {
+            name: Some(name.to_string()),
+            ..Default::default()
         }
     }
 

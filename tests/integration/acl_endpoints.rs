@@ -3930,6 +3930,7 @@ async fn worker_register_version_handshake_round_trip() -> R<()> {
                 build_version: "9.9.9-test".into(),
                 protocol_version: PROTOCOL_VERSION,
                 capabilities: vec!["checkpoint".into()],
+                build_id: "test-build".into(),
             },
             None,
         ))
@@ -3989,6 +3990,7 @@ async fn worker_register_version_handshake_round_trip() -> R<()> {
                 build_version: "99.0.0".into(),
                 protocol_version: PROTOCOL_VERSION + 1,
                 capabilities: Vec::new(),
+                build_id: String::new(),
             },
             None,
         ))

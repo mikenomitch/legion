@@ -5,6 +5,52 @@ use std::path::{Path, PathBuf};
 // Adds convenience for Result for brevity
 pub type R<T> = anyhow::Result<T>;
 
+/// This process's build id: the first 16 bytes of the SHA-256 of its own
+/// executable, as hex, computed once (the first call reads the whole
+/// binary, so call it off the async runtime, as the worker does at
+/// startup). Workers report it at registration as `buildId`, beside
+/// `buildVersion`, which a rebuild without a version bump does not change;
+/// the pair is the build bundled apps roll on (docs/apps.md, "Upgrades").
+/// `unknown` when the executable cannot be read.
+pub fn build_id() -> &'static str {
+    static BUILD_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BUILD_ID.get_or_init(|| match hash_own_executable() {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!(error = %err, "Could not hash this binary for its build id");
+            "unknown".to_string()
+        }
+    })
+}
+
+fn hash_own_executable() -> R<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let path = std::env::current_exe()?;
+    let mut file = std::fs::File::open(&path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// The (`buildVersion`, `buildId`) of this binary, as a worker reports them.
+pub fn own_build() -> crate::structs::app::BuildMarker {
+    crate::structs::app::BuildMarker {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build_id: build_id().to_string(),
+    }
+}
+
 pub fn random_string(length: usize) -> String {
     thread_rng()
         .sample_iter(&Alphanumeric)

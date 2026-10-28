@@ -5,6 +5,7 @@
 tonic::include_proto!("legion");
 
 pub mod acl;
+pub mod app;
 pub mod archive;
 pub mod artifact;
 pub mod band;
