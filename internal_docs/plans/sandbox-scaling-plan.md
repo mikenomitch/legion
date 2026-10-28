@@ -1454,6 +1454,10 @@ Each phase ships alone and is worth having alone.
   checkpoint per envelope, and density measurements per node.
 - **Phase 9: sub-VM tier seam.** `TaskPlugin::start_session`,
   `sessionsPerInstance`, accounting, and the isolation warning in docs.
+  *2026-10-28:* [isolate-runtime-plan.md](isolate-runtime-plan.md)
+  plans a concrete sub-VM tier: many tenants per `legion-isolate` host
+  process riding session envelopes, with burst to this plan's sandboxes.
+  It does not use a `start_session` seam on an existing allocation.
 - **Phase 10: cells (conditional).** Built only past the §6.11 trigger.
 
 ## 10. Testing plan

@@ -191,6 +191,7 @@ When one is required and what goes in it:
 | [shared-alloc-dir-proposal.md](plans/shared-alloc-dir-proposal.md) | proposal |
 | [swappable-seams-plan.md](plans/swappable-seams-plan.md) | shipped (2026-10-14: one attachment type for the datapath, one listener and dialer, the typed worker ↔ `netd` boundary, one object-storage layer, DNS on hickory-proto, the egress proxy on hyper, and the VIP and mesh-TLS fixes; the `legion netd` process split, a `NetdInput` wire encoding, GCS/Azure, and a `Vmm` trait deferred) |
 | [data-dir-env-plan.md](plans/data-dir-env-plan.md) | shipped (`LEGION_DATA_DIR`; no config-file field, by design) |
+| [isolate-runtime-plan.md](plans/isolate-runtime-plan.md) | planned (2026-10-28): a second, lighter sandbox tier. Isolates are WebAssembly components on wasmtime (pooling allocator, copy-on-write images, Cranelift ahead of time), with JS (StarlingMonkey) and Python (CPython for WASI) as pre-initialized images, in a confined `legion-isolate` host process per cordon (trust partition, default per namespace) with one shard per core; they start in microseconds, hold no stack while they await on the stackless callback ABI, page out and hibernate when idle, do all I/O through the worker's egress datapath, and burst to a `sandbox` microVM by an attached-VM API or by replay before egress. Rides session mode, nothing per isolate on raft. V8 (Phase 7, behind a trigger), continuation migration (Phase 8), and shared pool envelopes deferred |
 
 ## Judgement calls
 
@@ -255,6 +256,7 @@ by project impact. The full template and a worked example:
 - [ui-task-and-template-redesign-plan_calls.md](calls/ui-task-and-template-redesign-plan_calls.md)
 - [chunked-checkpoint-publish-plan_calls.md](calls/chunked-checkpoint-publish-plan_calls.md)
 - [checkpoint-encryption-plan_calls.md](calls/checkpoint-encryption-plan_calls.md)
+- [isolate-runtime-plan_calls.md](calls/isolate-runtime-plan_calls.md)
 - [kv-encryption-plan_calls.md](calls/kv-encryption-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [kv-cert-delivery-plan_calls.md](calls/kv-cert-delivery-plan_calls.md)

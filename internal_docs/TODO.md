@@ -2112,19 +2112,19 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       `sd_notify`-compatible readiness socket, `WatchdogSec`-style pings, and
       socket activation via pre-bound fds
       ([plan §8 phase 4](plans/host-process-supervision-plan.md))
-- [ ] A **WASM** runtime: run a WASI command module (`wasm32-wasip1`) as a
-      task. The embedding layer it needs is shared with the network plugins
-      and ready in [`src/wasm/`](../src/wasm/mod.rs): the engine, a memory cap
-      that names a refusal, failure descriptions, guest-memory helpers, a
-      WASI preview1 shim with real `args`/`environ` and pluggable
-      stdout/stderr (`WasiHost`), and module fetching by URL and checksum
-      through the artifact stager. Still to decide and build, in a plan:
-      the task surface (`runtime = "wasm"`, `config.module`), a CPU budget
-      for a whole run in place of a plugin's per-callback fuel, preopened
-      directories (the shim has no filesystem), networking (none, or the
-      gated datapath's proxy over a host function), and whether an
-      interpreter is fast enough for tasks or a task wants wasmtime beside
-      the plugin's wasmi.
+- [ ] A **WASM** runtime, now planned as the **isolate runtime**
+      ([plan](plans/isolate-runtime-plan.md) ·
+      [calls](calls/isolate-runtime-plan_calls.md), PLANNED 2026-10-28):
+      `runtime = "isolate"`, WebAssembly components on wasmtime in a
+      confined multi-tenant `legion-isolate` host per cordon, JS and Python
+      as pre-initialized images, request/tenant/session lifetimes with
+      page-out and hibernation, I/O through the worker's egress datapath,
+      and burst to a `sandbox` microVM. The plan answers the questions this
+      item listed (task surface, whole-run CPU budget, an in-memory
+      filesystem, networking through the datapath, and wasmtime for tasks
+      while network plugins keep wasmi, calls entries 1 and 4). Phase 0
+      (measurements on the AWS rig) comes first. The embedding layer in
+      [`src/wasm/`](../src/wasm/mod.rs) stays the plugins'.
 - [ ] A **`converge`** runtime — idempotent host resources (package, file,
       template, directory, user, service, mount) with per-resource
       `unchanged | changed | failed` reporting, i.e. the Chef-replacement shape —
