@@ -253,7 +253,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_info",
-            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`), and `deadline` (Unix seconds, 0 for none) when its `placementTimeout` fails the job if it is still short. A gang job with status `failed` (timed out, or failed by its `onMemberLoss`) places nothing until it is run again (docs/gang-scheduling.md).",
+            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`), and `deadline` (Unix seconds, 0 for none) when its `placementTimeout` fails the job if it is still short. A gang job with status `failed` (timed out, or failed by its `onMemberLoss`) places nothing until it is run again (docs/gang-scheduling.md). With `scale:read`, `scalingInputs` adds one entry per task with request vs usage, cluster-wide: ready/placed/desired/unplaced replicas, measured CPU (MHz, utilization against the reservation, per-replica histogram) and memory, requests per second, error ratio, and latency into a service the task backs (internal callers only), whether a rollout is active, and `freshness.state` (`current`, `missing`, `resyncing`; act only on `current`) (docs/autoscaling.md, \"Scaling inputs\").",
             input_schema: name_arg_schema,
             mutates: false,
         },
@@ -1532,7 +1532,20 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_job_info" => {
             let name = job_arg(&args, "name")?;
             let mut client = connect().await?;
-            grpc(client.get_job_info(GetJobInfoRequest { name })).await
+            let mut reply =
+                grpc(client.get_job_info(GetJobInfoRequest { name: name.clone() })).await?;
+            // Request vs usage, as `legion job info` shows it; left out when
+            // the caller lacks `scale:read` (docs/autoscaling.md).
+            if let (Some(object), Some(usage)) = (
+                reply.as_object_mut(),
+                crate::cmd::job::scaling_inputs_for_job(&mut client, &name).await,
+            ) {
+                object.insert(
+                    "scalingInputs".to_string(),
+                    serde_json::to_value(usage).map_err(|e| e.to_string())?,
+                );
+            }
+            Ok(reply)
         }
         "legion_job_spec" => {
             let name = job_arg(&args, "name")?;

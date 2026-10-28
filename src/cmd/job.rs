@@ -146,7 +146,7 @@ pub fn config() -> Command {
         .arg(json_flag());
 
     let info_cmd = Command::new("info")
-        .about("Get job info")
+        .about("Get job info, with each task's measured usage against its reservation")
         .arg(
             Arg::new("name")
                 .value_name("NAME")
@@ -2646,6 +2646,153 @@ fn reschedule_backoff_lines(backoffs: &[crate::structs::RescheduleBackoff]) -> V
     lines
 }
 
+/// The job's scaling inputs (`GetScalingInputs`), or `None` when the call
+/// fails: no `scale:read`, or a manager that predates the RPC. Shared with
+/// the MCP server's `legion_job_info`, so both render the same reply.
+pub(crate) async fn scaling_inputs_for_job(
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
+    job: &str,
+) -> Option<Vec<crate::structs::ScalingInputs>> {
+    let request = crate::structs::GetScalingInputsRequest {
+        targets: vec![crate::structs::ScalingTargetSelector {
+            job: job.to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    match client.get_scaling_inputs(request).await {
+        Ok(reply) => Some(reply.into_inner().inputs),
+        Err(status) => {
+            debug!(code = ?status.code(), message = %status.message(), "Scaling inputs unavailable");
+            None
+        }
+    }
+}
+
+/// `job info -j`'s data: the `Job` object, plus `scalingInputs` (one entry
+/// per task) when the caller could read them.
+pub(crate) fn job_info_json(
+    job: Option<crate::structs::Job>,
+    usage: Option<&[crate::structs::ScalingInputs]>,
+) -> Value {
+    let mut value = serde_json::to_value(&job).unwrap_or(Value::Null);
+    if let (Some(object), Some(usage)) = (value.as_object_mut(), usage) {
+        object.insert(
+            "scalingInputs".to_string(),
+            serde_json::to_value(usage).unwrap_or(Value::Null),
+        );
+    }
+    value
+}
+
+/// One `job info` usage row: a task's replicas, measured CPU and memory
+/// against its reservation, requests into its service, and how fresh the
+/// numbers are.
+#[derive(Tabled)]
+struct ScalingInputsPrint {
+    #[tabled(rename = "TASK")]
+    task: String,
+    #[tabled(rename = "REPLICAS")]
+    replicas: String,
+    #[tabled(rename = "CPU USED / RESERVED")]
+    cpu: String,
+    #[tabled(rename = "MEMORY USED / RESERVED")]
+    memory: String,
+    #[tabled(rename = "REQUESTS")]
+    requests: String,
+    #[tabled(rename = "DATA")]
+    data: String,
+}
+
+fn percent(ratio: f64) -> String {
+    format!("{:.0}%", ratio * 100.0)
+}
+
+impl From<&crate::structs::ScalingInputs> for ScalingInputsPrint {
+    fn from(inputs: &crate::structs::ScalingInputs) -> Self {
+        let task = format!("{}/{}", inputs.task_group, inputs.task_name);
+        if !inputs.error.is_empty() {
+            return Self {
+                task,
+                replicas: "-".into(),
+                cpu: "-".into(),
+                memory: "-".into(),
+                requests: "-".into(),
+                data: inputs.error.clone(),
+            };
+        }
+        let mut replicas = format!("{}/{} ready", inputs.ready_replicas, inputs.placed_replicas);
+        if inputs.unplaced_replicas > 0 {
+            replicas.push_str(&format!(", {} unplaced", inputs.unplaced_replicas));
+        }
+        if inputs.rollout_active {
+            replicas.push_str(", rollout");
+        }
+        let cpu = match inputs.cpu.as_ref().filter(|cpu| cpu.measured_replicas > 0) {
+            None => "-".to_string(),
+            Some(cpu) => {
+                let amount = if cpu.used_mhz > 0.0 || cpu.reserved_mhz > 0.0 {
+                    format!("{:.0} / {:.0} MHz", cpu.used_mhz, cpu.reserved_mhz)
+                } else {
+                    format!("{}m", cpu.used_millicores)
+                };
+                if cpu.unmeasurable_replicas < cpu.measured_replicas {
+                    format!(
+                        "{amount} ({}, max {})",
+                        percent(cpu.utilization),
+                        percent(cpu.max_utilization)
+                    )
+                } else {
+                    amount
+                }
+            }
+        };
+        let memory = match inputs
+            .memory
+            .as_ref()
+            .filter(|memory| memory.measured_replicas > 0)
+        {
+            None => "-".to_string(),
+            Some(memory) if memory.reserved_mib > 0.0 => format!(
+                "{:.0} / {:.0} MiB ({})",
+                memory.used_mib,
+                memory.reserved_mib,
+                percent(memory.utilization)
+            ),
+            Some(memory) => format!("{:.0} MiB", memory.used_mib),
+        };
+        let requests = match inputs.requests.as_ref() {
+            None => "-".to_string(),
+            Some(requests) => {
+                let mut line = format!(
+                    "{:.1} rps, {:.1}% err",
+                    requests.requests_per_second,
+                    requests.error_ratio * 100.0
+                );
+                if requests.latency_ms_mean > 0.0 {
+                    line.push_str(&format!(", {:.0}ms avg", requests.latency_ms_mean));
+                }
+                line
+            }
+        };
+        let data = match inputs.freshness.as_ref() {
+            None => "-".to_string(),
+            Some(freshness) if freshness.state == "current" => {
+                format!("current ({}s ago)", freshness.age_seconds)
+            }
+            Some(freshness) => freshness.state.clone(),
+        };
+        Self {
+            task,
+            replicas,
+            cpu,
+            memory,
+            requests,
+            data,
+        }
+    }
+}
+
 #[instrument(skip_all)]
 async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
@@ -2655,15 +2802,21 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
         arg_matches,
         arg_matches.get_one::<String>("name").context("need name")?,
     )?;
-    let request = tonic::Request::new(GetJobInfoRequest { name: job_name });
+    let request = tonic::Request::new(GetJobInfoRequest {
+        name: job_name.clone(),
+    });
     let response = output::resolve(
         format,
         "failed to fetch job info",
         client.get_job_info(request).await,
     )?;
+    // Request vs usage (docs/autoscaling.md, "Scaling inputs"). Best effort:
+    // a caller without `scale:read`, or a manager that predates the RPC,
+    // still gets the job.
+    let usage = scaling_inputs_for_job(&mut client, &job_name).await;
 
     if format.is_json() {
-        print_json(&response.into_inner().job);
+        print_json(&job_info_json(response.into_inner().job, usage.as_deref()));
     } else {
         let job = response.into_inner().job.context("no job found")?;
         let blocked = job.blocked.clone();
@@ -2672,6 +2825,10 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
         print_table(vec![printable_job]);
         for line in backoff_lines {
             println!("{line}");
+        }
+        if let Some(usage) = usage.as_deref().filter(|usage| !usage.is_empty()) {
+            println!();
+            print_table(usage.iter().map(ScalingInputsPrint::from).collect());
         }
         // What a blocked job waits for (docs/scheduler-and-eval-loop.md,
         // "Blocked evals"): it places on its own when that capacity appears.

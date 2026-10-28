@@ -205,6 +205,14 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "job.scaling-inputs",
+            cli: "legion job info <NAME>",
+            grpc: Some("Manager/GetScalingInputs"),
+            summary: "Cluster-wide request vs usage per task, batched: ready/placed/desired/unplaced replicas, measured CPU and memory against reservations, service request rate/errors/latency (internal callers), rollout state, and data freshness, with up to an hour of 10-second history. Needs scale:read (docs/autoscaling.md, \"Scaling inputs\").",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "job.destroy",
             cli: "legion job destroy <NAME>",
             grpc: Some("Manager/DestroyJob"),

@@ -4,6 +4,7 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, on }
 import { Badge, Button, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, RelativeTime, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import DagVisualization from '../../components/DagVisualization'
 import ScalePanel from '../../components/ScalePanel'
+import UsageInputsPanel from '../../components/UsageInputsPanel'
 import InstancesPanel from '../../components/InstancesPanel'
 import SessionNodesCard from '../../components/SessionNodesCard'
 import type { InstanceRow } from '../../components/InstancesTable'
@@ -626,6 +627,8 @@ function JobDetailContent() {
               </SectionCard>
 
               <ScalePanel jobName={jobName()} tick={statusTick} keyedTasks={keyedTaskNames()} />
+
+              <UsageInputsPanel jobName={jobName()} tick={statusTick} />
 
               {/* Where this job is reachable. Endpoints are derived from the
                   allocations plus health, so this is the honest answer to
