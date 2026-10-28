@@ -512,6 +512,7 @@ How to use it:
 | PR | What it lands | Notes |
 | --- | --- | --- |
 | [#51](https://github.com/mikenomitch/legion/pull/51) | Mesh interfaces: one handler pipeline, a smaller surface, the eBPF kernel classifier, WASM network plugins | Plan [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md); B1 end-to-end plugin overhead still open below |
+| [#57](https://github.com/mikenomitch/legion/pull/57) | Plans only: the autoscaler as a Legion app (autoscaler-v2), and the Legion apps substrate (system worker, granted identities, UI and jobspec extensions, strict unknown fields) | Supersedes autoscaler-plan.md; nothing built. Ecosystem apps → Legion apps substrate and Autoscaler |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -4360,7 +4361,7 @@ replicas is one command on day N. The shared substrate is
 [legion-apps-plan.md](plans/legion-apps-plan.md); each app still needs its own
 plan.
 
-- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (PLANNED) ·
+- [ ] **Legion apps substrate** (plan in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/legion-apps-plan.md) (PLANNED) ·
       [calls](calls/legion-apps-plan_calls.md)
   - [ ] A1: the `legion-system` namespace (bootstrapped, `*` globs skip
         reserved `legion-*` namespaces), node-side `namespaces` restriction on
@@ -4417,7 +4418,7 @@ plan.
         equivalent) and extension points beyond job, group, task, volume,
         port, and service (plan §11)
 
-- [ ] **Autoscaler**: [plan](plans/autoscaler-v2-plan.md) (PLANNED) ·
+- [ ] **Autoscaler** (v2 plan in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (PLANNED) ·
       [calls](calls/autoscaler-v2-plan_calls.md). Supersedes
       [autoscaler-plan.md](plans/autoscaler-plan.md) ·
       [calls](calls/autoscaler-plan_calls.md), whose Phase 1 shipped and is
