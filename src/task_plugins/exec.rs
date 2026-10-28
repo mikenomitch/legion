@@ -520,6 +520,7 @@ impl TaskPlugin for ExecTaskPlugin {
             .command
             .split_first()
             .context("exec task command must include at least one entry")?;
+        let program = &resolve_program(program)?;
 
         let mut linux_options = config.linux_options()?;
         // A gated allocation runs inside its own namespace
@@ -975,6 +976,26 @@ fn chown_tree(path: &Path, uid: u32, gid: u32) -> R<()> {
     Ok(())
 }
 
+/// The program an exec task's `command[0]` names. `legion:self` is the
+/// worker's own executable (docs/apps.md, "Bundled apps"; apps plan calls
+/// entry 12), so a bundled app is always the same build as the node that
+/// runs it, with nothing to download. Everything else is taken as written.
+pub(crate) fn resolve_program(program: &str) -> R<String> {
+    if program != crate::structs::app::SELF_COMMAND {
+        return Ok(program.to_string());
+    }
+    let exe = std::env::current_exe()
+        .context("cannot resolve `legion:self`: this worker cannot find its own executable")?;
+    // Linux names a running binary that was replaced on disk `<path>
+    // (deleted)`; the path itself now holds the replacement, which is what
+    // the node runs from here on.
+    let path = exe.display().to_string();
+    Ok(path
+        .strip_suffix(" (deleted)")
+        .map(str::to_string)
+        .unwrap_or(path))
+}
+
 #[cfg(unix)]
 fn lookup_user(value: &str) -> R<UserSpec> {
     let cstr = CString::new(value).context("exec task user must not contain null bytes")?;
@@ -1126,6 +1147,19 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn legion_self_resolves_to_the_running_executable() -> R<()> {
+        let resolved = resolve_program(crate::structs::app::SELF_COMMAND)?;
+        assert_eq!(
+            std::path::PathBuf::from(&resolved),
+            std::env::current_exe()?,
+            "legion:self is this process's own binary"
+        );
+        assert_eq!(resolve_program("/bin/echo")?, "/bin/echo");
+        assert_eq!(resolve_program("legion")?, "legion");
+        Ok(())
+    }
+
     #[test]
     fn chown_tree_walks_dirs_without_following_symlinks() -> R<()> {
         let temp_dir = tempfile::TempDir::new()?;

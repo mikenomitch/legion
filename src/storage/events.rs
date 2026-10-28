@@ -1429,6 +1429,120 @@ pub mod drafts {
             .meta(json!({ "namespace": name }))
     }
 
+    /// `app.installed` — an app was installed, or a bundled app seeded
+    /// (docs/apps.md). Scoped to the app's job, so whoever may read
+    /// `legion-system/<app>` sees its app events.
+    pub fn app_installed(name: &str, version: &str, source: &str, by: &str) -> EventDraft {
+        EventDraft::info(
+            "app.installed",
+            format!("App {name} {version} installed from {source} by {by}"),
+        )
+        .job(&crate::structs::app::app_job_id(name))
+        .meta(json!({ "app": name, "version": version, "source": source, "by": by }))
+    }
+
+    /// `app.upgraded` — an app's manifest was replaced: by `legion app
+    /// upgrade`, or, for a bundled app, by the manifest of the build its
+    /// nodes moved to.
+    pub fn app_upgraded(
+        name: &str,
+        from: &str,
+        to: &str,
+        added: usize,
+        removed: usize,
+        by: &str,
+    ) -> EventDraft {
+        let permissions = match (added, removed) {
+            (0, 0) => "permissions unchanged".to_string(),
+            (added, removed) => format!("{added} permission(s) added, {removed} removed"),
+        };
+        EventDraft::info(
+            "app.upgraded",
+            format!("App {name} upgraded {from} → {to} by {by}; {permissions}"),
+        )
+        .job(&crate::structs::app::app_job_id(name))
+        .meta(json!({
+            "app": name,
+            "from": from,
+            "to": to,
+            "permissionsAdded": added,
+            "permissionsRemoved": removed,
+            "by": by,
+        }))
+    }
+
+    /// `app.uninstalled` — an app was uninstalled: its job stopped and its
+    /// grants revoked.
+    pub fn app_uninstalled(name: &str, by: &str, revoked_grants: u64) -> EventDraft {
+        EventDraft::info(
+            "app.uninstalled",
+            format!("App {name} uninstalled by {by}; its job was stopped and {revoked_grants} grant(s) revoked"),
+        )
+        .job(&crate::structs::app::app_job_id(name))
+        .meta(json!({ "app": name, "by": by, "revokedGrants": revoked_grants }))
+    }
+
+    /// `app.enabled` / `app.disabled` — an app was enabled or disabled.
+    pub fn app_enabled(name: &str, enabled: bool, by: &str) -> EventDraft {
+        let (kind, verb) = if enabled {
+            ("app.enabled", "enabled")
+        } else {
+            ("app.disabled", "disabled")
+        };
+        EventDraft::info(kind, format!("App {name} {verb} by {by}"))
+            .job(&crate::structs::app::app_job_id(name))
+            .meta(json!({ "app": name, "by": by }))
+    }
+
+    /// `app.config_changed` — an app's config was replaced. `codeFields`
+    /// lists the code fields it touched (the caller's grant was checked).
+    pub fn app_config_changed(name: &str, by: &str, code_fields: &[String]) -> EventDraft {
+        let message = if code_fields.is_empty() {
+            format!("App {name} config changed by {by}")
+        } else {
+            format!(
+                "App {name} config changed by {by}, including code fields {}",
+                code_fields.join(", ")
+            )
+        };
+        EventDraft::info("app.config_changed", message)
+            .job(&crate::structs::app::app_job_id(name))
+            .meta(json!({ "app": name, "by": by, "codeFields": code_fields }))
+    }
+
+    /// `app.reconciled` — the app reconciler changed an app's job:
+    /// `created the job`, `config changed`, `reverted a direct edit by
+    /// userpass:alice`, `stopped (app disabled)`.
+    pub fn app_reconciled(name: &str, action: &str, digest: &str, detail: &str) -> EventDraft {
+        let message = if detail.is_empty() {
+            format!("App {name}: {action}")
+        } else {
+            format!("App {name}: {action} ({detail})")
+        };
+        EventDraft::info("app.reconciled", message)
+            .job(&crate::structs::app::app_job_id(name))
+            .meta(json!({ "app": name, "action": action, "digest": digest, "detail": detail }))
+    }
+
+    /// `app.reconcile_failed` — the app reconciler could not bring an app's
+    /// job in line with its record. `refused` is a submit the manager
+    /// refused (validation, grant, quota), which waits for the next change
+    /// instead of retrying; otherwise it retries with backoff, and this
+    /// event repeats at most every 10 minutes.
+    pub fn app_reconcile_failed(name: &str, error: &str, refused: bool) -> EventDraft {
+        let what = if refused {
+            "refused; waiting for a change to the app or the cluster"
+        } else {
+            "failing; retrying with backoff"
+        };
+        EventDraft::warn(
+            "app.reconcile_failed",
+            format!("App {name}: reconcile {what}: {error}"),
+        )
+        .job(&crate::structs::app::app_job_id(name))
+        .meta(json!({ "app": name, "error": error, "refused": refused }))
+    }
+
     /// A namespace was deleted.
     pub fn namespace_deleted(name: &str) -> EventDraft {
         EventDraft::info("namespace.deleted", format!("Namespace {name} deleted"))
@@ -2597,6 +2711,42 @@ impl EventRecorder<'_> {
 
     pub fn namespace_deleted(self, name: &str) {
         self.emit(drafts::namespace_deleted(name));
+    }
+
+    pub fn app_installed(self, name: &str, version: &str, source: &str, by: &str) {
+        self.emit(drafts::app_installed(name, version, source, by));
+    }
+
+    pub fn app_upgraded(
+        self,
+        name: &str,
+        from: &str,
+        to: &str,
+        added: usize,
+        removed: usize,
+        by: &str,
+    ) {
+        self.emit(drafts::app_upgraded(name, from, to, added, removed, by));
+    }
+
+    pub fn app_uninstalled(self, name: &str, by: &str, revoked_grants: u64) {
+        self.emit(drafts::app_uninstalled(name, by, revoked_grants));
+    }
+
+    pub fn app_enabled(self, name: &str, enabled: bool, by: &str) {
+        self.emit(drafts::app_enabled(name, enabled, by));
+    }
+
+    pub fn app_config_changed(self, name: &str, by: &str, code_fields: &[String]) {
+        self.emit(drafts::app_config_changed(name, by, code_fields));
+    }
+
+    pub fn app_reconciled(self, name: &str, action: &str, digest: &str, detail: &str) {
+        self.emit(drafts::app_reconciled(name, action, digest, detail));
+    }
+
+    pub fn app_reconcile_failed(self, name: &str, error: &str, refused: bool) {
+        self.emit(drafts::app_reconcile_failed(name, error, refused));
     }
 
     pub fn volume_mounted(self, volume: &crate::structs::Volume, node_id: &str, path: &str) {

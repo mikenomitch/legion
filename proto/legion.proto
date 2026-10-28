@@ -12286,6 +12286,10 @@ message UpgradeAppRequest {
 
   // Optional key to dedupe retries.
   optional string idempotency_key = 6;
+
+  // The config to run the new manifest with, as JSON. Unset keeps the
+  // stored config, which must then match the new manifest's schema.
+  optional string config_json = 7;
 }
 
 // How an upgrade changes an app's grant.

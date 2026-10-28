@@ -764,6 +764,8 @@ pub struct Metrics {
     pub eval_conflict_requeues_total: Arc<Counter>,
     /// `legion_evals_blocked{key_kind}`
     pub evals_blocked: Arc<GaugeVec>,
+    /// `legion_apps{status}` (docs/apps.md, "Health and visibility")
+    pub apps: Arc<GaugeVec>,
     /// `legion_gang_blocked_jobs`
     pub gang_blocked_jobs: Arc<Gauge>,
     /// `legion_gang_outcomes_total{outcome}`
@@ -1088,6 +1090,14 @@ impl Metrics {
                 name: "legion_evals_blocked",
                 help: "Evals waiting blocked on capacity, by the kind of key they wait under: `class` (a pool and pinned attributes), `node` (a resume pinned to the node holding its checkpoint), `escaped` (no schedulable node at all). Set by the scheduler-lane leader's wake pass; zero elsewhere.",
                 labels: &["key_kind"],
+            },
+            series: Series::new(),
+        });
+        let apps = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_apps",
+                help: "Installed apps by status: `running`, `degraded`, `pending`, `stopped` (docs/apps.md). Set by the control-lane leader's app reconciler after each pass; zero elsewhere. A `stopped` bundled app is worth a look: Legion's own add-ons are not running.",
+                labels: &["status"],
             },
             series: Series::new(),
         });
@@ -1960,6 +1970,7 @@ impl Metrics {
             Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
+            Arc::clone(&apps) as Arc<dyn RenderMetric>,
             Arc::clone(&gang_blocked_jobs) as Arc<dyn RenderMetric>,
             Arc::clone(&gang_outcomes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
@@ -2034,6 +2045,7 @@ impl Metrics {
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
             evals_blocked,
+            apps,
             gang_blocked_jobs,
             gang_outcomes_total,
             evals_unblocked_total,
@@ -3601,6 +3613,7 @@ mod tests {
         metrics().store_write_lock_wait_seconds.observe(0.002);
         let out = render();
         for family in [
+            "legion_apps",
             "legion_allocations",
             "legion_namespace_jobs",
             "legion_namespace_allocations",

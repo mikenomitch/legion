@@ -2,6 +2,7 @@
 
 pub mod acl;
 pub mod action;
+pub mod app;
 pub mod boot_ticket;
 pub mod capabilities;
 pub mod docs;
@@ -60,6 +61,7 @@ fn base_cli() -> Command {
         .subcommand(mcp::config())
         .subcommand(docs::config())
         .subcommand(job::config())
+        .subcommand(app::config())
         .subcommand(namespace::config())
         .subcommand(template::config())
         .subcommand(instance::config())
@@ -106,6 +108,8 @@ mod tests {
         "legion start gateway",
         "legion join",
         "legion mcp serve",
+        // The in-task entrypoint of a bundled app: a long-running process.
+        "legion app run",
         "legion guest-agent",
         "legion guest-resume",
     ];

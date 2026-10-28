@@ -345,8 +345,12 @@ impl AppManifest {
         let schema = self.config_schema();
         let compiled = compile_config_schema(&schema)
             .map_err(|err| format!("app {}: config.schema: {err}", self.name))?;
-        check_config(&compiled, &self.default_config())
-            .map_err(|err| format!("app {}: config.default does not match config.schema: {err}", self.name))?;
+        check_config(&compiled, &self.default_config()).map_err(|err| {
+            format!(
+                "app {}: config.default does not match config.schema: {err}",
+                self.name
+            )
+        })?;
         for field in &self.code_fields {
             validate_pointer(field.pointer())
                 .map_err(|err| format!("app {}: codeFields: {err}", self.name))?;
@@ -870,11 +874,7 @@ fn encode_segment(segment: &str) -> String {
 /// Every value at `pointer` in `config`, with its concrete pointer. A `*`
 /// segment matches every key of an object and every element of an array.
 pub fn values_at(config: &Value, pointer: &str) -> Vec<(String, Value)> {
-    let segments: Vec<String> = pointer
-        .split('/')
-        .skip(1)
-        .map(decode_segment)
-        .collect();
+    let segments: Vec<String> = pointer.split('/').skip(1).map(decode_segment).collect();
     let mut found = Vec::new();
     collect_at(config, &segments, String::new(), &mut found);
     found
@@ -937,16 +937,16 @@ pub fn changed_code_fields(manifest: &AppManifest, before: &Value, after: &Value
 /// sibling `checksum` string as its checksum.
 pub fn code_field_artifacts(manifest: &AppManifest, config: &Value) -> Vec<Value> {
     let mut artifacts = Vec::new();
-    for field in manifest.code_fields.iter().filter(|field| field.is_artifact()) {
+    for field in manifest
+        .code_fields
+        .iter()
+        .filter(|field| field.is_artifact())
+    {
         for (pointer, value) in values_at(config, field.pointer()) {
             let Some(source) = value.as_str().filter(|source| !source.trim().is_empty()) else {
                 continue;
             };
-            let segments: Vec<String> = pointer
-                .split('/')
-                .skip(1)
-                .map(decode_segment)
-                .collect();
+            let segments: Vec<String> = pointer.split('/').skip(1).map(decode_segment).collect();
             let parent = &segments[..segments.len().saturating_sub(1)];
             let dest: Vec<String> = parent
                 .iter()
@@ -989,8 +989,10 @@ pub fn canonical_json(value: &Value) -> String {
     fn sorted(value: &Value) -> Value {
         match value {
             Value::Object(map) => {
-                let ordered: BTreeMap<&String, Value> =
-                    map.iter().map(|(key, value)| (key, sorted(value))).collect();
+                let ordered: BTreeMap<&String, Value> = map
+                    .iter()
+                    .map(|(key, value)| (key, sorted(value)))
+                    .collect();
                 let mut out = Map::new();
                 for (key, value) in ordered {
                     out.insert(key.clone(), value);
@@ -1010,7 +1012,10 @@ pub fn canonical_json(value: &Value) -> String {
 pub fn digest_value(value: &Value) -> String {
     use sha2::Digest;
     let bytes = sha2::Sha256::digest(canonical_json(value).as_bytes());
-    bytes[..16].iter().map(|byte| format!("{byte:02x}")).collect()
+    bytes[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Call `f` on every task object of a jobspec (`task`, a `tasks` list, or a
@@ -1136,13 +1141,20 @@ pub fn render_app_job(record: &AppRecord, ctx: RenderContext<'_>) -> Result<Rend
     let manifest = &record.manifest;
     let mut job = manifest.job.clone();
     let Some(object) = job.as_object_mut() else {
-        return Err(format!("app {}: the manifest's job is not a record", record.name));
+        return Err(format!(
+            "app {}: the manifest's job is not a record",
+            record.name
+        ));
     };
     object.insert("name".into(), json!(record.name));
     object.insert("namespace".into(), json!(SYSTEM_NAMESPACE));
 
     let (permit, placement_constraints, placement_affinities) = placement_rules(&record.settings);
-    let marker = if record.is_bundled() { ctx.marker } else { None };
+    let marker = if record.is_bundled() {
+        ctx.marker
+    } else {
+        None
+    };
     let config_json = canonical_json(&record.config);
     let artifacts = code_field_artifacts(manifest, &record.config);
     let grant_rules = serde_json::to_value(&record.grant.rules).map_err(|err| err.to_string())?;
@@ -1164,9 +1176,7 @@ pub fn render_app_job(record: &AppRecord, ctx: RenderContext<'_>) -> Result<Rend
         }
 
         if let Some(resources) = record.settings.resources {
-            let entry = task
-                .entry("resources")
-                .or_insert_with(|| json!({}));
+            let entry = task.entry("resources").or_insert_with(|| json!({}));
             if !entry.is_object() {
                 *entry = json!({});
             }
@@ -1304,7 +1314,10 @@ pub struct MarkerDecision {
 ///   newest build;
 /// - with no usable node there is no new information: the marker stays
 ///   (`None` on a fresh cluster).
-pub fn decide_build_marker(current: Option<&BuildMarker>, eligible: &[NodeBuild]) -> MarkerDecision {
+pub fn decide_build_marker(
+    current: Option<&BuildMarker>,
+    eligible: &[NodeBuild],
+) -> MarkerDecision {
     let usable: Vec<(&NodeBuild, BuildMarker)> = eligible
         .iter()
         .filter_map(|node| node.usable().map(|build| (node, build)))
@@ -1478,7 +1491,9 @@ pub fn install_prompt(manifest: &AppManifest, app_user: &str) -> Vec<String> {
         users.join(" and ")
     )];
     if manifest.permissions.is_empty() {
-        lines.push(format!("in {SYSTEM_NAMESPACE}, and asks for no permissions."));
+        lines.push(format!(
+            "in {SYSTEM_NAMESPACE}, and asks for no permissions."
+        ));
     } else {
         lines.push(format!("in {SYSTEM_NAMESPACE}, and asks for:"));
         for rule in &manifest.permissions {
@@ -1604,7 +1619,10 @@ mod app_tests {
                 json!({ "job": { "name": "other", "task": { "runtime": "noop", "config": {} } } }),
                 "job.name is set by Legion",
             ),
-            (json!({ "job": { "priority": "high" } }), "`task` or `tasks`"),
+            (
+                json!({ "job": { "priority": "high" } }),
+                "`task` or `tasks`",
+            ),
             (
                 json!({ "permissions": [{ "resources": ["jobs"], "actions": ["read"] }] }),
                 "unknown resource",
@@ -1620,7 +1638,10 @@ mod app_tests {
                 } }),
                 "config.default does not match",
             ),
-            (json!({ "codeFields": ["plugins/*/url"] }), "not a JSON pointer"),
+            (
+                json!({ "codeFields": ["plugins/*/url"] }),
+                "not a JSON pointer",
+            ),
         ];
         for (extra, expected) in cases {
             let err = manifest(extra.clone())
@@ -1682,21 +1703,33 @@ mod app_tests {
 
         let mut changed = record.clone();
         changed.config = json!({ "repos": ["x"] });
-        assert_ne!(render_app_job(&changed, NO_MARKER).unwrap().digest, first.digest);
+        assert_ne!(
+            render_app_job(&changed, NO_MARKER).unwrap().digest,
+            first.digest
+        );
 
         let mut changed = record.clone();
         changed.settings.placement = Placement::Any;
-        assert_ne!(render_app_job(&changed, NO_MARKER).unwrap().digest, first.digest);
+        assert_ne!(
+            render_app_job(&changed, NO_MARKER).unwrap().digest,
+            first.digest
+        );
 
         let mut changed = record.clone();
         changed.grant.rules.pop();
-        assert_ne!(render_app_job(&changed, NO_MARKER).unwrap().digest, first.digest);
+        assert_ne!(
+            render_app_job(&changed, NO_MARKER).unwrap().digest,
+            first.digest
+        );
 
         // Bookkeeping is not an input.
         let mut changed = record.clone();
         changed.state.last_action = "anything".into();
         changed.updated_at = "later".into();
-        assert_eq!(render_app_job(&changed, NO_MARKER).unwrap().digest, first.digest);
+        assert_eq!(
+            render_app_job(&changed, NO_MARKER).unwrap().digest,
+            first.digest
+        );
     }
 
     #[test]
@@ -1812,11 +1845,17 @@ mod app_tests {
         assert_eq!(none.marker, None);
         assert!(none.reason.contains("waiting for an eligible node"));
 
-        let agreed = decide_build_marker(None, &[node("m1", "0.14.0", "a"), node("m2", "0.14.0", "a")]);
+        let agreed = decide_build_marker(
+            None,
+            &[node("m1", "0.14.0", "a"), node("m2", "0.14.0", "a")],
+        );
         assert_eq!(agreed.marker, Some(marker("0.14.0", "a")));
         assert!(agreed.reason.is_empty());
 
-        let split = decide_build_marker(None, &[node("m1", "0.14.0", "a"), node("m2", "0.15.0", "b")]);
+        let split = decide_build_marker(
+            None,
+            &[node("m1", "0.14.0", "a"), node("m2", "0.15.0", "b")],
+        );
         assert_eq!(split.marker, None);
         assert!(split.reason.contains("agree"), "{}", split.reason);
     }
@@ -1839,7 +1878,11 @@ mod app_tests {
             }
             if index < 2 {
                 assert_eq!(decision.marker, Some(old.clone()));
-                assert!(decision.reason.starts_with("upgrade waiting"), "{}", decision.reason);
+                assert!(
+                    decision.reason.starts_with("upgrade waiting"),
+                    "{}",
+                    decision.reason
+                );
             }
             current = decision.marker;
         }
@@ -1937,7 +1980,10 @@ mod app_tests {
             ),
             "{prompt}"
         );
-        assert_eq!(with_ui.ui_slots(), vec!["nav".to_string(), "job".to_string()]);
+        assert_eq!(
+            with_ui.ui_slots(),
+            vec!["nav".to_string(), "job".to_string()]
+        );
     }
 
     #[test]

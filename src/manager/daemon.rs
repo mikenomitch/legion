@@ -619,13 +619,31 @@ pub async fn run_manager_with(
     // Follower-side forwarding of rejected writes to the raft leader
     // (docs/raft-operations.md, "Writes on any manager").
     let leader_forward = crate::manager::leader_forward::LeaderForwardLayer::new(store.clone());
-    let manager_node = ManagerDaemonService::with_manager_config(store, &full_config)
-        .with_workload_identity(workload_identity_state.clone())
-        .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
-        .with_authenticator(authenticator)
-        .with_advertise_addr(full_config.server.advertised_address())
-        .with_join_address_warning(full_config.server.loopback_join_address_warning())
-        .with_manager_id(manager_node_id.clone());
+    let manager_node = Arc::new(
+        ManagerDaemonService::with_manager_config(store, &full_config)
+            .with_workload_identity(workload_identity_state.clone())
+            .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
+            .with_authenticator(authenticator)
+            .with_advertise_addr(full_config.server.advertised_address())
+            .with_join_address_warning(full_config.server.loopback_join_address_warning())
+            .with_manager_id(manager_node_id.clone()),
+    );
+    // The app reconciler (docs/apps.md): seeds bundled apps and keeps every
+    // app's job matching its record while this manager leads the Control
+    // lane. It submits through this same service, as RunJob does.
+    // This build's id hashes the executable: once, off the runtime.
+    let own_build = tokio::task::spawn_blocking(crate::util::own_build)
+        .await
+        .context("hashing this binary for its build id")?;
+    let app_nudge = crate::manager::apps::spawn_reconciler(
+        manager_node.clone(),
+        crate::manager::apps::ReconcilerSettings {
+            app_user: full_config.system_worker.app_user.clone(),
+            seed: full_config.apps.clone(),
+            own_build,
+        },
+    );
+    manager_node.set_app_nudge(app_nudge);
 
     let addr: std::net::SocketAddr =
         format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
@@ -705,7 +723,7 @@ pub async fn run_manager_with(
     // 200 bytes each); tonic's 4 MiB default would cap a node near 20,000
     // sessions. 64 MiB covers about 300,000 (session durability plan §6.5).
     let manager_service =
-        ManagerServer::new(manager_node).max_decoding_message_size(MANAGER_MAX_DECODE_BYTES);
+        ManagerServer::from_arc(manager_node).max_decoding_message_size(MANAGER_MAX_DECODE_BYTES);
     // Browser origins (docs/ui-architecture.md): loopback plus
     // `server.allowedOrigins`. The guard refuses everything else before any
     // handler runs; CORS only echoes the allowed origin back.

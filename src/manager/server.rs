@@ -66,7 +66,7 @@ use crate::structs::{
     ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
     ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply,
     ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
-    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, ManagerMember,
+    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, ManagedByInfo, ManagerMember,
     MintExecTicketReply, MintExecTicketRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
     PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
     QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
@@ -125,6 +125,7 @@ use tonic::transport::Channel;
 use tonic::{Request, Response, Status, Streaming};
 
 // Phase 6: ForkInstance, `from_snapshot` creates, and snapshot names.
+mod app_rpcs;
 mod checkpoint_support;
 mod fork_rpcs;
 mod make_room;
@@ -430,6 +431,21 @@ pub fn protocol_compat(worker_pv: u32, manager_pv: u32) -> VersionCompat {
 }
 
 /// Outcome of `submit_rendered_job`, shared by RunJob and RunJobTemplate.
+/// Who a stored job version is recorded as coming from
+/// ([`ManagerDaemonService::submit_rendered_job_from`]).
+pub(crate) enum SubmitOrigin {
+    /// The calling principal (RunJob, RunJobTemplate): its grant is the
+    /// caller's, and the version carries no `managedBy` stamp.
+    Principal,
+    /// The app reconciler, for an app (docs/apps.md): the version's grant
+    /// is recorded in `granted_by`'s name (who approved the app's grant),
+    /// and the version is stamped `managedBy`.
+    App {
+        granted_by: String,
+        managed_by: crate::structs::app::ManagedBy,
+    },
+}
+
 struct SubmittedJob {
     message: &'static str,
     job_name: String,
@@ -1922,6 +1938,13 @@ pub struct ManagerDaemonService {
     /// than a target, and `GetSchedulerConcurrency` reports it as such even
     /// when this manager does not lead the scheduler lane.
     eval_threads: usize,
+    /// `systemWorker.appUser`: the user apps' exec tasks run as when their
+    /// manifest names none (docs/apps.md).
+    app_user: String,
+    /// Wakes this manager's app reconciler after an app write; unset in a
+    /// service with no reconciler (tests, embedding), where writes simply
+    /// wait for whoever reconciles.
+    app_nudge: Arc<std::sync::OnceLock<crate::manager::apps::AppNudge>>,
 }
 
 /// Distinct merged policy bodies kept in memory.
@@ -1969,6 +1992,8 @@ impl ManagerDaemonService {
             stream_reauth_interval: acl::STREAM_REAUTH_INTERVAL,
             usage: Arc::new(Mutex::new(crate::manager::usage::UsageTable::default())),
             eval_threads: 1,
+            app_user: crate::structs::config::DEF_SYSTEM_WORKER_APP_USER.to_string(),
+            app_nudge: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -2213,6 +2238,30 @@ impl ManagerDaemonService {
         Ok(paths)
     }
 
+    /// [`Self::submit_rendered_job_from`] for a principal's submit.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_rendered_job(
+        &self,
+        identity: &AclIdentity,
+        js: &str,
+        subs: Vec<Submission>,
+        priority: Option<i64>,
+        force_reschedule: bool,
+        template: Option<&JobTemplateProvenance>,
+        namespace: Option<&str>,
+    ) -> Result<SubmittedJob, Status> {
+        self.submit_rendered_job_from(
+            identity,
+            js,
+            subs,
+            priority,
+            force_reschedule,
+            template,
+            namespace,
+            SubmitOrigin::Principal,
+        )
+    }
+
     /// Everything RunJob does once it holds a rendered jobspec, shared with
     /// RunJobTemplate so both submission paths behave identically: KV
     /// reference resolution, precise ACL enforcement, the template collision
@@ -2220,7 +2269,7 @@ impl ManagerDaemonService {
     /// provenance), status clears, KV-ref bookkeeping, keyed-instance
     /// seeding, and rollout/eval enqueueing.
     #[allow(clippy::too_many_arguments)]
-    fn submit_rendered_job(
+    fn submit_rendered_job_from(
         &self,
         identity: &AclIdentity,
         js: &str,
@@ -2233,6 +2282,8 @@ impl ManagerDaemonService {
         template: Option<&JobTemplateProvenance>,
         // The request's namespace (`-n`); resolved against the jobspec's own.
         namespace: Option<&str>,
+        // Who the stored version is recorded as coming from.
+        origin: SubmitOrigin,
     ) -> Result<SubmittedJob, Status> {
         if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
             subs.push(Submission {
@@ -2345,10 +2396,19 @@ impl ManagerDaemonService {
         // The version's grant is recorded in the submitter's name, in the
         // same entry as the version (`enforce_identity_grants` above checked
         // they hold it).
-        let submit_outcome = self
-            .store
-            .handle_job_submit_as(&config, &subs, template, &identity.principal)
-            .map_err(|e| map_store_error("Error running job", e))?;
+        let submit_outcome = match origin {
+            SubmitOrigin::Principal => {
+                self.store
+                    .handle_job_submit_as(&config, &subs, template, &identity.principal)
+            }
+            SubmitOrigin::App {
+                granted_by,
+                managed_by,
+            } => self
+                .store
+                .handle_job_submit_managed(&config, &subs, &granted_by, managed_by),
+        }
+        .map_err(|e| map_store_error("Error running job", e))?;
         crate::manager::telemetry::metrics()
             .job_submits_total
             .inc(&[&namespace]);
@@ -3237,6 +3297,7 @@ impl ManagerDaemonService {
         service.heartbeat = config.heartbeat.clone();
         service.eval_threads = config.eval_threads.max(1);
         service.edge_boot = config.edge_boot.clone();
+        service.app_user = config.system_worker.app_user.clone();
         service
     }
 
@@ -4999,9 +5060,18 @@ impl Manager for ManagerDaemonService {
             .map(reschedule_backoff_info)
             .collect();
 
+        let managed_by = self
+            .store
+            .job_managed_by(&name)
+            .map_err(|e| map_store_error("Error loading the job's app stamp", e))?
+            .map(|stamp| ManagedByInfo {
+                app: stamp.app,
+                digest: stamp.digest,
+            });
         let reply = GetJobInfoReply {
             job: Some(job),
             template,
+            managed_by,
         };
 
         Ok(Response::new(reply))
@@ -11840,6 +11910,62 @@ impl Manager for ManagerDaemonService {
         }))
     }
 
+    async fn list_apps(
+        &self,
+        request: Request<crate::structs::ListAppsRequest>,
+    ) -> Result<Response<crate::structs::ListAppsReply>, Status> {
+        self.list_apps_rpc(request).await
+    }
+
+    async fn get_app(
+        &self,
+        request: Request<crate::structs::GetAppRequest>,
+    ) -> Result<Response<crate::structs::GetAppReply>, Status> {
+        self.get_app_rpc(request).await
+    }
+
+    async fn install_app(
+        &self,
+        request: Request<crate::structs::InstallAppRequest>,
+    ) -> Result<Response<crate::structs::InstallAppReply>, Status> {
+        self.install_app_rpc(request).await
+    }
+
+    async fn upgrade_app(
+        &self,
+        request: Request<crate::structs::UpgradeAppRequest>,
+    ) -> Result<Response<crate::structs::UpgradeAppReply>, Status> {
+        self.upgrade_app_rpc(request).await
+    }
+
+    async fn uninstall_app(
+        &self,
+        request: Request<crate::structs::UninstallAppRequest>,
+    ) -> Result<Response<crate::structs::UninstallAppReply>, Status> {
+        self.uninstall_app_rpc(request).await
+    }
+
+    async fn set_app_enabled(
+        &self,
+        request: Request<crate::structs::SetAppEnabledRequest>,
+    ) -> Result<Response<crate::structs::SetAppEnabledReply>, Status> {
+        self.set_app_enabled_rpc(request).await
+    }
+
+    async fn update_app_settings(
+        &self,
+        request: Request<crate::structs::UpdateAppSettingsRequest>,
+    ) -> Result<Response<crate::structs::UpdateAppSettingsReply>, Status> {
+        self.update_app_settings_rpc(request).await
+    }
+
+    async fn set_app_config(
+        &self,
+        request: Request<crate::structs::SetAppConfigRequest>,
+    ) -> Result<Response<crate::structs::SetAppConfigReply>, Status> {
+        self.set_app_config_rpc(request).await
+    }
+
     #[instrument(skip_all, fields(job))]
     async fn revoke_grant(
         &self,
@@ -13105,6 +13231,12 @@ fn template_eval_status(err: anyhow::Error) -> Status {
 /// possible.
 /// `block_in_place` needs the multi-thread runtime; current-thread callers
 /// (tests) run inline.
+/// [`run_blocking_admission`] for the manager's own loops (the app
+/// reconciler submits through the same blocking path RunJob takes).
+pub(crate) fn run_blocking<T>(work: impl FnOnce() -> T) -> T {
+    run_blocking_admission(work)
+}
+
 fn run_blocking_admission<T>(work: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {

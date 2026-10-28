@@ -2994,6 +2994,19 @@ async fn heartbeat_tick(
                     &allocation.task_name,
                     &allocation.task_runtime,
                 );
+            // An app's config file is named relative to its task
+            // directory; the task gets the path in its own view.
+            if let Err(err) = crate::worker::identity::resolve_app_config_env(
+                &mut allocation.task_config,
+                delivery_base.as_ref(),
+            ) {
+                failed_prepare.push(allocation.allocation_id);
+                task_manager
+                    .lock()
+                    .expect("task manager")
+                    .record_failure(allocation.allocation_id, format!("{err:#}"));
+                continue;
+            }
             match identity_manager
                 .prepare_task_allocation(allocation, delivery_base)
                 .await

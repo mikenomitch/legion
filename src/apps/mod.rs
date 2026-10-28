@@ -1,0 +1,541 @@
+//! Apps from the inside (docs/apps.md, "Bundled apps" and "Writing an
+//! app"): the apps compiled into the binary, and `legion app run <name>`,
+//! the entrypoint their tasks run.
+//!
+//! A bundled app's job runs `command = ["legion:self", "app", "run",
+//! "<name>"]`: the exec runtime resolves `legion:self` to the worker's own
+//! executable (apps plan calls entry 12), so the app is always the same
+//! build as the node that runs it. [`run_app`] is what that command does:
+//!
+//! - read the app's config from `$LEGION_APP_CONFIG` (the file the app
+//!   reconciler renders into the job, resolved by the worker to a path the
+//!   task can open);
+//! - serve the app's HTTP port (`$LEGION_ADDR_API`, the manifest's `api`
+//!   port) with `/healthz`, answering from the health the app body sets;
+//! - hand the body an [`AppContext`] that connects to Legion through
+//!   `LEGION_ADDR` (the allocation's API socket, authenticated as the app's
+//!   `legion` identity);
+//! - stop the body on SIGTERM or SIGINT, giving it a grace period.
+//!
+//! **Adding a bundled app** is one entry in [`BUNDLED`]: its manifest (a
+//! Nickel file under `src/apps/bundled/`) and its body, an async function
+//! from [`AppContext`] to a result. The manifest is validated by a unit test
+//! below, and seeded on clusters by the first Control leader.
+
+pub mod autoscaler;
+
+use crate::prelude::*;
+use crate::structs::app::{AppManifest, APP_CONFIG_ENV, APP_NAME_ENV};
+use std::future::Future;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// How long a body has to finish after a stop signal before the process
+/// exits anyway. Under the worker's default kill timeout, so the app exits
+/// on its own terms.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// The port name an app's HTTP listener binds (`$LEGION_ADDR_API`,
+/// `$LEGION_PORT_API`).
+pub const APP_PORT_NAME: &str = "api";
+
+/// What an app body returns.
+pub type AppFuture = Pin<Box<dyn Future<Output = R<()>> + Send>>;
+
+/// An app body: started once, after config and the HTTP port are up. It
+/// should return when [`AppContext::stopped`] resolves.
+pub type AppBody = fn(AppContext) -> AppFuture;
+
+/// One app compiled into the binary.
+pub struct BundledApp {
+    pub name: &'static str,
+    /// The manifest, in Nickel, evaluated once per process with imports
+    /// refused.
+    pub manifest_source: &'static str,
+    pub body: AppBody,
+}
+
+/// Every bundled app. The first Control leader seeds a record for each
+/// (enabled unless the manager config's `apps` block says otherwise), with
+/// its manifest's permissions granted by `legion:bootstrap`.
+pub const BUNDLED: &[BundledApp] = &[BundledApp {
+    name: "autoscaler",
+    manifest_source: include_str!("bundled/autoscaler.ncl"),
+    body: autoscaler::run,
+}];
+
+/// The bundled manifests, evaluated and validated once.
+fn evaluated() -> &'static Result<Vec<AppManifest>, String> {
+    static MANIFESTS: OnceLock<Result<Vec<AppManifest>, String>> = OnceLock::new();
+    MANIFESTS.get_or_init(|| {
+        BUNDLED
+            .iter()
+            .map(|app| {
+                let json = crate::config_lang::eval_sandboxed(
+                    &format!("bundled/{}.ncl", app.name),
+                    app.manifest_source,
+                    None,
+                )
+                .map_err(|err| format!("bundled app {}: {err:#}", app.name))?;
+                let manifest = AppManifest::from_json(&json)
+                    .map_err(|err| format!("bundled app {}: {err}", app.name))?;
+                manifest.validate(true)?;
+                if manifest.name != app.name {
+                    return Err(format!(
+                        "bundled app {} has a manifest named {}",
+                        app.name, manifest.name
+                    ));
+                }
+                Ok(manifest)
+            })
+            .collect()
+    })
+}
+
+/// The manifests compiled into this binary. An error is a build defect,
+/// which the unit tests catch; callers log it and carry on without apps.
+pub fn bundled_manifests() -> R<&'static [AppManifest]> {
+    evaluated()
+        .as_ref()
+        .map(Vec::as_slice)
+        .map_err(|err| anyhow!("{err}"))
+}
+
+/// The manifest of bundled app `name`, if this binary has one.
+pub fn bundled_manifest(name: &str) -> Option<&'static AppManifest> {
+    bundled_manifests()
+        .ok()?
+        .iter()
+        .find(|manifest| manifest.name == name)
+}
+
+/// Whether `name` is a bundled app's (installed apps may not take it).
+pub fn is_bundled(name: &str) -> bool {
+    BUNDLED.iter().any(|app| app.name == name)
+}
+
+/// The health an app reports on `/healthz`.
+#[derive(Debug, Clone)]
+struct Health {
+    healthy: bool,
+    detail: String,
+}
+
+/// What an app body gets: its name, config, health, a way to reach
+/// Legion, and the stop signal.
+#[derive(Clone)]
+pub struct AppContext {
+    name: String,
+    config: Value,
+    config_path: Option<PathBuf>,
+    listen: SocketAddr,
+    health: Arc<std::sync::RwLock<Health>>,
+    stop: tokio::sync::watch::Receiver<bool>,
+}
+
+impl AppContext {
+    /// The app's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The app's config: what `legion app config set` stored, validated
+    /// against the manifest's schema.
+    pub fn config(&self) -> &Value {
+        &self.config
+    }
+
+    /// Where the config was read from (`None` when the task had no
+    /// `$LEGION_APP_CONFIG` and the manifest's default was used).
+    pub fn config_path(&self) -> Option<&std::path::Path> {
+        self.config_path.as_deref()
+    }
+
+    /// The address the app's HTTP port listens on.
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.listen
+    }
+
+    /// The manager address the client uses: `LEGION_ADDR`, which the worker
+    /// sets to the allocation's API socket when workload identity is on.
+    /// `None` when it is unset, and the app has no Legion credentials.
+    pub fn legion_addr(&self) -> Option<String> {
+        std::env::var("LEGION_ADDR")
+            .ok()
+            .filter(|addr| !addr.trim().is_empty())
+    }
+
+    /// A Legion client, authenticated as the app's `legion` identity by the
+    /// worker behind the API socket. Errors when the task has no
+    /// `LEGION_ADDR`.
+    pub async fn client(&self) -> R<crate::cmd::helpers::AuthedManagerClient> {
+        if self.legion_addr().is_none() {
+            bail!(
+                "LEGION_ADDR is not set: the app has no way to reach Legion (turn on \
+                 workloadIdentity.enabled on the managers so its `legion` identity gets an API \
+                 socket)"
+            );
+        }
+        crate::cmd::helpers::connect_manager_client().await
+    }
+
+    /// Report health on `/healthz`: 200 when healthy, 503 otherwise, with
+    /// `detail` as the body.
+    pub fn set_health(&self, healthy: bool, detail: impl Into<String>) {
+        if let Ok(mut health) = self.health.write() {
+            *health = Health {
+                healthy,
+                detail: detail.into(),
+            };
+        }
+    }
+
+    /// Whether a stop was requested.
+    pub fn stopping(&self) -> bool {
+        *self.stop.borrow()
+    }
+
+    /// Resolves when the app is asked to stop (SIGTERM or SIGINT).
+    pub async fn stopped(&mut self) {
+        while !*self.stop.borrow() {
+            if self.stop.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// `legion app run` arguments.
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    /// Listen here instead of `$LEGION_ADDR_API`.
+    pub listen: Option<String>,
+    /// Read the config here instead of `$LEGION_APP_CONFIG`.
+    pub config: Option<PathBuf>,
+}
+
+/// The config file path: the option, else `$LEGION_APP_CONFIG`, resolved
+/// against `$LEGION_TASK_DIR` when relative (the worker resolves it already;
+/// this keeps a hand-run app working too).
+fn config_path(options: &RunOptions) -> Option<PathBuf> {
+    if let Some(path) = &options.config {
+        return Some(path.clone());
+    }
+    let raw = std::env::var(APP_CONFIG_ENV).ok()?;
+    let path = PathBuf::from(raw.trim());
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    if path.is_absolute() {
+        return Some(path);
+    }
+    match std::env::var("LEGION_TASK_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => Some(PathBuf::from(dir).join(path)),
+        _ => Some(path),
+    }
+}
+
+/// The listen address: the option, else `$LEGION_ADDR_API`, else
+/// `127.0.0.1:$LEGION_PORT_API`, else an ephemeral loopback port.
+fn listen_addr(options: &RunOptions) -> R<SocketAddr> {
+    let port_env = APP_PORT_NAME.to_ascii_uppercase();
+    let raw = options
+        .listen
+        .clone()
+        .or_else(|| std::env::var(format!("LEGION_ADDR_{port_env}")).ok())
+        .or_else(|| {
+            std::env::var(format!("LEGION_PORT_{port_env}"))
+                .ok()
+                .map(|port| format!("127.0.0.1:{}", port.trim()))
+        })
+        .unwrap_or_else(|| "127.0.0.1:0".to_string());
+    raw.trim()
+        .parse()
+        .with_context(|| format!("invalid listen address {raw:?}"))
+}
+
+/// `legion app run <name>`: run bundled app `name` in this process until it
+/// returns or is told to stop.
+pub async fn run_app(name: &str, options: RunOptions) -> R<()> {
+    let Some(app) = BUNDLED.iter().find(|app| app.name == name) else {
+        let known: Vec<&str> = BUNDLED.iter().map(|app| app.name).collect();
+        bail!(
+            "`legion app run` runs the apps bundled with Legion ({}); {name:?} is not one",
+            known.join(", ")
+        );
+    };
+    let manifest = bundled_manifest(name)
+        .with_context(|| format!("bundled app {name} has no valid manifest in this build"))?;
+
+    let path = config_path(&options);
+    let config = match &path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read the app config {}", path.display()))?;
+            serde_json::from_str(&text)
+                .with_context(|| format!("the app config {} is not JSON", path.display()))?
+        }
+        None => {
+            warn!(
+                app = name,
+                "{APP_CONFIG_ENV} is not set; running with the manifest's default config"
+            );
+            manifest.default_config()
+        }
+    };
+    crate::structs::app::validate_app_config(manifest, &config)
+        .map_err(|err| anyhow!("the app config does not match {name}'s schema: {err}"))?;
+
+    let listener = tokio::net::TcpListener::bind(listen_addr(&options)?)
+        .await
+        .context("failed to bind the app's HTTP port")?;
+    let listen = listener.local_addr()?;
+    let health = Arc::new(std::sync::RwLock::new(Health {
+        healthy: true,
+        detail: "starting".to_string(),
+    }));
+    let server_health = health.clone();
+    tokio::spawn(async move {
+        if let Err(err) = serve_http(listener, server_health).await {
+            error!(error = ?err, "the app's HTTP listener stopped");
+        }
+    });
+
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let context = AppContext {
+        name: std::env::var(APP_NAME_ENV).unwrap_or_else(|_| name.to_string()),
+        config,
+        config_path: path,
+        listen,
+        health,
+        stop: stop_rx,
+    };
+    info!(
+        app = name,
+        %listen,
+        build = %crate::util::own_build().short(),
+        legion = context.legion_addr().is_some(),
+        "App started"
+    );
+
+    let mut body = tokio::spawn((app.body)(context));
+    let outcome = tokio::select! {
+        joined = &mut body => Some(joined),
+        signal = stop_signal() => {
+            info!(app = name, signal, "Stopping the app");
+            let _ = stop_tx.send(true);
+            match tokio::time::timeout(SHUTDOWN_GRACE, &mut body).await {
+                Ok(joined) => Some(joined),
+                Err(_) => {
+                    warn!(app = name, "The app did not stop within its grace period; exiting");
+                    body.abort();
+                    None
+                }
+            }
+        }
+    };
+    match outcome {
+        Some(Ok(Ok(()))) | None => {
+            info!(app = name, "App stopped");
+            Ok(())
+        }
+        Some(Ok(Err(err))) => Err(err.context(format!("app {name} failed"))),
+        Some(Err(join)) => Err(anyhow!("app {name} panicked: {join}")),
+    }
+}
+
+/// The first of SIGTERM and SIGINT.
+async fn stop_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            let _ = tokio::signal::ctrl_c().await;
+            return "SIGINT";
+        };
+        tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
+}
+
+/// The app's HTTP port: `/healthz` from the body's health. The UI views and
+/// actions (`/legion/v1/…`, apps plan §6.5) arrive with phase A4.
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    health: Arc<std::sync::RwLock<Health>>,
+) -> R<()> {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper::{Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(err) => {
+                debug!(error = ?err, "app listener accept failed");
+                continue;
+            }
+        };
+        let health = health.clone();
+        tokio::spawn(async move {
+            let service = hyper::service::service_fn(move |request: hyper::Request<_>| {
+                let health = health.clone();
+                async move {
+                    let (status, body) = match request.uri().path() {
+                        "/healthz" => {
+                            let health =
+                                health
+                                    .read()
+                                    .map(|health| health.clone())
+                                    .unwrap_or(Health {
+                                        healthy: false,
+                                        detail: "health state poisoned".into(),
+                                    });
+                            let status = if health.healthy {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            };
+                            (status, format!("{}\n", health.detail))
+                        }
+                        _ => (StatusCode::NOT_FOUND, "not found\n".to_string()),
+                    };
+                    let response = Response::builder()
+                        .status(status)
+                        .header("content-type", "text/plain")
+                        .body(Full::new(Bytes::from(body)))
+                        .expect("static response parts");
+                    Ok::<_, std::convert::Infallible>(response)
+                }
+            });
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+            {
+                debug!(error = ?err, "app connection closed");
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every bundled manifest evaluates, validates, and renders a job
+    /// RunJob takes.
+    #[test]
+    fn bundled_manifests_are_valid() {
+        let manifests = bundled_manifests().expect("bundled manifests evaluate");
+        assert_eq!(manifests.len(), BUNDLED.len());
+        for manifest in manifests {
+            assert!(manifest.version.is_none(), "{}", manifest.name);
+            assert!(manifest.runs_self(), "{} runs legion:self", manifest.name);
+            let record = crate::structs::app::AppRecord {
+                name: manifest.name.clone(),
+                source: crate::structs::app::AppSource::Bundled,
+                source_ref: String::new(),
+                manifest_digest: manifest.digest(),
+                enabled: true,
+                settings: crate::structs::app::AppSettings::from_manifest(manifest),
+                config: manifest.default_config(),
+                grant: crate::structs::app::AppGrant {
+                    rules: manifest.permissions.clone(),
+                    granted_by: crate::structs::app::BOOTSTRAP_PRINCIPAL.into(),
+                    granted_at: String::new(),
+                },
+                installed_by: crate::structs::app::BOOTSTRAP_PRINCIPAL.into(),
+                installed_at: String::new(),
+                updated_at: String::new(),
+                state: Default::default(),
+                manifest: manifest.clone(),
+            };
+            let marker = crate::util::own_build();
+            let rendered = crate::structs::app::render_app_job(
+                &record,
+                crate::structs::app::RenderContext {
+                    marker: Some(&marker),
+                    app_user: "nobody",
+                },
+            )
+            .expect("renders");
+            let config: crate::structs::JobConfig =
+                serde_json::from_value(rendered.jobspec).expect("a valid jobspec");
+            assert_eq!(config.name, format!("legion-system/{}", manifest.name));
+        }
+    }
+
+    /// The autoscaler asks for exactly what the plan lists (§6.1).
+    #[test]
+    fn the_autoscaler_manifest_asks_for_the_planned_permissions() {
+        let manifest = bundled_manifest("autoscaler").expect("bundled");
+        let rules = serde_json::to_value(&manifest.permissions).expect("rules");
+        assert_eq!(
+            rules,
+            json!([
+                { "resources": ["scale"], "actions": ["read", "write"], "namespaces": ["*"] },
+                { "resources": ["job"], "actions": ["read"], "namespaces": ["*"] },
+                { "resources": ["node"], "actions": ["read", "write"] },
+                { "resources": ["kv"], "actions": ["read", "write"], "paths": ["legion/apps/autoscaler/*"] },
+            ])
+        );
+        assert_eq!(manifest.placement, crate::structs::app::Placement::Managers);
+        assert_eq!(manifest.job["priority"], "critical");
+        assert!(is_bundled("autoscaler"));
+        assert!(!is_bundled("gitops"));
+    }
+
+    #[test]
+    fn the_listen_address_and_config_path_follow_the_options() {
+        let options = RunOptions {
+            listen: Some("127.0.0.1:9999".into()),
+            config: Some(PathBuf::from("/tmp/x.json")),
+        };
+        assert_eq!(listen_addr(&options).unwrap().port(), 9999);
+        assert_eq!(config_path(&options), Some(PathBuf::from("/tmp/x.json")));
+    }
+
+    /// The framework serves /healthz from the body's health, and stops the
+    /// body when asked.
+    #[tokio::test]
+    async fn healthz_follows_the_body() -> R<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let health = Arc::new(std::sync::RwLock::new(Health {
+            healthy: true,
+            detail: "ok".into(),
+        }));
+        tokio::spawn(serve_http(listener, health.clone()));
+        let get = |path: &'static str| async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(addr).await?;
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await?;
+            Ok::<_, anyhow::Error>(response)
+        };
+        assert!(get("/healthz").await?.starts_with("HTTP/1.1 200"));
+        health.write().unwrap().healthy = false;
+        assert!(get("/healthz").await?.starts_with("HTTP/1.1 503"));
+        assert!(get("/other").await?.starts_with("HTTP/1.1 404"));
+        Ok(())
+    }
+}

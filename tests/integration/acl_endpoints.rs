@@ -253,7 +253,56 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         // Job grants (docs/workload-identity.md, "Permissions"): ACL state.
         ("ListGrants", Plane::Protected("acl:read")),
         ("RevokeGrant", Plane::Protected("acl:write")),
+        // Apps (docs/apps.md): the cluster-scoped `app` resource. Install,
+        // upgrade, and code-field config changes also run the grant check.
+        ("ListApps", Plane::Protected("app:read")),
+        ("GetApp", Plane::Protected("app:read")),
+        ("InstallApp", Plane::Protected("app:write")),
+        ("UpgradeApp", Plane::Protected("app:write")),
+        ("UninstallApp", Plane::Protected("app:write")),
+        ("SetAppEnabled", Plane::Protected("app:write")),
+        ("UpdateAppSettings", Plane::Protected("app:write")),
+        ("SetAppConfig", Plane::Protected("app:write")),
     ]
+}
+
+const FIXTURE_APP: &str = "acl-app";
+const DELETABLE_APP: &str = "deletable-app";
+
+/// A minimal third-party app manifest, as JSON.
+fn app_manifest_json(name: &str, version: &str) -> String {
+    serde_json::json!({
+        "name": name,
+        "version": version,
+        "job": { "task": { "name": "main", "runtime": "noop", "config": {} } },
+    })
+    .to_string()
+}
+
+/// An installed (file) app record for the fixtures.
+fn app_fixture(name: &str) -> R<legion::structs::app::AppRecord> {
+    use legion::structs::app::*;
+    let manifest =
+        AppManifest::from_json(&app_manifest_json(name, "1.0.0")).map_err(|e| anyhow!(e))?;
+    Ok(AppRecord {
+        name: name.into(),
+        source: AppSource::File,
+        source_ref: "./app.json".into(),
+        manifest_digest: manifest.digest(),
+        enabled: true,
+        settings: AppSettings::from_manifest(&manifest),
+        config: serde_json::json!({}),
+        grant: AppGrant {
+            rules: Vec::new(),
+            granted_by: "fixture".into(),
+            granted_at: "2026-01-01T00:00:00Z".into(),
+        },
+        installed_by: "fixture".into(),
+        installed_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+        state: AppReconcileState::default(),
+        manifest,
+    })
 }
 
 /// An empty client-streaming request body, for exercising the ACL gate of
@@ -1581,6 +1630,86 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "ListApps" => svc
+            .list_apps(req(ListAppsRequest {}, token))
+            .await
+            .map(|_| ()),
+        "GetApp" => svc
+            .get_app(req(
+                GetAppRequest {
+                    name: FIXTURE_APP.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "InstallApp" => svc
+            .install_app(req(
+                InstallAppRequest {
+                    manifest_json: app_manifest_json("acl-new-app", "1.0.0"),
+                    source: "file".into(),
+                    source_ref: "./new.json".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "UpgradeApp" => svc
+            .upgrade_app(req(
+                UpgradeAppRequest {
+                    name: FIXTURE_APP.into(),
+                    manifest_json: app_manifest_json(FIXTURE_APP, "2.0.0"),
+                    approve: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "UninstallApp" => svc
+            .uninstall_app(req(
+                UninstallAppRequest {
+                    name: DELETABLE_APP.into(),
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "SetAppEnabled" => svc
+            .set_app_enabled(req(
+                SetAppEnabledRequest {
+                    name: FIXTURE_APP.into(),
+                    enabled: true,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "UpdateAppSettings" => svc
+            .update_app_settings(req(
+                UpdateAppSettingsRequest {
+                    name: FIXTURE_APP.into(),
+                    replicas: Some(2),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "SetAppConfig" => svc
+            .set_app_config(req(
+                SetAppConfigRequest {
+                    name: FIXTURE_APP.into(),
+                    config_json: "{}".into(),
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         other => {
             panic!("endpoint_table contains `{other}` but call_endpoint has no builder for it")
         }
@@ -1688,6 +1817,10 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
         &[],
         "fixture",
     )?;
+
+    for name in [FIXTURE_APP, DELETABLE_APP] {
+        store.insert_app(app_fixture(name)?)?;
+    }
 
     store.put_kv(KV_KEY, "v1", KvValueType::String, None, None)?;
     store.put_kv("team/deletable", "v1", KvValueType::String, None, None)?;

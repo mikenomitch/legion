@@ -909,6 +909,51 @@ fn inject_env_defaults(task_config_json: &mut String, vars: &[(String, String)])
     inject_env(task_config_json, &missing)
 }
 
+/// An app task's `LEGION_APP_CONFIG` (docs/apps.md, "Config"), made a path
+/// the task can open. The app reconciler renders the app's config as a file
+/// below the task directory and names it relatively; this resolves it to
+/// the task's own view of that directory (the host task directory for
+/// `exec`, the mount for `container`). An absolute value, and a task with no
+/// delivery mapping, are left alone. Runs for every task that sets the
+/// variable, whether or not workload identity is on.
+pub fn resolve_app_config_env(
+    task_config_json: &mut String,
+    delivery_base: Option<&FileDeliveryBase>,
+) -> R<()> {
+    let Some(base) = delivery_base else {
+        return Ok(());
+    };
+    let config: Value = match serde_json::from_str(task_config_json) {
+        Ok(config) => config,
+        Err(_) => return Ok(()),
+    };
+    let Some(relative) = config
+        .get("env")
+        .and_then(|env| env.get(crate::structs::app::APP_CONFIG_ENV))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty() && !Path::new(path).is_absolute())
+    else {
+        return Ok(());
+    };
+    if Path::new(relative)
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        bail!(
+            "{} {relative:?} climbs out of the task directory",
+            crate::structs::app::APP_CONFIG_ENV
+        );
+    }
+    let resolved = base.in_task_path(Path::new(relative));
+    inject_env(
+        task_config_json,
+        &[(
+            crate::structs::app::APP_CONFIG_ENV.to_string(),
+            resolved.display().to_string(),
+        )],
+    )
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1976,5 +2021,54 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "aws");
+    }
+
+    /// An app's config file, named relative to the task directory, becomes
+    /// the path the task sees: the host path for `exec`, the mount for
+    /// `container`; an absolute value and a climbing one are not rewritten.
+    #[test]
+    fn app_config_env_resolves_to_the_tasks_view() -> R<()> {
+        let config = |value: &str| {
+            json!({ "env": { crate::structs::app::APP_CONFIG_ENV: value } }).to_string()
+        };
+        let read = |json: &str| -> R<String> {
+            let value: Value = serde_json::from_str(json)?;
+            Ok(value["env"][crate::structs::app::APP_CONFIG_ENV]
+                .as_str()
+                .unwrap_or_default()
+                .to_string())
+        };
+        let exec = FileDeliveryBase {
+            in_task_root: None,
+            host_task_dir: PathBuf::from("/var/lib/legion/allocs/7/agent"),
+            host_sockets: true,
+        };
+        let mut task = config("legion-app-config.json");
+        resolve_app_config_env(&mut task, Some(&exec))?;
+        assert_eq!(
+            read(&task)?,
+            "/var/lib/legion/allocs/7/agent/legion-app-config.json"
+        );
+
+        let container = FileDeliveryBase {
+            in_task_root: Some("/legion/task"),
+            host_task_dir: PathBuf::from("/host/allocs/7/agent"),
+            host_sockets: true,
+        };
+        let mut task = config("legion-app-config.json");
+        resolve_app_config_env(&mut task, Some(&container))?;
+        assert_eq!(read(&task)?, "/legion/task/legion-app-config.json");
+
+        let mut task = config("/etc/app.json");
+        resolve_app_config_env(&mut task, Some(&exec))?;
+        assert_eq!(read(&task)?, "/etc/app.json");
+
+        let mut task = config("../../etc/shadow");
+        assert!(resolve_app_config_env(&mut task, Some(&exec)).is_err());
+
+        let mut untouched = json!({ "env": {} }).to_string();
+        resolve_app_config_env(&mut untouched, Some(&exec))?;
+        assert_eq!(untouched, json!({ "env": {} }).to_string());
+        Ok(())
     }
 }

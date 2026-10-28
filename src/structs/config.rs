@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -151,6 +151,33 @@ pub struct ManagerConfig {
     /// `legion-system` jobs, capped at 1 CPU and 1 GiB.
     #[serde(default)]
     pub system_worker: Option<SystemWorkerConfig>,
+    /// Seed-time settings for the apps bundled with Legion
+    /// (docs/apps.md, "Seeding"), by app name:
+    /// `apps = { autoscaler = { enabled = false } }`. Read only when the
+    /// first Control leader seeds an app's record; after that `legion app`
+    /// is the interface, and a manager that finds the block logs that it was
+    /// not applied.
+    #[serde(default)]
+    pub apps: Option<BTreeMap<String, AppSeedConfig>>,
+}
+
+/// One bundled app's seed-time settings (`apps.<name>`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppSeedConfig {
+    /// Seed the app enabled. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// `managers`, `workers`, or `any`. Default: the manifest's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
+    /// Replicas. Default: the manifest's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<u32>,
+    /// The app's initial config, validated against its schema. Default: the
+    /// manifest's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
 }
 
 /// Default `systemWorker.resources.cpu`, in MHz: one CPU's worth.
@@ -2339,6 +2366,10 @@ pub struct ManagerConfigFull {
     pub cluster_ca: ClusterCaConfigFull,
     #[serde(default)]
     pub system_worker: SystemWorkerConfigFull,
+    /// Seed-time bundled-app settings (`apps`); empty means every bundled
+    /// app is seeded with its manifest's defaults.
+    #[serde(default)]
+    pub apps: BTreeMap<String, AppSeedConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2547,6 +2578,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             }),
             cluster_ca: Some(val.cluster_ca.into()),
             system_worker: Some(val.system_worker.into()),
+            apps: (!val.apps.is_empty()).then_some(val.apps),
         }
     }
 }
@@ -2645,6 +2677,7 @@ impl ManagerConfig {
                 .as_ref()
                 .map(SystemWorkerConfig::with_defaults)
                 .unwrap_or_default(),
+            apps: self.apps.clone().unwrap_or_default(),
         }
     }
 }
@@ -2677,6 +2710,7 @@ impl Default for ManagerConfigFull {
             suspend: SuspendManagerConfigFull::default(),
             cluster_ca: ClusterCaConfigFull::default(),
             system_worker: SystemWorkerConfigFull::default(),
+            apps: BTreeMap::new(),
         }
     }
 }

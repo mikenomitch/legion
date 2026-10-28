@@ -2815,14 +2815,30 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     // still gets the job.
     let usage = scaling_inputs_for_job(&mut client, &job_name).await;
 
+    let reply = response.into_inner();
     if format.is_json() {
-        print_json(&job_info_json(response.into_inner().job, usage.as_deref()));
+        let mut value = job_info_json(reply.job, usage.as_deref());
+        if let (Some(object), Some(managed_by)) = (value.as_object_mut(), &reply.managed_by) {
+            object.insert(
+                "managedBy".to_string(),
+                json!({ "app": managed_by.app, "digest": managed_by.digest }),
+            );
+        }
+        print_json(&value);
     } else {
-        let job = response.into_inner().job.context("no job found")?;
+        let job = reply.job.context("no job found")?;
         let blocked = job.blocked.clone();
         let backoff_lines = reschedule_backoff_lines(&job.reschedule_backoffs);
         let printable_job: JobPrint = job.into();
         print_table(vec![printable_job]);
+        // An app's job (docs/apps.md): the reconciler owns its spec.
+        if let Some(managed_by) = &reply.managed_by {
+            let digest: String = managed_by.digest.chars().take(8).collect();
+            println!(
+                "managed by app {} (digest {digest}…); direct edits are reverted. Use `legion app`.",
+                managed_by.app
+            );
+        }
         for line in backoff_lines {
             println!("{line}");
         }

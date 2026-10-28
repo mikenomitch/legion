@@ -118,7 +118,8 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn list_apps(&self) -> R<Vec<AppRecord>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(&format!("SELECT {APP_COLUMNS} FROM app ORDER BY name ASC;"))?;
+        let mut stmt =
+            conn.prepare(&format!("SELECT {APP_COLUMNS} FROM app ORDER BY name ASC;"))?;
         let rows = stmt.query_map([], Self::app_from_row)?;
         Self::collect_rows(rows)
     }
@@ -261,10 +262,12 @@ impl Store {
         if !exists {
             return Err(StorageError::not_found("app", record.name.clone()).into());
         }
-        Err(anyhow::Error::new(StorageError::failed_precondition(format!(
-            "app {} changed while this request ran; read it again and retry",
-            record.name
-        ))))
+        Err(anyhow::Error::new(StorageError::failed_precondition(
+            format!(
+                "app {} changed while this request ran; read it again and retry",
+                record.name
+            ),
+        )))
     }
 
     /// Record the reconciler's bookkeeping for an app. Leaves `updated_at`
@@ -485,7 +488,10 @@ mod app_store_tests {
         let stored = store.get_app("demo")?.context("stored")?;
         assert_eq!(stored.updated_at, "t1");
         assert_eq!(stored.state.last_digest, "abc");
-        assert_eq!(stored.state.marker.as_ref().map(|m| m.version.as_str()), Some("0.1.0"));
+        assert_eq!(
+            stored.state.marker.as_ref().map(|m| m.version.as_str()),
+            Some("0.1.0")
+        );
 
         assert!(store.delete_app("demo")?);
         assert!(store.get_app("demo")?.is_none());

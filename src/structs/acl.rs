@@ -884,6 +884,58 @@ mod acl_rules_test {
         parse_rules(json).expect("rules should parse")
     }
 
+    /// `app` is cluster-scoped with a `names` selector (docs/apps.md):
+    /// `app:read` on `auto*` sees the autoscaler and nothing else, a rule
+    /// may not give it namespaces, and `app:write` does not imply `read`.
+    #[test]
+    fn app_rules_scope_by_app_name() {
+        let held = rules(r#"[{"resources": ["app"], "actions": ["read"], "names": ["auto*"]}]"#);
+        assert!(evaluate(
+            &held,
+            AclResource::App,
+            AclAction::Read,
+            &AclScope::app("autoscaler")
+        ));
+        assert!(!evaluate(
+            &held,
+            AclResource::App,
+            AclAction::Read,
+            &AclScope::app("gitops")
+        ));
+        assert!(!evaluate(
+            &held,
+            AclResource::App,
+            AclAction::Write,
+            &AclScope::app("autoscaler")
+        ));
+        assert!(evaluate(
+            &held,
+            AclResource::App,
+            AclAction::Read,
+            &AclScope::any()
+        ));
+        assert!(!AclResource::App.is_namespaced());
+        let err =
+            parse_rules(r#"[{"resources": ["app"], "actions": ["read"], "namespaces": ["*"]}]"#)
+                .expect_err("app is cluster-scoped");
+        assert!(err.contains("cluster-scoped"), "{err}");
+        // A namespaced `*` rule reaches no cluster-scoped resource.
+        let namespaced = rules(r#"[{"resources": ["*"], "actions": ["*"], "namespaces": ["*"]}]"#);
+        assert!(!evaluate(
+            &namespaced,
+            AclResource::App,
+            AclAction::Read,
+            &AclScope::app("x")
+        ));
+        let everything = rules(r#"[{"resources": ["*"], "actions": ["*"]}]"#);
+        assert!(evaluate(
+            &everything,
+            AclResource::App,
+            AclAction::Write,
+            &AclScope::app("x")
+        ));
+    }
+
     #[test]
     fn glob_match_basics() {
         assert!(glob_match("web", "web"));

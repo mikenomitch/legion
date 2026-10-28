@@ -651,6 +651,25 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_app_list",
+            description: "List installed apps (Legion's add-ons: the bundled autoscaler, and apps installed from manifests): each app's version, source, status (running, degraded, pending, stopped, with why), placement, replicas running, the nodes it runs on, and its UI slots. Needs app:read.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_app_status",
+            description: "Show one app: its record (manifest, settings, config), its grant (what its job's `legion` identity may do, and who approved it), its job's status, the app reconciler's last action and error, its build marker and what it waits for, and notes. Needs app:read on the app.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "app": { "type": "string", "description": "The app's name (for example `autoscaler`)." }
+                },
+                "required": ["app"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_acl_grants_list",
             description: "List job grants: what each job version's `legion` identity was granted at submit (inline permissions and policy names), who granted it, and whether it was revoked. Needs acl:read.",
             input_schema: || json!({
@@ -1735,6 +1754,37 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_acl_whoami" => {
             let mut client = connect().await?;
             grpc(client.who_am_i(crate::structs::WhoAmIRequest {})).await
+        }
+        "legion_app_list" => {
+            let mut client = connect().await?;
+            let reply = client
+                .list_apps(crate::structs::ListAppsRequest {})
+                .await
+                .map_err(|status| {
+                    let err = CliError::from_status("request failed", &status);
+                    serde_json::to_string(&err).unwrap_or_else(|_| status.message().to_string())
+                })?
+                .into_inner();
+            Ok(json!({
+                "apps": reply.apps.iter().map(crate::cmd::app::app_json).collect::<Vec<_>>(),
+            }))
+        }
+        "legion_app_status" => {
+            let name = str_arg(&args, "app")?;
+            let mut client = connect().await?;
+            let reply = client
+                .get_app(crate::structs::GetAppRequest { name })
+                .await
+                .map_err(|status| {
+                    let err = CliError::from_status("request failed", &status);
+                    serde_json::to_string(&err).unwrap_or_else(|_| status.message().to_string())
+                })?
+                .into_inner();
+            Ok(reply
+                .app
+                .as_ref()
+                .map(crate::cmd::app::app_json)
+                .unwrap_or(Value::Null))
         }
         "legion_acl_grants_list" => {
             let job = opt_str_arg(&args, "job").filter(|job| !job.trim().is_empty());
