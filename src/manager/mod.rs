@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod apps;
+pub mod autoscale;
 pub mod archive;
 pub mod auth_method;
 pub mod blocked;
@@ -20,6 +21,7 @@ pub mod origin;
 pub mod rollout;
 pub mod rollout_strategy;
 pub mod scaling_inputs;
+pub mod scaling_status;
 pub mod scheduler;
 pub mod server;
 pub mod sessions;

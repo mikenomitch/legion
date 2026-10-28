@@ -2077,6 +2077,14 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub suspend: Option<crate::structs::suspend::SuspendConfig>,
+    /// Task autoscaling (docs/autoscaling.md): `true` for the effective
+    /// defaults, or a sparse record overriding some of them. Stored exactly
+    /// as written; the defaults it inherits (cluster, namespace policies)
+    /// are resolved live. None (or `false`) = the count is the spec's, or a
+    /// `legion job scale` override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub autoscale: Option<crate::autoscaler::AutoscaleSpec>,
     /// Unknown keys kept on this task under `allow_unknown_fields`, as
     /// written and unvalidated (`structs::spec_fields`). Nothing acts on
     /// them; `legion job info` lists them. Empty for every task submitted
@@ -2735,6 +2743,10 @@ struct TaskConfigInput {
     snapshots: Option<crate::structs::snapshot::SnapshotsConfig>,
     #[serde(default)]
     suspend: Option<crate::structs::suspend::SuspendConfig>,
+    // Strict on its own (`deny_unknown_fields` on the record): a typo in an
+    // autoscale record is an error even under `allow_unknown_fields`.
+    #[serde(default)]
+    autoscale: Option<crate::autoscaler::AutoscaleSpec>,
     #[serde(default)]
     pending_extensions: PendingExtensions,
     #[serde(flatten)]
@@ -2777,7 +2789,8 @@ extension_point!(
         "actions",
         "speculativeStart",
         "snapshots",
-        "suspend"
+        "suspend",
+        "autoscale"
     ],
     |this, walk| {
         for (index, dependency) in this.depends_on.iter_mut().enumerate() {
@@ -2964,6 +2977,8 @@ impl TaskConfigInput {
             speculative_start: self.speculative_start,
             snapshots: self.snapshots,
             suspend: self.suspend,
+            // `autoscale = false` is the same as leaving it out; store it so.
+            autoscale: self.autoscale.filter(|spec| spec.is_enabled()),
             pending_extensions: self.pending_extensions,
         })
     }
@@ -3186,6 +3201,7 @@ impl TaskConfig {
             speculative_start: None,
             snapshots: None,
             suspend: None,
+            autoscale: None,
             name: name.into(),
             count: default_task_count(),
             runtime: runtime.into(),

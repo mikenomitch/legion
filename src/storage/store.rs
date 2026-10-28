@@ -13,6 +13,15 @@ use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, Scheduler
 use crate::storage::keyring::Keyring;
 use crate::storage::migrations::get_migrations;
 
+/// The `task_scale` columns [`Store::task_scale_from_row`] reads, in order,
+/// as a literal for `concat!`.
+macro_rules! task_scale_columns {
+    () => {
+        "job_id, task_group, task_name, count, pending_count, base_count, source, reason, \
+         principal, updated_at, version, pin_until_ms, pin_min, pin_max, pin_by, pin_reason"
+    };
+}
+
 // KV encryption keyring operations (initialization, rotation, rewrap, reset)
 // live in their own file so the keyring's write paths read as one unit.
 mod keyring_ops;
@@ -43,6 +52,13 @@ mod gang_losses;
 mod gang_members;
 // Scaling inputs: the reads behind the rollup loop and GetScalingInputs.
 mod scaling_ops;
+// Task autoscaling's state: scale writes with compare-and-set, pins,
+// history, pauses, the cluster's scaling defaults, policy snapshots.
+mod autoscale_ops;
+pub use autoscale_ops::{
+    HistoryRow, NewHistory, PauseRow, ScaleWrite, ScaleWriteOp, ScaleWriteOutcome,
+    ScalingDefaultsRow, TASK_SCALE_COUNTER,
+};
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -970,11 +986,46 @@ pub struct TaskScale {
     /// The spec count the override was laid over — the resubmit-ownership
     /// arbiter (see `handle_job_submit_apply`).
     pub base_count: u32,
-    /// `operator` today; `autoscaler` when the policy evaluator ships.
+    /// `operator`, `autoscaler`, or `wake`.
     pub source: String,
     pub reason: String,
     pub principal: String,
     pub updated_at: String,
+    /// The compare-and-set version (`ScaleTaskRequest.expected_version`): a
+    /// value of the `task_scale` counter, stamped on every write of the row,
+    /// so it never repeats across a delete and recreate.
+    pub version: u64,
+    /// The time-boxed pin, while one is recorded (it may have expired; see
+    /// [`TaskScalePin::active`]).
+    pub pin: Option<TaskScalePin>,
+}
+
+/// A pin on an autoscaled task (`legion job scale --for`): a floor and/or a
+/// ceiling the autoscaler stays within until `until_ms`. A count pin is
+/// `min == max`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskScalePin {
+    /// Unix milliseconds.
+    pub until_ms: i64,
+    pub min: Option<u32>,
+    pub max: Option<u32>,
+    pub by: String,
+    pub reason: String,
+}
+
+impl TaskScalePin {
+    /// Whether the pin still holds at `now_ms`.
+    pub fn active(&self, now_ms: i64) -> bool {
+        self.until_ms > now_ms
+    }
+
+    /// The pinned count, when the pin is a count pin (`min == max`).
+    pub fn count(&self) -> Option<u32> {
+        match (self.min, self.max) {
+            (Some(min), Some(max)) if min == max => Some(min),
+            _ => None,
+        }
+    }
 }
 
 impl TaskScale {
@@ -1423,6 +1474,10 @@ pub struct Store {
     // leader, every manager's merged per-(node, task) rollups. Soft state
     // like liveness; never written to the store.
     scaling_rollups: Arc<crate::manager::scaling_inputs::ScalingRollups>,
+    /// The autoscaler app's reports (`ReportScalingStatus`), held in memory
+    /// on the manager that receives them: the status-lane leader, which
+    /// every other manager forwards to (docs/autoscaling.md).
+    scaling_status: Arc<crate::manager::scaling_status::ScalingStatusBoard>,
     // Queued snapshot warms (WarmSnapshot), per node. Leader-local soft
     // state like the content index: best effort, never replicated.
     snapshot_warms: Arc<crate::storage::snapshot_warm::SnapshotWarmQueue>,
@@ -2113,6 +2168,7 @@ impl Store {
             content_locations: Arc::new(crate::storage::content_index::ContentLocationIndex::new()),
             sessions: Arc::new(crate::storage::session_index::SessionIndex::new()),
             scaling_rollups: Arc::new(crate::manager::scaling_inputs::ScalingRollups::new()),
+            scaling_status: Arc::new(crate::manager::scaling_status::ScalingStatusBoard::default()),
             snapshot_warms: Arc::new(crate::storage::snapshot_warm::SnapshotWarmQueue::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3453,7 +3509,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions, autoscale
             FROM task_config;
             "#,
         )?;
@@ -3505,6 +3561,7 @@ impl Store {
                 stop: parse_json_column(27, row.get(27)?)?,
                 disruption: parse_json_column(28, row.get(28)?)?,
                 pending_extensions: parse_json_column(33, row.get(33)?)?.unwrap_or_default(),
+                autoscale: parse_json_column(34, row.get(34)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -7464,6 +7521,7 @@ impl Store {
             suspend: parse_json_column(32, row.get(32)?)?,
             gang: parse_json_column(33, row.get(33)?)?,
             pending_extensions: parse_json_column(34, row.get(34)?)?.unwrap_or_default(),
+            autoscale: parse_json_column(35, row.get(35)?)?,
         };
 
         Ok(task_config)
@@ -8772,6 +8830,11 @@ impl Store {
         &self.scaling_rollups
     }
 
+    /// The autoscaler app's reports (see the field).
+    pub fn scaling_status(&self) -> &Arc<crate::manager::scaling_status::ScalingStatusBoard> {
+        &self.scaling_status
+    }
+
     /// The cluster CA provider (docs/cluster-ca.md).
     pub fn cluster_ca(&self) -> &crate::manager::cluster_ca::ClusterCa {
         &self.cluster_ca
@@ -9752,6 +9815,10 @@ impl Store {
         tx.execute(delete_sql, [name])?;
         // Count overrides die with the job (control-owned, same capture).
         tx.execute("DELETE FROM task_scale WHERE job_id = ?;", [&job.id])?;
+        // A destroyed job's scaling record goes with it (a recreated job of
+        // the same name starts with no history and no pause).
+        tx.execute("DELETE FROM scale_history WHERE job_id = ?;", [&job.id])?;
+        tx.execute("DELETE FROM scaling_pause WHERE job_id = ?;", [&job.id])?;
 
         for submission_hash in submission_hashes {
             let reference_count: i64 = tx.query_row(
@@ -11076,6 +11143,7 @@ impl Store {
                 Some(serde_json::to_string(&t.pending_extensions)?)
             };
             let schedule = t.schedule.as_ref().map(ToString::to_string);
+            let autoscale = t.autoscale.as_ref().map(serde_json::to_string).transpose()?;
             let task_params = named_params! {
                 ":name": t.name,
                 ":runtime": t.runtime,
@@ -11111,6 +11179,7 @@ impl Store {
                 ":suspend": suspend,
                 ":gang": gang,
                 ":pending_extensions": pending_extensions,
+                ":autoscale": autoscale,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -11161,30 +11230,111 @@ impl Store {
         // version no longer declares are orphans and cleared too.
         // `task_scale` is control-owned precisely so this rides the same
         // capture as the config write.
+        //
+        // An autoscaled task is different (autoscaler-v2 plan §6.3): its
+        // policy owns the live count, and `count` is the default floor. The
+        // override is kept, rebased onto the new spec count, and clamped
+        // into the new bounds, in this same transaction: raising `count`
+        // from 2 to 4 lifts a task at 3 to 4 at once and leaves one at 6
+        // alone; lowering it only lowers the floor. When `autoscale` is
+        // removed, the rule above applies again on the same submit.
         let mut scale_reset_events = Vec::new();
+        let autoscale_layers = if config
+            .tasks
+            .iter()
+            .any(crate::manager::autoscale::is_autoscaled)
+        {
+            Some(crate::manager::autoscale::AutoscaleLayers::load_tx(&tx)?)
+        } else {
+            None
+        };
+        let now_ms = OffsetDateTime::now_utc().unix_timestamp() * 1000;
         for t in &config.tasks {
-            let existing: Option<i64> = tx
+            let existing: Option<(i64, Option<i64>)> = tx
                 .query_row(
-                    "SELECT base_count FROM task_scale \
+                    "SELECT base_count, count FROM task_scale \
                      WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
                     params![job.id, t.group, t.name],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            if let Some(base_count) = existing {
-                if i64::from(t.count.num) != base_count {
+            let Some((base_count, count)) = existing else {
+                continue;
+            };
+            // The policy that owns this task's count: its own, or the one
+            // on its group's autoscaled task.
+            let owner = config.tasks.iter().find(|other| {
+                other.group == t.group && crate::manager::autoscale::is_autoscaled(other)
+            });
+            if let (Some(owner), Some(layers)) = (owner, autoscale_layers.as_ref()) {
+                let bounds = layers
+                    .resolve(&job.id, owner)
+                    .ok()
+                    .flatten()
+                    .map(|resolved| (resolved.policy.min, resolved.policy.max));
+                let spec = t.count.num;
+                let next = count.map(|count| {
+                    let count = count.max(0) as u32;
+                    match bounds {
+                        Some((min, max)) => count.clamp(min.min(max), max),
+                        None => count,
+                    }
+                });
+                let rebased = i64::from(spec) != base_count;
+                let moved = next.zip(count).is_some_and(|(next, count)| i64::from(next) != count);
+                if rebased || moved {
+                    let version = Self::next_scaling_counter_tx(&tx, TASK_SCALE_COUNTER)?;
                     tx.execute(
-                        "DELETE FROM task_scale \
-                         WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
-                        params![job.id, t.group, t.name],
+                        "UPDATE task_scale SET base_count = ?4, count = COALESCE(?5, count), \
+                         version = ?6 WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+                        params![job.id, t.group, t.name, spec, next, version as i64],
                     )?;
-                    scale_reset_events.push(drafts::scale_reset(
+                }
+                if moved && owner.name == t.name {
+                    let (from, to) = (count.unwrap_or_default().max(0) as u32, next.unwrap_or_default());
+                    Self::insert_history_tx(
+                        &tx,
                         &job.id,
                         &t.group,
                         &t.name,
-                        "resubmit changed the spec count; the spec owns the count again",
-                    ));
+                        now_ms,
+                        from,
+                        to,
+                        "operator",
+                        "",
+                        "scaled",
+                        true,
+                        &autoscale_ops::NewHistory {
+                            summary: format!(
+                                "resubmit moved the bounds; the count moves {from} -> {to} into them"
+                            ),
+                            ..Default::default()
+                        },
+                        "",
+                    )?;
                 }
+                continue;
+            }
+            if i64::from(t.count.num) != base_count {
+                tx.execute(
+                    "DELETE FROM task_scale \
+                     WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+                    params![job.id, t.group, t.name],
+                )?;
+                scale_reset_events.push(drafts::scale_reset(
+                    &job.id,
+                    &t.group,
+                    &t.name,
+                    "resubmit changed the spec count; the spec owns the count again",
+                ));
+            } else {
+                // Not autoscaled (any more): a pin has nothing to hold.
+                tx.execute(
+                    "UPDATE task_scale SET pin_until_ms = NULL, pin_min = NULL, pin_max = NULL \
+                     WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3 \
+                     AND pin_until_ms IS NOT NULL;",
+                    params![job.id, t.group, t.name],
+                )?;
             }
         }
         tx.execute(
@@ -16165,10 +16315,10 @@ impl Store {
 
     /// Set (or update) a task's count override: the applied count wins over
     /// the spec's `count.num` for every reader of desired count. Clears any
-    /// pending scale-in (a fresh override is newer intent). `base_count`
-    /// must be the CURRENT spec count — it is the resubmit-ownership
-    /// arbiter (`handle_job_submit_apply` clears the override when a
-    /// resubmit changes the spec count away from it).
+    /// pending scale-in (a fresh override is newer intent) and keeps any
+    /// pin. `base_count` must be the CURRENT spec count — it is the
+    /// resubmit-ownership arbiter (`handle_job_submit_apply` clears the
+    /// override when a resubmit changes the spec count away from it).
     #[instrument(err, skip(self, reason, principal))]
     pub fn set_task_scale_override(
         &self,
@@ -16214,15 +16364,50 @@ impl Store {
         reason: &str,
         principal: &str,
     ) -> R<()> {
-        let now = Self::now_rfc3339()?;
         let conn = self.write_connection()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO task_scale \
-             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9);",
-            params![job_id, task_group, task_name, count, base_count, source, reason, principal, now],
+        Self::upsert_task_scale_override_tx(
+            &conn, job_id, task_group, task_name, count, base_count, source, reason, principal,
         )?;
         Ok(())
+    }
+
+    /// The write behind [`Store::set_task_scale_override`], on a connection
+    /// or transaction the caller holds. Returns the row's new version.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsert_task_scale_override_tx(
+        conn: &Connection,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        count: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<u64> {
+        let now = Self::now_rfc3339()?;
+        let version = Self::next_scaling_counter_tx(conn, TASK_SCALE_COUNTER)?;
+        conn.execute(
+            "INSERT INTO task_scale \
+             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at, version) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(job_id, task_group, task_name) DO UPDATE SET \
+             count = ?4, pending_count = NULL, base_count = ?5, source = ?6, reason = ?7, \
+             principal = ?8, updated_at = ?9, version = ?10;",
+            params![
+                job_id,
+                task_group,
+                task_name,
+                count,
+                base_count,
+                source,
+                reason,
+                principal,
+                now,
+                version as i64
+            ],
+        )?;
+        Ok(version)
     }
 
     /// Record a scale-in that must WAIT for the active rollout to finish
@@ -16275,22 +16460,55 @@ impl Store {
         reason: &str,
         principal: &str,
     ) -> R<()> {
-        let now = Self::now_rfc3339()?;
         let conn = self.write_connection()?;
-        // Upsert preserving the applied `count` when a row already exists.
-        conn.execute(
-            "INSERT INTO task_scale \
-             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at) \
-             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9) \
-             ON CONFLICT(job_id, task_group, task_name) DO UPDATE SET \
-             pending_count = ?4, base_count = ?5, source = ?6, reason = ?7, principal = ?8, updated_at = ?9;",
-            params![job_id, task_group, task_name, pending, base_count, source, reason, principal, now],
+        Self::upsert_task_scale_pending_tx(
+            &conn, job_id, task_group, task_name, pending, base_count, source, reason, principal,
         )?;
         Ok(())
     }
 
-    /// Drop a task's override (and any pending scale-in), returning count
-    /// ownership to the job spec. Returns whether a row existed.
+    /// The write behind [`Store::set_task_scale_pending`]. Returns the row's
+    /// new version.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsert_task_scale_pending_tx(
+        conn: &Connection,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        pending: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<u64> {
+        let now = Self::now_rfc3339()?;
+        let version = Self::next_scaling_counter_tx(conn, TASK_SCALE_COUNTER)?;
+        // Upsert preserving the applied `count` when a row already exists.
+        conn.execute(
+            "INSERT INTO task_scale \
+             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at, version) \
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(job_id, task_group, task_name) DO UPDATE SET \
+             pending_count = ?4, base_count = ?5, source = ?6, reason = ?7, principal = ?8, \
+             updated_at = ?9, version = ?10;",
+            params![
+                job_id,
+                task_group,
+                task_name,
+                pending,
+                base_count,
+                source,
+                reason,
+                principal,
+                now,
+                version as i64
+            ],
+        )?;
+        Ok(version)
+    }
+
+    /// Drop a task's override (and any pending scale-in and pin), returning
+    /// count ownership to the job spec. Returns whether a row existed.
     #[instrument(err, skip(self))]
     pub fn clear_task_scale(&self, job_id: &str, task_group: &str, task_name: &str) -> R<bool> {
         let (job_id, task_group, task_name) = (
@@ -16327,17 +16545,31 @@ impl Store {
     fn promote_pending_task_scales_apply(&self, job_id: &str) -> R<Vec<TaskScale>> {
         let now = Self::now_rfc3339()?;
         let conn = self.write_connection()?;
-        let mut stmt = conn.prepare(
-            "UPDATE task_scale SET count = pending_count, pending_count = NULL, updated_at = ?2 \
-             WHERE job_id = ?1 AND pending_count IS NOT NULL \
-             RETURNING job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at;",
+        let pending: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_scale WHERE job_id = ?1 AND pending_count IS NOT NULL;",
+            [job_id],
+            |row| row.get(0),
         )?;
-        let promoted =
-            Self::collect_rows(stmt.query_map(params![job_id, now], Self::task_scale_from_row)?)?;
+        if pending == 0 {
+            return Ok(Vec::new());
+        }
+        // Every promoted row gets a fresh version: the count changed.
+        let version = Self::next_scaling_counter_tx(&conn, TASK_SCALE_COUNTER)?;
+        let mut stmt = conn.prepare(concat!(
+            "UPDATE task_scale SET count = pending_count, pending_count = NULL, updated_at = ?2, \
+             version = ?3 WHERE job_id = ?1 AND pending_count IS NOT NULL RETURNING ",
+            task_scale_columns!(),
+            ";"
+        ))?;
+        let promoted = Self::collect_rows(stmt.query_map(
+            params![job_id, now, version as i64],
+            Self::task_scale_from_row,
+        )?)?;
         Ok(promoted)
     }
 
-    fn task_scale_from_row(row: &Row<'_>) -> Result<TaskScale, rusqlite::Error> {
+    pub(crate) fn task_scale_from_row(row: &Row<'_>) -> Result<TaskScale, rusqlite::Error> {
+        let pin_until: Option<i64> = row.get(11)?;
         Ok(TaskScale {
             job_id: row.get(0)?,
             task_group: row.get(1)?,
@@ -16349,6 +16581,17 @@ impl Store {
             reason: row.get(7)?,
             principal: row.get(8)?,
             updated_at: row.get(9)?,
+            version: row.get::<_, i64>(10)?.max(0) as u64,
+            pin: match pin_until {
+                Some(until_ms) => Some(TaskScalePin {
+                    until_ms,
+                    min: row.get::<_, Option<i64>>(12)?.map(|n| n.max(0) as u32),
+                    max: row.get::<_, Option<i64>>(13)?.map(|n| n.max(0) as u32),
+                    by: row.get(14)?,
+                    reason: row.get(15)?,
+                }),
+                None => None,
+            },
         })
     }
 
@@ -16361,10 +16604,11 @@ impl Store {
     ) -> R<Option<TaskScale>> {
         let conn = self.read_connection()?;
         let scale = conn
-            .prepare_cached(
-                "SELECT job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at \
-                 FROM task_scale WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
-            )?
+            .prepare_cached(concat!(
+                "SELECT ",
+                task_scale_columns!(),
+                " FROM task_scale WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;"
+            ))?
             .query_row(
                 params![job_id, task_group, task_name],
                 Self::task_scale_from_row,
@@ -16376,10 +16620,11 @@ impl Store {
     /// Every override row for a job.
     pub fn task_scales_for_job(&self, job_id: &str) -> R<Vec<TaskScale>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(
-            "SELECT job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at \
-             FROM task_scale WHERE job_id = ?1 ORDER BY task_group, task_name;",
-        )?;
+        let mut stmt = conn.prepare(concat!(
+            "SELECT ",
+            task_scale_columns!(),
+            " FROM task_scale WHERE job_id = ?1 ORDER BY task_group, task_name;"
+        ))?;
         let scales = Self::collect_rows(stmt.query_map([job_id], Self::task_scale_from_row)?)?;
         Ok(scales)
     }

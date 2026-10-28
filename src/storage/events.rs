@@ -1160,6 +1160,105 @@ pub mod drafts {
         }))
     }
 
+    /// `scale.pinned` — a person pinned an autoscaled task's count, floor,
+    /// or ceiling for a while (`legion job scale --for`), or released the
+    /// pin (`--release`, `until_ms` = None) (docs/autoscaling.md).
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_pinned(
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        min: Option<u32>,
+        max: Option<u32>,
+        until_ms: Option<i64>,
+        by: &str,
+        reason: &str,
+    ) -> EventDraft {
+        let what = match (min, max, until_ms) {
+            (_, _, None) => "pin released".to_string(),
+            (Some(min), Some(max), Some(_)) if min == max => format!("pinned at {min}"),
+            (min, max, Some(_)) => format!(
+                "pinned to {}..{}",
+                min.map_or("-".to_string(), |n| n.to_string()),
+                max.map_or("-".to_string(), |n| n.to_string())
+            ),
+        };
+        EventDraft::info(
+            "scale.pinned",
+            format!("Job {job_id} task {task_group}/{task_name} {what} by {by}"),
+        )
+        .job(job_id)
+        .meta(json!({
+            "group": task_group,
+            "task": task_name,
+            "min": min,
+            "max": max,
+            "untilMs": until_ms,
+            "by": by,
+            "reason": reason,
+        }))
+    }
+
+    /// `scale.paused` / `scale.resumed` — autoscaling was paused or resumed
+    /// for a task, a job, or the cluster (`legion scaling pause|resume`).
+    pub fn scale_paused(
+        scope: &str,
+        target: &str,
+        paused: bool,
+        until_ms: Option<i64>,
+        by: &str,
+        reason: &str,
+    ) -> EventDraft {
+        let (kind, verb) = if paused {
+            ("scale.paused", "paused")
+        } else {
+            ("scale.resumed", "resumed")
+        };
+        let draft = EventDraft::info(kind, format!("Autoscaling {verb} for {target} by {by}"));
+        let draft = if scope == "all" {
+            draft
+        } else {
+            draft.job(target.split_once('/').map_or(target, |(job, _)| job))
+        };
+        draft.meta(json!({
+            "scope": scope,
+            "target": target,
+            "untilMs": until_ms,
+            "by": by,
+            "reason": reason,
+        }))
+    }
+
+    /// `scale.limited`, `scale.flapping`, `scale.check_failed` — state
+    /// changes the autoscaler reports (`ReportScalingStatus`), one per
+    /// episode, never per tick.
+    pub fn scale_flag(
+        kind: &str,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        message: &str,
+    ) -> Option<EventDraft> {
+        let (kind, level) = match kind {
+            "limited" => ("scale.limited", "info"),
+            "flapping" => ("scale.flapping", "warn"),
+            "check_failed" => ("scale.check_failed", "warn"),
+            _ => return None,
+        };
+        let text = format!("Job {job_id} task {task_group}/{task_name}: {message}");
+        let draft = if level == "warn" {
+            EventDraft::warn(kind, text)
+        } else {
+            EventDraft::info(kind, text)
+        };
+        Some(draft.job(job_id).meta(json!({
+            "group": task_group,
+            "task": task_name,
+            "message": message,
+            "source": "autoscaler",
+        })))
+    }
+
     /// `scale.reset` — an override was dropped: explicit
     /// `legion job scale --reset`, or a resubmit that changed the spec
     /// count reclaimed ownership (docs/autoscaling.md).
@@ -2629,6 +2728,41 @@ impl EventRecorder<'_> {
 
     pub fn scale_reset(self, job_id: &str, task_group: &str, task_name: &str, why: &str) {
         self.emit(drafts::scale_reset(job_id, task_group, task_name, why));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_pinned(
+        self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        min: Option<u32>,
+        max: Option<u32>,
+        until_ms: Option<i64>,
+        by: &str,
+        reason: &str,
+    ) {
+        self.emit(drafts::scale_pinned(
+            job_id, task_group, task_name, min, max, until_ms, by, reason,
+        ));
+    }
+
+    pub fn scale_paused(
+        self,
+        scope: &str,
+        target: &str,
+        paused: bool,
+        until_ms: Option<i64>,
+        by: &str,
+        reason: &str,
+    ) {
+        self.emit(drafts::scale_paused(scope, target, paused, until_ms, by, reason));
+    }
+
+    pub fn scale_flag(self, kind: &str, job_id: &str, task_group: &str, task_name: &str, message: &str) {
+        if let Some(draft) = drafts::scale_flag(kind, job_id, task_group, task_name, message) {
+            self.emit(draft);
+        }
     }
 
     pub fn rollout_event(

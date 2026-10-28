@@ -2230,6 +2230,100 @@ fn migration_list() -> Vec<M<'static>> {
         // like the rest of `task_config`. The job-level map and the record
         // of what the flag kept and dropped ride `job_config.meta`.
         M::up("ALTER TABLE task_config ADD COLUMN pending_extensions TEXT;").down(""),
+        // Task autoscaling (docs/autoscaling.md; autoscaler-v2 plan Phase 2).
+        // `task_config.autoscale` is the jobspec `autoscale` field exactly as
+        // written (`true`, or the sparse record), NULL without one: the
+        // defaults it inherits are resolved live, never frozen here.
+        M::up("ALTER TABLE task_config ADD COLUMN autoscale TEXT;").down(""),
+        // The override row gains its compare-and-set version (a value of the
+        // `task_scale` counter in `scaling_counter`, stamped on every write,
+        // so it never repeats across a delete and recreate) and a time-boxed
+        // pin (`legion job scale --for`): a floor and/or ceiling the
+        // autoscaler stays within until `pin_until_ms` (unix ms); a count pin
+        // is `pin_min = pin_max`. Appended, since raft changesets bind
+        // columns by position.
+        M::up(
+            "ALTER TABLE task_scale ADD COLUMN version INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE task_scale ADD COLUMN pin_until_ms INTEGER;
+             ALTER TABLE task_scale ADD COLUMN pin_min INTEGER;
+             ALTER TABLE task_scale ADD COLUMN pin_max INTEGER;
+             ALTER TABLE task_scale ADD COLUMN pin_by TEXT NOT NULL DEFAULT '';
+             ALTER TABLE task_scale ADD COLUMN pin_reason TEXT NOT NULL DEFAULT '';",
+        )
+        .down(""),
+        // Named counters that never go backwards, even when the rows they
+        // stamp are deleted (`task_scale` versions).
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_counter (
+            name TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_counter;"),
+        // The cluster's scaling defaults (`legion scaling defaults apply`):
+        // one row, the record as written.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_defaults (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            record TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            updated_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_defaults;"),
+        // The durable record of scaling changes, capped per task.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scale_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            task_group TEXT NOT NULL,
+            task_name TEXT NOT NULL,
+            at_ms INTEGER NOT NULL,
+            from_count INTEGER NOT NULL,
+            to_count INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            principal TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            applied INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            policy_digest TEXT NOT NULL DEFAULT '',
+            decision_id TEXT NOT NULL DEFAULT '',
+            decision TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS scale_history_target
+            ON scale_history (job_id, task_group, task_name, id);
+        CREATE INDEX IF NOT EXISTS scale_history_digest
+            ON scale_history (policy_digest);",
+        )
+        .down("DROP TABLE IF EXISTS scale_history;"),
+        // Pauses (`legion scaling pause`): one row per scope. The
+        // cluster-wide pause is `job_id = '*'`; a whole job's is
+        // `task_group = '*'`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_pause (
+            job_id TEXT NOT NULL,
+            task_group TEXT NOT NULL,
+            task_name TEXT NOT NULL,
+            until_ms INTEGER,
+            reason TEXT NOT NULL,
+            principal TEXT NOT NULL,
+            created_ms INTEGER NOT NULL,
+            PRIMARY KEY (job_id, task_group, task_name)
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_pause;"),
+        // Effective policies by digest, so a `scale_history` row's digest
+        // always resolves to the policy that decided. Pruned when no history
+        // row references a digest.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_policy_snapshot (
+            digest TEXT PRIMARY KEY,
+            policy TEXT NOT NULL,
+            first_used_ms INTEGER NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_policy_snapshot;"),
     ]
 }
 

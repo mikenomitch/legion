@@ -216,6 +216,15 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // reconciling `job_scale` eval is its own sequential scheduler-lane
     // enqueue, exactly the JC-33 wrapper-sequential shape stop_job uses.
     ("task_scale", Owner::Lane(Lane::Control)),
+    // Task autoscaling's state rides Control beside `task_scale` (plan
+    // non-goal: no new lane): every autoscaler write is a `task_scale`
+    // write plus its history row in one entry, and the defaults and pauses
+    // are operator intent read by the same submit and scale ops.
+    ("scaling_counter", Owner::Lane(Lane::Control)),
+    ("scaling_defaults", Owner::Lane(Lane::Control)),
+    ("scale_history", Owner::Lane(Lane::Control)),
+    ("scaling_pause", Owner::Lane(Lane::Control)),
+    ("scaling_policy_snapshot", Owner::Lane(Lane::Control)),
     // ── scheduler lane: placement + rollout progression ──────────────────
     ("allocation", Owner::Lane(Lane::Scheduler)),
     ("allocation_epoch", Owner::Lane(Lane::Scheduler)),

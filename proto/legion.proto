@@ -99,6 +99,19 @@ service Manager {
   // requested while a rollout is in flight is recorded as pending and
   // applied when the rollout finishes (scale-out applies immediately).
   // Guarded by `scale:write`, deliberately separate from `job:write`.
+  //
+  // On an autoscaled task (one with `autoscale` in its spec) the policy owns
+  // the count, so a person's write is a time-boxed pin: `count` with
+  // `pin_for_seconds` holds the count there until the pin expires, `min` or
+  // `max` with `pin_for_seconds` holds a floor or a ceiling, and `release`
+  // ends a pin early. A `count` without `pin_for_seconds` is refused with
+  // FAILED_PRECONDITION and a hint. The autoscaler itself writes with
+  // `source = "autoscaler"`, `expected_version` (compare-and-set: a stale
+  // writer gets FAILED_PRECONDITION and re-reads), and the `decision` that
+  // made the change; its writes to a paused or count-pinned task are
+  // refused. When the autoscaled task shares its group with other tasks,
+  // every task of the group moves to the count in one write. Every applied
+  // or deferred write is recorded in the task's scale history.
   rpc ScaleTask (ScaleTaskRequest) returns (ScaleTaskReply);
 
   // Reports every task's spec count, live override (or pending scale-in),
@@ -134,6 +147,123 @@ service Manager {
   // PERMISSION_DENIED when any named job is outside the caller's grant; a
   // namespace listing (no targets) silently leaves such jobs out.
   rpc GetScalingInputs (GetScalingInputsRequest) returns (GetScalingInputsReply);
+
+  // === AUTOSCALING ===
+  //
+  // Task autoscaling (docs/autoscaling.md): `autoscale` on a task in a
+  // jobspec, resolved against layered defaults (built-in, then the cluster's
+  // scaling defaults, then every namespace policy's `autoscale`, then the
+  // task's own record), and acted on by the bundled autoscaler app
+  // (`legion-system/autoscaler`, docs/apps.md). The app reads policies from
+  // WatchScalingPolicies and measurements from GetScalingInputs, writes
+  // counts through ScaleTask (compare-and-set, with the decision attached),
+  // and reports what it is doing through ReportScalingStatus. People read
+  // that back with GetScalingStatus and GetScaleHistory, and freeze it with
+  // PauseScaling.
+
+  // Streams the effective scaling policy of every autoscaled task the caller
+  // may read (`scale:read`), resolved live against the layered defaults.
+  //
+  // The first message is the full set. A new full set follows whenever any
+  // input changes: a job with `autoscale` is submitted, stopped, or
+  // destroyed; the cluster's scaling defaults change; a namespace policy's
+  // `autoscale` changes. Each message replaces the previous one; a consumer
+  // never merges. The manager checks for changes about once a second and
+  // sends nothing while nothing changed, so an idle stream costs one small
+  // read per second on the answering manager. Any manager answers: policies
+  // are computed from replicated state.
+  //
+  // A policy that no longer resolves (a defaults change applied with
+  // `force`, or two namespace policies that disagree) is still sent, with
+  // `state = "invalid"` and the reason in `error`: the autoscaler holds it
+  // and reports it, rather than dropping it silently.
+  //
+  // ACL: `scale:read`, gated before anything is read; policies of jobs
+  // outside the caller's grant are left out. Re-checks the caller's
+  // credential periodically, like StreamEvents.
+  rpc WatchScalingPolicies (WatchScalingPoliciesRequest) returns (stream ScalingPolicySet);
+
+  // Sets the cluster's scaling defaults: the record every autoscaled task
+  // inherits for the fields it, and its namespace policies, leave unset
+  // (`legion scaling defaults apply`). The record has the jobspec
+  // `autoscale` shape without `checks`, and an inherited `min` must be a
+  // multiple of `count` of at least "1x".
+  //
+  // Every autoscaled task's effective policy is re-resolved first. When the
+  // change would leave any of them invalid (a cluster `min` above a task's
+  // own `max`, say), the apply is refused with FAILED_PRECONDITION listing
+  // them, unless `force` is set; then those policies are held `invalid`
+  // until fixed. `dry_run` returns the same report and writes nothing.
+  // Inheriting tasks pick the change up live, with no resubmit.
+  //
+  // ACL: `operator:write`. Retry-safe with `idempotency_key`.
+  rpc ApplyScalingDefaults (ApplyScalingDefaultsRequest) returns (ApplyScalingDefaultsReply);
+
+  // Reads the cluster's scaling defaults as written, and the effective
+  // defaults for one namespace with the origin of every field (built-in,
+  // cluster defaults, or a namespace policy): what a task with
+  // `autoscale = true` in that namespace would get.
+  //
+  // ACL: `scale:read` on the namespace.
+  rpc GetScalingDefaults (GetScalingDefaultsRequest) returns (GetScalingDefaultsReply);
+
+  // The autoscaler app's heartbeat: one call per evaluation tick, carrying
+  // the last evaluation of every target it evaluated. Held in the memory of
+  // the manager that leads the status lane (other managers forward it), and
+  // read back by GetScalingStatus, which reports the app NOT RUNNING once no
+  // report has arrived for three of the app's intervals. Also the channel
+  // for the app's state-change events (`scale.limited`, `scale.flapping`,
+  // `scale.check_failed`), which the manager records.
+  //
+  // ACL: app-plane. Only the bundled autoscaler's own workload identity (a
+  // token whose job grant belongs to an allocation of
+  // `legion-system/autoscaler`) or a management token may call it, so a
+  // caller with `scale:write` cannot forge the app's status. With ACLs
+  // disabled every caller is trusted, as everywhere else.
+  rpc ReportScalingStatus (ReportScalingStatusRequest) returns (ReportScalingStatusReply);
+
+  // Records an autoscaler action that is not a count write. Today that is
+  // a `dry-run` policy's "would" decision: a `scale_history` row with
+  // `applied = false`, so `legion scaling history` shows what the policy
+  // would have done. Node-group and external-target action intents will
+  // use the same RPC.
+  //
+  // ACL: app-plane, like ReportScalingStatus.
+  rpc RecordScalingAction (RecordScalingActionRequest) returns (RecordScalingActionReply);
+
+  // Reports every autoscaled task's live state: its effective count, bounds
+  // and mode, the autoscaler's last evaluation of it (what it wants, the
+  // state, the one-line summary), pins and pauses, and the last recorded
+  // change; and whether the autoscaler app is running at all. With
+  // `detail`, also the last evaluation's full stage-by-stage decision and
+  // the effective policy with the origin of every field
+  // (`legion scaling explain`).
+  //
+  // Answered by the status-lane leader, which holds the app's reports (other
+  // managers forward). Works with the app down, and says so.
+  //
+  // ACL: `scale:read`, gated before any lookup; targets of jobs outside the
+  // caller's grant are left out (a request naming such a job is refused).
+  rpc GetScalingStatus (GetScalingStatusRequest) returns (GetScalingStatusReply);
+
+  // Lists the durable record of scaling changes for a job, newest first:
+  // every count write (by people and by the autoscaler, applied or
+  // deferred), pins and releases, and a `dry-run` policy's "would" rows.
+  // History is capped at 200 rows per task.
+  //
+  // ACL: `scale:read` on the job.
+  rpc GetScaleHistory (GetScaleHistoryRequest) returns (GetScaleHistoryReply);
+
+  // Pauses autoscaling for one task, every autoscaled task of one job, or
+  // the whole cluster (`all`), optionally for a duration; or resumes it
+  // (`resume`). A pause is replicated state, enforced in two places: the
+  // autoscaler skips paused targets, and ScaleTask refuses autoscaler
+  // writes to them, so a pause holds even against a misbehaving app. People
+  // can still scale a paused task by hand.
+  //
+  // ACL: `scale:write` on the job; `operator:write` for `all`. Retry-safe
+  // with `idempotency_key`.
+  rpc PauseScaling (PauseScalingRequest) returns (PauseScalingReply);
 
   // Permanently removes a stopped job and related records.
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
@@ -3669,6 +3799,32 @@ message PlanJobReply {
   // Like the rest of the reply, this is a plan against a snapshot, not a
   // reservation.
   repeated GangReport gang_reports = 9;
+
+  // One entry per task with `autoscale`, in task order: its effective
+  // policy as the cluster's current defaults resolve it, so nothing about
+  // `autoscale = true` is hidden (docs/autoscaling.md).
+  repeated AutoscalePlan autoscale = 10;
+}
+
+// The effective autoscaling policy of one task in a plan.
+message AutoscalePlan {
+  // `job/group/task`.
+  string target = 1;
+
+  // The effective record (JSON), with bounds as written (`"4x"`) and every
+  // default filled.
+  string effective_json = 2;
+
+  // The human summary, one line each:
+  // `hold cpu at 70% of 500MHz per replica, 1m average over ready replicas`,
+  // `bounds 2..8 (min = count, max = 4 x count)`, `up: ...`, `down: ...`.
+  repeated string summary = 3;
+
+  // Every field with the level it came from.
+  repeated ScalingProvenanceRow provenance = 4;
+
+  // The effective policy's digest.
+  string digest = 5;
 }
 
 // How one gang task fared in one plan (docs/gang-scheduling.md). The same
@@ -3895,14 +4051,84 @@ message ScaleTaskRequest {
 
   // Optional idempotency key. See `RunJobRequest.idempotency_key`.
   optional string idempotency_key = 7;
+
+  // Compare-and-set: apply only when the task's override row is at exactly
+  // this version, else fail with FAILED_PRECONDITION
+  // (`version conflict: ...`) and change nothing. 0 means "no override row
+  // exists". Read the current version from `ScalingInputs.override_version`
+  // or `TaskScaleStatus.version`. A version is a cluster-wide counter
+  // stamped on every write of the row, so it never repeats, even after the
+  // row is deleted and recreated. Unset: no check (a person's write).
+  optional uint64 expected_version = 8;
+
+  // Why the count changed, as the autoscaler decided it: recorded in the
+  // task's scale history with the write. Optional for people.
+  ScaleDecision decision = 9;
+
+  // Who is writing: `operator` (the default, also for an empty string),
+  // `autoscaler`, or `wake`. `autoscaler` and `wake` are honored only from
+  // the bundled autoscaler's own identity (or a management token); from
+  // any other caller the write is treated as `operator`. An `autoscaler`
+  // write is refused while the task is paused or pinned to a count, and
+  // must stay within a pinned floor or ceiling.
+  string source = 10;
+
+  // Pin: hold the result for this many seconds. With `count` it pins the
+  // count; with `min` and/or `max` it pins a floor and/or ceiling the
+  // autoscaler stays within. Required for a person's count on an
+  // autoscaled task; refused on a task without `autoscale`.
+  optional uint64 pin_for_seconds = 11;
+
+  // A pinned floor (with `pin_for_seconds`). The count is raised to it at
+  // once when below.
+  optional uint32 min = 12;
+
+  // A pinned ceiling (with `pin_for_seconds`). The count is lowered to it at
+  // once when above.
+  optional uint32 max = 13;
+
+  // End the task's pin now and leave the count where it is: the autoscaler
+  // takes over again at its normal rate. Mutually exclusive with `count`,
+  // `reset`, `min`, and `max`.
+  bool release = 14;
+}
+
+// Why a count changed (ScaleTask, RecordScalingAction), as the autoscaler
+// recorded it. Stored with the task's scale history row.
+message ScaleDecision {
+  // An id for the decision, unique per target (`d-` and hex), named in
+  // events and `legion scaling explain`.
+  string id = 1;
+
+  // The one-line why: `cpu 0.91 vs 0.70 (4 ready); rate-limited from 7`.
+  string summary = 2;
+
+  // The digest of the effective policy that decided (hex SHA-256 of
+  // `policy_json`). The manager keeps that policy once per digest, so a
+  // history row's digest always resolves to the exact policy, even after
+  // the defaults that shaped it change.
+  string policy_digest = 3;
+
+  // The effective policy as canonical JSON. Must hash to `policy_digest`,
+  // else the write is refused.
+  string policy_json = 4;
+
+  // The full decision as the engine made it (JSON): each check's reading
+  // and recommendation, and every pipeline stage's before, after, and note.
+  string detail_json = 5;
+
+  // When the decision was made, unix milliseconds.
+  int64 evaluated_at_unix_ms = 6;
 }
 
 // Reply payload for ScaleTask.
 message ScaleTaskReply {
   // Human-readable outcome, e.g.
-  // `"web/default/web: 4 -> 6 (spec count 2; override active)"` or the
+  // `"web/default/web: 4 -> 6 (spec count 2; override active)"`, the
   // deferral notice
-  // `"deferred: rollout web-7 is in progress; scale-in to 2 applies when it completes"`.
+  // `"deferred: rollout web-7 is in progress; scale-in to 2 applies when it completes"`,
+  // or for a pin
+  // `"web/default/web: 6 -> 12; autoscaling pinned until 05:10 UTC (legion job scale web --release)"`.
   string message = 1;
 
   // True when replayed from a recorded result for the request's
@@ -3912,6 +4138,15 @@ message ScaleTaskReply {
   // True when the request was a scale-in during an active rollout and was
   // recorded as pending rather than applied (see ScaleTask's RPC comment).
   bool deferred = 3;
+
+  // The override row's version after this write (the next write's
+  // `expected_version`). 0 when the row was removed (`reset`) or the reply
+  // is a replay.
+  uint64 version = 4;
+
+  // When the pin set by this write expires, unix milliseconds. Unset when
+  // the write set no pin.
+  optional int64 pinned_until_unix_ms = 5;
 }
 
 // Request payload for GetJobScaleStatus.
@@ -3947,8 +4182,7 @@ message TaskScaleStatus {
   // placement does.
   uint32 effective_count = 6;
 
-  // Who set the override: `operator` today; `autoscaler` when the policy
-  // evaluator ships.
+  // Who set the override: `operator`, `autoscaler`, or `wake`.
   string source = 7;
 
   // The audit note recorded with the override, if any.
@@ -3957,6 +4191,72 @@ message TaskScaleStatus {
   // RFC 3339 timestamp of the last override write; empty when no
   // override exists.
   string updated_at = 9;
+
+  // Whether the task has `autoscale` in its latest spec: the autoscaler owns
+  // its count, and a person's count is a pin.
+  bool autoscaled = 10;
+
+  // For an autoscaled task, its effective policy in one line
+  // (`2..8, cpu 70%, enforce`), or `invalid: <why>` when it does not
+  // resolve. Empty otherwise.
+  string policy_summary = 11;
+
+  // The active pin, if any.
+  ScalePin pin = 12;
+
+  // The pause that covers this task, if any (its own, its job's, or the
+  // cluster-wide one).
+  ScalingPauseInfo pause = 13;
+
+  // When the autoscaler last evaluated the task, unix milliseconds; 0 when
+  // it has not (since the status-lane leader started).
+  int64 last_evaluation_unix_ms = 14;
+
+  // The autoscaler's last word on the task (see `ScalingTargetStatus.state`);
+  // empty for a task without `autoscale`.
+  string state = 15;
+
+  // The override row's version (`ScaleTaskRequest.expected_version`); 0
+  // when no row exists.
+  uint64 version = 16;
+}
+
+// A time-boxed pin on an autoscaled task (`legion job scale --for`).
+// `min == max` pins the count.
+message ScalePin {
+  // When the pin ends, unix milliseconds.
+  int64 until_unix_ms = 1;
+
+  // The pinned floor, if any.
+  optional uint32 min = 2;
+
+  // The pinned ceiling, if any.
+  optional uint32 max = 3;
+
+  // Who pinned (the token's principal).
+  string by = 4;
+
+  // The reason given.
+  string reason = 5;
+}
+
+// A pause covering a target (`legion scaling pause`).
+message ScalingPauseInfo {
+  // What the pause covers: `all` (cluster-wide), `job`, or `task`.
+  string scope = 1;
+
+  // When the pause ends, unix milliseconds; unset holds until
+  // `legion scaling resume`.
+  optional int64 until_unix_ms = 2;
+
+  // Who paused.
+  string by = 3;
+
+  // The reason given.
+  string reason = 4;
+
+  // When the pause was set, unix milliseconds.
+  int64 since_unix_ms = 5;
 }
 
 // Reply payload for GetJobScaleStatus.
@@ -4096,6 +4396,16 @@ message ScalingInputs {
   // memory for at most 4096 tasks; a manager that recently took the status
   // lane holds only what it has seen since.
   repeated ScalingInputsPoint history = 16;
+
+  // The task's override row version, for a compare-and-set ScaleTask
+  // (`ScaleTaskRequest.expected_version`); 0 when no row exists.
+  uint64 override_version = 17;
+
+  // The task's active pin, if any.
+  ScalePin pin = 18;
+
+  // The pause that covers the task, if any.
+  ScalingPauseInfo pause = 19;
 }
 
 // One replica's reservation (GetScalingInputs).
@@ -4262,6 +4572,567 @@ message ScalingInputsPoint {
 
   // `ScalingRequestInputs.latency_ms_mean`.
   double latency_ms_mean = 9;
+}
+
+// Request payload for WatchScalingPolicies.
+message WatchScalingPoliciesRequest {
+  // Namespaces to watch, as names or `*`-globs. Empty means every namespace
+  // the caller can read, which is what the autoscaler asks for. Jobs the
+  // caller lacks `scale:read` on are always left out.
+  repeated string namespaces = 1;
+}
+
+// One message of WatchScalingPolicies: the complete set of effective task
+// policies at one moment. Each message replaces the previous one.
+message ScalingPolicySet {
+  // Every autoscaled task of every running job in scope, sorted by job id,
+  // group, task.
+  repeated ScalingPolicy policies = 1;
+
+  // Increases by one with every message on this stream.
+  uint64 generation = 2;
+
+  // When the set was resolved, unix milliseconds (the answering manager's
+  // clock).
+  int64 resolved_at_unix_ms = 3;
+
+  // The version of the cluster's scaling defaults the set was resolved
+  // against (0: none set).
+  uint64 defaults_version = 4;
+}
+
+// One autoscaled task's effective policy.
+//
+// The policy targets the task, or its whole group when the group has other
+// tasks: then `members` lists every task of the group, all of which move to
+// the same count in one ScaleTask write, and utilization is the group's
+// summed usage over its summed reservations.
+message ScalingPolicy {
+  // Canonical job id.
+  string job_id = 1;
+
+  // Task group.
+  string task_group = 2;
+
+  // The task that carries `autoscale`.
+  string task_name = 3;
+
+  // Every task the policy moves: just `task_name`, or every task of the
+  // group, in spec order.
+  repeated string members = 4;
+
+  // The task's spec `count` (the default floor).
+  uint32 count = 5;
+
+  // `ok`, or `invalid` when the policy does not resolve against the
+  // current defaults (see `error`); an invalid policy is held, never acted
+  // on.
+  string state = 6;
+
+  // Why the policy is invalid; empty when `state = "ok"`.
+  string error = 7;
+
+  // The digest of the effective policy (hex SHA-256 of `policy_json`).
+  string digest = 8;
+
+  // The effective policy as canonical JSON: every default filled, every
+  // `"Nx"` bound resolved (`min`, `max`, `cpu`, `memory`, `checks`, `up`,
+  // `down`, `headroom`, `warmup`, `tolerance`, `window`, `schedule`,
+  // `onMissing`, `mode`). Empty when invalid.
+  string policy_json = 9;
+
+  // The policy in one line: `2..8, cpu 70%, enforce`.
+  string summary = 10;
+
+  // The task's runtime (whether it reports usage is the runtime's).
+  string runtime = 11;
+}
+
+// Request payload for ApplyScalingDefaults.
+message ApplyScalingDefaultsRequest {
+  // The cluster-level record as JSON (the CLI evaluates a Nickel file to
+  // it): the jobspec `autoscale` record without `checks`, e.g.
+  // `{"cpu": 0.6, "max": "6x", "down": {"stabilize": "10m"}}`. `{}` clears
+  // every cluster default, so the built-ins apply.
+  string defaults_json = 1;
+
+  // Validate and report the effect on every inheriting policy; write
+  // nothing.
+  bool dry_run = 2;
+
+  // Apply even when some inheriting policies would become invalid; they
+  // are then held `invalid` until fixed.
+  bool force = 3;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 4;
+}
+
+// Reply payload for ApplyScalingDefaults.
+message ApplyScalingDefaultsReply {
+  // Human-readable outcome:
+  // `scaling defaults: v3 applied; 4 policies changed, 0 invalid`.
+  string message = 1;
+
+  // Whether the defaults were written (false for a dry run, an unchanged
+  // record, or a refusal reported as a dry run).
+  bool applied = 2;
+
+  // The defaults' version after the call.
+  uint64 version = 3;
+
+  // Every autoscaled task whose effective policy changes, or becomes
+  // invalid.
+  repeated ScalingPolicyChange changes = 4;
+
+  // How many of `changes` are invalid under the new defaults.
+  uint32 invalid = 5;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 6;
+}
+
+// How one task's effective policy changes under new defaults.
+message ScalingPolicyChange {
+  // `job/group/task`.
+  string target = 1;
+
+  // The effective policy's digest before the change (empty if it was
+  // already invalid).
+  string before_digest = 2;
+
+  // The digest after (empty if it becomes invalid).
+  string after_digest = 3;
+
+  // Why it becomes invalid; empty when it stays valid.
+  string error = 4;
+
+  // The field paths whose effective value changes (`max`, `down.stabilize`).
+  repeated string fields = 5;
+}
+
+// Request payload for GetScalingDefaults.
+message GetScalingDefaultsRequest {
+  // The namespace whose effective defaults to report. Empty means `default`.
+  string namespace = 1;
+}
+
+// Reply payload for GetScalingDefaults.
+message GetScalingDefaultsReply {
+  // The cluster-level record as written (JSON); `{}` when none is set.
+  string cluster_json = 1;
+
+  // The cluster defaults' version; 0 when none was ever applied.
+  uint64 version = 2;
+
+  // Who applied the current cluster defaults.
+  string updated_by = 3;
+
+  // When, RFC 3339.
+  string updated_at = 4;
+
+  // The namespace the effective rows are for.
+  string namespace = 5;
+
+  // The effective defaults for `namespace`, one row per field, with the
+  // level each value came from. Bounds are shown as written (`"1x"`).
+  repeated ScalingProvenanceRow effective = 6;
+
+  // Set when the namespace's defaults do not resolve: two namespace
+  // policies set one field differently. `effective` is then empty.
+  string error = 7;
+
+  // The namespace policies governing `namespace` that set `autoscale`.
+  repeated string policies = 8;
+}
+
+// One field of an effective policy or defaults, and where it came from.
+message ScalingProvenanceRow {
+  // The field path (`min`, `cpu`, `down.step`, `onMissing`).
+  string field = 1;
+
+  // The effective value, for people (`4 ("1x" of count 4)`, `10m`).
+  string value = 2;
+
+  // `built-in`, `cluster defaults`, `namespace policy <name>`, or
+  // `jobspec`.
+  string origin = 3;
+}
+
+// Request payload for ReportScalingStatus.
+message ReportScalingStatusRequest {
+  // The reporting app instance (its allocation id, or a name), shown by
+  // `legion scaling status`.
+  string instance = 1;
+
+  // The app's evaluation interval in seconds. The app counts as NOT
+  // RUNNING once no report has arrived for three intervals.
+  uint32 interval_seconds = 2;
+
+  // The app-wide mode: `enforce`, or `dry-run` when the app's config forces
+  // every policy to dry-run.
+  string mode = 3;
+
+  // The last evaluation of every target the app evaluated this tick.
+  repeated ScalingTargetReport targets = 4;
+
+  // The app's build (its `legion` version).
+  string version = 5;
+}
+
+// The autoscaler's last evaluation of one target.
+message ScalingTargetReport {
+  // Canonical job id.
+  string job_id = 1;
+
+  // Task group.
+  string task_group = 2;
+
+  // The task that carries `autoscale`.
+  string task_name = 3;
+
+  // The outcome in one word:
+  // - `ok`: the count is where the policy wants it;
+  // - `scaled`: this evaluation changed the count;
+  // - `held`: a safeguard held a change back (the summary says which);
+  // - `limited`: a bound, quota, or capacity limited the count;
+  // - `deferred`: a scale-in waits for a rollout;
+  // - `pinned`, `paused`: an operator holds the target;
+  // - `dry-run`: the policy would have changed the count;
+  // - `missing-data`: no check has data;
+  // - `invalid`: the policy does not resolve;
+  // - `error`: the evaluation or write failed (the summary says why).
+  string state = 4;
+
+  // The count when evaluated.
+  uint32 current = 5;
+
+  // The count the policy wants after every safeguard.
+  uint32 want = 6;
+
+  // When evaluated, unix milliseconds.
+  int64 evaluated_at_unix_ms = 7;
+
+  // The one-line why.
+  string summary = 8;
+
+  // The full decision (JSON: checks and stages). Empty when it is
+  // unchanged since the previous report; the manager keeps the last one.
+  string decision_json = 9;
+
+  // The digest of the effective policy evaluated.
+  string policy_digest = 10;
+
+  // State changes worth an event, at most one of each kind per episode.
+  repeated ScalingEventFlag events = 11;
+}
+
+// A state change the autoscaler reports for the manager to record as an
+// event.
+message ScalingEventFlag {
+  // `limited` (`scale.limited`), `flapping` (`scale.flapping`), or
+  // `check_failed` (`scale.check_failed`).
+  string kind = 1;
+
+  // What happened, for people.
+  string message = 2;
+}
+
+// Reply payload for ReportScalingStatus.
+message ReportScalingStatusReply {
+  // Targets accepted.
+  uint32 accepted = 1;
+
+  // The manager that holds the report (raft node id, or `local`).
+  string served_by = 2;
+}
+
+// Request payload for RecordScalingAction.
+message RecordScalingActionRequest {
+  // Canonical job id.
+  string job_id = 1;
+
+  // Task group.
+  string task_group = 2;
+
+  // Task name.
+  string task_name = 3;
+
+  // The action: `would` (a dry-run policy's decision). Other kinds are
+  // refused.
+  string kind = 4;
+
+  // The count when decided.
+  uint32 from = 5;
+
+  // The count the policy would have written.
+  uint32 to = 6;
+
+  // The decision.
+  ScaleDecision decision = 7;
+}
+
+// Reply payload for RecordScalingAction.
+message RecordScalingActionReply {
+  // The history row written.
+  uint64 history_id = 1;
+}
+
+// Request payload for GetScalingStatus.
+message GetScalingStatusRequest {
+  // Namespaces to list, as names or `*`-globs. Empty means `default`
+  // (or the namespace of `job`, when set).
+  repeated string namespaces = 1;
+
+  // Only this job's targets.
+  string job = 2;
+
+  // With `job`: only targets in this group.
+  optional string task_group = 3;
+
+  // With `job`: only this task's target.
+  optional string task_name = 4;
+
+  // Include each target's full last decision and its effective policy with
+  // provenance (`legion scaling explain`).
+  bool detail = 5;
+}
+
+// Reply payload for GetScalingStatus.
+message GetScalingStatusReply {
+  // The autoscaler app, as the reports show it.
+  ScalingAppStatus app = 1;
+
+  // One entry per autoscaled task in scope, sorted by job, group, task.
+  repeated ScalingTargetStatus targets = 2;
+}
+
+// Whether the autoscaler is running.
+message ScalingAppStatus {
+  // - `running`: a report arrived within three of the app's intervals;
+  // - `not-running`: none did (`message` says since when, and what the
+  //   app's job is doing);
+  // - `starting`: the answering manager took the status lane too recently
+  //   to tell;
+  // - `disabled`: the app is disabled (`legion app disable autoscaler`).
+  string state = 1;
+
+  // For people: `running 1/1 (alloc 42), last evaluation 3s ago`, or
+  // `NOT RUNNING since 14:05 UTC (app job legion-system/autoscaler pending:
+  // no node in pool legion-system)`.
+  string message = 2;
+
+  // When the last report arrived, unix milliseconds; 0 for none.
+  int64 last_report_unix_ms = 3;
+
+  // The app's reported interval, seconds.
+  uint32 interval_seconds = 4;
+
+  // The reporting instance.
+  string instance = 5;
+
+  // The app-wide mode it reported.
+  string mode = 6;
+
+  // The manager that answered (the status-lane leader).
+  string served_by = 7;
+
+  // The cluster-wide pause, if one is active.
+  ScalingPauseInfo paused_all = 8;
+}
+
+// One autoscaled task's live state.
+message ScalingTargetStatus {
+  // Canonical job id.
+  string job_id = 1;
+
+  // Task group.
+  string task_group = 2;
+
+  // The task that carries `autoscale`.
+  string task_name = 3;
+
+  // Every task the policy moves (see `ScalingPolicy.members`).
+  repeated string members = 4;
+
+  // The effective mode: `enforce` or `dry-run`.
+  string mode = 5;
+
+  // The effective count now.
+  uint32 now = 6;
+
+  // What the autoscaler wanted at its last evaluation (= `now` when it held
+  // or has not evaluated).
+  uint32 want = 7;
+
+  // The effective floor.
+  uint32 min = 8;
+
+  // The effective ceiling.
+  uint32 max = 9;
+
+  // The last evaluation's state (see `ScalingTargetReport.state`), or:
+  // `stale` when the last evaluation is older than three of the app's
+  // intervals, `not-evaluated` when there is none, `invalid` when the policy
+  // does not resolve.
+  string state = 10;
+
+  // When last evaluated, unix milliseconds; 0 for never.
+  int64 last_evaluation_unix_ms = 11;
+
+  // The last evaluation's one-line why.
+  string summary = 12;
+
+  // The newest scale-history row, if any.
+  ScaleHistoryEntry last_change = 13;
+
+  // The active pin, if any.
+  ScalePin pin = 14;
+
+  // The pause covering the target, if any.
+  ScalingPauseInfo pause = 15;
+
+  // The effective policy's digest.
+  string policy_digest = 16;
+
+  // Why the policy is invalid, when it is.
+  string error = 17;
+
+  // With `detail`: the last evaluation's full decision (JSON).
+  string decision_json = 18;
+
+  // With `detail`: the effective policy, field by field, with origins.
+  repeated ScalingProvenanceRow policy = 19;
+
+  // With `detail`: the effective policy as JSON.
+  string policy_json = 20;
+
+  // The override row's version.
+  uint64 version = 21;
+
+  // The policy in one line (`2..8, cpu 70%, enforce`).
+  string policy_summary = 22;
+}
+
+// Request payload for GetScaleHistory.
+message GetScaleHistoryRequest {
+  // Job name.
+  string job = 1;
+
+  // Only rows for tasks in this group.
+  optional string task_group = 2;
+
+  // Only rows for this task.
+  optional string task_name = 3;
+
+  // At most this many rows, newest first. 0 means 50; at most 1000.
+  uint32 limit = 4;
+
+  // Include each row's full decision and the effective policy its digest
+  // resolves to.
+  bool detail = 5;
+}
+
+// Reply payload for GetScaleHistory.
+message GetScaleHistoryReply {
+  // Newest first.
+  repeated ScaleHistoryEntry entries = 1;
+}
+
+// One durable scaling record.
+message ScaleHistoryEntry {
+  // Row id, increasing.
+  uint64 id = 1;
+
+  // Canonical job id.
+  string job_id = 2;
+
+  // Task group.
+  string task_group = 3;
+
+  // Task name.
+  string task_name = 4;
+
+  // When, unix milliseconds.
+  int64 at_unix_ms = 5;
+
+  // The count before.
+  uint32 from = 6;
+
+  // The count after (or the count a `would` row wanted).
+  uint32 to = 7;
+
+  // `operator`, `autoscaler`, or `wake`.
+  string source = 8;
+
+  // Who wrote it (the token's principal).
+  string principal = 9;
+
+  // The one-line why (the decision's summary, or a person's reason).
+  string summary = 10;
+
+  // Whether the count actually changed: false for `would` and `deferred`
+  // rows.
+  bool applied = 11;
+
+  // `scaled`, `deferred` (a scale-in waiting for a rollout), `would` (a
+  // dry-run decision), `pinned`, `released`, or `reset`.
+  string kind = 12;
+
+  // The digest of the effective policy that decided; empty for people.
+  string policy_digest = 13;
+
+  // With `detail`: the decision (JSON).
+  string decision_json = 14;
+
+  // With `detail`: the effective policy the digest resolves to (JSON).
+  string policy_json = 15;
+
+  // The decision's id, if any.
+  string decision_id = 16;
+}
+
+// Request payload for PauseScaling.
+message PauseScalingRequest {
+  // The job to pause (or resume). Empty with `all`.
+  string job = 1;
+
+  // Narrow to the autoscaled task of this group.
+  optional string task_group = 2;
+
+  // Narrow to this task.
+  optional string task_name = 3;
+
+  // Pause (or resume) the whole cluster: the kill switch.
+  bool all = 4;
+
+  // Pause for this many seconds; unset holds until resumed.
+  optional uint64 for_seconds = 5;
+
+  // Why, shown on every status surface.
+  string reason = 6;
+
+  // Resume instead: remove the pause at this scope.
+  bool resume = 7;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 8;
+}
+
+// Reply payload for PauseScaling.
+message PauseScalingReply {
+  // Human-readable outcome: `paused web (every autoscaled task) until
+  // 15:10 UTC`, `resumed autoscaling cluster-wide`.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key`.
+  bool deduplicated = 2;
+
+  // When the pause ends, unix milliseconds; unset for "until resumed" and
+  // for a resume.
+  optional int64 until_unix_ms = 3;
 }
 
 // Request payload for DestroyJob.

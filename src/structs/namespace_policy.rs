@@ -64,6 +64,13 @@ pub struct NamespacePolicy {
     /// or globs. Unset allows every host volume; an empty list allows none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_volumes: Option<Vec<String>>,
+    /// Autoscaling defaults for every task in the governed namespaces
+    /// (docs/autoscaling.md, "Overriding the defaults"): the jobspec
+    /// `autoscale` record without `checks`, overriding the cluster's
+    /// defaults field by field. Two governing policies that set one field
+    /// differently leave it unresolvable for tasks that do not set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoscale: Option<crate::autoscaler::AutoscaleRecord>,
 }
 
 /// One band's cap. Each dimension is optional; an unset one is uncapped.
@@ -221,6 +228,9 @@ impl NamespacePolicy {
                 }
                 validate_globs(&format!("{what}: {field}"), list)?;
             }
+        }
+        if let Some(autoscale) = self.autoscale.as_ref() {
+            autoscale.validate_inherited(&what)?;
         }
         Ok(())
     }
