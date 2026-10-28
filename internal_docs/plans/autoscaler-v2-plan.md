@@ -2,8 +2,11 @@
 
 > **Judgement calls:** [autoscaler-v2-plan_calls.md](../calls/autoscaler-v2-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-19; layered defaults, in-place policy
-edits, and the core-field rationale added 2026-10-27). This plan **supersedes**
+**Status: IN EXECUTION.** Phase 1 (cluster-wide scaling inputs) and the
+engine core (`src/autoscaler/`: spec, layered defaults, strategies,
+schedules, pipeline, simulator) shipped 2026-10-28; Phases 2–7 are in
+progress. (Written 2026-10-19; layered defaults, in-place policy edits, and
+the core-field rationale added 2026-10-27.) This plan **supersedes**
 [autoscaler-plan.md](autoscaler-plan.md). That plan's Phase 1 (`legion job
 scale`, count overrides, the `scale` ACL resource) shipped on 2026-07-30 and
 is still accurate. This plan treats it as **Phase 0** and builds on it

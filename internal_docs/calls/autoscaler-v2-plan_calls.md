@@ -843,6 +843,150 @@ already enforced by the `min = 0` validation (plan §6.12).
 KEDA. Treating missing data as idle would put a service to sleep because its
 metrics source had a blip.
 
+## 29. Rollups ride their own `ReportNodeLiveness` call every 10 seconds, not the 1-second digest
+
+*Implementation, Phase 1 (`src/manager/scaling_inputs.rs`).*
+
+**Call.** Each non-leader manager sends its rollups to the status-lane leader
+every 10 seconds on a separate `ReportNodeLiveness` call that carries no node
+ids. It does not ride every tenth 1-second liveness digest. The leader skips
+liveness bookkeeping for a digest with no node ids. The rollups are wrapped
+in a `RollupSync { epoch, seq, base_seq, full }` rather than the plan's bare
+`repeated TargetRollup`, so the leader can apply deltas and detect gaps.
+
+**Alternatives.** Piggyback the rollups on the existing digest, as the plan
+sketched (§6.7).
+
+**Trade-off.** One more manager-plane RPC per manager every 10 seconds, and a
+special case in the digest handler.
+
+**Why (performance and simplicity).** The liveness digest is on the path
+that decides whether nodes are alive. Keeping rollups off it means a large
+rollup payload can never delay a liveness report.
+
+## 30. Rollup deltas compare content, and unchanged rollups are re-confirmed every 60 seconds
+
+*Implementation, Phase 1.*
+
+**Call.**
+- A rollup is re-sent only when its content changes; the sample time alone
+  doesn't count. Unchanged rollups are re-sent every 60 seconds.
+- Any sync, even an empty one, confirms all of that manager's rollups.
+- The leader drops a manager's rollups after 35 seconds without a sync.
+
+**Alternatives.** Re-send every rollup on every tick.
+
+**Trade-off.**
+- A node that moves back to a manager it reported through before can show
+  stale numbers for up to 60 seconds.
+- `age_seconds` in `GetScalingInputs` means time since confirmation, not the
+  sample's own age.
+
+**Why (performance).** The steady-state payload shrinks to almost nothing.
+The debug-profile benchmark measured a 54ms steady delta against 136ms for a
+full send at 33,330 replicas.
+
+## 31. `resyncing` is a 10-second window after takeover, not per-peer tracking
+
+*Implementation, Phase 1.*
+
+**Call.** After a manager takes the status lane, `GetScalingInputs` reports
+`freshness.state = resyncing` for 10 seconds. It doesn't track which peers
+have completed their full resync. A single-manager cluster never shows it.
+
+**Alternatives.** Track each peer's resync, and report `resyncing` until all
+of them have arrived.
+
+**Trade-off.** A slow peer can leave a target's numbers incomplete for a moment
+after the window closes. The missing-data hold in the pipeline still guards
+against acting on that.
+
+**Why (simplicity).** A fixed window is easy to explain, and peers send their
+full set at once (entry 32), so the window is almost always longer than
+needed.
+
+## 32. A resync request is answered in the same tick
+
+*Implementation, Phase 1.*
+
+**Call.** When a new leader asks a peer for a full resync, the peer sends its
+full set in the same tick instead of waiting for its next 10-second send.
+
+**Alternatives.** Send the full set on the next regular tick.
+
+**Trade-off.** A brief burst of full payloads right after an election.
+
+**Why (correctness).** It shrinks the window where targets read as missing
+data from about 10 seconds to about zero.
+
+## 33. Request rates are attributed through the caller's declared upstream
+
+*Implementation, Phase 1.*
+
+**Call.**
+- A service's request, error, and latency figures come from edge samples,
+  attributed through the caller's declared upstream key.
+- An undeclared key is treated as a service in the caller's own namespace,
+  the same rule `ListServiceEdges` uses. External hosts are dropped.
+- A service backed by several tasks reports its full totals on each of them.
+
+**Alternatives.** Attribute by resolving each edge to the specific allocation
+it reached.
+
+**Trade-off.**
+- The figures cover internal callers only, which the public doc states.
+- A task that shares a service with another task sees the combined traffic.
+
+**Why (simplicity).** Edges are recorded on the caller's side, by the name it
+asked for, so that is the only attribution the data supports today.
+
+## 34. A job outside the caller's grant fails the whole `GetScalingInputs` batch
+
+*Implementation, Phase 1.*
+
+**Call.** If a request names a job the caller may not read, the whole batch
+fails with `PERMISSION_DENIED`. An unknown job or task gets a per-entry error
+instead.
+
+**Alternatives.** Return per-entry `PERMISSION_DENIED` and answer the rest.
+
+**Trade-off.** A caller has to split mixed-permission batches itself.
+
+**Why (security).** Per-entry answers would let a caller without access tell
+an existing job from a missing one (AGENTS.md: check before you fetch).
+
+## 35. `unplaced` counts across versions, and is 0 for keyed, `count.per`, batch, and cron tasks
+
+*Implementation, Phase 1.*
+
+**Call.** `unplaced` is the effective count minus live placements across all
+config versions. It is always 0 for keyed tasks, `count.per` tasks, batch and
+cron tasks, which have no autoscalable count. A stopped or failed job has a
+desired count of 0.
+
+**Alternatives.** Count only placements of the latest version.
+
+**Trade-off.** Mid-rollout, old-version allocations count as placed, so
+`unplaced` can read low while a rollout is still placing new ones.
+
+**Why (correctness).** Capacity is what the capacity guard and node
+autoscaling care about, and old-version allocations really do occupy it.
+
+## 36. `job info -j` adds a `scalingInputs` key rather than reshaping the job
+
+*Implementation, Phase 1.*
+
+**Call.** `legion job info -j` gains a `scalingInputs` key on the `Job`
+object. The human output adds a request-vs-usage block.
+
+**Alternatives.** A separate `legion job usage` command, as an earlier plan
+draft had.
+
+**Trade-off.** `job info` does one more RPC.
+
+**Why (simplicity).** One place to look, and the change is additive to an
+output that agents already parse.
+
 ## Ledger: what stands from the superseded plan's calls
 
 The superseded plan's calls are not rewritten (`plans/README.md`). This is

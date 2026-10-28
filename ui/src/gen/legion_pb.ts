@@ -466,6 +466,26 @@ export class WorkerConfig extends Message<WorkerConfig> {
    */
   security = "";
 
+  /**
+   * The namespaces whose jobs nodes of this type accept (worker-type config
+   * `namespaces`), as names or `*`-globs: `["ci-*"]`, `["legion-system"]`.
+   * The worker records the list on its node as the `namespaces` config
+   * attribute, and the scheduler refuses to place a job whose namespace no
+   * entry matches, whatever the job's `permit` says: it is a restriction of
+   * the node, not a toleration a job can write. The blocked-eval wake pass
+   * applies the same check, so a restricted node never wakes a job it would
+   * refuse. Globs follow the reserved-prefix rule: `*` matches every
+   * namespace except reserved `legion-*` ones, which only a pattern that
+   * itself starts with `legion-` matches. See docs/namespaces.md, "Nodes
+   * that accept only some namespaces".
+   *
+   * Default: empty (the node accepts every namespace, reserved ones
+   * included).
+   *
+   * @generated from field: repeated string namespaces = 16;
+   */
+  namespaces: string[] = [];
+
   constructor(data?: PartialMessage<WorkerConfig>) {
     super();
     proto3.util.initPartial(data, this);
@@ -489,6 +509,7 @@ export class WorkerConfig extends Message<WorkerConfig> {
     { no: 13, name: "edge_boot", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 14, name: "container", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 15, name: "security", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerConfig {
@@ -29171,6 +29192,387 @@ export class DeleteAclUserReply extends Message<DeleteAclUserReply> {
 
   static equals(a: DeleteAclUserReply | PlainMessage<DeleteAclUserReply> | undefined, b: DeleteAclUserReply | PlainMessage<DeleteAclUserReply> | undefined): boolean {
     return proto3.util.equals(DeleteAclUserReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListGrants.
+ *
+ * @generated from message legion.ListGrantsRequest
+ */
+export class ListGrantsRequest extends Message<ListGrantsRequest> {
+  /**
+   * Only this job's grants: its canonical id (`namespace/name`, or the bare
+   * name for a job in `default`). Unset or empty lists every job's.
+   *
+   * @generated from field: optional string job = 1;
+   */
+  job?: string;
+
+  /**
+   * Also list revoked grants, with who revoked them and when.
+   *
+   * Default: false.
+   *
+   * @generated from field: bool include_revoked = 2;
+   */
+  includeRevoked = false;
+
+  constructor(data?: PartialMessage<ListGrantsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListGrantsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 2, name: "include_revoked", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListGrantsRequest {
+    return new ListGrantsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListGrantsRequest {
+    return new ListGrantsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListGrantsRequest {
+    return new ListGrantsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListGrantsRequest | PlainMessage<ListGrantsRequest> | undefined, b: ListGrantsRequest | PlainMessage<ListGrantsRequest> | undefined): boolean {
+    return proto3.util.equals(ListGrantsRequest, a, b);
+  }
+}
+
+/**
+ * What one task's `legion` identity was granted.
+ *
+ * @generated from message legion.TaskGrantInfo
+ */
+export class TaskGrantInfo extends Message<TaskGrantInfo> {
+  /**
+   * The task's group.
+   *
+   * @generated from field: string group = 1;
+   */
+  group = "";
+
+  /**
+   * The task's name.
+   *
+   * @generated from field: string task = 2;
+   */
+  task = "";
+
+  /**
+   * The inline rules granted (`permissions` on the identity), as a JSON
+   * array in the shape `legion acl policy apply` takes. `[]` when the
+   * identity named only policies.
+   *
+   * @generated from field: string permissions_json = 3;
+   */
+  permissionsJson = "";
+
+  /**
+   * The policy names granted (`policies` on the identity). Resolved by name
+   * when a token is verified, so a later edit to a policy applies to the
+   * grant too.
+   *
+   * @generated from field: repeated string policies = 4;
+   */
+  policies: string[] = [];
+
+  constructor(data?: PartialMessage<TaskGrantInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TaskGrantInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "permissions_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "policies", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskGrantInfo {
+    return new TaskGrantInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TaskGrantInfo {
+    return new TaskGrantInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TaskGrantInfo {
+    return new TaskGrantInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TaskGrantInfo | PlainMessage<TaskGrantInfo> | undefined, b: TaskGrantInfo | PlainMessage<TaskGrantInfo> | undefined): boolean {
+    return proto3.util.equals(TaskGrantInfo, a, b);
+  }
+}
+
+/**
+ * One job config version's grant.
+ *
+ * @generated from message legion.JobGrant
+ */
+export class JobGrant extends Message<JobGrant> {
+  /**
+   * The job's canonical id.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * The job config version the grant belongs to; allocations of other
+   * versions resolve those versions' grants.
+   *
+   * @generated from field: int64 version = 2;
+   */
+  version = protoInt64.zero;
+
+  /**
+   * The job config id (`<job id>-<version>`).
+   *
+   * @generated from field: string job_config_id = 3;
+   */
+  jobConfigId = "";
+
+  /**
+   * What each task asking for something was granted.
+   *
+   * @generated from field: repeated legion.TaskGrantInfo tasks = 4;
+   */
+  tasks: TaskGrantInfo[] = [];
+
+  /**
+   * The principal whose submit was checked and granted it (for example
+   * `userpass:alice`). A version Legion stored itself, re-rendering a job
+   * after a KV change, carries the previous version's grant, and its granter,
+   * when it asks for exactly the same.
+   *
+   * @generated from field: string granted_by = 5;
+   */
+  grantedBy = "";
+
+  /**
+   * When the grant was recorded (RFC3339).
+   *
+   * @generated from field: string granted_at = 6;
+   */
+  grantedAt = "";
+
+  /**
+   * When the grant was revoked (RFC3339), empty while it is live.
+   *
+   * @generated from field: string revoked_at = 7;
+   */
+  revokedAt = "";
+
+  /**
+   * Who revoked it, empty while it is live.
+   *
+   * @generated from field: string revoked_by = 8;
+   */
+  revokedBy = "";
+
+  constructor(data?: PartialMessage<JobGrant>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobGrant";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "job_config_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "tasks", kind: "message", T: TaskGrantInfo, repeated: true },
+    { no: 5, name: "granted_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "granted_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "revoked_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "revoked_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobGrant {
+    return new JobGrant().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobGrant {
+    return new JobGrant().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobGrant {
+    return new JobGrant().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobGrant | PlainMessage<JobGrant> | undefined, b: JobGrant | PlainMessage<JobGrant> | undefined): boolean {
+    return proto3.util.equals(JobGrant, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListGrants.
+ *
+ * @generated from message legion.ListGrantsReply
+ */
+export class ListGrantsReply extends Message<ListGrantsReply> {
+  /**
+   * Grants, by job id, newest version first.
+   *
+   * @generated from field: repeated legion.JobGrant grants = 1;
+   */
+  grants: JobGrant[] = [];
+
+  constructor(data?: PartialMessage<ListGrantsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListGrantsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "grants", kind: "message", T: JobGrant, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListGrantsReply {
+    return new ListGrantsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListGrantsReply {
+    return new ListGrantsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListGrantsReply {
+    return new ListGrantsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListGrantsReply | PlainMessage<ListGrantsReply> | undefined, b: ListGrantsReply | PlainMessage<ListGrantsReply> | undefined): boolean {
+    return proto3.util.equals(ListGrantsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RevokeGrant.
+ *
+ * @generated from message legion.RevokeGrantRequest
+ */
+export class RevokeGrantRequest extends Message<RevokeGrantRequest> {
+  /**
+   * The job's canonical id (`namespace/name`, or the bare name in
+   * `default`). Required.
+   *
+   * @generated from field: string job = 1;
+   */
+  job = "";
+
+  /**
+   * Revoke only this version's grant. Unset revokes every version's, which
+   * is what stops a running job's access whatever version it runs.
+   *
+   * @generated from field: optional int64 version = 2;
+   */
+  version?: bigint;
+
+  /**
+   * Optional key to dedupe retries; a repeat returns the first reply with
+   * `deduplicated = true`.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<RevokeGrantRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RevokeGrantRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RevokeGrantRequest {
+    return new RevokeGrantRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RevokeGrantRequest {
+    return new RevokeGrantRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RevokeGrantRequest {
+    return new RevokeGrantRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RevokeGrantRequest | PlainMessage<RevokeGrantRequest> | undefined, b: RevokeGrantRequest | PlainMessage<RevokeGrantRequest> | undefined): boolean {
+    return proto3.util.equals(RevokeGrantRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RevokeGrant.
+ *
+ * @generated from message legion.RevokeGrantReply
+ */
+export class RevokeGrantReply extends Message<RevokeGrantReply> {
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * How many live grants this call revoked.
+   *
+   * @generated from field: uint32 revoked = 2;
+   */
+  revoked = 0;
+
+  /**
+   * True when `idempotency_key` matched an earlier call, whose reply this
+   * is.
+   *
+   * @generated from field: bool deduplicated = 3;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<RevokeGrantReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RevokeGrantReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "revoked", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RevokeGrantReply {
+    return new RevokeGrantReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RevokeGrantReply {
+    return new RevokeGrantReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RevokeGrantReply {
+    return new RevokeGrantReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RevokeGrantReply | PlainMessage<RevokeGrantReply> | undefined, b: RevokeGrantReply | PlainMessage<RevokeGrantReply> | undefined): boolean {
+    return proto3.util.equals(RevokeGrantReply, a, b);
   }
 }
 

@@ -4473,11 +4473,22 @@ plan.
         covers the deny side), and regenerating `ui/src/gen/legion_pb.ts`
         (no UI surface consumes the new RPCs yet; run the ui/README
         protoc command when the scaling panel is built).
-  - [ ] Phase 1: cluster-wide scaling inputs. Per-target usage and edge
-        rollups on the liveness digest, merged by the status-lane leader,
-        `GetScalingInputs`, request-vs-usage in `legion job info` and the job
-        page. Usage is sampled per allocation today, but it lives only on the
-        manager that received the heartbeat.
+  - [x] Phase 1: cluster-wide scaling inputs (2026-10-28,
+        [docs/autoscaling.md](../docs/autoscaling.md#scaling-inputs)).
+        Per-(node, task) usage and edge rollups sent every 10s on their own
+        `ReportNodeLiveness` call (delta-encoded, full resync on takeover),
+        merged at the status-lane leader with an hour of history;
+        `GetScalingInputs` (`scale:read`, forwarded to the leader);
+        request-vs-usage in `legion job info`, MCP `legion_job_info` and the
+        job page; `GetJobScaleStatus` reads through `effective_task_count`.
+        Calls 29–36. Not done: release-profile numbers for the rollup
+        benchmark (debug-profile numbers are in the calls doc), and "warming"
+        replicas and the override version, which Phase 2 adds.
+  - [x] Engine core (2026-10-28): `src/autoscaler/` — the `autoscale` spec,
+        layered defaults with provenance and digests, strategies, schedules
+        (5-field crontab, IANA time zones via `chrono-tz`), the safeguard
+        pipeline, and the simulator; pure and unit-tested, not yet wired to
+        the jobspec or an app. Calls 20–28.
   - [ ] Phase 2: task autoscaling MVP as the bundled app (needs apps A1–A3).
         `autoscale = true` and its expansion in `job plan`; layered,
         live-resolved defaults (cluster `legion scaling defaults`,
