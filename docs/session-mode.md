@@ -588,6 +588,11 @@ With `durability = "store"`, every checkpoint of the session (a suspend, a
 `checkpointEvery` checkpoint, an `onWorkerStop` checkpoint) is published and
 recorded in the session's manifest ([Session manifests](#session-manifests)).
 
+A session can also put itself to sleep. With `park = {}` in the `suspend`
+block, the workload writes `park` on `$LEGION_PARK_SOCKET` when it starts
+waiting, and its node suspends the session once the park's `after` passes,
+with no manager involved ([Park](park.md)).
+
 **Suspending.** `legion instance suspend <ID>` (`SuspendInstance`) on a
 session routes, by the node tag in the id, to that node
 (`Worker.SuspendSessions`). The reply names the checkpoint, its kind, the

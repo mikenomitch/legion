@@ -857,8 +857,8 @@
                     # "exec" on a sandbox pinned to a VMM (a microVM takes no
                     # exec sessions). On a sandbox, "network" also counts
                     # bytes the guest sends on its TAP or Apple container
-                    # NIC. "hint" (the workload's own signal) is not
-                    # available yet and is refused.
+                    # NIC. "hint" is refused: the workload's own signal is
+                    # `park` below, whose `busy` keeps this policy off.
                     signals = ["network", "cpu", "exec", "connections"],
                     # The cpu signal's threshold, as a fraction of this
                     # task's cpu. Default 0.02.
@@ -880,6 +880,19 @@
                     # instance resumes, then 503 with Retry-After. Default
                     # "30s", from "1s" to "5m".
                     timeout = "30s",
+                },
+                # The workload says when it is waiting (docs/park.md): the
+                # task gets $LEGION_PARK_SOCKET, a unix socket only it can
+                # reach. `park [LABEL] [after=DURATION]
+                # [checkpoint=memory|disk]` suspends the instance from its
+                # node once `after` passes; `unpark` cancels; `busy` holds
+                # the idle policy off; `status` reports. exec, container,
+                # and sandbox runtimes. Unset: no socket.
+                park = {
+                    # How long a park waits before it suspends, unless the
+                    # `park` line names its own `after`. Default "10s";
+                    # "0s" suspends at once; at most "24h".
+                    after = "10s",
                 },
             },
             resources = {

@@ -674,6 +674,10 @@ pub(crate) struct GuestPayload {
     /// PORT[=VIP:PORT]`: it listens on each loopback port (and VIP) and
     /// relays to the node datapath's vsock socket for the port.
     pub upstreams: Vec<legion_guest::identity::GuestUpstream>,
+    /// The task sets `suspend.park`: the agent serves the guest's park
+    /// socket (`--park`), relayed to the node on host vsock port 1090, and
+    /// `LEGION_PARK_SOCKET` names it (docs/park.md). Gated or not.
+    pub park: bool,
     /// A sandbox launched for memory checkpoints (or with token files):
     /// init starts the resume handler in the background, which watches the
     /// identity disk and refreshes the guest after every restore (new
@@ -782,6 +786,9 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
         }
         if payload.resume_watch {
             flags.push_str(" --resume-watch");
+        }
+        if payload.park {
+            flags.push_str(" --park");
         }
         let (started, missing) = if payload.relay {
             (
@@ -1810,6 +1817,27 @@ mod tests {
         );
         assert!(script.contains("the sandbox takes no exec sessions"));
         assert!(!script.contains("has no network"));
+        assert!(!script.contains("--park"));
+    }
+
+    /// `suspend.park` adds `--park` to the agent, gated or not: the guest's
+    /// park socket is its one way to reach the node (docs/park.md).
+    #[test]
+    fn a_parking_guest_runs_the_agent_with_park() {
+        for relay in [false, true] {
+            let script = render_init_script(&GuestPayload {
+                command: vec!["/bin/sh".into()],
+                guest_agent: true,
+                relay,
+                park: true,
+                ..GuestPayload::default()
+            });
+            let agent = script
+                .lines()
+                .find(|line| line.contains("/legion/legion guest-agent"))
+                .expect("the agent line");
+            assert!(agent.contains(" --park"), "{agent}");
+        }
     }
 
     /// A gated sandbox launched for checkpoints runs one process: the agent
@@ -1981,6 +2009,7 @@ mod tests {
             guest_agent: false,
             relay: false,
             resume_watch: false,
+            park: false,
             guest_binary: None,
             resolvers: Vec::new(),
             ingress_ports: Vec::new(),
@@ -2223,6 +2252,7 @@ mod tests {
             guest_agent: false,
             relay: false,
             resume_watch: false,
+            park: false,
             guest_binary: None,
             resolvers: Vec::new(),
             ingress_ports: Vec::new(),

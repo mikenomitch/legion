@@ -511,6 +511,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#58](https://github.com/mikenomitch/legion/pull/58) | Park: the workload says when it is waiting, and its node suspends it | Plan [park-plan.md](plans/park-plan.md); Phases 1–2, entries under "Park" above and in Done |
 | [#51](https://github.com/mikenomitch/legion/pull/51) | Mesh interfaces: one handler pipeline, a smaller surface, the eBPF kernel classifier, WASM network plugins | Plan [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md); B1 end-to-end plugin overhead still open below |
 | [#57](https://github.com/mikenomitch/legion/pull/57) | Plans only: the autoscaler as a Legion app (autoscaler-v2), and the Legion apps substrate (system worker, granted identities, UI and jobspec extensions, strict unknown fields) | Supersedes autoscaler-plan.md; nothing built. Ecosystem apps → Legion apps substrate and Autoscaler |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
@@ -2361,6 +2362,43 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] A real microVM resume behind the gateway on KVM hardware; CI only
         runs the gateway against a real manager with a simulated worker
         (`tests/integration/wake_integration.rs`).
+- [ ] **Park**: [plan](plans/park-plan.md) (IN EXECUTION) ·
+      [calls](calls/park-plan_calls.md) · [docs](../docs/park.md). Phases 1
+      and 2 are built (in Done below), in
+      [#58](https://github.com/mikenomitch/legion/pull/58).
+  - [ ] Phase 3: timed wake, `park until=<time>`: resume at the deadline if
+        nothing woke the instance first (the manager's sweep for keyed
+        instances, the node for sessions).
+  - [ ] Phase 4: Legion-run tools wake their caller (`--notify <instance>`
+        on a batch job or action), so an agent whose tools are Legion jobs
+        needs no gateway.
+  - [ ] Phase 5: persist pending parks and `busy` with the worker's state, so
+        a worker restart does not leave a parked agent awake
+        ([calls entry 7](calls/park-plan_calls.md#7-park-state-lives-in-the-workers-memory-a-restart-forgets-it)).
+  - [ ] Publish a keyed park's checkpoint under `durability = "store"`. A
+        local suspension's snapshot row is inserted `local` (as pressure
+        suspends always were), so the manager never asks for the publish;
+        insert it with the task's durability and check the publish
+        precondition on this path. Changes pressure suspends too
+        ([calls entry 6](calls/park-plan_calls.md#6-a-keyed-parks-checkpoint-stays-local-even-with-durability--store)).
+  - [ ] Park a real sandbox on KVM, gated and TAP, with memory and disk
+        checkpoints, and resume it. CI tests the guest relay and the host
+        listener over unix sockets standing in for vsock, and parks a real
+        `exec` task end to end.
+  - [ ] Park for `container` tasks on macOS: Apple `container`'s VM cannot
+        connect to a host unix socket in the mounted task directory, so only
+        `exec` parks there. A vsock-style relay like the sandbox one would
+        close it.
+  - [ ] Found while building park, read but not reproduced: a
+        manager-requested capture (`run_capture` → `checkpoint_begin` in
+        `src/worker/checkpoints.rs`) looks the allocation up under the
+        manager's id, but a ratified edge start is keyed by its negative
+        local key (`WorkerTaskManager::external_id`), so `legion instance
+        suspend` of an edge-started keyed instance likely fails with "not
+        running on this node". The local-suspension path now translates
+        (`run_local_suspension_for` captures under `local_key` and reports
+        the manager's id), which also fixed the pressure `suspend` step for
+        such instances; the manager-requested path needs the same.
 - [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (IN EXECUTION) ·
       [calls](calls/sandbox-exec-plan_calls.md). Exec into Linux microVM
       sandboxes, and exec sessions that skip the manager. Implemented
@@ -3183,9 +3221,11 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           KVM host: per-instance TAPs on a bridge with a pool, TAP counters,
           an in-place identity disk refresh in a running guest, and forks of
           a TAP sandbox.
-    - [ ] No signal keeps a TAP sandbox awake through a quiet outbound call
+    - [x] No signal keeps a TAP sandbox awake through a quiet outbound call
           (a harness waiting on a model). `connections` is refused there.
-          The `hint` signal (Phase 8) is the real fix.
+          Fixed by the workload's own word instead of a signal: `busy` on
+          the [park socket](../docs/park.md) holds the idle policy off
+          ([park plan](plans/park-plan.md)).
     - [x] Auto-TAP egress is whatever the operator enforces on the bridge.
           Per-sandbox egress policy needs gated networking, which now takes
           memory checkpoints (gated plan Phase 1), so agent sandboxes can
@@ -3201,6 +3241,12 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           renumbered.
   - [ ] Phase 8: fast paths, each needing its own review (wake on connect,
         `hint` idle signal, UFFD lazy memory, diff snapshots). Deferred.
+    - [x] The `hint` idle signal, as `suspend.park` instead of a signal:
+          the workload says `busy` or `park` on `$LEGION_PARK_SOCKET`, and a
+          park suspends from its node within seconds
+          ([park plan](plans/park-plan.md),
+          [calls entry 1](calls/park-plan_calls.md#1-park-is-its-own-block-and-its-own-verbs-not-the-hint-idle-signal),
+          [docs](../docs/park.md)).
     - [x] Lazy memory restore, Phase 1, in flight in the "lazy memory
           restore" PR: restores trust the content store's digest instead of
           rehashing every part, cloud-hypervisor v52+ restores on demand
@@ -5365,6 +5411,19 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       and `endpoints` on `GetInstance`.
       [plan](plans/wake-on-request-plan.md) ·
       [docs](../docs/gateway.md)
+- [x] **Park, Phases 1 and 2**: `suspend.park = { after }` gives a task
+      `$LEGION_PARK_SOCKET` (`park [LABEL] [after=] [checkpoint=]`,
+      `unpark`, `busy`, `status`, CLI-envelope replies). A park's deadline
+      suspends a keyed instance from its node as a local suspension with
+      `suspend_reason = park` (`SnapshotReport.local_suspension_reason`), or
+      a session on its node; the checkpoint kind is chosen per park; `busy`
+      and a pending park hold the idle policy off;
+      `legion_worker_parks_total{outcome}`. Transports: the task dir for
+      `exec` and `container`, `guest-agent --park` relaying the guest's
+      `/legion/park.sock` to host vsock port 1090 for `sandbox` (upstream
+      port 1090 refused on a parking gated sandbox).
+      [plan](plans/park-plan.md) · [calls](calls/park-plan_calls.md) ·
+      [docs](../docs/park.md)
 - [x] **Gated sandboxes, Phases 1 to 5** of the
       [gated sandbox checkpoints plan](plans/gated-sandbox-checkpoints-plan.md)
       ([calls](calls/gated-sandbox-checkpoints-plan_calls.md)), built on a

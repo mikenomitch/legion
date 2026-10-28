@@ -22,6 +22,9 @@
 //!         port = "http",            # the network.ports label requests go to
 //!         timeout = "30s",          # how long the gateway holds a request for the resume
 //!     },
+//!     park = {                      # the workload says when it waits ($LEGION_PARK_SOCKET)
+//!         after = "10s",            # how long a park waits before it suspends
+//!     },
 //!     # Session tasks only (docs/session-mode.md, "Idle sessions"):
 //!     keepFor = "24h",              # how long a node keeps a suspended session's checkpoint
 //!     checkpointEvery = "10m",      # checkpoint running sessions periodically (off by default)
@@ -29,9 +32,9 @@
 //! },
 //! ```
 //!
-//! The `hint` idle signal (the workload's own busy/idle report) is not
-//! implemented. A spec that lists it is refused at submit rather than
-//! accepted and ignored.
+//! The workload's own busy/idle report is `suspend.park` (docs/park.md),
+//! not an idle signal: a spec that lists the `hint` signal is refused at
+//! submit with a pointer at it.
 
 use std::time::Duration;
 
@@ -97,6 +100,69 @@ impl OnWorkerStop {
             OnWorkerStop::Keep => "keep",
             OnWorkerStop::Checkpoint => "checkpoint",
         }
+    }
+}
+
+/// Default `suspend.park.after`: how long a park waits before it suspends.
+/// Long enough that a tool call that returns in a few seconds never pays for
+/// a suspend and a resume, short enough that a real wait stops costing at
+/// once.
+pub const DEFAULT_PARK_AFTER: Duration = Duration::from_secs(10);
+
+/// Longest `after` a park takes, in the jobspec or on the socket. A park
+/// means "suspend me soon"; a deadline past a day is not one.
+pub const MAX_PARK_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Runtimes Legion can hand a park socket to (docs/park.md, "Transports"):
+/// a socket in the task directory for `exec` and `container`, the guest
+/// agent's vsock relay for `sandbox`.
+pub const PARK_RUNTIMES: [&str; 3] = ["exec", "container", "sandbox"];
+
+/// The `suspend.park` block, as written: the task gets a park socket
+/// (`$LEGION_PARK_SOCKET`) on which the workload says when it is waiting
+/// (docs/park.md).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ParkConfig {
+    /// How long a park waits before it suspends, unless the `park` request
+    /// names its own `after`. Default `"10s"`; `"0s"` suspends at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+/// [`ParkConfig`] with defaults applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedPark {
+    pub after: Duration,
+}
+
+impl Default for ResolvedPark {
+    fn default() -> Self {
+        ResolvedPark {
+            after: DEFAULT_PARK_AFTER,
+        }
+    }
+}
+
+impl ParkConfig {
+    pub fn resolve(&self) -> Result<ResolvedPark, String> {
+        let after = match self.after.as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_PARK_AFTER,
+            Some(raw) => {
+                let after = humantime::parse_duration(raw).map_err(|err| {
+                    format!("suspend.park.after {raw:?} is not a duration: {err}")
+                })?;
+                if after > MAX_PARK_AFTER {
+                    return Err(format!(
+                        "suspend.park.after {raw:?} is longer than 24h: a park suspends the \
+                         instance soon after the workload starts waiting\nHint: use a few \
+                         seconds, like \"10s\", or \"0s\" to suspend at once"
+                    ));
+                }
+                after
+            }
+        };
+        Ok(ResolvedPark { after })
     }
 }
 
@@ -184,8 +250,8 @@ impl IdleSignal {
         }
     }
 
-    /// Parse one `signals` entry. `hint` is refused with a pointer at what
-    /// works today.
+    /// Parse one `signals` entry. `hint` is refused with a pointer at
+    /// `suspend.park`, which is how a workload reports itself.
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim() {
             "network" => Ok(IdleSignal::Network),
@@ -193,12 +259,11 @@ impl IdleSignal {
             "cpu" => Ok(IdleSignal::Cpu),
             "exec" => Ok(IdleSignal::Exec),
             "hint" => Err(
-                "suspend.idle.signals \"hint\" is not implemented yet: the workload's own \
-                 busy/idle signal ships in suspend plan Phase 8\nHint: remove \"hint\". To keep \
-                 an instance awake through a quiet call, add \"connections\" (any open \
-                 connection through the node datapath, inbound or out through a gated \
-                 task's egress proxy, counts as activity; a sandbox has one only on gated \
-                 networking)"
+                "suspend.idle.signals \"hint\" is not a signal: the workload's own busy/idle \
+                 report is the park socket\nHint: remove \"hint\" and add `park = {}` to the \
+                 suspend block. The task then gets $LEGION_PARK_SOCKET: `busy` on it keeps the \
+                 idle policy off through a quiet call, and `park` suspends the instance when \
+                 it starts waiting (docs/park.md)"
                     .to_string(),
             ),
             other => Err(format!(
@@ -531,6 +596,11 @@ pub struct SuspendConfig {
     /// instance resumes only on `legion instance start`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<WakeConfig>,
+    /// Give the task a park socket (`$LEGION_PARK_SOCKET`) on which the
+    /// workload says when it is waiting, and the node suspends it then
+    /// (docs/park.md). Unset: no socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub park: Option<ParkConfig>,
     /// Session tasks only: how long a node keeps a suspended session's
     /// local checkpoint before it evicts it, and then how long it remembers
     /// the eviction so the session answers `evicted` rather than `not
@@ -570,6 +640,8 @@ pub struct ResolvedSuspend {
     pub archive: Option<ArchiveMode>,
     /// `suspend.wake`, when the task accepts wake on request.
     pub wake: Option<ResolvedWake>,
+    /// `suspend.park`, when the task has a park socket.
+    pub park: Option<ResolvedPark>,
     /// `suspend.keepFor` (session tasks).
     pub keep_for: Duration,
     /// `suspend.checkpointEvery` (session tasks), when set.
@@ -591,6 +663,7 @@ impl Default for ResolvedSuspend {
             durability: SnapshotDurability::Local,
             archive: None,
             wake: None,
+            park: None,
             keep_for: DEFAULT_KEEP_FOR,
             checkpoint_every: None,
             on_worker_stop: OnWorkerStop::Keep,
@@ -604,6 +677,7 @@ impl SuspendConfig {
     pub fn resolve(&self) -> Result<ResolvedSuspend, String> {
         let idle = self.idle.as_ref().map(IdleConfig::resolve).transpose()?;
         let wake = self.wake.as_ref().map(WakeConfig::resolve).transpose()?;
+        let park = self.park.as_ref().map(ParkConfig::resolve).transpose()?;
         let reserve = self
             .reserve
             .as_ref()
@@ -725,6 +799,7 @@ impl SuspendConfig {
             durability,
             archive,
             wake,
+            park,
         })
     }
 }
@@ -828,6 +903,15 @@ pub fn validate_suspend(task: &crate::structs::TaskConfig) -> Result<(), String>
     }
     if let Some(wake) = resolved.wake.as_ref() {
         validate_wake_port(task, wake)?;
+    }
+    if resolved.park.is_some() && !PARK_RUNTIMES.contains(&task.runtime.as_str()) {
+        return Err(format!(
+            "task {:?} sets suspend.park, but runtime {:?} runs no process Legion can hand a \
+             park socket to\nHint: suspend.park works on the {} runtimes",
+            task.name,
+            task.runtime,
+            PARK_RUNTIMES.join(", ")
+        ));
     }
     if !resolved.on_resume.is_empty()
         && (task.runtime != "sandbox" || resolved.checkpoint == Some(SnapshotKind::Disk))
@@ -1085,6 +1169,9 @@ pub const SUSPEND_REASON_PRESSURE: &str = "pressure";
 /// The manager suspended it to make room for a resume pinned to its node
 /// (manager `suspend.makeRoom`).
 pub const SUSPEND_REASON_MAKE_ROOM: &str = "make_room";
+/// The workload parked itself on its park socket (`suspend.park`), and its
+/// node suspended it at the park's deadline.
+pub const SUSPEND_REASON_PARK: &str = "park";
 
 /// `instance.pending_op` while a suspend capture is outstanding.
 pub const PENDING_SUSPEND: &str = "suspend";
@@ -1100,8 +1187,8 @@ pub struct InstanceSuspendState {
     /// and while a resume is in flight.
     pub checkpoint_id: Option<String>,
     /// `manual` (SuspendInstance), `idle` (the idle sweep), `pressure`
-    /// (the node's `suspend` pressure step), or `make_room` (a resume
-    /// needed its node's capacity). Written when a suspend starts,
+    /// (the node's `suspend` pressure step), `park` (the workload parked
+    /// itself), or `make_room` (a resume needed its node's capacity). Written when a suspend starts,
     /// so while one is in flight it names that suspend's reason.
     pub suspend_reason: Option<String>,
     /// Unix seconds of the last successful suspend.
@@ -1224,11 +1311,13 @@ mod tests {
         assert!(validate_suspend(&task("sandbox", true, serde_json::json!({}))).is_ok());
     }
 
+    /// `hint` was the suspend plan's name for the workload's own report.
+    /// That report is the park socket now, and the refusal says so.
     #[test]
-    fn later_phase_fields_are_refused_with_a_hint() {
+    fn the_hint_signal_is_refused_with_a_pointer_at_park() {
         let field = serde_json::json!({ "idle": { "signals": ["network", "hint"] } });
         let err = validate_suspend(&task("sandbox", true, field)).unwrap_err();
-        assert!(err.contains("Phase 8"), "{err}");
+        assert!(err.contains("park = {}"), "{err}");
         assert!(err.contains("Hint:"), "{err}");
         assert!(validate_suspend(&task(
             "sandbox",
@@ -1236,6 +1325,65 @@ mod tests {
             serde_json::json!({ "durability": "local" })
         ))
         .is_ok());
+    }
+
+    #[test]
+    fn park_resolves_with_its_default_and_accepts_zero() {
+        let resolved = SuspendConfig {
+            park: Some(ParkConfig::default()),
+            ..Default::default()
+        }
+        .resolve()
+        .unwrap();
+        assert_eq!(resolved.park, Some(ResolvedPark::default()));
+        assert_eq!(resolved.park.unwrap().after, Duration::from_secs(10));
+
+        let now = ParkConfig {
+            after: Some("0s".into()),
+        }
+        .resolve()
+        .unwrap();
+        assert_eq!(now.after, Duration::ZERO);
+
+        let err = ParkConfig {
+            after: Some("soon".into()),
+        }
+        .resolve()
+        .unwrap_err();
+        assert!(
+            err.starts_with("suspend.park.after \"soon\" is not a duration"),
+            "{err}"
+        );
+        assert!(SuspendConfig::default().resolve().unwrap().park.is_none());
+        let err = ParkConfig {
+            after: Some("2d".into()),
+        }
+        .resolve()
+        .unwrap_err();
+        assert!(err.contains("longer than 24h"), "{err}");
+    }
+
+    /// A park socket needs a process Legion can hand it to. Every runtime
+    /// that has one is accepted, and the refusal names them.
+    #[test]
+    fn park_is_refused_on_a_runtime_with_no_process() {
+        for runtime in PARK_RUNTIMES {
+            let spec = task(runtime, true, serde_json::json!({ "park": {} }));
+            assert_eq!(validate_suspend(&spec), Ok(()), "{runtime}");
+        }
+        let err =
+            validate_suspend(&task("noop", true, serde_json::json!({ "park": {} }))).unwrap_err();
+        assert_eq!(
+            err,
+            "task \"workspace\" sets suspend.park, but runtime \"noop\" runs no process Legion \
+             can hand a park socket to\nHint: suspend.park works on the exec, container, sandbox \
+             runtimes"
+        );
+        // A misspelled field is refused when the spec parses, not ignored.
+        assert!(
+            serde_json::from_value::<ParkConfig>(serde_json::json!({ "afterwards": "1s" }))
+                .is_err()
+        );
     }
 
     #[test]

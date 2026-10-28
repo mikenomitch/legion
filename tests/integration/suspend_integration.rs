@@ -24,7 +24,7 @@ use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;
 use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
-use legion::structs::suspend::{IdleConfig, SuspendConfig, SuspendReserveConfig};
+use legion::structs::suspend::{IdleConfig, ParkConfig, SuspendConfig, SuspendReserveConfig};
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::StatefulConfig, job::StatefulStorageConfig,
     job::TaskConfig, AllocationUsage, CheckpointRequest, DestroyInstanceRequest,
@@ -1263,6 +1263,40 @@ async fn a_local_suspension_applies_the_suspend_with_reason_pressure() -> R<()> 
     // And it resumes from the node's checkpoint.
     let started = cluster.start(false).await?;
     assert_eq!(started.resuming_from, "snap-local");
+    Ok(())
+}
+
+/// A park (docs/park.md) rides the same path: the node suspends on its own
+/// at the park's deadline and says why in the report. The manager records
+/// reason `park`, emits it on `instance.suspended`, and the instance
+/// resumes like any other.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_park_local_suspension_applies_the_suspend_with_reason_park() -> R<()> {
+    let cluster = Cluster::new()?;
+    cluster.add_node(json!(["checkpoint"]))?;
+    cluster.submit(job(
+        "exec",
+        Some(SuspendConfig {
+            park: Some(ParkConfig::default()),
+            ..Default::default()
+        }),
+    ))?;
+    let alloc = cluster.active_instance()?;
+    let report = SnapshotReport {
+        local_suspension_reason: "park".into(),
+        ..local_capture("snap-park", alloc)
+    };
+    cluster.heartbeat(vec![report]).await?;
+    let info = cluster.info().await?;
+    assert_eq!(info.state, "suspended");
+    assert_eq!(info.suspend_reason.as_deref(), Some("park"));
+    assert_eq!(info.checkpoint_id.as_deref(), Some("snap-park"));
+    let suspended = cluster.events("instance.suspended")?;
+    assert_eq!(suspended.len(), 1);
+    assert_eq!(suspended[0]["reason"], "park");
+
+    let started = cluster.start(false).await?;
+    assert_eq!(started.resuming_from, "snap-park");
     Ok(())
 }
 

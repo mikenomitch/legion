@@ -763,6 +763,15 @@ enum LaunchFinish {
     Cancelled(Box<UnlockedLaunch>),
 }
 
+/// What a park suspends ([`WorkerTaskManager::park_target`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParkTarget {
+    /// An unpromoted session, suspended on this node.
+    Session(String),
+    /// A keyed instance's allocation, under its manager-facing id.
+    Allocation(i64),
+}
+
 pub struct WorkerTaskManager {
     registry: TaskPluginRegistry,
     instances: HashMap<i64, TaskInstance>,
@@ -816,6 +825,10 @@ pub struct WorkerTaskManager {
     /// heartbeat that still lists an evicted allocation (the report of the
     /// eviction has not reached the manager yet) would relaunch it.
     pressure_evicted: std::collections::HashSet<i64>,
+    /// The park sockets of tasks that set `suspend.park` (docs/park.md),
+    /// set by the daemon once the manager exists. `None` (tests, the
+    /// simulator) gives no task a socket.
+    park: Option<Arc<crate::worker::park::ParkService>>,
     /// Who displaced each preempted allocation, from the same heartbeat feed
     /// as [`Self::stop_causes`]. Written into the stop notice so a task can
     /// tell "the platform wanted my capacity for job X" from "my operator
@@ -1032,6 +1045,7 @@ impl WorkerTaskManager {
             stop_causes: HashMap::new(),
             bands: HashMap::new(),
             pressure_evicted: std::collections::HashSet::new(),
+            park: None,
             preemptors: HashMap::new(),
             terminating: HashMap::new(),
             draining: HashMap::new(),
@@ -1665,20 +1679,149 @@ impl WorkerTaskManager {
         if let Some(kind) = declared {
             return Ok(kind);
         }
-        let launched_for_memory = self
-            .instances
-            .get(&allocation_id)
-            .is_some_and(|instance| instance.checkpoint_launch);
-        let memory = launched_for_memory
-            && self.registry.plugin(&task.runtime).is_some_and(|plugin| {
-                plugin.checkpoint_support(&crate::task_plugins::CheckpointQuery::new(&task.config))
-                    == crate::task_plugins::CheckpointSupport::Memory
-            });
-        Ok(if memory {
+        Ok(if self.can_take_memory_checkpoint(allocation_id) {
             SnapshotKind::Memory
         } else {
             SnapshotKind::Disk
         })
+    }
+
+    /// Whether this allocation can be memory-checkpointed: it was launched
+    /// for checkpoints, on a runtime that takes memory ones.
+    fn can_take_memory_checkpoint(&self, allocation_id: i64) -> bool {
+        let Some(task) = self.task_configs.get(&allocation_id) else {
+            return false;
+        };
+        let launched_for_memory = self
+            .instances
+            .get(&allocation_id)
+            .is_some_and(|instance| instance.checkpoint_launch);
+        launched_for_memory
+            && self.registry.plugin(&task.runtime).is_some_and(|plugin| {
+                plugin.checkpoint_support(&crate::task_plugins::CheckpointQuery::new(&task.config))
+                    == crate::task_plugins::CheckpointSupport::Memory
+            })
+    }
+
+    /// The checkpoint kind a park of this allocation takes (docs/park.md):
+    /// the one the `park` request named, when the allocation can take it,
+    /// else [`Self::local_suspend_kind`].
+    pub fn park_checkpoint_kind(
+        &self,
+        allocation_id: i64,
+        requested: Option<crate::structs::checkpoint::SnapshotKind>,
+    ) -> R<crate::structs::checkpoint::SnapshotKind> {
+        use crate::structs::checkpoint::SnapshotKind;
+        match requested {
+            None => self.local_suspend_kind(allocation_id),
+            Some(SnapshotKind::Disk) => Ok(SnapshotKind::Disk),
+            Some(SnapshotKind::Memory) => {
+                if self.can_take_memory_checkpoint(allocation_id) {
+                    return Ok(SnapshotKind::Memory);
+                }
+                let runtime = self
+                    .task_configs
+                    .get(&allocation_id)
+                    .map(|task| task.runtime.clone())
+                    .with_context(|| {
+                        format!("allocation {allocation_id} is not running on this node")
+                    })?;
+                bail!(
+                    "this allocation cannot take a memory checkpoint: runtime {runtime:?} \
+                     supports \"disk\" only\nHint: park with checkpoint=disk, or leave checkpoint \
+                     out for the task's default"
+                )
+            }
+        }
+    }
+
+    /// What a park of the allocation under `local_key` suspends: its
+    /// session, or the allocation under the id the manager knows it by
+    /// (docs/park.md). A provisional allocation the manager has not
+    /// confirmed yet has no such id, and cannot be suspended on its own.
+    pub(crate) fn park_target(&self, local_key: i64) -> R<ParkTarget> {
+        if let Some(session_id) = self.session_id_for_local_key(local_key) {
+            return Ok(ParkTarget::Session(session_id));
+        }
+        match self.external_id(local_key) {
+            Some(allocation_id) => Ok(ParkTarget::Allocation(allocation_id)),
+            None => bail!(
+                "this instance is not confirmed by the manager yet, so its node cannot suspend \
+                 it\nHint: park again once it is running"
+            ),
+        }
+    }
+
+    /// [`Self::open_park_socket`] for a task a previous worker started,
+    /// recording the env it was started with.
+    fn reopen_park_socket(
+        &self,
+        allocation_id: i64,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+    ) {
+        let (Some(alloc_dir), Some(task_dir)) =
+            (instance.alloc_dir.clone(), instance.task_dir.clone())
+        else {
+            return;
+        };
+        if let Some(socket) = self.open_park_socket(allocation_id, task, &alloc_dir, &task_dir) {
+            if task.runtime != "sandbox" {
+                instance.extra_env.insert(
+                    crate::worker::park::PARK_SOCKET_ENV.into(),
+                    socket.display().to_string(),
+                );
+            }
+        }
+    }
+
+    /// Give this worker's tasks park sockets (docs/park.md). The daemon
+    /// sets it once, before it restores the allocations a previous worker
+    /// left running, so those get their sockets back.
+    pub fn set_park_service(&mut self, park: Arc<crate::worker::park::ParkService>) {
+        self.park = Some(park);
+    }
+
+    /// Allocations whose park socket holds the idle policy off: the
+    /// workload said `busy`, or a park owns when it suspends. Under the ids
+    /// the usage report uses: the manager's for an allocation, the local key
+    /// for a session that has none.
+    pub fn park_held(&self) -> std::collections::HashSet<i64> {
+        let Some(park) = self.park.as_ref() else {
+            return Default::default();
+        };
+        park.held()
+            .into_iter()
+            .map(|local| self.external_id(local).unwrap_or(local))
+            .collect()
+    }
+
+    /// Serve the park socket of a task that sets `suspend.park`. Returns
+    /// the host path it listens on, or `None` when the task has no park
+    /// block, the worker serves none, or the socket could not be bound (a
+    /// warning, not a failed start: the task runs, it just cannot park).
+    fn open_park_socket(
+        &self,
+        allocation_id: i64,
+        task: &TaskConfig,
+        alloc_dir: &std::path::Path,
+        task_dir: &std::path::Path,
+    ) -> Option<PathBuf> {
+        let park = self.park.as_ref()?;
+        let defaults = task.suspend.as_ref()?.resolve().ok()?.park?;
+        let socket = crate::worker::park::host_socket_path(&task.runtime, alloc_dir, task_dir);
+        match park.open(allocation_id, &socket, defaults) {
+            Ok(()) => Some(socket),
+            Err(err) => {
+                warn!(
+                    allocation_id,
+                    task_name = %task.name,
+                    error = %format!("{err:#}"),
+                    "Park socket not available; the task runs but cannot park"
+                );
+                None
+            }
+        }
     }
 
     /// Keep an allocation from being relaunched until the manager drops it
@@ -2297,6 +2440,9 @@ impl WorkerTaskManager {
     }
 
     fn cleanup_alloc_dir(&self, allocation_id: i64) {
+        if let Some(park) = self.park.as_ref() {
+            park.close(allocation_id);
+        }
         let dir = self.alloc_dir(allocation_id);
         if dir.exists() {
             // A sandbox's directory holds its root disk. Removing it under
@@ -2360,6 +2506,17 @@ impl WorkerTaskManager {
                 .display()
                 .to_string(),
         );
+        // A sandbox's guest names its own socket (`/legion/park.sock`); a
+        // host process or a container gets the task-dir path (translated
+        // to the in-container path by the container runtime).
+        if let Some(socket) = self.open_park_socket(allocation.id, task, &alloc_dir, &task_dir) {
+            if task.runtime != "sandbox" {
+                instance.extra_env.insert(
+                    crate::worker::park::PARK_SOCKET_ENV.into(),
+                    socket.display().to_string(),
+                );
+            }
+        }
         instance.alloc_dir = Some(alloc_dir);
         instance.device_link_root = Some(self.device_link_root.clone());
         instance.task_dir = Some(task_dir);
@@ -5151,6 +5308,11 @@ impl WorkerTaskManager {
         if let Some(log_dir) = instance.log_dir.as_deref() {
             self.stderr_marks.insert(allocation_id, stderr_len(log_dir));
         }
+        // The process that parked is gone: its park must not suspend the
+        // one that replaces it (docs/park.md).
+        if let Some(park) = self.park.as_ref() {
+            park.reset(allocation_id);
+        }
         // A restart is a start of its own, timed and logged as one.
         instance.start_timings = StartTimings::begin();
         let runtime = task.runtime.clone();
@@ -5301,6 +5463,9 @@ impl WorkerTaskManager {
                 resumed_stops.push((record.allocation, record.task, instance, stop));
                 continue;
             }
+            // The task kept its env; give it its socket back. Pending parks
+            // are not persisted, so it restarts with none (it stays awake).
+            self.reopen_park_socket(record.allocation.id, &record.task, &mut instance);
             self.instances.insert(record.allocation.id, instance);
             self.allocations
                 .insert(record.allocation.id, record.allocation.clone());
@@ -5559,6 +5724,7 @@ impl WorkerTaskManager {
                 self.resources.restore(local_key, assignment);
                 instance.resource_assignment = Some(assignment.clone());
             }
+            self.reopen_park_socket(local_key, &process.task, &mut instance);
             self.instances.insert(local_key, instance);
             self.allocations
                 .insert(local_key, process.allocation.clone());
@@ -7301,6 +7467,92 @@ mod tests {
         Ok(())
     }
 
+    /// A park on a real `exec` task (docs/park.md): the task gets its
+    /// socket and `LEGION_PARK_SOCKET`, a memory checkpoint is refused on
+    /// the socket, and `park after=0s` makes the worker capture and stop it
+    /// as a local suspension reported with reason `park`. The socket goes
+    /// with the allocation. A task without `suspend.park` gets neither.
+    #[test]
+    fn a_park_on_an_exec_task_reports_a_local_suspension_with_reason_park() -> R<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let park = crate::worker::park::ParkService::new(
+            runtime.handle().clone(),
+            Arc::new(crate::worker::park::TaskManagerSuspender::new(&manager)),
+        );
+        manager.lock().unwrap().set_park_service(park.clone());
+
+        let plain = volume_payload(70);
+        launch_task_allocation(&manager, &plain)?;
+        assert!(!manager.lock().unwrap().instances[&70]
+            .extra_env
+            .contains_key("LEGION_PARK_SOCKET"));
+        let mut parking = volume_payload(71);
+        parking.task_suspend = json!({ "park": { "after": "1h" } }).to_string();
+        launch_task_allocation(&manager, &parking)?;
+        let socket = PathBuf::from(
+            manager.lock().unwrap().instances[&71]
+                .extra_env
+                .get("LEGION_PARK_SOCKET")
+                .cloned()
+                .expect("a parking task gets the env var"),
+        );
+        assert!(socket.ends_with("park.sock"), "{}", socket.display());
+        assert!(socket.exists());
+
+        let ask = |line: &'static str| -> Value {
+            runtime.block_on(async {
+                let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                let (read, mut write) = stream.into_split();
+                write.write_all(line.as_bytes()).await.unwrap();
+                let mut reply = String::new();
+                tokio::io::BufReader::new(read)
+                    .read_line(&mut reply)
+                    .await
+                    .unwrap();
+                serde_json::from_str(&reply).unwrap()
+            })
+        };
+        let refused = ask("park checkpoint=memory\n");
+        assert_eq!(refused["error"]["code"], "FailedPrecondition");
+        assert!(
+            refused["error"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("checkpoint=disk"),
+            "{refused}"
+        );
+        let parked = ask("park ci-4821 after=0s\n");
+        assert_eq!(parked["data"]["state"], "parked", "{parked}");
+        assert_eq!(parked["data"]["checkpoint"], "disk");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let report = loop {
+            let mut reports = manager.lock().unwrap().drain_snapshot_reports();
+            if let Some(report) = reports.pop() {
+                break report;
+            }
+            assert!(std::time::Instant::now() < deadline, "no local suspension");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(report.ok && report.local_suspension, "{report:?}");
+        assert_eq!(report.local_suspension_reason, "park");
+        assert_eq!(report.allocation_id, 71);
+        assert!(!manager.lock().unwrap().is_allocation_active(71));
+        assert!(manager.lock().unwrap().is_allocation_active(70));
+
+        stop_and_reap(&manager);
+        assert!(!socket.exists(), "the socket goes with the allocation");
+        assert!(park.state(71).is_none());
+        Ok(())
+    }
+
     /// A pressure suspend that cannot capture releases its hold and leaves
     /// the task running.
     #[test]
@@ -8854,6 +9106,40 @@ mod tests {
                 .into_iter()
                 .find(|row| row.session_id == session_id),
         )
+    }
+
+    /// A park's deadline on a session (docs/park.md): the worker's
+    /// suspender finds the session by its local key and suspends it on its
+    /// node with the kind the park resolved, leaving the other session be.
+    #[test]
+    fn a_park_suspends_a_session_on_its_node_test() -> R<()> {
+        use crate::worker::park::Suspender;
+        let temp_dir = TempDir::new()?;
+        let manager = worker_with_store(&temp_dir, None)?;
+        manager
+            .lock()
+            .expect("task manager")
+            .begin_task_allocation(&envelope_payload(100))?;
+        let a = start_sleepy_session(&manager, "workspace-a")?;
+        start_sleepy_session(&manager, "workspace-b")?;
+        let suspender = crate::worker::park::TaskManagerSuspender::new(&manager);
+        assert_eq!(
+            suspender.checkpoint_kind(a.local_key, None),
+            Ok(crate::structs::checkpoint::SnapshotKind::Disk)
+        );
+        suspender
+            .suspend(a.local_key, crate::structs::checkpoint::SnapshotKind::Disk)
+            .map_err(|err| anyhow!(err))?;
+        let guard = manager.lock().expect("task manager");
+        assert_eq!(
+            guard.session_status("workspace-a").expect("listed").state,
+            "suspended"
+        );
+        assert_eq!(
+            guard.session_status("workspace-b").expect("listed").state,
+            "running"
+        );
+        Ok(())
     }
 
     /// Phase 5a: a session suspends into the node's content store, frees

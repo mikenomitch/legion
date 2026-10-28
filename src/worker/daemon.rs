@@ -524,6 +524,14 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             content_store_target.clone(),
             Some(host_guard.clone()),
         );
+        // Park sockets (docs/park.md), before the restore below so tasks a
+        // previous worker left running get theirs back.
+        manager.set_park_service(crate::worker::park::ParkService::new(
+            tokio::runtime::Handle::current(),
+            Arc::new(crate::worker::park::TaskManagerSuspender::new(
+                &task_manager,
+            )),
+        ));
         manager.restore_allocations().unwrap_or_else(|err| {
             warn!(error = ?err, "Failed to restore persisted allocations");
             Vec::new()
@@ -2370,11 +2378,11 @@ async fn heartbeat_tick(
                 // Sessions ride along under their negative local keys, for
                 // the idle policy only (docs/session-mode.md#idle-sessions):
                 // their entries come back out before the report is sent.
-                let targets = {
+                let (targets, park_held) = {
                     let manager = task_manager.lock().expect("task manager");
                     let mut targets = manager.usage_targets();
                     targets.extend(manager.session_idle_targets());
-                    targets
+                    (targets, manager.park_held())
                 };
                 // What the datapath and exec server saw, for activity and
                 // the idle policy (docs/suspend-and-resume.md, "Idle policy").
@@ -2383,6 +2391,7 @@ async fn heartbeat_tick(
                 let inputs = crate::worker::usage::ActivityInputs {
                     datapath: activity.snapshot(),
                     exec_sessions: crate::worker::exec::open_sessions(),
+                    park_held,
                 };
                 // One `container stats` call covers every Apple container
                 // sandbox; a node with none never runs it.
