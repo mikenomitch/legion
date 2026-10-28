@@ -392,6 +392,12 @@ worker page) drives three operator flows:
 The RPC is idempotent (optional `idempotency_key`), returns NotFound for
 unknown nodes, and requires `node:write` on the node's pool.
 
+A drained node that will not come back is removed with `legion node forget
+<ID>` (`ForgetNode`, MCP `legion_node_forget`), which drops the record and
+revokes the node's token. It refuses a node that still has allocations, is
+live and not cordoned, or holds node-local volumes, unless `--force`. See
+[Forgetting a node](architecture-managers-workers.md#forgetting-a-node).
+
 ## Dynamic Node Attr Update
 
 `update_node_dynamic`:

@@ -5,8 +5,11 @@ new job version or start a rollout. This is the manual half of autoscaling.
 The inputs an automatic half needs are collected too: `GetScalingInputs`
 (and `legion job info`) reports every task's replicas, measured CPU and memory
 against its reservation, and service traffic, cluster-wide
-([Scaling inputs](#scaling-inputs)). The `scaling` policy block that acts on
-them, and node autoscaling, are not built yet.
+([Scaling inputs](#scaling-inputs)). For nodes, `GetCapacityDemand` (and
+`legion scaling demand`) answers how many nodes of a given shape the work the
+scheduler could not place needs ([Capacity demand](#capacity-demand)). The
+`scaling` policy block that acts on these inputs, and the node autoscaler
+that would act on capacity demand, are not built yet.
 
 ## Why it exists
 
@@ -233,6 +236,152 @@ request is gated before anything is looked up. A request that names a job
 outside the caller's grant is refused whole with `PermissionDenied` (not
 `job not found`). A namespace listing leaves such jobs out.
 
+## Capacity demand
+
+`GetCapacityDemand` answers the question node autoscaling starts from: *how
+many nodes of this shape would the work that is waiting need?* It is a
+read-only simulation on whichever manager answers, computed off the
+scheduler's path, and with the scheduler's own placement rules, so it cannot
+disagree with the scheduler about what fits.
+
+```
+$ legion scaling demand --name general --cpu 4000 --memory 8192 --attr zone=a
+GROUP                 NODES  REPLICAS  ABSORBED  CPU (req/cap)          MEMORY (req/cap)
+general                   3        12         0  10100/12000 MHz        7744/24576 MiB
+
+Pending work: 17 replica(s) in 6 task group(s)
+  huge (huge): 1 pending (0/1 placed), each {"allocations":1,"cpu":1000,"memory":65536}
+  mpi (mpi): 4 pending (0/4 placed, gang quorum 4), each {"allocations":1,"cpu":1000,"memory":512}
+  ...
+
+Unfittable (no template can host them):
+  huge (huge): 1 replica(s)
+    general: resources: one replica needs memory 65536 > 8192 per node
+  spread (spread): 2 replica(s)
+    general: distinct: distinct zone leaves no value for more replicas: every new node of this template has the same value
+  train (train): 2 replica(s)
+    general: permit: task train's permit does not tolerate pool "default"
+```
+
+Several templates at once, from a file (Nickel or JSON): a node-group policy
+(its `name` and `target.nodes` are the template), a bare template, or a list
+of either:
+
+```nickel
+# groups.ncl  —  legion scaling demand -f groups.ncl -j
+[
+  { name = "general", workerType = "default", shape = { cpu = 8000, memory = 16384 } },
+  { name = "gpu", pool = "gpu", shape = { cpu = 16000, memory = 65536,
+                                          attributes = { accel = "a100" },
+                                          resources = { gpu = 4 } } },
+  { name = "like-web-3", likeNode = "web-3", upcoming = 2 },
+]
+```
+
+### The pending work
+
+Every task of an active job that is short of its effective count (the count
+`legion job scale` set, or the spec's), counted against its allocations in
+every config version, plus keyed instances that have no allocation. A task
+group's tasks place together, so a group is one unit: its replicas reserve
+what its short tasks reserve together.
+
+Left out, and why:
+
+- **Jobs whose eval is still pending or in flight.** The scheduler has not
+  tried the capacity that exists yet, so they are listed under
+  `awaiting_scheduler` rather than counted. A blocked eval (no room
+  anywhere) is exactly what this is for.
+- **`count.per` tasks**, which follow nodes rather than ask for them, **cron
+  tasks**, and **batch tasks that already finished**.
+- **Free room on existing nodes.** The work is pending because the scheduler
+  already found no room for it; capacity demand sizes new nodes only.
+
+### The template
+
+Each template is one node group: a name, a worker type (default `default`),
+an optional pool, a shape, and optionally an existing node to copy. The
+manager builds the node a new member would register as: the worker type's
+pool, `namespaces`, attributes, custom `resources`, `reservedResources`,
+`maxAllocations` and oversubscription, then the shape on top (`cpu` and
+`memory` become its capacity, attributes and resources are added), then
+`legion.nodegroup = <name>`, which every member of a node group carries
+([Node attributes from the join](auth-and-acls.md#node-attributes-from-the-join)).
+`likeNode` copies a member's observed capacity and attributes instead, which
+is a better template than a declared shape once one member has joined; a
+shape on top of a copy can only lower it. The reply echoes the node it built
+(`node_pool`, `node_attributes_json`), so you can see what the manager
+understood.
+
+### How it packs
+
+The pending replicas are packed onto copies of each template's node, first
+fit decreasing (the largest share of a node first), with the scheduler's own
+functions:
+
+| Rule | What refuses |
+| --- | --- |
+| `permit` | the task's permit does not tolerate the template's pool or restrictions |
+| `namespace` | the template's nodes accept only some namespaces ([Namespaces](namespaces.md)), not the job's |
+| `constraint` | a constraint does not hold on the template's attributes (the reply names it: `accel = "a100"`) |
+| `volume-driver` | the template's nodes lack a volume driver the task needs |
+| `resources` | one replica is larger than an empty node (`one replica needs memory 65536 > 8192 per node`) |
+| `distinct` | `distinct` leaves no value for more replicas: every new node of one template has the same attributes, so a `distinct` key the template sets hosts one replica |
+| `static-port` | two tasks of one group claim the same static port, so they can never share a node (one replica per node per port is packed as such) |
+| `gang` | a gang's missing quorum places on one template together, or not at all |
+| `invalid` | the task's resources, constraints or permit do not parse |
+
+**Upcoming nodes** (`upcoming`, members asked for that have not joined)
+absorb pending work first, across every template, so a group that was just
+asked to grow is not asked again for the same replicas. Then **each template
+is answered on its own**: "if only this group grew, how many nodes would the
+work it can host need?" Choosing between groups that could host the same work
+is the caller's job.
+
+### What it returns
+
+- Per template (`groups`): `nodes` (the `nodegroup.pending` input), the
+  `replicas` they would host, what its upcoming nodes `absorbed`, the CPU and
+  memory those replicas reserve against what the new nodes offer (the inputs
+  a least-waste choice between groups needs), and `refusals`: the pending
+  work it cannot host, with the rule.
+- `pending`: the work considered, one entry per task group, with desired,
+  placed and pending counts, a gang's quorum, what one replica reserves, and
+  what upcoming nodes absorbed.
+- `unfittable`: replicas no single template can host, with every template's
+  rule. That is a jobspec or template problem, not a capacity problem: no
+  number of new nodes of these shapes will place them.
+- `awaiting_scheduler`, and `truncated` when the pending work is larger than
+  one call simulates (20,000 replicas; node counts are then a floor).
+
+The same read is the MCP tool `legion_scaling_demand` (read-only).
+
+### Access
+
+`node:read`, checked before anything is read, and then on each template's
+pool (the pool the built node ends up in). Node counts cover all pending
+work, but a `pending` or `unfittable` entry names its job, group and tasks
+only when the caller has `job:read` on that job; others keep their counts and
+rules and read `redacted = true`, and `awaiting_scheduler` leaves them out
+and counts them in `awaiting_scheduler_redacted`.
+
+### Limits
+
+- It is approximate, on the safe side. First fit is not the scheduler's
+  scoring, and preemption, disk for node-local volumes, and checkpoint
+  headroom are not modelled, so it can over-ask by a node. It never counts
+  room on existing nodes.
+- A rollout that is stuck for room shows no demand: during a rollout the old
+  version's allocations still count as placed.
+- A task group with one short member is sized as if the group's short tasks
+  move together, which is what a group placement needs.
+- It is a point-in-time read with no memory: a caller that wants
+  stabilization keeps it.
+- Nothing calls it on a schedule yet. The node-group policy shape and its
+  decision engine exist as a library (`src/autoscaler/nodes.rs`); running node
+  groups (minting tokens, calling a provider, draining and forgetting nodes)
+  is not built.
+
 ## Access control
 
 Scaling has its own ACL resource: **`scale`** (actions `read`/`write`, scoped
@@ -289,8 +438,8 @@ a job without the right to redeploy it. See [auth-and-acls.md](auth-and-acls.md)
 ## Known limitations (v1)
 
 - There is no `scaling` policy block yet. This is the manual surface, plus
-  the inputs (`GetScalingInputs`) an automatic one will read. Nothing acts on
-  those inputs yet.
+  the inputs (`GetScalingInputs`, `GetCapacityDemand`) an automatic one will
+  read. Nothing acts on those inputs yet.
 - Scaling inputs are held in the status-lane leader's memory. A takeover
   starts them empty for up to 10 seconds and starts the hour of history
   afresh. History is kept for at most 4096 tasks; past that, a task still

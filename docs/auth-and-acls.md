@@ -109,7 +109,7 @@ reports `aclEnabled: false`.
 | Resource | Covers | `read` | `write` |
 | --- | --- | --- | --- |
 | `job` | jobs, specs, plans, rollouts | list/inspect/plan | submit/stop/destroy/advance |
-| `node` | worker nodes, pools, ledger | list/inspect | restart, drain/attrs |
+| `node` | worker nodes, pools, ledger, join tokens | list/inspect, list join tokens, capacity demand (`GetCapacityDemand`, scoped by each template's pool; it names only jobs you can `job:read`) | restart, drain/attrs, forget (`ForgetNode`), create and revoke join tokens |
 | `kv` | KV entries and locks | get/list | put/patch/delete/locks |
 | `state` | raw state store, saved queries | SQL reads, schema | SQL writes, saved queries |
 | `operator` | raft, manager configs, observability | status/history/logs | raft commands, raft join tokens |
@@ -643,6 +643,76 @@ Workers get their attributes from their worker type's template (pool,
 attributes, and resources from `workerConfigPath`) plus worker-side
 fingerprinting. The join token pins which template applies.
 
+#### Limiting a token's uses
+
+`--max-uses N` makes a token admit at most N new nodes. Use it whenever the
+number of machines is known when the token is minted: a fleet bring-up, or a
+node group asking its provider for N machines:
+
+```bash
+legion join-token create --type default --ttl 1h --max-uses 3
+legion join-token list
+# ID        WORKER_TYPE  DESCRIPTION  USES  ATTRIBUTES  EXPIRES_AT
+# 3f9c2a1b  default                   2/3               2026-10-28T13:00:00Z
+```
+
+- Each new node that registers with the token uses it once. A spent token
+  refuses the next new node with `PermissionDenied: join token <id> is spent:
+  3 of its 3 uses (max_uses) are taken`.
+- A node re-registering under its own name is not a new use: a restart that
+  falls back to the join token, or a node that went `lost` and rejoins. (A
+  restart with the node token never touches the join token at all.)
+- A node removed with [`legion node forget`](architecture-managers-workers.md#forgetting-a-node)
+  is new again, so a spent token cannot bring a forgotten machine back.
+- The limit holds with ACLs off too, for a worker that presents the token.
+  `--max-uses 0` is refused; leave the flag out for no limit.
+
+#### Node attributes from the join
+
+A node's config attributes come from three places, and the more specific one
+wins:
+
+1. the join token's attributes (`legion join-token create --attr k=v`,
+   repeatable), stamped on every node that joins with it;
+2. the host's own `--attr k=v` on `legion join` or `legion start worker`
+   (repeatable), for what only that machine knows;
+3. the worker type's `attributes`.
+
+```bash
+# The minter (an operator, or whatever provisions the group) says which group:
+legion join-token create --type default --max-uses 5 \
+  --attr legion.nodegroup=workers-general
+# The host says which machine it is:
+legion join --token-file /etc/legion/join-token \
+  --attr legion.provider-id=$(curl -s http://169.254.169.254/latest/meta-data/instance-id) \
+  --attr rack=r12
+```
+
+Constraints, `distinct`, and `legion node info` see the merged attributes.
+The token's attributes survive the node's restarts: they are recorded on the
+node as `legion.join` (`{"token": "<id>", "attributes": {...}}`) and applied
+again whenever the node re-registers with its node token.
+
+Keys under `legion.` are reserved. With ACLs enforced, a worker cannot report
+one itself: a `legion.*` attribute reaches the node only if the join token
+sets it, the worker type sets it, or (on a restart) the node's own record
+already has it. One the worker reports that nothing vouches for is dropped
+with a warning, so a host cannot claim `legion.nodegroup = gpu-expensive` and
+attract that group's work. `--attr` may set only the per-host reserved keys,
+today `legion.provider-id`; any other `legion.*` key, and any key Legion
+reads as node structure (`namespaces`, `restriction`, `resources`,
+`reservedResources`, `maxAllocations`, `capacity`, `oversubscribe`,
+`workerAddress`, ...), is refused with `InvalidArgument` (the CLI checks
+before it starts the worker). A token may set any `legion.*` label except
+`legion.role` and `legion.join`, which Legion writes itself, and no
+structural key. Keys are at most 128 bytes, values 1024, and a token or a
+registration carries at most 64.
+
+`legion.provider-id` is a claim the host makes about itself, like every
+`--attr`. Anything that acts on a machine by that id (a script that
+terminates instances, say) should check it against the provider's own list
+of instances first.
+
 When ACLs are enforced:
 
 - `WorkerPreRegister`/`WorkerRegister` require a valid join secret, or the
@@ -670,8 +740,8 @@ When ACLs are enforced:
   working). Re-registering with the node token keeps it: the reply carries no
   new token, so a crash during a restart can never leave the worker holding
   a revoked one.
-- If the manager refuses the persisted node token (the node was removed, or
-  ACL state was reset), or a heartbeat comes back `Unauthenticated`, the
+- If the manager refuses the persisted node token (the node was removed or
+  forgotten, or ACL state was reset), or a heartbeat comes back `Unauthenticated`, the
   worker discards it and registers with its join secret. If that is gone
   too, the worker exits with `Unauthenticated: unknown or revoked join
   token`; mint a new join token for that host and run `legion join` again.
