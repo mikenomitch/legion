@@ -48,6 +48,10 @@ pub struct IntervalActivity {
     pub open_connections: u32,
     /// Exec sessions open at the sample.
     pub exec_sessions: u32,
+    /// The workload's park socket holds the policy off: it said `busy`, or
+    /// a pending park owns when it suspends (docs/park.md). Counts as
+    /// activity whatever the signals list.
+    pub park_held: bool,
 }
 
 impl IdlePolicy {
@@ -72,8 +76,10 @@ impl IdlePolicy {
     /// Whether anything this policy counts happened. Signals the task did
     /// not list are ignored, which is the point of listing them: a quiet
     /// open connection keeps an instance awake only with `connections`.
+    /// The workload's own word on its park socket always counts.
     pub fn is_active(&self, activity: &IntervalActivity) -> bool {
-        (self.counts(IdleSignal::Network) && activity.network_bytes)
+        activity.park_held
+            || (self.counts(IdleSignal::Network) && activity.network_bytes)
             || (self.counts(IdleSignal::Connections) && activity.open_connections > 0)
             || (self.counts(IdleSignal::Cpu)
                 && activity.cpu_millicores >= self.cpu_active_millicores)
@@ -199,6 +205,24 @@ mod tests {
         assert!(policy(&with_connections).is_active(&quiet));
         // And with no connection open, `connections` alone sees nothing.
         assert!(!policy(&[IdleSignal::Connections]).is_active(&IntervalActivity::default()));
+    }
+
+    /// `busy` on the park socket (or a pending park) keeps every policy
+    /// awake, whatever it lists: the workload knows it is working.
+    #[test]
+    fn a_park_hold_counts_for_every_policy() {
+        let held = IntervalActivity {
+            park_held: true,
+            ..Default::default()
+        };
+        for signals in [
+            DEFAULTS,
+            &[IdleSignal::Cpu][..],
+            &[IdleSignal::Connections][..],
+        ] {
+            assert!(policy(signals).is_active(&held), "{signals:?}");
+        }
+        assert!(!policy(DEFAULTS).is_active(&IntervalActivity::default()));
     }
 
     #[test]

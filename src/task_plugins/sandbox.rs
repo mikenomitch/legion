@@ -1096,6 +1096,10 @@ fn build_stamp(layout: &Path, payload: &GuestPayload, artifacts: &[StagedArtifac
     if payload.resume_watch {
         hasher.update(b"\0resume-watch\0");
     }
+    if payload.park {
+        // `--park` on the agent's command line, baked into init.
+        hasher.update(b"\0park\0");
+    }
     for port in &payload.ingress_ports {
         // The init script hands these to the agent.
         hasher.update(b"\0ingress-port\0");
@@ -1349,6 +1353,20 @@ impl SandboxTaskPlugin {
         // A guest launched for checkpoints, or with token files, watches its
         // identity disk. The agent runs the watch.
         let resume_watch = instance.checkpoint_launch || file_tokens;
+        // `suspend.park`: the agent serves the guest's park socket, relayed
+        // to the worker's listener on this VM's `vsock.sock_1090`
+        // (docs/park.md).
+        let park = task
+            .suspend
+            .as_ref()
+            .and_then(|suspend| suspend.resolve().ok())
+            .is_some_and(|resolved| resolved.park.is_some());
+        if park {
+            guest_env.insert(
+                crate::worker::park::PARK_SOCKET_ENV.to_string(),
+                crate::worker::netd::guest_agent::PARK_SOCKET.to_string(),
+            );
+        }
         let mut payload = GuestPayload {
             command: config.command.clone(),
             env: guest_env,
@@ -1368,6 +1386,7 @@ impl SandboxTaskPlugin {
             // and VIP and relays to the datapath's vsock socket for it.
             upstreams: gated_guest_upstreams(allocation.network.as_ref(), &BTreeMap::new()),
             resume_watch,
+            park,
             guest_binary: Some(microvm::guest_binary()?),
             resolvers: lease
                 .as_ref()

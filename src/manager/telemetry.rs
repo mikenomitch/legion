@@ -1262,7 +1262,7 @@ impl Metrics {
         let instance_suspends_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_instance_suspends_total",
-                help: "Suspends applied, by reason: manual (SuspendInstance), idle (the task's suspend.idle policy), or pressure (a node's suspend pressure step). Counted when the node's capture report reaches this manager.",
+                help: "Suspends applied, by reason: manual (SuspendInstance), idle (the task's suspend.idle policy), pressure (a node's suspend pressure step), park (the workload parked itself on its park socket), or make_room (room for a pinned resume). Counted when the node's capture report reaches this manager.",
                 labels: &["reason"],
             },
             series: Series::new(),
@@ -2172,6 +2172,11 @@ pub struct WorkerMetrics {
     /// `legion_worker_pressure_actions_total{step}` — actions this node's
     /// memory pressure response took (docs/resource-enforcement.md).
     pub pressure_actions_total: Arc<CounterVec>,
+    /// `legion_worker_parks_total{outcome}` — what the park sockets on this
+    /// node did (docs/park.md): `parked` (a park accepted), `unparked` (one
+    /// cancelled before its deadline), `suspended` (a deadline passed and
+    /// the suspend ran), `failed` (it did not, and the task keeps running).
+    pub parks_total: Arc<CounterVec>,
     /// `legion_provisional_starts_total{origin,gate}` — provisional
     /// allocations admitted on this node (docs/edge-boot.md).
     pub provisional_starts_total: Arc<CounterVec>,
@@ -2442,6 +2447,14 @@ impl WorkerMetrics {
             },
             series: Series::new(),
         });
+        let parks_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_worker_parks_total",
+                help: "What this node's park sockets did, by outcome (parked|unparked|suspended|failed).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
         let simulated_registrations_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_worker_simulated_registrations_total",
@@ -2553,6 +2566,7 @@ impl WorkerMetrics {
             Arc::clone(&provisional_refused_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_starts_total) as Arc<dyn RenderMetric>,
             Arc::clone(&pressure_actions_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&parks_total) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_nodes_target) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_registrations_total) as Arc<dyn RenderMetric>,
@@ -2565,6 +2579,7 @@ impl WorkerMetrics {
             allocations_running,
             allocation_failures_reported_total,
             pressure_actions_total,
+            parks_total,
             provisional_starts_total,
             provisional_refused_total,
             provisional_killed_total,

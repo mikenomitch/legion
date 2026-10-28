@@ -19,6 +19,7 @@ pub mod logs;
 pub mod managers;
 pub mod netd;
 pub mod node_check;
+pub mod park;
 pub mod plane;
 pub mod pressure;
 pub mod resources;

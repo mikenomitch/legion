@@ -6193,9 +6193,12 @@ export class InstanceInfo extends Message<InstanceInfo> {
 
   /**
    * Why the instance is (or was last) suspended: `manual` (SuspendInstance),
-   * `idle` (the task's `suspend.idle` policy: quiet for `idle.after`), or
+   * `idle` (the task's `suspend.idle` policy: quiet for `idle.after`),
    * `pressure` (the node's memory pressure response took the `suspend` step
-   * because the task sets `suspend.onPressure = true`). While a suspend is in
+   * because the task sets `suspend.onPressure = true`), `park` (the workload
+   * parked itself on its park socket, `suspend.park`, and its node suspended
+   * it at the park's deadline), or `make_room` (the manager suspended it to
+   * make room for a resume pinned to its node). While a suspend is in
    * flight it names the reason of that suspend.
    *
    * @generated from field: optional string suspend_reason = 20;
@@ -9199,13 +9202,16 @@ export class SnapshotReport extends Message<SnapshotReport> {
   /**
    * A `capture` the worker took on its own, with no CheckpointRequest: the
    * memory pressure response's `suspend` step checkpointed and stopped the
-   * allocation (its task sets `suspend.onPressure = true`), and
-   * `snapshot_id` is an id the worker minted. The manager has no snapshot
+   * allocation (its task sets `suspend.onPressure = true`), or the workload
+   * parked itself on its park socket and its deadline passed (its task sets
+   * `suspend.park`), and `snapshot_id` is an id the worker minted.
+   * `local_suspension_reason` says which. The manager has no snapshot
    * row for it, so it inserts one (`purpose = suspend`, `state = local`) and
    * applies the same suspend transaction a SuspendInstance capture does, with
-   * `suspend_reason = pressure`. When the instance has moved on (stopped,
-   * destroyed, or rescheduled while the node was out of contact), the row is
-   * inserted as `deleting` instead, and the node reclaims the checkpoint.
+   * `suspend_reason` set from `local_suspension_reason`. When the instance
+   * has moved on (stopped, destroyed, or rescheduled while the node was out
+   * of contact), the row is inserted as `deleting` instead, and the node
+   * reclaims the checkpoint.
    * The worker re-sends the report on every heartbeat until the manager
    * drops the allocation from its desired set, so a report lost to a failed
    * heartbeat or a manager failover still lands. Only successful captures
@@ -9235,6 +9241,17 @@ export class SnapshotReport extends Message<SnapshotReport> {
    */
   manifestUrl = "";
 
+  /**
+   * With `local_suspension`: why the node suspended the allocation on its
+   * own, stored as the instance's `suspend_reason`. `pressure` (the memory
+   * pressure response's `suspend` step) or `park` (the workload parked
+   * itself on `$LEGION_PARK_SOCKET` and the park's deadline passed,
+   * docs/park.md). Empty, or any other value, is recorded as `pressure`.
+   *
+   * @generated from field: string local_suspension_reason = 12;
+   */
+  localSuspensionReason = "";
+
   constructor(data?: PartialMessage<SnapshotReport>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9254,6 +9271,7 @@ export class SnapshotReport extends Message<SnapshotReport> {
     { no: 9, name: "local_suspension", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 10, name: "pause_ms", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 11, name: "manifest_url", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "local_suspension_reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SnapshotReport {

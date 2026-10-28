@@ -495,6 +495,7 @@ mod tests {
                     error: String::new(),
                     manifest_json: "{}".into(),
                     manifest_url: String::new(),
+                    local_suspension_reason: String::new(),
                     duration_ms: 1,
                     total_bytes: 2,
                     allocation_id: 3,

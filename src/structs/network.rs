@@ -471,6 +471,34 @@ fn validate_gated_guest_ports(task: &crate::structs::TaskConfig) -> Result<(), S
             upstream.port.unwrap_or_default()
         ));
     }
+    // A parking guest's park socket is relayed to host vsock port 1090
+    // (docs/park.md), which an upstream on that port would land on too.
+    let parks = task
+        .suspend
+        .as_ref()
+        .and_then(|suspend| suspend.resolve().ok())
+        .is_some_and(|resolved| resolved.park.is_some());
+    let park_port = u16::try_from(legion_guest::agent::PARK_PORT).unwrap_or(u16::MAX);
+    let on_park = parks
+        .then(|| {
+            task.connect.as_ref().and_then(|connect| {
+                connect
+                    .upstreams
+                    .iter()
+                    .find(|upstream| upstream.port == Some(park_port))
+            })
+        })
+        .flatten();
+    if let Some(upstream) = on_park {
+        return Err(format!(
+            "task {:?} connect.upstreams entry {:?} sets port {park_port}, but a gated sandbox's \
+             upstreams are relayed to the node on vsock ports of the same number, and this task \
+             sets suspend.park, whose socket the guest relays to vsock port {park_port}\nHint: \
+             pick another port, or drop it to take a dynamic one",
+            task.name,
+            upstream.key(),
+        ));
+    }
     Ok(())
 }
 
@@ -2955,6 +2983,15 @@ mod tests {
         }
         let fine = with_connect(gated.clone(), json!({ "to": "db", "port": 5432 }));
         assert!(validate_gated_sandbox(&fine, false).is_ok());
+        // Port 1090 is the park socket's host port, held only when the task
+        // parks.
+        let mut on_park = with_connect(gated.clone(), json!({ "to": "db", "port": 1090 }));
+        assert!(validate_gated_sandbox(&on_park, false).is_ok());
+        on_park.suspend =
+            Some(serde_json::from_value(json!({ "park": {} })).expect("a suspend block parses"));
+        let err = validate_gated_sandbox(&on_park, false).unwrap_err();
+        assert!(err.contains("sets suspend.park"), "{err}");
+        assert!(err.contains("vsock port 1090"), "{err}");
         // Off gated networking the agent relays nothing.
         let tap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "tap" } });
         let mut on_tap = task_of("sandbox", None, tap);

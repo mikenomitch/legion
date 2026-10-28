@@ -918,12 +918,43 @@ pub fn suspend_session_with(
     trigger: &str,
     mode: SuspendMode,
 ) -> R<SuspendOutcome> {
+    suspend_session_inner(manager, session_id, trigger, mode, None)
+}
+
+/// [`suspend_session`] with the checkpoint kind a park asked for in place
+/// of the task's default (docs/park.md).
+pub fn suspend_session_as(
+    manager: &Arc<Mutex<WorkerTaskManager>>,
+    session_id: &str,
+    trigger: &str,
+    kind: SnapshotKind,
+) -> R<SuspendOutcome> {
+    suspend_session_inner(
+        manager,
+        session_id,
+        trigger,
+        SuspendMode::Publish,
+        Some(kind),
+    )
+}
+
+fn suspend_session_inner(
+    manager: &Arc<Mutex<WorkerTaskManager>>,
+    session_id: &str,
+    trigger: &str,
+    mode: SuspendMode,
+    kind: Option<SnapshotKind>,
+) -> R<SuspendOutcome> {
     let plan = {
         let mut guard = manager.lock().expect("task manager");
         if let Some(checkpoint) = guard.suspended_checkpoint(session_id) {
             return Ok(SuspendOutcome::AlreadySuspended(checkpoint));
         }
-        guard.begin_session_capture(session_id)?
+        let mut plan = guard.begin_session_capture(session_id)?;
+        if let Some(kind) = kind {
+            plan.kind = kind;
+        }
+        plan
     };
     let request = CheckpointRequest {
         snapshot_id: crate::structs::snapshot::new_snapshot_id(),

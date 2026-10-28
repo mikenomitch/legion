@@ -441,8 +441,8 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   [How memory comes back](task-runtime-sandbox.md#how-memory-comes-back)).
 - **`legion_instance_suspends_total{reason}`** (counter): suspends applied,
   by `reason`: `manual` (SuspendInstance), `idle` (a task's idle policy),
-  `pressure` (a node's `suspend` pressure step), or `make_room` (to make room
-  for a resume, see
+  `pressure` (a node's `suspend` pressure step), `park` (the workload
+  [parked](park.md) itself), or `make_room` (to make room for a resume, see
   [Capacity for resumes](suspend-and-resume.md#capacity-for-resumes)).
 - **`legion_idle_sweep_suspends_total{outcome}`** (counter): suspends the
   idle sweep tried to start, by `outcome`: `started`, or `skipped` (the
@@ -891,6 +891,13 @@ of worker readiness. Default: disabled.
   node's memory pressure response took, by `step` (`reclaim`,
   `evict-bursting`, `evict-reserved`). Counted when the worker acts, before
   the manager hears about it.
+- **`legion_worker_parks_total{outcome}`** (counter): what the
+  [park sockets](park.md) on this node did, by `outcome`: `parked` (a
+  `park` accepted), `unparked` (a pending park cancelled by `unpark` or
+  `busy`), `suspended` (a deadline passed and the suspend ran), `failed`
+  (the suspend did not, and the task keeps running). `parked` well above
+  `suspended` plus `unparked` means parks are being replaced before their
+  deadlines.
 - **`legion_worker_allocations_running`** (gauge): allocations this worker
   currently runs, as reported on its last heartbeat.
 - **`legion_worker_allocation_failures_reported_total`** (counter):

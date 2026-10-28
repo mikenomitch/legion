@@ -119,6 +119,7 @@ suspend = {
   idle = { after = "3m" },        # suspend automatically when quiet
   onPressure = true,              # let a short node suspend it instead of evicting
   wake = { port = "http" },       # resume on a request through `legion start gateway`
+  park = { after = "10s" },       # the workload says when it waits ($LEGION_PARK_SOCKET)
 },
 ```
 
@@ -135,6 +136,7 @@ suspend = {
 | `onPressure` | `false` | Let the node's memory pressure response suspend this instance (the `suspend` step) before it evicts anything. See [Under memory pressure](#under-memory-pressure). |
 | `keepFor`, `checkpointEvery`, `onWorkerStop` | `24h`, off, `keep` | Session tasks only: how long a suspended session's local checkpoint is kept, a periodic live checkpoint, and whether a stopping worker checkpoints running sessions. See [Idle sessions](session-mode.md#idle-sessions). With `durability = "store"` each of these checkpoints is published and written to the session's manifest, and `stateful.fenceAfter` (default `2m`) sets when a node cut off from managers and the bucket suspends its running sessions ([No split brain](session-mode.md#no-split-brain)). |
 | `wake` | none | `{ port, timeout = "30s" }`: requests through `legion start gateway` for this instance go to the `network.ports` label `port`, and a request for a suspended instance resumes it and is held until it serves. Without it, the gateway refuses the instance. See [Waking on a request](#waking-on-a-request). |
+| `park` | none | `{ after = "10s" }`: give the task a park socket (`$LEGION_PARK_SOCKET`) on which the workload says when it is waiting; the node suspends it a park's `after` later, and `busy` holds the idle policy off. `exec`, `container`, and `sandbox`. See [Park](park.md). |
 
 Submit refuses anything the block cannot honor, with the fix in the hint:
 
@@ -238,11 +240,13 @@ or `pending` one fails with `FailedPrecondition`.
 
 ## Automatic suspend
 
-Calling `instance suspend` is one way in. Two more put an instance into
+Calling `instance suspend` is one way in. Three more put an instance into
 `suspended` without anyone asking: the idle policy, when nothing has happened
-for a while, and the node itself, when it runs short of memory. Both take the
-same checkpoint a manual suspend takes, and `instance get` names which one did
-it in `suspend_reason`: `manual`, `idle`, or `pressure`.
+for a while; the node itself, when it runs short of memory; and the workload,
+when it [parks](park.md) on its park socket because it is about to wait. All
+take the same checkpoint a manual suspend takes, and `instance get` names
+which one did it in `suspend_reason`: `manual`, `idle`, `pressure`, or `park`
+(or `make_room`, when the manager made room for a resume).
 
 ### Idle policy
 
@@ -313,9 +317,13 @@ connection through the proxy, and a long streamed response counts as
 makes its outbound connections around the datapath, so there is nothing to
 count for a model call. See the next section.
 
-Suspending *during* a model call, and waking when it returns, needs the
-workload to say it is parked. That is the `hint` signal, which is not
-available yet. A spec that lists it is refused with a hint.
+Only the workload knows for sure whether it is waiting or working. A task
+that sets [`suspend.park`](park.md) gets a socket for saying so: `busy`
+on it holds this policy off whatever the signals see (on a TAP sandbox, the
+only way to keep it awake through a quiet model call), and `park` suspends
+the instance when it starts a long wait, within seconds rather than after
+`idle.after`. There is no `hint` signal: a spec that lists it is refused
+with a pointer at `suspend.park`.
 
 ### What each signal sees on a sandbox
 
@@ -2186,7 +2194,7 @@ while the manager's keyring is locked.
 | `snapshot.publish_failed` | warn | A `durability = "store"` snapshot could not be uploaded and stays `local`. The metadata carries `error`, which says whether the manager will retry. |
 | `snapshot.warmed` | info | A node fetched a published snapshot's parts after `snapshot warm`. The metadata carries `fetchedBytes` and `durationMs`. |
 | `snapshot.warm_failed` | warn | A node could not warm a snapshot. The metadata carries `error`. |
-| `instance.suspended` | info | A suspend's capture landed. The instance is `suspended`. The metadata carries `kind`, `totalBytes`, `durationMs`, `reserved` (whether it holds a share of its reservation), and `reason` (`manual`, `idle`, `pressure`, or `make_room`). |
+| `instance.suspended` | info | A suspend's capture landed. The instance is `suspended`. The metadata carries `kind`, `totalBytes`, `durationMs`, `reserved` (whether it holds a share of its reservation), and `reason` (`manual`, `idle`, `pressure`, `park`, or `make_room`). |
 | `instance.archived` | info | A published suspend checkpoint was archived (`suspend.archive`). The metadata carries `snapshotId`, `manifestUrl`, and `manifestOnly` (whether the instance row was dropped too). |
 | `instance.make_room` | info | A resume did not fit on its checkpoint's node, and the manager started suspends to make room. The metadata carries the resume's `instanceId` and the instances it is `suspending`. |
 | `instance.suspend_failed` | warn | A suspend's capture failed. The instance keeps running. The metadata carries `error`. |
@@ -2208,7 +2216,7 @@ A suspend by the node's pressure response also emits `node.pressure` with
 | `legion_instance_suspend_seconds` | histogram | `kind` | How long each successful suspend's capture took on its node. |
 | `legion_instance_resume_seconds` | histogram | `kind` | How long each successful resume's restore took on its node. Placement time is not included. |
 | `legion_checkpoint_bytes` | histogram | `kind` | Size of each captured checkpoint (suspends and snapshots). A disk suspend reports 0, since its volume stays in place. |
-| `legion_instance_suspends_total` | counter | `reason` | Suspends applied, by `manual`, `idle`, `pressure`, or `make_room`. |
+| `legion_instance_suspends_total` | counter | `reason` | Suspends applied, by `manual`, `idle`, `pressure`, `park`, or `make_room`. |
 | `legion_make_room_suspends_total` | counter | `outcome` | Make-room suspends: `started`, `failed` (could not start), or `no_room` (a round that would not have made enough room, so nothing was suspended). |
 | `legion_idle_sweep_suspends_total` | counter | `outcome` | Suspends the idle sweep tried to start: `started`, or `skipped` (the instance changed, an operation was in flight, or the node cannot checkpoint). |
 | `legion_checkpoint_publish_bytes` | histogram | `kind` | Bytes a node uploaded to publish one checkpoint: only the chunks the store did not hold yet. 0 when it held every one. |

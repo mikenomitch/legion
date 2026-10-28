@@ -150,6 +150,8 @@ features that make sandboxes work great:
   sandboxes first and evicts other work only if that isn't enough. A
   suspended sandbox resumes in place with its processes intact when you
   start it or when the next request reaches the [gateway](docs/gateway.md).
+  An agent that knows it is about to wait can [park](docs/park.md) itself
+  and suspend within seconds, instead of waiting for the idle policy.
   Snapshots let you roll one back, and fork copies a running one for an
   agent to explore from. See the
   [agent sandboxes guide](docs/guides/agent-sandboxes.md).
@@ -445,7 +447,7 @@ start:
   [Running Agent Sandboxes](docs/guides/agent-sandboxes.md) ·
   [Sandboxes at Scale](docs/sandboxes-at-scale.md) ·
   [Session Mode](docs/session-mode.md) · [Edge Boot](docs/edge-boot.md) ·
-  [Suspend and Resume](docs/suspend-and-resume.md) ·
+  [Suspend and Resume](docs/suspend-and-resume.md) · [Park](docs/park.md) ·
   [Gateway: Wake on Request](docs/gateway.md)
 - **Guides:** [Running Postgres](docs/guides/postgres.md) ·
   [Running Redis](docs/guides/redis.md) ·

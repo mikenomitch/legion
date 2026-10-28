@@ -216,6 +216,10 @@ pub struct ActivityInputs {
     pub datapath: HashMap<i64, crate::worker::netd::activity::DatapathActivity>,
     /// Exec sessions open per allocation (`src/worker/exec.rs`).
     pub exec_sessions: HashMap<i64, u32>,
+    /// Allocations whose park socket holds the idle policy off: the
+    /// workload said `busy`, or a park owns when it suspends
+    /// (`src/worker/park.rs`).
+    pub park_held: std::collections::HashSet<i64>,
 }
 
 /// The value of `key` in a flat-keyed cgroup file (`memory.stat`,
@@ -424,6 +428,7 @@ impl UsageSampler {
                     .get(&target.allocation_id)
                     .copied()
                     .unwrap_or(0),
+                park_held: inputs.park_held.contains(&target.allocation_id),
             };
             let active = cpu_millicores >= ACTIVE_CPU_FLOOR_MILLICORES
                 || interval.network_bytes

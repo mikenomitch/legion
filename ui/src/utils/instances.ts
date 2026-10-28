@@ -26,6 +26,8 @@ export const suspendReasonLabel = (reason: string | undefined): string | undefin
       return 'suspended by its idle policy (suspend.idle)'
     case 'pressure':
       return "suspended by its node's memory pressure response (suspend.onPressure)"
+    case 'park':
+      return 'suspended when its workload parked itself on its park socket (suspend.park)'
     default:
       return reason ? `suspended (${reason})` : undefined
   }
