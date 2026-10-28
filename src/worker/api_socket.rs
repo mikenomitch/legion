@@ -22,15 +22,16 @@
 //!   allocation's own resource, so neither applies.
 //!
 //! **Who may connect.** Tasks can share a uid, so the file's mode is not
-//! enough. When the worker's resource governor runs (Linux, cgroup v2) every
-//! process of an allocation lives in its leaf, `<cgroupParent>/{share,
+//! enough. Where every task is guaranteed a cgroup leaf (Linux with cgroup
+//! v2, and the resource governor or the kernel host guard running), every
+//! process of an allocation lives in `<cgroupParent>/{share,
 //! reserve}/legion-<alloc>`, and the worker reads the connecting process's
 //! credentials (`SO_PEERCRED`), then its cgroup (`/proc/<pid>/cgroup`), and
-//! refuses a process outside this allocation's leaf. Without cgroups
-//! (macOS, enforcement off) only the directory modes guard the socket: the
-//! allocation directory is reachable by the allocation's own user alone,
-//! the same boundary that protects its token file. That is weaker when
-//! allocations share a user, and root reaches everything.
+//! refuses a process outside this allocation's leaf ([`PeerCheck`]).
+//! Elsewhere (macOS, cgroup v1, both off) only the directory modes guard the
+//! socket: the allocation directory is reachable by the allocation's own
+//! user alone, the same boundary that protects its token file. That is
+//! weaker when allocations share a user, and root reaches everything.
 
 use crate::prelude::*;
 use std::path::{Path, PathBuf};
@@ -211,6 +212,7 @@ struct Proxy {
     token: Arc<StdRwLock<Option<String>>>,
 }
 
+#[instrument(skip_all, fields(allocation_id = proxy.allocation_id))]
 async fn accept_loop(listener: UnixListener, proxy: Arc<Proxy>) {
     loop {
         let stream = match listener.accept().await {

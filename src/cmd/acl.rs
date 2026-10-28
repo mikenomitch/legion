@@ -178,6 +178,9 @@ pub fn config() -> Command {
         )
         .subcommand(
             Command::new("revoke")
+                // `--version` is the job config version here, as on
+                // `legion template`, not the binary's.
+                .disable_version_flag(true)
                 .about(
                     "Revoke a job's grants; its tokens lose them at their next request. The \
                      next submit by someone who holds the access grants them again",
