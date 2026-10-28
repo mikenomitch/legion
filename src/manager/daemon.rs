@@ -3940,7 +3940,7 @@ fn ensure_system_namespace(store: &Store) -> R<()> {
         info!(
             namespace = crate::structs::namespace::SYSTEM_NAMESPACE,
             "Created the legion-system namespace and its namespace policy (pools.default = \
-             \"legion-system\")"
+             [\"legion-system\", \"default\"])"
         );
     }
     Ok(())

@@ -411,7 +411,8 @@ What the manager registers:
   the node, so no job from another namespace lands there whatever its
   permit says. The pool keeps away every job that does not permit it, too.
   A job in `legion-system` whose permit names no pool goes there through
-  the `legion-system` namespace policy (`pools.default = "legion-system"`,
+  the `legion-system` namespace policy (`pools.default = ["legion-system",
+  "default"]`, so it also places on a `--run-worker` manager's worker;
   [Reserved namespaces](namespaces.md#reserved-namespaces)).
 - **Attribute `legion.role = "manager"`**, so a job can be constrained to
   managers' workers (`constraints = { "legion.role" = "manager" }`).

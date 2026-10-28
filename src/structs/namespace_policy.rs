@@ -101,9 +101,56 @@ pub struct PoolRule {
     /// Pool names or globs. Unset allows every pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed: Option<Vec<String>>,
-    /// The pool a task without a `pool` permit lands in.
+    /// The pool a task without a `pool` permit lands in, or a list of pools
+    /// it may land in, any of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default: Option<String>,
+    pub default: Option<PoolDefault>,
+}
+
+/// `pools.default`: one pool (`"gpu"`), or several (`["legion-system",
+/// "default"]`), any of which a task that names no pool may run in. Several
+/// render a `pool matches ^(a|b)$` permit, which is what lets the reserved
+/// `legion-system` namespace run on the managers' system workers and on a
+/// `--run-worker` manager's worker alike.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PoolDefault {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl PoolDefault {
+    /// The pools, in order.
+    pub fn pools(&self) -> Vec<&str> {
+        match self {
+            PoolDefault::One(pool) => vec![pool.as_str()],
+            PoolDefault::Many(pools) => pools.iter().map(String::as_str).collect(),
+        }
+    }
+
+    /// `gpu`, or `legion-system, default`.
+    pub fn label(&self) -> String {
+        self.pools().join(", ")
+    }
+
+    /// The same pools, whatever their order.
+    fn same_pools(&self, other: &PoolDefault) -> bool {
+        let mut mine = self.pools();
+        let mut theirs = other.pools();
+        mine.sort_unstable();
+        mine.dedup();
+        theirs.sort_unstable();
+        theirs.dedup();
+        mine == theirs
+    }
+
+    /// `permit` with this default's `pool` rule added.
+    pub fn apply_to(&self, permit: &Value) -> Value {
+        match self.pools().as_slice() {
+            [one] => crate::constraints::with_permit_pool(permit, one),
+            pools => crate::constraints::with_permit_pools(permit, pools),
+        }
+    }
 }
 
 fn memory_mib<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
@@ -205,17 +252,35 @@ impl NamespacePolicy {
                 validate_globs(&format!("{what}: pools.allowed"), allowed)?;
             }
             if let Some(default) = pools.default.as_mut() {
-                *default = default.trim().to_string();
-                if default.is_empty() {
-                    return Err(format!("{what}: pools.default must not be empty"));
+                let mut names: Vec<String> = default
+                    .pools()
+                    .into_iter()
+                    .map(|pool| pool.trim().to_string())
+                    .collect();
+                names.dedup();
+                if names.is_empty() || names.iter().any(String::is_empty) {
+                    return Err(format!(
+                        "{what}: pools.default must name a pool (or a list of pools)"
+                    ));
                 }
-                if let Some(allowed) = pools.allowed.as_ref() {
-                    if !allowed.iter().any(|glob| glob_match(glob, default)) {
+                for name in &names {
+                    if name.contains('*') {
                         return Err(format!(
-                            "{what}: pools.default '{default}' is not in pools.allowed"
+                            "{what}: pools.default '{name}' must be a pool name, not a glob"
                         ));
                     }
+                    if let Some(allowed) = pools.allowed.as_ref() {
+                        if !allowed.iter().any(|glob| glob_match(glob, name)) {
+                            return Err(format!(
+                                "{what}: pools.default '{name}' is not in pools.allowed"
+                            ));
+                        }
+                    }
                 }
+                *default = match <[String; 1]>::try_from(names) {
+                    Ok([one]) => PoolDefault::One(one),
+                    Err(names) => PoolDefault::Many(names),
+                };
             }
         }
         for (field, list) in [
@@ -310,17 +375,19 @@ pub fn admit_job(policies: &[NamespacePolicy], config: &mut JobConfig) -> Result
         policy
             .pools
             .as_ref()
-            .and_then(|pools| pools.default.as_deref())
+            .and_then(|pools| pools.default.as_ref())
             .map(|pool| (policy.name.as_str(), pool))
     });
     let default_pool = defaults.next();
     if let (Some((first, pool)), Some((second, other))) = (default_pool, defaults.next()) {
-        if pool != other {
+        if !pool.same_pools(other) {
             return Err(format!(
                 "namespace policies '{first}' and '{second}' both govern namespace {namespace} \
-                 and set different default pools ({pool}, {other}); a task that names no pool \
-                 has no single place to go. Hint: name the pool in the task's permit, or make \
-                 the policies agree"
+                 and set different default pools ({}; {}); a task that names no pool has no \
+                 single place to go. Hint: name the pool in the task's permit, or make the \
+                 policies agree",
+                pool.label(),
+                other.label()
             ));
         }
     }
@@ -355,10 +422,16 @@ pub fn admit_job(policies: &[NamespacePolicy], config: &mut JobConfig) -> Result
         }
         let mut pool = crate::constraints::permit_pool(&task.permit)
             .map_err(|err| format!("task {} permit: {err:#}", task.name))?;
+        // The pools a policy default put in the permit, each checked below.
+        let mut defaulted: Vec<String> = Vec::new();
         if pool == crate::constraints::PermitPool::Implicit {
             if let Some((_, default)) = default_pool {
-                task.permit = crate::constraints::with_permit_pool(&task.permit, default);
-                pool = crate::constraints::PermitPool::Exact(default.to_string());
+                task.permit = default.apply_to(&task.permit);
+                defaulted = default.pools().into_iter().map(str::to_string).collect();
+                pool = match default.pools().as_slice() {
+                    [one] => crate::constraints::PermitPool::Exact(one.to_string()),
+                    _ => crate::constraints::PermitPool::Other,
+                };
             }
         }
         for policy in &governing {
@@ -369,6 +442,23 @@ pub fn admit_job(policies: &[NamespacePolicy], config: &mut JobConfig) -> Result
             else {
                 continue;
             };
+            if defaulted.len() > 1 {
+                if let Some(name) = defaulted
+                    .iter()
+                    .find(|name| !allowed.iter().any(|glob| glob_match(glob, name)))
+                {
+                    return Err(format!(
+                        "namespace policy '{}' allows pools [{}] in {}; task {} would run in \
+                         pool {name} (a default pool). Hint: set the task's permit to an \
+                         allowed pool",
+                        policy.name,
+                        allowed.join(", "),
+                        policy.selector(),
+                        task.name
+                    ));
+                }
+                continue;
+            }
             let name = match &pool {
                 crate::constraints::PermitPool::Implicit => "default".to_string(),
                 crate::constraints::PermitPool::Exact(name) => name.clone(),
@@ -503,6 +593,74 @@ mod namespace_policy_test {
         let mut other = job("shared/web", "exec", json!({}));
         admit_job(&policies, &mut other).unwrap();
         assert_eq!(other.tasks[0].permit, json!({}));
+    }
+
+    /// `pools.default` may name several pools: a task that names none may
+    /// run in any of them (the `legion-system` policy's two pools).
+    #[test]
+    fn a_default_of_several_pools_permits_any_of_them_test() {
+        let system = policy(json!({
+            "name": "legion-system",
+            "namespaces": ["legion-system"],
+            "pools": { "default": ["legion-system", "default"] },
+        }));
+        let policies = vec![system.clone()];
+        let mut plain = job("legion-system/agent", "exec", json!({}));
+        admit_job(&policies, &mut plain).unwrap();
+        assert_eq!(
+            plain.tasks[0].permit,
+            json!([{ "key": "pool", "operator": "matches", "value": "^(legion\\-system|default)$" }])
+        );
+        // An object permit keeps its other rules.
+        let mut zoned = job("legion-system/agent", "exec", json!({ "zone": "a" }));
+        admit_job(&policies, &mut zoned).unwrap();
+        assert_eq!(
+            zoned.tasks[0].permit,
+            json!([
+                { "key": "zone", "value": "a" },
+                { "key": "pool", "operator": "matches", "value": "^(legion\\-system|default)$" },
+            ])
+        );
+        // A task that names its pool is untouched.
+        let mut named = job(
+            "legion-system/agent",
+            "exec",
+            json!({ "pool": "legion-system" }),
+        );
+        admit_job(&policies, &mut named).unwrap();
+        assert_eq!(named.tasks[0].permit, json!({ "pool": "legion-system" }));
+
+        // One name normalizes to the single form; a glob and an empty list
+        // are refused; each default must be allowed.
+        let one = policy(json!({ "name": "p", "namespaces": ["*"],
+                                 "pools": { "default": ["gpu"] } }));
+        assert_eq!(
+            one.pools.unwrap().default,
+            Some(PoolDefault::One("gpu".into()))
+        );
+        for bad in [json!([]), json!(["gpu-*"])] {
+            let mut raw: NamespacePolicy = serde_json::from_value(json!({
+                "name": "p", "namespaces": ["*"], "pools": { "default": bad },
+            }))
+            .unwrap();
+            assert!(raw.normalize().is_err());
+        }
+        let mut outside: NamespacePolicy = serde_json::from_value(json!({
+            "name": "p", "namespaces": ["*"],
+            "pools": { "allowed": ["gpu"], "default": ["gpu", "cpu"] },
+        }))
+        .unwrap();
+        let err = outside.normalize().unwrap_err();
+        assert!(err.contains("'cpu' is not in pools.allowed"), "{err}");
+
+        // Two policies agree when they name the same pools in any order.
+        let reordered = policy(json!({
+            "name": "again",
+            "namespaces": ["legion-*"],
+            "pools": { "default": ["default", "legion-system"] },
+        }));
+        let mut agent = job("legion-system/agent", "exec", json!({}));
+        admit_job(&[system, reordered], &mut agent).unwrap();
     }
 
     #[test]
