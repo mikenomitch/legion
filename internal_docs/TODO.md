@@ -511,6 +511,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#58](https://github.com/mikenomitch/legion/pull/58) | Park: the workload says when it is waiting, and its node suspends it | Plan [park-plan.md](plans/park-plan.md); Phases 1–2, entries under "Park" above and in Done |
 | [#51](https://github.com/mikenomitch/legion/pull/51) | Mesh interfaces: one handler pipeline, a smaller surface, the eBPF kernel classifier, WASM network plugins | Plan [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md); B1 end-to-end plugin overhead still open below |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
@@ -2358,7 +2359,8 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         (`tests/integration/wake_integration.rs`).
 - [ ] **Park**: [plan](plans/park-plan.md) (IN EXECUTION) ·
       [calls](calls/park-plan_calls.md) · [docs](../docs/park.md). Phases 1
-      and 2 are built (in Done below).
+      and 2 are built (in Done below), in
+      [#58](https://github.com/mikenomitch/legion/pull/58).
   - [ ] Phase 3: timed wake, `park until=<time>`: resume at the deadline if
         nothing woke the instance first (the manager's sweep for keyed
         instances, the node for sessions).
