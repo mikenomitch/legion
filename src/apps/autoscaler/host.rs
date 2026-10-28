@@ -85,7 +85,7 @@ pub struct RecommendCall<'a> {
 }
 
 enum Loaded {
-    External(Transport),
+    External(Box<Transport>),
     Prometheus(PrometheusSource),
     Http(HttpSource),
     Exec(ExecTarget),
@@ -196,7 +196,7 @@ impl PluginHost {
                     if let Some(timeout) = timeout {
                         transport = transport.with_timeout(timeout);
                     }
-                    Loaded::External(transport)
+                    Loaded::External(Box::new(transport))
                 }
             };
             plugins.insert(entry.name.clone(), loaded);
@@ -238,7 +238,7 @@ impl PluginHost {
     /// The external plugin `name`'s transport (the conformance suite).
     pub fn transport(&self, name: &str) -> Option<&Transport> {
         match self.plugins.get(name) {
-            Some(Loaded::External(transport)) => Some(transport),
+            Some(Loaded::External(transport)) => Some(transport.as_ref()),
             _ => None,
         }
     }

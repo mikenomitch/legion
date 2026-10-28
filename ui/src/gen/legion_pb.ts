@@ -8303,6 +8303,7 @@ export class RecordScalingActionRequest extends Message<RecordScalingActionReque
    *   Written as a `scaled` row and a `scale.applied` event;
    * - `failed`: the target plugin refused or failed the `scale` just
    *   recorded (`applied = false`, the error in the decision's summary).
+   *
    * `scale` and `failed` need `policy`; task targets change their count
    * through ScaleTask. Other kinds are refused.
    *
