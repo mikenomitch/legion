@@ -1156,10 +1156,11 @@ async fn a_new_bundled_manifest_is_adopted_with_the_leaders_build_test() -> R<()
         fx.store.insert_node(manager_node(id, "0.1.0", "a"))?;
     }
     // The record an older build seeded: the same app with fewer
-    // permissions (so another manifest digest).
+    // permissions (none; so another manifest digest).
     let current = legion::apps::bundled_manifest("autoscaler").context("bundled")?;
+    assert!(!current.permissions.is_empty());
     let mut older = current.clone();
-    older.permissions.truncate(2);
+    older.permissions.clear();
     let mut record = legion::manager::apps::seed_record(&older, None);
     record.manifest_digest = older.digest();
     assert!(fx.store.seed_app(record)?);
@@ -1169,7 +1170,7 @@ async fn a_new_bundled_manifest_is_adopted_with_the_leaders_build_test() -> R<()
     assert!(submitted(&reconciler.reconcile_app("autoscaler").await));
     let record = fx.app("autoscaler")?;
     assert_eq!(record.manifest_digest, older.digest());
-    assert_eq!(record.grant.rules.len(), 2);
+    assert!(record.grant.rules.is_empty());
 
     // The nodes move to b, the leader's build: adopted, one roll.
     for id in ["m1", "m2"] {
@@ -1184,7 +1185,10 @@ async fn a_new_bundled_manifest_is_adopted_with_the_leaders_build_test() -> R<()
     let upgraded = fx.events("app.upgraded")?;
     assert_eq!(upgraded.len(), 1);
     assert!(
-        upgraded[0].message.contains("2 permission(s) added"),
+        upgraded[0].message.contains(&format!(
+            "{} permission(s) added",
+            current.permissions.len()
+        )),
         "{}",
         upgraded[0].message
     );
