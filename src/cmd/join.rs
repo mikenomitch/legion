@@ -45,6 +45,41 @@ pub fn config() -> Command {
                 .help("Override the worker name/ID"),
         )
         .arg(advertise_addr_arg())
+        .arg(attr_arg())
+}
+
+/// `--attr k=v`, shared by `legion join` and `legion start worker`:
+/// per-host node attributes sent with the registration.
+pub fn attr_arg() -> Arg {
+    Arg::new("attr")
+        .long("attr")
+        .value_name("KEY=VALUE")
+        .action(ArgAction::Append)
+        .help(
+            "Node attribute for this host, repeatable (--attr rack=r12 \
+             --attr legion.provider-id=i-0abc). Overrides the worker type's attributes; \
+             the join token's win over it. Only the token may set other legion.* keys",
+        )
+}
+
+/// The `--attr k=v` values, checked the way the manager checks them, so a
+/// typo fails here rather than at registration.
+pub fn join_attributes_from(arg_matches: &ArgMatches) -> R<HashMap<String, String>> {
+    let mut attributes = HashMap::new();
+    for raw in arg_matches.get_many::<String>("attr").into_iter().flatten() {
+        let (key, value) = raw
+            .split_once('=')
+            .with_context(|| format!("--attr {raw:?} is not KEY=VALUE"))?;
+        if attributes
+            .insert(key.to_string(), value.to_string())
+            .is_some()
+        {
+            bail!("--attr {key} is given twice");
+        }
+    }
+    crate::structs::check_join_attributes(&attributes, crate::structs::JoinAttrSource::Host)
+        .map_err(|err| anyhow!(err))?;
+    Ok(attributes)
 }
 
 /// `--token-file`, shared by `legion join` and `legion start worker`.
@@ -135,7 +170,8 @@ pub async fn handle(arg_matches: &ArgMatches) -> R<()> {
     let advertise = arg_matches
         .get_one::<String>("advertise-addr")
         .map(String::as_str);
-    run_worker(&token, name, advertise).await
+    let attributes = join_attributes_from(arg_matches)?;
+    run_worker(&token, name, advertise, attributes).await
 }
 
 /// `--auto` convenience: mint a join token through the normal authenticated
@@ -148,6 +184,7 @@ async fn request_join_token(ttl: &str, worker_type: &str) -> R<String> {
         worker_type: worker_type.to_string(),
         ttl: Some(ttl.to_string()),
         description: "created by `legion join --auto`".to_string(),
+        ..Default::default()
     });
 
     let response = client
@@ -219,6 +256,47 @@ mod tests {
         assert!(cli()
             .try_get_matches_from(["legion", "join", "--auto", "--token-file", "/x"])
             .is_err());
+    }
+
+    #[test]
+    fn attr_is_repeatable_and_checked_like_the_manager_test() -> R<()> {
+        let matches = crate::cmd::cli().try_get_matches_from([
+            "legion",
+            "join",
+            "lgnjoin_abc",
+            "--attr",
+            "rack=r12",
+            "--attr",
+            "legion.provider-id=i-0abc",
+            "--attr",
+            "note=a=b",
+        ])?;
+        let (_, join) = matches.subcommand().context("join")?;
+        let attrs = join_attributes_from(join)?;
+        assert_eq!(attrs.len(), 3);
+        assert_eq!(attrs["legion.provider-id"], "i-0abc");
+        assert_eq!(attrs["note"], "a=b", "only the first = splits");
+
+        for (bad, needle) in [
+            ("legion.nodegroup=x", "reserved"),
+            ("namespaces=*", "structure"),
+            ("novalue", "not KEY=VALUE"),
+        ] {
+            let matches =
+                crate::cmd::cli().try_get_matches_from(["legion", "join", "t", "--attr", bad])?;
+            let (_, join) = matches.subcommand().context("join")?;
+            let err = join_attributes_from(join).unwrap_err().to_string();
+            assert!(err.contains(needle), "{bad}: {err}");
+        }
+        // `legion start worker` takes it too.
+        let matches = crate::cmd::cli()
+            .try_get_matches_from(["legion", "start", "worker", "t", "--attr", "rack=r1"])?;
+        let mut current = &matches;
+        while let Some((_, sub)) = current.subcommand() {
+            current = sub;
+        }
+        assert_eq!(join_attributes_from(current)?["rack"], "r1");
+        Ok(())
     }
 
     #[test]

@@ -55,6 +55,10 @@ mod scaling_ops;
 // Task autoscaling's state: scale writes with compare-and-set, pins,
 // history, pauses, the cluster's scaling defaults, policy snapshots.
 mod autoscale_ops;
+// GetCapacityDemand's pending work, and ForgetNode (autoscaler v2 plan
+// §6.11).
+mod demand_ops;
+mod forget_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -65,6 +69,8 @@ pub use autoscale_ops::{
     covering_pause, HistoryRow, NewHistory, PauseRow, ScaleWrite, ScaleWriteOp, ScaleWriteOutcome,
     ScalingDefaultsRow, HISTORY_CAP, PAUSE_ANY, TASK_SCALE_COUNTER,
 };
+pub use demand_ops::{PendingTaskRow, PendingWork};
+pub use forget_ops::ForgetOutcome;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use gang_losses::GangLoss;
 pub use gang_members::GangMember;

@@ -34,6 +34,27 @@ pub fn config() -> Command {
                 .value_name("TEXT")
                 .help("Free-form note shown in `join-token list`"),
         )
+        .arg(
+            Arg::new("max-uses")
+                .long("max-uses")
+                .value_name("N")
+                .value_parser(clap::value_parser!(u32).range(1..))
+                .help(
+                    "Admit at most N new nodes; a node restarting under its own name does not \
+                     count (default: no limit)",
+                ),
+        )
+        .arg(
+            Arg::new("attr")
+                .long("attr")
+                .value_name("KEY=VALUE")
+                .action(ArgAction::Append)
+                .help(
+                    "Node attribute stamped on every node that joins with the token, \
+                     repeatable (--attr legion.nodegroup=workers-general). Wins over the \
+                     worker's --attr and its worker type's attributes",
+                ),
+        )
         .arg(json_flag());
 
     let list_cmd = Command::new("list")
@@ -94,6 +115,30 @@ async fn create(arg_matches: &ArgMatches) -> R<()> {
         .get_one::<String>("description")
         .cloned()
         .unwrap_or_default();
+    // The bare `legion join-token` form has neither flag.
+    let max_uses = arg_matches
+        .try_get_one::<u32>("max-uses")
+        .ok()
+        .flatten()
+        .copied();
+    let mut attributes = std::collections::HashMap::new();
+    for raw in arg_matches
+        .try_get_many::<String>("attr")
+        .ok()
+        .flatten()
+        .into_iter()
+        .flatten()
+    {
+        let (key, value) = raw
+            .split_once('=')
+            .with_context(|| format!("--attr {raw:?} is not KEY=VALUE"))?;
+        if attributes
+            .insert(key.to_string(), value.to_string())
+            .is_some()
+        {
+            bail!("--attr {key} is given twice");
+        }
+    }
 
     let mut client = connect_manager_client().await?;
     let response = output::resolve(
@@ -104,6 +149,8 @@ async fn create(arg_matches: &ArgMatches) -> R<()> {
                 worker_type,
                 ttl,
                 description,
+                max_uses,
+                attributes,
             }))
             .await,
     )?;
@@ -116,6 +163,8 @@ async fn create(arg_matches: &ArgMatches) -> R<()> {
             "token": reply.token,
             "workerType": info.worker_type,
             "expiresAt": info.expires_at,
+            "maxUses": info.max_uses,
+            "attributes": sorted(&info.attributes),
         });
         if !reply.warning.is_empty() {
             data["warning"] = json!(reply.warning);
@@ -136,8 +185,31 @@ async fn create(arg_matches: &ArgMatches) -> R<()> {
         if let Some(expires) = info.expires_at {
             println!("Expires: {expires}");
         }
+        if let Some(max) = info.max_uses {
+            println!("Admits at most {max} new node(s).");
+        }
+        if !info.attributes.is_empty() {
+            println!("Stamps: {}", attributes_text(&info.attributes));
+        }
     }
     Ok(())
+}
+
+fn sorted(
+    attributes: &std::collections::HashMap<String, String>,
+) -> std::collections::BTreeMap<&str, &str> {
+    attributes
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
+}
+
+fn attributes_text(attributes: &std::collections::HashMap<String, String>) -> String {
+    sorted(attributes)
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[derive(Tabled)]
@@ -145,6 +217,8 @@ struct JoinTokenPrint {
     id: String,
     worker_type: String,
     description: String,
+    uses: String,
+    attributes: String,
     expires_at: String,
 }
 
@@ -155,6 +229,9 @@ fn info_json(info: &JoinTokenInfo) -> Value {
         "description": info.description,
         "expiresAt": info.expires_at,
         "createdAt": info.created_at,
+        "uses": info.uses,
+        "maxUses": info.max_uses,
+        "attributes": sorted(&info.attributes),
     })
 }
 
@@ -178,6 +255,11 @@ async fn list(format: OutputFormat) -> R<()> {
             tokens
                 .into_iter()
                 .map(|info| JoinTokenPrint {
+                    uses: match info.max_uses {
+                        Some(max) => format!("{}/{max}", info.uses),
+                        None => info.uses.to_string(),
+                    },
+                    attributes: attributes_text(&info.attributes),
                     id: info.id,
                     worker_type: info.worker_type,
                     description: info.description,

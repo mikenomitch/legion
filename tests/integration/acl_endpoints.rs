@@ -109,6 +109,9 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetScalingStatus", Plane::Protected("scale:read")),
         ("GetScaleHistory", Plane::Protected("scale:read")),
         ("PauseScaling", Plane::Protected("scale:write")),
+        // Node autoscaling's demand read: node-scoped (it sizes node
+        // groups), and names only the jobs the caller can read.
+        ("GetCapacityDemand", Plane::Protected("node:read")),
         ("DestroyJob", Plane::Protected("job:write")),
         ("ListJobs", Plane::Protected("job:read")),
         // Namespaces (docs/namespaces.md). ListNamespaces filters per item
@@ -156,6 +159,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetNode", Plane::Protected("node:read")),
         ("RestartWorker", Plane::Protected("node:write")),
         ("SetNodeAvailability", Plane::Protected("node:write")),
+        ("ForgetNode", Plane::Protected("node:write")),
         ("GetLedger", Plane::Protected("node:read")),
         ("UpdateNodeDynamic", Plane::Protected("node:write")),
         ("GetManagerConfigs", Plane::Protected("operator:read")),
@@ -725,6 +729,23 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "GetCapacityDemand" => svc
+            .get_capacity_demand(req(
+                GetCapacityDemandRequest {
+                    templates: vec![NodeGroupTemplate {
+                        name: "acl-group".into(),
+                        shape: Some(NodeGroupShape {
+                            cpu: Some(8000),
+                            memory: Some(16384),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         "DestroyJob" => svc
             .destroy_job(req(
                 DestroyJobRequest {
@@ -996,6 +1017,20 @@ async fn call_endpoint(
                     // allocations untouched for the other endpoints.
                     availability: "drained".into(),
                     evict: false,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        // A node that does not exist: the ACL gate runs before the lookup
+        // (NotFound for an authorized caller), and the fixture node, which
+        // the matrix cordons just before, is kept for the endpoints after.
+        "ForgetNode" => svc
+            .forget_node(req(
+                ForgetNodeRequest {
+                    node_id: "acl-forget-missing".into(),
+                    force: false,
                     idempotency_key: None,
                 },
                 token,
@@ -1565,6 +1600,7 @@ async fn call_endpoint(
                     worker_type: "default".into(),
                     ttl: None,
                     description: "test".into(),
+                    ..Default::default()
                 },
                 token,
             ))
@@ -1947,6 +1983,9 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
         expires_at: None,
         created_at: "2026-01-01T00:00:00Z".into(),
         pinned_attrs: None,
+        max_uses: None,
+        uses: 0,
+        attributes: Default::default(),
     })?;
 
     Ok(Fixtures {
@@ -2128,6 +2167,7 @@ async fn registration_pins_namespaces_and_role_test() -> R<()> {
                 worker_type: "ci".into(),
                 ttl: Some("1h".into()),
                 description: String::new(),
+                ..Default::default()
             },
             Some(&admin),
         ))
@@ -2226,6 +2266,7 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
                 worker_type: "default".into(),
                 ttl: Some("1h".into()),
                 description: "test rack".into(),
+                ..Default::default()
             },
             Some(&management_secret),
         ))
@@ -2461,6 +2502,7 @@ async fn a_fleet_claim_needs_a_worker_type_grant() -> R<()> {
                         worker_type: worker_type.into(),
                         ttl: Some("1h".into()),
                         description: "fleet test".into(),
+                        ..Default::default()
                     },
                     Some(&management_secret),
                 ))
@@ -2542,6 +2584,7 @@ async fn worker_plane_binds_node_ids_to_the_caller() -> R<()> {
                 worker_type: "default".into(),
                 ttl: Some("1h".into()),
                 description: "binding test".into(),
+                ..Default::default()
             },
             Some(&management_secret),
         ))
@@ -3723,6 +3766,142 @@ async fn scaling_inputs_check_before_fetch_and_filter_listings() -> R<()> {
     Ok(())
 }
 
+/// GetCapacityDemand is gated on `node:read` for every template's pool, and
+/// names only the jobs the caller can read: a pool-scoped node reader sizes
+/// its own pool, is refused another pool's template, and sees the fixture
+/// job (pending: it was stored without an eval) without its name.
+/// ForgetNode needs `node:write` on the node's pool.
+#[tokio::test]
+async fn capacity_demand_and_forget_are_pool_scoped() -> R<()> {
+    let (svc, _, admin) = setup_enabled()?;
+    let (_, node_reader) = token_with_rules(
+        &svc,
+        "default-pool-reader",
+        r#"[{"resources": ["node"], "actions": ["read"], "pools": ["default"]}]"#,
+    )?;
+    let template = |pool: &str| NodeGroupTemplate {
+        name: format!("{pool}-group"),
+        pool: Some(pool.into()),
+        shape: Some(NodeGroupShape {
+            cpu: Some(4000),
+            memory: Some(8192),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let reply = svc
+        .get_capacity_demand(req(
+            GetCapacityDemandRequest {
+                templates: vec![template("default")],
+            },
+            Some(&node_reader),
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(reply.groups.len(), 1);
+    assert_eq!(reply.pending.len(), 1, "{reply:?}");
+    let pending = &reply.pending[0];
+    assert!(pending.redacted, "{reply:?}");
+    assert!(
+        pending.job_id.is_empty() && pending.tasks.is_empty(),
+        "{reply:?}"
+    );
+    assert_eq!(
+        (pending.namespace.as_str(), pending.pending),
+        ("default", 1)
+    );
+    assert_eq!(reply.groups[0].replicas, 1, "counts cover every job");
+
+    // A job whose eval has not run is listed by name only to its readers.
+    svc.run_job(req(
+        RunJobRequest {
+            parsed_jobspec: serde_json::json!({
+                "name": "acl-late-job",
+                "tasks": [{
+                    "name": "main", "runtime": "exec",
+                    "config": { "command": ["sleep", "60"] },
+                    "resources": {},
+                }],
+            })
+            .to_string(),
+            ..Default::default()
+        },
+        Some(&admin),
+    ))
+    .await?;
+    let reply = svc
+        .get_capacity_demand(req(
+            GetCapacityDemandRequest {
+                templates: vec![template("default")],
+            },
+            Some(&node_reader),
+        ))
+        .await?
+        .into_inner();
+    assert!(reply.awaiting_scheduler.is_empty(), "{reply:?}");
+    assert_eq!(reply.awaiting_scheduler_redacted, 1, "{reply:?}");
+    let status = svc
+        .get_capacity_demand(req(
+            GetCapacityDemandRequest {
+                templates: vec![template("default"), template("gpu")],
+            },
+            Some(&node_reader),
+        ))
+        .await
+        .expect_err("another pool's template is refused");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    let (_, node_and_jobs) = token_with_rules(
+        &svc,
+        "node-and-jobs-reader",
+        r#"[{"resources": ["node"], "actions": ["read"], "pools": ["*"]},
+            {"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
+    )?;
+    let reply = svc
+        .get_capacity_demand(req(
+            GetCapacityDemandRequest {
+                templates: vec![template("gpu")],
+            },
+            Some(&node_and_jobs),
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(reply.pending[0].job_id, JOB_NAME);
+    assert!(!reply.pending[0].redacted);
+    assert_eq!(reply.awaiting_scheduler, vec!["acl-late-job".to_string()]);
+
+    // ForgetNode: write on the node's pool, not read, not another pool.
+    let (_, gpu_writer) = token_with_rules(
+        &svc,
+        "gpu-node-writer",
+        r#"[{"resources": ["node"], "actions": ["read", "write"], "pools": ["gpu"]}]"#,
+    )?;
+    for secret in [&node_reader, &gpu_writer] {
+        let status = svc
+            .forget_node(req(
+                ForgetNodeRequest {
+                    node_id: NODE_ID.into(),
+                    force: true,
+                    ..Default::default()
+                },
+                Some(secret),
+            ))
+            .await
+            .expect_err("forgetting a default-pool node needs node:write there");
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{}",
+            status.message()
+        );
+    }
+    assert!(
+        svc.store.get_node(NODE_ID).is_ok(),
+        "the node is still there"
+    );
+    Ok(())
+}
+
 /// Node lookups gate before they fetch: a caller with no node access gets
 /// PermissionDenied for a node that does not exist, not NotFound, so it
 /// cannot probe which node ids exist.
@@ -3764,6 +3943,33 @@ async fn node_lookups_check_before_fetch() -> R<()> {
                 UpdateNodeDynamicRequest {
                     id: missing.clone(),
                     dynamic_diff: "{}".into(),
+                },
+                Some(&secret),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "ForgetNode",
+            svc.forget_node(req(
+                ForgetNodeRequest {
+                    node_id: missing.clone(),
+                    ..Default::default()
+                },
+                Some(&secret),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "GetCapacityDemand",
+            svc.get_capacity_demand(req(
+                GetCapacityDemandRequest {
+                    templates: vec![NodeGroupTemplate {
+                        name: "g".into(),
+                        like_node: Some(missing.clone()),
+                        ..Default::default()
+                    }],
                 },
                 Some(&secret),
             ))
@@ -4216,6 +4422,7 @@ async fn worker_register_version_handshake_round_trip() -> R<()> {
                 protocol_version: PROTOCOL_VERSION,
                 capabilities: vec!["checkpoint".into()],
                 build_id: "test-build".into(),
+                ..Default::default()
             },
             None,
         ))
@@ -4276,6 +4483,7 @@ async fn worker_register_version_handshake_round_trip() -> R<()> {
                 protocol_version: PROTOCOL_VERSION + 1,
                 capabilities: Vec::new(),
                 build_id: String::new(),
+                ..Default::default()
             },
             None,
         ))

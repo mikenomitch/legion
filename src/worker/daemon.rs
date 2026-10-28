@@ -187,6 +187,9 @@ struct RegistrationPayload {
     /// Worker capabilities advertised at registration
     /// (`WorkerRegisterRequest.capabilities`).
     capabilities: Vec<String>,
+    /// Per-host attributes from `--attr`
+    /// (`WorkerRegisterRequest.join_attributes`).
+    join_attributes: HashMap<String, String>,
 }
 
 /// What this worker advertises at registration: it always takes
@@ -236,6 +239,9 @@ pub struct WorkerJoin {
     /// What the manager imposes on its in-process worker over its worker
     /// type's stored config. `None` for every standalone worker.
     pub local: Option<LocalWorkerSettings>,
+    /// Per-host node attributes from `--attr k=v`, sent with every
+    /// registration (`WorkerRegisterRequest.join_attributes`).
+    pub join_attributes: HashMap<String, String>,
 }
 
 /// What a manager imposes on its in-process worker over the config its
@@ -279,6 +285,7 @@ pub async fn run_worker(
     token: &str,
     name_override: Option<&str>,
     advertise_addr: Option<&str>,
+    join_attributes: HashMap<String, String>,
 ) -> R<()> {
     let join_token = JoinToken::decode(token)?;
     info!(worker_type = %join_token.worker_type, "Decoded join token");
@@ -291,6 +298,7 @@ pub async fn run_worker(
             advertise_addr: advertise_addr.map(str::to_string),
             in_process: false,
             local: None,
+            join_attributes,
         },
         name_override,
     )
@@ -326,6 +334,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         advertise_addr,
         in_process,
         local,
+        join_attributes,
     } = join;
     let server_port = local
         .as_ref()
@@ -840,6 +849,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 .is_some(),
             edge_boot_config.accept_claims,
         ),
+        join_attributes,
     };
     // The build id hashes this executable (hundreds of MB for a debug
     // build): computed once, off the runtime, before the first registration
@@ -3792,6 +3802,7 @@ async fn register_self(
         protocol_version: PROTOCOL_VERSION,
         capabilities: registration.capabilities.clone(),
         build_id: crate::util::build_id().to_string(),
+        join_attributes: registration.join_attributes.clone(),
     };
 
     let response = if credentials.has_node_token() {
@@ -4098,6 +4109,7 @@ mod tests {
                 fingerprint_attrs: "{}".into(),
                 health_checks: "[]".into(),
                 capabilities: worker_capabilities(false, false),
+                join_attributes: HashMap::new(),
             },
             Arc::new(Netd::new(
                 Arc::new(UpstreamForwarder::new()),
@@ -4182,6 +4194,7 @@ mod tests {
             fingerprint_attrs: "{}".into(),
             health_checks: "[]".into(),
             capabilities: Vec::new(),
+            join_attributes: HashMap::new(),
         };
 
         // First join: the join token mints a node token, persisted at once.

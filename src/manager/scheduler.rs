@@ -1048,7 +1048,7 @@ fn allocation_host_ports(allocation: &Allocation) -> impl Iterator<Item = u16> +
 /// The static host ports a task claims wherever it lands: `network.ports`
 /// entries with a `static` port and `connect.upstreams` with a fixed
 /// `localPort`. Empty for the common all-dynamic task.
-fn task_static_ports(task: &TaskConfig) -> Vec<u16> {
+pub(crate) fn task_static_ports(task: &TaskConfig) -> Vec<u16> {
     let mut ports: Vec<u16> = task
         .network
         .iter()
@@ -5915,7 +5915,7 @@ fn namespace_restriction_note(
 /// usable. An installed-but-unavailable driver (no `mount` binary, no declared
 /// host volumes) is treated as absent — it cannot serve a mount either way, and
 /// skipping the node produces a better error than a failed task start.
-fn node_provides_volume_drivers(
+pub(crate) fn node_provides_volume_drivers(
     node: &Node,
     required: &std::collections::BTreeSet<String>,
 ) -> bool {

@@ -184,7 +184,11 @@ Worker startup (`run_worker`) flow:
    operator's `drained`, so a cordoned node stays cordoned across a worker
    restart; it clears the `unavailable` that node loss sets, because a
    registering worker is alive. Only a new node starts `available`. The
-   reply also carries every manager's address.
+   reply also carries every manager's address. The registration also carries
+   the host's `--attr k=v` values, which the manager merges with the join
+   token's attributes and the worker type's (the token wins, then `--attr`;
+   see [Node attributes from the join](auth-and-acls.md#node-attributes-from-the-join)),
+   and counts against the token's `--max-uses` when this is a new node.
 9. Send a CSR to `IssueNodeCertificate` and check that the CA bundle in the
    reply contains the join token's pin. A mismatch stops the join:
 
@@ -737,6 +741,51 @@ Two code paths exist:
   could host it ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)).
 - Eval path (used in tests/manual eval insertion):
   - `node_drop` / `node_join` eval kinds with a node call equivalent store reconciliation logic.
+
+### Forgetting a node
+
+A node that is gone keeps its record: it reads `lost` in `legion node list`
+until something removes it. `legion node forget` (the `ForgetNode` RPC,
+`node:write` on the node's pool) is that something. It removes the record and
+revokes the node's token in one write, so a worker still running on that
+machine can no longer heartbeat or re-register under its old identity:
+
+```bash
+legion node forget ip-10-0-1-7            # a dead machine
+legion node drain web-3 && legion node forget web-3   # once web-3 is empty
+legion node forget old-host --force       # the machine is gone; drop it whatever its state
+```
+
+Without `--force` the manager refuses, with `FailedPrecondition` and what to
+do instead, a node that:
+
+- still has allocations, including stateful ones its `stateful.onLost`
+  policy is holding: drain it and wait until it is empty;
+- is live and schedulable (status `active`, not cordoned): cordon or drain it,
+  or wait until it is marked lost. A cordoned, empty node can be forgotten
+  while it still heartbeats; that is the scale-in order (drain, stop the
+  machine, forget it);
+- holds node-local volumes, whose data lives on that machine.
+
+`--force` asserts the machine and its data are gone for good. The record goes
+whatever its state; its allocations are removed and replaced elsewhere at
+once (stateful instances too, without waiting for `onLost.replaceAfter`,
+which is only safe because the machine is gone); and node-local volumes stay
+pinned to the missing node, so their instances do not place until you
+replace them (`legion instance replace`). Snapshots stored on the node are
+marked lost either way, and its liveness rows are swept by the next orphan
+pass. The reply counts what went: allocations, node tokens, snapshots, and
+orphaned volumes.
+
+Forgetting is retry-safe: with `--idempotency-key`, a repeat of a forget that
+succeeded replays its result (`deduplicated = true`) instead of answering
+`NotFound`. The MCP tool is `legion_node_forget` (behind `--allow-write`).
+
+A forgotten machine that comes back needs a join token, and joins as a new
+node. A node group's `--max-uses` token is already spent by then, so it cannot
+rejoin with that one ([Limiting a token's uses](auth-and-acls.md#limiting-a-tokens-uses)).
+Nothing forgets nodes automatically yet: a lost node stays listed until an
+operator forgets it.
 
 ## What Is Not Implemented Yet
 

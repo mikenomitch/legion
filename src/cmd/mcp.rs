@@ -652,6 +652,56 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: true,
         },
         ToolDef {
+            name: "legion_node_forget",
+            description: "Forget a dead node: remove its record and revoke its node token in one write, so a worker still running there can no longer heartbeat or re-register under that identity. Refused (FailedPrecondition, with what to do) while the node has allocations, is live and not cordoned, or holds node-local volumes, unless force is true, which asserts the machine is gone for good and releases its allocations for replacement at once. Mutating; retry-safe with idempotency_key (a repeat replays the result with deduplicated = true).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "Node ID." },
+                    "force": { "type": "boolean", "description": "Forget it whatever the guard says (default false)." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["node_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_scaling_demand",
+            description: "How many nodes of each node-group template the pending work needs (GetCapacityDemand, docs/autoscaling.md \"Capacity demand\"): every replica the scheduler left unplaced is packed onto copies of the template with the scheduler's own rules (permit and pool, node namespaces, constraints, distinct, static ports, resources, gang quorum). Per template: nodes, replicas hosted, requested vs offered CPU and memory, and what it refuses with the rule. Also the pending work considered, `unfittable` replicas no template can host (a jobspec problem, not capacity), and jobs the scheduler has not tried yet. Read-only; needs node:read, and names only jobs you can read.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "templates": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 64,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "Node group name (also its legion.nodegroup attribute)." },
+                                "worker_type": { "type": "string", "description": "Worker type members join as (default: default)." },
+                                "pool": { "type": "string", "description": "Pool members join (default: the worker type's)." },
+                                "cpu": { "type": "integer", "minimum": 1, "description": "CPU of one member, MHz." },
+                                "memory": { "type": "integer", "minimum": 1, "description": "Memory of one member, MiB." },
+                                "cores": { "type": "integer", "minimum": 1, "description": "Whole cores of one member." },
+                                "attributes": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Node attributes every member has." },
+                                "resources": { "type": "object", "description": "Custom resources of one member: {\"gpu\": 2}." },
+                                "max_allocations": { "type": "integer", "minimum": 0 },
+                                "like_node": { "type": "string", "description": "Copy an existing member's capacity and attributes." },
+                                "upcoming": { "type": "integer", "minimum": 0, "description": "Members asked for that have not joined." }
+                            },
+                            "required": ["name"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["templates"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_acl_whoami",
             description: "Show whether ACLs are enabled and what access the current credentials grant. Use this to diagnose PermissionDenied errors.",
             input_schema: empty_schema,
@@ -1781,6 +1831,23 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             }))
             .await
             .map(decode_node_attrs)
+        }
+        "legion_node_forget" => {
+            let node_id = str_arg(&args, "node_id")?;
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.forget_node(crate::structs::ForgetNodeRequest {
+                node_id,
+                force,
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            }))
+            .await
+        }
+        "legion_scaling_demand" => {
+            let templates = demand_templates(&args)?;
+            let mut client = connect().await?;
+            grpc(client.get_capacity_demand(crate::structs::GetCapacityDemandRequest { templates }))
+                .await
         }
         "legion_boot_ticket_create" => {
             let scope = opt_str_arg(&args, "scope").unwrap_or_else(|| "boot".to_string());
@@ -3056,6 +3123,54 @@ fn decode_node_attrs(mut reply: Value) -> Value {
         nodes.iter_mut().for_each(decode);
     }
     reply
+}
+
+/// `legion_scaling_demand`'s templates, as `GetCapacityDemand` takes them.
+fn demand_templates(args: &Value) -> Result<Vec<crate::structs::NodeGroupTemplate>, String> {
+    let items = args
+        .get("templates")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| "templates must be a non-empty array".to_string())?;
+    items
+        .iter()
+        .map(|item| {
+            let u64_of = |key: &str| item.get(key).and_then(Value::as_u64);
+            let u32_of = |key: &str| u64_of(key).and_then(|v| u32::try_from(v).ok());
+            let attributes = match item.get("attributes") {
+                None | Some(Value::Null) => Default::default(),
+                Some(Value::Object(map)) => map
+                    .iter()
+                    .map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (key.clone(), value.to_string()))
+                            .ok_or_else(|| format!("attributes.{key} must be a string"))
+                    })
+                    .collect::<Result<_, _>>()?,
+                Some(_) => return Err("attributes must be an object".to_string()),
+            };
+            Ok(crate::structs::NodeGroupTemplate {
+                name: str_arg(item, "name")?,
+                worker_type: opt_str_arg(item, "worker_type").unwrap_or_default(),
+                pool: opt_str_arg(item, "pool"),
+                shape: Some(crate::structs::NodeGroupShape {
+                    cpu: u64_of("cpu"),
+                    memory: u64_of("memory"),
+                    cores: u32_of("cores"),
+                    attributes,
+                    resources_json: item
+                        .get("resources")
+                        .filter(|value| !value.is_null())
+                        .map(Value::to_string)
+                        .unwrap_or_default(),
+                    max_allocations: u32_of("max_allocations"),
+                }),
+                like_node: opt_str_arg(item, "like_node"),
+                upcoming: u32_of("upcoming").unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 fn str_arg(args: &Value, key: &str) -> Result<String, String> {

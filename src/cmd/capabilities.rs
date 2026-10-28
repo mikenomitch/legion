@@ -270,6 +270,17 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "scaling.demand",
+            cli: "legion scaling demand [--pool P --cpu MHZ --memory MIB ... | -f nodes.ncl]",
+            grpc: Some("Manager/GetCapacityDemand"),
+            summary: "How many nodes of a node-group template the pending work needs, packed \
+                 with the scheduler's own rules, plus the replicas no template can host and \
+                 the rule that fails. Read-only; needs node:read (docs/autoscaling.md, \
+                 \"Capacity demand\").",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "job.destroy",
             cli: "legion job destroy <NAME>",
             grpc: Some("Manager/DestroyJob"),
@@ -704,10 +715,21 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
+            name: "node.forget",
+            cli: "legion node forget <ID> [--force]",
+            grpc: Some("Manager/ForgetNode"),
+            summary: "Remove a dead node's record and revoke its node token in one write. \
+                 Refused without --force while it has allocations, is live and not cordoned, \
+                 or holds node-local volumes. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "node.join-token.create",
-            cli: "legion join-token create",
+            cli: "legion join-token create [--max-uses N] [--attr K=V]...",
             grpc: Some("Manager/CreateJoinToken"),
-            summary: "Create a join token that introduces a worker to the cluster.",
+            summary: "Create a join token that introduces a worker to the cluster, optionally \
+                 admitting at most N new nodes and stamping attributes on each.",
             mutates: true,
             read_only_safe: false,
         },
@@ -715,7 +737,8 @@ pub fn catalog() -> Vec<Capability> {
             name: "node.join-token.list",
             cli: "legion join-token list",
             grpc: Some("Manager/ListJoinTokens"),
-            summary: "List worker join tokens (metadata only).",
+            summary: "List worker join tokens (metadata only), with uses against max_uses and \
+                 the attributes each stamps.",
             mutates: false,
             read_only_safe: true,
         },

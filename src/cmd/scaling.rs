@@ -9,7 +9,9 @@
 //! - `pause` / `resume`: freeze autoscaling for a task, a job, or the whole
 //!   cluster (`--all`);
 //! - `defaults get` / `defaults apply`: the cluster's scaling defaults, and
-//!   the effective defaults for a namespace with provenance.
+//!   the effective defaults for a namespace with provenance;
+//! - `demand`: how many nodes of each node-group template the pending work
+//!   needs ([`crate::cmd::scaling_demand`]).
 //!
 //! Every subcommand takes `--json`/`-j` and emits the standard
 //! [`crate::cmd::output`] envelope.
@@ -81,9 +83,10 @@ pub fn config() -> Command {
             .help("Job name (`name` or `namespace/name`)")
     };
     Command::new("scaling")
-        .about("Task autoscaling: status, explanations, history, pauses, and defaults (docs/autoscaling.md)")
+        .about("Autoscaling: status, explanations, history, pauses, defaults, and node-group capacity demand (docs/autoscaling.md)")
         .subcommand_required(true)
         .arg_required_else_help(true)
+        .subcommand(crate::cmd::scaling_demand::demand_command())
         .subcommand(
             Command::new("status")
                 .about("Every autoscaled task's count, wanted count, bounds, and state, and whether the autoscaler runs")
@@ -211,6 +214,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
             Some(("apply", sub)) => defaults_apply(sub).await,
             _ => unreachable!("subcommand required"),
         },
+        Some(("demand", sub)) => crate::cmd::scaling_demand::handle_demand(sub).await,
         _ => unreachable!("subcommand required"),
     }
 }

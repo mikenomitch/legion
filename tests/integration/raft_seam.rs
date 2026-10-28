@@ -56,6 +56,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "delete_acl_policy",
     "delete_acl_token",
     "delete_acl_user",
+    "consume_join_token_use",
     "delete_exec_key",
     "delete_join_token",
     "delete_kv",
@@ -272,6 +273,7 @@ fn lane_for(method: &str) -> Lane {
         | "delete_acl_policy"
         | "delete_acl_token"
         | "delete_acl_user"
+        | "consume_join_token_use"
         | "delete_exec_key"
         | "delete_join_token"
         | "delete_kv"

@@ -265,6 +265,52 @@ service Manager {
   // with `idempotency_key`.
   rpc PauseScaling (PauseScalingRequest) returns (PauseScalingReply);
 
+  // How many nodes of each node-group template the pending work needs
+  // (docs/autoscaling.md, "Capacity demand"; the `nodegroup.pending` input
+  // of node autoscaling).
+  //
+  // Pending work is every task of an active job that is short of its
+  // effective count (the count `legion job scale` and the autoscaler set),
+  // counted against its allocations across config versions, plus keyed
+  // instances that have no allocation. Left out: `count.per` tasks (they
+  // follow nodes rather than ask for them), cron tasks, finished batch
+  // tasks, and jobs whose eval is still pending or in flight (the scheduler
+  // has not tried the capacity that exists yet; they are listed in
+  // `awaiting_scheduler`). A blocked eval is exactly what this is for.
+  //
+  // For each template the manager builds a synthetic node (the worker
+  // type's pool, namespaces, attributes and resources, then the shape, or a
+  // copy of an existing member) and packs the pending replicas onto copies
+  // of it, first fit decreasing, with the scheduler's own feasibility
+  // functions: the permit and pool, the node's namespaces, constraints,
+  // volume drivers, resources (with `reservedResources`, `capacity` and
+  // oversubscription), `distinct`, static ports, and a gang's quorum, which
+  // places together or not at all. A task group's tasks pack as one unit.
+  // Nodes already on their way (`upcoming`) absorb pending work first,
+  // across all templates. Each template is then answered on its own: "if
+  // only this group grew, how many nodes would the work it can host need?"
+  // Replicas no template can host are `unfittable`, with each template's
+  // failing rule: a jobspec or policy problem, not a capacity problem.
+  //
+  // The answer is approximate, on the safe side: first fit is not the
+  // scheduler's scoring, and preemption, node-local disk, and the free room
+  // on existing nodes are not modelled, so it can over-ask by a node. It is
+  // a point-in-time read on whichever manager answers, computed off the
+  // scheduler's path; nothing is written.
+  //
+  // ACL: `node:read`, gated before anything is read, then on each
+  // template's pool. Node counts cover all pending work, but a pending or
+  // unfittable entry names its job only when the caller has `job:read` on
+  // it; entries for other jobs keep their counts and rules and leave the
+  // job, group and task names empty (`redacted = true`).
+  //
+  // Errors:
+  // - InvalidArgument: no templates, a template without a name, two with
+  //   the same name, an invalid shape, or more than 64 templates.
+  // - NotFound: `like_node` names a node that does not exist.
+  // - PermissionDenied: `node:read` missing for a template's pool.
+  rpc GetCapacityDemand (GetCapacityDemandRequest) returns (GetCapacityDemandReply);
+
   // Permanently removes a stopped job and related records.
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
 
@@ -1647,6 +1693,46 @@ service Manager {
   rpc SetNodeAvailability (SetNodeAvailabilityRequest)
       returns (SetNodeAvailabilityReply);
 
+  // Removes a node's record and revokes its node token, in one write
+  // (docs/architecture-managers-workers.md, "Forgetting a node"). For dead
+  // records (a machine that is gone and will not come back), and the last
+  // step of node-group scale-in (drain, terminate, forget).
+  //
+  // A forgotten node is gone from `legion node list` and from scheduling.
+  // Its node token no longer authenticates, so a worker still running there
+  // cannot heartbeat or re-register under its old identity: it would have
+  // to join again with a join token, which a node group's spent
+  // `max_uses` token refuses. Its allocations, if any (only with `force`),
+  // are removed and replaced elsewhere, snapshots stored on it are marked
+  // lost, and its liveness row is swept by the next orphan pass.
+  //
+  // The guard, unless `force` is set, refuses (FailedPrecondition, naming
+  // what to do) a node that:
+  // - still has allocations, including stateful ones held by their
+  //   `stateful.onLost` policy: drain it first, or wait for the policy;
+  // - is live and schedulable: its status is `active` and it is not
+  //   cordoned. Cordon or drain it first, or wait until it is marked lost
+  //   (a cordoned, empty node may be forgotten while it still heartbeats:
+  //   that is the scale-in flow, which terminates the machine first);
+  // - holds node-local volumes, whose data lives on that machine.
+  //
+  // `force` asserts the machine is gone for good: the record is removed
+  // whatever its state, its allocations are released for replacement at
+  // once (stateful instances included, without waiting for
+  // `onLost.replaceAfter`), and node-local volumes stay pinned to the
+  // missing node until an operator replaces their instances.
+  //
+  // Retry-safe: with an `idempotency_key`, a repeat of a request that
+  // succeeded replays its result with `deduplicated = true` instead of
+  // answering NotFound.
+  //
+  // Errors:
+  // - InvalidArgument: `node_id` is empty.
+  // - NotFound: no node with `node_id` exists.
+  // - FailedPrecondition: the guard refused (see above).
+  // - PermissionDenied: caller lacks `node:write` for the node's pool.
+  rpc ForgetNode (ForgetNodeRequest) returns (ForgetNodeReply);
+
   // Retrieves captured task stdout/stderr for a job's allocations.
   //
   // The manager locates the node hosting each allocation and proxies the read
@@ -2825,6 +2911,19 @@ message WorkerRegisterRequest {
   // Default: empty (a worker that predates it). Such a node is left out of
   // every bundled app's build marker.
   string build_id = 10;
+
+  // Per-host node attributes from `legion join --attr k=v` (and `legion
+  // start worker --attr`), such as the machine's provider id:
+  // `legion.provider-id = "i-0abc"`. Merged into the node's attributes over
+  // its worker type's, and under the join token's: token, then `--attr`,
+  // then worker type. Keys under the reserved `legion.` prefix are refused
+  // with InvalidArgument, except the per-host ones (`legion.provider-id`),
+  // and so are keys Legion reads as node structure (`namespaces`,
+  // `resources`, ...). At most 64 entries; keys up to 128 bytes, values up
+  // to 1024. See docs/auth-and-acls.md, "Node attributes from the join".
+  //
+  // Default: empty.
+  map<string, string> join_attributes = 11;
 }
 
 // Reply payload for WorkerRegister.
@@ -4317,6 +4416,239 @@ message GetScalingInputsReply {
   // for a single manager). The merged usage is younger than this: a recent
   // takeover means a recent, possibly partial, resync.
   uint64 leader_for_seconds = 3;
+}
+
+// Request payload for GetCapacityDemand.
+message GetCapacityDemandRequest {
+  // The node-group templates to size, each answered on its own. At least
+  // one, at most 64, with distinct names.
+  repeated NodeGroupTemplate templates = 1;
+}
+
+// One node group's template: what a new member would look like.
+//
+// The synthetic node is built in this order, each step overriding the last:
+// 1. `like_node` (a copy of that member: its pool, attributes, fingerprint
+//    and capacity), or else what a node of `worker_type` registers as: the
+//    type's pool, `namespaces`, attributes, custom `resources`,
+//    `reservedResources`, `maxAllocations` and oversubscription;
+// 2. `pool`, when set;
+// 3. `shape`: `cpu`, `memory` and `cores` become the node's capacity (with
+//    no member to copy, the shape is the whole machine; on a copy it can
+//    only lower it), and its attributes and resources are added;
+// 4. `legion.nodegroup = <name>`, which every member of a node group
+//    carries (its join token stamps it), so constraints on it are honored.
+message NodeGroupTemplate {
+  // The node group's name: echoed in the reply, and the value of the
+  // template node's `legion.nodegroup` attribute. Required.
+  string name = 1;
+
+  // The worker type members join as. Default: `default`. A type that does
+  // not exist contributes nothing (the shape alone describes the node).
+  string worker_type = 2;
+
+  // The pool members join. Default: the worker type's pool, else
+  // `default`.
+  optional string pool = 3;
+
+  // A member's size and attributes. Optional when `like_node` is set.
+  NodeGroupShape shape = 4;
+
+  // An existing node to copy: its observed capacity and attributes are a
+  // better template than a declared shape once one member has joined.
+  optional string like_node = 5;
+
+  // Members already asked for that have not joined yet. They absorb pending
+  // work before any template is sized, so a group that was just asked to
+  // grow is not asked again for the same replicas. Default: 0.
+  uint32 upcoming = 6;
+}
+
+// A member's size and attributes, as `GetCapacityDemand` builds its node.
+message NodeGroupShape {
+  // CPU in MHz (all cores together), the unit task `cpu` reservations use.
+  // Unset: unbounded.
+  optional uint64 cpu = 1;
+
+  // Memory in MiB. Unset: unbounded.
+  optional uint64 memory = 2;
+
+  // Whole cores, for tasks that reserve `cores`. Unset: unbounded.
+  optional uint32 cores = 3;
+
+  // Node attributes every member has (`arch = "amd64"`), seen by
+  // constraints and `distinct`. `legion.nodegroup` is set from the
+  // template's name and may not be given here.
+  map<string, string> attributes = 4;
+
+  // Custom resources a member offers, as a JSON object in a worker type's
+  // `resources` form: `{"gpu": 2}` or `{"gpu": ["g0", "g1"]}`. Default:
+  // empty.
+  string resources_json = 5;
+
+  // The most allocations one member takes. Unset: the worker type's, else
+  // unbounded.
+  optional uint32 max_allocations = 6;
+}
+
+// Reply payload for GetCapacityDemand.
+message GetCapacityDemandReply {
+  // One entry per template, in request order.
+  repeated NodeGroupDemand groups = 1;
+
+  // The pending work considered, one entry per job task group that is short
+  // (a task group's tasks place together, so they are one unit). Ordered by
+  // job, then group. `NodeGroupDemand.refusals` and `unfittable` point here
+  // by index.
+  repeated PendingCapacity pending = 2;
+
+  // Pending replicas no single template can host, with every template's
+  // failing rule.
+  repeated UnfittableCapacity unfittable = 3;
+
+  // Jobs short of their count whose eval is still pending or in flight:
+  // the scheduler has not tried the capacity that exists, so they are not
+  // demand yet. Names of jobs the caller cannot read are left out (see
+  // `awaiting_scheduler_redacted`).
+  repeated string awaiting_scheduler = 4;
+
+  // How many `awaiting_scheduler` jobs were left out because the caller
+  // lacks `job:read` on them.
+  uint32 awaiting_scheduler_redacted = 5;
+
+  // Set when the pending work was larger than one call simulates (20,000
+  // replicas): the rest is listed in `pending` but was not packed, so node
+  // counts are a floor.
+  bool truncated = 6;
+
+  // RFC3339 time the answer was computed.
+  string computed_at = 7;
+}
+
+// One template's answer.
+message NodeGroupDemand {
+  // The node group's name, from the request.
+  string name = 1;
+
+  // New nodes of this template the pending work it can host needs: the
+  // `nodegroup.pending` input. 0 when it can host none of it (see
+  // `refusals`) or the upcoming nodes already absorb it.
+  uint32 nodes = 2;
+
+  // Pending replicas those nodes would host.
+  uint32 replicas = 3;
+
+  // Pending replicas this template's upcoming nodes absorbed (they are not
+  // in `replicas`).
+  uint32 absorbed = 4;
+
+  // CPU the hosted replicas reserve, MHz.
+  double cpu_requested_mhz = 5;
+
+  // Memory the hosted replicas reserve, MiB.
+  double memory_requested_mib = 6;
+
+  // CPU the `nodes` new nodes offer, MHz. 0 when the template does not
+  // bound CPU.
+  double cpu_capacity_mhz = 7;
+
+  // Memory the `nodes` new nodes offer, MiB. 0 when the template does not
+  // bound memory.
+  double memory_capacity_mib = 8;
+
+  // Pending work this template cannot host, and why.
+  repeated CapacityRefusal refusals = 9;
+
+  // The pool of the synthetic node the template was sized as, for checking
+  // what the manager understood.
+  string node_pool = 10;
+
+  // The synthetic node's config attributes, as a JSON object.
+  string node_attributes_json = 11;
+}
+
+// Why a template cannot host some pending replicas.
+message CapacityRefusal {
+  // Index into `GetCapacityDemandReply.pending`.
+  uint32 pending_index = 1;
+
+  // Replicas refused.
+  uint32 replicas = 2;
+
+  // The failing rule: `permit` (pool or restrictions), `namespace` (the
+  // node's `namespaces`), `constraint`, `volume-driver`, `resources` (one
+  // replica is larger than an empty node), `distinct` (no value left for
+  // more replicas), `static-port` (members of one group claim the same
+  // port), `gang` (the quorum cannot place together), or `invalid` (the
+  // task does not parse).
+  string rule = 3;
+
+  // What failed, in words: `one replica needs memory 16384 > 8192 per
+  // node`.
+  string detail = 4;
+}
+
+// One unit of pending work: a job's task group short of its count.
+message PendingCapacity {
+  // Canonical job id. Empty when `redacted`.
+  string job_id = 1;
+
+  // The job's namespace.
+  string namespace = 2;
+
+  // The task group. Empty when `redacted`.
+  string task_group = 3;
+
+  // The group's short tasks. Empty when `redacted`.
+  repeated string tasks = 4;
+
+  // The count the group should have.
+  uint32 desired = 5;
+
+  // Allocations it has, across config versions.
+  uint32 placed = 6;
+
+  // Replicas waiting (`desired - placed`).
+  uint32 pending = 7;
+
+  // For a gang: its quorum, which places together.
+  optional uint32 gang_quorum = 8;
+
+  // What one replica reserves (every short task of the group together), as
+  // a JSON object of normalized resources (`{"cpu": 500, "memory": 256}`).
+  string resources_json = 9;
+
+  // Replicas the upcoming nodes absorbed.
+  uint32 absorbed = 10;
+
+  // Set when the caller lacks `job:read` on the job: the names are left
+  // out, the counts and rules are kept.
+  bool redacted = 11;
+}
+
+// Pending replicas no single template can host.
+message UnfittableCapacity {
+  // Index into `GetCapacityDemandReply.pending`.
+  uint32 pending_index = 1;
+
+  // Replicas no template can host (pending minus the most any one
+  // template hosts).
+  uint32 replicas = 2;
+
+  // Each template's failing rule for them.
+  repeated TemplateRefusal reasons = 3;
+}
+
+// One template's reason, in `UnfittableCapacity`.
+message TemplateRefusal {
+  // The template.
+  string template = 1;
+
+  // The rule (see `CapacityRefusal.rule`).
+  string rule = 2;
+
+  // What failed.
+  string detail = 3;
 }
 
 // The scaling inputs of one task (`job_id`, `task_group`, `task_name`).
@@ -9491,6 +9823,48 @@ message SetNodeAvailabilityReply {
   bool deduplicated = 3;
 }
 
+// Request payload for ForgetNode.
+message ForgetNodeRequest {
+  // The node to forget. Required.
+  string node_id = 1;
+
+  // Forget it whatever the guard says: the machine is gone for good. See
+  // `ForgetNode` for what that does to its allocations and volumes.
+  // Default: false.
+  bool force = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`. A
+  // repeat of a forget that succeeded replays its result instead of
+  // answering NotFound.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for ForgetNode.
+message ForgetNodeReply {
+  // Human-readable status message: `"Forgot node <id>"`.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh; the counts below are 0
+  // then.
+  bool deduplicated = 2;
+
+  // Allocations removed with the node (only with `force`).
+  uint32 allocations_removed = 3;
+
+  // Node tokens revoked (normally 1; 0 for a node that never had one, such
+  // as one registered with ACLs off).
+  uint32 tokens_revoked = 4;
+
+  // Node-local volumes still pinned to the forgotten node (only with
+  // `force`). Their instances cannot be placed until an operator replaces
+  // them (`legion instance replace`).
+  uint32 volumes_orphaned = 5;
+
+  // Snapshots stored on the node, now marked lost.
+  uint32 snapshots_lost = 6;
+}
+
 // Request payload for GetLedger.
 message GetLedgerRequest {
   // Empty request; full ledger is returned.
@@ -13457,6 +13831,28 @@ message CreateJoinTokenRequest {
 
   // Free-form description shown in ListJoinTokens (for example "rack 12").
   string description = 3;
+
+  // The most nodes that may register with this token. Each new node that
+  // registers with it uses it once; a node re-registering under its own
+  // name (a restart that fell back to the join token, or a node that was
+  // marked lost rejoining) does not. Once spent, the token refuses new
+  // nodes with PERMISSION_DENIED. A node that `ForgetNode` removed is new
+  // again, so a spent token cannot bring it back.
+  //
+  // Default: unset (no limit). 0 is refused with InvalidArgument.
+  optional uint32 max_uses = 4;
+
+  // Node attributes stamped on every node that registers with this token
+  // (`legion.nodegroup = "workers-general"`). They take precedence over the
+  // worker's `--attr` values and its worker type's attributes, and survive
+  // the node's restarts. Keys Legion reads as node structure (`namespaces`,
+  // `resources`, `restriction`, ...) and `legion.role` and `legion.join`
+  // are refused with InvalidArgument. At most 64 entries; keys up to 128
+  // bytes, values up to 1024. See docs/auth-and-acls.md, "Node attributes
+  // from the join".
+  //
+  // Default: empty.
+  map<string, string> attributes = 5;
 }
 
 // Metadata describing a join token. Never contains the secret.
@@ -13475,6 +13871,15 @@ message JoinTokenInfo {
 
   // RFC3339 creation timestamp.
   string created_at = 5;
+
+  // The most nodes that may register with this token. Unset: no limit.
+  optional uint32 max_uses = 6;
+
+  // New nodes that have registered with this token so far.
+  uint32 uses = 7;
+
+  // Node attributes stamped on every node that registers with it.
+  map<string, string> attributes = 8;
 }
 
 // Reply payload for CreateJoinToken.

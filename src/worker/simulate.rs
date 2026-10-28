@@ -1386,6 +1386,7 @@ async fn register_sim_node_inner(
         } else {
             Vec::new()
         },
+        join_attributes: Default::default(),
     });
     let reply = client.clone().worker_register(req).await?.into_inner();
     node.credentials.store_node_token(reply.node_token);

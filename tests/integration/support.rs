@@ -111,3 +111,51 @@ pub fn task_processes_under(dir: &Path) -> Vec<libc::pid_t> {
         Vec::new()
     }
 }
+
+/// A fresh store in its own directory under [`scratch_root`].
+pub fn temp_store(prefix: &str) -> anyhow::Result<legion::storage::store::Store> {
+    use anyhow::Context;
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(scratch_root())?
+        .keep();
+    legion::storage::store::Store::start_storage(&legion::structs::config::ManagerConfigFull {
+        store_path: dir.to_str().context("store path")?.to_string(),
+        ..Default::default()
+    })
+}
+
+/// A manager service over a fresh store with ACLs enforced, and the
+/// management token's secret.
+pub fn acl_service(
+    prefix: &str,
+) -> anyhow::Result<(legion::manager::server::ManagerDaemonService, String)> {
+    let store = temp_store(prefix)?;
+    let authenticator = std::sync::Arc::new(legion::manager::acl::Authenticator::from_config(
+        &legion::structs::config::AclConfig {
+            enabled: Some(true),
+            ..Default::default()
+        }
+        .with_defaults(),
+    )?);
+    let (_, management) = authenticator
+        .mint_initial_management_token(&store, None)
+        .map_err(|status| anyhow::anyhow!(status.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("a fresh store has no management token"))?;
+    Ok((
+        legion::manager::server::ManagerDaemonService::with_acl(store, authenticator),
+        management,
+    ))
+}
+
+/// A request carrying `token` as its bearer credential, when given.
+pub fn authed<T>(inner: T, token: Option<&str>) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(inner);
+    if let Some(token) = token {
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("ascii token"),
+        );
+    }
+    request
+}

@@ -104,6 +104,17 @@ impl ConstraintSet {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
+
+    /// The first rule that fails on `node`, in words (`region = "eu"`), for
+    /// diagnostics such as `GetCapacityDemand`'s refusals. `distinct` is
+    /// judged as [`Self::is_satisfied`] judges it without a tracker (the
+    /// key must be present). `None` when every rule holds.
+    pub fn unsatisfied_rule(&self, node: &Node) -> Option<String> {
+        self.rules
+            .iter()
+            .find(|rule| !rule.matches(node, None))
+            .map(Rule::describe)
+    }
 }
 
 /// The node config attribute holding the namespaces a node accepts (its
@@ -478,6 +489,29 @@ fn parse_operator(value: &Value) -> R<Operator> {
 }
 
 impl Rule {
+    /// The rule as written: `key operator value`.
+    fn describe(&self) -> String {
+        let operator = match self.operator {
+            Operator::Eq => "=",
+            Operator::NotEq => "!=",
+            Operator::Gt => ">",
+            Operator::Gte => ">=",
+            Operator::Lt => "<",
+            Operator::Lte => "<=",
+            Operator::Distinct => "distinct",
+            Operator::Matches => "matches",
+            Operator::VersionMatches => "version_matches",
+            Operator::Contains => "contains",
+            Operator::ContainsAny => "contains_any",
+            Operator::IsSet => "is_set",
+            Operator::IsNotSet => "is_not_set",
+        };
+        match &self.value {
+            Some(value) => format!("{} {operator} {value}", self.key),
+            None => format!("{} {operator}", self.key),
+        }
+    }
+
     fn matches(&self, node: &Node, distinct: Option<&DistinctTracker>) -> bool {
         self.matches_attr(node_attr(node, &self.key), distinct)
     }

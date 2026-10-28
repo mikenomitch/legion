@@ -16,6 +16,7 @@
 //! | [`schedule`] | Cron windows in IANA time zones (DST-correct) that raise the floor or lower the ceiling. |
 //! | [`pipeline`] | [`evaluate`]: the fixed safeguard pipeline, from an [`Observation`] and the per-policy [`PolicyState`] to a [`Decision`] whose stage notes explain it. |
 //! | [`simulate`] | [`simulate()`](simulate::simulate) over rows or a CSV series, and [`simulate_with`] over a load model. |
+//! | [`nodes`] | Node-group autoscaling (§6.11): the [`NodeGroupPolicy`] spec, the least-waste [`expand`]er, [`decide`] (scale-up from pending work, join timeouts, scale-in victims, never-victim rules, budget) and the drain state machine [`step_drain`]. |
 //!
 //! # How later phases use it
 //!
@@ -41,6 +42,7 @@
 #![warn(missing_docs)]
 
 pub mod defaults;
+pub mod nodes;
 pub mod pipeline;
 pub mod schedule;
 pub mod simulate;
@@ -51,6 +53,10 @@ pub use defaults::{
     builtin_defaults, effective_defaults, resolve, DefaultsLayers, EffectiveCheck,
     EffectiveDefaults, EffectivePolicy, EffectiveSchedule, NamespaceDefaults, Origin,
     ProvenanceRow, ResolvedPolicy,
+};
+pub use nodes::{
+    decide, expand, step_drain, EffectiveNodeGroup, NodeDecision, NodeGroupObservation,
+    NodeGroupPolicy, NodeGroupState, NodeIntent,
 };
 pub use pipeline::{
     evaluate, CapacityGuard, CheckOutcome, Decision, DecisionKind, Flag, Guards, Observation,
