@@ -409,6 +409,10 @@ What the manager registers:
   [Reserved namespaces](namespaces.md#reserved-namespaces)).
 - **Attribute `legion.role = "manager"`**, so a job can be constrained to
   managers' workers (`constraints = { "legion.role" = "manager" }`).
+  The manager pins both the namespace list and the role on the join token
+  it mints for its own worker, and registration takes them from the token,
+  not from what the worker reports: a forged registration cannot drop the
+  restriction or claim the role ([namespaces.md](namespaces.md#known-limitations)).
 - **Capacity: the lend, not the host.** The node's `capacity` attribute caps
   its schedulable CPU and memory at `resources`, and offers no exclusive
   `cores` (the lend is a share of the host's CPUs, not whole ones to pin).

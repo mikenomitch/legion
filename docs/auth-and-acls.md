@@ -378,6 +378,84 @@ is Nickel (`.ncl`) or JSON (`.json`), read by the same rules as every other
 Legion config (see [Configuration Language](configuration-language.md)). It
 can be a bare rules array or `{description, rules}`. `apply` prints a
 warning for each rule naming an exact namespace that does not exist yet.
+Policy names starting with `grant:` are reserved for [job grants](#job-grants).
+
+### Job grants
+
+A job can ask for access to Legion itself: `permissions` (inline rules, the
+same shape as a policy) and `policies` (policy names) on the reserved
+`legion` identity of a task ([Workload identity:
+Permissions](workload-identity.md#permissions)). The job's workload token then
+carries them, and its task reaches the API through a local socket with no
+token handling.
+
+**You can grant only what you hold.** Every path that stores a job config
+(`RunJob`, `RunJobTemplate`) checks that the submitting token holds every
+requested rule, and every rule of every named policy (which must exist).
+It runs on every submit, an unchanged one included. Management tokens pass;
+in audit-only mode a miss is logged under `acl_audit` and allowed. A miss
+names the first rule not held:
+
+```text
+cert-renewer-app-example-com: identity 'legion' asks for kv:write on certs/*, which your token does
+not hold
+Hint: have someone with that access submit this job, or ask for it to be granted to you
+```
+
+**What "holds" means.** Deciding exactly whether one set of glob rules
+contains another is set algebra; the check decides a sufficient condition
+instead, which is sound and occasionally conservative:
+
+- A requested `(resource, action)` is held when one allow rule covers the
+  same pair and every one of its selectors covers the requested one. A
+  requested `*` resource or action asks for each one.
+- A requested glob is covered when the requested pattern, as a string,
+  matches a held glob: a held `pay*` covers a requested `payments-*`, and a
+  held `certs/*` covers `certs/app.example.com`. For `*`-only globs that is
+  exact: every name the requested pattern reaches, the held one reaches too.
+- **Reserved names first.** A requested pattern that can reach a reserved
+  name (it starts with `legion-` for namespaces, or `legion/` for KV keys) is
+  covered only by a held pattern with the same prefix. A held `*` does not
+  reach `legion-system`, so it does not cover a requested `legion-*`:
+  without this, a tenant admin could grant a job `exec:write` into Legion's
+  own jobs. The error says so when this is why.
+- A selector the request leaves out reaches more than any held selector, so
+  it is covered only by a held rule that leaves it out too (a held
+  `names = ["*"]` does not cover a request with no `names`).
+- `host = true` on a request needs `host = true` on the held rule.
+- **Deny rules.** When the submitter holds any deny rule on a resource, a
+  grant on that resource also needs `acl:write`: subtracting denies is not
+  attempted, and `acl:write` can write any policy anyway.
+- A requested deny rule only takes access away, and is never checked.
+
+Conservative cases have someone whose own policy covers the request outright
+submit the job: a request covered only by two held rules together (`a*` and
+`b*` for `*`), or a cluster-scoped resource requested from a held rule that
+names `namespaces` (which never matches a cluster-scoped request).
+
+**Grants are per version and revocable.** The grant is recorded with the job
+config version it was checked for, in the submitter's name, and resolved
+every time the job's token is verified:
+
+```console
+$ legion acl grants list
+ job                          | version | grants                     | granted_by | granted_at           | revoked
+------------------------------+---------+----------------------------+------------+----------------------+---------
+ cert-renewer-app-example-com | 1       | kv:read,write on certs/*   | ops-alice  | 2026-10-28T10:02:11Z | -
+
+$ legion acl grants revoke cert-renewer-app-example-com
+revoked 1 grant of job `cert-renewer-app-example-com`; its tokens lose them at their next request
+```
+
+`list` takes `--job` (with `-n` for a namespaced job) and `--all` to include
+revoked grants; `revoke` takes `--version` to revoke one version only and
+`--idempotency-key` for retries; both take `--json`. `ListGrants` needs
+`acl:read` and `RevokeGrant` `acl:write`. A revoke applies at the workload's
+next request, including ACL tokens minted from its identity with `legion login
+--method legion`, which carry a `grant:alloc/<id>` reference rather than a
+copy. The next submit of the job by someone who holds the access grants it
+again. A grant outlives the granter's own access, as in Kubernetes RBAC:
+revoke it when that matters.
 
 ### Tokens
 

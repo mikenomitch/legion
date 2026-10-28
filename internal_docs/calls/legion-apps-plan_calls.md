@@ -4,7 +4,9 @@ Decisions made while designing
 [`plans/legion-apps-plan.md`](../plans/legion-apps-plan.md). **Entries are
 ordered by project impact, highest first, and an entry's number is its
 rank.** Entries 1-17 are design-time calls. Implementation calls start at
-18 (phase A1), appended after the design calls, since none outranks them.
+18 (phase A1, entries 18-28) and continue at 29 (phase A2, entries 29-41),
+appended after the design calls, since none outranks them; each phase's
+entries are ranked among themselves.
 Autoscaler-specific calls are in
 [autoscaler-v2-plan_calls.md](autoscaler-v2-plan_calls.md).
 
@@ -1017,3 +1019,296 @@ the flag included.
 
 **Why (simplicity).** A command-line flag is the more specific, more recent
 statement of intent, the same precedence `--no-acl` has over `acl.enabled`.
+
+## 29. A token carries a grant reference, `grant:alloc/<id>`, resolved at every verification, not the granted rules (A2)
+
+**Call.** The `legion` auth method adds `grant:alloc/<id>` to a verified
+token's policy names when its allocation's version has a live grant, and
+`resolve_acl_rules` expands that name, on every request, into the grant's
+inline permissions plus the rules of its named policies. A token minted from
+the identity with `legion login --method legion` stores the same name. A
+stored policy may not be named `grant:…`, and `CreateAclToken` and
+`UpsertAclUser` already refuse names that are not stored policies, so only
+the auth method can hand one out.
+
+```console
+$ legion acl whoami            # inside the task, through its API socket
+Principal:  legion:auto:default:cert-renewer-app-example-com:… (via jwt)
+Policies:   grant:alloc/412
+```
+
+**Alternatives.**
+- (a) `VerifiedIdentity` gains inline `rules`, resolved once when the token
+  is verified, and Login copies the grant's policy names into the ACL token
+  it mints.
+- (b) Snapshot the grant into a synthetic stored policy per version.
+
+**Trade-off.** One more indexed read per request on a workload token
+(allocation → version → grant), and a policy-name prefix (`grant:`) that
+users cannot use. The name is visible in `whoami` and `acl token list`.
+
+**Why (security boundary, then simplicity).** The plan promises revocation
+"effective on the next token verification". Under (a) a login-minted token
+keeps its copy until it expires, so a revoke would not reach it. (b) leaves
+rows to clean up and a second copy of the grant to drift. A name resolved
+where every other policy name is resolved needs no new path through the
+authenticator, and every credential type gets the same revocation.
+
+## 30. Coverage is decided per (resource, action, namespace pattern, path pattern), and a request's missing selector needs the held rule's to be missing too (A2)
+
+**Call.** Implementing calls entry 4's coverage test
+(`crate::structs::grant::first_uncovered`):
+- Each requested allow rule is split into atoms: every resource (a `*`
+  resource asks for all fourteen), every action (`write` first, so a miss
+  names the more privileged one), every `namespaces` pattern and every
+  `paths` pattern. One held allow rule must cover the whole atom; the other
+  selectors (`names`, `pools`, `actionNames`, `templates`, `bands`) are
+  checked whole on that rule.
+- A selector the request leaves out is covered only by a held rule that
+  leaves it out too, with the existing default reach for `namespaces` (a
+  `*`-resource rule reaches what `*` reaches, a legacy explicit one
+  `default`) and `paths` (what `*` reaches).
+- A held rule that names `namespaces` never covers a cluster-scoped request
+  (its scopes carry no namespace, so that rule never matches them).
+- A held deny on the resource requires `acl:write` **in addition** to allow
+  coverage. `host = true` must be held as `host = true`.
+
+```text
+side-door: identity 'legion' asks for exec:write in legion-system, which your token does not
+hold (`*` does not reach reserved `legion-*` namespaces or `legion/` keys; only a rule that
+names them covers a request for them)
+```
+
+**Alternatives.**
+- (a) Evaluate the request with `evaluate()` against synthesized sample
+  scopes (one per requested pattern).
+- (b) Treat a missing selector as `*` on both sides.
+- (c) With a deny held, require `acl:write` instead of coverage.
+
+**Trade-off.** Conservative refusals: a request covered only by a union of
+held rules (`a*` plus `b*` for `*`), or one that leaves out a selector a held
+rule names (`names = ["*"]`), needs an admin to submit it.
+
+**Why (security boundary).** (a) is unsound: a sample scope stands for one
+name, not every name a glob reaches. (b) lets a held
+`resources = ["*"], namespaces = ["*"]` grant `kv:write`, which that rule
+itself never matches, an escalation found while writing the coverage table.
+(c) lets an `acl:write` holder skip the check; requiring both costs an ACL
+admin nothing they could not do anyway, and keeps the error about the actual
+missing rule.
+
+## 31. The socket checks the peer's cgroup only where every task is guaranteed a leaf, and otherwise relies on file modes (A2)
+
+**Call.** `PeerCheck::Cgroup` when the node runs cgroup v2 (unified at
+`/sys/fs/cgroup`) and either the resource governor enforces or the kernel
+host guard runs (both give every task a leaf). Then a connection from outside
+the allocation's leaf is refused, and so is any connection while the leaf is
+missing. Elsewhere `PeerCheck::FileMode`: the socket is `0666` inside the
+allocation's owner-only directory.
+
+```text
+WARN Refused an API socket connection: pid 4121 (uid 65534) runs in cgroup
+  /legion/share/legion-88, not in allocation 87's
+```
+
+**Alternatives.**
+- (a) Refuse every connection without a leaf (no socket on macOS or cgroup
+  v1).
+- (b) Decide per connection: check the cgroup when the leaf exists, admit
+  otherwise.
+
+**Trade-off.** Without cgroup attribution, two allocations running as the
+same user, or any root process, can use each other's sockets (documented).
+The dev container and CI (cgroup v1) exercise only the file-mode path end to
+end; the cgroup refusal is unit-tested on the parser, and an `#[ignore]`d
+test needs root and delegated cgroup v2.
+
+**Why (simplicity, inside the boundary the kernel can enforce).** (a) breaks
+the one-command local cluster on a Mac and on most CI hosts, where the token
+file next to the socket is equally reachable anyway. (b) opens a window
+before a task's first launch, when its leaf does not exist yet but its socket
+does, in which any process the directory admits could connect as the
+allocation. Deciding once per node keeps the rule explainable.
+
+## 32. Registration pins `namespaces` and `legion.role` from the token, the worker type, or the node record, by grant (A2, A1 follow-up)
+
+**Call.** `worker_register` overwrites the two keys in the reported config
+attributes:
+- a join token a manager minted for its own in-process worker carries them
+  (`join_token.pinned_attrs`, a new column, from the manager's
+  `systemWorker` or `--run-worker` settings);
+- any other join token takes them from its worker type (`namespaces`, and
+  `legion.role` from the type's `attributes`);
+- a node token keeps what the node registered with;
+- ACLs off, a management token, or an audit-only pass keep what the worker
+  reported.
+
+**Alternatives.**
+- (a) Pin from the worker type alone (the text of entry 19's TODO).
+- (b) Move `namespaces` to a node column set from the token (plan §7).
+
+**Trade-off.** A migration on `join_token`, and the forwarded join-token
+write carries the new field. A registration with no proven caller still
+reports what it likes, which with ACLs off is everything anyway.
+
+**Why (correctness).** (a) is wrong for exactly the workers that matter:
+every manager's system worker registers as the built-in `legion-system`
+type, whose stored `namespaces` is `["legion-system"]` whatever a manager's
+own `systemWorker.namespaces` says (entry 24), and `--run-worker` registers
+as `default`, whose type has no `legion.role`. The minting manager is the
+only party that knows its own worker's settings, so it writes them where
+registration reads them. (b) is the larger change entry 19 declined.
+
+## 33. A grant is per task: the version's row holds each task's request, and a token gets its own task's (A2)
+
+**Call.** `job_grant.tasks` is a JSON array of `{group, task, permissions,
+policies}`, and a token resolves the entry for its allocation's task.
+
+**Alternatives.** One rule set per version, the union of every task's
+request (the plan's "rules JSON").
+
+**Trade-off.** A token's resolution joins `task_config` for the task's group
+and name.
+
+**Why (security).** The jobspec declares permissions on each task's identity;
+a union would hand a sidecar the access its main task asked for, which no one
+reviewing the spec would expect.
+
+## 34. A KV re-render keeps the previous version's grant only when it asks for exactly the same (A2)
+
+**Call.** Versions Legion stores itself (`Store::handle_job_submit`, the KV
+re-render path) carry the previous version's unrevoked grant forward, with
+its granter, when the new version's requests are identical, and get no grant
+otherwise (logged).
+
+**Alternatives.** (a) Always carry forward. (b) Never: every re-render drops
+the grant until someone resubmits.
+
+**Trade-off.** A re-render that changes the requested permissions (through a
+legacy `$` KV reference inside them) leaves the job without a grant until a
+holder resubmits it.
+
+**Why (security, then simplicity).** (a) lets whoever writes a KV key the
+spec references widen a job's grant with no check. (b) breaks every KV-driven
+job with permissions on its first re-render, the common case.
+
+## 35. Every principal's submit records the grant, so a resubmit restores a revoked grant; revocation is not sticky (A2)
+
+**Call.** A submit that passes the check upserts the version's grant in the
+submitter's name, an unchanged resubmit included; a revoked row is granted
+again. An unchanged live row is not rewritten, so a steady resubmit adds
+nothing to the raft log.
+
+**Alternatives.** Keep a revoked grant revoked until an admin clears it (a
+"blocked" flag on the job).
+
+**Trade-off.** "Revoke" means "take it back from what runs now", not "forbid
+it": a holder can redeploy the job with the access.
+
+**Why (simplicity).** A grant only records that someone who held the access
+submitted the job. A sticky revoke would be a second authorization system on
+top of the ACL (who may clear it?), and the way to stop someone regranting is
+to take the access away from them.
+
+## 36. The socket keeps a caller's own credential and attaches the identity only when there is none (A2)
+
+**Call.** The proxy adds `authorization: Bearer <identity token>` only to
+requests that carry no `authorization` header.
+
+**Alternatives.** Always overwrite it with the allocation's identity.
+
+**Trade-off.** A process that holds some other token can use the socket as a
+route to the managers for it.
+
+**Why (simplicity).** It grants nothing: the caller already holds the token,
+and could present it to any manager it can reach. It makes `legion login`
+inside a task useful (a person exec'd into a task can act as themselves);
+an overwrite would silently turn their token into the job's.
+
+## 37. The `legion` identity always delivers a token file, which the worker writes at `secrets/legion.token` when the identity names no file (A2)
+
+**Call.** `WorkloadIdentity::is_delivered` is true for `legion`, and the
+worker's parser fills in `file = "secrets/legion.token"` (relative to the
+delivery root) when it declares none, so the existing delivery, refresh,
+sandbox identity disk and cleanup apply unchanged. The task directory is
+created owner-only when a token is delivered, before the first launch.
+Sandboxes get the token file and `LEGION_IDENTITY_TOKEN_FILE`, but no socket
+and no `LEGION_ADDR`.
+
+**Alternatives.** A separate writer for this token file outside the
+declared-delivery machinery, and a socket over vsock for sandboxes now.
+
+**Trade-off.** A sandbox task sets `LEGION_ADDR` itself and presents the
+token as a bearer credential, over a direct connection with no failover.
+
+**Why (simplicity).** One delivery path keeps refresh, the sandbox disk and
+cleanup consistent; the vsock path is its own project (plan §6.4 defers it).
+Creating the task directory early also fixed a pre-existing gap the
+end-to-end test found: a relative token path could not be written before the
+task's first launch.
+
+## 38. A call that fails to reach a manager is not retried on the next one; it counts toward the worker's failover (A2)
+
+**Call.** On a transport error the proxy answers `Unavailable` ("the worker
+could not reach a manager for this allocation's API socket") and records the
+failure on `ManagerEndpoints`; two in a row move the worker, and with it the
+socket, to the next manager.
+
+**Alternatives.** Buffer each request body and replay it on the next manager.
+
+**Trade-off.** The first call after a manager dies fails, and the client
+retries.
+
+**Why (simplicity and correctness).** gRPC bodies are streams (exec is
+bidirectional), and replaying a mutating call after a transport error can
+apply it twice; `Unavailable` is retryable, and mutating RPCs take
+idempotency keys for exactly this.
+
+## 39. The `sub` charset check reads the job's bare name, so a namespaced job can declare identities (A2)
+
+**Call.** Admission checks `[A-Za-z0-9._-]` against the bare job name, not
+the canonical id.
+
+```text
+before: Error validating task configs: job name "team-a/web" contains '/', which is not allowed
+        for a task that declares workload identities
+```
+
+**Alternatives.** Keep checking the canonical id.
+
+**Trade-off.** None found: the namespace is its own `sub` component, validated
+as a namespace name.
+
+**Why (correctness).** Without it no job outside `default` could declare any
+identity, `legion-system` apps included (found by the canonical-id grant
+test).
+
+## 40. A job's own env wins over the ambient env (A2)
+
+**Call.** `LEGION_ADDR`, `LEGION_SECRETS_DIR` and `LEGION_IDENTITY_TOKEN_FILE`
+are injected only when the task's config does not set them.
+
+**Alternatives.** Always set them.
+
+**Trade-off.** A job that sets `LEGION_ADDR` by hand (the old cert renewer)
+keeps its direct connection, with the host-guard and failover caveats, until
+it drops the variable.
+
+**Why (simplicity).** A job that sets the address does so on purpose (a
+manager in another cluster, a test fixture); overriding it would be a
+surprise with no way out.
+
+## 41. `permissions` and `policies` ride in the identity JSON, not a `WorkloadIdentity` proto message (A2, deviates from plan §7)
+
+**Call.** The fields are on the `WorkloadIdentity` struct and travel inside
+the task's identities JSON (`TaskAllocation.task_identities`); `permissions`
+uses the ACL rule struct.
+
+**Alternatives.** The plan's `repeated AclRule permissions` on a proto
+message.
+
+**Trade-off.** None: no proto message for identities exists, and one for two
+fields would fork the representation.
+
+**Why (simplicity).** Identities have always been JSON on the wire; the new
+fields follow.

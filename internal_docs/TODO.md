@@ -4360,8 +4360,8 @@ replicas is one command on day N. The shared substrate is
 [legion-apps-plan.md](plans/legion-apps-plan.md); each app still needs its own
 plan.
 
-- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (IN EXECUTION; A1 shipped, in
-      Done) · [calls](calls/legion-apps-plan_calls.md)
+- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (IN EXECUTION; A1 and A2
+      shipped, in Done) · [calls](calls/legion-apps-plan_calls.md)
   - [ ] A1 follow-ups, found while building it:
     - [ ] **A manager's system worker and a standalone worker on one Linux
           host overwrite each other's host guard.** The kernel host guard is
@@ -4386,18 +4386,30 @@ plan.
           `node:write` with `pools = ["*"]` can cordon or drain the managers'
           system workers. Apply the reserved rule to pool selectors too, or
           decide it is fine.
-    - [ ] **A node's `namespaces` and `legion.role` attributes are
-          worker-reported**, like every config attribute: a worker that
-          forges its registration can drop its restriction or claim to be a
-          manager's. Pin both from the join token's worker type at
-          registration before A3 places apps by `legion.role`
-          ([calls entry 19](calls/legion-apps-plan_calls.md)).
-  - [ ] A2: `identities[].permissions` / `policies` on the `legion` identity,
-        granted at submit only up to what the submitter holds; per-version
-        grants with `legion acl grants list|revoke`; a per-allocation API
-        socket (`LEGION_ADDR=unix://…`, `SO_PEERCRED` plus cgroup check)
-        proxied by the worker with the allocation's identity; the grant check
-        on `RunJobTemplate` too; rewrite `configs/jobs/cert-renewer.ncl` on it
+  - [ ] A2 follow-ups, found while building it:
+    - [ ] **Sandboxes have no API socket.** They get the `legion` token file
+          (`/legion/identity/secrets/legion.token`) but no `LEGION_ADDR`, so
+          a sandbox task sets its own address and dials a manager directly,
+          with no failover and subject to its network policy. Serve the
+          socket over the guest agent's vsock (plan §6.4;
+          [calls entry 37](calls/legion-apps-plan_calls.md);
+          [docs](../docs/workload-identity.md#sandboxes-and-other-runtimes)).
+    - [ ] **Verify the socket's peer-cgroup refusal on a cgroup v2 host.**
+          `another_allocations_process_is_refused_by_the_peer_cgroup_check_test`
+          (`tests/integration/api_socket.rs`) is `#[ignore]`d: it needs root
+          and delegated cgroup v2, which CI and the dev container lack. The
+          end-to-end socket test's "direct port dropped by the host guard"
+          half also runs only where the kernel guard does
+          ([calls entry 31](calls/legion-apps-plan_calls.md)).
+    - [ ] **`job plan` does not run the grant check**, so an agent cannot
+          preview a refusal for permissions its token does not hold; only
+          `job run` says so. Run `enforce_identity_grants` on `PlanJob` too,
+          reporting a miss as a plan warning.
+    - [ ] **The coverage check refuses grants covered only by a union of
+          held rules** (`a*` plus `b*` for a requested `*`), and requests
+          that leave out a selector a held rule names. Decide whether a
+          normalizing pass is worth it once apps hit it
+          ([calls entry 30](calls/legion-apps-plan_calls.md)).
   - [ ] A3: app manifests and records; the Control-leader reconciler
         (event-driven, a render digest stamped on the job as `managedBy`,
         idempotency keys per digest and starting state, stopped jobs
@@ -6132,6 +6144,39 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         reshaped as `namespaces = ["*", "legion-*"]` with no cap
   - [x] No root `exec` tasks and no privilege-floor opt-out containers in
         reserved namespaces
+  - [x] A node's `namespaces` and `legion.role` are pinned at registration
+        from the join token (a manager's own worker), its worker type, or
+        the node's record, never taken from what the worker reports
+        (shipped with A2, [calls entry 32](calls/legion-apps-plan_calls.md),
+        [docs](../docs/namespaces.md#known-limitations))
+- [x] **Legion apps A2: identity that just works** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §6.4, §8 ·
+      [calls 29-41](calls/legion-apps-plan_calls.md) · docs:
+      [workload-identity.md](../docs/workload-identity.md#control-plane-identity),
+      [auth-and-acls.md](../docs/auth-and-acls.md#job-grants),
+      [agent-readiness.md](../docs/agent-readiness.md#agents-that-run-as-legion-jobs))
+  - [x] `permissions` (inline rules) and `policies` (names) on the reserved
+        `legion` identity, in `configs/jobs/maximal.ncl`
+  - [x] The grant check on every path that stores a job config (`RunJob`,
+        `RunJobTemplate`), on every submit: string-glob coverage, reserved
+        prefixes first, deny rules needing `acl:write`, management tokens
+        passing, with the documented error
+  - [x] Per-version, per-task grants in the Control-lane `job_grant` table;
+        the `legion` auth method resolves them through a `grant:alloc/<id>`
+        reference, keyed by canonical job id; KV re-renders carry an
+        unchanged grant forward
+  - [x] `ListGrants`/`RevokeGrant` RPCs, `legion acl grants list|revoke`,
+        capabilities entries, the `legion_acl_grants_list` MCP tool;
+        revocation applies at the next verification, login tokens included
+  - [x] The per-allocation API socket (`$LEGION_SECRETS_DIR/legion.sock`),
+        proxied over the worker's manager channel with failover, attaching
+        the allocation's current token; `SO_PEERCRED` plus cgroup-leaf check
+        where leaves are guaranteed, file modes elsewhere
+  - [x] Ambient `LEGION_ADDR=unix://…`, `LEGION_SECRETS_DIR`,
+        `LEGION_IDENTITY_TOKEN_FILE`; `unix://` in the CLI and Rust client;
+        `legion login` never writes over the identity token file
+  - [x] `configs/jobs/cert-renewer.ncl` rewritten on `permissions` and the
+        socket: no manager-config binding, no hard-coded address
 
 ## Auth & ACLs
 

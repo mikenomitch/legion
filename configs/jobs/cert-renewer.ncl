@@ -36,10 +36,11 @@
 #     (and `kv:read` on the DNS token below, which the env template reads).
 #     A token that does not is refused before anything is stored:
 #
-#       error: cert-renewer-app-example-com: identity 'legion' asks for
-#         kv:write on certs/*, which your token does not hold
+#       Error: failed to run job: cert-renewer-app-example-com: identity
+#       'legion' asks for kv:write on certs/*, which your token does not hold
+#       [code=PermissionDenied]
 #       Hint: have someone with that access submit this job, or ask for it
-#         to be granted to you
+#       to be granted to you
 #
 #   - Inside the task, `legion` reaches the cluster through the worker's
 #     per-allocation socket: the worker sets

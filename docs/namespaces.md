@@ -770,11 +770,14 @@ namespace's manifests can land under a fence prefix.
 - **Rollout, volume and snapshot replies** carry the canonical `job_id`
   rather than a separate `namespace` field; split it at the first `/`.
 - Namespaces cannot be renamed or nested.
-- **Node `namespaces` lists are reported by the worker**, like its
-  attributes: the worker registers what its worker type (or its manager, for
-  a system worker) told it. A worker that could forge its registration could
-  drop its own restriction; the restriction keeps tenants' jobs off nodes,
-  it does not authenticate them.
+- **Node `namespaces` lists are pinned at registration.** The manager takes
+  a node's `namespaces` (and its `legion.role`) from what admits the
+  registration, whatever the worker reports: the join token's worker type,
+  the settings a manager pinned on its own system worker's token, or, when a
+  node re-registers with its node token, what it first registered with. A
+  worker that forges its registration can neither drop its restriction nor
+  claim to be a manager's. With ACLs off, or a management token, nothing
+  about the caller is proven, so the reported values stand.
 - **There is no soft form** of the node restriction (no "prefer not"); a
   node accepts a namespace or it does not.
 - **List selection is not ACL.** `-n '*'` on a list command selects every

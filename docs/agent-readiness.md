@@ -98,6 +98,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_net_ca_rotate` | **yes** | Rotate the built-in cluster CA in two steps: the new CA, cross-signed by the old one, signs at once and the old one stays trusted for 24 hours, so no connection breaks. Every node re-issues within one heartbeat. A `file` or `exec` CA rotates outside Legion: this returns `FailedPrecondition` with the procedure. |
 | `legion_net_policy_apply` | **yes** | Create or replace a network policy object. `dry_run` validates and lists affected allocations without writing. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
+| `legion_acl_grants_list` | no | Job grants: what each job version's `legion` identity was granted at submit (inline `permissions` and `policies`), who granted it, and whether it was revoked (`include_revoked`). `job` narrows to one job's canonical id. Needs `acl:read`. Revoking is `legion acl grants revoke` on the CLI, not an MCP tool. |
 | `legion_events` | no | List scheduler events. Poll with `after_id` to tail. `instance_id` narrows to one stateful instance (its own events plus its allocations'), `allocation_id` to one allocation. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job, including allocations removed in the last 24 hours (`removed`, `removalCause`). |
 | `legion_state_query` | no | Read-only SQL against the state store. |
@@ -757,7 +758,9 @@ Explorer. See `AGENT_SAVED_QUERIES` in [`src/cmd/state.rs`](../src/cmd/state.rs)
 
 All client commands and the MCP server read:
 
-- `LEGION_ADDR`: manager address (default `http://127.0.0.1:4747`).
+- `LEGION_ADDR`: manager address (default `http://127.0.0.1:4747`), or a
+  `unix://` socket path, which is what a task with the `legion` identity
+  gets ([below](#agents-that-run-as-legion-jobs)).
 - `LEGION_TLS_CA_CERT`: CA certificate path for `https`/`grpcs` addresses.
 - `LEGION_TOKEN`: ACL token sent as a bearer credential. ACLs are on by
   default, so the CLI and the MCP server need a token for every call. Falls
@@ -784,6 +787,29 @@ All client commands and the MCP server read:
 
 Both timeouts take a duration (`45s`, `2m`) or bare seconds, and `0` turns
 the timeout off.
+
+### Agents that run as Legion jobs
+
+An agent that runs as a task needs no address or token in its spec. Give
+its task the reserved `legion` identity, with what it may do as
+`permissions`, and submit it with a token that holds them
+([Workload identity: Permissions](workload-identity.md#permissions)):
+
+```nickel
+identities = [{
+  name = "legion",
+  permissions = [{ resources = ["job"], actions = ["read"], namespaces = ["agents-dev"] }],
+}],
+```
+
+Inside the task, `LEGION_ADDR` is already `unix://…/legion.sock`, a socket
+the worker proxies to the managers with the task's own identity attached, so
+`legion …` commands and `legion mcp serve` work with nothing set and no route
+to a manager. `LEGION_IDENTITY_TOKEN_FILE` names the raw token for clients
+that cannot use a socket. What the job may do is listed with `legion acl
+grants list` (`legion_acl_grants_list`) and taken back with `legion acl grants
+revoke`, effective at its next call. See [Workload identity: The API
+socket](workload-identity.md#the-api-socket).
 
 ### Namespaces for agents
 

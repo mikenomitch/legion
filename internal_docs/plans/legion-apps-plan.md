@@ -11,7 +11,18 @@ rule, node-side `namespaces`, and the system worker; docs:
 Where A1 differs from this text, calls entries 18-28 say how and why; the
 largest differences are that a node's `namespaces` is a config attribute,
 not a column (entry 19), and that the system worker has its own port and
-state directory (entry 20). A2-A6 are not built. It has six phases (§8),
+state directory (entry 20). **A2 shipped 2026-10-28** (`permissions` and
+`policies` on the `legion` identity, granted at submit up to what the
+submitter holds; per-version grants with `legion acl grants list|revoke`;
+the per-allocation API socket with ambient `LEGION_ADDR=unix://…`; and
+registration-pinned node `namespaces` and `legion.role`; docs:
+[workload-identity.md](../../docs/workload-identity.md#control-plane-identity),
+[auth-and-acls.md](../../docs/auth-and-acls.md#job-grants)). Calls entries
+29-41 record where A2 differs: a token resolves its grant through a
+`grant:alloc/<id>` reference (entry 29), grants are per task (entry 33),
+registration pins from the token for in-process workers (entry 32), and
+sandboxes get the token file but no socket yet (entry 37). A3-A6 are not
+built. It has six phases (§8),
 and each ships alone. The first consumer is the autoscaler
 ([autoscaler-v2-plan.md](autoscaler-v2-plan.md)). GitOps is the second, and
 this plan checks the substrate against it (§6.8). Deliberately deferred:
