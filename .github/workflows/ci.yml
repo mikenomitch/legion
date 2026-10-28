@@ -26,7 +26,10 @@ permissions:
 jobs:
   cargo-test:
     name: Cargo Test
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: rusqlite's `session` feature runs
+    # bindgen against the runner's libclang, and the newer ubuntu-latest
+    # image's libclang makes bindgen 0.69 emit empty SQLite structs.
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -67,7 +70,10 @@ jobs:
 
   cargo-clippy:
     name: Cargo Clippy
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: rusqlite's `session` feature runs
+    # bindgen against the runner's libclang, and the newer ubuntu-latest
+    # image's libclang makes bindgen 0.69 emit empty SQLite structs.
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -236,7 +242,10 @@ jobs:
 
   scheduler-benchmark-gate:
     name: Scheduler Benchmark Gate
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: rusqlite's `session` feature runs
+    # bindgen against the runner's libclang, and the newer ubuntu-latest
+    # image's libclang makes bindgen 0.69 emit empty SQLite structs.
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
 
     steps:
