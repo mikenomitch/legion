@@ -511,6 +511,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#58](https://github.com/mikenomitch/legion/pull/58) | Park: the workload says when it is waiting, and its node suspends it | Plan [park-plan.md](plans/park-plan.md); Phases 1–2, entries under "Park" above and in Done |
 | [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after adversarial security and correctness reviews | All three plans SHIPPED; their items, and both hardening passes, are checked off and in Done; the reviews' open and design-level items are under *Ecosystem apps* |
 | branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phases O1-O4 | Builds on #60; O1-O4 are checked off and in Done; the deferrals and follow-ups are open under Ecosystem apps |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
@@ -2375,7 +2376,8 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         (`tests/integration/wake_integration.rs`).
 - [ ] **Park**: [plan](plans/park-plan.md) (IN EXECUTION) ·
       [calls](calls/park-plan_calls.md) · [docs](../docs/park.md). Phases 1
-      and 2 are built (in Done below).
+      and 2 are built (in Done below), in
+      [#58](https://github.com/mikenomitch/legion/pull/58).
   - [ ] Phase 3: timed wake, `park until=<time>`: resume at the deadline if
         nothing woke the instance first (the manager's sweep for keyed
         instances, the node for sessions).
