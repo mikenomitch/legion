@@ -676,6 +676,26 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_app_view",
+            description: "Render one of an app's declarative views as JSON: what its panel on a job, task, or node page, its sidebar page, or its overview card shows a human. The same data as `legion app view`. Returns the validated `legion-view/1` document (stats, series, table, timeline, keyValue, notice, markdown, and actions blocks), the actions it offers with whether you may run them, and which allocation answered. Needs app:read on the app and the view's declared permission on the context (checked by the manager before the app sees anything). Omit `view` for the slot's first view you may see. Call legion_app_status for the app's slots.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "app": { "type": "string", "description": "The app's name (for example `autoscaler`)." },
+                    "slot": { "type": "string", "enum": ["nav", "overview", "job", "task", "node"], "description": "Where the view is shown: nav (a sidebar page), overview (a card), job (a panel on a job's page), task (a task row's badge and the task's page), node (a panel on a node's page)." },
+                    "view": { "type": "string", "description": "The view's name; omit for the slot's first view you may see." },
+                    "job": { "type": "string", "description": "For the job and task slots: the job, `name` (in `namespace`, default `default`) or `namespace/name`." },
+                    "namespace": { "type": "string", "description": "The job's namespace, when `job` is a bare name." },
+                    "task": { "type": "string", "description": "For the task slot: the task's name." },
+                    "group": { "type": "string", "description": "For the task slot: the task's group, when it has one." },
+                    "node": { "type": "string", "description": "For the node slot: the node's id." }
+                },
+                "required": ["app", "slot"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_acl_grants_list",
             description: "List job grants: what each job version's `legion` identity was granted at submit (inline permissions and policy names), who granted it, and whether it was revoked. Needs acl:read.",
             input_schema: || json!({
@@ -1794,6 +1814,33 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 .as_ref()
                 .map(crate::cmd::app::app_json)
                 .unwrap_or(Value::Null))
+        }
+        "legion_app_view" => {
+            let app = str_arg(&args, "app")?;
+            let slot = str_arg(&args, "slot")?;
+            let field = |name: &str| opt_str_arg(&args, name).unwrap_or_default();
+            let context = crate::structs::AppViewContext {
+                slot,
+                namespace: field("namespace"),
+                job: field("job"),
+                group: field("group"),
+                task: field("task"),
+                node: field("node"),
+            };
+            let mut client = connect().await?;
+            let reply = client
+                .get_app_view(crate::structs::GetAppViewRequest {
+                    app,
+                    view: field("view"),
+                    context: Some(context),
+                })
+                .await
+                .map_err(|status| {
+                    let err = CliError::from_status("request failed", &status);
+                    serde_json::to_string(&err).unwrap_or_else(|_| status.message().to_string())
+                })?
+                .into_inner();
+            Ok(crate::cmd::app_view::view_json(&reply))
         }
         "legion_acl_grants_list" => {
             let job = opt_str_arg(&args, "job").filter(|job| !job.trim().is_empty());
@@ -3112,6 +3159,13 @@ mod tests {
         let names: Vec<&str> = available_tools(false).iter().map(|t| t.name).collect();
         assert!(names.contains(&"legion_app_list"));
         assert!(names.contains(&"legion_app_status"));
+        assert!(names.contains(&"legion_app_view"));
+        let view = tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "legion_app_view")
+            .expect("legion_app_view");
+        assert!(!view.mutates);
+        assert_eq!((view.input_schema)()["required"], json!(["app", "slot"]));
         let status = tool_defs()
             .into_iter()
             .find(|tool| tool.name == "legion_app_status")
