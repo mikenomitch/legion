@@ -4,6 +4,7 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, on }
 import { Badge, Button, CodeBlock, ConfirmButton, EmptyState, MonoBadge, Note, PageHeader, RelativeTime, SectionCard, Spinner, StatusBadge, TableShell, Tabs, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../../components/ui'
 import DagVisualization from '../../components/DagVisualization'
 import ScalePanel from '../../components/ScalePanel'
+import { AppPanels, AppTaskBadges } from '../../components/apps/AppSlot'
 import UsageInputsPanel from '../../components/UsageInputsPanel'
 import InstancesPanel from '../../components/InstancesPanel'
 import SessionNodesCard from '../../components/SessionNodesCard'
@@ -609,6 +610,9 @@ function JobDetailContent() {
                                         </Show>
                                       </div>
                                     </Show>
+                                    <div class="mt-2 flex flex-wrap items-center gap-1.5 empty:hidden">
+                                      <AppTaskBadges job={jobName()} task={task.name} group={task.group} />
+                                    </div>
                                     <Show when={task.stateful?.storagePath}>
                                       <p class="mt-1.5 truncate font-mono text-2xs text-faint" title={`Persistent storage path: ${task.stateful!.storagePath}`}>
                                         {task.stateful!.storagePath}
@@ -627,6 +631,8 @@ function JobDetailContent() {
               </SectionCard>
 
               <ScalePanel jobName={jobName()} tick={statusTick} keyedTasks={keyedTaskNames()} />
+
+              <AppPanels slot="job" job={jobName()} />
 
               <UsageInputsPanel jobName={jobName()} tick={statusTick} />
 

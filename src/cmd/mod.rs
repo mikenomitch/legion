@@ -3,6 +3,7 @@
 pub mod acl;
 pub mod action;
 pub mod app;
+pub mod app_view;
 pub mod boot_ticket;
 pub mod capabilities;
 pub mod docs;

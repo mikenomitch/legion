@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, ApplyNamespacePolicyReply, ApplyNamespacePolicyRequest, ApplyNamespaceReply, ApplyNamespaceRequest, ApplyScalingDefaultsReply, ApplyScalingDefaultsRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNamespacePolicyReply, DeleteNamespacePolicyRequest, DeleteNamespaceReply, DeleteNamespaceRequest, DeleteNetPluginReply, DeleteNetPluginRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForgetNodeReply, ForgetNodeRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetAppReply, GetAppRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetCapacityDemandReply, GetCapacityDemandRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNamespacePolicyReply, GetNamespacePolicyRequest, GetNamespaceReply, GetNamespaceRequest, GetNetPluginReply, GetNetPluginRequest, GetNetPluginStatusReply, GetNetPluginStatusRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetScaleHistoryReply, GetScaleHistoryRequest, GetScalingDefaultsReply, GetScalingDefaultsRequest, GetScalingInputsReply, GetScalingInputsRequest, GetScalingStatusReply, GetScalingStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, InstallAppReply, InstallAppRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListAppsReply, ListAppsRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListGrantsReply, ListGrantsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNamespacePoliciesReply, ListNamespacePoliciesRequest, ListNamespacesReply, ListNamespacesRequest, ListNetPluginsReply, ListNetPluginsRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PauseScalingReply, PauseScalingRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, RecordScalingActionReply, RecordScalingActionRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ReportScalingStatusReply, ReportScalingStatusRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RevokeGrantReply, RevokeGrantRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, ScalingPolicySet, SchedulerEvent, SetAppConfigReply, SetAppConfigRequest, SetAppEnabledReply, SetAppEnabledRequest, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UninstallAppReply, UninstallAppRequest, UpdateAppSettingsReply, UpdateAppSettingsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpgradeAppReply, UpgradeAppRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPluginReply, UpsertNetPluginRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WatchScalingPoliciesRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, ApplyNamespacePolicyReply, ApplyNamespacePolicyRequest, ApplyNamespaceReply, ApplyNamespaceRequest, ApplyScalingDefaultsReply, ApplyScalingDefaultsRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNamespacePolicyReply, DeleteNamespacePolicyRequest, DeleteNamespaceReply, DeleteNamespaceRequest, DeleteNetPluginReply, DeleteNetPluginRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForgetNodeReply, ForgetNodeRequest, ForkInstanceReply, ForkInstanceRequest, ForwardAppRequestReply, ForwardAppRequestRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetAppReply, GetAppRequest, GetAppViewReply, GetAppViewRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetCapacityDemandReply, GetCapacityDemandRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNamespacePolicyReply, GetNamespacePolicyRequest, GetNamespaceReply, GetNamespaceRequest, GetNetPluginReply, GetNetPluginRequest, GetNetPluginStatusReply, GetNetPluginStatusRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetScaleHistoryReply, GetScaleHistoryRequest, GetScalingDefaultsReply, GetScalingDefaultsRequest, GetScalingInputsReply, GetScalingInputsRequest, GetScalingStatusReply, GetScalingStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, InstallAppReply, InstallAppRequest, InvokeAppActionReply, InvokeAppActionRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListAppsReply, ListAppsRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListGrantsReply, ListGrantsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNamespacePoliciesReply, ListNamespacePoliciesRequest, ListNamespacesReply, ListNamespacesRequest, ListNetPluginsReply, ListNetPluginsRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListUiExtensionsReply, ListUiExtensionsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PauseScalingReply, PauseScalingRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, RecordScalingActionReply, RecordScalingActionRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ReportScalingStatusReply, ReportScalingStatusRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RevokeGrantReply, RevokeGrantRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, ScalingPolicySet, SchedulerEvent, SetAppConfigReply, SetAppConfigRequest, SetAppEnabledReply, SetAppEnabledRequest, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UninstallAppReply, UninstallAppRequest, UpdateAppSettingsReply, UpdateAppSettingsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpgradeAppReply, UpgradeAppRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPluginReply, UpsertNetPluginRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WatchScalingPoliciesRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -3724,6 +3724,131 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Lists the UI extensions installed apps register (docs/apps.md, "Views
+     * and actions"; docs/ui-architecture.md, "App extensions"): the pages,
+     * overview cards, job and node panels, and task badges the SPA draws from
+     * apps' declarative views. Requires `app:read`; the list is filtered to
+     * the apps the caller may read (`names` selector), and to enabled apps.
+     *
+     * Each entry the manifest declares with a `permission` is filtered by it,
+     * checked as the caller:
+     * - with `context` set, on that context's scope (the job's namespace and
+     *   name for `job` and `task` slots; the node's pool for `node`), exactly
+     *   as GetAppView will check it, so the SPA shows a panel only to viewers
+     *   who may see it;
+     * - without `context`, on any scope ("does the caller hold it
+     *   anywhere?"), which is what the sidebar and overview need at login.
+     *
+     * An entry without a permission needs only `app:read` on its app.
+     *
+     * Nothing is forwarded to any app: this answers from the installed
+     * manifests alone.
+     *
+     * Errors:
+     * - InvalidArgument: an unknown `slot`, or a `context` whose slot is not
+     *   `slot` or that does not fit its slot (see AppViewContext).
+     *
+     * @generated from rpc legion.Manager.ListUiExtensions
+     */
+    listUiExtensions: {
+      name: "ListUiExtensions",
+      I: ListUiExtensionsRequest,
+      O: ListUiExtensionsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Renders one of an app's declarative views (`legion app view`, the
+     * `legion_app_view` MCP tool, and every app panel in the SPA). The one
+     * data path for all three (apps plan §6.5).
+     *
+     * The manager authorizes before anything reaches the app:
+     * 1. `app:read` on the app;
+     * 2. the view must be registered in the context's slot;
+     * 3. the entry's declared `permission`, checked as the caller on the
+     *    context's scope (on any scope for `nav` and `overview`). A caller
+     *    without it is refused here, and the app sees no request at all.
+     *
+     * Only then does it forward `GET /legion/v1/views/<view>?<context>` to
+     * one running allocation of the app's job, over the worker plane
+     * (`Worker.ForwardAppRequest`), to the port the manifest's `ui.port`
+     * names. The request carries a **viewer assertion** in the
+     * `Legion-Viewer` header: a JWT signed with the cluster's
+     * workload-identity key, `aud = app:<name>`, living 60 seconds, whose
+     * `legion.io/viewer` claim names the caller (principal, accessor id), the
+     * permission checked and where, and the context exactly as the query
+     * carries it. Apps must refuse a request whose assertion is missing,
+     * expired, for another audience, or for another context; the app
+     * framework does (docs/apps.md, "The viewer assertion").
+     *
+     * The answer is validated against the view schema (`legion-view/1`: the
+     * closed block set, no unknown fields, no raw HTML, links only to
+     * `http(s)` or in-app routes) before it is returned. A view may answer
+     * `{ "hidden": true }`: nothing to show for this context.
+     *
+     * Errors:
+     * - InvalidArgument: a context that does not fit its slot.
+     * - PermissionDenied: the caller lacks `app:read` or the entry's
+     *   permission on the context.
+     * - NotFound: no such app, or the app registers no such view in that
+     *   slot (or the app answered 404 for it).
+     * - FailedPrecondition: the app is disabled; workload identity is off on
+     *   this manager (`workloadIdentity.enabled`), so no assertion can be
+     *   signed; or the app answered with a view that fails the schema, or
+     *   refused the assertion (the message names which).
+     * - Unavailable: no allocation of the app's job is running, or its node
+     *   or port cannot be reached (retryable).
+     * - DeadlineExceeded: the app did not answer within 10 seconds.
+     *
+     * @generated from rpc legion.Manager.GetAppView
+     */
+    getAppView: {
+      name: "GetAppView",
+      I: GetAppViewRequest,
+      O: GetAppViewReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Invokes an action an app declares (`ui.actions`), the button in a
+     * view's `actions` block. Mutating, retry-safe with `idempotency_key`,
+     * and audited: every invocation that passes `app:read` records an
+     * `app.action` event (app, action, caller, context, outcome `ok`,
+     * `failed`, or `denied`).
+     *
+     * Authorization, before anything reaches the app:
+     * 1. `app:read` on the app;
+     * 2. the action must be declared, and the context must have a scope
+     *    (`job`, `task`, or `node`): actions are never pressed on the
+     *    sidebar or the overview;
+     * 3. the action's declared `permission` (required on every action),
+     *    checked as the caller on the context's scope. `app:write` is not
+     *    needed: the declared permission is what the button may do, and
+     *    `app:write` would let every operator who presses it reconfigure the
+     *    app.
+     *
+     * `inputs_json` is checked against the action's typed inputs (string,
+     * number, duration, enum, boolean); unknown inputs are refused and
+     * defaults filled in. The manager then forwards `POST
+     * /legion/v1/actions/<action>` with `{ "context": {...}, "inputs":
+     * {...} }` and a viewer assertion that also carries the SHA-256 of the
+     * inputs' canonical JSON, so an app acts only on the context and inputs
+     * the manager authorized.
+     *
+     * The app answers `{ "message": "...", "view": {...} }`; `view`, when
+     * present, is a refreshed view, validated like GetAppView's.
+     *
+     * Errors: as GetAppView, plus InvalidArgument for inputs that fail their
+     * declaration, and FailedPrecondition carrying the app's own message when
+     * the app reports the action failed (HTTP 4xx other than 401, 403, 404).
+     *
+     * @generated from rpc legion.Manager.InvokeAppAction
+     */
+    invokeAppAction: {
+      name: "InvokeAppAction",
+      I: InvokeAppActionRequest,
+      O: InvokeAppActionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Lists the auth methods clients may log in with.
      *
      * Open endpoint: login UIs need this before any credential exists. Only
@@ -3985,6 +4110,44 @@ export const Worker = {
       I: ExecClientFrame,
       O: ExecServerFrame,
       kind: MethodKind.BiDiStreaming,
+    },
+    /**
+     * Delivers one HTTP request to an app allocation's UI port and returns
+     * the answer: the unary subset of a worker-plane tunnel that app views
+     * and actions need (docs/apps.md, "Views and actions";
+     * Manager.GetAppView). Caller class: manager. The manager has already
+     * authorized the viewer and put a signed viewer assertion in the
+     * request's `legion-viewer` header; the worker adds nothing and checks
+     * nothing about the viewer.
+     *
+     * What the worker does check, so this is not a general proxy:
+     * - the allocation runs on this node, now, and its job is the request's
+     *   `job_id`, in the reserved `legion-system` namespace (apps only);
+     * - the allocation declares the port label `port`;
+     * - the method is GET or POST, the path starts with `/legion/v1/`, only
+     *   the `legion-viewer`, `content-type`, and `accept` headers pass, and
+     *   the body is at most 256 KiB.
+     *
+     * It then dials the port the way the ingress datapath does (loopback,
+     * inside the task's network namespace when it is gated; a sandbox guest
+     * over vsock or its bridge address), never a caller-named address, sends
+     * one HTTP/1.1 request, and reads at most 1 MiB of answer within 10
+     * seconds.
+     *
+     * Errors: Unauthenticated without a manager certificate; InvalidArgument
+     * for a request outside the limits above; NotFound when the allocation
+     * does not run here or runs another job; FailedPrecondition when the job
+     * is not an app's or the port is not declared; Unavailable when the port
+     * cannot be dialed; DeadlineExceeded when the app does not answer in
+     * time.
+     *
+     * @generated from rpc legion.Worker.ForwardAppRequest
+     */
+    forwardAppRequest: {
+      name: "ForwardAppRequest",
+      I: ForwardAppRequestRequest,
+      O: ForwardAppRequestReply,
+      kind: MethodKind.Unary,
     },
     /**
      * Starts work on this node from a boot ticket, without any call to a

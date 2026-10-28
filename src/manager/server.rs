@@ -127,6 +127,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 // Phase 6: ForkInstance, `from_snapshot` creates, and snapshot names.
 mod app_rpcs;
+mod app_ui_rpcs;
 mod autoscale_rpcs;
 mod checkpoint_support;
 mod fork_rpcs;
@@ -1967,6 +1968,9 @@ pub struct ManagerDaemonService {
     /// service with no reconciler (tests, embedding), where writes simply
     /// wait for whoever reconciles.
     app_nudge: Arc<std::sync::OnceLock<crate::manager::apps::AppNudge>>,
+    /// How app view and action requests reach an app's allocation: the
+    /// worker plane, or (tests) a forwarder that delivers in process.
+    app_forwarder: Arc<dyn crate::manager::app_forward::AppForwarder>,
 }
 
 /// Distinct merged policy bodies kept in memory.
@@ -2016,7 +2020,18 @@ impl ManagerDaemonService {
             eval_threads: 1,
             app_user: crate::structs::config::DEF_SYSTEM_WORKER_APP_USER.to_string(),
             app_nudge: Arc::new(std::sync::OnceLock::new()),
+            app_forwarder: Arc::new(crate::manager::app_forward::WorkerPlaneForwarder),
         }
+    }
+
+    /// Deliver app view and action requests through `forwarder` instead of
+    /// the worker plane (tests, embedding).
+    pub fn with_app_forwarder(
+        mut self,
+        forwarder: Arc<dyn crate::manager::app_forward::AppForwarder>,
+    ) -> Self {
+        self.app_forwarder = forwarder;
+        self
     }
 
     /// The delegated exec keys for a heartbeat that asked with `version`:
@@ -11987,6 +12002,30 @@ impl Manager for ManagerDaemonService {
         self.set_app_config_rpc(request).await
     }
 
+    #[instrument(skip_all)]
+    async fn list_ui_extensions(
+        &self,
+        request: Request<crate::structs::ListUiExtensionsRequest>,
+    ) -> Result<Response<crate::structs::ListUiExtensionsReply>, Status> {
+        self.list_ui_extensions_rpc(request).await
+    }
+
+    #[instrument(skip_all, fields(app = %request.get_ref().app, view = %request.get_ref().view))]
+    async fn get_app_view(
+        &self,
+        request: Request<crate::structs::GetAppViewRequest>,
+    ) -> Result<Response<crate::structs::GetAppViewReply>, Status> {
+        self.get_app_view_rpc(request).await
+    }
+
+    #[instrument(skip_all, fields(app = %request.get_ref().app, action = %request.get_ref().action))]
+    async fn invoke_app_action(
+        &self,
+        request: Request<crate::structs::InvokeAppActionRequest>,
+    ) -> Result<Response<crate::structs::InvokeAppActionReply>, Status> {
+        self.invoke_app_action_rpc(request).await
+    }
+
     #[instrument(skip_all, fields(job))]
     async fn revoke_grant(
         &self,
@@ -16396,6 +16435,20 @@ mod tests {
             }))
         }
 
+        async fn forward_app_request(
+            &self,
+            request: Request<crate::structs::ForwardAppRequestRequest>,
+        ) -> Result<Response<crate::structs::ForwardAppRequestReply>, Status> {
+            let request = request.into_inner();
+            Ok(Response::new(crate::structs::ForwardAppRequestReply {
+                status: 200,
+                content_type: "application/json".into(),
+                body: json!({ "path": request.path, "allocation": request.allocation_id })
+                    .to_string()
+                    .into_bytes(),
+            }))
+        }
+
         type ExecTaskStream =
             tokio_stream::wrappers::ReceiverStream<Result<crate::structs::ExecServerFrame, Status>>;
 
@@ -16481,6 +16534,28 @@ mod tests {
             Some("node-1"),
             "the worker saw the restart"
         );
+
+        // An app view request takes the same authenticated hop
+        // (docs/apps.md, "Views and actions").
+        use crate::manager::app_forward::AppForwarder;
+        let forwarded = crate::manager::app_forward::WorkerPlaneForwarder
+            .forward(
+                &store,
+                "node-1",
+                crate::structs::ForwardAppRequestRequest {
+                    allocation_id: 7,
+                    job_id: "legion-system/fake".into(),
+                    port: "api".into(),
+                    method: "GET".into(),
+                    path: "/legion/v1/views/job?slot=job".into(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(forwarded.status, 200);
+        let echoed: Value = serde_json::from_slice(&forwarded.body)?;
+        assert_eq!(echoed["path"], "/legion/v1/views/job?slot=job");
+        assert_eq!(echoed["allocation"], 7);
 
         // A pre-mTLS worker (protocol 2, plaintext address) is never dialed.
         let old = Node {

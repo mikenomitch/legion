@@ -28,6 +28,7 @@ mod support;
 mod acl_default_on;
 mod acl_endpoints;
 mod api_socket;
+mod app_views;
 mod apple_container_idle;
 mod apps;
 mod archive_integration;

@@ -1135,6 +1135,29 @@ impl WorkloadIdentityState {
         )
     }
 
+    /// A viewer assertion for app `app` (docs/apps.md, "The viewer
+    /// assertion"): `aud = app:<name>`, signed with the active key and
+    /// verified by the app's framework against the JWKS. The Legion claims
+    /// (`legion.io/viewer`) are the caller's.
+    pub fn issue_viewer_assertion(
+        &self,
+        app: &str,
+        jti: &str,
+        subject: &str,
+        claims: Map<String, Value>,
+        iat: u64,
+        exp: u64,
+    ) -> R<IssuedToken> {
+        self.read_issuer()?.issue_ticket(
+            &crate::structs::app_ui::assertion_audience(app),
+            jti,
+            subject,
+            claims,
+            iat,
+            exp,
+        )
+    }
+
     /// One pass of the rotation state machine, persisting every transition:
     /// rotate when the active key is older than `rotationAge`, then expire
     /// retiring keys past their overlap window. Returns true when a rotation

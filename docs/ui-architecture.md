@@ -75,6 +75,8 @@ Routes in `App.tsx`:
 - `/raft`, `/events`, `/kv`, `/access`, `/api`, `/state-explorer`,
   `/observability` (shown only when the manager reports o11y enabled),
   `/testing` (unlisted component fixtures, see below)
+- `/apps/:app/:view` (an installed app's page; no index, see
+  [App extensions](#app-extensions))
 - anything else renders a not-found card naming the path
 
 A shared layout provides the grouped sidebar nav, a slim topbar
@@ -716,6 +718,64 @@ Two rules keep restricted identities from breaking the app:
   conditional around the outlet.
 
 All of this is cosmetic. The manager is the only enforcement point.
+
+## App extensions
+
+Installed apps add to the UI without shipping code into it
+([Apps: Views and actions](apps.md#views-and-actions)). An app registers
+**slots** in its manifest, and answers each with a **declarative view**: a
+`legion-view/1` JSON document built from a closed set of blocks, which the
+SPA draws with its own components. No app code runs in the SPA's origin,
+where the operator's token lives.
+
+| Slot | Outlet | Component |
+| --- | --- | --- |
+| `nav` | an item in the sidebar's **Apps** section, opening `/apps/:app/:view` | `pages/AppPage.tsx` |
+| `overview` | a card on the overview, under the stat cards | `AppPanels slot="overview"` |
+| `job` | a panel on the job page, under the scale panel | `AppPanels slot="job"` |
+| `task` | a badge on each task tile of the job page, and a panel on the task page's overview tab | `AppTaskBadges`, `AppPanels slot="task"` |
+| `node` | a panel on the node page | `AppPanels slot="node"` |
+
+The pieces, in `ui/src`:
+
+- `utils/appViews.ts`: the view types, link checks, and the **registry**:
+  `ListUiExtensions` without a context, fetched once per login (and again
+  when the stored token changes). The sidebar and the overview read it.
+- `components/apps/AppSlot.tsx`: the outlets. A job, task, or node outlet
+  asks `ListUiExtensions` again **with the page's context**, which the
+  manager filters by each entry's declared permission as the viewer, so a
+  panel appears only to viewers who may see it there. Each entry then
+  fetches `GetAppView` and re-fetches at the app's `ui.refresh` (at least
+  5 seconds; `usePoll`, so it pauses in a hidden tab). A view the app marks
+  `hidden` draws nothing; a denied one draws nothing in a panel and says so
+  on a page.
+- `components/apps/ViewBlocks.tsx`: the block renderer: stat tiles, an SVG
+  line chart (four lines, a dashed right axis), tables with in-app and
+  external links, a timeline, key-values, notices, markdown, and action
+  buttons.
+- `components/apps/SafeMarkdown.tsx`: a CommonMark subset (headings,
+  paragraphs, lists, quotes, code, emphasis, links) drawn as DOM nodes,
+  never `innerHTML`.
+
+**Links.** An in-app `route` (one leading slash) becomes a router link; an
+`http(s)` `href` opens in a new tab with `noopener noreferrer`; anything
+else renders as text. The manager already refuses other schemes, raw HTML,
+and images; the renderer would not draw them either.
+
+**Actions.** A button names an action the manifest declares. `GetAppView`
+returns each referenced action's title, confirmation (context filled in),
+typed inputs, and whether the viewer holds its permission here: a button the
+viewer may not press is disabled, titled with the permission it needs. A
+`write` action always opens an inline confirmation, with fields for the
+inputs the button does not preset (text, number, duration, a select for an
+enum, a checkbox for a boolean). It runs through `InvokeAppAction` with a
+fresh idempotency key per press. The app's message shows above the view,
+and a view it returns replaces the drawn one; the panel then re-fetches.
+
+The browser never talks to an app: every view and action is a gRPC-Web call
+to the manager, which authorizes as the viewer, forwards with a signed viewer
+assertion, and validates the answer. Tier 2 (sandboxed single-file pages for
+UIs the blocks cannot express) is not built.
 
 ## Namespaces
 

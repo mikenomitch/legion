@@ -42,7 +42,8 @@ dials the others' system workers.
 
 The worker plane is reachable by default and safe to expose because it is
 mutual TLS with per-RPC caller classes: only a manager certificate can call
-`PostWork`, `GetTaskLogs`, `ExecTask`, `RestartWorker`, or `StopSessions`, and
+`PostWork`, `GetTaskLogs`, `ExecTask`, `RestartWorker`, `StopSessions`, or
+`ForwardAppRequest`, and
 `StartClaim` needs a signed boot ticket. See [auth-and-acls.md](auth-and-acls.md#the-worker-plane).
 
 Where a worker listens and what it advertises:
@@ -514,6 +515,12 @@ Known limitations:
 - `StopSessions`: a manager ends running [sessions](session-mode.md) on the
   node (`legion instance stop` or `destroy` on a session, or the later copy
   of a duplicated one). Session starts arrive as `PostWork`.
+- `ForwardAppRequest`: an [app](apps.md#views-and-actions)'s view or action,
+  after the manager authorized the viewer and signed a viewer assertion. The
+  worker delivers one HTTP request to the app allocation's UI port, dialed
+  the way the ingress datapath dials a task, and only for a running
+  allocation of a `legion-system` job that declares the port, under
+  `/legion/v1/`, with a bounded body and answer.
 - `StartClaim`: not called by managers. Edge routers call it with a boot
   ticket ([edge-boot.md](edge-boot.md)).
 
@@ -536,7 +543,7 @@ listener and no setting that turns one on.
 
   | RPC | Admits | Check |
   | --- | --- | --- |
-  | `PostWork`, `GetTaskLogs`, `RestartWorker`, `Probe`, `StopSessions` | manager | a client certificate from the cluster CA carrying `legion://manager/<id>` |
+  | `PostWork`, `GetTaskLogs`, `RestartWorker`, `Probe`, `StopSessions`, `ForwardAppRequest` | manager | a client certificate from the cluster CA carrying `legion://manager/<id>` |
   | `ExecTask` | manager, ticket | a manager certificate as above, or (where the worker sets `exec = { direct = true }`) an exec ticket in the first frame, verified offline against the cluster JWKS |
   | `StartClaim` | ticket | the boot ticket in the request; a client certificate is ignored |
 

@@ -2,7 +2,8 @@
 //! a manifest, a grant, and registrations (docs/apps.md).
 //!
 //! Every subcommand but `run` takes `--json`/`-j` and emits the standard
-//! [`crate::cmd::output`] envelope. `run` is the in-task entrypoint bundled
+//! [`crate::cmd::output`] envelope. `view` renders an app's declarative
+//! views ([`crate::cmd::app_view`]). `run` is the in-task entrypoint bundled
 //! apps' jobs execute (`legion:self app run <name>`), a long-running process
 //! like `legion start`.
 
@@ -268,6 +269,7 @@ pub fn config() -> Command {
                 .arg(idempotency_arg())
                 .arg(json_flag()),
         )
+        .subcommand(crate::cmd::app_view::command())
         .subcommand(
             Command::new("run")
                 .about(
@@ -309,6 +311,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         Some(("install", sub)) => install(sub).await,
         Some(("upgrade", sub)) => upgrade(sub).await,
         Some(("uninstall", sub)) => uninstall(sub).await,
+        Some(("view", sub)) => crate::cmd::app_view::handle(sub).await,
         Some(("run", sub)) => {
             crate::apps::run_app(
                 sub.get_one::<String>("name").expect("required"),

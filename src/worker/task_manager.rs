@@ -3373,6 +3373,58 @@ impl WorkerTaskManager {
         ))
     }
 
+    /// Where `Worker.ForwardAppRequest` delivers an app view or action
+    /// request (docs/apps.md, "Views and actions"): allocation
+    /// `allocation_id`'s port `label`, dialed the way the ingress datapath
+    /// dials it. Refused unless the allocation runs here now and runs
+    /// `job_id`, and declares the label.
+    pub fn app_forward_target(
+        &self,
+        allocation_id: i64,
+        job_id: &str,
+        label: &str,
+    ) -> Result<crate::worker::netd::ingress::TaskTarget, tonic::Status> {
+        let key = self.local_key(allocation_id);
+        let running = self.instances.contains_key(&key) && !self.terminated.contains_key(&key);
+        let (Some(allocation), Some(task)) =
+            (self.allocations.get(&key), self.task_configs.get(&key))
+        else {
+            return Err(tonic::Status::not_found(format!(
+                "allocation {allocation_id} does not run on this node"
+            )));
+        };
+        if !running {
+            return Err(tonic::Status::not_found(format!(
+                "allocation {allocation_id} is not running on this node"
+            )));
+        }
+        if allocation.job_id != job_id {
+            return Err(tonic::Status::not_found(format!(
+                "allocation {allocation_id} runs {}, not {job_id}",
+                allocation.job_id
+            )));
+        }
+        let network = allocation.network.clone().unwrap_or_default();
+        let Some(port) = network.ports.iter().find(|port| port.name == label) else {
+            return Err(tonic::Status::failed_precondition(format!(
+                "allocation {allocation_id} declares no port {label:?}"
+            )));
+        };
+        let payload = TaskAllocation {
+            allocation_id: key,
+            task_runtime: task.runtime.clone(),
+            task_config: task.config.to_string(),
+            ..Default::default()
+        };
+        let attachment =
+            crate::worker::netd::attach::Attachment::of(&payload, &network, &self.alloc_root);
+        Ok(crate::worker::netd::ingress::TaskTarget {
+            dial: attachment.task_dial(),
+            label: label.to_string(),
+            port: port.bind_port(),
+        })
+    }
+
     pub fn open_exec_session(
         &mut self,
         allocation_id: i64,
