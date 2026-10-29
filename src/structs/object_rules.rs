@@ -952,8 +952,9 @@ mod object_rules_tests {
     /// its raw text, before any parser sees it.
     #[test]
     fn a_deeply_nested_rule_never_reaches_the_parser_test() {
-        for (open, close) in [("(", ")"), ("[", "]"), ("{1:", "}")] {
-            let source = format!("{}1{} == 1", open.repeat(500), close.repeat(500));
+        for (open, close, depth) in [("(", ")", 500), ("[", "]", 500), ("{1:", "}", 250)] {
+            let source = format!("{}1{} == 1", open.repeat(depth), close.repeat(depth));
+            assert!(source.len() <= MAX_RULE_BYTES, "within the size limit");
             let refused = std::thread::Builder::new()
                 .stack_size(2 << 20)
                 .spawn(move || compile_rule(&source).expect_err("too deep"))
