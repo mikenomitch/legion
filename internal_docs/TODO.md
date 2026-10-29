@@ -511,8 +511,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#51](https://github.com/mikenomitch/legion/pull/51) | Mesh interfaces: one handler pipeline, a smaller surface, the eBPF kernel classifier, WASM network plugins | Plan [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md); B1 end-to-end plugin overhead still open below |
-| [#57](https://github.com/mikenomitch/legion/pull/57) | Plans only: the autoscaler as a Legion app (autoscaler-v2), and the Legion apps substrate (system worker, granted identities, UI and jobspec extensions, strict unknown fields) | Supersedes autoscaler-plan.md; nothing built. Ecosystem apps → Legion apps substrate and Autoscaler |
+| [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after adversarial security and correctness reviews | All three plans SHIPPED; their items, and both hardening passes, are checked off and in Done; the reviews' open and design-level items are under *Ecosystem apps* |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -521,6 +520,17 @@ How to use it:
 ---
 
 ## Scheduling & placement
+
+- [ ] **Node namespace restrictions cost one attribute lookup per node per
+      task on the candidate scan.** `PermitSet::is_permitted` reads the
+      node's `namespaces` config attribute after the permit check
+      (apps A1, [calls 25](calls/legion-apps-plan_calls.md)).
+      `candidate_construction` on 10,000 nodes with indexes measured 11.0
+      → 12.2 ms against `main` (2026-10-29, one sequential run each on a
+      4-core VM; 1,000 and 5,000 nodes within noise; the Scheduler Benchmark
+      Gate SLO passes). Precompute "accepts every namespace" per node in the
+      read model, or fold the lookup into `permits_restrictions`' single
+      pass over `config_attrs`, and re-measure.
 
 - [x] **Per-eval planning cost no longer grows with node count
       (local; AWS retest pending).** Phases 1-2 of
@@ -1255,9 +1265,10 @@ How to use it:
 - [ ] Worker groups + taint/toleration equivalent. Pools already act as
       taints: a node's pool must be matched by the task's `permit`, with an
       implicit `pool=default` (`src/constraints.rs:114-175`). What's missing
-      is a soft (prefer-not) form, and a restriction the job can't opt into
-      itself. The node-side `namespaces` restriction is
-      [legion-apps](plans/legion-apps-plan.md) A1.
+      is a soft (prefer-not) form. A restriction the job can't opt into
+      itself shipped as the worker type's `namespaces` list
+      ([legion-apps](plans/legion-apps-plan.md) A1,
+      [docs](../docs/namespaces.md#nodes-that-accept-only-some-namespaces)).
 - [ ] Preemption follow-ups — the feature shipped
       ([plan](plans/preemption-and-eviction-plan.md) ·
       [docs](../docs/preemption-and-eviction.md)); these are what it left open.
@@ -4361,56 +4372,222 @@ replicas is one command on day N. The shared substrate is
 [legion-apps-plan.md](plans/legion-apps-plan.md); each app still needs its own
 plan.
 
-- [ ] **Legion apps substrate** (plan in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/legion-apps-plan.md) (PLANNED) ·
-      [calls](calls/legion-apps-plan_calls.md)
-  - [ ] A1: the `legion-system` namespace (bootstrapped, `*` globs skip
-        reserved `legion-*` namespaces), node-side `namespaces` restriction on
-        worker types (scheduler filter + blocked-eval wake), and a default-on
-        system worker in each manager (capped lend, pool `legion-system`,
-        `legion.role = manager`, `cpu.max`/`memory.max` on its cgroup parent),
-        with `--run-worker` reshaped as `namespaces = ["*", "legion-*"]`;
-        the `legion/` KV prefix reserved the same way; no root exec tasks or
-        privileged containers in reserved namespaces
-  - [ ] A2: `identities[].permissions` / `policies` on the `legion` identity,
-        granted at submit only up to what the submitter holds; per-version
-        grants with `legion acl grants list|revoke`; a per-allocation API
-        socket (`LEGION_ADDR=unix://…`, `SO_PEERCRED` plus cgroup check)
-        proxied by the worker with the allocation's identity; the grant check
-        on `RunJobTemplate` too; rewrite `configs/jobs/cert-renewer.ncl` on it
-  - [ ] A3: app manifests and records; the Control-leader reconciler
-        (event-driven, a render digest stamped on the job as `managedBy`,
-        idempotency keys per digest and starting state, stopped jobs
-        restarted, direct edits reverted); `legion:self` for bundled apps,
-        rolled once the eligible nodes agree on a new (`buildVersion`,
-        `buildId`) build marker, with a `version_matches` constraint (workers
-        report a new `buildId`); seeding; `legion app
-        list|status|install|upgrade|config|set|enable|disable|uninstall`
-  - [ ] A4: UI tier 1, declarative views in `nav`/`overview`/`job`/`task`/`node`
-        slots, served by `GetAppView`/`InvokeAppAction` (authorized as the
-        viewer, forwarded with a signed viewer assertion), plus
-        `legion app view` and `legion_app_view`
-  - [ ] A5: UI tier 2, sandboxed single-file pages with a postMessage bridge
-        (RPC allowlist, viewer identity, strict CSP)
-  - [ ] A6: jobspec extensions and strict fields, in two halves.
-        (a) Unknown jobspec fields become submit errors with a
-        did-you-mean, and `--allow-unknown-fields` keeps unknown keys at
-        extension points as `pending` and drops unknown keys elsewhere. Today
-        `TaskConfigInput` ignores unknown keys (`src/structs/job.rs:2404`),
-        so a typo, or `autoscale` sent to an old manager, is silently
-        dropped. It needs a capture-then-validate parser (replacing
-        `deny_unknown_fields` on `VolumeSpec` and friends) and tasks parsed
-        by shape rather than through the untagged `TaskConfigList`. No
-        dependency; can ship first.
-        (b) Natural extension keys that apps declare at fixed points (job,
-        group via a task, task, volume, port, service), validated against the
-        app's JSON Schema (the task-runtime schema pattern). Collisions are
-        refused at install, `--key` renames, and `apps.<app>` is a qualified
-        spelling that never collides. Plus an optional validate call that
-        fails open, `WatchAppExtensions`, a new `GetJobSchema` RPC (today
-        `job schema`/`job validate` are CLI-local), live schema defaults,
-        and in-place version moves for extension-only changes (a new check
-        in `run_job`'s `Updated` branch, which today always rolls out).
-        Needs A3.
+- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (SHIPPED; every
+      phase, A1-A6, is in Done; what follows are follow-ups and deferrals) · [calls](calls/legion-apps-plan_calls.md)
+  - [ ] A1 follow-ups, found while building it:
+    - [ ] **Run the per-worker host-guard naming as root**: the system
+          worker's table (`legion_host_guard_legion-system`) and pin
+          directory are unit-tested, not exercised by the root-only kernel
+          tests; two workers sharing one cgroup parent still collide
+          ([calls 95](calls/legion-apps-plan_calls.md)).
+    - [ ] **Verify the system worker's `cpu.max` ceiling on a cgroup v2
+          host** with a busy loop (plan §9 A1). It is unit-tested on a
+          scratch tree (`parent_limits_cap_the_whole_hierarchy_test`); CI and
+          the dev container have no cgroup v2.
+  - [ ] A2 follow-ups, found while building it:
+    - [ ] **Sandboxes have no API socket.** They get the `legion` token file
+          (`/legion/identity/secrets/legion.token`) but no `LEGION_ADDR`, so
+          a sandbox task sets its own address and dials a manager directly,
+          with no failover and subject to its network policy. Serve the
+          socket over the guest agent's vsock (plan §6.4;
+          [calls entry 37](calls/legion-apps-plan_calls.md);
+          [docs](../docs/workload-identity.md#sandboxes-and-other-runtimes)).
+    - [ ] **Verify the socket's peer-cgroup refusal on a cgroup v2 host.**
+          `another_allocations_process_is_refused_by_the_peer_cgroup_check_test`
+          (`tests/integration/api_socket.rs`) is `#[ignore]`d: it needs root
+          and delegated cgroup v2, which CI and the dev container lack. The
+          end-to-end socket test's "direct port dropped by the host guard"
+          half also runs only where the kernel guard does
+          ([calls entry 31](calls/legion-apps-plan_calls.md)).
+    - [ ] **`job plan` does not run the grant check**, so an agent cannot
+          preview a refusal for permissions its token does not hold; only
+          `job run` says so. Run `enforce_identity_grants` on `PlanJob` too,
+          reporting a miss as a plan warning.
+    - [ ] **The coverage check refuses grants covered only by a union of
+          held rules** (`a*` plus `b*` for a requested `*`), and requests
+          that leave out a selector a held rule names. Decide whether a
+          normalizing pass is worth it once apps hit it
+          ([calls entry 30](calls/legion-apps-plan_calls.md)).
+  - [ ] A3 follow-ups, found while building it:
+    - [x] **Apps hold no credentials on a default cluster.** Closed by
+          autoscaler-v2 Phase 2: workload identity is on by default
+          ([autoscaler calls 37](calls/autoscaler-v2-plan_calls.md),
+          [docs](../docs/workload-identity.md#manager-configuration)); in
+          Done under *Workload identity*.
+    - [ ] **A stopped bundled app is not yet a cluster-health finding**
+          (plan §6.7): no `legion doctor` exists and the UI has no Apps
+          page or overview card. `legion_apps{status}` and `legion app list`
+          show it today.
+    - [ ] **An app's own health view** (plan §6.7, a manifest-declared
+          `health` view) waits on A4's views; status comes from the job's
+          allocations and checks.
+    - [ ] **Sandbox apps get no config file**: only `exec` and `container`
+          tasks have `$LEGION_APP_CONFIG`
+          ([calls entry 52](calls/legion-apps-plan_calls.md)).
+    - [ ] **A manifest whose job reads KV needs `kv:read` in its own
+          `permissions`**, because the reconciler's submit is checked as the
+          recorded grant; otherwise the app shows `reconcile refused`
+          ([calls entry 42](calls/legion-apps-plan_calls.md)).
+    - [ ] **Reconcile backoff is leader-local**: a new Control leader
+          retries a failing or parked app once, then backs off from scratch.
+    - [ ] **`legion app config get` prints JSON, not Nickel**
+          ([calls entry 57](calls/legion-apps-plan_calls.md)).
+  - [ ] A4/A5 follow-ups, found while building them:
+    - [ ] **No Apps index page or stopped-app overview finding**, and the
+          plan §6.7 `health` view is not built.
+    - [ ] **No command or MCP tool runs an app action**; the terminal and
+          agents read views only ([calls 78](calls/legion-apps-plan_calls.md)).
+    - [ ] **Sandbox apps cannot serve views or pages**: no API socket to
+          fetch the keys that verify the viewer assertion
+          ([calls 69](calls/legion-apps-plan_calls.md)).
+    - [ ] **`legion app test`** (check that a third-party app refuses bad
+          assertions, plan §6.5, and makes its action writes with
+          `legion-on-behalf-of`) is not built
+          ([calls 78](calls/legion-apps-plan_calls.md)).
+    - [x] **Actions run with the app's grant**, with the viewer only in the
+          reason ([calls 68](calls/legion-apps-plan_calls.md),
+          [autoscaler calls 83](calls/autoscaler-v2-plan_calls.md)). Closed
+          by [app-actions-as-viewer-plan.md](plans/app-actions-as-viewer-plan.md):
+          actions run as `<viewer> via app <app>`; in Done under *Ecosystem
+          apps*.
+  - [ ] App-actions-as-viewer follow-ups, found while building it
+        ([plan](plans/app-actions-as-viewer-plan.md) ·
+        [calls](calls/app-actions-as-viewer-plan_calls.md)):
+    - [ ] **The `app.action` event does not name the delegation** (the
+          resource, actions and scope the press handed the app); only the
+          `app_audit` log line does. Add it to the event's meta if audits
+          ask ([calls 15](calls/app-actions-as-viewer-plan_calls.md)).
+    - [ ] **A delegation is reusable by its app for 60 seconds**: the
+          manager tracks no spent assertions. A per-call or single-use
+          check would need a replicated spent set
+          ([calls 5](calls/app-actions-as-viewer-plan_calls.md)).
+    - [ ] **A mixed-version cluster fails viewer-client calls**: an
+          assertion signed by a manager that predates delegation carries
+          none, so the autoscaler's Pause, Resume and Release fail until
+          every manager is upgraded (views are unaffected). Say so in
+          [upgrades.md](../docs/upgrades.md) or keep it in the apps doc's
+          limitations, where it is today.
+    - [ ] **A JWT (SSO) viewer's delegation is not re-checked**: without an
+          ACL token accessor, revoking their access takes effect when the
+          assertion expires (60 seconds), not at once
+          ([calls 4](calls/app-actions-as-viewer-plan_calls.md)).
+    - [ ] **Pages only in the sidebar**: pages in job, task, and node slots
+          are deferred ([calls 82](calls/legion-apps-plan_calls.md)).
+    - [ ] **`PAGE_RPCS` must classify every new page-callable RPC**, or
+          pages can't call it ([calls 80](calls/legion-apps-plan_calls.md)).
+    - [ ] **The UI smoke tests are not in CI** (`npm run test:smoke`
+          needs Playwright and a browser;
+          [calls 84](calls/legion-apps-plan_calls.md)).
+    - [ ] **Fold `ForwardAppRequest` into the reverse proxy's
+          `ProxyTunnel`** when that plan ships, and list it in the
+          worker-plane-auth plan §6.1
+          ([calls 70](calls/legion-apps-plan_calls.md)).
+  - [ ] A6b follow-ups, found while building it:
+    - [ ] **No `legion app set --key`**: an extension key can be renamed
+          only at install ([calls 89](calls/legion-apps-plan_calls.md)).
+    - [ ] **Adopted pending values are not persisted** until the job's next
+          submit ([calls 86](calls/legion-apps-plan_calls.md)).
+    - [ ] **`job plan` and `job validate` skip `requires` and the validate
+          call**, so a plan can pass what the run refuses
+          ([calls 87](calls/legion-apps-plan_calls.md)).
+    - [ ] **`WatchAppExtensions` polls the store per stream** (1s
+          fingerprint, 30s full read); event-driven delivery would cut the
+          cost ([calls 90](calls/legion-apps-plan_calls.md)).
+    - [ ] **No Nickel contract library for app keys**: authors get JSON
+          Schema errors at submit, not Nickel contract errors at eval.
+  - [ ] A6a follow-ups:
+    - [ ] **Free-form maps are not checked**: `resources = { memroy = 512 }`
+          is accepted and blocks the job on a dimension no node offers,
+          rather than failing the submit
+          ([calls entry 60](calls/legion-apps-plan_calls.md),
+          [docs](../docs/jobs-tasks-and-scheduling.md#unknown-fields)).
+    - [ ] **A field missing from its block's `FIELDS` list loses its
+          did-you-mean** unless an example uses it; the check only covers
+          `configs/jobs`
+          ([calls entry 63](calls/legion-apps-plan_calls.md)).
+  - [ ] Left open by the apps hardening after the adversarial security
+        review (the fixed findings are in Done under *Ecosystem apps*;
+        [calls 99-110](calls/legion-apps-plan_calls.md)):
+    - [ ] **Delegations are coarse**: `resource:action` on the pressed
+          context, reusable for 60 s on any RPC that permission gates, so a
+          "Pause" lets the app `ScaleTask(count = 0)` the same job as the
+          viewer. Accepted for now; binding a delegation to RPCs needs a
+          per-RPC permission model
+          ([calls 105](calls/legion-apps-plan_calls.md),
+          [docs](../docs/auth-and-acls.md#delegated-identities)).
+    - [ ] **Views without a permission answer with the app's grant**: a
+          `job`, `task`, or `node` entry may omit `permission`, and then any
+          `app:read` holder can ask for it on any context. Make `job:read`
+          (or `node:read`) on the context the default
+          ([calls 106](calls/legion-apps-plan_calls.md),
+          [docs](../docs/apps.md#who-sees-what)).
+    - [ ] **Viewer-assertion replay is checked by the app only**, in memory
+          per replica; the manager keeps no spent set (see the delegation
+          item above; [docs](../docs/apps.md#the-viewer-assertion)).
+    - [ ] **A grant outlives its granter**: an app's grant, and the bound on
+          its pages' `rpcs`, are checked when someone installs, upgrades,
+          or changes code, never again when that person loses access
+          ([docs](../docs/apps.md#trust-model)).
+    - [ ] **Config `identities` are rendered into every app's job**, and are
+          protected only when the manifest lists `/identities` as a code
+          field (the autoscaler does); make them a code field by rule
+          ([docs](../docs/apps.md#what-legion-renders)).
+    - [ ] **The autoscaler's source settings are not code fields**:
+          `builtin`, `config.url`, `config.headers`, and `namespaces` steer
+          metrics, and so scaling, in every namespace, and make the
+          managers fetch a URL, with only `app:write`
+          ([docs](../docs/autoscaling.md)).
+    - [ ] **The validate call runs before the full submit authorization**:
+          `kv:read` now comes first (calls 99), but the host grant and the
+          band are checked after the app has heard the values
+          ([docs](../docs/apps.md#the-validate-call)).
+    - [ ] **`WatchAppExtensions` and the validate call amplify cost**: every
+          stream polls each second and rescans every value when any job
+          changes, nothing caps streams per app, and each validate call
+          holds a submit up to 2 s. Cap watches per app, share one diff per
+          app, and scan only changed jobs
+          ([calls 90](calls/legion-apps-plan_calls.md)).
+    - [ ] **Schema `pattern`s backtrack** (fancy-regex, capped at 1M steps
+          per match), and values re-validate on every read: refuse
+          lookaround and backreferences at install, or cache validity per
+          schema digest
+          ([docs](../docs/apps.md#values-as-they-read-now)).
+  - [ ] Left open by the apps hardening after the adversarial correctness
+        and operability review (the fixed findings are in Done under
+        *Ecosystem apps*; [calls 111-129](calls/legion-apps-plan_calls.md)):
+    - [ ] **No `legion app rollback`**: the record keeps only the installed
+          manifest, so going back means upgrading to the old file. Keep
+          the previous manifest (and config) on the record and add the
+          verb ([calls 115](calls/legion-apps-plan_calls.md),
+          [docs](../docs/apps.md#upgrading)).
+    - [ ] **The reconciler is one serial loop** that blocks on admission
+          (pin resolution can reach registries): one slow app stalls every
+          other app's pass ([calls 129](calls/legion-apps-plan_calls.md)).
+    - [ ] **Renders depend on the leader's build**: a mixed-version manager
+          set can re-roll every app when leadership moves
+          ([calls 129](calls/legion-apps-plan_calls.md)).
+    - [ ] **Apps have no health of their own**: status reflects allocation
+          health only, and validate calls fail open with warnings buried in
+          submit replies ([calls 129](calls/legion-apps-plan_calls.md)).
+    - [ ] **A keyed action can run twice across a leadership change**: the
+          in-flight key set is the leader's memory
+          ([calls 113](calls/legion-apps-plan_calls.md),
+          [docs](../docs/apps.md#actions)).
+    - [ ] **A held bundled upgrade does not hold the binary**: `legion:self`
+          runs the node's build, so an allocation restarted on an upgraded
+          node runs the new build with the old config until it is set
+          ([calls 120](calls/legion-apps-plan_calls.md),
+          [docs](../docs/apps.md#upgrades-of-bundled-apps)).
+    - [ ] **Git pin failures are classified by stderr text**: a new git
+          wording for a network failure parks the app instead of retrying
+          ([calls 118](calls/legion-apps-plan_calls.md)).
+    - [ ] **An app's job cannot be autoscaled**: `ScaleTask` on it is
+          refused for everyone; scaling an app is `replicas`
+          ([calls 111](calls/legion-apps-plan_calls.md)).
+    - [ ] **A submit's stopped-status clear is a separate write** after the
+          version's compare-and-set entry: an uninstall in between leaves a
+          stamped job running until the next full pass sweeps it
+          ([calls 114](calls/legion-apps-plan_calls.md)).
   - [ ] Deferred: install apps from a registry (waits on a registry plan
         that doesn't exist yet), tenant-owned apps, and pre-approved
         per-namespace grants, so GitOps needn't hold the union of what its
@@ -4418,7 +4595,7 @@ plan.
         equivalent) and extension points beyond job, group, task, volume,
         port, and service (plan §11)
 
-- [ ] **Autoscaler** (v2 plan in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (PLANNED) ·
+- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (SHIPPED; Phases 2, 3, 4, 5b, 6 and 7 in Done, Phase 5a below; open follow-ups here) ·
       [calls](calls/autoscaler-v2-plan_calls.md). Supersedes
       [autoscaler-plan.md](plans/autoscaler-plan.md) ·
       [calls](calls/autoscaler-plan_calls.md), whose Phase 1 shipped and is
@@ -4440,43 +4617,143 @@ plan.
         covers the deny side), and regenerating `ui/src/gen/legion_pb.ts`
         (no UI surface consumes the new RPCs yet; run the ui/README
         protoc command when the scaling panel is built).
-  - [ ] Phase 1: cluster-wide scaling inputs. Per-target usage and edge
-        rollups on the liveness digest, merged by the status-lane leader,
-        `GetScalingInputs`, request-vs-usage in `legion job info` and the job
-        page. Usage is sampled per allocation today, but it lives only on the
-        manager that received the heartbeat.
-  - [ ] Phase 2: task autoscaling MVP as the bundled app (needs apps A1–A3).
-        `autoscale = true` and its expansion in `job plan`; layered,
-        live-resolved defaults (cluster `legion scaling defaults`,
-        namespace-policy `autoscale`, the task), with provenance in
-        `scaling explain --policy`; in-place resubmits for `autoscale`/`count`
-        changes; the safeguard
-        pipeline, compare-and-set `ScaleTask`, `scale_history`, pins
-        (`job scale --for/--min/--max/--release`), `legion scaling
-        status|explain|history|pause|resume`, `dry-run`, events, MCP read tools
-  - [ ] Phase 3: full policies. `checks`, `prometheus`/`http` sources, the
-        `per-replica`/`threshold`/`pass-through`/`fixed` strategies,
-        schedules, `headroom`, activation-gated `min = 0`, `legion scaling
-        simulate`
-  - [ ] Phase 4: external plugins (JSON-RPC over stdio or HTTP) installed
-        through app config, the `exec`/`noop` targets, `legion scaling plugin
-        test`, the SDK and example plugins, and standalone `ScalingPolicy`
-        objects for external targets
-  - [ ] Phase 5: node autoscaling. `GetCapacityDemand` (pending work
-        simulated on node-group templates), join tokens with `max_uses` and
-        `attributes`, `legion join --attr`, drain → terminate → `ForgetNode`
-        with budgets and protections, and a first-party `aws-asg` plugin
-  - [ ] Phase 6: autoscaler UI as app extensions (needs apps A4)
-  - [ ] Phase 7: sharded replicas (shard leases, rebalancing) and a
-        10,000-policy load test
-  - [ ] **Hardening:** `GetJobScaleStatus` reports
-        `override_count.unwrap_or(spec)` without the `base_count` filter that
-        `effective_task_count` applies (`src/manager/server.rs:6250`). This
-        can't be reached today, because submit arbitration deletes a
-        mismatched override in the same transaction
-        (`store.rs:10838-10850`). Pins and autoscale-aware arbitration add
-        new override states, so v2 Phase 1 routes status through
-        `effective_task_count`.
+  - [x] Phase 1: cluster-wide scaling inputs (2026-10-28,
+        [docs/autoscaling.md](../docs/autoscaling.md#scaling-inputs)).
+        Per-(node, task) usage and edge rollups sent every 10s on their own
+        `ReportNodeLiveness` call (delta-encoded, full resync on takeover),
+        merged at the status-lane leader with an hour of history;
+        `GetScalingInputs` (`scale:read`, forwarded to the leader);
+        request-vs-usage in `legion job info`, MCP `legion_job_info` and the
+        job page; `GetJobScaleStatus` reads through `effective_task_count`.
+        Calls 29–36. Not done: release-profile numbers for the rollup
+        benchmark (debug-profile numbers are in the calls doc), and "warming"
+        replicas and the override version, which Phase 2 adds.
+  - [x] Engine core (2026-10-28): `src/autoscaler/` — the `autoscale` spec,
+        layered defaults with provenance and digests, strategies, schedules
+        (5-field crontab, IANA time zones via `chrono-tz`), the safeguard
+        pipeline, and the simulator; pure and unit-tested, not yet wired to
+        the jobspec or an app. Calls 20–28.
+  - [x] Phase 2: task autoscaling MVP as the bundled app (2026-10-28; in
+        Done, under *Ecosystem apps*). It also runs `checks` on the `legion`
+        source, every built-in strategy, schedules, `headroom`, `scaleIn`,
+        and `onMissing` ([calls 38](calls/autoscaler-v2-plan_calls.md)).
+  - [ ] Phase 2 follow-ups, found while building it:
+    - [ ] **The quota stage is the write's refusal**: the app passes the
+          engine no quota headroom, so near a namespace quota a target holds
+          (`held`, with the quota's message) instead of filling to exactly
+          what fits ([calls 48](calls/autoscaler-v2-plan_calls.md)).
+    - [ ] **No `/metrics` on the app** (plan §6.6:
+          `legion_autoscaler_evaluations_total{result}`,
+          `..._actions_total{direction,source}`, `..._desired{target}`) and
+          no per-evaluation span fields beyond the tick's.
+    - [ ] **Warmup is derived from rises in the ready count**, not
+          per-replica ready times, and a warming replica's usage still
+          enters the mean ([calls 50](calls/autoscaler-v2-plan_calls.md));
+          `GetScalingInputs` could carry per-replica ready times.
+    - [ ] **`WatchScalingPolicies` re-resolves and re-sends every policy on
+          any change** (a 1s fingerprint poll, no deltas, no shard filter;
+          [calls 46](calls/autoscaler-v2-plan_calls.md)). Fine at hundreds;
+          Phase 7 needs deltas and shards.
+    - [ ] **An `autoscale` edit during a rollout restarts the rollout**
+          instead of applying in place
+          ([calls 47](calls/autoscaler-v2-plan_calls.md)).
+    - [ ] **Cluster scaling defaults keep no version history**: only the
+          current record and its version; a history row's digest still
+          resolves to the exact policy through `scaling_policy_snapshot`.
+  - [x] Phase 3: full policies (2026-10-28; in Done, under *Ecosystem
+        apps*): the `prometheus` and `http` sources, activation-gated
+        `min = 0`, `legion scaling simulate` ([calls 65, 72-74](calls/autoscaler-v2-plan_calls.md)).
+  - [x] Phase 4: external plugins and standalone policies (2026-10-28; in
+        Done, under *Ecosystem apps*; [calls 63-64, 66-71, 75-81](calls/autoscaler-v2-plan_calls.md)).
+  - [ ] Phase 3 and 4 follow-ups, found while building them:
+    - [ ] **One request at a time per plugin program**: a slow program
+          plugin serializes every policy that uses it. `concurrency` caps a
+          plugin's calls in flight (Phase 7), but a program stays at 1;
+          multiplexing requests by id is open (serving it over `url` is the
+          way out today; [calls 67, 100](calls/autoscaler-v2-plan_calls.md)).
+    - [ ] **`app config set autoscaler` does not list the policies a plugin
+          change breaks**: removing a plugin, or narrowing its `namespaces`,
+          turns the policies that use it `invalid` at the next push instead
+          of being refused or warned about, as `scaling defaults apply`
+          does ([calls 70](calls/autoscaler-v2-plan_calls.md)).
+    - [ ] **No secret references in plugin config**: a Prometheus
+          `Authorization` header or an API key sits in the app config as
+          written, readable with `app:read` (docs/autoscaling.md, "Known
+          limitations"); needs a reference into the KV store or a secret
+          mechanism for app config.
+    - [ ] **Simulation sees only Legion's own history**: checks on other
+          sources and plugin strategies read as missing over history, and
+          pins, pauses, rollouts and quotas are not replayed
+          (`autoscaler::simulate`); recording external readings in the
+          history would close it.
+    - [ ] **History counts cost a store read per autoscaled job per 10s**
+          on the status-lane leader (`autoscaled_replica_counts`), and
+          history points hold `f32`s, so replay parity is exact only while
+          readings survive that precision; measure at Phase 7's 10,000
+          policies.
+    - [ ] **No metrics for plugin calls** (latency, failures, restarts per
+          plugin); only the app's logs carry them.
+    - [ ] **The `noop` target keeps its count in memory** and restarts at
+          `min` ([calls 77](calls/autoscaler-v2-plan_calls.md)).
+  - [ ] Phase 5: node autoscaling.
+    - [x] Phase 5a, the substrate (2026-10-28,
+          [docs/autoscaling.md](../docs/autoscaling.md#capacity-demand),
+          [architecture-managers-workers.md](../docs/architecture-managers-workers.md),
+          [calls 51-62](calls/autoscaler-v2-plan_calls.md)): join tokens
+          with `max_uses` and `attributes`, `legion join --attr`
+          (`legion.provider-id`), `ForgetNode` and `legion node forget`
+          (revokes the node token), `GetCapacityDemand` and
+          `legion scaling demand` (pending work packed onto node-group
+          templates with the scheduler's feasibility functions), and the
+          pure node-group engine (`src/autoscaler/nodes.rs`: spec, victims
+          and protections, budgets, the drain state machine, least-waste)
+    - [x] Phase 5b: node groups run by the autoscaler app (2026-10-28; in
+          Done)
+    - [ ] Lost-node GC: forgetting nodes that stayed lost past a deadline
+          (`legion node forget` is the manual path today; a node group's
+          lost member is never a scale-in victim, so it lingers until
+          forgotten by hand)
+    - [ ] **The fits-elsewhere simulation ignores static ports** held on
+          the other members, and the minAvailable check is per node (two
+          victims of one task in one evaluation are not summed); the
+          scheduler still enforces both when the drained work is placed
+          ([calls 90](calls/autoscaler-v2-plan_calls.md))
+    - [ ] **A node group's scale-in clocks are in the app's memory**: after
+          a restart a member must be seen empty for a whole `down.for`
+          again (drains in flight survive in the action row)
+    - [ ] **Consolidation**: moving work off a node that is not
+          underutilized to empty it; node groups only scale in nodes that
+          are empty or whose work fits elsewhere today
+    - [ ] **The `aws-asg` plugin has no release artifact**: operators build
+          it (`cargo build --release` in `plugins/scaling/aws-asg/`) and
+          host the tarball themselves; publishing it with Legion's
+          releases is open
+  - [x] Phase 6: the autoscaler's UI as app views (2026-10-28; in Done)
+  - [ ] Phase 6 follow-ups: the job panel's series is the app's in-memory
+        evaluation log, empty after a restart and per replica
+        ([calls 82](calls/autoscaler-v2-plan_calls.md))
+  - [x] Phase 7: sharded replicas and a 10,000-policy load test
+        (2026-10-28; in Done)
+  - [ ] **The policy watch re-resolves every policy on any change**, per
+        watching replica: deltas and the shard filter save the wire and
+        the app, not the manager's resolution (calls 98)
+  - [ ] **A shard that moves loses its windows**: the new owner holds
+        scale-in for one `down.stabilize` while they refill; handing the
+        windows over with the shard is open
+  - [ ] **`GetScalingInputs` reads the store per job** (about 0.7 ms each
+        in a release build): it is 7 of the 7.7 seconds a 10,000-policy
+        tick takes (docs/benchmarks.md); one batched read across jobs would
+        give a single replica much more headroom
+  - [ ] **A replica's status report is one request**: ~11 MB at 10,000
+        targets with every decision changed, under the manager's 64 MiB
+        limit; splitting it into parts (as the policy watch's `more` does)
+        would lift the ~50,000-targets-per-replica ceiling
+  - [ ] **The load test is in process** (calls 101): a run on the AWS rig,
+        with the app on a manager's system worker and real workers'
+        heartbeats, is open
+  - [x] **Hardening:** `GetJobScaleStatus` reports through
+        `effective_task_count` (done in Phase 1), which pins and the
+        autoscale-aware arbitration (Phase 2) rely on.
   - [ ] Deferred from v2 (plan §4, §8): waking a `service` from zero on
         the first request (needs the gateway to route to services),
         `service.concurrency` once netd attributes ingress requests, keyed
@@ -6085,6 +6362,454 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       [docs](../docs/workload-identity.md#forks-and-snapshots)). Offline
       verifiers (AWS, GCP, Vault) cannot see the epoch, and login-minted ACL
       tokens are still open (Task runtimes, Phase 6 follow-ups).
+- [x] Workload identity on by default (2026-10-28,
+      [autoscaler calls 37](calls/autoscaler-v2-plan_calls.md) ·
+      [docs](../docs/workload-identity.md#manager-configuration)): the
+      issuer, its first key, the `legion` control-plane method, and the
+      discovery/JWKS routes need no configuration, so apps and API sockets
+      hold credentials on a fresh cluster; `enabled = false` opts out.
+      Federation still needs an explicit public `issuer`.
+
+## Ecosystem apps
+
+- [x] **Autoscaler Phase 2: task autoscaling as the bundled app**
+      (2026-10-28, [plan](plans/autoscaler-v2-plan.md) §6.3-§6.6, §8 ·
+      [calls 37-50](calls/autoscaler-v2-plan_calls.md) · docs:
+      [autoscaling.md](../docs/autoscaling.md),
+      [apps.md](../docs/apps.md),
+      [agent-readiness.md](../docs/agent-readiness.md),
+      [event-stream.md](../docs/event-stream.md))
+  - [x] The `autoscale` jobspec field (core, in `FIELDS`, stored as written,
+        JSON schema, `maximal.ncl`), validated at submit (bounds against
+        `count`, usage-capable runtime, groups, gang quorum, keyed,
+        `count.per`, batch, sources and the `legion` vocabulary; `min = 0`
+        refused); `legion job plan` prints the effective record and summary
+  - [x] Layered defaults resolved live: `ApplyScalingDefaults` (dry run,
+        force, idempotency) / `GetScalingDefaults` with provenance,
+        namespace-policy `autoscale` (with `--force` on `namespace policy
+        apply`), `scaling_policy_snapshot` so history digests resolve
+  - [x] In-place resubmits for `autoscale`/`count` changes, and the
+        autoscale-aware submit arbitration (keep, rebase, clamp)
+  - [x] `ScaleTask` gains compare-and-set versions (a Control counter),
+        decisions, `source`, pins (`--for/--min/--max/--release`), group
+        targets in one write, server-side pause and pin refusals;
+        `scale_history` (capped, `applied`, digests) and `scaling_pause`
+  - [x] `WatchScalingPolicies`, `ReportScalingStatus` and
+        `RecordScalingAction` (app-plane), `GetScalingStatus` (NOT RUNNING
+        after three intervals), `GetScaleHistory`, `PauseScaling`; ACL rows
+        in `acl_endpoints.rs`
+  - [x] The bundled app's engine loop: watch, batched inputs, the full
+        safeguard pipeline, CAS writes, dry-run "would" rows, events
+        (`scale.limited|flapping|check_failed|pinned|paused|resumed`); its
+        grant trimmed to `scale:read/write`; app config `interval`, `mode`
+  - [x] Workload identity on by default (see *Workload identity*)
+  - [x] CLI `legion scaling status|explain [--policy]|history|pause|resume|
+        defaults get|apply`, capability entries, MCP `legion_scaling_status`,
+        `legion_scaling_explain`, `legion_scaling_history`,
+        `legion_scaling_pause`
+  - [x] Tests: store (CAS, versions across delete/recreate, history cap,
+        pauses and pins, group writes), resolution and validation tables,
+        `tests/integration/autoscaler.rs` (S1 end to end, in-place
+        resubmits, CAS and `--all` pause, dry-run, live defaults, NOT
+        RUNNING, and the real binary's app on a fresh cluster)
+
+- [x] **Autoscaler Phase 3: external sources, scale to zero, simulate**
+      (2026-10-28, [plan](plans/autoscaler-v2-plan.md) §6.5, §6.12, §8 ·
+      [calls 65, 72-74](calls/autoscaler-v2-plan_calls.md) · docs:
+      [autoscaling.md](../docs/autoscaling.md#sources),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] The `prometheus` source (instant query, or a range over the
+        check's window, averaged) and the `http` source (GET, a JSON
+        pointer), installed in the autoscaler's app config with a
+        `namespaces` allowlist; each distinct `(source, query, window)` read
+        once per evaluation
+  - [x] `min = 0` with `activation`: the wake rule at submit, idle through
+        the scale-in path, waking from zero on an activation check
+  - [x] History points carry desired, healthy and unplaced counts;
+        `legion scaling simulate` (replay and follow, warm or cold, CSV
+        series, standalone policy files), MCP `legion_scaling_simulate`
+  - [x] Tests: source unit tests and fake Prometheus/HTTP servers, the
+        scale-to-zero cycle, and the acceptance test that a replay of the
+        live policy matches the live engine's decisions
+        (`tests/integration/autoscaler.rs`)
+  - Deferred: `wake = "on-request"` (in *Deferred from v2* above)
+
+- [x] **Autoscaler Phase 7: sharded replicas** (2026-10-28,
+      [plan](plans/autoscaler-v2-plan.md) §6.9, §8 ·
+      [calls 95-102](calls/autoscaler-v2-plan_calls.md) · docs:
+      [autoscaling.md](../docs/autoscaling.md#replicas),
+      [benchmarks.md](../docs/benchmarks.md#the-autoscaler-at-10000-policies),
+      [apps.md](../docs/apps.md), [kv-store.md](../docs/kv-store.md))
+  - [x] 64 shards (FNV-1a of the target's key; every node group in one),
+        membership and shard leases as KV locks under
+        `legion/apps/autoscaler/` (15s TTL, renewed every 5s), up to
+        `ceil(64 / live)` each, a lone replica on one `shards/all` lease,
+        rebalancing on join and death; `legion app set autoscaler
+        --replicas 3`; the app's grant gains `kv` on its reserved prefix
+  - [x] `WatchScalingPolicies` deltas (`full`, `removed`, `more` parts of
+        at most 1,000) and the shard filter; the app restarts its watch
+        when its shards change; `ListKv` `include_locks` (lock ids redacted)
+  - [x] Per-plugin `concurrency` caps (default 8, 1 for a program plugin);
+        identical source queries were already asked once per evaluation
+  - [x] The status board per replica: `ScalingAppStatus.replicas`,
+        `ScalingTargetStatus.instance`, NOT RUNNING only when no replica
+        reports
+  - [x] Tests: rebalance after a replica dies, one `ScaleTask` and one
+        `target/scale` per decision under a forced overlap, the delta and
+        shard-filtered watch, and the opt-in 10,000-policy load test with
+        its numbers in docs/benchmarks.md (7.7s median tick, release build)
+  - [x] Found by the load test: an index on `task_config(job_id)` (the
+        batched inputs scanned every task config per job), and the policy
+        watch's first set split into parts under gRPC's 4 MiB limit
+- [x] **Autoscaler Phase 5b: node groups run by the autoscaler app**
+      (2026-10-28, [plan](plans/autoscaler-v2-plan.md) §6.9, §6.11, §8 ·
+      [calls 85-94](calls/autoscaler-v2-plan_calls.md) · docs:
+      [autoscaling.md](../docs/autoscaling.md#node-groups),
+      [autoscaling-plugins.md](../docs/autoscaling-plugins.md#node-group-targets),
+      [apps.md](../docs/apps.md), [event-stream.md](../docs/event-stream.md),
+      [auth-and-acls.md](../docs/auth-and-acls.md),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] Node-group `ScalingPolicy` objects (`kind = nodes`, cluster-scoped)
+        through `legion scaling apply|list|delete|explain|history|pause`;
+        `operator:write` and `node:write` to write, `node:read` to read; a
+        bare name shared with `default`'s policies is refused
+        ([calls 91](calls/autoscaler-v2-plan_calls.md); lifts
+        [calls 69](calls/autoscaler-v2-plan_calls.md))
+  - [x] The app runs them: one `GetCapacityDemand` per evaluation with every
+        group's members, `nodes::decide` and the drain machine, a join
+        token per scale-up (`max_uses`, `legion.nodegroup`, TTL twice
+        `joinTimeout`), `target/scale` with `join`, drain → `target/terminate`
+        → `ForgetNode`, the join-timeout backoff, and the
+        `nodegroup.pending|join_timeout|scale_in` events
+        ([calls 92, 94](calls/autoscaler-v2-plan_calls.md))
+  - [x] Compare-and-set action intents: `RecordScalingAction` `intent` /
+        `outcome` on a Control-lane `scaling_action` row per policy (external
+        targets too), refused while paused, reconciled after 150 seconds
+        ([calls 85-87](calls/autoscaler-v2-plan_calls.md))
+  - [x] The deferred engine inputs: the fits-elsewhere simulation,
+        `disruption.minAvailable` (and gang quorum), and the provider-id
+        cross-check ([calls 88-90](calls/autoscaler-v2-plan_calls.md))
+  - [x] `PluginHost.terminate`, `capabilities.nodes` required of a node
+        target, `exec` target `terminate`, the node-group panel's policy state
+  - [x] The first-party `aws-asg` plugin (`plugins/scaling/aws-asg/`):
+        SigV4 by hand, STS web identity / IMDSv2 / environment credentials,
+        the join token through SSM, tests against AWS's published vectors and
+        a mock AWS ([calls 93](calls/autoscaler-v2-plan_calls.md)); the app's
+        `identities` config for keyless credentials
+- [x] **Autoscaler Phase 6: the autoscaler's UI as app views** (2026-10-28,
+      [plan](plans/autoscaler-v2-plan.md) §6.14, §8 ·
+      [calls 82-84](calls/autoscaler-v2-plan_calls.md) · docs:
+      [autoscaling.md](../docs/autoscaling.md#in-the-ui))
+  - [x] The Autoscaling sidebar page (filtered by the viewer's
+        namespaces), the job panel (now/want/bounds, an hour of replicas
+        against the signal, history, Pause/Resume/Release), the task badge
+        (`auto 6 · 2..8`), and the node-group panel; rendered by the SPA,
+        `legion app view autoscaler …`, and `legion_app_view`
+- [x] **Autoscaler Phase 4: plugins and standalone policies** (2026-10-28,
+      [plan](plans/autoscaler-v2-plan.md) §6.2, §6.7, §6.13, §8 ·
+      [calls 63-64, 66-71, 75-81](calls/autoscaler-v2-plan_calls.md) ·
+      docs: [autoscaling.md](../docs/autoscaling.md#plugins),
+      [autoscaling-plugins.md](../docs/autoscaling-plugins.md),
+      [apps.md](../docs/apps.md), [auth-and-acls.md](../docs/auth-and-acls.md),
+      [event-stream.md](../docs/event-stream.md),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] The `legion-scaling/1` protocol (JSON-RPC 2.0 over stdio or HTTP
+        POST): `initialize` with `policyConfigSchema`, `source/query`,
+        `strategy/recommend`, `target/status|scale|terminate`; timeouts
+        (10s, 120s for targets), restart with backoff, redacted call logs
+  - [x] Plugins installed through the autoscaler's app config (`builtin`,
+        `source`+`checksum`+`command`, `command`, `url`; `config`,
+        `namespaces`; code fields), checked at submit and apply against the
+        install and the allowlist; strategy plugins by name
+  - [x] The `exec` and `noop` targets
+  - [x] Standalone policies: the Control-lane `scaling_policy` table,
+        `ApplyScalingPolicy` (dry run with diff, idempotency),
+        `DeleteScalingPolicy`, `ListScalingPolicies`, served on
+        `WatchScalingPolicies`; status, history, pause and events by
+        `policy`; CLI `legion scaling apply [--dry-run] [--wait]|list|
+        delete` and `--standalone` on `explain|history|pause|resume`;
+        MCP `legion_scaling_apply`; capability entries; ACL rows
+  - [x] `legion scaling plugin test`, the conformance suite
+  - [x] The Rust SDK crate `legion-scaling-plugin` and example plugins
+        (Python strategy, Go source and target, Rust strategy) in
+        `examples/scaling-plugins/`
+  - [x] Tests: protocol, host and builtin unit tests;
+        `tests/integration/scaling_plugins.rs` (conformance of every
+        example and of broken fixtures, the built-in sources, a Python
+        strategy installed through app config driving a task, a standalone
+        `exec` policy applied, run, paused and deleted); ACL scoping in
+        `acl_endpoints.rs`; `configs/scaling/` examples validated
+  - Deferred: node-group policies at `scaling apply` (Phase 5b), per-plugin
+    concurrency (follow-ups above)
+
+- [x] **Legion apps A1: places to run** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §8 ·
+      [calls](calls/legion-apps-plan_calls.md) · docs:
+      [namespaces.md](../docs/namespaces.md#reserved-namespaces),
+      [architecture-managers-workers.md](../docs/architecture-managers-workers.md#the-system-worker),
+      [auth-and-acls.md](../docs/auth-and-acls.md#policies))
+  - [x] The `legion-system` namespace, created by the first control leader of
+        an empty store with its namespace policy (`pools.default =
+        "legion-system"`), and undeletable
+  - [x] The reserved-prefix glob rule: allow-rule `namespaces` globs skip
+        `legion-*` and `paths` globs skip `legion/` unless the pattern names
+        the prefix; namespace-policy selectors and node lists follow it;
+        denials inside reserved names say why
+  - [x] Node-side `namespaces` on worker types, checked in the candidate
+        filter, the apply recheck and the blocked-eval wake match, and named
+        in placement failures (`N nodes accept only namespaces [...]`)
+  - [x] A default-on system worker per manager (`systemWorker`): pool and
+        type `legion-system`, `legion.role = "manager"`, the lend as its
+        capacity and its cgroup parent's `cpu.max`/`memory.max`, its own port
+        (4849) and state directory, started on followers too; `--run-worker`
+        reshaped as `namespaces = ["*", "legion-*"]` with no cap
+  - [x] No root `exec` tasks and no privilege-floor opt-out containers in
+        reserved namespaces
+  - [x] A node's `namespaces` and `legion.role` are pinned at registration
+        from the join token (a manager's own worker), its worker type, or
+        the node's record, never taken from what the worker reports
+        (shipped with A2, [calls entry 32](calls/legion-apps-plan_calls.md),
+        [docs](../docs/namespaces.md#known-limitations))
+- [x] **Legion apps A2: identity that just works** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §6.4, §8 ·
+      [calls 29-41](calls/legion-apps-plan_calls.md) · docs:
+      [workload-identity.md](../docs/workload-identity.md#control-plane-identity),
+      [auth-and-acls.md](../docs/auth-and-acls.md#job-grants),
+      [agent-readiness.md](../docs/agent-readiness.md#agents-that-run-as-legion-jobs))
+  - [x] `permissions` (inline rules) and `policies` (names) on the reserved
+        `legion` identity, in `configs/jobs/maximal.ncl`
+  - [x] The grant check on every path that stores a job config (`RunJob`,
+        `RunJobTemplate`), on every submit: string-glob coverage, reserved
+        prefixes first, deny rules needing `acl:write`, management tokens
+        passing, with the documented error
+  - [x] Per-version, per-task grants in the Control-lane `job_grant` table;
+        the `legion` auth method resolves them through a `grant:alloc/<id>`
+        reference, keyed by canonical job id; KV re-renders carry an
+        unchanged grant forward
+  - [x] `ListGrants`/`RevokeGrant` RPCs, `legion acl grants list|revoke`,
+        capabilities entries, the `legion_acl_grants_list` MCP tool;
+        revocation applies at the next verification, login tokens included
+  - [x] The per-allocation API socket (`$LEGION_SECRETS_DIR/legion.sock`),
+        proxied over the worker's manager channel with failover, attaching
+        the allocation's current token; `SO_PEERCRED` plus cgroup-leaf check
+        where leaves are guaranteed, file modes elsewhere
+  - [x] Ambient `LEGION_ADDR=unix://…`, `LEGION_SECRETS_DIR`,
+        `LEGION_IDENTITY_TOKEN_FILE`; `unix://` in the CLI and Rust client;
+        `legion login` never writes over the identity token file
+  - [x] `configs/jobs/cert-renewer.ncl` rewritten on `permissions` and the
+        socket: no manager-config binding, no hard-coded address
+- [x] **Legion apps A3: apps** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §6.1-§6.3, §8 ·
+      [calls 42-57](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md),
+      [auth-and-acls.md](../docs/auth-and-acls.md#app-grants),
+      [event-stream.md](../docs/event-stream.md),
+      [metrics.md](../docs/metrics.md#apps))
+  - [x] App manifests (Nickel or JSON, unknown fields refused; JSON Schema
+        draft 7 config with local refs only; `codeFields`), and Control-lane
+        app records with the grant, settings, config, and the reconciler's
+        status; `configs/apps/example-app.ncl`
+  - [x] The app reconciler on the Control leader: renders each app's job
+        (placement table, replicas, `appUser`, the `legion` identity with
+        the recorded grant, the config file, code-field artifacts), stamps
+        `managedBy = { app, digest }` (kept by KV re-renders, cleared by any
+        other submit), resubmits on drift or a stopped job, stops disabled
+        apps, keys submits `app:<name>:<digest>:<from>`, coalesces bursts,
+        backs off 5s-5m, parks refusals until the next change; triggers on
+        app writes, job and node events, leadership, and a 60s full pass
+  - [x] `legion:self` in the exec runtime, and `legion app run` (config,
+        `/healthz`, signals) with the bundled `autoscaler` app (its engine
+        is Phase 2 of the autoscaler plan)
+  - [x] Workers report `buildId` (a hash of their executable); bundled apps
+        roll once their eligible nodes agree on a (`buildVersion`,
+        `buildId`) marker, with a `version_matches` constraint and a
+        straggler status; new bundled manifests adopted only when the leader
+        runs the marker's build, their permissions granted by
+        `legion:bootstrap`
+  - [x] Seeding of bundled apps by the first Control leader, with the
+        manager config's seed-only `apps` block
+  - [x] The `app` ACL resource (`names` selector); `ListApps`, `GetApp`,
+        `InstallApp`, `UpgradeApp` (permission diff, approval),
+        `UninstallApp`, `SetAppEnabled`, `UpdateAppSettings`, `SetAppConfig`
+        (code-field changes need the grant), idempotency keys on every write
+  - [x] `legion app list|status|logs|config get|set|schema|set|enable|
+        disable|install|upgrade|uninstall|run`, install from a file or URL
+        with the permission prompt; the `job info` banner for managed jobs
+  - [x] App events (`app.installed|upgraded|uninstalled|enabled|disabled|
+        config_changed|reconciled|reconcile_failed`), `legion_apps{status}`,
+        the `legion_app_list` and `legion_app_status` MCP tools, capability
+        entries
+- [x] **Legion apps A4: UI tier 1** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §6.5, §8 ·
+      [calls 68-79](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md#views-and-actions),
+      [ui-architecture.md](../docs/ui-architecture.md),
+      [auth-and-acls.md](../docs/auth-and-acls.md),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] The typed manifest `ui` block (slots `nav`, `overview`, `job`,
+        `task`, `node`; actions with typed inputs and permissions) and the
+        closed `legion-view/1` block set with its validator
+  - [x] `ListUiExtensions`, `GetAppView`, `InvokeAppAction` (as the viewer,
+        idempotency keys, `app.action` events), the signed viewer assertion,
+        and the worker-plane forward `ForwardAppRequest`
+  - [x] The app framework's views, actions and assertion verification
+        (`AppContext::view`/`action`), `legion app view`, `legion_app_view`
+  - [x] SPA slot outlets: the Apps sidebar section and app pages, homepage
+        cards, job/task/node panels, task badges
+- [x] **Legion apps A5: sandboxed pages** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §6.5, §8 ·
+      [calls 80-84](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md), [ui-architecture.md](../docs/ui-architecture.md))
+  - [x] `ui.pages` and `GetAppPage`; pages as sidebar entries
+  - [x] The `srcdoc` iframe host (`sandbox="allow-scripts"`, the plan's
+        CSP), the `postMessage` bridge (`legion.call|view|action|navigate`)
+        with the `PAGE_RPCS` allowlist re-checked by the manager and an
+        SPA-owned confirmation for every write
+  - [x] Playwright smoke tests (`npm run test:smoke` in `ui/`)
+- [x] **App actions run as the viewer** (2026-10-29,
+      [plan](plans/app-actions-as-viewer-plan.md) ·
+      [calls](calls/app-actions-as-viewer-plan_calls.md) · docs:
+      [auth-and-acls.md](../docs/auth-and-acls.md#delegated-identities),
+      [apps.md](../docs/apps.md#acting-as-the-viewer),
+      [autoscaling.md](../docs/autoscaling.md#in-the-ui),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] A `delegation` on an action's viewer assertion: the declared
+        permission, `read` on the same resource when the viewer holds it,
+        the exact scope checked
+  - [x] `legion-on-behalf-of`: the app presents the assertion beside its
+        own credential, and the manager authenticates the call as
+        `<viewer> via app <app>` (one synthesized rule, intersected with
+        the app's grant, both parties' deny rules; only that app may
+        present it; the viewer's token re-resolved per call; streams and
+        the app plane refuse it; `WhoAmI` reports `delegated`)
+  - [x] The framework's `ActionRequest::client_as_viewer` and
+        `ManagerConnection`; the autoscaler's Pause, Resume and Release
+        recorded by the viewer, the `by <viewer>` reason gone
+- [x] **Legion apps A6b: jobspec extensions** (2026-10-29,
+      [plan](plans/legion-apps-plan.md) §6.6, §8 ·
+      [calls 85-94](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md#jobspec-extensions),
+      [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#extension-keys),
+      [agent-readiness.md](../docs/agent-readiness.md),
+      [upgrades.md](../docs/upgrades.md))
+  - [x] Manifest `extensions[]` (point, key, schema, examples, `validate`,
+        `requires`) at the job, group, task, volume, port and service
+        points; keys resolved at submit with the `apps.<app>` spelling and
+        did-you-mean over installed keys; JSON Schema draft 7 with local
+        `$ref`s only and defaults filled on read
+  - [x] Collisions refused at install (core fields, other apps), `--key`
+        renames, shadowed-key detection; `requires` as the submitter; the
+        fail-open validate call over the app forward
+  - [x] `GetJobSchema` (`legion job schema`, `job validate`,
+        `legion_job_schema`), `WatchAppExtensions`, values in `job info`
+        and `job plan`, `legion app extensions`; pending values adopted on
+        install; upgrade re-validation; `uninstall --force` leaving values
+        orphaned
+  - [x] Extension-only resubmits move allocations in place (same ids, no
+        rollout)
+- [x] **Apps hardening after an adversarial security review** (2026-10-29,
+      [#60](https://github.com/mikenomitch/legion/pull/60) ·
+      [calls 99-110](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md#trust-model),
+      [auth-and-acls.md](../docs/auth-and-acls.md#kv-references-in-a-job),
+      [namespaces.md](../docs/namespaces.md#reserved-namespaces))
+  - [x] Every KV reference (core field, extension value, pending key,
+        `kvInjections`) needs `kv:read`, checked before any is resolved, so
+        none reaches a plan, a stored version, an error, or an app's
+        validate call
+  - [x] No host-level construct in an app's job (exec health checks,
+        `file://` artifacts, `auth.nodeIdentity`, and an exec task's files
+        at host paths, own cgroup, or negative OOM score are refused in
+        `legion-system` for everyone, and install, upgrade and config
+        changes check the render); the reconciler holds no `host` grant
+  - [x] Each app runs as its own uid (`1900000000` up, on the record);
+        manifests may not name `user`; `systemWorker.appUser` removed
+  - [x] A page's `rpcs` need the installer to hold their permissions
+        everywhere; ACL, token, grant and app writes and key rotations are
+        no longer page-callable
+  - [x] Default filling is bounded, and schemas that loop on one value
+        (which crashed the validator) are refused
+  - [x] Changing an app's placement or pool, or installing one placed
+        elsewhere than `managers`, needs `operator:write`
+  - [x] The bridge confirms the decoded message, refuses a field spelled
+        both ways, and arms "Run as me" after 500 ms
+  - [x] The page guard answers every refusal alike before authentication
+  - [x] Install takes over no `legion-system` job; an app's identity and
+        its forwarded requests need the reconciler's `managedBy` stamp
+  - [x] Idempotency scopes include how the caller authenticated
+- [x] **Apps hardening after an adversarial correctness and operability
+      review** (2026-10-29,
+      [#60](https://github.com/mikenomitch/legion/pull/60) ·
+      [calls 111-129](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md#editing-an-apps-job),
+      [autoscaling.md](../docs/autoscaling.md#no-duplicate-actions),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] An app action runs once wherever it lands: actions run on the
+        Control leader (a follower refuses before forwarding), and a keyed
+        duplicate waits for the first and gets its reply
+  - [x] The reconciler's submit is compare-and-set on the app record, and a
+        job stamped for an app with no record is stopped and revoked
+  - [x] One app record that does not decode breaks nothing else: rows
+        decode one at a time, stored records read leniently, the bad one is
+        `corrupt` in the list and status, and uninstall removes it by name
+  - [x] Status counts only the job's latest version (`upgrading`,
+        `upgrade failing`), and `app enable` or a same-manifest upgrade
+        resubmits a job not healthy at its version
+  - [x] A failed app job is restarted with backoff, and status says why
+  - [x] Direct writes to an installed app's job (run, plan, scale, stop,
+        destroy, stop-rollout) are refused, superseding reverting
+  - [x] A pin whose source cannot be reached is `UNAVAILABLE` and retried;
+        a bad reference is still a refusal
+  - [x] Bundled apps agree on a marker on mixed-architecture fleets, and
+        adopt on the version
+  - [x] A bundled upgrade whose schema refuses the stored config is held,
+        reported, and released by a matching `config set`
+  - [x] An upgrade that drops an extension point jobs use needs `--force`;
+        the prompt reports orphaned values apart
+  - [x] Install, upgrade, `config set` and `set` run the job's admission
+        chain first
+  - [x] The reconciler forgets its runtime on acquiring leadership, and a
+        current job is never parked
+  - [x] `uninstall --purge` deletes the app's KV; installs are told about
+        leftovers
+  - [x] Install and uninstall record their idempotency key in the same
+        entry, and uninstall's retry returns the whole first reply
+  - [x] A node-group intent is acted on for at most 120 seconds
+  - [x] Validate calls are asked on the Control leader, and a short answer
+        warns
+  - [x] `--dry-run` on `set`, `config set`, `enable`, `disable`,
+        `uninstall`; `upgrade --dry-run -j` reports `uncovered` and
+        `orphanedJobs`, and the CLI refuses before asking
+  - [x] Docs: an upgrade keeps operator settings (and says so), and the
+        lease cost of several autoscaler replicas
+- [x] **Legion apps A1 follow-ups** (2026-10-29,
+      [calls 95-97](calls/legion-apps-plan_calls.md))
+  - [x] The host guard's `nftables` table and BPF pin directory are named
+        after the worker's cgroup parent, so a system worker and a
+        standalone worker on one host stop overwriting each other
+  - [x] `*` pool globs no longer reach reserved `legion-` pools
+  - [x] `pools.default` takes a list; `legion-system` defaults to
+        `["legion-system", "default"]`, so its jobs place on a
+        `--run-worker` dev cluster
+- [x] **Legion apps A6a: strict jobspec fields** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §6.6, §8 ·
+      [calls 58-67](calls/legion-apps-plan_calls.md) · docs:
+      [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#unknown-fields),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] Unknown keys anywhere in a jobspec fail the submit, one error per
+        key with its path and a did-you-mean (`structs::spec_fields`, a
+        capture-then-validate parser; no `deny_unknown_fields` left), and
+        tasks, artifacts and `count` parse by shape, so a task typo shows
+        the task's own error
+  - [x] `allow_unknown_fields` on `RunJob`, `PlanJob` and `RunJobTemplate`,
+        `--allow-unknown-fields` on `job run|plan|validate` and
+        `template run`, and on the MCP tools: keys at extension points kept
+        in `pendingExtensions`, the rest dropped, each reported in the new
+        `warnings`, and recorded on the version (`GetJobInfoReply.unknown_fields`,
+        shown by `job info`)
+  - [x] Fixed on the way: KV re-renders dropped per-group rollout overrides
+        (`rolloutByGroup` was serialized snake_case), and seven example
+        jobspecs carried snake_case keys that never took effect
 
 ## Auth & ACLs
 
@@ -6699,6 +7424,13 @@ Found on the live AWS rig (3 raft managers, 2 workers).
       instead of the whole repository, so editing a doc no longer rebuilds
       the crate; the empty doc-test pass and `legion` bin unit-test target
       switched off.
+- [x] **Raft-entry-count tests read the applied marker** (2026-10-28).
+      `session_integration`'s promotion and unnamed-session checks,
+      `tests/raft_job_eval_ops.rs` and `tests/raft_lifecycle_ops.rs` counted
+      entries from openraft's metrics, which lag the apply under load and
+      read one extra or one short. They now sum each lane's `raft_applied`
+      marker (`Store::raft_applied_entries`), which moves in the apply's
+      own transaction.
 - [x] **CI dependency cache, cancellation, and pinned protoc.**
       `Swatinem/rust-cache` on the Rust jobs, saved from `main` (CI now also
       runs on pushes to `main`); superseded PR runs cancelled; `protoc` from

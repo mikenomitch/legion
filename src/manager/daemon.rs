@@ -9,6 +9,7 @@ use crate::storage::store::{ClaimScope, EvalBatchLimits, EvalCompletion, Store};
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, NodeMsg,
     Submission, TaskConfig, TlsConfigFull, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
+    MANAGER_ROLE_ATTR, MANAGER_ROLE_VALUE, SYSTEM_WORKER_TYPE,
 };
 use crate::worker::daemon::run_worker_local;
 
@@ -151,6 +152,13 @@ pub async fn run_manager_with(
     // rather than in an incident (docs/heartbeat-cadence-and-scale.md,
     // docs/node-liveness.md).
     full_config.heartbeat.validate()?;
+    // A system worker that cannot do what its block says (no namespaces, a
+    // root app user, a zero lend) stops the start, rather than leaving the
+    // manager without the worker Legion's own jobs need.
+    full_config
+        .system_worker
+        .validate()
+        .context("invalid systemWorker configuration")?;
     full_config.liveness.validate(
         full_config.heartbeat.parsed_min_interval()
             * full_config.heartbeat.missed_beats_before_lost.max(1),
@@ -207,6 +215,10 @@ pub async fn run_manager_with(
         // manager) if leadership never converges — see `startup_write`.
         startup_write("load initial config data", || {
             load_initial_data(&store, &config)
+        })
+        .await?;
+        startup_write("create the legion-system namespace", || async {
+            ensure_system_namespace(&store)
         })
         .await?;
         startup_write("seed UI test data", || async { seed_ui_test_data(&store) }).await?;
@@ -267,6 +279,9 @@ pub async fn run_manager_with(
                     if let Err(err) = load_initial_data(&watch_store, &watch_config).await {
                         warn!(error = ?err, "Failed loading initial config data after leadership acquisition");
                     }
+                    if let Err(err) = ensure_system_namespace(&watch_store) {
+                        warn!(error = ?err, "Failed creating the legion-system namespace after leadership acquisition");
+                    }
                     if let Err(err) = seed_ui_test_data(&watch_store) {
                         warn!(error = ?err, "Failed seeding UI test data after leadership acquisition");
                     }
@@ -298,6 +313,7 @@ pub async fn run_manager_with(
     let store_copy_b = store.clone();
 
     let store_for_keyring = store.clone();
+    let store_for_rollups = store.clone();
 
     let store_for_shutdown = store.clone();
     let store_copy_c = store.clone();
@@ -483,51 +499,44 @@ pub async fn run_manager_with(
         }
     });
 
-    // The in-process worker (--run-worker) registers like any external
-    // worker; with ACLs enforced the manager self-issues its join token.
-    // Certificates name this manager by its raft node id, or `local`.
+    // The in-process worker (the system worker, or --run-worker's) registers
+    // like any external worker; with ACLs enforced the manager self-issues
+    // its join token. Certificates name this manager by its raft node id, or
+    // `local`.
     let manager_cert_id = store
         .raft_status()
         .map(|status| status.node_id)
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| "local".to_string());
     crate::manager::worker_plane::WorkerPlane::global().set_manager_id(&manager_cert_id);
-    // The in-process worker pins the cluster CA like any joining worker.
-    let local_worker_ca_pin = if run_worker {
-        // An `exec` CA may still be answering its first describe: wait for
-        // it rather than start the worker without a pin.
-        let pin_store = store.clone();
-        let ensured = tokio::task::spawn_blocking(move || {
-            pin_store
-                .cluster_ca()
-                .ensure_waiting(&pin_store, Duration::from_secs(30))
-        })
-        .await
-        .map_err(|err| anyhow!("cluster CA task failed: {err}"))?;
-        match ensured {
-            Ok(view) => Some(view.pin),
-            Err(err) => {
-                warn!(error = ?err, "Cluster CA unavailable for the in-process worker's pin");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let local_worker_join_secret = if run_worker && authenticator.enabled {
-        let (_, composite) = authenticator
-            .mint_join_token(
-                &store,
-                &full_config.server.advertised_address(),
-                "default",
-                Some(Duration::from_secs(15 * 60)),
-                "in-process worker (--run-worker)",
-            )
-            .map_err(|e| anyhow!("failed to mint local worker join token: {e}"))?;
-        Some(crate::structs::token::JoinToken::decode(&composite)?.secret)
-    } else {
-        None
-    };
+    let in_process = in_process_worker(run_worker, &full_config.system_worker);
+    match &in_process {
+        Some(worker) if worker.worker_type == SYSTEM_WORKER_TYPE => info!(
+            namespaces = ?full_config.system_worker.namespaces,
+            cpu_mhz = full_config.system_worker.resources.cpu,
+            memory_mib = full_config.system_worker.resources.memory,
+            port = full_config.system_worker.port,
+            "This manager runs a system worker for Legion's own jobs (systemWorker)"
+        ),
+        Some(_) => info!(
+            "--run-worker: this manager's worker runs every namespace's jobs, in the default pool"
+        ),
+        None => info!(
+            "systemWorker.enabled = false: this manager runs no worker, so jobs in \
+             legion-system need a worker whose pool they permit and whose type accepts \
+             that namespace"
+        ),
+    }
+    if let Some(dir) = in_process
+        .as_ref()
+        .and_then(|worker| worker.state_dir.clone())
+    {
+        crate::constants::set_worker_state_dir(dir);
+    }
+    // The in-process worker's task needs its own handles: the API server
+    // takes these by value below.
+    let in_process_store = store.clone();
+    let in_process_authenticator = authenticator.clone();
 
     let store_for_rotation = store.clone();
 
@@ -610,13 +619,39 @@ pub async fn run_manager_with(
     // Follower-side forwarding of rejected writes to the raft leader
     // (docs/raft-operations.md, "Writes on any manager").
     let leader_forward = crate::manager::leader_forward::LeaderForwardLayer::new(store.clone());
-    let manager_node = ManagerDaemonService::with_manager_config(store, &full_config)
-        .with_workload_identity(workload_identity_state.clone())
-        .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
-        .with_authenticator(authenticator)
-        .with_advertise_addr(full_config.server.advertised_address())
-        .with_join_address_warning(full_config.server.loopback_join_address_warning())
-        .with_manager_id(manager_node_id.clone());
+    let manager_node = Arc::new(
+        ManagerDaemonService::with_manager_config(store, &full_config)
+            .with_workload_identity(workload_identity_state.clone())
+            .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
+            .with_authenticator(authenticator)
+            .with_advertise_addr(full_config.server.advertised_address())
+            .with_join_address_warning(full_config.server.loopback_join_address_warning())
+            .with_manager_id(manager_node_id.clone()),
+    );
+    // The app reconciler (docs/apps.md): seeds bundled apps and keeps every
+    // app's job matching its record while this manager leads the Control
+    // lane. It submits through this same service, as RunJob does.
+    // This build's id hashes the executable: once, off the runtime.
+    let own_build = tokio::task::spawn_blocking(crate::util::own_build)
+        .await
+        .context("hashing this binary for its build id")?;
+    let app_nudge = crate::manager::apps::spawn_reconciler(
+        manager_node.clone(),
+        crate::manager::apps::ReconcilerSettings {
+            seed: full_config.apps.clone(),
+            own_build,
+        },
+    );
+    manager_node.set_app_nudge(app_nudge);
+    // Load the jobspec keys installed apps add, now rather than at the first
+    // submit, so a key a core field of this release shadows is logged at
+    // start (docs/apps.md, "Keys cannot collide").
+    if let Err(status) = manager_node.extension_registry() {
+        warn!(
+            "Could not read installed apps' jobspec keys: {}",
+            status.message()
+        );
+    }
 
     let addr: std::net::SocketAddr =
         format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
@@ -689,11 +724,14 @@ pub async fn run_manager_with(
     // The idle sweep reads the usage table heartbeats fill, so it shares
     // the service's handle.
     let usage_for_idle_sweep = manager_node.usage_handle();
+    // The scaling-input rollup loop folds the same table (docs/autoscaling.md,
+    // "Scaling inputs").
+    let usage_for_rollups = manager_node.usage_handle();
     // A worker's full session report carries every session it holds (about
     // 200 bytes each); tonic's 4 MiB default would cap a node near 20,000
     // sessions. 64 MiB covers about 300,000 (session durability plan §6.5).
     let manager_service =
-        ManagerServer::new(manager_node).max_decoding_message_size(MANAGER_MAX_DECODE_BYTES);
+        ManagerServer::from_arc(manager_node).max_decoding_message_size(MANAGER_MAX_DECODE_BYTES);
     // Browser origins (docs/ui-architecture.md): loopback plus
     // `server.allowedOrigins`. The guard refuses everything else before any
     // handler runs; CORS only echoes the allowed origin back.
@@ -730,6 +768,11 @@ pub async fn run_manager_with(
         .layer(cors)
         .layer(GrpcWebLayer::new())
         .layer(crate::manager::telemetry::GrpcMetricsLayer)
+        // A call the SPA makes for an app's sandboxed page is held to the
+        // page's RPC allowlist (docs/apps.md, "Sandboxed pages").
+        .layer(crate::manager::app_page_guard::AppPageGuardLayer::new(
+            store_for_api.clone(),
+        ))
         // Innermost, on native gRPC: a write a follower rejects as
         // not-the-leader is replayed to the leader and the leader's reply
         // returned, so every manager accepts every request.
@@ -767,30 +810,43 @@ pub async fn run_manager_with(
     // 127.0.0.1, which no OTHER manager can reach. When this manager has a
     // non-loopback advertised address, the co-located worker advertises the
     // same host. An explicit LEGION_WORKER_ADVERTISE_ADDR still wins.
-    let local_worker_advertise =
-        if run_worker && std::env::var_os(crate::worker::plane::WORKER_ADVERTISE_ENV).is_none() {
-            in_process_worker_advertise_host(
-                full_config.server.advertise_addr.as_deref(),
-                full_config.persistence.raft.advertise_addr.as_deref(),
-            )
-            .inspect(|host| info!(%host, "In-process worker advertises this manager's host"))
-        } else {
-            None
-        };
+    let local_worker_advertise = if in_process.is_some()
+        && std::env::var_os(crate::worker::plane::WORKER_ADVERTISE_ENV).is_none()
+    {
+        in_process_worker_advertise_host(
+            full_config.server.advertise_addr.as_deref(),
+            full_config.persistence.raft.advertise_addr.as_deref(),
+        )
+        .inspect(|host| info!(%host, "In-process worker advertises this manager's host"))
+    } else {
+        None
+    };
     // Its own task rather than one of the background loops: it stops on the
     // same signal the manager does (stopping its tasks first on macOS), and
     // the shutdown below waits for that instead of aborting it mid-stop.
-    let worker_task = run_worker.then(|| {
+    // Until it has its join credential it has nothing to stop, and the
+    // shutdown aborts it instead (`worker_started`).
+    let worker_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_task = in_process.map(|worker| {
+        let store = in_process_store;
+        let authenticator = in_process_authenticator;
+        let advertised = full_config.server.advertised_address();
+        let started = worker_started.clone();
         tokio::spawn(async move {
-            info!(%manager_addr, "Starting in-process worker");
+            let (ca_pin, join_secret) =
+                in_process_join_credentials(&store, &authenticator, &advertised, &worker).await;
+            started.store(true, std::sync::atomic::Ordering::SeqCst);
+            info!(%manager_addr, worker_type = worker.worker_type, "Starting in-process worker");
             let result = run_worker_local(
                 crate::worker::daemon::WorkerJoin {
                     manager_addr,
-                    worker_type: "default".to_string(),
-                    join_secret: local_worker_join_secret,
-                    ca_pin: local_worker_ca_pin,
+                    worker_type: worker.worker_type.to_string(),
+                    join_secret,
+                    ca_pin,
                     advertise_addr: local_worker_advertise,
                     in_process: true,
+                    local: Some(worker.local),
+                    join_attributes: Default::default(),
                 },
                 None,
             )
@@ -807,15 +863,25 @@ pub async fn run_manager_with(
         Ok::<(), anyhow::Error>(())
     };
     let keyring_fut = start_keyring_maintenance(store_for_keyring);
+    let rollup_manager_id = manager_node_id.clone();
+    let rollup_fut = async move {
+        crate::manager::scaling_inputs::run_rollup_loop(
+            store_for_rollups,
+            usage_for_rollups,
+            rollup_manager_id,
+        )
+        .await;
+    };
     // The background loops run as one task the daemon can abort: without an
     // API and raft transport they must not keep acting on the cluster.
     let background = tokio::spawn(async move {
-        let (checker, evals, concurrency, rotation, keyring) = join!(
+        let (checker, evals, concurrency, rotation, keyring, ()) = join!(
             node_checker_fut,
             eval_loop_fut,
             concurrency_fut,
             rotation_fut,
-            keyring_fut
+            keyring_fut,
+            rollup_fut
         );
         for (name, result) in [
             ("node status checker", checker),
@@ -871,6 +937,16 @@ pub async fn run_manager_with(
     // The in-process worker heard the same signal and is stopping too. Wait
     // for it, so the process does not exit under its session checkpoints or
     // (on macOS) the task stops. A second signal still exits at once.
+    // An in-process worker still waiting for its join credential (a
+    // follower with no leader yet) has nothing to stop: abort it.
+    let worker_task = worker_task.and_then(|worker| {
+        if worker_started.load(std::sync::atomic::Ordering::SeqCst) {
+            Some(worker)
+        } else {
+            worker.abort();
+            None
+        }
+    });
     if let Some(worker) = worker_task {
         tokio::select! {
             stopped = tokio::time::timeout(IN_PROCESS_WORKER_STOP_TIMEOUT, worker) => {
@@ -894,6 +970,156 @@ pub async fn run_manager_with(
     shutdown_persistence(&store_for_shutdown).await;
     info!("Manager stopped");
     Ok(())
+}
+
+/// The worker a manager runs in its own process, and what it imposes on it.
+#[derive(Debug, Clone)]
+struct InProcessWorker {
+    /// The worker type it registers as: `legion-system`, or `default` for
+    /// `--run-worker`.
+    worker_type: &'static str,
+    /// What `legion join-token list` says its self-issued token is for.
+    description: &'static str,
+    local: crate::worker::daemon::LocalWorkerSettings,
+    /// Where its state lives, when not `<data dir>/workers`.
+    state_dir: Option<std::path::PathBuf>,
+}
+
+impl InProcessWorker {
+    /// The node attributes its registration takes from its join token
+    /// rather than from what the worker reports (apps plan calls entry 19):
+    /// its `namespaces` restriction and `legion.role`. A forged registration
+    /// with this token can neither drop the restriction nor claim another
+    /// role.
+    fn pinned_attrs(&self) -> Value {
+        let mut attrs = serde_json::Map::new();
+        if let Some(namespaces) = &self.local.namespaces {
+            attrs.insert(
+                crate::constraints::NODE_NAMESPACES_ATTR.to_string(),
+                json!(namespaces),
+            );
+        }
+        if let Some(role) = self.local.attributes.get(MANAGER_ROLE_ATTR) {
+            attrs.insert(MANAGER_ROLE_ATTR.to_string(), json!(role));
+        }
+        Value::Object(attrs)
+    }
+}
+
+/// Which in-process worker this manager runs (docs/architecture-managers-
+/// workers.md, "The system worker"):
+///
+/// - `--run-worker`: the manager also runs everything, as before. Worker
+///   type and pool `default`, `namespaces = ["*", "legion-*"]` (every
+///   namespace, reserved ones included), no lend cap, its state in
+///   `<data dir>/workers`.
+/// - otherwise, with `systemWorker.enabled` (the default): the system
+///   worker. Worker type and pool `legion-system`, the configured
+///   namespaces, capacity and cgroup parent capped at the lend, its own
+///   port and state directory, so a standalone worker can share the host.
+/// - otherwise none.
+///
+/// Both carry `legion.role = "manager"`, which is what placement keys on to
+/// find a manager's worker.
+fn in_process_worker(
+    run_worker: bool,
+    system: &crate::structs::SystemWorkerConfigFull,
+) -> Option<InProcessWorker> {
+    let manager_role = HashMap::from([(
+        MANAGER_ROLE_ATTR.to_string(),
+        MANAGER_ROLE_VALUE.to_string(),
+    )]);
+    if run_worker {
+        return Some(InProcessWorker {
+            worker_type: "default",
+            description: "in-process worker (--run-worker)",
+            local: crate::worker::daemon::LocalWorkerSettings {
+                namespaces: Some(vec![
+                    "*".to_string(),
+                    crate::structs::namespace::RESERVED_NAMESPACE_PREFIX.to_string() + "*",
+                ]),
+                attributes: manager_role,
+                ..Default::default()
+            },
+            state_dir: None,
+        });
+    }
+    if !system.enabled {
+        return None;
+    }
+    Some(InProcessWorker {
+        worker_type: SYSTEM_WORKER_TYPE,
+        description: "system worker (systemWorker)",
+        local: crate::worker::daemon::LocalWorkerSettings {
+            namespaces: Some(system.namespaces.clone()),
+            attributes: manager_role,
+            lend: Some(system.resources),
+            cgroup_parent: Some(SYSTEM_WORKER_TYPE.to_string()),
+            port: Some(system.port),
+        },
+        state_dir: Some(
+            crate::constants::data_dir().join(crate::constants::SYSTEM_WORKER_STATE_SUBDIR),
+        ),
+    })
+}
+
+/// The in-process worker's CA pin and, with ACLs enforced, its join secret,
+/// retried until both are in hand. The pin waits for the cluster CA (an
+/// `exec` CA may still be answering its first describe), and the token's row
+/// is forwarded to the control leader when this manager is a follower, so a
+/// manager that starts while its cluster has no leader yet gets its worker
+/// as soon as one is elected, instead of failing its start.
+#[instrument(skip_all, fields(worker_type = worker.worker_type))]
+async fn in_process_join_credentials(
+    store: &Store,
+    authenticator: &crate::manager::acl::Authenticator,
+    advertised: &str,
+    worker: &InProcessWorker,
+) -> (Option<String>, Option<String>) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let attempt = async {
+            let pin_store = store.clone();
+            let view = tokio::task::spawn_blocking(move || {
+                pin_store
+                    .cluster_ca()
+                    .ensure_waiting(&pin_store, Duration::from_secs(30))
+            })
+            .await
+            .map_err(|err| anyhow!("cluster CA task failed: {err}"))?
+            .context("the cluster CA is unavailable for the in-process worker's pin")?;
+            let secret = if authenticator.enabled {
+                let (_, composite) = authenticator
+                    .mint_local_worker_join_token(
+                        store,
+                        advertised,
+                        worker.worker_type,
+                        Some(Duration::from_secs(15 * 60)),
+                        worker.description,
+                        &worker.pinned_attrs(),
+                    )
+                    .map_err(|e| {
+                        anyhow!("failed to mint the in-process worker's join token: {e}")
+                    })?;
+                Some(crate::structs::token::JoinToken::decode(&composite)?.secret)
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>((Some(view.pin), secret))
+        };
+        match attempt.await {
+            Ok(credentials) => return credentials,
+            Err(err) => {
+                warn!(
+                    error = %format!("{err:#}"),
+                    retry_in_secs = backoff.as_secs(),
+                    "In-process worker cannot join yet; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
 }
 
 /// The host an in-process worker (`--run-worker`) should advertise for its
@@ -1363,6 +1589,8 @@ fn seed_ui_test_data(store: &Store) -> R<()> {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
 
     let submit_outcome = store.handle_job_submit(
@@ -3702,6 +3930,21 @@ fn parse_worker_config(config_path: &str) -> R<WorkerConfigAlt> {
 }
 
 #[instrument(err, skip_all)]
+/// Create the reserved `legion-system` namespace and its namespace policy
+/// on an empty store (docs/namespaces.md, "Reserved namespaces"). A
+/// control-lane write, so only the leader runs it; it is a no-op once the
+/// namespace exists, and the namespace cannot be deleted.
+fn ensure_system_namespace(store: &Store) -> R<()> {
+    if store.ensure_system_namespace()? {
+        info!(
+            namespace = crate::structs::namespace::SYSTEM_NAMESPACE,
+            "Created the legion-system namespace and its namespace policy (pools.default = \
+             [\"legion-system\", \"default\"])"
+        );
+    }
+    Ok(())
+}
+
 async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
     let worker_conf_path = config.with_defaults().worker_config_path.clone();
     // No worker config directory configured (the default): register the
@@ -3743,11 +3986,71 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
         configs
     };
 
+    if let Some((path_str, _)) = worker_configs
+        .iter()
+        .find(|(_, wcp)| wcp.worker_type == SYSTEM_WORKER_TYPE)
+    {
+        bail!(
+            "worker config {path_str} declares worker type {SYSTEM_WORKER_TYPE:?}, which is built \
+             in: it is the type of every manager's system worker. Configure that worker with the \
+             manager config's `systemWorker` block, and give this type another name"
+        );
+    }
+    // Every manager's system worker registers as this type, whatever this
+    // manager's own `systemWorker` says: worker types are cluster-wide, and
+    // a manager that leads with its system worker off still has followers
+    // that run one. The lend, namespaces, and cgroup parent each manager
+    // applies come from its own config (`InProcessWorker`).
+    let mut worker_configs = worker_configs;
+    worker_configs.push((
+        "<built-in legion-system worker type>".to_string(),
+        serde_json::from_value(json!({
+            "workerType": SYSTEM_WORKER_TYPE,
+            "pool": SYSTEM_WORKER_TYPE,
+            "namespaces": [crate::structs::namespace::SYSTEM_NAMESPACE],
+            "namePrefix": SYSTEM_WORKER_TYPE,
+            "attributes": { (MANAGER_ROLE_ATTR): MANAGER_ROLE_VALUE },
+        }))?,
+    ));
+
     for (path_str, wcp) in worker_configs {
         let path_str = path_str.as_str();
+        let built_in_system = wcp.worker_type == SYSTEM_WORKER_TYPE;
 
         let af = wcp.additional_node_checks.unwrap_or([].to_vec());
         let attrs = wcp.attributes.unwrap_or(HashMap::new());
+        // Node config attributes Legion sets itself: a type's `attributes`
+        // must not shadow them, or `namespaces = "x"` would read as a
+        // restriction nobody declared and `legion.role = "manager"` would
+        // pass a worker off as a manager's own.
+        for reserved in [
+            crate::constraints::NODE_NAMESPACES_ATTR,
+            crate::resources::CAPACITY_ATTR,
+            MANAGER_ROLE_ATTR,
+        ] {
+            if attrs.contains_key(reserved) && !built_in_system {
+                bail!(
+                    "worker config {path_str}: attribute {reserved:?} is set by Legion, not by \
+                     a worker type{}",
+                    if reserved == crate::constraints::NODE_NAMESPACES_ATTR {
+                        "; use the worker type's top-level `namespaces` list instead"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        let namespaces = wcp.namespaces.clone().unwrap_or_default();
+        if wcp.namespaces.as_ref().is_some_and(Vec::is_empty) {
+            bail!(
+                "worker config {path_str}: namespaces must not be empty; leave it out to accept \
+                 every namespace, or name the ones this type's nodes accept (\"ci-*\")"
+            );
+        }
+        for pattern in &namespaces {
+            crate::structs::namespace_policy::validate_namespace_glob(pattern)
+                .map_err(|err| anyhow!("worker config {path_str}: namespaces: {err}"))?;
+        }
         let resources = wcp
             .resources
             .as_ref()
@@ -3987,6 +4290,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             edge_boot,
             security,
             container,
+            namespaces,
         };
 
         store.insert_worker_type(&wc)?;
@@ -4010,6 +4314,153 @@ mod tests {
             "exec": { "enabled": false },
             "telemetry": { "enabled": false },
         }))?)
+    }
+
+    /// Which in-process worker a manager runs: the system worker by
+    /// default, `--run-worker`'s wide one when asked (whatever
+    /// `systemWorker.enabled` says), and none when the system worker is off.
+    #[test]
+    fn in_process_worker_follows_the_flag_and_the_system_worker_block_test() {
+        let defaults = crate::structs::SystemWorkerConfigFull::default();
+        let role = |worker: &InProcessWorker| {
+            worker
+                .local
+                .attributes
+                .get(MANAGER_ROLE_ATTR)
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        let system = in_process_worker(false, &defaults).expect("on by default");
+        assert_eq!(system.worker_type, SYSTEM_WORKER_TYPE);
+        assert_eq!(
+            system.local.namespaces,
+            Some(vec!["legion-system".to_string()])
+        );
+        assert_eq!(
+            system.local.lend,
+            Some(crate::structs::SystemWorkerResources {
+                cpu: 1000,
+                memory: 1024
+            })
+        );
+        assert_eq!(system.local.cgroup_parent.as_deref(), Some("legion-system"));
+        assert_eq!(system.local.port, Some(4849));
+        assert!(system
+            .state_dir
+            .as_ref()
+            .is_some_and(|dir| dir.ends_with("system-worker")));
+        assert_eq!(role(&system), MANAGER_ROLE_VALUE);
+
+        let off = crate::structs::SystemWorkerConfig {
+            enabled: Some(false),
+            ..Default::default()
+        }
+        .with_defaults();
+        assert!(in_process_worker(false, &off).is_none());
+        for system in [&defaults, &off] {
+            let wide = in_process_worker(true, system).expect("--run-worker always runs one");
+            assert_eq!(wide.worker_type, "default");
+            assert_eq!(
+                wide.local.namespaces,
+                Some(vec!["*".to_string(), "legion-*".to_string()])
+            );
+            assert_eq!(wide.local.lend, None, "no lend cap");
+            assert_eq!(wide.local.cgroup_parent, None);
+            assert_eq!(wide.local.port, None, "LEGION_WORKER_PORT, as before");
+            assert_eq!(wide.state_dir, None);
+            assert_eq!(role(&wide), MANAGER_ROLE_VALUE);
+        }
+    }
+
+    /// The store always holds the built-in `legion-system` type every
+    /// manager's system worker registers as, beside the types it loads.
+    #[tokio::test]
+    async fn load_initial_data_registers_the_built_in_system_worker_type_test() -> R<()> {
+        let store = setup_store()?;
+        let config: ManagerConfig = serde_json::from_value(json!({ "workerConfigPath": "" }))?;
+        load_initial_data(&store, &config).await?;
+        let system = store.get_worker_type(SYSTEM_WORKER_TYPE.into())?;
+        assert_eq!(system.pool, SYSTEM_WORKER_TYPE);
+        assert_eq!(system.namespaces, vec!["legion-system".to_string()]);
+        assert_eq!(system.name_prefix.as_deref(), Some(SYSTEM_WORKER_TYPE));
+        assert_eq!(
+            system.attributes.get(MANAGER_ROLE_ATTR).map(String::as_str),
+            Some(MANAGER_ROLE_VALUE)
+        );
+        assert!(store
+            .get_worker_type("default".into())?
+            .namespaces
+            .is_empty());
+        Ok(())
+    }
+
+    /// A worker type's `namespaces` is stored with it; an empty list, the
+    /// built-in type's name, and an attribute Legion sets itself each stop
+    /// the load, naming the file.
+    #[tokio::test]
+    async fn worker_type_namespaces_load_and_reserved_names_fail_test() -> R<()> {
+        let load = |files: Vec<(&'static str, Value)>| async move {
+            let dir = Builder::new()
+                .prefix("legion-worker-types-")
+                .tempdir_in(crate::test_scratch::root())?;
+            for (name, body) in &files {
+                std::fs::write(dir.path().join(name), body.to_string())?;
+            }
+            let store = setup_store()?;
+            let config: ManagerConfig = serde_json::from_value(json!({
+                "workerConfigPath": dir.path().to_str().context("utf-8")?,
+            }))?;
+            load_initial_data(&store, &config).await.map(|()| store)
+        };
+        let store = load(vec![(
+            "ci.json",
+            json!({ "workerType": "ci", "pool": "ci", "namespaces": ["ci-*"] }),
+        )])
+        .await?;
+        assert_eq!(
+            store.get_worker_type("ci".into())?.namespaces,
+            vec!["ci-*".to_string()]
+        );
+
+        for (body, says) in [
+            (
+                json!({ "workerType": "ci", "namespaces": [] }),
+                "must not be empty",
+            ),
+            (
+                json!({ "workerType": "ci", "namespaces": ["Bad"] }),
+                "namespaces",
+            ),
+            (json!({ "workerType": SYSTEM_WORKER_TYPE }), "built in"),
+            (
+                json!({ "workerType": "ci", "attributes": { "legion.role": "manager" } }),
+                "set by Legion",
+            ),
+            (
+                json!({ "workerType": "ci", "attributes": { "namespaces": "ci" } }),
+                "top-level `namespaces`",
+            ),
+        ] {
+            let err = match load(vec![("bad.json", body.clone())]).await {
+                Ok(_) => panic!("{body} loaded"),
+                Err(err) => format!("{err:#}"),
+            };
+            assert!(err.contains(says), "{body}: {err}");
+            assert!(err.contains("bad.json"), "{body}: {err}");
+        }
+        Ok(())
+    }
+
+    /// The shipped CI worker type is the documented example of a
+    /// namespace-restricted type, and parses as one.
+    #[test]
+    fn the_shipped_ci_worker_config_accepts_only_ci_namespaces_test() -> R<()> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/configs/workers/ci.ncl");
+        let config = parse_worker_config(path)?;
+        assert_eq!(config.pool.as_deref(), Some("ci"));
+        assert_eq!(config.namespaces, Some(vec!["ci-*".to_string()]));
+        Ok(())
     }
 
     /// The shipped worker config documents the content defaults without
@@ -4377,6 +4828,8 @@ mod tests {
             name: "restart-survivor".into(),
             tasks: vec![TaskConfig::new("svc", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,

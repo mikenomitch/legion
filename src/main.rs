@@ -28,8 +28,14 @@ async fn main() -> R<()> {
     // includes the gateway: its copy loop `splice`s into client sockets,
     // which raises SIGPIPE when the client has gone. Every other command is
     // a one-shot CLI whose stdout may be piped into `head`.
+    // `legion app run` is a bundled app's process, run by its task.
+    let app_run = matches!(
+        matches.subcommand(),
+        Some(("app", sub_matches)) if sub_matches.subcommand_name() == Some("run")
+    );
     let long_running = server_mode
         || mcp_mode
+        || app_run
         || matches!(
             matches.subcommand_name(),
             Some("guest-agent" | "guest-resume")
@@ -44,6 +50,8 @@ async fn main() -> R<()> {
         Some(("docs", sub_matches)) => cmd::docs::handle(sub_matches).await?,
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,
         Some(("job", sub_matches)) => cmd::job::handle(sub_matches).await?,
+        Some(("scaling", sub_matches)) => cmd::scaling::handle(sub_matches).await?,
+        Some(("app", sub_matches)) => cmd::app::handle(sub_matches).await?,
         Some(("namespace", sub_matches)) => cmd::namespace::handle(sub_matches).await?,
         Some(("template", sub_matches)) => cmd::template::handle(sub_matches).await?,
         Some(("instance", sub_matches)) => cmd::instance::handle(sub_matches).await?,

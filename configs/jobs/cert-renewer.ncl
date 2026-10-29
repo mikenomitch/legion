@@ -26,26 +26,27 @@
 #     certificate if a bad one ever lands.
 #
 # Before you run it:
-#   - The worker node needs `legion` on PATH and `openssl`, and the task
-#     needs LEGION_ADDR (below) pointing at a manager.
-#   - Workload identity enabled on the manager, with a binding that lets
-#     this job write its KV key (docs/workload-identity.md, "Control-plane
-#     identity"):
+#   - The worker node needs `legion` on PATH and `openssl`.
+#   - Workload identity enabled on the manager (`workloadIdentity.enabled =
+#     true`). Nothing else on the manager: no binding, no policy, no address.
+#     The job asks for what it needs (`permissions` on its `legion` identity,
+#     below), and Legion grants it at submit because the token that submits
+#     the job holds it (docs/workload-identity.md, "Permissions").
+#   - Submit it with a token that holds `kv:read` and `kv:write` on `certs/*`
+#     (and `kv:read` on the DNS token below, which the env template reads).
+#     A token that does not is refused before anything is stored:
 #
-#       # manager.ncl
-#       workloadIdentity = {
-#         enabled = true,
-#         controlPlaneBindings = [
-#           { claim = "legion.io/job", value = "cert-renewer-app-example-com",
-#             policies = ["cert-writer"] },
-#         ],
-#       },
+#       Error: failed to run job: cert-renewer-app-example-com: identity
+#       'legion' asks for kv:write on certs/*, which your token does not hold
+#       [code=PermissionDenied]
+#       Hint: have someone with that access submit this job, or ask for it
+#       to be granted to you
 #
-#       # the policy, created once:
-#       legion acl policy apply cert-writer --rules '[
-#         {"resources": ["kv"], "actions": ["read", "write"], "paths": ["certs/*"]}
-#       ]'
-#
+#   - Inside the task, `legion` reaches the cluster through the worker's
+#     per-allocation socket: the worker sets
+#     LEGION_ADDR=unix://$LEGION_SECRETS_DIR/legion.sock and attaches this
+#     allocation's current identity token to every call, so the task holds
+#     no token and needs no route to a manager.
 #   - A Cloudflare API token with Zone.DNS edit rights, stored in KV:
 #       legion kv put secrets/cloudflare-dns-token "<token>"
 #     (lego supports 150+ DNS providers; swap `--dns cloudflare` and the env
@@ -53,6 +54,7 @@
 #
 # Run and inspect:
 #   legion job run configs/jobs/cert-renewer.ncl
+#   legion acl grants list --job cert-renewer-app-example-com
 #   legion job logs cert-renewer-app-example-com
 #   legion kv get certs/app.example.com
 #
@@ -77,15 +79,17 @@ let email = "ops@example.com" in
       "https://github.com/go-acme/lego/releases/download/v4.21.0/lego_v4.21.0_linux_amd64.tar.gz",
     ],
 
-    # A short-lived token for talking to Legion itself, as this job. The
-    # `legion` CLI reads LEGION_TOKEN. A token refreshed mid-run restarts the
-    # run, which is safe: every step is idempotent.
+    # Talking to Legion itself, as this job. `permissions` is what the job
+    # may do (the same rule shape `legion acl policy apply` takes); the
+    # submitter must hold it. The worker serves the allocation a local API
+    # socket that authenticates as this identity and refreshes it on its
+    # own, so nothing here restarts when the token rotates.
     identities = [
       {
         name = "legion",
-        ttl = "1h",
-        env = "LEGION_TOKEN",
-        changeMode = "restart",
+        permissions = [
+          { resources = ["kv"], actions = ["read", "write"], paths = ["certs/*"] },
+        ],
       },
     ],
 
@@ -99,7 +103,6 @@ let email = "ops@example.com" in
 
     config = {
       env = {
-        LEGION_ADDR = "http://manager.internal:4747",
         DOMAIN = domain,
         EMAIL = email,
         KV_KEY = "certs/%{domain}",

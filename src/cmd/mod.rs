@@ -2,6 +2,8 @@
 
 pub mod acl;
 pub mod action;
+pub mod app;
+pub mod app_view;
 pub mod boot_ticket;
 pub mod capabilities;
 pub mod docs;
@@ -30,6 +32,11 @@ pub mod oidc;
 pub mod output;
 pub mod raft;
 pub mod sandbox;
+pub mod scaling;
+pub mod scaling_demand;
+pub mod scaling_plugin;
+pub mod scaling_policy;
+pub mod scaling_simulate;
 pub mod scheduler;
 pub mod service;
 pub mod session;
@@ -60,6 +67,8 @@ fn base_cli() -> Command {
         .subcommand(mcp::config())
         .subcommand(docs::config())
         .subcommand(job::config())
+        .subcommand(scaling::config())
+        .subcommand(app::config())
         .subcommand(namespace::config())
         .subcommand(template::config())
         .subcommand(instance::config())
@@ -106,6 +115,8 @@ mod tests {
         "legion start gateway",
         "legion join",
         "legion mcp serve",
+        // The in-task entrypoint of a bundled app: a long-running process.
+        "legion app run",
         "legion guest-agent",
         "legion guest-resume",
     ];

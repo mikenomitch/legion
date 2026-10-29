@@ -7,6 +7,25 @@ package legion;
 // - `*_json` and many string fields contain JSON payloads serialized as strings.
 // - Timestamps are generally RFC3339 strings unless a field explicitly says Unix timestamp.
 // - Optional fields are omitted when not provided by the client/server.
+//
+// Authentication rides in gRPC metadata, not in messages
+// (docs/auth-and-acls.md):
+// - `authorization: Bearer <token>` (or `x-legion-token`): the caller's
+//   credential, a Legion ACL token or a JWT an auth method accepts. A task's
+//   API socket attaches the task's `legion` identity token when the caller
+//   sends none.
+// - `legion-on-behalf-of: <viewer assertion>`: an app acting as a viewer.
+//   An app's own credential presents the viewer assertion of an action
+//   InvokeAppAction forwarded to it, and the call is authenticated as the
+//   delegated identity `<viewer> via app <app>`: the action's declared
+//   permission on the context it was pressed on (and `read` on the same
+//   resource when the viewer holds it), within the app's own grant, for the
+//   assertion's 60 seconds, and only while the viewer's token is valid.
+//   Presented by anyone but that app, expired, or for a revoked viewer, the
+//   call is Unauthenticated or PermissionDenied; it never falls back to the
+//   app's own identity. Streaming RPCs and app-plane RPCs refuse it
+//   (PermissionDenied). Ignored when ACLs are disabled. See
+//   docs/auth-and-acls.md, "Delegated identities".
 
 // === MANAGER ===
 
@@ -48,6 +67,43 @@ service Manager {
   //
   // Depending on current state, this may create a new job config, create a rollout,
   // and enqueue reconciliation work.
+  //
+  // KV references (docs/auth-and-acls.md, "KV references in a job"): every
+  // `$path/key` string anywhere in the jobspec (a core field, an extension
+  // value, a pending key) and every key a task's `kvInjections` read needs
+  // `kv:read` on the key, checked before any of them is resolved; a miss is
+  // PERMISSION_DENIED naming the key, and nothing resolved reaches an error
+  // message, an app's validate call, or the stored job.
+  //
+  // Jobspec extensions (docs/apps.md, "Jobspec extensions"): a key an
+  // installed app declares at an extension point (the job, a group written
+  // on one of its tasks, a task, a volume, a port, a service), or written
+  // `apps.<app>` there, is checked against the key's JSON Schema with its
+  // defaults filled, and stored as written, by app. A value that fails the
+  // schema is INVALID_ARGUMENT naming its full path, `allow_unknown_fields`
+  // or not. A value that is new or changed since the job's previous version,
+  // for a key that declares `requires`, needs that permission as the caller
+  // on the job (PERMISSION_DENIED otherwise). A key that declares `validate`
+  // makes the manager ask its app first (`POST
+  // /legion/v1/extensions/validate`, 2 seconds per app): the app's errors
+  // are INVALID_ARGUMENT, its warnings land in `RunJobReply.warnings`, and
+  // an app that cannot answer lets the submit through with a warning. A
+  // resubmit whose only differences are extension values (or pending keys)
+  // creates a version but no rollout: the running allocations move to it in
+  // place. Apps are asked on the Control lane's leader: a follower refuses
+  // such a submit before asking any app, and the leader-forward layer
+  // replays it there, so each app is asked once per submit.
+  //
+  // Artifact pins (`resolve: "pin"`) resolve at submit: a source that could
+  // not be reached (connection refused, a timeout, a 5xx or 429 answer) is
+  // UNAVAILABLE, retryable as is; a reference that does not resolve (a tag
+  // that does not exist, refused credentials) is INVALID_ARGUMENT.
+  //
+  // An installed app's job (`legion-system/<app>` while the app is
+  // installed) is the app reconciler's: a direct submit of it is refused
+  // (FAILED_PRECONDITION naming `legion app set|config set|disable|
+  // uninstall`), for every caller, management tokens included
+  // (docs/apps.md, "Editing an app's job").
   rpc RunJob (RunJobRequest) returns (RunJobReply);
 
   // Returns the submitted source files (submissions) associated with the latest job config.
@@ -81,12 +137,41 @@ service Manager {
   rpc AdvanceRollout (AdvanceRolloutRequest) returns (AdvanceRolloutReply);
 
   // Stops an in-flight rollout and optionally reverts to the previous config.
+  // Refused (FAILED_PRECONDITION) for a rollout of an installed app's job,
+  // which the app reconciler owns; AdvanceRollout, which moves toward the
+  // version the reconciler submitted, is allowed.
   rpc StopRollout (StopRolloutRequest) returns (StopRolloutReply);
 
   // Computes a placement plan for a jobspec without mutating cluster state.
+  // Requires `job:read` on the job, and `kv:read` on every KV key the
+  // jobspec references, checked before any is resolved, as RunJob does (the
+  // plan shows the rendered values). A plan of an installed app's job is
+  // refused as RunJob would refuse the submit (FAILED_PRECONDITION).
   rpc PlanJob (PlanJobRequest) returns (PlanJobReply);
 
-  // Marks a job as stopped and enqueues stop reconciliation.
+  // Returns this cluster's jobspec schema (JSON Schema, draft 7): the
+  // compiled-in core schema plus each key an installed app adds to the
+  // jobspec (docs/apps.md, "Jobspec extensions"), as a property at its
+  // extension point, described as "From the backup app, 0.3.1: …", and
+  // under that point's `apps` record in its qualified spelling
+  // (`apps.<app>`). `legion job schema`, `legion job validate`, and the
+  // `legion_job_schema` MCP tool use it when a manager is reachable, so an
+  // agent authoring a jobspec sees exactly what this cluster accepts;
+  // offline they fall back to the compiled-in schema and say that installed
+  // keys were not included.
+  //
+  // `extensions` lists the same keys structurally, with each key's own
+  // schema, so a client can check values against them the way a submit
+  // does (`legion job validate` does).
+  //
+  // Requires `job:read` (any scope): the schema says what a jobspec may
+  // contain, nothing about any job. Disabled apps' keys are included: a
+  // disabled app's keys are still validated at submit.
+  rpc GetJobSchema (GetJobSchemaRequest) returns (GetJobSchemaReply);
+
+  // Marks a job as stopped and enqueues stop reconciliation. Refused
+  // (FAILED_PRECONDITION) for an installed app's job: `legion app disable`
+  // stops it (docs/apps.md, "Editing an app's job").
   rpc StopJob (StopJobRequest) returns (StopJobReply);
 
   // Sets (or clears) a task's count override — the `legion job scale`
@@ -99,6 +184,23 @@ service Manager {
   // requested while a rollout is in flight is recorded as pending and
   // applied when the rollout finishes (scale-out applies immediately).
   // Guarded by `scale:write`, deliberately separate from `job:write`.
+  //
+  // On an autoscaled task (one with `autoscale` in its spec) the policy owns
+  // the count, so a person's write is a time-boxed pin: `count` with
+  // `pin_for_seconds` holds the count there until the pin expires, `min` or
+  // `max` with `pin_for_seconds` holds a floor or a ceiling, and `release`
+  // ends a pin early. A `count` without `pin_for_seconds` is refused with
+  // FAILED_PRECONDITION and a hint. The autoscaler itself writes with
+  // `source = "autoscaler"`, `expected_version` (compare-and-set: a stale
+  // writer gets FAILED_PRECONDITION and re-reads), and the `decision` that
+  // made the change; its writes to a paused or count-pinned task are
+  // refused. When the autoscaled task shares its group with other tasks,
+  // every task of the group moves to the count in one write. Every applied
+  // or deferred write is recorded in the task's scale history.
+  //
+  // Refused (FAILED_PRECONDITION) for an installed app's job: its count is
+  // the app's `replicas` (`legion app set --replicas`), and an override
+  // would outlive every resubmit the reconciler makes.
   rpc ScaleTask (ScaleTaskRequest) returns (ScaleTaskReply);
 
   // Reports every task's spec count, live override (or pending scale-in),
@@ -106,7 +208,320 @@ service Manager {
   // surface; `scale:read`.
   rpc GetJobScaleStatus (GetJobScaleStatusRequest) returns (GetJobScaleStatusReply);
 
-  // Permanently removes a stopped job and related records.
+  // Reads what a scaling decision needs about a batch of tasks, cluster-wide,
+  // in one call (docs/autoscaling.md, "Scaling inputs"): replica counts and
+  // readiness, measured CPU and memory against the reservations, request
+  // rate, errors, and latency for a service the task backs, replicas the
+  // scheduler has not placed, whether a rollout is active, and how fresh the
+  // measurements are.
+  //
+  // Measured usage never touches the state store. Each manager rolls up the
+  // usage reports and service-graph samples its own workers send, per
+  // (node, task), and every 10 seconds ships the rollups that changed to the
+  // manager that leads the status lane, on the liveness digest. That manager
+  // merges them (the newest rollup per (node, task) wins, so a node that
+  // moves between managers is never counted twice), keeps one hour of
+  // 10-second totals in memory, and answers this RPC. Any other manager
+  // forwards the request to it, so every manager returns the same answer.
+  // Replica counts, the desired count, and rollouts come from the replicated
+  // state store.
+  //
+  // After the status lane changes hands, the new leader starts empty and
+  // asks every peer for a full resync on its first digest. Until that lands
+  // (about one 10-second interval), targets read
+  // `freshness.state = "resyncing"` and their usage is partial.
+  //
+  // ACL: `scale:read`. The request is gated coarsely before anything is
+  // looked up. A request that names targets is refused whole with
+  // PERMISSION_DENIED when any named job is outside the caller's grant; a
+  // namespace listing (no targets) silently leaves such jobs out.
+  rpc GetScalingInputs (GetScalingInputsRequest) returns (GetScalingInputsReply);
+
+  // === AUTOSCALING ===
+  //
+  // Task autoscaling (docs/autoscaling.md): `autoscale` on a task in a
+  // jobspec, resolved against layered defaults (built-in, then the cluster's
+  // scaling defaults, then every namespace policy's `autoscale`, then the
+  // task's own record), and acted on by the bundled autoscaler app
+  // (`legion-system/autoscaler`, docs/apps.md). The app reads policies from
+  // WatchScalingPolicies and measurements from GetScalingInputs, writes
+  // counts through ScaleTask (compare-and-set, with the decision attached),
+  // and reports what it is doing through ReportScalingStatus. People read
+  // that back with GetScalingStatus and GetScaleHistory, and freeze it with
+  // PauseScaling. A target that is not a Legion task has a standalone
+  // policy (ApplyScalingPolicy, DeleteScalingPolicy, ListScalingPolicies),
+  // which the app runs through a target plugin installed in its app config
+  // (docs/autoscaling.md, "Standalone policies"; docs/autoscaling-plugins.md).
+
+  // Streams the effective scaling policy of every autoscaled task, and every
+  // standalone policy, the caller may read (`scale:read`), resolved live
+  // against the layered defaults and the plugins installed in the
+  // autoscaler's app config.
+  //
+  // The first message is the full set. Another follows whenever any input
+  // changes: a job with `autoscale` is submitted, stopped, or destroyed; a
+  // standalone policy is applied or deleted, or its pause or action row
+  // changes; the cluster's scaling defaults change; a namespace policy's
+  // `autoscale` changes; the autoscaler's plugins change. Without `deltas`
+  // each message is the full set again and replaces the previous one. With
+  // `deltas`, every later message carries only what changed (`full =
+  // false`): new or changed policies, and the keys of removed ones in
+  // `removed`; the consumer merges them into what it holds. With `deltas`,
+  // a change of more than 1,000 policies (the first set of a large
+  // cluster) is split into messages of at most 1,000, all but the last
+  // marked `more`, so no message nears gRPC's 4 MiB default limit. The manager
+  // checks for changes about once a second and sends nothing while nothing
+  // changed, so an idle stream costs one small read per second on the
+  // answering manager. Any manager answers: policies are computed from
+  // replicated state.
+  //
+  // With `shard_count` and `shards`, only the policies in those shards are
+  // sent (docs/autoscaling.md, "Replicas"): a policy's shard is FNV-1a
+  // (64-bit) of its key modulo `shard_count`, where the key is
+  // `<job id>/<group>/<task>` for an autoscaled task, `policy:<id>` for an
+  // external-target standalone policy, and `nodegroups` for every node
+  // group. An autoscaler replica watches the shards it holds a lease on, and
+  // starts a new watch when they change.
+  //
+  // A policy that no longer resolves (a defaults change applied with
+  // `force`, two namespace policies that disagree, or a plugin it names
+  // that was removed or closed to its namespace) is still sent, with
+  // `state = "invalid"` and the reason in `error`: the autoscaler holds it
+  // and reports it, rather than dropping it silently.
+  //
+  // ACL: `scale:read`, gated before anything is read; policies of jobs
+  // outside the caller's grant are left out. Re-checks the caller's
+  // credential periodically, like StreamEvents.
+  rpc WatchScalingPolicies (WatchScalingPoliciesRequest) returns (stream ScalingPolicySet);
+
+  // Sets the cluster's scaling defaults: the record every autoscaled task
+  // inherits for the fields it, and its namespace policies, leave unset
+  // (`legion scaling defaults apply`). The record has the jobspec
+  // `autoscale` shape without `checks`, and an inherited `min` must be a
+  // multiple of `count` of at least "1x".
+  //
+  // Every autoscaled task's effective policy is re-resolved first. When the
+  // change would leave any of them invalid (a cluster `min` above a task's
+  // own `max`, say), the apply is refused with FAILED_PRECONDITION listing
+  // them, unless `force` is set; then those policies are held `invalid`
+  // until fixed. `dry_run` returns the same report and writes nothing.
+  // Inheriting tasks pick the change up live, with no resubmit.
+  //
+  // ACL: `operator:write`. Retry-safe with `idempotency_key`.
+  rpc ApplyScalingDefaults (ApplyScalingDefaultsRequest) returns (ApplyScalingDefaultsReply);
+
+  // Reads the cluster's scaling defaults as written, and the effective
+  // defaults for one namespace with the origin of every field (built-in,
+  // cluster defaults, or a namespace policy): what a task with
+  // `autoscale = true` in that namespace would get.
+  //
+  // ACL: `scale:read` on the namespace.
+  rpc GetScalingDefaults (GetScalingDefaultsRequest) returns (GetScalingDefaultsReply);
+
+  // The autoscaler app's heartbeat: one call per evaluation tick, carrying
+  // the last evaluation of every target it evaluated. Held in the memory of
+  // the manager that leads the status lane (other managers forward it), and
+  // read back by GetScalingStatus, which reports the app NOT RUNNING once no
+  // report has arrived for three of the app's intervals. Also the channel
+  // for the app's state-change events (`scale.limited`, `scale.flapping`,
+  // `scale.check_failed`), which the manager records.
+  //
+  // ACL: app-plane. Only the bundled autoscaler's own workload identity (a
+  // token whose job grant belongs to an allocation of
+  // `legion-system/autoscaler`) or a management token may call it, so a
+  // caller with `scale:write` cannot forge the app's status. The app acting
+  // as a viewer (`legion-on-behalf-of`) is PermissionDenied, in audit-only
+  // mode too. With ACLs disabled every caller is trusted, as everywhere
+  // else.
+  rpc ReportScalingStatus (ReportScalingStatusRequest) returns (ReportScalingStatusReply);
+
+  // Records an autoscaler action that is not a task's count write:
+  //
+  // - a `dry-run` policy's "would" decision (`kind = "would"`): a
+  //   `scale_history` row with `applied = false`, so `legion scaling
+  //   history` shows what the policy would have done;
+  // - an **action intent** on a standalone policy (`kind = "intent"`),
+  //   written before the app acts on a target outside Legion (calls
+  //   `target/scale` or `target/terminate`, drains or forgets a node-group
+  //   member), and its **outcome** (`kind = "outcome"`) once it has. Both are
+  //   compare-and-set on the policy's action version, so when two autoscaler
+  //   replicas' shard leases overlap, exactly one of them acts on each
+  //   decision (docs/autoscaling.md, "No duplicate actions"). The reply says
+  //   whether the write won, and carries the policy's action row either
+  //   way.
+  //
+  // ACL: app-plane, like ReportScalingStatus.
+  rpc RecordScalingAction (RecordScalingActionRequest) returns (RecordScalingActionReply);
+
+  // Reports every autoscaled task's live state: its effective count, bounds
+  // and mode, the autoscaler's last evaluation of it (what it wants, the
+  // state, the one-line summary), pins and pauses, and the last recorded
+  // change; and whether the autoscaler app is running at all. With
+  // `detail`, also the last evaluation's full stage-by-stage decision and
+  // the effective policy with the origin of every field
+  // (`legion scaling explain`).
+  //
+  // Answered by the status-lane leader, which holds the app's reports (other
+  // managers forward). Works with the app down, and says so.
+  //
+  // Standalone policies are listed after the tasks; node groups (kind
+  // `nodes`) are listed whatever namespaces are asked for, since they have
+  // none. With several autoscaler replicas (docs/autoscaling.md,
+  // "Replicas"), each target's entry is the newest report of it, from the
+  // replica that owns it.
+  //
+  // ACL: `scale:read`, gated before any lookup; targets of jobs outside the
+  // caller's grant are left out (a request naming such a job is refused).
+  // Node groups need `node:read`.
+  rpc GetScalingStatus (GetScalingStatusRequest) returns (GetScalingStatusReply);
+
+  // Lists the durable record of scaling changes for a job, newest first:
+  // every count write (by people and by the autoscaler, applied or
+  // deferred), pins and releases, and a `dry-run` policy's "would" rows.
+  // History is capped at 200 rows per task. A standalone policy's history
+  // (`policy`) also has its action intents' rows: `scaled`, `failed`, and
+  // for a node group `drain`, `terminate`, `forget`, and `uncordon`.
+  //
+  // ACL: `scale:read` on the job, or on the standalone policy; a node
+  // group's with `node:read`.
+  rpc GetScaleHistory (GetScaleHistoryRequest) returns (GetScaleHistoryReply);
+
+  // Pauses autoscaling for one task, every autoscaled task of one job, one
+  // standalone policy (`policy`), or the whole cluster (`all`), optionally
+  // for a duration; or resumes it (`resume`). A pause is replicated state, enforced in two places: the
+  // autoscaler skips paused targets, and ScaleTask refuses autoscaler
+  // writes to them, so a pause holds even against a misbehaving app. People
+  // can still scale a paused task by hand.
+  //
+  // A node group (`policy` naming one) is paused like a standalone policy:
+  // its count holds, no drain starts, and drains that have not reached
+  // terminate are abandoned (their nodes uncordoned).
+  //
+  // ACL: `scale:write` on the job (or the standalone policy); a node group
+  // needs `operator:write` and `node:write`; `all` needs `operator:write`.
+  // A standalone policy is gated before its lookup with either grant, so a
+  // caller cannot probe for policies. Retry-safe with `idempotency_key`.
+  rpc PauseScaling (PauseScalingRequest) returns (PauseScalingReply);
+
+  // Creates or replaces a standalone scaling policy (`legion scaling
+  // apply`; docs/autoscaling.md, "Standalone policies"): a policy for a
+  // target that is not a Legion task, stored as its own versioned object on
+  // the Control lane. `spec_json` is the policy as written (the CLI
+  // evaluates a Nickel file to it): `name`, `namespace`, `description`,
+  // `target = { plugin, config }`, and the jobspec `autoscale` record's
+  // fields, with `min`, `max` and `checks` required.
+  //
+  // The policy is resolved exactly as the autoscaler will run it (the
+  // layered defaults, then its own fields) and every plugin it names (its
+  // target, each check's source, each plugin strategy) must be installed in
+  // the autoscaler's app config and open to the policy's namespace; a
+  // policy that fails either is refused with INVALID_ARGUMENT naming the
+  // field or the plugin. What only the plugin knows (that it implements
+  // the kind, and its `policyConfigSchema`) is checked by the autoscaler
+  // when it next evaluates the policy, which reports `invalid` with the
+  // reason (`legion scaling apply --wait` waits for that report).
+  //
+  // A node-group policy (`target = { nodes = … }`; docs/autoscaling.md,
+  // "Node groups") is cluster-scoped: it is stored with no namespace, its id
+  // is its bare name, and it must name a target plugin that is installed
+  // (whether that plugin declares the `nodes` capability is checked by the
+  // autoscaler). Its name may not be the name of a policy in the `default`
+  // namespace, nor the reverse (ALREADY_EXISTS): both are addressed by the
+  // bare name.
+  //
+  // `dry_run` validates and returns the diff against the stored version
+  // without writing. Applying an unchanged policy writes nothing and keeps
+  // its version.
+  //
+  // ACL: `scale:write` on the policy's namespace and name (the scope a job
+  // of that name would have), checked once the body is parsed and before
+  // anything is looked up. A node-group policy needs `operator:write` and
+  // `node:write`, and no `scale` grant. Retry-safe with `idempotency_key`.
+  rpc ApplyScalingPolicy (ApplyScalingPolicyRequest) returns (ApplyScalingPolicyReply);
+
+  // Deletes a standalone scaling policy. The autoscaler stops evaluating it
+  // on its next policy update; its history stays until the history cap
+  // (or the policy's name is reused) ages it out. Deleting a policy that
+  // does not exist is NOT_FOUND.
+  //
+  // `name` is `namespace/name`, or a bare name: the `default` namespace's
+  // policy of that name, else the node group of that name.
+  //
+  // ACL: before the lookup, `scale:write` on the policy's namespace and
+  // name, or `operator:write` and `node:write` (the node-group grant);
+  // after it, the grant the policy's kind needs. Node groups are looked up
+  // only for a caller holding the node-group grant, so a caller cannot tell
+  // an existing policy from a missing one. Retry-safe with
+  // `idempotency_key`: a replayed delete reports `deduplicated`.
+  rpc DeleteScalingPolicy (DeleteScalingPolicyRequest) returns (DeleteScalingPolicyReply);
+
+  // Lists scaling policies in the namespaces asked for (`legion scaling
+  // list`): every autoscaled task (kind `task`, or `group` for a multi-task
+  // group), every standalone policy (kind `external`), and every node group
+  // (kind `nodes`, listed whatever namespaces are asked for: it has none),
+  // with its mode, bounds, and whether it resolves. Any manager answers:
+  // policies are computed from replicated state.
+  //
+  // ACL: `scale:read`, gated with `AclScope::any()`; entries outside the
+  // caller's grant are left out. Node groups need `node:read`.
+  rpc ListScalingPolicies (ListScalingPoliciesRequest) returns (ListScalingPoliciesReply);
+
+  // How many nodes of each node-group template the pending work needs
+  // (docs/autoscaling.md, "Capacity demand"; the `nodegroup.pending` input
+  // of node autoscaling).
+  //
+  // Pending work is every task of an active job that is short of its
+  // effective count (the count `legion job scale` and the autoscaler set),
+  // counted against its allocations across config versions, plus keyed
+  // instances that have no allocation. Left out: `count.per` tasks (they
+  // follow nodes rather than ask for them), cron tasks, finished batch
+  // tasks, and jobs whose eval is still pending or in flight (the scheduler
+  // has not tried the capacity that exists yet; they are listed in
+  // `awaiting_scheduler`). A blocked eval is exactly what this is for.
+  //
+  // For each template the manager builds a synthetic node (the worker
+  // type's pool, namespaces, attributes and resources, then the shape, or a
+  // copy of an existing member) and packs the pending replicas onto copies
+  // of it, first fit decreasing, with the scheduler's own feasibility
+  // functions: the permit and pool, the node's namespaces, constraints,
+  // volume drivers, resources (with `reservedResources`, `capacity` and
+  // oversubscription), `distinct`, static ports, and a gang's quorum, which
+  // places together or not at all. A task group's tasks pack as one unit.
+  // Nodes already on their way (`upcoming`) absorb pending work first,
+  // across all templates. Each template is then answered on its own: "if
+  // only this group grew, how many nodes would the work it can host need?"
+  // Replicas no template can host are `unfittable`, with each template's
+  // failing rule: a jobspec or policy problem, not a capacity problem.
+  //
+  // The answer is approximate, on the safe side: first fit is not the
+  // scheduler's scoring, and preemption, node-local disk, and the free room
+  // on existing nodes are not modelled, so it can over-ask by a node. It is
+  // a point-in-time read on whichever manager answers, computed off the
+  // scheduler's path; nothing is written.
+  //
+  // With a template's `members`, the reply also describes the group's
+  // current members for node scale-in: each node's provider id, its
+  // `legion.scale-in` tag, its reserved share, and its allocations with
+  // what makes a node never a victim (a `legion-system` job, node-local
+  // storage, a `disruption.minAvailable` the drain would break), and with
+  // `fit_check` whether an underutilized member's work fits on the others.
+  //
+  // ACL: `node:read`, gated before anything is read, then on each
+  // template's pool. Node counts cover all pending work, but a pending or
+  // unfittable entry names its job only when the caller has `job:read` on
+  // it; entries for other jobs keep their counts and rules and leave the
+  // job, group and task names empty (`redacted = true`).
+  //
+  // Errors:
+  // - InvalidArgument: no templates, a template without a name, two with
+  //   the same name, an invalid shape, or more than 64 templates.
+  // - NotFound: `like_node` names a node that does not exist.
+  // - PermissionDenied: `node:read` missing for a template's pool.
+  rpc GetCapacityDemand (GetCapacityDemandRequest) returns (GetCapacityDemandReply);
+
+  // Permanently removes a stopped job and related records. Refused
+  // (FAILED_PRECONDITION) for an installed app's job; once the app is
+  // uninstalled, its stopped job is an ordinary job and can be destroyed.
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
 
   // Lists jobs known by the manager.
@@ -271,6 +686,9 @@ service Manager {
   // fails with FAILED_PRECONDITION unless the caller also holds plain
   // `job:write` on that job name (this stops a template-only identity from
   // hijacking unrelated jobs when the rendered name is user-influenced).
+  //
+  // A render that names an installed app's job is refused, as RunJob's
+  // submit is (FAILED_PRECONDITION).
   rpc RunJobTemplate (RunJobTemplateRequest) returns (RunJobTemplateReply);
 
   // Creates a keyed-mode stateful instance for a job's keyed task and
@@ -1488,6 +1906,46 @@ service Manager {
   rpc SetNodeAvailability (SetNodeAvailabilityRequest)
       returns (SetNodeAvailabilityReply);
 
+  // Removes a node's record and revokes its node token, in one write
+  // (docs/architecture-managers-workers.md, "Forgetting a node"). For dead
+  // records (a machine that is gone and will not come back), and the last
+  // step of node-group scale-in (drain, terminate, forget).
+  //
+  // A forgotten node is gone from `legion node list` and from scheduling.
+  // Its node token no longer authenticates, so a worker still running there
+  // cannot heartbeat or re-register under its old identity: it would have
+  // to join again with a join token, which a node group's spent
+  // `max_uses` token refuses. Its allocations, if any (only with `force`),
+  // are removed and replaced elsewhere, snapshots stored on it are marked
+  // lost, and its liveness row is swept by the next orphan pass.
+  //
+  // The guard, unless `force` is set, refuses (FailedPrecondition, naming
+  // what to do) a node that:
+  // - still has allocations, including stateful ones held by their
+  //   `stateful.onLost` policy: drain it first, or wait for the policy;
+  // - is live and schedulable: its status is `active` and it is not
+  //   cordoned. Cordon or drain it first, or wait until it is marked lost
+  //   (a cordoned, empty node may be forgotten while it still heartbeats:
+  //   that is the scale-in flow, which terminates the machine first);
+  // - holds node-local volumes, whose data lives on that machine.
+  //
+  // `force` asserts the machine is gone for good: the record is removed
+  // whatever its state, its allocations are released for replacement at
+  // once (stateful instances included, without waiting for
+  // `onLost.replaceAfter`), and node-local volumes stay pinned to the
+  // missing node until an operator replaces their instances.
+  //
+  // Retry-safe: with an `idempotency_key`, a repeat of a request that
+  // succeeded replays its result with `deduplicated = true` instead of
+  // answering NotFound.
+  //
+  // Errors:
+  // - InvalidArgument: `node_id` is empty.
+  // - NotFound: no node with `node_id` exists.
+  // - FailedPrecondition: the guard refused (see above).
+  // - PermissionDenied: caller lacks `node:write` for the node's pool.
+  rpc ForgetNode (ForgetNodeRequest) returns (ForgetNodeReply);
+
   // Retrieves captured task stdout/stderr for a job's allocations.
   //
   // The manager locates the node hosting each allocation and proxies the read
@@ -1791,7 +2249,11 @@ service Manager {
   // Gets one KV entry by key.
   rpc GetKv (GetKvRequest) returns (GetKvReply);
 
-  // Lists KV entries by prefix.
+  // Lists KV entries by prefix, and with `include_locks` the unexpired
+  // locks under it (owners and expiries, never their lock ids).
+  //
+  // ACL: `kv:read`, gated before anything is read; entries and locks whose
+  // keys the caller cannot read are left out.
   rpc ListKv (ListKvRequest) returns (ListKvReply);
 
   // Deletes one KV entry by key.
@@ -2138,6 +2600,485 @@ service Manager {
   // deleted; deleting the user only prevents future logins.
   rpc DeleteAclUser (DeleteAclUserRequest) returns (DeleteAclUserReply);
 
+  // Lists job grants: what each job config version's `legion` identities
+  // were granted at submit, and by whom (docs/workload-identity.md,
+  // "Permissions"). Requires `acl:read`.
+  //
+  // A job asks for access to Legion itself with `permissions` (inline ACL
+  // rules) and `policies` (policy names) on the reserved `legion` identity
+  // of a task. Every path that stores a job config (RunJob, RunJobTemplate)
+  // grants them only when the submitting token holds every one, and records
+  // the grant with the version, in the submitter's name. A workload's
+  // `legion` token then carries the grant of the version its allocation
+  // runs, resolved when the token is verified. Versions that ask for nothing
+  // have no grant and are not listed.
+  //
+  // Revoked grants are left out unless `include_revoked` is set.
+  rpc ListGrants (ListGrantsRequest) returns (ListGrantsReply);
+
+  // Revokes a job's grants: every version's, or one version's. Requires
+  // `acl:write`.
+  //
+  // A workload token resolves its grant every time it is verified, so the
+  // job's tokens (and ACL tokens minted from them with `legion login
+  // --method legion`) lose the access at their next request; tokens keep
+  // whatever `controlPlaneBindings` give them. Allocations keep running.
+  // Revocation does not stick to the job: the next submit of the job by
+  // someone who holds the access grants it again, as a submit always does.
+  //
+  // Retry-safe: a repeated `idempotency_key` returns the first reply with
+  // `deduplicated` set. Revoking a job with no live grants succeeds and
+  // revokes nothing (`revoked = 0`).
+  //
+  // Errors:
+  // - InvalidArgument: `job` is empty.
+  rpc RevokeGrant (RevokeGrantRequest) returns (RevokeGrantReply);
+
+  // Lists installed apps (docs/apps.md): each app's record, settings, grant,
+  // status, and where it runs. Requires `app:read`; the list is filtered to
+  // the apps the caller may read (`names` selector).
+  //
+  // An app is a job in the reserved `legion-system` namespace, a grant (what
+  // that job's `legion` identity may do), and registrations. Its status is
+  // derived when it is read: `stopped` (disabled), `degraded` (the
+  // reconciler's last pass failed, or fewer replicas run than asked for),
+  // `pending` (nothing runs yet, with why), or `running`.
+  rpc ListApps (ListAppsRequest) returns (ListAppsReply);
+
+  // Shows one app: everything ListApps reports, plus its manifest, config,
+  // and the reconciler's last action, error, and build marker. Requires
+  // `app:read` on the app.
+  //
+  // Errors:
+  // - NotFound: no app of that name is installed.
+  rpc GetApp (GetAppRequest) returns (GetAppReply);
+
+  // Installs an app from a manifest (`legion app install <file|url>`).
+  // Requires `app:write` on the app's name, and every permission the
+  // manifest asks for: the same grant check a job submit runs (docs/
+  // workload-identity.md, "Permissions"), against the installer. The grant
+  // is recorded on the app record in the installer's name, and the app
+  // reconciler then submits the app's job in `legion-system`.
+  //
+  // What else installing takes (docs/apps.md, "Trust model"):
+  // - every permission behind each RPC a sandboxed page lists in `rpcs`,
+  //   everywhere the RPC reaches, reserved scopes included (a page runs its
+  //   RPCs as whoever views it, so it can never make a viewer do what its
+  //   installer could not);
+  // - `operator:write`, when the manifest's `placement` is not `managers`
+  //   (where an app runs is where its token lands).
+  //
+  // The app's job, as rendered, may hold nothing host-level besides its
+  // own `exec` tasks, which run as the app's own uid (assigned here, from
+  // 1900000000 up, and never shared): no `exec` health check, `file://`
+  // artifact, `auth.nodeIdentity`, file at an absolute host path, cgroup of
+  // its own, or negative OOM score, whoever installs it. A manifest may not
+  // name an exec task's `user`.
+  //
+  // The rendered job then goes through the submit's admission chain as the
+  // reconciler would submit it (its recorded grant, the namespace's
+  // policies and quota, `kv:read` on every KV key it references, artifacts
+  // and pins, volumes, capabilities), writing nothing: an app whose job the
+  // reconciler would be refused is refused here, with the reason, instead
+  // of installing and sitting in `reconcile refused`.
+  //
+  // KV keys under `legion/apps/<name>/` left by an earlier app of the same
+  // name (uninstalled without `purge`) are reported in the prompt: the new
+  // app's grant may reach them.
+  //
+  // `dry_run` validates the manifest and the installer's coverage and
+  // returns the prompt (`prompt`) without installing, which is how the CLI
+  // shows what the app runs, where, as whom, and with what grant before it
+  // asks. A dry run that the grant check would refuse still answers, with
+  // the refusal in `uncovered`; one the admission chain refuses is that
+  // error.
+  //
+  // Retry-safe: a repeated `idempotency_key` returns the first reply with
+  // `deduplicated` set.
+  //
+  // Jobspec keys (`extensions`; docs/apps.md, "Jobspec extensions"): each
+  // declaration is checked (one key per point, `task` and `group` as one; an
+  // object schema of at most 64 KiB with only local `$ref`s, compiled with a
+  // resolver that refuses every other ref, so nothing is fetched; examples
+  // that pass it), and so are the collision rules: a key that is a core
+  // field at its point is refused, and so is one another installed app
+  // declares there (`keys` installs it under another name). The prompt
+  // reports what the app's keys would do to stored values: the pending
+  // values (kept under `allow_unknown_fields`) it adopts, and how they fare
+  // against its schemas.
+  //
+  // Errors:
+  // - InvalidArgument: the manifest does not parse or validate (unknown
+  //   fields, a bad name, a missing `version`, a config schema that does
+  //   not compile, has a remote `$ref`, or applies itself to the same
+  //   value again (`allOf: [{ "$ref": "#" }]`), a default that fails it, a
+  //   job fragment that does not parse or names an exec task's `user`, a
+  //   job with something host-level in it, an extension declaration that
+  //   breaks a rule above, a key that is a core field, a page RPC that is
+  //   not page-callable), `config_json` fails the schema, or `keys` names a
+  //   key the manifest does not declare.
+  // - PermissionDenied: the caller lacks `app:write`, a permission the
+  //   manifest asks for, a permission behind a page's `rpcs`, or
+  //   `operator:write` for a placement other than `managers`.
+  // - AlreadyExists: an app of that name is installed (use UpgradeApp).
+  // - Any code of the admission chain (`app <name>'s job would be refused
+  //   when the reconciler submits it: …`): INVALID_ARGUMENT,
+  //   PERMISSION_DENIED (a KV key the grant does not cover),
+  //   RESOURCE_EXHAUSTED (a quota), UNAVAILABLE (a pin's source could not be
+  //   reached; retry).
+  // - FailedPrecondition: the name is a bundled app's, a job
+  //   `legion-system/<name>` exists that is not this app's (no `managedBy`
+  //   stamp for it: install never takes a job over), or one of its jobspec
+  //   keys is another installed app's at that point (the message names the
+  //   owner and the `--key` rename).
+  rpc InstallApp (InstallAppRequest) returns (InstallAppReply);
+
+  // Replaces an installed app's manifest (`legion app upgrade`). Requires
+  // `app:write` and, because a new manifest changes the code the app runs,
+  // every permission the new manifest asks for, checked against the caller
+  // as at install, and so are the permissions behind its pages' `rpcs`.
+  // The new job is held to the install rules too: nothing host-level
+  // besides the app's own `exec` tasks, and no `user`.
+  //
+  // The reply carries the permission diff. When the new manifest asks for a
+  // permission the recorded grant does not hold, nothing changes unless
+  // `approve` is set: the reply has `upgraded = false` and the diff, so the
+  // CLI can ask. A manifest that only keeps or drops permissions upgrades
+  // without `approve`. The stored config is checked against the new
+  // schema; a config that no longer matches refuses the upgrade.
+  //
+  // The new manifest's jobspec keys replace the installed ones, with the
+  // install-time checks (a key the installed version already declared may
+  // stay even if a newer Legion made it a core field). The prompt reports
+  // every stored value of the app's keys checked against the new schemas;
+  // values that fail stay stored and read as `invalid`. A point the new
+  // manifest no longer declares orphans the values jobs set there: the
+  // upgrade is then refused unless `force` is set, and `orphaned_jobs`
+  // lists them (on a dry run too).
+  //
+  // The new job goes through the submit's admission chain, as at install.
+  // The operator's settings (replicas, placement, pool, resources) are kept;
+  // the prompt says so where the new manifest's defaults differ.
+  //
+  // Upgrading to the manifest that is already installed is still a write:
+  // when the app's job does not run healthy at the version the record
+  // renders (its rollout failed or rolled back), the reconciler resubmits it
+  // with a forced reschedule, which is how a failed upgrade is retried.
+  // There is no rollback verb: upgrade again with the previous manifest.
+  //
+  // Retry-safe with `idempotency_key`.
+  //
+  // Errors:
+  // - NotFound: no app of that name.
+  // - InvalidArgument: the manifest is invalid (as at install), names
+  //   another app, or the stored config fails its schema.
+  // - PermissionDenied: the caller lacks `app:write`, a permission, or a
+  //   permission behind a page's `rpcs`.
+  // - FailedPrecondition: the app is bundled (bundled apps upgrade with the
+  //   binary), or the new manifest drops an extension point jobs use and
+  //   `force` is not set (the message lists them).
+  // - Any code of the admission chain, as at install.
+  rpc UpgradeApp (UpgradeAppRequest) returns (UpgradeAppReply);
+
+  // Uninstalls an app (`legion app uninstall`): disables the record (so a
+  // reconciler submit already in flight loses its compare-and-set), stops
+  // its job, revokes the job's grants, and deletes the record. The stopped
+  // job stays in `legion-system`, an ordinary job now, until someone
+  // destroys it. Requires `app:write`. A record this manager cannot decode
+  // (`status = corrupt`) is removed by name the same way, a bundled app's
+  // included (the reconciler seeds it again from this build).
+  //
+  // While any job sets the app's jobspec keys, uninstalling needs `force`;
+  // the values stay stored, read as `orphaned`, and are listed in
+  // `orphaned_jobs`.
+  //
+  // The app's KV under `legion/apps/<name>/` stays unless `purge` is set
+  // (which also needs `kv:write` there); `kv_keys` says how many keys were
+  // left or deleted. `dry_run` reports all of this and changes nothing.
+  //
+  // Retry-safe with `idempotency_key`: the record's deletion, the purge, and
+  // the key are one replicated entry, and a retry gets the first reply back
+  // whole, with `deduplicated`. Uninstalling an app that is not installed is
+  // NotFound.
+  //
+  // Errors:
+  // - FailedPrecondition: the app is bundled (disable it instead), or jobs
+  //   set its jobspec keys and `force` is not set (the message lists them).
+  // - PermissionDenied: `purge` without `kv:write` on the app's prefix.
+  rpc UninstallApp (UninstallAppRequest) returns (UninstallAppReply);
+
+  // Enables or disables an app (`legion app enable|disable`). Disabling
+  // stops the app's job and keeps its record, config, and grant; enabling
+  // runs it again. Requires `app:write`. Setting the state an app already
+  // has is a write too: it retries a reconcile the last failure parked, and
+  // resubmits (with a forced reschedule) a job that does not run healthy at
+  // the version the record renders. `dry_run` says what would change.
+  //
+  // Retry-safe with `idempotency_key`.
+  rpc SetAppEnabled (SetAppEnabledRequest) returns (SetAppEnabledReply);
+
+  // Changes an app's settings (`legion app set`): replicas, placement, the
+  // pool for worker placement, and CPU and memory per task. The reconciler
+  // re-renders the job and rolls it. Requires `app:write`; a change of
+  // placement or pool also requires `operator:write`, because it decides
+  // which nodes hold the app's token and run its code with its grant. The
+  // re-rendered job goes through the submit's admission chain first (a
+  // quota, a pool policy). `dry_run` validates and says what would change.
+  //
+  // Retry-safe with `idempotency_key`.
+  //
+  // Errors:
+  // - InvalidArgument: replicas outside 1-32, an unknown placement, a pool
+  //   with `managers` placement, a zero resource.
+  // - PermissionDenied: the caller lacks `app:write`, or `operator:write`
+  //   for a placement or pool change.
+  rpc UpdateAppSettings (UpdateAppSettingsRequest) returns (UpdateAppSettingsReply);
+
+  // Replaces an app's config (`legion app config set`), validated against
+  // the manifest's config schema. The reconciler renders it into the job as
+  // a file (`$LEGION_APP_CONFIG`) and rolls the job: the job's version
+  // history is the config's history. Requires `app:write`; a change to any
+  // of the manifest's `codeFields` (plugin sources, endpoints the app runs)
+  // also requires every permission of the app's recorded grant, as install
+  // does, so `app:write` is never a path to the app's grant.
+  //
+  // Retry-safe with `idempotency_key`.
+  //
+  // The job the new config renders is held to the install rules: a config
+  // that would add something host-level (an artifact code field set to a
+  // `file://` source) is refused, whoever sets it; and it goes through the
+  // submit's admission chain. `dry_run` validates and says what would
+  // change.
+  //
+  // A bundled app whose new build is held because the stored config does
+  // not match that build's config schema (`upgrade held: …`) accepts a
+  // config that matches the new schema even where the stored manifest's
+  // refuses it: that config is what lets the upgrade through.
+  //
+  // Errors:
+  // - InvalidArgument: `config_json` is not JSON, fails the schema, or
+  //   renders a job with something host-level in it.
+  // - PermissionDenied: a code field changed and the caller does not hold
+  //   the app's grant.
+  rpc SetAppConfig (SetAppConfigRequest) returns (SetAppConfigReply);
+
+  // Streams the calling app's jobspec extension values (docs/apps.md,
+  // "Jobspec extensions"; apps plan §6.6, "How values reach the app"): every
+  // value, in every job, that the app's keys own, wherever in the job it is
+  // written, with the effective value (the app's current schema defaults
+  // filled) and its validity against that schema.
+  //
+  // The first message has `snapshot` set and carries every current value.
+  // Each later message carries what changed since the previous one: upserts
+  // (a new value, a changed value, a new job version, a value whose
+  // validity changed after an app upgrade) and deletes (a value removed by
+  // a resubmit, or its job destroyed). The manager checks for changes about
+  // once a second and sends nothing while nothing changed. Any manager
+  // answers: values are read from replicated state.
+  //
+  // A value is included whatever its job's status (`job_status` says it);
+  // `invalid` values are included too, flagged, and the app decides whether
+  // to act on them. A pending value (kept under `--allow-unknown-fields`
+  // before the app was installed) that the app's key claims is included
+  // with `adopted` set, unless the key declares `requires`: then it stays
+  // pending until a submit by someone holding the permission.
+  //
+  // `shard_count` and `shards` split the values across an app's replicas:
+  // a value belongs to shard `shard_of(job_id, shard_count)` (the first
+  // eight bytes of SHA-256 of the canonical job id, big-endian, modulo the
+  // count), the same key hash the autoscaler shards its policies by.
+  //
+  // ACL: app-plane. Only an app's own workload identity may call it (its
+  // `legion` token, through the API socket or as a bearer token, or an ACL
+  // token minted from it with `legion login --method legion`), and it
+  // returns only that app's values: `app` must be empty or name the caller.
+  // A management token may name any installed `app`. An app acting as a
+  // viewer (`legion-on-behalf-of`) is refused. Re-checks the caller's
+  // credential periodically, like StreamEvents.
+  //
+  // Errors:
+  // - Unauthenticated: no credential.
+  // - PermissionDenied: the caller is not an app's workload identity (or
+  //   names another app).
+  // - InvalidArgument: a shard outside `shard_count`, or a management
+  //   caller that names no app.
+  // - NotFound: `app` is not installed.
+  rpc WatchAppExtensions (WatchAppExtensionsRequest) returns (stream AppExtensionEvent);
+
+  // Lists the UI extensions installed apps register (docs/apps.md, "Views
+  // and actions"; docs/ui-architecture.md, "App extensions"): the pages,
+  // overview cards, job and node panels, and task badges the SPA draws from
+  // apps' declarative views, and the apps' sandboxed pages (`ui.pages`,
+  // listed in the `nav` slot with `page` set). Requires `app:read`; the
+  // list is filtered to the apps the caller may read (`names` selector),
+  // and to enabled apps.
+  //
+  // Each entry the manifest declares with a `permission` is filtered by it,
+  // checked as the caller:
+  // - with `context` set, on that context's scope (the job's namespace and
+  //   name for `job` and `task` slots; the node's pool for `node`), exactly
+  //   as GetAppView will check it, so the SPA shows a panel only to viewers
+  //   who may see it;
+  // - without `context`, on any scope ("does the caller hold it
+  //   anywhere?"), which is what the sidebar and overview need at login.
+  //   A sandboxed page's permission is always checked this way, as
+  //   GetAppPage checks it.
+  //
+  // An entry without a permission needs only `app:read` on its app.
+  //
+  // Nothing is forwarded to any app: this answers from the installed
+  // manifests alone.
+  //
+  // Errors:
+  // - InvalidArgument: an unknown `slot`, or a `context` whose slot is not
+  //   `slot` or that does not fit its slot (see AppViewContext).
+  rpc ListUiExtensions (ListUiExtensionsRequest) returns (ListUiExtensionsReply);
+
+  // Renders one of an app's declarative views (`legion app view`, the
+  // `legion_app_view` MCP tool, and every app panel in the SPA). The one
+  // data path for all three (apps plan §6.5).
+  //
+  // The manager authorizes before anything reaches the app:
+  // 1. `app:read` on the app;
+  // 2. the view must be registered in the context's slot;
+  // 3. the entry's declared `permission`, checked as the caller on the
+  //    context's scope (on any scope for `nav` and `overview`). A caller
+  //    without it is refused here, and the app sees no request at all.
+  //
+  // Only then does it forward `GET /legion/v1/views/<view>?<context>` to
+  // one running allocation of the app's job, over the worker plane
+  // (`Worker.ForwardAppRequest`), to the port the manifest's `ui.port`
+  // names. The request carries a **viewer assertion** in the
+  // `Legion-Viewer` header: a JWT signed with the cluster's
+  // workload-identity key, `aud = app:<name>`, living 60 seconds, whose
+  // `legion.io/viewer` claim names the caller (principal, accessor id), the
+  // permission checked and where, and the context exactly as the query
+  // carries it. Apps must refuse a request whose assertion is missing,
+  // expired, for another audience, or for another context; the app
+  // framework does (docs/apps.md, "The viewer assertion").
+  //
+  // The answer is validated against the view schema (`legion-view/1`: the
+  // closed block set, no unknown fields, no raw HTML, links only to
+  // `http(s)` or in-app routes) before it is returned. A view may answer
+  // `{ "hidden": true }`: nothing to show for this context.
+  //
+  // Errors:
+  // - InvalidArgument: a context that does not fit its slot.
+  // - PermissionDenied: the caller lacks `app:read` or the entry's
+  //   permission on the context.
+  // - NotFound: no such app, or the app registers no such view in that
+  //   slot (or the app answered 404 for it).
+  // - FailedPrecondition: the app is disabled; workload identity is off on
+  //   this manager (`workloadIdentity.enabled`), so no assertion can be
+  //   signed; or the app answered with a view that fails the schema, or
+  //   refused the assertion (the message names which).
+  // - Unavailable: no allocation of the app's job is running, or its node
+  //   or port cannot be reached (retryable).
+  // - DeadlineExceeded: the app did not answer within 10 seconds.
+  rpc GetAppView (GetAppViewRequest) returns (GetAppViewReply);
+
+  // Invokes an action an app declares (`ui.actions`), the button in a
+  // view's `actions` block. Mutating, retry-safe with `idempotency_key`,
+  // and audited: every invocation that passes `app:read` records an
+  // `app.action` event (app, action, caller, context, outcome `ok`,
+  // `failed`, or `denied`).
+  //
+  // Authorization, before anything reaches the app:
+  // 1. `app:read` on the app;
+  // 2. the action must be declared, and the context must have a scope
+  //    (`job`, `task`, or `node`): actions are never pressed on the
+  //    sidebar or the overview;
+  // 3. the action's declared `permission` (required on every action),
+  //    checked as the caller on the context's scope. `app:write` is not
+  //    needed: the declared permission is what the button may do, and
+  //    `app:write` would let every operator who presses it reconfigure the
+  //    app.
+  //
+  // `inputs_json` is checked against the action's typed inputs (string,
+  // number, duration, enum, boolean); unknown inputs are refused and
+  // defaults filled in. The manager then forwards `POST
+  // /legion/v1/actions/<action>` with `{ "context": {...}, "inputs":
+  // {...} }` and a viewer assertion that also carries the SHA-256 of the
+  // inputs' canonical JSON, so an app acts only on the context and inputs
+  // the manager authorized.
+  //
+  // The action's assertion also carries a `delegation`: the declared
+  // resource, the declared action (then `read` on the same resource when
+  // the caller holds it there), and exactly the scope checked (`namespace`
+  // and `name`, plus `template` when the job came from one, for job and
+  // task slots; `pool` for a node slot's `node` permission). The app may
+  // present the assertion back in the `legion-on-behalf-of` metadata, beside
+  // its own credential, to make its calls as `<caller> via app <app>`,
+  // holding only that delegation within its own grant, for the assertion's
+  // 60 seconds; the pause or pin it makes is then recorded by that
+  // principal, not by the app (docs/auth-and-acls.md, "Delegated
+  // identities"). A context whose job, namespace, or pool has a `*` in its
+  // name cannot be delegated: InvalidArgument.
+  //
+  // The app answers `{ "message": "...", "view": {...} }`; `view`, when
+  // present, is a refreshed view, validated like GetAppView's.
+  //
+  // Actions run on the Control lane's leader. A follower refuses an action
+  // before anything reaches the app (the typed not-the-leader rejection),
+  // and the leader-forward layer replays it on the leader, so a press that
+  // lands on a follower runs once. With `idempotency_key`, the reply is
+  // recorded when the app answers; a call with the same key that arrives
+  // while the first still runs (a retry after a client timeout, a double
+  // press) waits for it, up to 45 seconds, and returns its reply with
+  // `deduplicated` (ABORTED, retryable with the same key, if it is still
+  // running then). A failure to record the key after the app ran the action
+  // is logged, never returned: returning it would run the action again.
+  // A leadership change while an action runs can still let a retry with the
+  // same key run it again on the new leader.
+  //
+  // Errors: as GetAppView, plus InvalidArgument for inputs that fail their
+  // declaration, FailedPrecondition carrying the app's own message when the
+  // app reports the action failed (HTTP 4xx other than 401, 403, 404), and
+  // Aborted when a call with the same key is still running.
+  rpc InvokeAppAction (InvokeAppActionRequest) returns (InvokeAppActionReply);
+
+  // Fetches one of an app's sandboxed pages (`ui.pages`; docs/apps.md,
+  // "Sandboxed pages"; apps plan §6.5, tier 2): the single-file HTML bundle
+  // the SPA mounts in an `<iframe sandbox="allow-scripts" srcdoc=...>`
+  // under a strict Content-Security-Policy, and the Manager RPCs the page
+  // may call through the SPA's bridge as the viewer.
+  //
+  // Authorized exactly like GetAppView, before anything reaches the app:
+  // 1. `app:read` on the app;
+  // 2. the page must be declared in the app's manifest;
+  // 3. the page's declared `permission`, if any, checked as the caller on
+  //    any scope (pages live in the sidebar, like a `nav` view).
+  //
+  // Only then does the manager forward `GET <bundle>` (default
+  // `/legion/v1/pages/<page>`) to one running allocation of the app's job,
+  // with a viewer assertion whose `legion.io/viewer` claim has `kind =
+  // "page"`, the page's name, and the `nav` slot's empty context. The answer
+  // must be `200` with a `text/html` content type, UTF-8, and at most 1 MiB;
+  // the manager does not sanitize it (a page is code, confined by the SPA's
+  // sandbox and CSP, not by the manager).
+  //
+  // The SPA stamps every call it makes for the page `legion-app-page:
+  // <app>/<page>`, and the manager refuses (PermissionDenied) a stamped call
+  // whose RPC the page's current manifest does not list, or whose app is
+  // not installed or enabled. That check runs before authentication, so
+  // every such refusal reads the same and names none of the page's `rpcs`.
+  // The RPCs a page may list never include ACL, token, grant, or app
+  // writes, or key rotations, and installing a page takes holding every
+  // permission behind its `rpcs` (InstallApp).
+  //
+  // Errors:
+  // - PermissionDenied: the caller lacks `app:read` or the page's
+  //   permission.
+  // - NotFound: no such app, or the app declares no such page (or answered
+  //   404 for it).
+  // - FailedPrecondition: the app is disabled; workload identity is off on
+  //   this manager; the app refused the viewer assertion; or the answer is
+  //   not UTF-8 HTML within 1 MiB (the message names which).
+  // - Unavailable: no allocation of the app's job is running, or its node
+  //   or port cannot be reached (retryable).
+  // - DeadlineExceeded: the app did not answer within 10 seconds.
+  rpc GetAppPage (GetAppPageRequest) returns (GetAppPageReply);
+
   // Lists the auth methods clients may log in with.
   //
   // Open endpoint: login UIs need this before any credential exists. Only
@@ -2382,6 +3323,22 @@ message WorkerConfig {
   //
   // Default: empty string (the default guard, no overrides).
   string security = 15;
+
+  // The namespaces whose jobs nodes of this type accept (worker-type config
+  // `namespaces`), as names or `*`-globs: `["ci-*"]`, `["legion-system"]`.
+  // The worker records the list on its node as the `namespaces` config
+  // attribute, and the scheduler refuses to place a job whose namespace no
+  // entry matches, whatever the job's `permit` says: it is a restriction of
+  // the node, not a toleration a job can write. The blocked-eval wake pass
+  // applies the same check, so a restricted node never wakes a job it would
+  // refuse. Globs follow the reserved-prefix rule: `*` matches every
+  // namespace except reserved `legion-*` ones, which only a pattern that
+  // itself starts with `legion-` matches. See docs/namespaces.md, "Nodes
+  // that accept only some namespaces".
+  //
+  // Default: empty (the node accepts every namespace, reserved ones
+  // included).
+  repeated string namespaces = 16;
 }
 
 // Reply payload for WorkerPreRegister.
@@ -2489,6 +3446,31 @@ message WorkerRegisterRequest {
   //
   // Default: empty (a worker that predates capabilities).
   repeated string capabilities = 9;
+
+  // A hash of the worker's own executable, computed once at startup (the
+  // first 16 bytes of its SHA-256, as hex). Recorded into the node's
+  // `dynamic_attrs` as `buildId`, next to `buildVersion`. `buildVersion` is
+  // the package version, which a rebuild without a version bump does not
+  // change; together they are the build the app reconciler rolls bundled
+  // apps on (docs/apps.md, "Upgrades"): an app's build marker moves only
+  // when every ready node its placement allows reports the same pair.
+  //
+  // Default: empty (a worker that predates it). Such a node is left out of
+  // every bundled app's build marker.
+  string build_id = 10;
+
+  // Per-host node attributes from `legion join --attr k=v` (and `legion
+  // start worker --attr`), such as the machine's provider id:
+  // `legion.provider-id = "i-0abc"`. Merged into the node's attributes over
+  // its worker type's, and under the join token's: token, then `--attr`,
+  // then worker type. Keys under the reserved `legion.` prefix are refused
+  // with InvalidArgument, except the per-host ones (`legion.provider-id`),
+  // and so are keys Legion reads as node structure (`namespaces`,
+  // `resources`, ...). At most 64 entries; keys up to 128 bytes, values up
+  // to 1024. See docs/auth-and-acls.md, "Node attributes from the join".
+  //
+  // Default: empty.
+  map<string, string> join_attributes = 11;
 }
 
 // Reply payload for WorkerRegister.
@@ -2604,6 +3586,45 @@ message RunJobRequest {
   // Neither set means `default`. The namespace must exist (NOT_FOUND
   // otherwise; namespaces are never created implicitly).
   optional string namespace = 6;
+
+  // Accept a jobspec that carries keys Legion does not know
+  // (`legion job run --allow-unknown-fields`).
+  //
+  // Default `false`: every unknown key, at the job level, in a task, or in
+  // any nested block, fails the request with INVALID_ARGUMENT. The message
+  // names each key with its path and, when one is close, the known key it
+  // most likely meant: `web: task web: unknown field `cuont` (did you mean
+  // `count`?)`.
+  //
+  // A key an installed app declares at that point is not unknown: it is
+  // checked against the app's schema (see RunJob), and a suggestion can be
+  // one (`did you mean `backup`, the backup app's key?`).
+  //
+  // When `true`:
+  // - a key directly on an extension point (the job's top level, a task, an
+  //   entry in a task's `volumes`, an entry in `network.ports`, or a task's
+  //   `service` block) that no installed app declares is kept, unvalidated,
+  //   in that block's `pendingExtensions` map, and stored with the version.
+  //   These are the places where apps declare their own keys, so a key there
+  //   may belong to an app that is not installed yet: installing one that
+  //   declares it adopts the value (`GetJobInfoReply.extensions`);
+  // - a key anywhere else is dropped;
+  // - each kept or dropped key is listed in `RunJobReply.warnings`, and the
+  //   set is recorded on the job config version this request creates
+  //   (`GetJobInfoReply.unknown_fields`, `legion job info`).
+  //
+  // The flag is about keys Legion does not know. A value Legion knows is
+  // wrong (a bad type, an out-of-range number, an unknown runtime, a value
+  // that fails an installed app's key's schema) is still an error. It does
+  // not relax blocks that are strict on their own: the
+  // network policy blocks (`network.egress`, `network.ingress`, an
+  // upstream's `handlers`), value sources (`{ kv = … }`), the runtime's
+  // `config`, and the `count`, `gang`, and `schedule` shorthands.
+  //
+  // A resubmit with the same flag and spec is `unchanged` and keeps the
+  // record of the version it matched. A manager that predates this field
+  // ignores it and drops every unknown key silently.
+  bool allow_unknown_fields = 7;
 }
 
 // Reply payload for RunJob.
@@ -2639,6 +3660,21 @@ message RunJobReply {
   //
   // In both cases `message` describes the recorded outcome, not this request's.
   bool deduplicated = 2;
+
+  // Advisory lines, one per warning, without the `warning: ` prefix. The
+  // same lines are appended to `message`, each after `warning: `, for
+  // clients that print only the message.
+  //
+  // They start with every unknown key `allow_unknown_fields` kept or
+  // dropped, dropped keys first (`task web: dropped unknown field
+  // `stop.signall``, `task postgres: volume data: kept `backup` as pending
+  // (no installed app declares it)`), then the submit's other warnings: a
+  // priority band preemption cannot honor, `resources` a runtime cannot
+  // enforce as written, a gated task with no egress, and the like (the lines
+  // `PlanJobReply.warnings` carries).
+  //
+  // A `deduplicated` reply rebuilds this list from the recorded `message`.
+  repeated string warnings = 3;
 }
 
 // One declared job-template variable.
@@ -2858,6 +3894,14 @@ message RunJobTemplateRequest {
   // there, scoped by the `templates` selector. Resolved against a
   // `namespace` the template renders exactly as RunJobRequest.namespace is.
   optional string namespace = 7;
+
+  // Accept a rendered spec that carries keys Legion does not know
+  // (`legion template run --allow-unknown-fields`). Default `false`: every
+  // unknown key fails the run with INVALID_ARGUMENT. When `true`, keys on
+  // extension points are kept as pending and the rest are dropped, exactly
+  // as RunJobRequest.allow_unknown_fields describes, and each one is listed
+  // in `RunJobTemplateReply.warnings` and recorded on the version.
+  bool allow_unknown_fields = 8;
 }
 
 // Reply payload for RunJobTemplate.
@@ -2873,6 +3917,12 @@ message RunJobTemplateReply {
 
   // Job config ID produced (or matched, when unchanged) by this run.
   string job_config_id = 4;
+
+  // Advisory lines, one per warning, without the `warning: ` prefix: the
+  // same lines RunJobReply.warnings carries (unknown keys the run kept or
+  // dropped under `allow_unknown_fields` among them). Also appended to
+  // `message`, each after `warning: `.
+  repeated string warnings = 5;
 }
 
 // Request payload for GetJobInfo.
@@ -2891,6 +3941,129 @@ message GetJobInfoReply {
   // Template that rendered the job's latest config, when it was submitted
   // via RunJobTemplate. Unset for raw RunJob submissions.
   optional JobTemplateProvenance template = 2;
+
+  // Set when the job's latest version was submitted by the app reconciler:
+  // the job belongs to an app (docs/apps.md), and direct writes to it are
+  // refused while the app is installed. Unset for every other job, and for
+  // an app's job whose latest version was stored some other way (which the
+  // reconciler reverts).
+  optional ManagedByInfo managed_by = 3;
+
+  // What `allow_unknown_fields` kept and dropped when the job's latest
+  // config version was submitted. Unset when that submit kept and dropped
+  // nothing (every submit without the flag, and one with the flag whose
+  // spec had no unknown keys). `legion job info` prints it as
+  // `submitted with --allow-unknown-fields: dropped …; … pending`.
+  //
+  // It describes the submit that created the version. Resubmitting a spec
+  // that renders to the same config is `unchanged` and leaves it in place,
+  // even when the resubmit no longer carries the dropped keys.
+  optional UnknownFieldsRecord unknown_fields = 4;
+
+  // The job's values for installed apps' jobspec keys (docs/apps.md,
+  // "Jobspec extensions"), as they read now: every value the latest
+  // version stores, with its effective value and its state against the
+  // apps installed now, then every pending key (kept under
+  // `--allow-unknown-fields`), adopted by an installed app that declares
+  // it or still pending. Values are visible to anyone with `job:read`, so
+  // they never hold secrets.
+  repeated JobExtensionValue extensions = 5;
+}
+
+// Where a jobspec extension value is written: the group and task for a
+// task-level point and every point below it, then the volume, port, or
+// service. All empty for the job point.
+message ExtensionPath {
+  string group = 1;
+  string task = 2;
+  string volume = 3;
+  string port = 4;
+  string service = 5;
+}
+
+// One of a job's values for an installed app's jobspec key, as it reads
+// now (GetJobInfoReply.extensions).
+message JobExtensionValue {
+  // The app that owns it: the app whose key stored it, or the installed app
+  // that claims a pending value. Empty for a pending value no app claims.
+  string app = 1;
+
+  // The extension point the app declared: `job`, `group`, `task`, `volume`,
+  // `port`, or `service`. A `group` value is written on one task of its
+  // group (`path.task`).
+  string point = 2;
+
+  ExtensionPath path = 3;
+
+  // The key as the jobspec wrote it: `backup`, or `apps.backup`.
+  string key = 4;
+
+  // The value as written, as JSON.
+  string value_json = 5;
+
+  // The value with the owning app's current schema defaults filled, as
+  // JSON (the value as written when no installed app owns it).
+  string effective_json = 6;
+
+  // `valid` (passes the app's current schema), `invalid` (fails it: an app
+  // upgrade tightened the schema; the job's next submit must conform),
+  // `pending` (kept under `--allow-unknown-fields`, and no installed app
+  // claims it, or the one that does declares `requires`), or `orphaned`
+  // (its app was uninstalled, or no longer declares a key at this point;
+  // resubmitting the job fails unless the key is removed or
+  // `--allow-unknown-fields` is passed).
+  string state = 7;
+
+  // Why it is invalid, pending, or orphaned; `app disabled` when its app is
+  // disabled (nothing acts on the value meanwhile); `adopted from pending`.
+  string detail = 8;
+
+  // `<app>@<manifest digest>`: the manifest whose schema checked it at
+  // submit. Empty for pending values.
+  string validated_by = 9;
+
+  // A pending value an installed app claims (adopted when the app was
+  // installed).
+  bool adopted = 10;
+}
+
+// The app that manages a job (GetJobInfoReply.managed_by).
+message ManagedByInfo {
+  // The app's name (`legion app status <app>`).
+  string app = 1;
+
+  // The digest of the render the reconciler submitted. The reconciler
+  // compares it with the digest of a fresh render of the app record; a
+  // difference resubmits the job.
+  string digest = 2;
+}
+
+// One jobspec key Legion did not know, as `allow_unknown_fields` handled it.
+message UnknownJobspecField {
+  // Where the key's block sits, as error messages name it: `task postgres`,
+  // `task postgres: volume data`, `task web: port http`. Empty for a key at
+  // the job's top level.
+  string scope = 1;
+
+  // The key, dotted from its scope: `backup`, `stop.signall`,
+  // `checks[0].everyy`.
+  string path = 2;
+
+  // For a kept key, the extension point it sits on: `job`, `task`,
+  // `volume`, `port`, or `service`. Empty for a dropped key.
+  string point = 3;
+}
+
+// The unknown keys one submit kept and dropped under
+// `allow_unknown_fields`, recorded on the job config version it created.
+message UnknownFieldsRecord {
+  // Keys on extension points, kept unvalidated in the block's
+  // `pendingExtensions` map. Nothing acts on them; they stay with every
+  // version whose spec still carries them.
+  repeated UnknownJobspecField pending = 1;
+
+  // Keys elsewhere, dropped: the version does not carry them.
+  repeated UnknownJobspecField dropped = 2;
 }
 
 // Request payload for ListRollouts.
@@ -3261,6 +4434,15 @@ message PlanJobRequest {
   // Namespace to plan into; resolved against the jobspec's own `namespace`
   // exactly as RunJobRequest.namespace is.
   optional string namespace = 2;
+
+  // Plan a jobspec that carries keys Legion does not know
+  // (`legion job plan --allow-unknown-fields`), as a submit with
+  // RunJobRequest.allow_unknown_fields would take it: keys on extension
+  // points kept as pending, the rest dropped, each listed in
+  // `PlanJobReply.warnings`. Default `false`: every unknown key fails the
+  // plan with INVALID_ARGUMENT, as it would fail the submit. Nothing is
+  // recorded; a plan stores nothing.
+  bool allow_unknown_fields = 3;
 }
 
 // Reply payload for PlanJob.
@@ -3314,6 +4496,11 @@ message PlanJobReply {
   // stored policy object covering it, whose outbound connections would all
   // be refused with `gated-default`. Each line ends with a `hint:` naming the
   // fix. Empty when there is nothing to say.
+  //
+  // Under `allow_unknown_fields`, the list starts with one line per unknown
+  // key the submit would drop (`task web: dropped unknown field
+  // `stop.signall``) or keep as pending (`task postgres: volume data: kept
+  // `backup` as pending (no installed app declares it)`).
   repeated string warnings = 8;
 
   // One report per task that sets `gang` (docs/gang-scheduling.md), in task
@@ -3330,6 +4517,45 @@ message PlanJobReply {
   // Like the rest of the reply, this is a plan against a snapshot, not a
   // reservation.
   repeated GangReport gang_reports = 9;
+
+  // One entry per task with `autoscale`, in task order: its effective
+  // policy as the cluster's current defaults resolve it, so nothing about
+  // `autoscale = true` is hidden (docs/autoscaling.md).
+  repeated AutoscalePlan autoscale = 10;
+
+  // The jobspec's values for installed apps' keys (docs/apps.md, "Jobspec
+  // extensions"), each with its effective value (the app's current schema
+  // defaults filled), and its pending keys, as GetJobInfoReply.extensions
+  // reports them. A value that fails its schema fails the plan instead.
+  // The plan does not check a key's `requires` or ask the app; a submit
+  // does.
+  repeated JobExtensionValue extensions = 11;
+}
+
+// The effective autoscaling policy of one task in a plan.
+message AutoscalePlan {
+  // `job/group/task`.
+  string target = 1;
+
+  // The effective record (JSON), with bounds as written (`"4x"`) and every
+  // default filled.
+  string effective_json = 2;
+
+  // The human summary, one line each:
+  // `hold cpu at 70% of 500MHz per replica, 1m average over ready replicas`,
+  // `bounds 2..8 (min = count, max = 4 x count)`, `up: ...`, `down: ...`.
+  repeated string summary = 3;
+
+  // Every field with the level it came from.
+  repeated ScalingProvenanceRow provenance = 4;
+
+  // The effective policy's digest.
+  string digest = 5;
+
+  // The effective policy as canonical JSON (every default filled, every
+  // `"Nx"` resolved): what the autoscaler would run, and what
+  // `legion scaling simulate` replays.
+  string policy_json = 6;
 }
 
 // How one gang task fared in one plan (docs/gang-scheduling.md). The same
@@ -3556,14 +4782,84 @@ message ScaleTaskRequest {
 
   // Optional idempotency key. See `RunJobRequest.idempotency_key`.
   optional string idempotency_key = 7;
+
+  // Compare-and-set: apply only when the task's override row is at exactly
+  // this version, else fail with FAILED_PRECONDITION
+  // (`version conflict: ...`) and change nothing. 0 means "no override row
+  // exists". Read the current version from `ScalingInputs.override_version`
+  // or `TaskScaleStatus.version`. A version is a cluster-wide counter
+  // stamped on every write of the row, so it never repeats, even after the
+  // row is deleted and recreated. Unset: no check (a person's write).
+  optional uint64 expected_version = 8;
+
+  // Why the count changed, as the autoscaler decided it: recorded in the
+  // task's scale history with the write. Optional for people.
+  ScaleDecision decision = 9;
+
+  // Who is writing: `operator` (the default, also for an empty string),
+  // `autoscaler`, or `wake`. `autoscaler` and `wake` are honored only from
+  // the bundled autoscaler's own identity (or a management token); from
+  // any other caller the write is treated as `operator`. An `autoscaler`
+  // write is refused while the task is paused or pinned to a count, and
+  // must stay within a pinned floor or ceiling.
+  string source = 10;
+
+  // Pin: hold the result for this many seconds. With `count` it pins the
+  // count; with `min` and/or `max` it pins a floor and/or ceiling the
+  // autoscaler stays within. Required for a person's count on an
+  // autoscaled task; refused on a task without `autoscale`.
+  optional uint64 pin_for_seconds = 11;
+
+  // A pinned floor (with `pin_for_seconds`). The count is raised to it at
+  // once when below.
+  optional uint32 min = 12;
+
+  // A pinned ceiling (with `pin_for_seconds`). The count is lowered to it at
+  // once when above.
+  optional uint32 max = 13;
+
+  // End the task's pin now and leave the count where it is: the autoscaler
+  // takes over again at its normal rate. Mutually exclusive with `count`,
+  // `reset`, `min`, and `max`.
+  bool release = 14;
+}
+
+// Why a count changed (ScaleTask, RecordScalingAction), as the autoscaler
+// recorded it. Stored with the task's scale history row.
+message ScaleDecision {
+  // An id for the decision, unique per target (`d-` and hex), named in
+  // events and `legion scaling explain`.
+  string id = 1;
+
+  // The one-line why: `cpu 0.91 vs 0.70 (4 ready); rate-limited from 7`.
+  string summary = 2;
+
+  // The digest of the effective policy that decided (hex SHA-256 of
+  // `policy_json`). The manager keeps that policy once per digest, so a
+  // history row's digest always resolves to the exact policy, even after
+  // the defaults that shaped it change.
+  string policy_digest = 3;
+
+  // The effective policy as canonical JSON. Must hash to `policy_digest`,
+  // else the write is refused.
+  string policy_json = 4;
+
+  // The full decision as the engine made it (JSON): each check's reading
+  // and recommendation, and every pipeline stage's before, after, and note.
+  string detail_json = 5;
+
+  // When the decision was made, unix milliseconds.
+  int64 evaluated_at_unix_ms = 6;
 }
 
 // Reply payload for ScaleTask.
 message ScaleTaskReply {
   // Human-readable outcome, e.g.
-  // `"web/default/web: 4 -> 6 (spec count 2; override active)"` or the
+  // `"web/default/web: 4 -> 6 (spec count 2; override active)"`, the
   // deferral notice
-  // `"deferred: rollout web-7 is in progress; scale-in to 2 applies when it completes"`.
+  // `"deferred: rollout web-7 is in progress; scale-in to 2 applies when it completes"`,
+  // or for a pin
+  // `"web/default/web: 6 -> 12; autoscaling pinned until 05:10 UTC (legion job scale web --release)"`.
   string message = 1;
 
   // True when replayed from a recorded result for the request's
@@ -3573,6 +4869,15 @@ message ScaleTaskReply {
   // True when the request was a scale-in during an active rollout and was
   // recorded as pending rather than applied (see ScaleTask's RPC comment).
   bool deferred = 3;
+
+  // The override row's version after this write (the next write's
+  // `expected_version`). 0 when the row was removed (`reset`) or the reply
+  // is a replay.
+  uint64 version = 4;
+
+  // When the pin set by this write expires, unix milliseconds. Unset when
+  // the write set no pin.
+  optional int64 pinned_until_unix_ms = 5;
 }
 
 // Request payload for GetJobScaleStatus.
@@ -3592,19 +4897,23 @@ message TaskScaleStatus {
   // The spec's `count.num` in the latest job config version.
   uint32 spec_count = 3;
 
-  // The applied override count, when one exists.
+  // The applied override count, when one exists and binds to the current
+  // spec. An override binds only to the spec count it was laid over; a row
+  // laid over a different spec count is not reported here and does not move
+  // `effective_count`.
   optional uint32 override_count = 4;
 
   // A recorded scale-in waiting for the active rollout to finish, when
   // one exists.
   optional uint32 pending_count = 5;
 
-  // The count the scheduler currently converges to
-  // (`override_count` if set, else `spec_count`).
+  // The count the scheduler currently converges to: the binding override
+  // if there is one, else `spec_count`. Read through the same accessor the
+  // scheduler, rollouts, and quota use, so this always agrees with what
+  // placement does.
   uint32 effective_count = 6;
 
-  // Who set the override: `operator` today; `autoscaler` when the policy
-  // evaluator ships.
+  // Who set the override: `operator`, `autoscaler`, or `wake`.
   string source = 7;
 
   // The audit note recorded with the override, if any.
@@ -3613,12 +4922,1765 @@ message TaskScaleStatus {
   // RFC 3339 timestamp of the last override write; empty when no
   // override exists.
   string updated_at = 9;
+
+  // Whether the task has `autoscale` in its latest spec: the autoscaler owns
+  // its count, and a person's count is a pin.
+  bool autoscaled = 10;
+
+  // For an autoscaled task, its effective policy in one line
+  // (`2..8, cpu 70%, enforce`), or `invalid: <why>` when it does not
+  // resolve. Empty otherwise.
+  string policy_summary = 11;
+
+  // The active pin, if any.
+  ScalePin pin = 12;
+
+  // The pause that covers this task, if any (its own, its job's, or the
+  // cluster-wide one).
+  ScalingPauseInfo pause = 13;
+
+  // When the autoscaler last evaluated the task, unix milliseconds; 0 when
+  // it has not (since the status-lane leader started).
+  int64 last_evaluation_unix_ms = 14;
+
+  // The autoscaler's last word on the task (see `ScalingTargetStatus.state`);
+  // empty for a task without `autoscale`.
+  string state = 15;
+
+  // The override row's version (`ScaleTaskRequest.expected_version`); 0
+  // when no row exists.
+  uint64 version = 16;
+}
+
+// A time-boxed pin on an autoscaled task (`legion job scale --for`).
+// `min == max` pins the count.
+message ScalePin {
+  // When the pin ends, unix milliseconds.
+  int64 until_unix_ms = 1;
+
+  // The pinned floor, if any.
+  optional uint32 min = 2;
+
+  // The pinned ceiling, if any.
+  optional uint32 max = 3;
+
+  // Who pinned (the token's principal).
+  string by = 4;
+
+  // The reason given.
+  string reason = 5;
+}
+
+// A pause covering a target (`legion scaling pause`).
+message ScalingPauseInfo {
+  // What the pause covers: `all` (cluster-wide), `job`, `task`, or
+  // `policy` (one standalone policy).
+  string scope = 1;
+
+  // When the pause ends, unix milliseconds; unset holds until
+  // `legion scaling resume`.
+  optional int64 until_unix_ms = 2;
+
+  // Who paused.
+  string by = 3;
+
+  // The reason given.
+  string reason = 4;
+
+  // When the pause was set, unix milliseconds.
+  int64 since_unix_ms = 5;
 }
 
 // Reply payload for GetJobScaleStatus.
 message GetJobScaleStatusReply {
   // One entry per task in the job's latest config, spec-order.
   repeated TaskScaleStatus tasks = 1;
+}
+
+// Request payload for GetScalingInputs (docs/autoscaling.md, "Scaling
+// inputs").
+message GetScalingInputsRequest {
+  // The tasks to read. Each selector names a job and optionally narrows it
+  // to one task group and/or task name; a selector that names neither reads
+  // every task of the job. At most 1000 selectors.
+  //
+  // When empty, every job in `namespaces` is read instead.
+  repeated ScalingTargetSelector targets = 1;
+
+  // Used only when `targets` is empty: namespaces to list, as names or
+  // `*`-globs (`["*"]` for every namespace). Empty means `default`. Jobs the
+  // caller lacks `scale:read` on are left out, so `*` widens what is
+  // considered, never what is visible.
+  repeated string namespaces = 2;
+
+  // Also return this many seconds of each target's history, as the
+  // 10-second points the answering manager keeps in memory
+  // (`ScalingInputs.history`, oldest first). 0, the default, returns none.
+  // Values above 3600 (the hour the manager keeps) are clamped to 3600.
+  uint32 history_seconds = 3;
+}
+
+// One job, or one task of it, to read scaling inputs for.
+message ScalingTargetSelector {
+  // Job id (`namespace/name`, or the bare name for a job in `default`).
+  // Required.
+  string job = 1;
+
+  // Narrow to tasks in this group. Unset or empty matches every group.
+  optional string task_group = 2;
+
+  // Narrow to the task with this name. Unset or empty matches every task.
+  optional string task_name = 3;
+}
+
+// Reply payload for GetScalingInputs.
+message GetScalingInputsReply {
+  // One entry per task the request resolved to, in request order (spec
+  // order within a job). A selector that names no existing job or task
+  // yields one entry with `error` set rather than failing the batch.
+  repeated ScalingInputs inputs = 1;
+
+  // The manager that answered: its raft node id, or `local` for a
+  // single-manager cluster. It is the status-lane leader, wherever the
+  // request was sent.
+  string served_by = 2;
+
+  // Seconds since the answering manager took the status lane (or started,
+  // for a single manager). The merged usage is younger than this: a recent
+  // takeover means a recent, possibly partial, resync.
+  uint64 leader_for_seconds = 3;
+}
+
+// Request payload for GetCapacityDemand.
+message GetCapacityDemandRequest {
+  // The node-group templates to size, each answered on its own. At least
+  // one, at most 64, with distinct names.
+  repeated NodeGroupTemplate templates = 1;
+}
+
+// One node group's template: what a new member would look like.
+//
+// The synthetic node is built in this order, each step overriding the last:
+// 1. `like_node` (a copy of that member: its pool, attributes, fingerprint
+//    and capacity), or else what a node of `worker_type` registers as: the
+//    type's pool, `namespaces`, attributes, custom `resources`,
+//    `reservedResources`, `maxAllocations` and oversubscription;
+// 2. `pool`, when set;
+// 3. `shape`: `cpu`, `memory` and `cores` become the node's capacity (with
+//    no member to copy, the shape is the whole machine; on a copy it can
+//    only lower it), and its attributes and resources are added;
+// 4. `legion.nodegroup = <name>`, which every member of a node group
+//    carries (its join token stamps it), so constraints on it are honored.
+message NodeGroupTemplate {
+  // The node group's name: echoed in the reply, and the value of the
+  // template node's `legion.nodegroup` attribute. Required.
+  string name = 1;
+
+  // The worker type members join as. Default: `default`. A type that does
+  // not exist contributes nothing (the shape alone describes the node).
+  string worker_type = 2;
+
+  // The pool members join. Default: the worker type's pool, else
+  // `default`.
+  optional string pool = 3;
+
+  // A member's size and attributes. Optional when `like_node` is set.
+  NodeGroupShape shape = 4;
+
+  // An existing node to copy: its observed capacity and attributes are a
+  // better template than a declared shape once one member has joined.
+  optional string like_node = 5;
+
+  // Members already asked for that have not joined yet. They absorb pending
+  // work before any template is sized, so a group that was just asked to
+  // grow is not asked again for the same replicas. Default: 0.
+  uint32 upcoming = 6;
+
+  // Also describe the group's members: every node whose `legion.nodegroup`
+  // attribute is this template's name, with what node scale-in needs to
+  // know about it (`NodeGroupDemand.members`). The autoscaler sets it; a
+  // sizing question (`legion scaling demand`) leaves it off. Members are
+  // listed only in pools the caller has `node:read` on.
+  bool members = 7;
+
+  // With `members`: for each live, schedulable member whose reserved share
+  // (the larger of CPU and memory) is under 50%, simulate whether every
+  // allocation on it would fit on the group's other live, schedulable
+  // members, with the demand's own feasibility rules
+  // (`NodeGroupMember.fits_elsewhere`). For `down.when = "underutilized"`.
+  bool fit_check = 8;
+}
+
+// A member's size and attributes, as `GetCapacityDemand` builds its node.
+message NodeGroupShape {
+  // CPU in MHz (all cores together), the unit task `cpu` reservations use.
+  // Unset: unbounded.
+  optional uint64 cpu = 1;
+
+  // Memory in MiB. Unset: unbounded.
+  optional uint64 memory = 2;
+
+  // Whole cores, for tasks that reserve `cores`. Unset: unbounded.
+  optional uint32 cores = 3;
+
+  // Node attributes every member has (`arch = "amd64"`), seen by
+  // constraints and `distinct`. `legion.nodegroup` is set from the
+  // template's name and may not be given here.
+  map<string, string> attributes = 4;
+
+  // Custom resources a member offers, as a JSON object in a worker type's
+  // `resources` form: `{"gpu": 2}` or `{"gpu": ["g0", "g1"]}`. Default:
+  // empty.
+  string resources_json = 5;
+
+  // The most allocations one member takes. Unset: the worker type's, else
+  // unbounded.
+  optional uint32 max_allocations = 6;
+}
+
+// Reply payload for GetCapacityDemand.
+message GetCapacityDemandReply {
+  // One entry per template, in request order.
+  repeated NodeGroupDemand groups = 1;
+
+  // The pending work considered, one entry per job task group that is short
+  // (a task group's tasks place together, so they are one unit). Ordered by
+  // job, then group. `NodeGroupDemand.refusals` and `unfittable` point here
+  // by index.
+  repeated PendingCapacity pending = 2;
+
+  // Pending replicas no single template can host, with every template's
+  // failing rule.
+  repeated UnfittableCapacity unfittable = 3;
+
+  // Jobs short of their count whose eval is still pending or in flight:
+  // the scheduler has not tried the capacity that exists, so they are not
+  // demand yet. Names of jobs the caller cannot read are left out (see
+  // `awaiting_scheduler_redacted`).
+  repeated string awaiting_scheduler = 4;
+
+  // How many `awaiting_scheduler` jobs were left out because the caller
+  // lacks `job:read` on them.
+  uint32 awaiting_scheduler_redacted = 5;
+
+  // Set when the pending work was larger than one call simulates (20,000
+  // replicas): the rest is listed in `pending` but was not packed, so node
+  // counts are a floor.
+  bool truncated = 6;
+
+  // RFC3339 time the answer was computed.
+  string computed_at = 7;
+}
+
+// One template's answer.
+message NodeGroupDemand {
+  // The node group's name, from the request.
+  string name = 1;
+
+  // New nodes of this template the pending work it can host needs: the
+  // `nodegroup.pending` input. 0 when it can host none of it (see
+  // `refusals`) or the upcoming nodes already absorb it.
+  uint32 nodes = 2;
+
+  // Pending replicas those nodes would host.
+  uint32 replicas = 3;
+
+  // Pending replicas this template's upcoming nodes absorbed (they are not
+  // in `replicas`).
+  uint32 absorbed = 4;
+
+  // CPU the hosted replicas reserve, MHz.
+  double cpu_requested_mhz = 5;
+
+  // Memory the hosted replicas reserve, MiB.
+  double memory_requested_mib = 6;
+
+  // CPU the `nodes` new nodes offer, MHz. 0 when the template does not
+  // bound CPU.
+  double cpu_capacity_mhz = 7;
+
+  // Memory the `nodes` new nodes offer, MiB. 0 when the template does not
+  // bound memory.
+  double memory_capacity_mib = 8;
+
+  // Pending work this template cannot host, and why.
+  repeated CapacityRefusal refusals = 9;
+
+  // The pool of the synthetic node the template was sized as, for checking
+  // what the manager understood.
+  string node_pool = 10;
+
+  // The synthetic node's config attributes, as a JSON object.
+  string node_attributes_json = 11;
+
+  // With the template's `members`: the group's members, by node id.
+  repeated NodeGroupMember members = 12;
+}
+
+// One member of a node group, as node scale-in sees it.
+message NodeGroupMember {
+  // The node id.
+  string node_id = 1;
+
+  // Its status (`active`, `lost`, …).
+  string status = 2;
+
+  // Its availability (`available`, or `drained` when cordoned).
+  string availability = 3;
+
+  // Its `legion.provider-id` (the instance it runs on), when it joined
+  // with one.
+  string provider_id = 4;
+
+  // Its `legion.scale-in` attribute (`never` protects it).
+  string scale_in = 5;
+
+  // Reserved CPU over allocatable CPU, 0 to 1 (0 when unbounded).
+  double reserved_cpu = 6;
+
+  // Reserved memory over allocatable memory, 0 to 1 (0 when unbounded).
+  double reserved_memory = 7;
+
+  // Its allocations.
+  repeated NodeGroupAllocation allocations = 8;
+
+  // With `fit_check`, for an underutilized member: whether every
+  // allocation on it fits on the group's other members. Unset when not
+  // simulated.
+  optional bool fits_elsewhere = 9;
+
+  // Why it does not fit, or `fits on w-2, w-5`.
+  string fit_detail = 10;
+}
+
+// One allocation on a node-group member.
+message NodeGroupAllocation {
+  // The allocation id.
+  int64 allocation_id = 1;
+
+  // Its job (empty when `redacted`).
+  string job_id = 2;
+
+  // Its job's namespace (`legion-system` makes the node never a victim).
+  string namespace = 3;
+
+  // Its task group (empty when `redacted`).
+  string task_group = 4;
+
+  // Its task (empty when `redacted`).
+  string task_name = 5;
+
+  // `work`, `session-envelope` (one per node; with no live sessions it
+  // does not keep the node from being empty), or `per-node` (a
+  // `count.per = "id"` task: one per node by design).
+  string kind = 6;
+
+  // For a session envelope: the live sessions in it.
+  uint32 sessions = 7;
+
+  // It holds stateful node-local storage: its data lives on this machine.
+  bool node_local_storage = 8;
+
+  // Draining this node now would take its task below its
+  // `disruption.minAvailable` (or a gang below its quorum): the task's
+  // live allocations, less the ones on this node, would be under the
+  // floor.
+  bool breaks_min_available = 9;
+
+  // With `breaks_min_available`: `web/web has 3 live, 2 on this node,
+  // minAvailable 2`.
+  string min_available_detail = 10;
+
+  // The job is outside the caller's `job:read`: its names are left out.
+  bool redacted = 11;
+}
+
+// Why a template cannot host some pending replicas.
+message CapacityRefusal {
+  // Index into `GetCapacityDemandReply.pending`.
+  uint32 pending_index = 1;
+
+  // Replicas refused.
+  uint32 replicas = 2;
+
+  // The failing rule: `permit` (pool or restrictions), `namespace` (the
+  // node's `namespaces`), `constraint`, `volume-driver`, `resources` (one
+  // replica is larger than an empty node), `distinct` (no value left for
+  // more replicas), `static-port` (members of one group claim the same
+  // port), `gang` (the quorum cannot place together), or `invalid` (the
+  // task does not parse).
+  string rule = 3;
+
+  // What failed, in words: `one replica needs memory 16384 > 8192 per
+  // node`.
+  string detail = 4;
+}
+
+// One unit of pending work: a job's task group short of its count.
+message PendingCapacity {
+  // Canonical job id. Empty when `redacted`.
+  string job_id = 1;
+
+  // The job's namespace.
+  string namespace = 2;
+
+  // The task group. Empty when `redacted`.
+  string task_group = 3;
+
+  // The group's short tasks. Empty when `redacted`.
+  repeated string tasks = 4;
+
+  // The count the group should have.
+  uint32 desired = 5;
+
+  // Allocations it has, across config versions.
+  uint32 placed = 6;
+
+  // Replicas waiting (`desired - placed`).
+  uint32 pending = 7;
+
+  // For a gang: its quorum, which places together.
+  optional uint32 gang_quorum = 8;
+
+  // What one replica reserves (every short task of the group together), as
+  // a JSON object of normalized resources (`{"cpu": 500, "memory": 256}`).
+  string resources_json = 9;
+
+  // Replicas the upcoming nodes absorbed.
+  uint32 absorbed = 10;
+
+  // Set when the caller lacks `job:read` on the job: the names are left
+  // out, the counts and rules are kept.
+  bool redacted = 11;
+}
+
+// Pending replicas no single template can host.
+message UnfittableCapacity {
+  // Index into `GetCapacityDemandReply.pending`.
+  uint32 pending_index = 1;
+
+  // Replicas no template can host (pending minus the most any one
+  // template hosts).
+  uint32 replicas = 2;
+
+  // Each template's failing rule for them.
+  repeated TemplateRefusal reasons = 3;
+}
+
+// One template's reason, in `UnfittableCapacity`.
+message TemplateRefusal {
+  // The template.
+  string template = 1;
+
+  // The rule (see `CapacityRefusal.rule`).
+  string rule = 2;
+
+  // What failed.
+  string detail = 3;
+}
+
+// The scaling inputs of one task (`job_id`, `task_group`, `task_name`).
+//
+// Replica counts and the desired count are read from the replicated state
+// store when the request is answered. Measured CPU, memory, and requests are
+// the newest rollups the answering manager holds, at most one 10-second
+// rollup interval behind the worker samples they come from; see
+// `freshness`.
+message ScalingInputs {
+  // Canonical job id.
+  string job_id = 1;
+
+  // Task group.
+  string task_group = 2;
+
+  // Task name.
+  string task_name = 3;
+
+  // Set when the selector resolved to nothing: `job not found`, or `no task
+  // matches group=<g> task=<t>`. Every other field is then empty, and the
+  // job and selector fields above echo the request.
+  string error = 4;
+
+  // The count the scheduler converges to (`Store::effective_task_count`:
+  // the binding count override, else the spec's `count`). 0 for a stopped
+  // or failed job. For a task without a scalable count (`count_scalable`
+  // false), the number of placed replicas.
+  uint32 desired_replicas = 5;
+
+  // Whether the task has a count `legion job scale` can change: false for
+  // keyed stateful tasks (no count) and `count.per` tasks.
+  bool count_scalable = 6;
+
+  // Allocations of this task the scheduler has placed, across every version
+  // of the job (a rollout runs old and new replicas side by side).
+  uint32 placed_replicas = 7;
+
+  // Placed replicas whose latest health report says healthy.
+  uint32 ready_replicas = 8;
+
+  // `desired_replicas - placed_replicas`, floored at 0: replicas the
+  // scheduler has not placed, usually for lack of room. Always 0 for tasks
+  // without a scalable count and for batch and cron tasks, whose
+  // allocations end by design.
+  uint32 unplaced_replicas = 9;
+
+  // Whether a rollout of this job is in flight. Scale-in is deferred during
+  // one (docs/autoscaling.md), and new replicas are still warming.
+  bool rollout_active = 10;
+
+  // One replica's reservation in the job's latest spec, after
+  // `taskResourceDefaults`.
+  ScalingReservation reservation = 11;
+
+  // Measured CPU, summed over the replicas that reported.
+  ScalingCpuInputs cpu = 12;
+
+  // Measured memory, summed over the replicas that reported.
+  ScalingMemoryInputs memory = 13;
+
+  // Requests into the service this task backs (its `service` block), from
+  // the service graph. Unset when the task backs no service.
+  //
+  // Recorded on the CALLING side, so only internal callers are counted:
+  // traffic from outside Legion into an advertised port is not seen, and
+  // neither is traffic that bypasses the datapath in `host` mode
+  // (docs/network-handlers.md, "Service graph"). A service backed by several
+  // tasks reports the service's totals on each of them.
+  optional ScalingRequestInputs requests = 14;
+
+  // How current the measured inputs are.
+  ScalingDataFreshness freshness = 15;
+
+  // Up to `history_seconds` of 10-second totals, oldest first. Empty unless
+  // the request asked for history. The answering manager keeps one hour in
+  // memory for at most 4096 tasks; a manager that recently took the status
+  // lane holds only what it has seen since. An autoscaled task's points also
+  // carry its counts, and it has points while scaled to zero.
+  repeated ScalingInputsPoint history = 16;
+
+  // The task's override row version, for a compare-and-set ScaleTask
+  // (`ScaleTaskRequest.expected_version`); 0 when no row exists.
+  uint64 override_version = 17;
+
+  // The task's active pin, if any.
+  ScalePin pin = 18;
+
+  // The pause that covers the task, if any.
+  ScalingPauseInfo pause = 19;
+}
+
+// One replica's reservation (GetScalingInputs).
+message ScalingReservation {
+  // CPU in MHz. 0 when the task reserves whole cores (`cores`) instead.
+  double cpu_mhz = 1;
+
+  // Whole cores. 0 when the task reserves MHz. Utilization treats `cores =
+  // N` as N x 1000 millicores, and converts to MHz with each node's clock.
+  double cores = 2;
+
+  // Memory in MiB.
+  double memory_mib = 3;
+}
+
+// Measured CPU of one task (GetScalingInputs), summed over its replicas'
+// latest samples.
+message ScalingCpuInputs {
+  // Replicas with a current usage sample. Only governed runtimes (exec,
+  // container, sandbox) on workers with `resourceEnforcement` on report
+  // usage; others count in `placed_replicas` but never here.
+  uint32 measured_replicas = 1;
+
+  // Measured CPU in millicores (1000 = one core busy), as the workers sample
+  // it.
+  uint64 used_millicores = 2;
+
+  // Measured CPU in MHz: each replica's millicores times its node's
+  // `mhz_per_core`, the arithmetic GetNodeUsage uses. Replicas on nodes that
+  // report no clock speed contribute 0.
+  double used_mhz = 3;
+
+  // The measured replicas' reservations in MHz (a `cores = N` reservation is
+  // N x the node's `mhz_per_core`).
+  double reserved_mhz = 4;
+
+  // Mean utilization against the reservation, over the replicas where it can
+  // be computed: sum of used millicores / sum of reserved millicores. 0.7
+  // means 70% of the reservation. 0 when no replica is measurable.
+  double utilization = 5;
+
+  // The busiest replica's utilization against its reservation.
+  double max_utilization = 6;
+
+  // Per-replica utilization histogram: `histogram[i]` counts replicas whose
+  // utilization is below `histogram_bounds[i]` (and not below the previous
+  // bound). The last bucket has no upper bound and counts everything at or
+  // above the last entry of `histogram_bounds`, so `histogram` has one more
+  // entry than `histogram_bounds`. The bounds are fixed:
+  // 0.1, 0.25, 0.5, 0.7, 0.85, 1.0, 1.5.
+  repeated uint32 histogram = 7;
+
+  // Upper bounds of every bucket but the last; see `histogram`.
+  repeated double histogram_bounds = 8;
+
+  // Measured replicas whose utilization cannot be computed: no CPU
+  // reservation, or an MHz reservation on a node that reports no clock
+  // speed. Counted in `measured_replicas` and `used_millicores`, left out
+  // of `utilization` and `histogram`.
+  uint32 unmeasurable_replicas = 9;
+}
+
+// Measured memory of one task (GetScalingInputs).
+message ScalingMemoryInputs {
+  // Replicas with a current usage sample.
+  uint32 measured_replicas = 1;
+
+  // Current memory (`memory.current`, page cache included), in MiB, summed.
+  double used_mib = 2;
+
+  // The measured replicas' reservations in MiB, summed.
+  double reserved_mib = 3;
+
+  // `used_mib / reserved_mib`; 0 when nothing is reserved.
+  double utilization = 4;
+
+  // The largest single replica's memory against its reservation.
+  double max_utilization = 5;
+}
+
+// Requests into one service (GetScalingInputs), from the caller-side service
+// graph, over the most recent rollup interval of every calling node.
+message ScalingRequestInputs {
+  // The service, as a canonical reference (`namespace/name`, or the bare
+  // name in `default`).
+  string service = 1;
+
+  // Requests (HTTP upstreams) or connections (TCP upstreams) per second that
+  // reached an endpoint, summed over every calling node.
+  double requests_per_second = 2;
+
+  // Of those, 5xx answers plus attempts that reached no endpoint, per
+  // second.
+  double errors_per_second = 3;
+
+  // `errors / (requests + errors)`, the share of attempts that failed, as
+  // `ListServiceEdges` computes `error_rate`; 0 with no attempts.
+  double error_ratio = 4;
+
+  // Mean request latency in milliseconds (HTTP upstreams only); 0 with no
+  // HTTP requests.
+  double latency_ms_mean = 5;
+
+  // The slowest request in the window, milliseconds.
+  uint64 latency_ms_max = 6;
+
+  // Nodes whose callers contributed.
+  uint32 calling_nodes = 7;
+}
+
+// How current one task's measured inputs are (GetScalingInputs).
+message ScalingDataFreshness {
+  // - `current`: rollups for this task are in hand, each confirmed by its
+  //   reporting manager within the last 35 seconds.
+  // - `missing`: no rollup: nothing reports usage for the task (no
+  //   replicas, a runtime that reports no usage, enforcement off), or the
+  //   managers that held its rollups stopped confirming them.
+  // - `resyncing`: the answering manager took the status lane less than one
+  //   rollup interval ago, and peers' full resyncs may not have landed. The
+  //   numbers may be partial; treat them as missing.
+  string state = 1;
+
+  // The newest worker sample among the task's rollups, unix milliseconds
+  // (the worker's clock). 0 when `missing`.
+  int64 sampled_at_unix_ms = 2;
+
+  // Seconds since the least recently confirmed rollup was confirmed by the
+  // manager that holds it, on the answering manager's clock. Usually under
+  // 10.
+  uint32 age_seconds = 3;
+
+  // Nodes with a current rollup for the task: nodes running its replicas,
+  // plus nodes whose callers reach the service it backs.
+  uint32 reporting_nodes = 4;
+}
+
+// One 10-second point of a task's history (GetScalingInputs), the totals the
+// answering manager computed at `at_unix_ms`.
+message ScalingInputsPoint {
+  // When the point was taken, unix milliseconds, answering manager's clock.
+  int64 at_unix_ms = 1;
+
+  // `ScalingCpuInputs.measured_replicas` at the time.
+  uint32 measured_replicas = 2;
+
+  // `ScalingCpuInputs.used_mhz`.
+  double cpu_used_mhz = 3;
+
+  // `ScalingCpuInputs.utilization`.
+  double cpu_utilization = 4;
+
+  // `ScalingMemoryInputs.used_mib`.
+  double memory_used_mib = 5;
+
+  // `ScalingMemoryInputs.utilization`.
+  double memory_utilization = 6;
+
+  // `ScalingRequestInputs.requests_per_second`; 0 when the task backs no
+  // service.
+  double requests_per_second = 7;
+
+  // `ScalingRequestInputs.errors_per_second`.
+  double errors_per_second = 8;
+
+  // `ScalingRequestInputs.latency_ms_mean`.
+  double latency_ms_mean = 9;
+
+  // The task's effective count at the point (`ScalingInputs.desired_replicas`).
+  // Recorded for autoscaled tasks only; unset for others.
+  optional uint32 desired_replicas = 10;
+
+  // Its healthy replicas at the point (`ScalingInputs.ready_replicas`):
+  // warming ones included. Autoscaled tasks only.
+  optional uint32 ready_replicas = 11;
+
+  // Its unplaced replicas at the point. Autoscaled tasks only.
+  optional uint32 unplaced_replicas = 12;
+}
+
+// Request payload for WatchScalingPolicies.
+message WatchScalingPoliciesRequest {
+  // Namespaces to watch, as names or `*`-globs. Empty means every namespace
+  // the caller can read, which is what the autoscaler asks for. Jobs the
+  // caller lacks `scale:read` on are always left out.
+  repeated string namespaces = 1;
+
+  // How many shards policies hash to (the autoscaler uses 64). 0, the
+  // default, sends every policy; with a count, `shards` names which to send.
+  uint32 shard_count = 2;
+
+  // The shards to send, each below `shard_count`. Ignored when
+  // `shard_count` is 0. Empty with a `shard_count` sends nothing but empty
+  // sets (a replica that holds no shard yet).
+  repeated uint32 shards = 3;
+
+  // Send changes, not full sets, after the first message (see
+  // `ScalingPolicySet.full` and `removed`). Default `false`: every message
+  // is the full set.
+  bool deltas = 4;
+}
+
+// One message of WatchScalingPolicies: the complete set of effective task
+// policies at one moment. Each message replaces the previous one.
+message ScalingPolicySet {
+  // Every autoscaled task of every running job in scope, sorted by job id,
+  // group, task.
+  repeated ScalingPolicy policies = 1;
+
+  // Increases by one with every message on this stream.
+  uint64 generation = 2;
+
+  // When the set was resolved, unix milliseconds (the answering manager's
+  // clock).
+  int64 resolved_at_unix_ms = 3;
+
+  // The version of the cluster's scaling defaults the set was resolved
+  // against (0: none set).
+  uint64 defaults_version = 4;
+
+  // Every standalone policy in scope (`legion scaling apply`), sorted by
+  // namespace and name.
+  repeated StandaloneScalingPolicy standalone = 5;
+
+  // Whether this message is the full set (always, without `deltas`; the
+  // first message, with them). When false, `policies` and `standalone` hold
+  // only the policies that are new or changed since the previous message,
+  // and `removed` the ones that are gone.
+  bool full = 6;
+
+  // With `deltas`, the keys of policies gone since the previous message
+  // (their job stopped, their task lost `autoscale`, the policy was
+  // deleted, or it left the requested shards): `<job id>/<group>/<task>`
+  // for a task, `policy:<id>` for a standalone policy. Always empty in a
+  // full set.
+  repeated string removed = 7;
+
+  // With `deltas`, a change larger than 1,000 policies is split across
+  // messages: every message but the last of a change has `more = true`
+  // (the first carries `full` and `removed`). Apply them all before acting
+  // on any, so a consumer never acts on half a set. Always false without
+  // `deltas`, where every message is one whole set.
+  bool more = 8;
+}
+
+// One autoscaled task's effective policy.
+//
+// The policy targets the task, or its whole group when the group has other
+// tasks: then `members` lists every task of the group, all of which move to
+// the same count in one ScaleTask write, and utilization is the group's
+// summed usage over its summed reservations.
+message ScalingPolicy {
+  // Canonical job id.
+  string job_id = 1;
+
+  // Task group.
+  string task_group = 2;
+
+  // The task that carries `autoscale`.
+  string task_name = 3;
+
+  // Every task the policy moves: just `task_name`, or every task of the
+  // group, in spec order.
+  repeated string members = 4;
+
+  // The task's spec `count` (the default floor).
+  uint32 count = 5;
+
+  // `ok`, or `invalid` when the policy does not resolve against the
+  // current defaults (see `error`); an invalid policy is held, never acted
+  // on.
+  string state = 6;
+
+  // Why the policy is invalid; empty when `state = "ok"`.
+  string error = 7;
+
+  // The digest of the effective policy (hex SHA-256 of `policy_json`).
+  string digest = 8;
+
+  // The effective policy as canonical JSON: every default filled, every
+  // `"Nx"` bound resolved (`min`, `max`, `cpu`, `memory`, `checks`, `up`,
+  // `down`, `headroom`, `warmup`, `tolerance`, `window`, `schedule`,
+  // `onMissing`, `mode`). Empty when invalid.
+  string policy_json = 9;
+
+  // The policy in one line: `2..8, cpu 70%, enforce`.
+  string summary = 10;
+
+  // The task's runtime (whether it reports usage is the runtime's).
+  string runtime = 11;
+}
+
+// Request payload for ApplyScalingDefaults.
+message ApplyScalingDefaultsRequest {
+  // The cluster-level record as JSON (the CLI evaluates a Nickel file to
+  // it): the jobspec `autoscale` record without `checks`, e.g.
+  // `{"cpu": 0.6, "max": "6x", "down": {"stabilize": "10m"}}`. `{}` clears
+  // every cluster default, so the built-ins apply.
+  string defaults_json = 1;
+
+  // Validate and report the effect on every inheriting policy; write
+  // nothing.
+  bool dry_run = 2;
+
+  // Apply even when some inheriting policies would become invalid; they
+  // are then held `invalid` until fixed.
+  bool force = 3;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 4;
+}
+
+// Reply payload for ApplyScalingDefaults.
+message ApplyScalingDefaultsReply {
+  // Human-readable outcome:
+  // `scaling defaults: v3 applied; 4 policies changed, 0 invalid`.
+  string message = 1;
+
+  // Whether the defaults were written (false for a dry run, an unchanged
+  // record, or a refusal reported as a dry run).
+  bool applied = 2;
+
+  // The defaults' version after the call.
+  uint64 version = 3;
+
+  // Every autoscaled task whose effective policy changes, or becomes
+  // invalid.
+  repeated ScalingPolicyChange changes = 4;
+
+  // How many of `changes` are invalid under the new defaults.
+  uint32 invalid = 5;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh.
+  bool deduplicated = 6;
+}
+
+// How one task's effective policy changes under new defaults.
+message ScalingPolicyChange {
+  // `job/group/task`.
+  string target = 1;
+
+  // The effective policy's digest before the change (empty if it was
+  // already invalid).
+  string before_digest = 2;
+
+  // The digest after (empty if it becomes invalid).
+  string after_digest = 3;
+
+  // Why it becomes invalid; empty when it stays valid.
+  string error = 4;
+
+  // The field paths whose effective value changes (`max`, `down.stabilize`).
+  repeated string fields = 5;
+}
+
+// Request payload for GetScalingDefaults.
+message GetScalingDefaultsRequest {
+  // The namespace whose effective defaults to report. Empty means `default`.
+  string namespace = 1;
+}
+
+// Reply payload for GetScalingDefaults.
+message GetScalingDefaultsReply {
+  // The cluster-level record as written (JSON); `{}` when none is set.
+  string cluster_json = 1;
+
+  // The cluster defaults' version; 0 when none was ever applied.
+  uint64 version = 2;
+
+  // Who applied the current cluster defaults.
+  string updated_by = 3;
+
+  // When, RFC 3339.
+  string updated_at = 4;
+
+  // The namespace the effective rows are for.
+  string namespace = 5;
+
+  // The effective defaults for `namespace`, one row per field, with the
+  // level each value came from. Bounds are shown as written (`"1x"`).
+  repeated ScalingProvenanceRow effective = 6;
+
+  // Set when the namespace's defaults do not resolve: two namespace
+  // policies set one field differently. `effective` is then empty.
+  string error = 7;
+
+  // The namespace policies governing `namespace` that set `autoscale`.
+  repeated string policies = 8;
+}
+
+// One field of an effective policy or defaults, and where it came from.
+message ScalingProvenanceRow {
+  // The field path (`min`, `cpu`, `down.step`, `onMissing`).
+  string field = 1;
+
+  // The effective value, for people (`4 ("1x" of count 4)`, `10m`).
+  string value = 2;
+
+  // `built-in`, `cluster defaults`, `namespace policy <name>`, or
+  // `jobspec`.
+  string origin = 3;
+}
+
+// Request payload for ReportScalingStatus.
+message ReportScalingStatusRequest {
+  // The reporting app instance (its allocation id, or a name), shown by
+  // `legion scaling status`.
+  string instance = 1;
+
+  // The app's evaluation interval in seconds. The app counts as NOT
+  // RUNNING once no report has arrived for three intervals.
+  uint32 interval_seconds = 2;
+
+  // The app-wide mode: `enforce`, or `dry-run` when the app's config forces
+  // every policy to dry-run.
+  string mode = 3;
+
+  // The last evaluation of every target the app evaluated this tick.
+  repeated ScalingTargetReport targets = 4;
+
+  // The app's build (its `legion` version).
+  string version = 5;
+
+  // The shards this replica evaluated (docs/autoscaling.md, "Replicas").
+  // Empty: every shard (a lone replica, which holds them all with one
+  // lease).
+  repeated uint32 shards = 6;
+
+  // How many shards policies hash to (64); 0 from a replica that does not
+  // shard.
+  uint32 shard_count = 7;
+}
+
+// The autoscaler's last evaluation of one target.
+message ScalingTargetReport {
+  // Canonical job id.
+  string job_id = 1;
+
+  // Task group.
+  string task_group = 2;
+
+  // The task that carries `autoscale`.
+  string task_name = 3;
+
+  // The outcome in one word:
+  // - `ok`: the count is where the policy wants it;
+  // - `scaled`: this evaluation changed the count;
+  // - `held`: a safeguard held a change back (the summary says which);
+  // - `limited`: a bound, quota, or capacity limited the count;
+  // - `deferred`: a scale-in waits for a rollout;
+  // - `pinned`, `paused`: an operator holds the target;
+  // - `dry-run`: the policy would have changed the count;
+  // - `draining`: a node group is draining members (scale-in in flight);
+  // - `missing-data`: no check has data;
+  // - `invalid`: the policy does not resolve;
+  // - `error`: the evaluation or write failed (the summary says why).
+  string state = 4;
+
+  // The count when evaluated.
+  uint32 current = 5;
+
+  // The count the policy wants after every safeguard.
+  uint32 want = 6;
+
+  // When evaluated, unix milliseconds.
+  int64 evaluated_at_unix_ms = 7;
+
+  // The one-line why.
+  string summary = 8;
+
+  // The full decision (JSON: checks and stages). Empty when it is
+  // unchanged since the previous report; the manager keeps the last one.
+  string decision_json = 9;
+
+  // The digest of the effective policy evaluated.
+  string policy_digest = 10;
+
+  // State changes worth an event, at most one of each kind per episode.
+  repeated ScalingEventFlag events = 11;
+
+  // A standalone policy's canonical id, when the report is for one; the
+  // job, group and task fields are then empty.
+  string policy = 12;
+}
+
+// A state change the autoscaler reports for the manager to record as an
+// event.
+message ScalingEventFlag {
+  // `limited` (`scale.limited`), `flapping` (`scale.flapping`), or
+  // `check_failed` (`scale.check_failed`); for a node group also `pending`
+  // (`nodegroup.pending`: waiting work needs new nodes of the group),
+  // `join_timeout` (`nodegroup.join_timeout`: nodes asked for did not join
+  // within `up.joinTimeout`), or `scale_in` (`nodegroup.scale_in`: a drain
+  // finished, see `outcome`).
+  string kind = 1;
+
+  // What happened, for people.
+  string message = 2;
+
+  // For `scale_in`: `completed` (the node was terminated and forgotten) or
+  // `aborted` (the drain outlived `down.drainDeadline`, was uncordoned by
+  // someone else, or the group was paused; the node was uncordoned).
+  string outcome = 3;
+}
+
+// Reply payload for ReportScalingStatus.
+message ReportScalingStatusReply {
+  // Targets accepted.
+  uint32 accepted = 1;
+
+  // The manager that holds the report (raft node id, or `local`).
+  string served_by = 2;
+}
+
+// Request payload for RecordScalingAction.
+message RecordScalingActionRequest {
+  // Canonical job id (a `would` row for a task target).
+  string job_id = 1;
+
+  // Task group.
+  string task_group = 2;
+
+  // Task name.
+  string task_name = 3;
+
+  // The action:
+  // - `would`: a dry-run policy's decision, recorded as a history row with
+  //   `applied = false` (`legion scaling history` shows what the policy
+  //   would have done). Names a task (`job_id`, `task_group`, `task_name`)
+  //   or a standalone policy (`policy`), with `from`, `to` and `decision`.
+  // - `intent`: open an action intent on a standalone policy before the
+  //   app acts on its target (calls `target/scale`, starts a drain, calls
+  //   `target/terminate`, forgets a node). Needs `policy`, `intent` and
+  //   `expected_action_version`; written only when the policy's action row
+  //   is still at that version (compare-and-set), so of two autoscaler
+  //   replicas whose leases overlap exactly one wins and acts (`won`), and
+  //   the other reads the winner's intent from `action` instead. Refused
+  //   with FAILED_PRECONDITION while a pause covers the policy, when the
+  //   intent changes the count (`desired`) or starts a drain (`cordon`):
+  //   a pause holds even against a misbehaving app. Drains already past
+  //   their drain step (terminate, forget) and aborts (uncordon) go on
+  //   under a pause. Written with the intent's history rows (`scaled`,
+  //   `drain`, `terminate`, `forget`, `uncordon`) and a `scale.applied`
+  //   event for a count change.
+  // - `outcome`: close the open intent at `expected_action_version` with
+  //   `outcome` (`succeeded`, `failed`, or `reconciled`, for an intent a
+  //   crashed replica left open) and `detail`. Compare-and-set like
+  //   `intent`. A `failed` outcome of an intent that changed the count
+  //   writes a `failed` history row.
+  //
+  // Other kinds are refused with INVALID_ARGUMENT. A task target changes
+  // its count through ScaleTask, never here.
+  string kind = 4;
+
+  // `would`: the count when decided.
+  uint32 from = 5;
+
+  // `would`: the count the policy would have written.
+  uint32 to = 6;
+
+  // The decision (`would`, and the history rows of an `intent`).
+  ScaleDecision decision = 7;
+
+  // A standalone policy's canonical id, instead of a job, group and task.
+  // Required for `intent` and `outcome`.
+  string policy = 8;
+
+  // `intent` and `outcome`: the version of the policy's action row the
+  // app last read (from WatchScalingPolicies, or the last
+  // RecordScalingAction reply); 0 when the policy has none yet.
+  uint64 expected_action_version = 9;
+
+  // `intent`: what the app is about to do.
+  ScalingActionIntent intent = 10;
+
+  // `outcome`: `succeeded`, `failed`, or `reconciled`.
+  string outcome = 11;
+
+  // `outcome`: what happened, for people (a plugin's error, or what the
+  // target's status showed when reconciling).
+  string detail = 12;
+
+  // The app instance writing (shown as the action's `owner`).
+  string instance = 13;
+}
+
+// What the autoscaler is about to do to a standalone policy's target: the
+// payload of an action intent.
+message ScalingActionIntent {
+  // The decision's id (`legion scaling history` shows it).
+  string decision_id = 1;
+
+  // The target's count when decided.
+  uint32 from = 2;
+
+  // `target/scale` to this count, when the intent changes it.
+  optional uint32 desired = 3;
+
+  // Node groups: members to cordon and drain (scale-in victims).
+  repeated ScalingActionNode cordon = 4;
+
+  // Node groups: members whose instances `target/terminate` stops.
+  repeated ScalingActionNode terminate = 5;
+
+  // Node groups: members `ForgetNode` removes (their instances are gone).
+  repeated string forget = 6;
+
+  // Node groups: members to uncordon (an aborted drain).
+  repeated string uncordon = 7;
+
+  // The decision in one line.
+  string summary = 8;
+
+  // Node groups: every drain in flight once this intent is carried out,
+  // as the engine's JSON (node, provider id, start, phase). A replica that
+  // takes the group over resumes them from here.
+  string drains_json = 9;
+}
+
+// One node in an action intent.
+message ScalingActionNode {
+  // The node id.
+  string node = 1;
+
+  // Its `legion.provider-id`, what `target/terminate` takes.
+  string provider_id = 2;
+}
+
+// A standalone policy's action row: its latest action intent and how it
+// ended.
+message ScalingAction {
+  // The policy's canonical id.
+  string policy = 1;
+
+  // The row's version: the compare-and-set token the next intent or
+  // outcome names. Never repeats.
+  uint64 version = 2;
+
+  // `open` (the intent was written and its outcome is not in yet),
+  // `succeeded`, `failed`, or `reconciled`.
+  string state = 3;
+
+  // The intent.
+  ScalingActionIntent intent = 4;
+
+  // The app instance that opened it.
+  string owner = 5;
+
+  // When it was opened, unix ms.
+  int64 opened_at_unix_ms = 6;
+
+  // When it was closed, unix ms; 0 while open.
+  int64 closed_at_unix_ms = 7;
+
+  // What closing it said.
+  string detail = 8;
+}
+
+// Reply payload for RecordScalingAction.
+message RecordScalingActionReply {
+  // The history row written (`would`; the first of an intent's rows; 0
+  // when none was).
+  uint64 history_id = 1;
+
+  // `intent` and `outcome`: whether this write won the compare-and-set.
+  // False: the action row had moved past `expected_action_version`;
+  // nothing was written, and `action` is the row as it is.
+  bool won = 2;
+
+  // `intent` and `outcome`: the policy's action row after the call (unset
+  // when the policy has none).
+  ScalingAction action = 3;
+}
+
+// Request payload for GetScalingStatus.
+message GetScalingStatusRequest {
+  // Namespaces to list, as names or `*`-globs. Empty means `default`
+  // (or the namespace of `job`, when set).
+  repeated string namespaces = 1;
+
+  // Only this job's targets.
+  string job = 2;
+
+  // With `job`: only targets in this group.
+  optional string task_group = 3;
+
+  // With `job`: only this task's target.
+  optional string task_name = 4;
+
+  // Include each target's full last decision and its effective policy with
+  // provenance (`legion scaling explain`).
+  bool detail = 5;
+
+  // One standalone policy, by canonical id (`namespace/name`, or `name` in
+  // `default`), instead of `job`. Without `job` or `policy`, standalone
+  // policies in `namespaces` are listed after the tasks.
+  string policy = 6;
+}
+
+// Reply payload for GetScalingStatus.
+message GetScalingStatusReply {
+  // The autoscaler app, as the reports show it.
+  ScalingAppStatus app = 1;
+
+  // One entry per autoscaled task in scope, sorted by job, group, task.
+  repeated ScalingTargetStatus targets = 2;
+}
+
+// Whether the autoscaler is running.
+message ScalingAppStatus {
+  // - `running`: a report arrived within three of the app's intervals;
+  // - `not-running`: none did (`message` says since when, and what the
+  //   app's job is doing);
+  // - `starting`: the answering manager took the status lane too recently
+  //   to tell;
+  // - `disabled`: the app is disabled (`legion app disable autoscaler`).
+  string state = 1;
+
+  // For people: `running 1/1 (alloc 42), last evaluation 3s ago`, or
+  // `NOT RUNNING since 14:05 UTC (app job legion-system/autoscaler pending:
+  // no node in pool legion-system)`.
+  string message = 2;
+
+  // When the last report arrived, unix milliseconds; 0 for none.
+  int64 last_report_unix_ms = 3;
+
+  // The app's reported interval, seconds.
+  uint32 interval_seconds = 4;
+
+  // The reporting instance.
+  string instance = 5;
+
+  // The app-wide mode it reported.
+  string mode = 6;
+
+  // The manager that answered (the status-lane leader).
+  string served_by = 7;
+
+  // The cluster-wide pause, if one is active.
+  ScalingPauseInfo paused_all = 8;
+
+  // Every replica that reported in the last hour, newest report first. The
+  // app is `running` while any of them reported within three of the app's
+  // intervals (the newest report's: a replica replaced by a config change
+  // does not linger as running on its old interval); `instance`,
+  // `interval_seconds`, `mode` and `last_report_unix_ms` above are the
+  // newest report's.
+  repeated ScalingAppReplica replicas = 9;
+}
+
+// One replica of the autoscaler app, as its last report shows it.
+message ScalingAppReplica {
+  // The replica (its allocation, `alloc 41`).
+  string instance = 1;
+
+  // When its last report arrived, unix milliseconds.
+  int64 last_report_unix_ms = 2;
+
+  // Its evaluation interval, seconds.
+  uint32 interval_seconds = 3;
+
+  // Its app-wide mode: `enforce` or `dry-run`.
+  string mode = 4;
+
+  // Its build.
+  string version = 5;
+
+  // The shards it holds; empty means every shard.
+  repeated uint32 shards = 6;
+
+  // How many shards policies hash to (64); 0 from a replica that does not
+  // shard.
+  uint32 shard_count = 7;
+
+  // The targets in its last report.
+  uint32 targets = 8;
+
+  // `running` when it reported within three of the app's intervals,
+  // `stale` otherwise (it died, or lost its leases and stopped reporting; its
+  // shards move to the others within a lease TTL).
+  string state = 9;
+}
+
+// One autoscaled task's live state.
+message ScalingTargetStatus {
+  // Canonical job id.
+  string job_id = 1;
+
+  // Task group.
+  string task_group = 2;
+
+  // The task that carries `autoscale`.
+  string task_name = 3;
+
+  // Every task the policy moves (see `ScalingPolicy.members`).
+  repeated string members = 4;
+
+  // The effective mode: `enforce` or `dry-run`.
+  string mode = 5;
+
+  // The effective count now.
+  uint32 now = 6;
+
+  // What the autoscaler wanted at its last evaluation (= `now` when it held
+  // or has not evaluated).
+  uint32 want = 7;
+
+  // The effective floor.
+  uint32 min = 8;
+
+  // The effective ceiling.
+  uint32 max = 9;
+
+  // The last evaluation's state (see `ScalingTargetReport.state`), or:
+  // `stale` when the last evaluation is older than three of the app's
+  // intervals, `not-evaluated` when there is none, `invalid` when the policy
+  // does not resolve.
+  string state = 10;
+
+  // When last evaluated, unix milliseconds; 0 for never.
+  int64 last_evaluation_unix_ms = 11;
+
+  // The last evaluation's one-line why.
+  string summary = 12;
+
+  // The newest scale-history row, if any.
+  ScaleHistoryEntry last_change = 13;
+
+  // The active pin, if any.
+  ScalePin pin = 14;
+
+  // The pause covering the target, if any.
+  ScalingPauseInfo pause = 15;
+
+  // The effective policy's digest.
+  string policy_digest = 16;
+
+  // Why the policy is invalid, when it is.
+  string error = 17;
+
+  // With `detail`: the last evaluation's full decision (JSON).
+  string decision_json = 18;
+
+  // With `detail`: the effective policy, field by field, with origins.
+  repeated ScalingProvenanceRow policy = 19;
+
+  // With `detail`: the effective policy as JSON.
+  string policy_json = 20;
+
+  // The override row's version.
+  uint64 version = 21;
+
+  // The policy in one line (`2..8, cpu 70%, enforce`).
+  string policy_summary = 22;
+
+  // A standalone policy's canonical id; the job, group and task fields are
+  // then empty, and `now` is the count its target last reported. (`policy`
+  // is the effective policy's provenance, above.)
+  string policy_id = 23;
+
+  // `task`, `group` (a task's whole group moves together), `external`
+  // (a standalone policy's target plugin), or `nodes` (a node group:
+  // `now` is the count its provider holds, and `decision_json` is the node
+  // group's decision, with its victims and protected members).
+  string kind = 24;
+
+  // The autoscaler replica whose report this is (`alloc 41`): the one that
+  // holds the target's shard (docs/autoscaling.md, "Replicas"). Empty when
+  // no replica has reported the target.
+  string instance = 25;
+}
+
+// Request payload for GetScaleHistory.
+message GetScaleHistoryRequest {
+  // Job name.
+  string job = 1;
+
+  // Only rows for tasks in this group.
+  optional string task_group = 2;
+
+  // Only rows for this task.
+  optional string task_name = 3;
+
+  // At most this many rows, newest first. 0 means 50; at most 1000.
+  uint32 limit = 4;
+
+  // Include each row's full decision and the effective policy its digest
+  // resolves to.
+  bool detail = 5;
+
+  // A standalone policy's canonical id, instead of `job`.
+  string policy = 6;
+}
+
+// Reply payload for GetScaleHistory.
+message GetScaleHistoryReply {
+  // Newest first.
+  repeated ScaleHistoryEntry entries = 1;
+}
+
+// One durable scaling record.
+message ScaleHistoryEntry {
+  // Row id, increasing.
+  uint64 id = 1;
+
+  // Canonical job id.
+  string job_id = 2;
+
+  // Task group.
+  string task_group = 3;
+
+  // Task name.
+  string task_name = 4;
+
+  // When, unix milliseconds.
+  int64 at_unix_ms = 5;
+
+  // The count before.
+  uint32 from = 6;
+
+  // The count after (or the count a `would` row wanted).
+  uint32 to = 7;
+
+  // `operator`, `autoscaler`, or `wake`.
+  string source = 8;
+
+  // Who wrote it (the token's principal).
+  string principal = 9;
+
+  // The one-line why (the decision's summary, or a person's reason).
+  string summary = 10;
+
+  // Whether the count actually changed: false for `would` and `deferred`
+  // rows.
+  bool applied = 11;
+
+  // `scaled`, `deferred` (a scale-in waiting for a rollout), `would` (a
+  // dry-run decision), `pinned`, `released`, `reset`, or `failed` (a
+  // standalone policy's target refused the change recorded just before).
+  string kind = 12;
+
+  // The digest of the effective policy that decided; empty for people.
+  string policy_digest = 13;
+
+  // With `detail`: the decision (JSON).
+  string decision_json = 14;
+
+  // With `detail`: the effective policy the digest resolves to (JSON).
+  string policy_json = 15;
+
+  // The decision's id, if any.
+  string decision_id = 16;
+
+  // A standalone policy's canonical id, when the row is one's; the job,
+  // group and task fields are then empty.
+  string policy = 17;
+}
+
+// Request payload for PauseScaling.
+message PauseScalingRequest {
+  // The job to pause (or resume). Empty with `all`.
+  string job = 1;
+
+  // Narrow to the autoscaled task of this group.
+  optional string task_group = 2;
+
+  // Narrow to this task.
+  optional string task_name = 3;
+
+  // Pause (or resume) the whole cluster: the kill switch.
+  bool all = 4;
+
+  // Pause for this many seconds; unset holds until resumed.
+  optional uint64 for_seconds = 5;
+
+  // Why, shown on every status surface.
+  string reason = 6;
+
+  // Resume instead: remove the pause at this scope.
+  bool resume = 7;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 8;
+
+  // A standalone policy's canonical id, instead of `job`. Needs
+  // `scale:write` on the policy.
+  string policy = 9;
+}
+
+// Reply payload for PauseScaling.
+message PauseScalingReply {
+  // Human-readable outcome: `paused web (every autoscaled task) until
+  // 15:10 UTC`, `resumed autoscaling cluster-wide`.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key`.
+  bool deduplicated = 2;
+
+  // When the pause ends, unix milliseconds; unset for "until resumed" and
+  // for a resume.
+  optional int64 until_unix_ms = 3;
+}
+
+// Request payload for ApplyScalingPolicy.
+message ApplyScalingPolicyRequest {
+  // The policy as JSON (the CLI evaluates a Nickel file to it). See the
+  // RPC's comment and docs/autoscaling.md, "Standalone policies".
+  string spec_json = 1;
+
+  // The namespace the policy belongs to when `spec_json` names none: the
+  // CLI's `-n`, else `default`. A `namespace` in the spec wins.
+  string namespace = 2;
+
+  // Validate, resolve, and diff against the stored version; write nothing.
+  bool dry_run = 3;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 4;
+}
+
+// Reply payload for ApplyScalingPolicy.
+message ApplyScalingPolicyReply {
+  // The policy's canonical id: `name` in `default`, `namespace/name`
+  // elsewhere.
+  string id = 1;
+
+  // `external` (a target plugin) or `nodes` (a node group).
+  string kind = 2;
+
+  // The version now stored: unchanged when the policy was (or, with
+  // `dry_run`, would be). Versions come from a Control-lane counter and
+  // never repeat, across deletes too.
+  uint64 version = 3;
+
+  // The policy did not exist before.
+  bool created = 4;
+
+  // The stored policy changed (or would, with `dry_run`).
+  bool changed = 5;
+
+  // Field-by-field differences against the stored version, `field: old ->
+  // new`, in the effective policy's terms (so a change to an inherited
+  // default shows too). Empty when created or unchanged.
+  repeated string diff = 6;
+
+  // For people: `scaling policy media/render-farm: created (v3)`.
+  string message = 7;
+
+  // A replay of an earlier request with the same idempotency key: nothing
+  // was written and only `message` is set.
+  bool deduplicated = 8;
+
+  // The effective policy the autoscaler will run, as canonical JSON (the
+  // same shape `ScalingPolicy.policy_json` carries).
+  string policy_json = 9;
+
+  // Its digest.
+  string digest = 10;
+
+  // Every field of the effective policy with the level it came from
+  // (built-in, cluster defaults, a namespace policy, or `policy` for the
+  // file itself, shown as `jobspec`).
+  repeated ScalingProvenanceRow provenance = 11;
+
+  // The request was a dry run.
+  bool dry_run = 12;
+}
+
+// Request payload for DeleteScalingPolicy.
+message DeleteScalingPolicyRequest {
+  // The policy's name, or its canonical id (`namespace/name`).
+  string name = 1;
+
+  // The namespace, when `name` is bare: the CLI's `-n`, else `default`.
+  string namespace = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for DeleteScalingPolicy.
+message DeleteScalingPolicyReply {
+  // For people: `scaling policy media/render-farm: deleted (was v3)`.
+  string message = 1;
+
+  // A replay of an earlier request with the same idempotency key.
+  bool deduplicated = 2;
+
+  // The deleted policy's canonical id.
+  string id = 3;
+}
+
+// Request payload for ListScalingPolicies.
+message ListScalingPoliciesRequest {
+  // Namespaces to list, as names or `*`-globs (`["*"]` for every namespace
+  // the caller can read). Empty means `default`.
+  repeated string namespaces = 1;
+
+  // Also return each standalone policy's spec as written (`spec_json`).
+  bool detail = 2;
+}
+
+// Reply payload for ListScalingPolicies.
+message ListScalingPoliciesReply {
+  // Task targets first (by job, group, task), then standalone policies (by
+  // namespace and name).
+  repeated ScalingPolicySummary policies = 1;
+}
+
+// One scaling policy in a listing.
+message ScalingPolicySummary {
+  // The target's label: `job/group/task` for a task, the canonical policy
+  // id (`namespace/name`, or `name` in `default`) for a standalone policy.
+  string id = 1;
+
+  // `task`, `group` (a task's whole group moves together), `external`, or
+  // `nodes` (a node group).
+  string kind = 2;
+
+  // The namespace (empty for a node group).
+  string namespace = 3;
+
+  // The effective mode: `enforce` or `dry-run`. Empty when invalid.
+  string mode = 4;
+
+  // The effective floor. 0 when invalid.
+  uint32 min = 5;
+
+  // The effective ceiling. 0 when invalid.
+  uint32 max = 6;
+
+  // `ok`, or `invalid` when the policy does not resolve against the current
+  // defaults and installed plugins (see `error`).
+  string state = 7;
+
+  // Why the policy is invalid.
+  string error = 8;
+
+  // What it scales: `job web` for a task's (or group's) policy, `plugin
+  // render-exec` for an external target.
+  string target = 9;
+
+  // A standalone policy's version; 0 for a task (its job has versions).
+  uint64 version = 10;
+
+  // The policy in one line: `0..50, queue (per-replica 10), enforce`.
+  string summary = 11;
+
+  // A standalone policy's description.
+  string description = 12;
+
+  // Who last applied a standalone policy, and when (unix ms).
+  string updated_by = 13;
+  int64 updated_at_unix_ms = 14;
+
+  // With `detail`: a standalone policy as written.
+  string spec_json = 15;
+}
+
+// A standalone scaling policy, as WatchScalingPolicies delivers it to the
+// autoscaler.
+message StandaloneScalingPolicy {
+  // The canonical id (`namespace/name`, or `name` in `default`).
+  string id = 1;
+
+  // Its namespace.
+  string namespace = 2;
+
+  // Its name.
+  string name = 3;
+
+  // `external` (a target plugin), or `nodes` (a node group, whose
+  // namespace is empty: it belongs to the cluster).
+  string kind = 4;
+
+  // The stored version.
+  uint64 version = 5;
+
+  // `ok`, or `invalid` (see `error`): the policy no longer resolves against
+  // the defaults, or a plugin it names was removed from the autoscaler's
+  // app config or no longer allows its namespace. An invalid policy is
+  // held and reported, never acted on.
+  string state = 6;
+
+  // Why it is invalid.
+  string error = 7;
+
+  // The effective policy's digest.
+  string digest = 8;
+
+  // The effective policy as canonical JSON: the shape of
+  // `ScalingPolicy.policy_json` for an external target, the node group's
+  // effective record (every default filled) for a node group. Empty when
+  // invalid.
+  string policy_json = 9;
+
+  // The target plugin.
+  string target_plugin = 10;
+
+  // The target plugin's per-policy config, as JSON (`{}` when unset).
+  string target_config_json = 11;
+
+  // The pause that covers this policy (its own, or the cluster-wide one),
+  // if any.
+  ScalingPauseInfo pause = 12;
+
+  // The policy in one line.
+  string summary = 13;
+
+  // The policy's action row (RecordScalingAction): its version, which the
+  // next intent names, and the latest intent with the drains a node group
+  // has in flight. Unset before the first intent.
+  ScalingAction action = 14;
 }
 
 // Request payload for DestroyJob.
@@ -7977,6 +11039,48 @@ message SetNodeAvailabilityReply {
   bool deduplicated = 3;
 }
 
+// Request payload for ForgetNode.
+message ForgetNodeRequest {
+  // The node to forget. Required.
+  string node_id = 1;
+
+  // Forget it whatever the guard says: the machine is gone for good. See
+  // `ForgetNode` for what that does to its allocations and volumes.
+  // Default: false.
+  bool force = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`. A
+  // repeat of a forget that succeeded replays its result instead of
+  // answering NotFound.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for ForgetNode.
+message ForgetNodeReply {
+  // Human-readable status message: `"Forgot node <id>"`.
+  string message = 1;
+
+  // True when replayed from a recorded result for the request's
+  // `idempotency_key` rather than applied fresh; the counts below are 0
+  // then.
+  bool deduplicated = 2;
+
+  // Allocations removed with the node (only with `force`).
+  uint32 allocations_removed = 3;
+
+  // Node tokens revoked (normally 1; 0 for a node that never had one, such
+  // as one registered with ACLs off).
+  uint32 tokens_revoked = 4;
+
+  // Node-local volumes still pinned to the forgotten node (only with
+  // `force`). Their instances cannot be placed until an operator replaces
+  // them (`legion instance replace`).
+  uint32 volumes_orphaned = 5;
+
+  // Snapshots stored on the node, now marked lost.
+  uint32 snapshots_lost = 6;
+}
+
 // Request payload for GetLedger.
 message GetLedgerRequest {
   // Empty request; full ledger is returned.
@@ -8914,7 +12018,8 @@ message KvJobReference {
 
 // Request payload for ListKv.
 message ListKvRequest {
-  // Prefix filter; entries with keys beginning with this prefix are returned.
+  // Prefix filter; entries (and, with `include_locks`, locks) with keys
+  // beginning with this prefix are returned.
   //
   // Default empty string matches all keys.
   string prefix = 1;
@@ -8928,12 +12033,25 @@ message ListKvRequest {
   // `legion kv list --values` does) to get them all. Every other field
   // (type, version, timestamps, `encrypted`) is returned either way.
   bool include_values = 2;
+
+  // Also return the unexpired locks under `prefix` in `locks`, filtered by
+  // `kv:read` like the entries. A listed lock's `lock_id` is left empty:
+  // it is the holder's secret (whoever has it can renew or release the
+  // lock), so only the holder, which got it from AcquireKvLock, knows it.
+  // Default `false`. The autoscaler's replicas read their shard leases
+  // this way (docs/autoscaling.md, "Replicas").
+  bool include_locks = 3;
 }
 
 // Reply payload for ListKv.
 message ListKvReply {
   // Matching KV entries.
   repeated KvEntry entries = 1;
+
+  // With `include_locks`, the unexpired locks under the prefix, by key,
+  // each with its `owner`, `acquired_at` and `expires_at` and an empty
+  // `lock_id`. A lock's key need not have an entry.
+  repeated KvLock locks = 2;
 }
 
 // Request payload for DeleteKv.
@@ -9880,6 +12998,36 @@ service Worker {
   // check above, with the check named.
   rpc ExecTask (stream ExecClientFrame) returns (stream ExecServerFrame);
 
+  // Delivers one HTTP request to an app allocation's UI port and returns
+  // the answer: the unary subset of a worker-plane tunnel that app views
+  // and actions need (docs/apps.md, "Views and actions";
+  // Manager.GetAppView). Caller class: manager. The manager has already
+  // authorized the viewer and put a signed viewer assertion in the
+  // request's `legion-viewer` header; the worker adds nothing and checks
+  // nothing about the viewer.
+  //
+  // What the worker does check, so this is not a general proxy:
+  // - the allocation runs on this node, now, and its job is the request's
+  //   `job_id`, in the reserved `legion-system` namespace (apps only);
+  // - the allocation declares the port label `port`;
+  // - the method is GET or POST, the path starts with `/legion/v1/`, only
+  //   the `legion-viewer`, `content-type`, and `accept` headers pass, and
+  //   the body is at most 256 KiB.
+  //
+  // It then dials the port the way the ingress datapath does (loopback,
+  // inside the task's network namespace when it is gated; a sandbox guest
+  // over vsock or its bridge address), never a caller-named address, sends
+  // one HTTP/1.1 request, and reads at most 1 MiB of answer within 10
+  // seconds.
+  //
+  // Errors: Unauthenticated without a manager certificate; InvalidArgument
+  // for a request outside the limits above; NotFound when the allocation
+  // does not run here or runs another job; FailedPrecondition when the job
+  // is not an app's or the port is not declared; Unavailable when the port
+  // cannot be dialed; DeadlineExceeded when the app does not answer in
+  // time.
+  rpc ForwardAppRequest (ForwardAppRequestRequest) returns (ForwardAppRequestReply);
+
   // Starts work on this node from a boot ticket, without any call to a
   // manager on the critical path (docs/edge-boot.md). Caller class: ticket.
   //
@@ -10664,6 +13812,44 @@ message ListJobActionsReply {
   repeated JobAction actions = 1;
 }
 
+// One HTTP header of a forwarded app request or answer.
+message AppHttpHeader {
+  // The header's name, lowercase.
+  string name = 1;
+  // Its value.
+  string value = 2;
+}
+
+// Request payload for Worker.ForwardAppRequest.
+message ForwardAppRequestRequest {
+  // The app allocation to deliver to (the manager's id).
+  int64 allocation_id = 1;
+  // The job the manager expects it to run (`legion-system/<app>`); the
+  // worker refuses an allocation running anything else.
+  string job_id = 2;
+  // The port label (`network.ports[].name`) to deliver to: the manifest's
+  // `ui.port`.
+  string port = 3;
+  // `GET` or `POST`.
+  string method = 4;
+  // The path and query, starting `/legion/v1/`.
+  string path = 5;
+  // Headers: `legion-viewer`, `content-type`, `accept`; others are dropped.
+  repeated AppHttpHeader headers = 6;
+  // The body (POST), at most 256 KiB.
+  bytes body = 7;
+}
+
+// Response payload for Worker.ForwardAppRequest.
+message ForwardAppRequestReply {
+  // The app's HTTP status.
+  uint32 status = 1;
+  // Its `content-type`.
+  string content_type = 2;
+  // Its body, at most 1 MiB.
+  bytes body = 3;
+}
+
 // Selects which captured stream(s) to read for a task.
 //
 // Used by both `Worker.GetTaskLogs` and `Manager.GetAllocationLogs`.
@@ -11146,7 +14332,11 @@ message WhoAmIReply {
   // How the caller was identified.
   //
   // One of: `disabled` (ACLs off), `token` (Legion ACL token), `jwt`
-  // (external JWT validated by an auth method), `anonymous` (no credential).
+  // (external JWT validated by an auth method), `anonymous` (no credential),
+  // `delegated` (an app's own credential presenting a viewer's assertion in
+  // `legion-on-behalf-of`: `principal` is `<viewer> via app <app>`, and
+  // `rules_json` the one rule the delegation holds, plus any deny rules the
+  // app or the viewer carry).
   string source = 3;
 
   // Human-readable principal: token name, `user:<name>`, JWT subject, or
@@ -11444,6 +14634,905 @@ message DeleteAclUserReply {
   string message = 1;
 }
 
+// Request payload for ListGrants.
+message ListGrantsRequest {
+  // Only this job's grants: its canonical id (`namespace/name`, or the bare
+  // name for a job in `default`). Unset or empty lists every job's.
+  optional string job = 1;
+
+  // Also list revoked grants, with who revoked them and when.
+  //
+  // Default: false.
+  bool include_revoked = 2;
+}
+
+// What one task's `legion` identity was granted.
+message TaskGrantInfo {
+  // The task's group.
+  string group = 1;
+
+  // The task's name.
+  string task = 2;
+
+  // The inline rules granted (`permissions` on the identity), as a JSON
+  // array in the shape `legion acl policy apply` takes. `[]` when the
+  // identity named only policies.
+  string permissions_json = 3;
+
+  // The policy names granted (`policies` on the identity). Resolved by name
+  // when a token is verified, so a later edit to a policy applies to the
+  // grant too.
+  repeated string policies = 4;
+}
+
+// One job config version's grant.
+message JobGrant {
+  // The job's canonical id.
+  string job_id = 1;
+
+  // The job config version the grant belongs to; allocations of other
+  // versions resolve those versions' grants.
+  int64 version = 2;
+
+  // The job config id (`<job id>-<version>`).
+  string job_config_id = 3;
+
+  // What each task asking for something was granted.
+  repeated TaskGrantInfo tasks = 4;
+
+  // The principal whose submit was checked and granted it (for example
+  // `userpass:alice`). A version Legion stored itself, re-rendering a job
+  // after a KV change, carries the previous version's grant, and its granter,
+  // when it asks for exactly the same.
+  string granted_by = 5;
+
+  // When the grant was recorded (RFC3339).
+  string granted_at = 6;
+
+  // When the grant was revoked (RFC3339), empty while it is live.
+  string revoked_at = 7;
+
+  // Who revoked it, empty while it is live.
+  string revoked_by = 8;
+}
+
+// Reply payload for ListGrants.
+message ListGrantsReply {
+  // Grants, by job id, newest version first.
+  repeated JobGrant grants = 1;
+}
+
+// Request payload for RevokeGrant.
+message RevokeGrantRequest {
+  // The job's canonical id (`namespace/name`, or the bare name in
+  // `default`). Required.
+  string job = 1;
+
+  // Revoke only this version's grant. Unset revokes every version's, which
+  // is what stops a running job's access whatever version it runs.
+  optional int64 version = 2;
+
+  // Optional key to dedupe retries; a repeat returns the first reply with
+  // `deduplicated = true`.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for RevokeGrant.
+message RevokeGrantReply {
+  // Human-readable status message.
+  string message = 1;
+
+  // How many live grants this call revoked.
+  uint32 revoked = 2;
+
+  // True when `idempotency_key` matched an earlier call, whose reply this
+  // is.
+  bool deduplicated = 3;
+}
+
+// === APPS ===
+
+// Request payload for ListApps.
+message ListAppsRequest {
+}
+
+// Reply payload for ListApps.
+message ListAppsReply {
+  // Installed apps the caller may read, by name.
+  repeated App apps = 1;
+}
+
+// An app's settings (`legion app set`).
+message AppSettingsInfo {
+  // Copies of each task. 1-32.
+  uint32 replicas = 1;
+
+  // `managers`, `workers`, or `any` (docs/apps.md, "Placement").
+  string placement = 2;
+
+  // CPU (MHz) for each task, overriding the manifest. Unset keeps the
+  // manifest's.
+  optional uint64 cpu = 3;
+
+  // Memory (MiB) for each task, overriding the manifest.
+  optional uint64 memory = 4;
+
+  // The worker pool for `workers` and `any` placement. Unset is `default`.
+  optional string pool = 5;
+}
+
+// What an app's `legion` identity was granted.
+message AppGrantInfo {
+  // The granted rules, as a JSON array in the shape `legion acl policy
+  // apply` takes.
+  string rules_json = 1;
+
+  // Who approved them: the installer (`userpass:alice`), or
+  // `legion:bootstrap` for a bundled app's seed.
+  string granted_by = 2;
+
+  // When (RFC3339).
+  string granted_at = 3;
+}
+
+// The app reconciler's view of an app.
+message AppReconcileInfo {
+  // The digest of the last render the reconciler submitted or found.
+  string last_digest = 1;
+
+  // What its last pass did: `created the job`, `reverted a direct edit by
+  // userpass:alice`, `stopped (app disabled)`.
+  string last_action = 2;
+
+  // Its last error, empty after a success.
+  string last_error = 3;
+
+  // When the last action or error was recorded (RFC3339).
+  string last_at = 4;
+
+  // The build marker a bundled app's job is rendered for
+  // (`<buildVersion>+<buildId>`), empty for installed apps and before any
+  // eligible node reported its build.
+  string build_marker = 5;
+
+  // What the app waits for, when anything: `upgrade waiting: 2 of 3
+  // eligible nodes on 0.15.0 (waiting for mgr-3)`.
+  string marker_reason = 6;
+
+  // The digest stamped on the job's latest version (`managedBy`). Empty
+  // when the latest version was submitted by someone else.
+  string job_digest = 7;
+}
+
+// An installed app.
+message App {
+  // The app's name; its job is `legion-system/<name>`.
+  string name = 1;
+
+  // The manifest's description.
+  string description = 2;
+
+  // The manifest's version, or a bundled app's build marker version.
+  string version = 3;
+
+  // `bundled`, `file`, or `url`.
+  string source = 4;
+
+  // The file or URL the manifest was installed from; empty for bundled
+  // apps.
+  string source_ref = 5;
+
+  // Whether the app should run.
+  bool enabled = 6;
+
+  AppSettingsInfo settings = 7;
+
+  // `running`, `upgrading`, `degraded`, `pending`, `stopped`, or
+  // `corrupt`. Derived from the app's job as it runs now: `running` counts
+  // only healthy allocations of the job version the record renders, so an
+  // upgrade that has not taken shows `upgrading` (the previous version still
+  // serves) or `degraded` with `upgrade failing: …` (its rollout failed or
+  // rolled back), never `running` on the old version. `corrupt` is a record
+  // this manager cannot decode (`status_detail` says why); only `legion app
+  // uninstall` acts on it.
+  string status = 8;
+
+  // Why, when the status needs one: `2/3 running`, `reconcile failing:
+  // ...`, `waiting for an eligible node to report its build`, `its job
+  // failed; restarting it in 20s (restart 2)`, `upgrade held: …`.
+  string status_detail = 9;
+
+  // The app's job (`legion-system/<name>`).
+  string job_id = 10;
+
+  // Allocations running.
+  uint32 running = 11;
+
+  // Allocations the app should run: replicas times tasks, 0 when disabled.
+  uint32 desired = 12;
+
+  // The digest of the stored manifest.
+  string manifest_digest = 13;
+
+  // The stored manifest, as JSON.
+  string manifest_json = 14;
+
+  // The app's config, as JSON.
+  string config_json = 15;
+
+  AppGrantInfo grant = 16;
+
+  // Who installed it.
+  string installed_by = 17;
+
+  // When it was installed, and last changed (RFC3339).
+  string installed_at = 18;
+  string updated_at = 19;
+
+  AppReconcileInfo reconcile = 20;
+
+  // The UI slots the manifest registers (`nav`, `job`, ...).
+  repeated string ui_slots = 21;
+
+  // Things an operator should know: no system worker on its managers,
+  // workload identity off (the app has no Legion credentials).
+  repeated string notes = 22;
+
+  // The nodes running it.
+  repeated string running_on = 23;
+
+  // The jobspec keys the app adds (docs/apps.md, "Jobspec extensions"),
+  // with renames applied: `legion app extensions` lists them.
+  repeated AppExtensionKey extension_keys = 24;
+
+  // The uid (and gid) the app's `exec` tasks run as: its own, assigned when
+  // it was installed or seeded, from 1900000000 up, and never shared with
+  // another app (docs/apps.md, "What Legion renders"). 0 in a dry run's
+  // reply, before the store assigns one.
+  uint32 uid = 25;
+}
+
+// One jobspec key an installed app adds (App.extension_keys,
+// GetJobSchemaReply.extensions).
+message AppExtensionKey {
+  // The app that declares it, and its version (`bundled` apps report their
+  // build's).
+  string app = 1;
+  string app_version = 2;
+
+  // The digest of the app's manifest: what `validated_by` stamps name.
+  string manifest_digest = 3;
+
+  // Whether the app is enabled. A disabled app's keys are still validated
+  // at submit; nothing acts on the values while it is off.
+  bool app_enabled = 4;
+
+  // `job`, `group`, `task`, `volume`, `port`, or `service`. A `group` key
+  // is written on one task of the group and applies to the whole group.
+  string point = 5;
+
+  // What job authors write at the point: the declared key, or the
+  // operator's rename (`legion app install --key`). Every key can also be
+  // written in its qualified spelling, `apps.<app>`.
+  string key = 6;
+
+  // The key the manifest declares.
+  string declared_key = 7;
+
+  string description = 8;
+
+  // The value's JSON Schema (draft 7), as JSON.
+  string schema_json = 9;
+
+  // The manifest's example values, as a JSON array; each passes the
+  // schema.
+  string examples_json = 10;
+
+  // Whether a submit also asks the app (`POST
+  // /legion/v1/extensions/validate`), failing open when it cannot answer.
+  bool validate = 11;
+
+  // A permission whoever sets or changes the value must hold on the job
+  // (`net:write`), beyond `job:write`; empty when none.
+  string requires = 12;
+
+  // A core field of the same name now exists at the point (a Legion
+  // release added it): the core field wins, and job authors write the
+  // app's values as `apps.<app>`.
+  bool shadowed = 13;
+}
+
+// Request payload for GetJobSchema.
+message GetJobSchemaRequest {}
+
+// Reply payload for GetJobSchema.
+message GetJobSchemaReply {
+  // The cluster's jobspec JSON Schema (draft 7), as JSON: the core schema
+  // with every installed app's keys at their points.
+  string schema_json = 1;
+
+  // The installed keys, one per app and point.
+  repeated AppExtensionKey extensions = 2;
+}
+
+// Request payload for WatchAppExtensions.
+message WatchAppExtensionsRequest {
+  // The shards to watch, each below `shard_count`. Empty watches every
+  // shard.
+  repeated uint32 shards = 1;
+
+  // How many shards values split into. 0 (or 1) means one shard: every
+  // value.
+  uint32 shard_count = 2;
+
+  // The app whose values to watch: empty (or the caller's own name) for an
+  // app's identity; required for a management token.
+  string app = 3;
+}
+
+// One message of WatchAppExtensions.
+message AppExtensionEvent {
+  // True for the first message: `upserts` is every current value, and a
+  // consumer replaces whatever it held.
+  bool snapshot = 1;
+
+  // Values that are new or changed since the previous message.
+  repeated AppExtensionValue upserts = 2;
+
+  // Values that are gone since the previous message.
+  repeated AppExtensionValueRef deletes = 3;
+
+  // Increases by one with every message on this stream.
+  uint64 generation = 4;
+}
+
+// One of the calling app's values, in one job.
+message AppExtensionValue {
+  // The job's canonical id, its namespace, the version the value comes
+  // from, and the job's status.
+  string job_id = 1;
+  string namespace = 2;
+  uint32 config_version = 3;
+  string job_status = 4;
+
+  // The point the app declared (`group` keys are written on a task).
+  string point = 5;
+
+  // Where in the job: the group and task, then the volume, port, or
+  // service. The app acts only on what carries the value.
+  ExtensionPath path = 6;
+
+  // The key as written (`backup` or `apps.backup`).
+  string key = 7;
+
+  // The value as written, and with the app's current schema defaults
+  // filled, as JSON.
+  string value_json = 8;
+  string effective_json = 9;
+
+  // `valid` or `invalid` against the app's current schema; `detail` says
+  // why for `invalid`.
+  string state = 10;
+  string detail = 11;
+
+  // `<app>@<manifest digest>` that checked it at submit (empty for an
+  // adopted pending value, which no submit checked).
+  string validated_by = 12;
+
+  // A value kept pending under `--allow-unknown-fields` before the app was
+  // installed, which the app's key claims.
+  bool adopted = 13;
+
+  // The shard the value belongs to (0 when the stream is not sharded).
+  uint32 shard = 14;
+}
+
+// Identifies a value WatchAppExtensions no longer reports.
+message AppExtensionValueRef {
+  string job_id = 1;
+  string point = 2;
+  ExtensionPath path = 3;
+}
+
+// Request payload for GetApp.
+message GetAppRequest {
+  // The app's name.
+  string name = 1;
+}
+
+// Reply payload for GetApp.
+message GetAppReply {
+  App app = 1;
+}
+
+// Request payload for InstallApp.
+message InstallAppRequest {
+  // The manifest, as JSON (the CLI evaluates a Nickel manifest first).
+  string manifest_json = 1;
+
+  // `file` or `url`: where the manifest came from.
+  string source = 2;
+
+  // The path or URL, recorded for `legion app status`.
+  string source_ref = 3;
+
+  // Validate and check the grant, and return the prompt, without
+  // installing.
+  bool dry_run = 4;
+
+  // The initial config, as JSON. Unset installs the manifest's default.
+  optional string config_json = 5;
+
+  // Optional key to dedupe retries; a repeat returns the first reply with
+  // `deduplicated = true`.
+  optional string idempotency_key = 6;
+
+  // Jobspec keys to install under another name, `<point>.<declared
+  // key>=<key>` (`--key volume.backup=pgbackup`): how an operator installs
+  // an app whose key another installed app already owns at that point. Job
+  // authors then write the new key; stored values belong to the app, not
+  // the key.
+  repeated string keys = 7;
+}
+
+// Reply payload for InstallApp.
+message InstallAppReply {
+  // The installed app (on a dry run, the record it would be).
+  App app = 1;
+
+  // Human-readable status message.
+  string message = 2;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+
+  // The install prompt: what the app runs, where, as whom, what it asks
+  // for, and its UI, one line each; then, for an app with jobspec keys, how
+  // the stored values its keys own fare against its schemas, and the
+  // pending values it adopts.
+  repeated string prompt = 4;
+
+  // On a dry run, the first permission the caller does not hold, worded as
+  // the refusal would be; empty when the caller holds them all.
+  string uncovered = 5;
+}
+
+// Request payload for UpgradeApp.
+message UpgradeAppRequest {
+  // The app to upgrade.
+  string name = 1;
+
+  // The new manifest, as JSON. Its `name` must be the app's.
+  string manifest_json = 2;
+
+  // The path or URL it came from.
+  string source_ref = 3;
+
+  // Approve permissions the new manifest adds. Without it, an upgrade that
+  // adds any changes nothing and returns the diff.
+  bool approve = 4;
+
+  // Show the diff and the prompt without upgrading.
+  bool dry_run = 5;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 6;
+
+  // The config to run the new manifest with, as JSON. Unset keeps the
+  // stored config, which must then match the new manifest's schema.
+  optional string config_json = 7;
+
+  // Upgrade even though jobs set a jobspec key at an extension point the
+  // new manifest no longer declares. Their values stay stored, flagged
+  // `orphaned`, and each such job's next submit fails until the key is
+  // removed (or `--allow-unknown-fields` is passed). Without it, such an
+  // upgrade is refused (`FAILED_PRECONDITION`) naming the jobs, as
+  // `UninstallApp` is.
+  bool force = 8;
+}
+
+// How an upgrade changes an app's grant.
+message PermissionDiff {
+  // Rules the new manifest adds, as a JSON array.
+  string added_json = 1;
+
+  // Rules it drops.
+  string removed_json = 2;
+
+  // Rules both have.
+  string unchanged_json = 3;
+}
+
+// Reply payload for UpgradeApp.
+message UpgradeAppReply {
+  // The app after the call (unchanged when `upgraded` is false).
+  App app = 1;
+
+  PermissionDiff diff = 2;
+
+  // Whether the manifest was replaced.
+  bool upgraded = 3;
+
+  // Human-readable status message; says why when `upgraded` is false.
+  string message = 4;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 5;
+
+  // The new manifest's install prompt, then, for an app with jobspec keys,
+  // every stored value of its keys checked against the new schemas (`14
+  // jobs set backup on volumes; 2 fail this version's schema: …`), the
+  // values a dropped extension point orphans, and the operator settings
+  // the upgrade keeps where the new manifest's defaults differ.
+  repeated string prompt = 6;
+
+  // The first permission the caller does not hold, worded as the refusal
+  // would be; empty when the caller holds them all. Set on a dry run, so an
+  // agent can tell "would be refused" from the field rather than the
+  // message.
+  string uncovered = 7;
+
+  // The jobs whose values the upgrade leaves orphaned, because the new
+  // manifest drops the extension point their key is declared at.
+  repeated string orphaned_jobs = 8;
+}
+
+// Request payload for UninstallApp.
+message UninstallAppRequest {
+  string name = 1;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 2;
+
+  // Uninstall even though jobs set the app's jobspec keys. Their values
+  // stay stored, flagged `orphaned`; resubmitting such a job fails unless
+  // the key is removed or `--allow-unknown-fields` is passed.
+  bool force = 3;
+
+  // Also delete every KV key under `legion/apps/<name>/`, the app's own
+  // state. Needs `kv:write` on that prefix besides `app:write`. Without
+  // it, the keys stay, and a later install of an app with the same name
+  // is told about them in its prompt (its grant may reach them).
+  bool purge = 4;
+
+  // Check what the uninstall would do (the jobs it would orphan, the
+  // grants it would revoke, the keys `purge` would delete) without doing
+  // it.
+  bool dry_run = 5;
+}
+
+// Reply payload for UninstallApp.
+message UninstallAppReply {
+  // Human-readable status message.
+  string message = 1;
+
+  // How many job grants were revoked.
+  uint32 revoked_grants = 2;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+
+  // The jobs whose values for the app's keys are now orphaned (with
+  // `force`).
+  repeated string orphaned_jobs = 4;
+
+  // How many KV keys under `legion/apps/<name>/` were deleted (`purge`),
+  // or, without it, are left behind.
+  uint32 kv_keys = 5;
+
+  // Whether `kv_keys` were deleted (`purge`) or are left behind.
+  bool purged = 6;
+}
+
+// Request payload for SetAppEnabled.
+message SetAppEnabledRequest {
+  string name = 1;
+
+  // True runs the app; false stops its job and keeps everything else.
+  // Enabling an app that is already enabled reconciles it again, and
+  // resubmits its job when the job is not running healthy at the version
+  // the record renders (a failed upgrade, a failed job).
+  bool enabled = 2;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 3;
+
+  // Say what would change without changing it.
+  bool dry_run = 4;
+}
+
+// Reply payload for SetAppEnabled.
+message SetAppEnabledReply {
+  App app = 1;
+
+  // Human-readable status message.
+  string message = 2;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+}
+
+// Request payload for UpdateAppSettings. Unset fields keep their value.
+message UpdateAppSettingsRequest {
+  string name = 1;
+
+  optional uint32 replicas = 2;
+
+  // `managers`, `workers`, or `any`.
+  optional string placement = 3;
+
+  // CPU (MHz) per task; 0 clears the override.
+  optional uint64 cpu = 4;
+
+  // Memory (MiB) per task; 0 clears the override.
+  optional uint64 memory = 5;
+
+  // The worker pool for `workers` and `any` placement; empty clears it.
+  optional string pool = 6;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 7;
+
+  // Validate the change (and its `operator:write` check) and say what would
+  // change, without changing it.
+  bool dry_run = 8;
+}
+
+// Reply payload for UpdateAppSettings.
+message UpdateAppSettingsReply {
+  App app = 1;
+
+  // Human-readable status message: what changed.
+  string message = 2;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+}
+
+// Request payload for SetAppConfig.
+message SetAppConfigRequest {
+  string name = 1;
+
+  // The whole new config, as JSON.
+  string config_json = 2;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 3;
+
+  // Validate the config (its schema, the job it renders, the code-field
+  // grant check) and say what would change, without changing it.
+  bool dry_run = 4;
+}
+
+// Reply payload for SetAppConfig.
+message SetAppConfigReply {
+  App app = 1;
+
+  // Human-readable status message.
+  string message = 2;
+
+  // The code fields the change touched (concrete JSON pointers); the
+  // caller's grant was checked when any did.
+  repeated string code_fields_changed = 3;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 4;
+}
+
+// === APP UI EXTENSIONS (docs/apps.md, "Views and actions") ===
+
+// Where an app view or action is shown, and what it is about. The manager
+// checks a declared permission on this context, and the viewer assertion
+// carries it to the app exactly as the request does. Which fields a slot
+// takes:
+// - `nav`, `overview`: none;
+// - `job`: `namespace` (default `default`) and `job`;
+// - `task`: `namespace`, `job`, `task`, and `group` when the task has one;
+// - `node`: `node`.
+//
+// Any other field set for the slot is InvalidArgument.
+message AppViewContext {
+  // `nav`, `overview`, `job`, `task`, or `node`.
+  string slot = 1;
+  // The job's namespace (`job` and `task`).
+  string namespace = 2;
+  // The job's bare name, or its canonical id `namespace/name` (split into
+  // `namespace` and `job` on the way in).
+  string job = 3;
+  // The task's group (`task`, optional).
+  string group = 4;
+  // The task's name (`task`).
+  string task = 5;
+  // The node's id (`node`).
+  string node = 6;
+}
+
+// A permission a UI extension or action declares: an ACL resource and
+// action, checked as the viewer.
+message UiPermission {
+  // An ACL resource: `job`, `scale`, `node`, ...
+  string resource = 1;
+  // `read` or `write`.
+  string action = 2;
+}
+
+// One UI registration the caller may see.
+message UiExtension {
+  // The app that registers it.
+  string app = 1;
+  // `nav`, `overview`, `job`, `task`, or `node`.
+  string slot = 2;
+  // The page's, card's, or panel's title (the sidebar label for `nav`).
+  // Empty for a task entry that only shows a badge.
+  string title = 3;
+  // The sidebar icon name (`nav`); the SPA uses a default for one it does
+  // not know.
+  string icon = 4;
+  // The view to fetch with GetAppView. Empty for a task entry that only
+  // shows a badge.
+  string view = 5;
+  // For `task`: the view whose `badge` the task row shows.
+  string badge = 6;
+  // The permission the entry declares, when it declares one.
+  UiPermission permission = 7;
+  // How often the SPA re-fetches the app's views, in seconds (the
+  // manifest's `ui.refresh`); 0 means on page load and on demand only.
+  uint32 refresh_seconds = 8;
+  // The app's one-line description.
+  string app_description = 9;
+  // For `nav`: the sandboxed page this entry opens (`ui.pages[].name`),
+  // fetched with GetAppPage; `view` is then empty. The SPA routes it to
+  // `/apps/<app>/pages/<page>`.
+  string page = 10;
+}
+
+// Request payload for ListUiExtensions.
+message ListUiExtensionsRequest {
+  // Only this slot's entries; empty for every slot.
+  string slot = 1;
+  // When set, entries are filtered by their permission on this context;
+  // `context.slot` must equal `slot`.
+  AppViewContext context = 2;
+  // Only this app's entries; empty for every app.
+  string app = 3;
+}
+
+// Response payload for ListUiExtensions.
+message ListUiExtensionsReply {
+  // The entries, by app name, then slot, then declaration order.
+  repeated UiExtension extensions = 1;
+}
+
+// Request payload for GetAppView.
+message GetAppViewRequest {
+  // The app's name.
+  string app = 1;
+  // The view's name. Empty picks the first entry the caller may see in the
+  // context's slot (its view, or a task entry's badge view).
+  string view = 2;
+  // Where the view is shown. Required (its `slot` at least).
+  AppViewContext context = 3;
+}
+
+// An action a view's `actions` block offers: its declaration, and whether
+// the caller may invoke it on this context.
+message AppActionInfo {
+  // The action's name, for InvokeAppAction.
+  string name = 1;
+  // Its title, the default button label.
+  string title = 2;
+  // The confirmation to show, with `{job}` and the other context
+  // placeholders filled in. Empty when none is needed: a `write` action
+  // always has one (its own, or "<title>?").
+  string confirm = 3;
+  // The declared inputs, as a JSON object keyed by input name:
+  // `{ "for": { "type": "duration", "default": "1h" } }`. Types are
+  // `string`, `number`, `duration`, `enum` (with `values`), and `boolean`.
+  string inputs_json = 4;
+  // The permission InvokeAppAction checks as the caller.
+  UiPermission permission = 5;
+  // Whether the caller holds it on this context. The SPA disables the
+  // button otherwise; the check runs again on invocation.
+  bool allowed = 6;
+  // Whether the action is a `write`.
+  bool mutating = 7;
+}
+
+// Response payload for GetAppView.
+message GetAppViewReply {
+  // The app's name.
+  string app = 1;
+  // The view that was rendered.
+  string view = 2;
+  // The context, normalized (namespace filled in, `ns/job` split).
+  AppViewContext context = 3;
+  // The view document, validated, as JSON: `{ "view": "legion-view/1",
+  // "title"?, "badge"?, "hidden"?, "blocks": [...] }` (docs/apps.md, "The
+  // view schema").
+  string view_json = 4;
+  // The entry's title; the document's own `title` overrides it.
+  string title = 5;
+  // The actions the document's `actions` blocks reference.
+  repeated AppActionInfo actions = 6;
+  // The app's `ui.refresh`, in seconds; 0 for none.
+  uint32 refresh_seconds = 7;
+  // The allocation that answered.
+  int64 allocation_id = 8;
+  // The node it runs on.
+  string node_id = 9;
+}
+
+// Request payload for InvokeAppAction.
+message InvokeAppActionRequest {
+  // The app's name.
+  string app = 1;
+  // The action's name (`ui.actions[].name`).
+  string action = 2;
+  // Where it was pressed: a `job`, `task`, or `node` context.
+  AppViewContext context = 3;
+  // The inputs, as a JSON object; empty or `{}` for the defaults.
+  string inputs_json = 4;
+  // Optional client key for retry-safe submission: a repeated key from the
+  // same caller with the same arguments returns the first successful
+  // reply with `deduplicated` set, and the app sees one request.
+  optional string idempotency_key = 5;
+}
+
+// Response payload for InvokeAppAction.
+message InvokeAppActionReply {
+  // What the app says happened.
+  string message = 1;
+  // A refreshed view the app returned, validated, as JSON; empty when it
+  // returned none.
+  string view_json = 2;
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+  // The inputs the action ran with, defaults filled in, as JSON.
+  string inputs_json = 4;
+}
+
+// Request payload for GetAppPage.
+message GetAppPageRequest {
+  // The app's name.
+  string app = 1;
+  // The page's name (`ui.pages[].name`).
+  string page = 2;
+}
+
+// A Manager RPC a sandboxed page may call through the SPA's bridge.
+message AppPageRpc {
+  // The RPC's name, as `proto/legion.proto` spells it (`GetJobInfo`).
+  string method = 1;
+  // Whether the call changes something. The SPA asks the viewer before
+  // every such call, naming the app, the RPC, and the target of the request
+  // as it will be sent (a request that spells a field both ways, `nodeId`
+  // and `node_id`, is refused); reads run without asking. Classified by
+  // what the call does, not by its ACL action.
+  bool mutating = 2;
+}
+
+// Response payload for GetAppPage.
+message GetAppPageReply {
+  // The app's name.
+  string app = 1;
+  // The page's name.
+  string page = 2;
+  // The page's title (`ui.pages[].title`).
+  string title = 3;
+  // The page's single-file HTML bundle, as the app served it (UTF-8, at
+  // most 1 MiB). The SPA prepends its Content-Security-Policy and the
+  // bridge's script, and mounts it in a sandboxed `srcdoc` iframe.
+  string html = 4;
+  // The RPCs the page may call through the bridge (`ui.pages[].rpcs`), as
+  // the viewer. Every bridged call carries the `legion-app-page: <app>/<page>`
+  // header, and the manager refuses one whose RPC is not on this list.
+  repeated AppPageRpc rpcs = 5;
+  // The allocation that answered.
+  int64 allocation_id = 6;
+  // The node it runs on.
+  string node_id = 7;
+}
+
 // === AUTH METHODS & JOIN TOKENS ===
 
 // Request payload for GetAuthMethods.
@@ -11490,6 +15579,28 @@ message CreateJoinTokenRequest {
 
   // Free-form description shown in ListJoinTokens (for example "rack 12").
   string description = 3;
+
+  // The most nodes that may register with this token. Each new node that
+  // registers with it uses it once; a node re-registering under its own
+  // name (a restart that fell back to the join token, or a node that was
+  // marked lost rejoining) does not. Once spent, the token refuses new
+  // nodes with PERMISSION_DENIED. A node that `ForgetNode` removed is new
+  // again, so a spent token cannot bring it back.
+  //
+  // Default: unset (no limit). 0 is refused with InvalidArgument.
+  optional uint32 max_uses = 4;
+
+  // Node attributes stamped on every node that registers with this token
+  // (`legion.nodegroup = "workers-general"`). They take precedence over the
+  // worker's `--attr` values and its worker type's attributes, and survive
+  // the node's restarts. Keys Legion reads as node structure (`namespaces`,
+  // `resources`, `restriction`, ...) and `legion.role` and `legion.join`
+  // are refused with InvalidArgument. At most 64 entries; keys up to 128
+  // bytes, values up to 1024. See docs/auth-and-acls.md, "Node attributes
+  // from the join".
+  //
+  // Default: empty.
+  map<string, string> attributes = 5;
 }
 
 // Metadata describing a join token. Never contains the secret.
@@ -11508,6 +15619,15 @@ message JoinTokenInfo {
 
   // RFC3339 creation timestamp.
   string created_at = 5;
+
+  // The most nodes that may register with this token. Unset: no limit.
+  optional uint32 max_uses = 6;
+
+  // New nodes that have registered with this token so far.
+  uint32 uses = 7;
+
+  // Node attributes stamped on every node that registers with it.
+  map<string, string> attributes = 8;
 }
 
 // Reply payload for CreateJoinToken.
@@ -12119,6 +16239,12 @@ service RaftTransport {
   // decide liveness at `digestInterval` resolution, and it keeps the message
   // small and the merge trivial.
   //
+  // The same RPC carries the sender's scaling-input rollups (`rollups`,
+  // docs/autoscaling.md "Scaling inputs") every 10 seconds, on a digest of
+  // their own with no node ids, so the liveness digest itself stays as small
+  // and as frequent as it was. Delta-encoded; the reply's `rollup_resync`
+  // asks for a full set.
+  //
   // ACL: manager-plane internal, authenticated by cluster secret metadata —
   // it is not a `Manager` RPC, so it takes no ACL row and
   // `tests/integration/acl_endpoints.rs::every_manager_rpc_is_classified` does not cover
@@ -12311,7 +16437,113 @@ message NodeLivenessDigestRequest {
   // digest. Authoritative for this peer: the leader REPLACES the peer's
   // previous claimed set, so a node that moved managers is not left attributed
   // to the old one.
+  //
+  // A digest that carries only `rollups` leaves this empty, and the leader
+  // then leaves the peer's liveness state untouched: an empty list is not a
+  // liveness observation.
   repeated string seen_node_ids = 4;
+
+  // The sender's scaling-input rollups (docs/autoscaling.md, "Scaling
+  // inputs"), sent every 10 seconds on a digest of their own. Unset on an
+  // ordinary liveness digest.
+  RollupSync rollups = 5;
+}
+
+// One manager's per-(node, task) usage and service-graph rollups, shipped to
+// the status-lane leader on `ReportNodeLiveness` (docs/autoscaling.md,
+// "Scaling inputs").
+//
+// Delta-encoded against what the leader already holds from this sender: a
+// `full` sync replaces everything the sender contributed before, and a delta
+// applies only on top of the sync numbered `base_seq` in the same `epoch`.
+// When the leader cannot apply a delta (it just took the lane, restarted, or
+// missed a sync), it drops it and answers `rollup_resync`, and the sender
+// sends a full set at once.
+message RollupSync {
+  // The sender's rollup session: random, fixed for the life of the sending
+  // process. A new epoch means the leader's state for this sender is void.
+  uint64 epoch = 1;
+
+  // This sync's number, increasing within an epoch.
+  uint64 seq = 2;
+
+  // The sync this delta builds on. Ignored when `full`.
+  uint64 base_seq = 3;
+
+  // True when `rollups` is the sender's complete set.
+  bool full = 4;
+
+  // Rollups added or changed since `base_seq` (or every rollup, when
+  // `full`), plus `removed` entries for (node, task) pairs the sender no
+  // longer reports.
+  repeated TargetRollup rollups = 5;
+}
+
+// Usage and service-graph totals for one task on one node, as one manager
+// saw them in its latest reports (docs/autoscaling.md, "Scaling inputs").
+//
+// The usage half sums the replicas of the task that run on the node. The
+// request half sums what CALLERS on the node sent to the service the task
+// backs, so a node can carry a request half for a task it runs no replica
+// of. The leader keeps the newest rollup per (node, task), by
+// `sampled_at_unix_ms`, whichever manager sent it.
+message TargetRollup {
+  // The node the totals were measured on.
+  string node_id = 1;
+
+  // The task: job id, group, and name.
+  string job_id = 2;
+  string task_group = 3;
+  string task_name = 4;
+
+  // The node's newest usage sample folded in, unix milliseconds on the
+  // worker's clock; for a request-only rollup, when the sender folded the
+  // window, on the sender's clock.
+  int64 sampled_at_unix_ms = 5;
+
+  // The sender no longer reports this (node, task): drop it, unless another
+  // manager's newer rollup has replaced it. Every other field is empty.
+  bool removed = 6;
+
+  // Replicas of the task on the node with a usage sample.
+  uint32 replicas = 7;
+
+  // CPU sums over those replicas: measured millicores; measured MHz (the
+  // node's `mhz_per_core` times millicores / 1000, 0 when the node reports
+  // no clock); reserved MHz (`cores = N` counts as N x `mhz_per_core`).
+  uint64 cpu_used_millicores = 8;
+  double cpu_used_mhz = 9;
+  double cpu_reserved_mhz = 10;
+
+  // Used and reserved millicores over the replicas whose utilization can be
+  // computed (`cores = N` reserves N x 1000), so the leader can divide sums
+  // rather than average ratios.
+  uint64 cpu_util_used_millicores = 11;
+  double cpu_util_reserved_millicores = 12;
+
+  // The busiest replica's utilization, and the per-replica histogram over
+  // `ScalingCpuInputs.histogram_bounds` (one more bucket than bounds).
+  double cpu_utilization_max = 13;
+  repeated uint32 cpu_utilization_histogram = 14;
+
+  // Replicas whose utilization cannot be computed.
+  uint32 cpu_unmeasurable = 15;
+
+  // Memory sums: current bytes, reserved MiB; and the largest single
+  // replica's current memory against its reservation.
+  uint64 memory_used_bytes = 16;
+  double memory_reserved_mib = 17;
+  double memory_utilization_max = 18;
+
+  // Requests into the task's service from callers on this node over
+  // `edge_window_ms`: attempts that reached an endpoint, failures, and the
+  // latency sum and max (HTTP). All 0, with a 0 window, when no caller on the
+  // node reached the service.
+  uint64 edge_requests = 19;
+  uint64 edge_errors = 20;
+  uint64 edge_latency_ms_sum = 21;
+  uint64 edge_latency_ms_max = 22;
+  uint32 edge_window_ms = 23;
 }
 
 // Reply payload for RaftTransport.ReportNodeLiveness.
@@ -12335,6 +16567,12 @@ message NodeLivenessDigestReply {
   // talks to. Absent when the leader has adaptive cadence off or predates
   // this field, and the sender then serves no interval either.
   optional uint32 served_interval_seconds = 4;
+
+  // Set on an accepted digest whose `rollups` the leader could not apply: it
+  // holds no state for this sender (it just took the status lane or
+  // restarted), the epoch changed, or `base_seq` is not the last sync it
+  // applied. The sender answers with a full sync.
+  bool rollup_resync = 5;
 }
 
 // Request envelope for the three openraft protocol RPCs (AppendEntries,
@@ -13224,6 +17462,12 @@ message ApplyNamespacePolicyRequest {
 
   // Optional idempotency key. See `RunJobRequest.idempotency_key`.
   optional string idempotency_key = 3;
+
+  // Apply even when the policy's `autoscale` would leave some autoscaled
+  // task's effective policy invalid (docs/autoscaling.md). Without it such
+  // an apply is refused with FAILED_PRECONDITION naming the tasks; with it
+  // those tasks' policies are held `invalid` until fixed.
+  bool force = 4;
 }
 
 // One thing a policy would have refused, reported by a dry run.
@@ -13236,7 +17480,8 @@ message NamespacePolicyViolation {
   string job_id = 2;
 
   // Which rule: `runtimes`, `pools`, `hostVolumes`, `quota`, `maxJobs`,
-  // `maxNamespaces`.
+  // `maxNamespaces`, or `autoscale` (an autoscaled task whose effective
+  // policy would no longer resolve).
   string rule = 3;
 
   // The refusal message admission would have returned.

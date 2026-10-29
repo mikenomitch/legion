@@ -1,0 +1,24 @@
+[package]
+name = "legion-scaling-aws-asg"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Legion's node-group target for AWS Auto Scaling groups: a legion-scaling/1 plugin"
+repository = "https://github.com/mikenomitch/legion"
+publish = false
+
+# A first-party plugin, built on its own (docs/autoscaling-plugins.md, "The
+# aws-asg plugin"): `cargo build --release` here, or `LEGION_BUILD_PLUGINS=1`
+# from the root. It is outside Legion's workspace (`plugins/` is excluded)
+# and deliberately small: SigV4 is written out in `src/sigv4.rs` instead of
+# taking the AWS SDK, and every dependency is one Legion already builds, so
+# it builds offline from the same registry cache.
+[dependencies]
+legion-scaling-plugin = { path = "../../../examples/scaling-plugins/rust" }
+reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde_json = "1.0"
+sha2 = "0.10.8"
+
+[[bin]]
+name = "aws-asg"
+path = "src/main.rs"

@@ -134,6 +134,9 @@ fn default_config_requires_a_token_and_mints_one_at_first_start_test() {
         "storePath": dir.path().join("store").to_str().expect("utf-8 path"),
         "exec": { "enabled": false },
         "telemetry": { "enabled": false },
+        // No system worker: it would bind a worker port nobody reserved
+        // (tests/integration/system_worker.rs covers it).
+        "systemWorker": { "enabled": false },
     });
     std::fs::write(&paths.config, config.to_string()).expect("write config");
 

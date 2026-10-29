@@ -1,4 +1,5 @@
 pub mod acl_store;
+pub mod app_store;
 pub mod boot_ticket_store;
 pub(crate) mod coalesce;
 pub mod content_index;

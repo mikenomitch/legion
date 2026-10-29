@@ -474,14 +474,14 @@ type:
 Workers without an `artifacts` block get these defaults. The settings are
 delivered through the existing worker pre-registration config flow.
 
-> **Failure semantics: fetch failures use up your `on_unhealthy` budgets.**
+> **Failure semantics: fetch failures use up your `onUnhealthy` budgets.**
 > A staging failure (404 after retries, checksum mismatch, timeout, oversize,
 > missing credential) is an **allocation failure**. It is reported through
 > the same heartbeat path as a crashed task, and the manager handles it with
-> the existing `on_unhealthy` restart/move logic. So a flaky registry or
+> the existing `onUnhealthy` restart/move logic. So a flaky registry or
 > object store uses up the task's restart and move budget, the same way an
 > unhealthy task does. For jobs that pull from less reliable origins, size
-> `on_unhealthy.restart_count`/`move_count` with that in mind. There is no
+> `onUnhealthy.restartCount`/`moveCount` with that in mind. There is no
 > separate `onFetchFailure` policy yet to treat a registry outage
 > differently from an unhealthy task.
 
@@ -736,6 +736,11 @@ published part is sealed (encrypted) first. Configure it per worker type with
   },
 }
 ```
+
+The example keeps the credential under the reserved `legion/` KV prefix,
+which suits a cluster-wide secret: a tenant's `paths = ["*"]` rule cannot
+read or overwrite it, and writing it takes a management token or a rule
+whose `paths` starts with `legion/` ([KV store](kv-store.md#data-model)).
 
 **Ambient credentials.** With no `auth`, every client of the store (the
 publisher, [session manifests](session-mode.md), a restoring node's fetches,
@@ -1057,7 +1062,7 @@ Remember the allowlists. Add a custom scheme to the cluster's
   pointing at a host path the container can't see.
 - **Archive formats** are `.tar.gz`/`.tgz`/`.tar`/`.gz`. `zip` and `zstd`
   are not recognized yet. Use `unpack = "file"` to stage such files as-is.
-- **Fetch failures use up `on_unhealthy` budgets** (see
+- **Fetch failures use up `onUnhealthy` budgets** (see
   [Failure semantics](#staging-mechanics)). There is no dedicated
   `onFetchFailure` policy yet.
 - **Windows staging** has not been specifically tested.

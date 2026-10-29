@@ -27,6 +27,7 @@ use crate::storage::store::{
 };
 use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
+use crate::structs::spec_fields::{UnknownFieldMode, UnknownFieldsRecord};
 // KV encryption keyring surface (docs/kv-encryption.md).
 use crate::structs::{
     validate_keyed_instance_id, worker_client::WorkerClient, AcquireKvLockReply,
@@ -66,7 +67,7 @@ use crate::structs::{
     ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
     ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply,
     ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
-    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, ManagerMember,
+    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, ManagedByInfo, ManagerMember,
     MintExecTicketReply, MintExecTicketRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
     PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
     QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
@@ -80,7 +81,7 @@ use crate::structs::{
     SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
     StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
     StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
-    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
     UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
     UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
     WorkerRegisterReply, WorkerRegisterRequest,
@@ -112,6 +113,10 @@ use crate::structs::{
     GetNetPluginStatusReply, GetNetPluginStatusRequest, ListNetPluginsReply, ListNetPluginsRequest,
     UpsertNetPluginReply, UpsertNetPluginRequest,
 };
+use crate::structs::{
+    JobGrant, ListGrantsReply, ListGrantsRequest, RevokeGrantReply, RevokeGrantRequest,
+    TaskGrantInfo,
+};
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
@@ -121,19 +126,28 @@ use tonic::transport::Channel;
 use tonic::{Request, Response, Status, Streaming};
 
 // Phase 6: ForkInstance, `from_snapshot` creates, and snapshot names.
+mod app_rpcs;
+mod app_ui_rpcs;
+mod autoscale_rpcs;
 mod checkpoint_support;
+mod delegation;
+mod extension_rpcs;
 mod fork_rpcs;
 mod make_room;
 mod material_rpcs;
 mod namespace_policy_rpcs;
 mod namespace_rpcs;
 mod node_content_rpcs;
+mod node_group_rpcs;
 mod plugin_rpcs;
+mod scaling_policy_rpcs;
+mod scaling_rpcs;
 mod session_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
 mod work_stream;
 pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};
+pub(crate) use scaling_rpcs::scaling_replica_counts;
 pub(crate) use snapshot_rpcs::snapshot_restore_payload;
 pub use snapshot_rpcs::{
     checkpoint_part_keys, expire_snapshots, PartKeyUse, CHECKPOINT_CAPABILITY,
@@ -215,6 +229,7 @@ fn store_error_status(action: &str, err: &anyhow::Error) -> Status {
         StorageError::Conflict { .. } => Status::already_exists(message),
         StorageError::InvalidInput { .. } => Status::invalid_argument(message),
         StorageError::FailedPrecondition { .. } => Status::failed_precondition(message),
+        StorageError::Aborted { .. } => Status::aborted(message),
         StorageError::ForeignKey { .. } => Status::failed_precondition(message),
         StorageError::DatabaseBusy | StorageError::DatabaseLocked => Status::unavailable(message),
         StorageError::DatabaseReadOnly => Status::failed_precondition(message),
@@ -425,6 +440,52 @@ pub fn protocol_compat(worker_pv: u32, manager_pv: u32) -> VersionCompat {
 }
 
 /// Outcome of `submit_rendered_job`, shared by RunJob and RunJobTemplate.
+/// Who a stored job version is recorded as coming from
+/// ([`ManagerDaemonService::submit_rendered_job_from`]).
+pub(crate) enum SubmitOrigin {
+    /// The calling principal (RunJob, RunJobTemplate): its grant is the
+    /// caller's, and the version carries no `managedBy` stamp.
+    Principal,
+    /// The app reconciler, for an app (docs/apps.md): the version's grant
+    /// is recorded in `granted_by`'s name (who approved the app's grant),
+    /// and the version is stamped `managedBy`.
+    App {
+        granted_by: String,
+        managed_by: crate::structs::app::ManagedBy,
+        /// The app record's `updated_at` the render came from: the store
+        /// refuses the submit unless the record is still there, enabled, and
+        /// unchanged.
+        record_updated_at: String,
+    },
+}
+
+/// What admission made of a submit ([`ManagerDaemonService::admit_rendered_job`]).
+struct AdmittedJob {
+    config: JobConfig,
+    kv_refs: Vec<KvReference>,
+    unknown_fields: UnknownFieldsRecord,
+    namespace: String,
+    artifact_pins: Vec<ArtifactPin>,
+    autoscale_warnings: Vec<String>,
+}
+
+/// The status of a failed artifact admission: `Unavailable` (retry) when a
+/// pin's resolution failed for a reason a retry can fix (the registry or
+/// git remote could not be reached, timed out, or answered 5xx or 429),
+/// `InvalidArgument` (fix the job) for everything else: a reference that
+/// does not exist, credentials that are refused, a rule the job breaks.
+fn artifact_admission_status(e: anyhow::Error) -> Status {
+    if crate::artifacts::fetcher::PinResolveFailure::transient_in(&e) {
+        warn!("Error resolving an artifact pin (transient): {e:#}");
+        return Status::unavailable(format!(
+            "Error normalizing artifacts: {e:#}\nHint: the source could not be reached; the \
+             submit can be retried as it is"
+        ));
+    }
+    error!("Error normalizing artifacts: {:?}", e);
+    Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
+}
+
 struct SubmittedJob {
     message: &'static str,
     job_name: String,
@@ -452,6 +513,17 @@ impl SubmittedJob {
         }
         message
     }
+}
+
+/// The `warning: ` lines of a reply message, without the prefix: how a
+/// replayed (`deduplicated`) reply rebuilds its `warnings` from the
+/// recorded message, which is all an idempotency record keeps.
+fn warnings_from_message(message: &str) -> Vec<String> {
+    message
+        .lines()
+        .filter_map(|line| line.strip_prefix("warning: "))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Store record -> proto message for one template version.
@@ -1472,10 +1544,111 @@ enum MissingKvBehavior {
     KeepExisting,
 }
 
-fn resolve_jobspec_kv_references(store: &Store, jobspec: &str) -> R<(JobConfig, Vec<KvReference>)> {
-    let mut value: Value = serde_json::from_str(jobspec)?;
+/// The `$path/key` KV references in a jobspec, without resolving them: each
+/// key and the JSON pointer of the string that names it.
+fn collect_kv_references(value: &Value, pointer: &str, refs: &mut Vec<KvReference>) {
+    match value {
+        Value::String(text) => {
+            if let Some(key) = parse_kv_reference(text) {
+                refs.push(KvReference {
+                    key: key.to_string(),
+                    json_pointer: pointer.to_string(),
+                });
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_kv_references(
+                    item,
+                    &append_json_pointer(pointer, &index.to_string()),
+                    refs,
+                );
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                collect_kv_references(item, &append_json_pointer(pointer, key), refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `kv:read` on every key a job's `kvInjections` read, checked before any
+/// of them is rendered: the `templateKv` pointer first (its value is the
+/// template the other lookups come from), then the `{{ kv "…" }}` lookups.
+fn enforce_kv_injection_read(
+    store: &Store,
+    identity: &AclIdentity,
+    config: &JobConfig,
+) -> Result<(), Status> {
+    for injections in config
+        .tasks
+        .iter()
+        .filter_map(|task| task.kv_injections.as_ref())
+    {
+        let sources = injections
+            .env
+            .iter()
+            .map(|env| &env.value)
+            .chain(injections.files.iter().map(|file| &file.file));
+        for source in sources {
+            if let Some(key) = source.template_kv.as_deref() {
+                enforce_kv_reference_read(
+                    identity,
+                    &[KvReference {
+                        key: key.to_string(),
+                        json_pointer: String::new(),
+                    }],
+                )?;
+            }
+            let deps = template_source_deps(store, source).map_err(|e| {
+                Status::invalid_argument(format!("Error reading a kvInjections template: {e:#}"))
+            })?;
+            let deps: Vec<KvReference> = deps
+                .into_iter()
+                .map(|key| KvReference {
+                    key,
+                    json_pointer: String::new(),
+                })
+                .collect();
+            enforce_kv_reference_read(identity, &deps)?;
+        }
+    }
+    Ok(())
+}
+
+/// Parse a submitted jobspec as `identity`: resolve its `$path/key` KV
+/// references, then check its keys the way `mode` (the request's
+/// `allow_unknown_fields`) says (docs/jobs-tasks-and-scheduling.md,
+/// "Unknown fields"). Returns the references the job keeps as dependency
+/// edges, and the record of what the flag kept and dropped.
+///
+/// **Every reference needs `kv:read` on its key, checked before any is
+/// resolved** (docs/auth-and-acls.md, "KV references in a job"): in a core
+/// field, an extension value, or a pending key alike, and for the keys
+/// `kvInjections` read. Nothing a caller may not read is ever resolved, so
+/// no reply, parse error, schema error, or app validate call can carry one,
+/// and a missing key cannot be told from an unreadable one. A refusal is
+/// `PermissionDenied`; anything else wrong with the spec is
+/// `InvalidArgument`, prefixed with `context`.
+fn resolve_jobspec_kv_references(
+    store: &Store,
+    identity: &AclIdentity,
+    jobspec: &str,
+    mode: UnknownFieldMode,
+    registry: &crate::structs::extensions::ExtensionRegistry,
+    context: &str,
+) -> Result<(JobConfig, Vec<KvReference>, UnknownFieldsRecord), Status> {
+    // Not logged: the text can hold a resolved value (one the caller may
+    // read, but the log is not the caller's).
+    let invalid = |e: anyhow::Error| Status::invalid_argument(format!("{context}: {e}"));
+    let mut value: Value = serde_json::from_str(jobspec).map_err(|e| invalid(e.into()))?;
+    let mut named = Vec::new();
+    collect_kv_references(&value, "", &mut named);
+    enforce_kv_reference_read(identity, &named)?;
     let mut refs = Vec::new();
-    resolve_kv_references_in_value(store, &mut value, &mut refs, "")?;
+    resolve_kv_references_in_value(store, &mut value, &mut refs, "").map_err(invalid)?;
     let mut refs = refs
         .into_iter()
         .map(|reference| {
@@ -1485,14 +1658,37 @@ fn resolve_jobspec_kv_references(store: &Store, jobspec: &str) -> R<(JobConfig, 
                 json_pointer,
             })
         })
-        .collect::<R<Vec<_>>>()?;
-    let mut config: JobConfig = serde_json::from_value(value)?;
-    refs.extend(apply_job_kv_injections(
-        store,
-        &mut config,
-        MissingKvBehavior::Error,
-    )?);
-    Ok((config, refs))
+        .collect::<R<Vec<_>>>()
+        .map_err(invalid)?;
+    let (mut config, unknown_fields) = JobConfig::parse_submitted_with(
+        value,
+        mode,
+        crate::structs::spec_fields::ExtensionCheck::Installed(registry),
+    )
+    .map_err(invalid)?;
+    // A `$path` reference inside an extension value or a pending key points
+    // where the stored config has nothing (those are stored by app, or under
+    // `pendingExtensions`): it is resolved once, here, and not re-rendered,
+    // rather than failing every later KV-driven update of the job. Its read
+    // was checked above with the rest; only the dependency edge is dropped.
+    let stored = serde_json::to_value(&config).map_err(|e| invalid(e.into()))?;
+    refs.retain(|reference| {
+        let keep = !reference.json_pointer.starts_with('/')
+            || stored.pointer(&reference.json_pointer).is_some();
+        if !keep {
+            debug!(
+                key = %reference.key,
+                "KV reference inside an extension value is resolved once at submit"
+            );
+        }
+        keep
+    });
+    enforce_kv_injection_read(store, identity, &config)?;
+    let injected =
+        apply_job_kv_injections(store, &mut config, MissingKvBehavior::Error).map_err(invalid)?;
+    enforce_kv_reference_read(identity, &injected)?;
+    refs.extend(injected);
+    Ok((config, refs, unknown_fields))
 }
 
 /// Re-materialize a stored job config from the current KV state. Returns the
@@ -1835,8 +2031,8 @@ pub struct ManagerDaemonService {
     manager_id: String,
     allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
     /// OIDC issuer state; `None` when `workloadIdentity.enabled` is false
-    /// (the default), in which case IssueWorkloadIdentityToken returns
-    /// FailedPrecondition.
+    /// (it is on by default), in which case IssueWorkloadIdentityToken
+    /// returns FailedPrecondition.
     workload_identity: Option<Arc<WorkloadIdentityState>>,
     /// Debounce window for KV-driven reconciliation (`kvDebounceMs` in the
     /// manager config). Zero reconciles synchronously inside the KV RPC.
@@ -1917,6 +2113,24 @@ pub struct ManagerDaemonService {
     /// than a target, and `GetSchedulerConcurrency` reports it as such even
     /// when this manager does not lead the scheduler lane.
     eval_threads: usize,
+    /// Wakes this manager's app reconciler after an app write; unset in a
+    /// service with no reconciler (tests, embedding), where writes simply
+    /// wait for whoever reconciles.
+    app_nudge: Arc<std::sync::OnceLock<crate::manager::apps::AppNudge>>,
+    /// How app view and action requests reach an app's allocation: the
+    /// worker plane, or (tests) a forwarder that delivers in process.
+    app_forwarder: Arc<dyn crate::manager::app_forward::AppForwarder>,
+    /// The idempotency keys of app actions running now on this manager
+    /// (the Control leader, where every keyed action runs): a duplicate
+    /// waits for the first and gets its reply, instead of running the
+    /// action again.
+    app_actions_in_flight: Arc<app_ui_rpcs::InFlightKeys>,
+    /// The keys installed apps add to the jobspec, rebuilt when an app
+    /// record changes (`extension_rpcs`).
+    extension_registry: extension_rpcs::RegistryCache,
+    /// Field names treated as core although this build has none (tests: a
+    /// simulated release that adds a core field named like an app's key).
+    simulated_core_fields: Vec<(crate::structs::spec_fields::ExtensionPoint, String)>,
 }
 
 /// Distinct merged policy bodies kept in memory.
@@ -1964,7 +2178,22 @@ impl ManagerDaemonService {
             stream_reauth_interval: acl::STREAM_REAUTH_INTERVAL,
             usage: Arc::new(Mutex::new(crate::manager::usage::UsageTable::default())),
             eval_threads: 1,
+            app_nudge: Arc::new(std::sync::OnceLock::new()),
+            app_forwarder: Arc::new(crate::manager::app_forward::WorkerPlaneForwarder),
+            app_actions_in_flight: Arc::new(app_ui_rpcs::InFlightKeys::default()),
+            extension_registry: Arc::new(Mutex::new(None)),
+            simulated_core_fields: Vec::new(),
         }
+    }
+
+    /// Deliver app view and action requests through `forwarder` instead of
+    /// the worker plane (tests, embedding).
+    pub fn with_app_forwarder(
+        mut self,
+        forwarder: Arc<dyn crate::manager::app_forward::AppForwarder>,
+    ) -> Self {
+        self.app_forwarder = forwarder;
+        self
     }
 
     /// The delegated exec keys for a heartbeat that asked with `version`:
@@ -2030,12 +2259,6 @@ impl ManagerDaemonService {
     pub fn with_stream_reauth_interval(mut self, interval: Duration) -> Self {
         self.stream_reauth_interval = interval;
         self
-    }
-
-    /// The caller's credential, kept so a long-lived stream can re-check it.
-    fn stream_credential<T>(&self, request: &Request<T>) -> acl::StreamCredential {
-        acl::StreamCredential::new(self.auth.clone(), request.metadata())
-            .with_interval(self.stream_reauth_interval)
     }
 
     /// The store's network-policy generation, cached for
@@ -2119,8 +2342,14 @@ impl ManagerDaemonService {
 
     /// Resolves the caller's identity without enforcing anything. Pair with
     /// `acl::enforce` once the request body has been parsed.
+    ///
+    /// A request carrying `legion-on-behalf-of` (an app presenting an
+    /// action's viewer assertion beside its own credential) resolves to a
+    /// delegated identity, `<viewer> via app <app>`, or is refused; it never
+    /// falls back to the app's own identity (`delegation.rs`).
     fn authenticate_acl<T>(&self, request: &Request<T>) -> Result<AclIdentity, Status> {
-        self.auth.authenticate(request.metadata(), &self.store)
+        let caller = self.auth.authenticate(request.metadata(), &self.store)?;
+        self.with_delegation(caller, request.metadata())
     }
 
     /// Every manager a worker may dial (`HeartbeatReply.manager_addresses`,
@@ -2208,40 +2437,66 @@ impl ManagerDaemonService {
         Ok(paths)
     }
 
-    /// Everything RunJob does once it holds a rendered jobspec, shared with
-    /// RunJobTemplate so both submission paths behave identically: KV
-    /// reference resolution, precise ACL enforcement, the template collision
-    /// guard, task validation, artifact admission, persistence (with
-    /// provenance), status clears, KV-ref bookkeeping, keyed-instance
-    /// seeding, and rollout/eval enqueueing.
+    /// [`Self::submit_rendered_job_from`] for a principal's submit.
     #[allow(clippy::too_many_arguments)]
     fn submit_rendered_job(
         &self,
         identity: &AclIdentity,
         js: &str,
-        mut subs: Vec<Submission>,
-        // Explicit eval-queue override (`--priority`/`--asap`). `None` lets
-        // the job's priority band set the queue position, which is the
-        // default and the point of having one field mean both things.
+        subs: Vec<Submission>,
         priority: Option<i64>,
         force_reschedule: bool,
         template: Option<&JobTemplateProvenance>,
-        // The request's namespace (`-n`); resolved against the jobspec's own.
         namespace: Option<&str>,
+        unknown_field_mode: UnknownFieldMode,
+        app_warnings: Vec<String>,
     ) -> Result<SubmittedJob, Status> {
-        if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
-            subs.push(Submission {
-                path: "job.rendered.json".into(),
-                content: js.to_string(),
-                is_primary: false,
-            });
-        }
+        self.submit_rendered_job_from(
+            identity,
+            js,
+            subs,
+            priority,
+            force_reschedule,
+            template,
+            namespace,
+            SubmitOrigin::Principal,
+            unknown_field_mode,
+            app_warnings,
+        )
+    }
 
-        let (mut config, kv_refs) =
-            resolve_jobspec_kv_references(&self.store, js).map_err(|e| {
-                error!("Error parsing jobspec: {:?}", e);
-                Status::invalid_argument(format!("Error parsing jobspec: {e}"))
-            })?;
+    /// The admission half of a submit: everything RunJob checks before it
+    /// writes (KV reference resolution with its `kv:read` checks, precise
+    /// ACL enforcement, the reserved-namespace and app-managed-job rules,
+    /// namespace policies, extension `requires`, the template collision
+    /// guard, task, autoscale, identity, volume and capability validation,
+    /// and artifact admission with pin resolution). Shared by the submit
+    /// and by the app RPCs' dry run of an app's job (install, upgrade,
+    /// config and settings changes), so they refuse what the reconciler's
+    /// submit would.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_rendered_job(
+        &self,
+        identity: &AclIdentity,
+        js: &str,
+        template: Option<&JobTemplateProvenance>,
+        namespace: Option<&str>,
+        origin: &SubmitOrigin,
+        unknown_field_mode: UnknownFieldMode,
+    ) -> Result<AdmittedJob, Status> {
+        // The keys installed apps add to the jobspec: the parse resolves
+        // extension values against them (docs/apps.md, "Jobspec extensions").
+        let registry = self.extension_registry()?;
+        // `kv:read` on every KV reference is enforced inside, before any is
+        // resolved.
+        let (mut config, kv_refs, unknown_fields) = resolve_jobspec_kv_references(
+            &self.store,
+            identity,
+            js,
+            unknown_field_mode,
+            &registry,
+            "Error parsing jobspec",
+        )?;
         // The namespace is resolved before anything is scoped: every check
         // below runs against `config.name`, which is now the canonical id.
         let namespace = self.admit_job_namespace(&mut config, js, namespace)?;
@@ -2258,11 +2513,15 @@ impl ManagerDaemonService {
         // bypassable by rendering.
         // A job with a host-level task (worker-plane-auth plan §6.16) needs a
         // `job:write` rule with `host = true`: "can deploy" must not quietly
-        // mean "is root on every node".
-        let host_level = config
-            .tasks
-            .iter()
-            .find_map(crate::task_plugins::task_host_level_reason);
+        // mean "is root on every node". An app's own `exec` task runs as the
+        // app's uid, so for the app reconciler the runtime alone is not
+        // host-level; anything else that is needs a host grant it never
+        // holds (docs/apps.md, "Trust model").
+        let classify: fn(&crate::structs::TaskConfig) -> Option<String> = match origin {
+            SubmitOrigin::App { .. } => crate::task_plugins::app_task_host_level_reason,
+            SubmitOrigin::Principal => crate::task_plugins::task_host_level_reason,
+        };
+        let host_level = config.tasks.iter().find_map(classify);
         let scope = match template {
             Some(template) => AclScope::job_via_template(&config.name, &template.name),
             None => AclScope::job(&config.name),
@@ -2293,6 +2552,12 @@ impl ManagerDaemonService {
             }
         })?;
 
+        // An installed app's job is the app reconciler's alone (docs/apps.md,
+        // "Editing an app's job"): a direct submit is refused, not reverted.
+        if matches!(origin, SubmitOrigin::Principal) {
+            self.refuse_direct_app_job_write(&config.name, "submitting it directly")?;
+        }
+
         // After authorization, so a caller with no grant in the namespace
         // cannot learn whether it exists.
         self.ensure_namespace_exists(&namespace)?;
@@ -2300,6 +2565,17 @@ impl ManagerDaemonService {
         // policy's default pool lands in the stored config); quota and
         // `maxJobs` inside the store's submit entry.
         self.admit_namespace_policies(&mut config)?;
+        // Extension values, beyond their schemas: a key that a core field
+        // now shadows, and each new or changed value's `requires`, checked
+        // as the submitter against the job's previous version.
+        if !config.extensions.is_empty() || registry.keys().iter().any(|key| key.shadowed) {
+            let previous = self
+                .store
+                .get_job_config_optional(&config.name)
+                .map_err(|e| map_store_error("Error loading the job's previous version", e))?;
+            self.check_shadowed_keys(&config, previous.as_ref(), js, &registry)?;
+            self.enforce_extension_requires(identity, &config, previous.as_ref(), &registry)?;
+        }
 
         if let Some(template) = template {
             self.enforce_template_collision_guard(identity, &config.name, template)?;
@@ -2309,14 +2585,21 @@ impl ManagerDaemonService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
+        // `autoscale` against the cluster's scaling defaults and namespace
+        // policies, as they stand now (docs/autoscaling.md).
+        let autoscale_warnings: Vec<String> = self
+            .validate_autoscale(&config)?
+            .into_iter()
+            .flat_map(|task| task.warnings)
+            .collect();
         self.validate_identity_sub_templates(&config)?;
+        self.enforce_identity_grants(identity, &config)?;
         enforce_kv_tls_read(identity, &config.tasks)?;
         self.check_job_plugins(&config.tasks)?;
         enforce_kv_credential_read(
             identity,
             config.tasks.iter().filter_map(|task| task.connect.as_ref()),
         )?;
-        enforce_kv_reference_read(identity, &kv_refs)?;
         enforce_kv_artifact_read(identity, &config)?;
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
@@ -2329,20 +2612,101 @@ impl ManagerDaemonService {
         // Artifact admission: desugar/auth/pin. Pin resolution can reach
         // registries, so it runs as blocking work.
         let artifact_pins =
-            run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true)).map_err(
-                |e| {
-                    error!("Error normalizing artifacts: {:?}", e);
-                    Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
-                },
-            )?;
-        let config = config;
-        let submit_outcome = match template {
-            Some(template) => self
-                .store
-                .handle_job_submit_from_template(&config, &subs, template),
-            None => self.store.handle_job_submit(&config, &subs),
+            run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true))
+                .map_err(artifact_admission_status)?;
+        Ok(AdmittedJob {
+            config,
+            kv_refs,
+            unknown_fields,
+            namespace,
+            artifact_pins,
+            autoscale_warnings,
+        })
+    }
+
+    /// Everything RunJob does once it holds a rendered jobspec, shared with
+    /// RunJobTemplate so both submission paths behave identically: KV
+    /// reference resolution, precise ACL enforcement, the template collision
+    /// guard, task validation, artifact admission, persistence (with
+    /// provenance), status clears, KV-ref bookkeeping, keyed-instance
+    /// seeding, and rollout/eval enqueueing.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_rendered_job_from(
+        &self,
+        identity: &AclIdentity,
+        js: &str,
+        mut subs: Vec<Submission>,
+        // Explicit eval-queue override (`--priority`/`--asap`). `None` lets
+        // the job's priority band set the queue position, which is the
+        // default and the point of having one field mean both things.
+        priority: Option<i64>,
+        force_reschedule: bool,
+        template: Option<&JobTemplateProvenance>,
+        // The request's namespace (`-n`); resolved against the jobspec's own.
+        namespace: Option<&str>,
+        // Who the stored version is recorded as coming from.
+        origin: SubmitOrigin,
+        // The request's `allow_unknown_fields`.
+        unknown_field_mode: UnknownFieldMode,
+        // Warnings found before the submit: apps' answers to their validate
+        // calls (`ask_apps_to_validate`).
+        app_warnings: Vec<String>,
+    ) -> Result<SubmittedJob, Status> {
+        if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
+            subs.push(Submission {
+                path: "job.rendered.json".into(),
+                content: js.to_string(),
+                is_primary: false,
+            });
+        }
+
+        let AdmittedJob {
+            config,
+            kv_refs,
+            unknown_fields,
+            namespace,
+            artifact_pins,
+            autoscale_warnings,
+        } = self.admit_rendered_job(
+            identity,
+            js,
+            template,
+            namespace,
+            &origin,
+            unknown_field_mode,
+        )?;
+        // The version's grant is recorded in the submitter's name, in the
+        // same entry as the version (`enforce_identity_grants` above checked
+        // they hold it).
+        let submit_outcome = match origin {
+            SubmitOrigin::Principal => self.store.handle_job_submit_as(
+                &config,
+                &subs,
+                template,
+                &identity.principal,
+                Some(&unknown_fields),
+            ),
+            SubmitOrigin::App {
+                granted_by,
+                managed_by,
+                record_updated_at,
+            } => self.store.handle_job_submit_managed(
+                &config,
+                &subs,
+                &granted_by,
+                managed_by,
+                &record_updated_at,
+            ),
         }
         .map_err(|e| map_store_error("Error running job", e))?;
+        if !unknown_fields.is_empty() {
+            info!(
+                job = %config.name,
+                pending = unknown_fields.pending.len(),
+                dropped = unknown_fields.dropped.len(),
+                "job submitted with allow_unknown_fields"
+            );
+        }
         crate::manager::telemetry::metrics()
             .job_submits_total
             .inc(&[&namespace]);
@@ -2412,6 +2776,11 @@ impl ManagerDaemonService {
                 .len();
         }
 
+        let in_place = if matches!(submit_outcome, JobSubmitOutcome::Updated { .. }) {
+            self.update_in_place(&config, &job_config_id)?
+        } else {
+            None
+        };
         let (eval_kind, message) = match submit_outcome {
             JobSubmitOutcome::Unchanged { .. } => {
                 if force_reschedule {
@@ -2453,6 +2822,32 @@ impl ManagerDaemonService {
                 }
             }
             JobSubmitOutcome::Created { .. } => (Some("job_submit"), "Job submit success"),
+            JobSubmitOutcome::Updated { .. } if in_place.is_some() => {
+                let change = in_place.expect("checked by the guard");
+                // Only `autoscale` and autoscaled tasks' `count`, or only
+                // installed apps' extension values, changed: the running
+                // allocations moved to the new version, and a `job_scale`
+                // eval converges the count, or starts a job that was not
+                // running (docs/autoscaling.md, "Editing the policy restarts
+                // nothing"; docs/apps.md, "Jobspec extensions").
+                (
+                    Some("job_scale"),
+                    match (change.autoscale, change.extensions) {
+                        (true, false) => {
+                            "Job updated in place: only autoscale (and autoscaled counts) \
+                             changed, so nothing restarts"
+                        }
+                        (false, _) => {
+                            "Job updated in place: only jobspec extension values changed, so \
+                             nothing restarts (the apps that own them see the new values)"
+                        }
+                        (true, true) => {
+                            "Job updated in place: only autoscale and jobspec extension values \
+                             changed, so nothing restarts"
+                        }
+                    },
+                )
+            }
             JobSubmitOutcome::Updated { .. } => {
                 let previous_job_config_id = self
                     .store
@@ -2553,9 +2948,13 @@ impl ManagerDaemonService {
             message,
             job_name: config.name.clone(),
             job_config_id,
-            warnings: self
-                .band_submit_warnings(&config)
+            // Unknown keys first: a dropped key is intent the submit lost.
+            warnings: unknown_fields
+                .warnings()
                 .into_iter()
+                .chain(app_warnings)
+                .chain(self.band_submit_warnings(&config))
+                .chain(autoscale_warnings)
                 .chain(crate::task_plugins::resource_submit_warnings(&config))
                 .chain(crate::structs::suspend::sandbox_submit_warnings(&config))
                 .chain(self.gated_egress_submit_warnings(&config))
@@ -2565,6 +2964,88 @@ impl ManagerDaemonService {
         })
     }
 
+    /// What a job's `legion` identities ask for (`permissions`, and the
+    /// rules of the `policies` they name) may be granted only when the
+    /// submitting token holds every one (apps plan §6.4,
+    /// docs/workload-identity.md, "Permissions"). Runs on every path that
+    /// stores a job config, and on every submit, an unchanged resubmit
+    /// included, so nobody launders a grant by resubmitting a job they can
+    /// write. Coverage is [`crate::structs::grant::first_uncovered`].
+    fn enforce_identity_grants(
+        &self,
+        identity: &AclIdentity,
+        config: &JobConfig,
+    ) -> Result<(), Status> {
+        use crate::structs::grant::{first_uncovered, requested_grants, UncoveredReason};
+        const HINT: &str =
+            "Hint: have someone with that access submit this job, or ask for it to be granted \
+             to you";
+        let requested = requested_grants(&config.tasks);
+        for grant in &requested {
+            let who = if config.tasks.len() == 1 {
+                format!("{}: identity 'legion'", config.name)
+            } else {
+                format!("{}: task {}'s identity 'legion'", config.name, grant.task)
+            };
+            let missing = self
+                .store
+                .missing_acl_policies(&grant.policies)
+                .map_err(|e| map_store_error("Error loading ACL policies", e))?;
+            if !missing.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "{who} names policies that do not exist: {}\nHint: create them with `legion \
+                     acl policy apply`, or list the permissions inline",
+                    missing.join(", ")
+                )));
+            }
+            let mut asks: Vec<(Option<&str>, Vec<crate::structs::acl::AclRule>)> =
+                vec![(None, grant.permissions.clone())];
+            for policy in &grant.policies {
+                let rules = self
+                    .store
+                    .resolve_acl_rules(std::slice::from_ref(policy))
+                    .map_err(|e| map_store_error("Error loading ACL policies", e))?;
+                asks.push((Some(policy.as_str()), rules));
+            }
+            for (policy, rules) in asks {
+                let Some(miss) = first_uncovered(identity, &rules) else {
+                    continue;
+                };
+                let asks_for = match policy {
+                    Some(policy) => format!("asks for policy {policy}, which grants {}", miss.what),
+                    None => format!("asks for {}", miss.what),
+                };
+                let message = match miss.reason {
+                    UncoveredReason::NotHeld => {
+                        format!("{who} {asks_for}, which your token does not hold")
+                    }
+                    UncoveredReason::Reserved => format!(
+                        "{who} {asks_for}, which your token does not hold (`*` does not reach \
+                         reserved `legion-*` namespaces or `legion/` keys; only a rule that \
+                         names them covers a request for them)"
+                    ),
+                    UncoveredReason::DenyRules => format!(
+                        "{who} {asks_for}; your token holds it, but it also carries deny rules on \
+                         {}, so granting it takes acl:write",
+                        miss.resource
+                    ),
+                };
+                if identity.audit_only {
+                    warn!(
+                        target: "acl_audit",
+                        principal = %identity.principal,
+                        job = %config.name,
+                        enforced = false,
+                        "grant check would deny (audit-only): {message}"
+                    );
+                    continue;
+                }
+                return Err(Status::permission_denied(format!("{message}\n{HINT}")));
+            }
+        }
+        Ok(())
+    }
+
     /// `RunJob` after its ACL gate: the idempotency check, the submit, and
     /// the idempotency record. Blocking, so the handler runs it through
     /// [`run_blocking_admission`].
@@ -2572,6 +3053,7 @@ impl ManagerDaemonService {
         &self,
         identity: &AclIdentity,
         inner: RunJobRequest,
+        app_warnings: Vec<String>,
     ) -> Result<Response<RunJobReply>, Status> {
         let idempotency_key = scoped_idempotency_key(
             identity,
@@ -2589,6 +3071,7 @@ impl ManagerDaemonService {
             .map_err(|e| map_store_error("Error checking idempotency", e))?
         {
             return Ok(Response::new(RunJobReply {
+                warnings: warnings_from_message(&message),
                 message,
                 deduplicated: true,
             }));
@@ -2602,6 +3085,8 @@ impl ManagerDaemonService {
             inner.force_reschedule,
             None,
             inner.namespace.as_deref(),
+            UnknownFieldMode::from_allow(inner.allow_unknown_fields),
+            app_warnings,
         )?;
 
         let message = submitted.message_with_warnings();
@@ -2630,6 +3115,7 @@ impl ManagerDaemonService {
         };
 
         Ok(Response::new(RunJobReply {
+            warnings: warnings_from_message(&message),
             message,
             deduplicated,
         }))
@@ -2827,7 +3313,7 @@ impl ManagerDaemonService {
         }
         match self.auth.verify_join_secret(&self.store, join_token) {
             Ok(record) => Ok(RegistrationGrant::JoinToken {
-                record,
+                record: Box::new(record),
                 caller_node: acl::worker_node_id(identity).map(str::to_string),
             }),
             Err(status) if self.auth.audit_only => {
@@ -2933,6 +3419,106 @@ impl ManagerDaemonService {
             return Ok(());
         }
         Err(Status::permission_denied(message))
+    }
+
+    /// The registration's config attributes with the keys Legion owns
+    /// pinned (apps plan calls entry 19): a node's `namespaces` restriction
+    /// and its `legion.role` come from what the registration's grant says,
+    /// never from what the worker reports. A worker that forges its
+    /// registration can therefore neither drop its restriction nor claim to
+    /// be a manager's own.
+    ///
+    /// - A join token a manager minted for its own in-process worker carries
+    ///   both (the manager's own `systemWorker` settings, or `--run-worker`'s).
+    /// - Any other join token takes them from its worker type.
+    /// - A node token keeps what the node registered with.
+    /// - ACLs off, a management credential, or an audit-only pass: as
+    ///   reported, since nothing about the caller is proven.
+    fn pin_registration_attrs(
+        &self,
+        grant: &RegistrationGrant,
+        node_id: &str,
+        reported: &str,
+    ) -> Result<String, Status> {
+        use crate::constraints::NODE_NAMESPACES_ATTR;
+        use crate::structs::MANAGER_ROLE_ATTR;
+        const PINNED: [&str; 2] = [NODE_NAMESPACES_ATTR, MANAGER_ROLE_ATTR];
+        let pinned: serde_json::Map<String, Value> = match grant {
+            RegistrationGrant::Unrestricted => return Ok(reported.to_string()),
+            RegistrationGrant::JoinToken { record, .. } => match &record.pinned_attrs {
+                Some(raw) => serde_json::from_str(raw).map_err(|e| {
+                    Status::internal(format!(
+                        "join token {} pins unreadable attributes: {e}",
+                        record.id
+                    ))
+                })?,
+                None => {
+                    let worker_type = self
+                        .store
+                        .get_worker_type(record.worker_type.clone())
+                        .map_err(|e| map_store_error("Error loading worker type", e))?;
+                    let mut attrs = serde_json::Map::new();
+                    if !worker_type.namespaces.is_empty() {
+                        attrs.insert(
+                            NODE_NAMESPACES_ATTR.to_string(),
+                            json!(worker_type.namespaces),
+                        );
+                    }
+                    if let Some(role) = worker_type.attributes.get(MANAGER_ROLE_ATTR) {
+                        attrs.insert(MANAGER_ROLE_ATTR.to_string(), json!(role));
+                    }
+                    attrs
+                }
+            },
+            RegistrationGrant::Node(_) => {
+                let existing = self
+                    .store
+                    .get_node(node_id)
+                    .map_err(|e| map_store_error("Error loading node", e))?;
+                PINNED
+                    .iter()
+                    .filter_map(|key| {
+                        existing
+                            .config_attrs
+                            .get(*key)
+                            .map(|value| (key.to_string(), value.clone()))
+                    })
+                    .collect()
+            }
+        };
+        let mut attrs: Value = serde_json::from_str(reported).unwrap_or_else(|_| json!({}));
+        if !attrs.is_object() {
+            attrs = json!({});
+        }
+        let object = attrs.as_object_mut().expect("made an object above");
+        for key in PINNED {
+            match pinned.get(key) {
+                Some(value) => {
+                    if object.get(key) != Some(value) {
+                        if object.contains_key(key) {
+                            warn!(
+                                node_id,
+                                attribute = key,
+                                "Registration reported a node attribute Legion pins; using the \
+                                 pinned value"
+                            );
+                        }
+                        object.insert(key.to_string(), value.clone());
+                    }
+                }
+                None => {
+                    if object.remove(key).is_some() {
+                        warn!(
+                            node_id,
+                            attribute = key,
+                            "Registration reported a node attribute its grant does not give; \
+                             dropping it"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(attrs.to_string())
     }
 
     /// A registration's `workerFleet` claim, checked against its grant. The
@@ -3300,13 +3886,16 @@ impl ManagerDaemonService {
                 {
                     continue;
                 }
-                let resolved = self.resolve_pin(spec).with_context(|| {
-                    format!(
-                        "resolve artifact {} at submit failed; fix the reference or set \
-                         resolve: \"always\" to re-resolve at staging instead",
-                        spec.redacted_source()
-                    )
-                })?;
+                let resolved = self
+                    .resolve_pin(spec)
+                    .map_err(crate::artifacts::fetcher::PinResolveFailure::classify)
+                    .with_context(|| {
+                        format!(
+                            "resolve artifact {} at submit failed; fix the reference or set \
+                             resolve: \"always\" to re-resolve at staging instead",
+                            spec.redacted_source()
+                        )
+                    })?;
                 notes.push(ArtifactPin {
                     task: task.name.clone(),
                     from: spec.redacted_source(),
@@ -4418,6 +5007,29 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
+        // Apps whose jobspec keys ask to check their values are asked first,
+        // on the runtime (a retried request already recorded asks nobody).
+        let replay = self
+            .store
+            .idempotency_lookup(&scoped_idempotency_key(
+                &identity,
+                "run_job",
+                inner.idempotency_key.as_deref(),
+                &inner,
+            ))
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+            .is_some();
+        let app_warnings = if replay {
+            Vec::new()
+        } else {
+            self.ask_apps_to_validate(
+                &identity,
+                &inner.parsed_jobspec,
+                inner.namespace.as_deref(),
+                UnknownFieldMode::from_allow(inner.allow_unknown_fields),
+            )
+            .await?
+        };
         // Off the runtime, like `heartbeat`. `run_job_blocking` is
         // synchronous and a submit is a chain of quorum writes (the job
         // config, its status clears, KV references, the eval enqueue, the
@@ -4427,7 +5039,7 @@ impl Manager for ManagerDaemonService {
         // `spawn_blocking` await waits behind them for a thread to resume
         // on: measured on the AWS rig as 14-78ms per eval outside every
         // instrumented phase, about as long again as the plan itself.
-        run_blocking_admission(|| self.run_job_blocking(&identity, inner))
+        run_blocking_admission(|| self.run_job_blocking(&identity, inner, app_warnings))
     }
 
     #[instrument(skip_all)]
@@ -4640,8 +5252,15 @@ impl Manager for ManagerDaemonService {
             .await
             .map_err(template_eval_status)?;
 
-        let (mut config, kv_refs) = resolve_jobspec_kv_references(&self.store, &rendered)
-            .map_err(|e| Status::invalid_argument(format!("rendered jobspec is invalid: {e}")))?;
+        let registry = self.extension_registry()?;
+        let (mut config, _, _) = resolve_jobspec_kv_references(
+            &self.store,
+            &identity,
+            &rendered,
+            UnknownFieldMode::Reject,
+            &registry,
+            "rendered jobspec is invalid",
+        )?;
         let namespace =
             self.admit_job_namespace(&mut config, &rendered, inner.namespace.as_deref())?;
         acl::enforce(
@@ -4654,7 +5273,6 @@ impl Manager for ManagerDaemonService {
             &AclScope::job_via_template(&config.name, &template.name).with_band(config.priority),
         )?;
         self.ensure_namespace_exists(&namespace)?;
-        enforce_kv_reference_read(&identity, &kv_refs)?;
         enforce_kv_artifact_read(&identity, &config)?;
         validate_job_config(&config).map_err(|e| {
             Status::invalid_argument(format!("rendered jobspec failed validation: {e}"))
@@ -4701,6 +5319,7 @@ impl Manager for ManagerDaemonService {
                     job_config_id: String::new(),
                 });
             return Ok(Response::new(RunJobTemplateReply {
+                warnings: warnings_from_message(&record.message),
                 message: record.message,
                 deduplicated: true,
                 job_name: record.job_name,
@@ -4737,6 +5356,16 @@ impl Manager for ManagerDaemonService {
             version: template.version,
         };
 
+        // Apps whose jobspec keys ask to check their values, asked before
+        // the submit (docs/apps.md, "Jobspec extensions").
+        let app_warnings = self
+            .ask_apps_to_validate(
+                &identity,
+                &rendered,
+                inner.namespace.as_deref(),
+                UnknownFieldMode::from_allow(inner.allow_unknown_fields),
+            )
+            .await?;
         // Off the runtime for the same reason as `run_job`: the submit and
         // the idempotency record are blocking quorum writes.
         let submitted = run_blocking_admission(|| {
@@ -4748,6 +5377,8 @@ impl Manager for ManagerDaemonService {
                 inner.force_reschedule,
                 Some(&provenance),
                 inner.namespace.as_deref(),
+                UnknownFieldMode::from_allow(inner.allow_unknown_fields),
+                app_warnings,
             )?;
             info!(
                 template = %template.name,
@@ -4773,8 +5404,9 @@ impl Manager for ManagerDaemonService {
         })?;
 
         Ok(Response::new(RunJobTemplateReply {
-            message: submitted.message.into(),
+            message: submitted.message_with_warnings(),
             deduplicated: false,
+            warnings: submitted.warnings,
             job_name: submitted.job_name,
             job_config_id: submitted.job_config_id,
         }))
@@ -4811,9 +5443,32 @@ impl Manager for ManagerDaemonService {
             .map(reschedule_backoff_info)
             .collect();
 
+        let managed_by = self
+            .store
+            .job_managed_by(&name)
+            .map_err(|e| map_store_error("Error loading the job's app stamp", e))?
+            .map(|stamp| ManagedByInfo {
+                app: stamp.app,
+                digest: stamp.digest,
+            });
+        let unknown_fields = self
+            .store
+            .job_unknown_fields_record(&name)
+            .map_err(|e| map_store_error("Error loading job provenance", e))?
+            .map(crate::structs::UnknownFieldsRecord::from);
+        // Installed apps' values, as they read now against the apps
+        // installed now (docs/apps.md, "Jobspec extensions").
+        // (The read model's cached task configs: no JSON parse per call.)
+        let extensions = match self.store.job_status_and_latest_config(&name) {
+            Ok((_, config)) => self.job_extension_values(&config),
+            Err(_) => Vec::new(),
+        };
         let reply = GetJobInfoReply {
             job: Some(job),
             template,
+            managed_by,
+            unknown_fields,
+            extensions,
         };
 
         Ok(Response::new(reply))
@@ -5040,7 +5695,7 @@ impl Manager for ManagerDaemonService {
                 &AclScope::any(),
             )?;
         }
-        let credential = self.stream_credential(&request);
+        let credential = self.stream_credential(&request, &identity)?;
         let mut inbound = request.into_inner();
         let first = inbound
             .message()
@@ -5107,9 +5762,10 @@ impl Manager for ManagerDaemonService {
         }
         let Some(state) = self.workload_identity.as_ref() else {
             return Err(Status::failed_precondition(
-                "exec tickets are signed by the workload-identity issuer, which is not enabled \
-                 on this manager\nHint: set workloadIdentity.enabled: true in the manager \
-                 config, or exec through the manager (drop --direct)",
+                "exec tickets are signed by the workload-identity issuer, which is turned off \
+                 on this manager (workloadIdentity.enabled = false)\nHint: remove that setting \
+                 (workload identity is on by default), or exec through the manager (drop \
+                 --direct)",
             ));
         };
         let store = self.store.clone();
@@ -5295,7 +5951,7 @@ impl Manager for ManagerDaemonService {
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
         let identity = self.authenticate_acl(&request)?;
         let audience = EventAudience::for_identity(&identity)?;
-        let credential = self.stream_credential(&request);
+        let credential = self.stream_credential(&request, &identity)?;
         let request = request.into_inner();
         // One predicate for replayed and live events alike.
         let audience = EventFeed {
@@ -5422,6 +6078,15 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
         self.enforce_rollout_job(&identity, AclAction::Write, request.id)?;
+        // Stopping (or reverting) an app's rollout fights the reconciler;
+        // advancing one moves toward what it submitted, and is allowed.
+        if let Some(rollout) = self
+            .store
+            .get_rollout(request.id)
+            .map_err(|e| map_store_error("Error loading rollout", e))?
+        {
+            self.refuse_direct_app_job_write(&rollout.job_id, "stopping its rollout")?;
+        }
         let priority = request.priority.unwrap_or(self.store.default_eval_priority);
         let rollout = stop_rollout_state(&self.store, request.id, request.revert, priority)
             .map_err(|e| Status::invalid_argument(format!("Error stopping rollout: {e}")))?;
@@ -5451,11 +6116,18 @@ impl Manager for ManagerDaemonService {
             return Err(Status::invalid_argument("Plan request missing jobspec"));
         }
 
-        let (mut config, kv_refs) =
-            resolve_jobspec_kv_references(&self.store, &jobspec).map_err(|e| {
-                error!("Error parsing jobspec for plan: {:?}", e);
-                Status::invalid_argument(format!("Error parsing jobspec: {e}"))
-            })?;
+        let registry = self.extension_registry()?;
+        // The plan shows the KV-rendered config (`same_content`, extension
+        // values), so it needs the reads a submit would; they are enforced
+        // inside, before any reference is resolved.
+        let (mut config, _, unknown_fields) = resolve_jobspec_kv_references(
+            &self.store,
+            &identity,
+            &jobspec,
+            UnknownFieldMode::from_allow(inner.allow_unknown_fields),
+            &registry,
+            "Error parsing jobspec",
+        )?;
         let namespace =
             self.admit_job_namespace(&mut config, &jobspec, inner.namespace.as_deref())?;
         acl::enforce(
@@ -5464,10 +6136,10 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             &AclScope::job(&config.name),
         )?;
+        // A plan predicts the run: a direct submit to an installed app's
+        // job would be refused.
+        self.refuse_direct_app_job_write(&config.name, "submitting it directly")?;
         self.ensure_namespace_exists(&namespace)?;
-        // The plan compares the KV-rendered config with the stored one
-        // (`same_content`), so it needs the reads a submit would.
-        enforce_kv_reference_read(&identity, &kv_refs)?;
         enforce_kv_artifact_read(&identity, &config)?;
         let mut config = self
             .store
@@ -5483,6 +6155,7 @@ impl Manager for ManagerDaemonService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
+        let autoscale_plans = self.validate_autoscale(&config)?;
         self.validate_identity_sub_templates(&config)?;
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
@@ -5495,10 +6168,7 @@ impl Manager for ManagerDaemonService {
         // Artifact admission for plan mirrors run: pins resolve here too so
         // the plan shows the digests a submit would ship.
         let pin_notes = run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true))
-            .map_err(|e| {
-                error!("Error normalizing artifacts: {:?}", e);
-                Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
-            })?;
+            .map_err(artifact_admission_status)?;
         let config = config;
 
         let scheduler = Scheduler::new(&self.store).map_err(|e| {
@@ -5684,9 +6354,15 @@ impl Manager for ManagerDaemonService {
             index_usage,
             preemptions,
             preemption_mode: scheduler.preemption_settings().mode.as_str().to_string(),
-            warnings: self
-                .gated_egress_submit_warnings(&config)
+            warnings: unknown_fields
+                .warnings()
                 .into_iter()
+                .chain(
+                    autoscale_plans
+                        .iter()
+                        .flat_map(|task| task.warnings.iter().cloned()),
+                )
+                .chain(self.gated_egress_submit_warnings(&config))
                 .chain(self.tcp_upstream_submit_warnings(&config))
                 .chain(crate::task_plugins::container_security_warnings(&config))
                 .collect(),
@@ -5694,6 +6370,28 @@ impl Manager for ManagerDaemonService {
                 .iter()
                 .map(crate::manager::scheduler::GangReport::to_proto)
                 .collect(),
+            autoscale: autoscale_plans
+                .iter()
+                .map(|task| crate::structs::AutoscalePlan {
+                    target: task.target.clone(),
+                    effective_json: serde_json::to_string(&task.resolved.record)
+                        .unwrap_or_default(),
+                    summary: task.summary.clone(),
+                    provenance: task
+                        .resolved
+                        .explain_rows()
+                        .into_iter()
+                        .map(|row| crate::structs::ScalingProvenanceRow {
+                            field: row.field,
+                            value: row.value,
+                            origin: row.origin.to_string(),
+                        })
+                        .collect(),
+                    digest: task.resolved.digest.clone(),
+                    policy_json: task.resolved.policy.canonical_json(),
+                })
+                .collect(),
+            extensions: self.job_extension_values(&config),
         };
 
         Ok(Response::new(reply))
@@ -6017,6 +6715,8 @@ impl Manager for ManagerDaemonService {
                 deduplicated: true,
             }));
         }
+        // An installed app's job stops with `legion app disable`.
+        self.refuse_direct_app_job_write(&name, "stopping it directly")?;
 
         let job_config_id = self
             .store
@@ -6058,194 +6758,8 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ScaleTaskRequest>,
     ) -> Result<Response<ScaleTaskReply>, Status> {
-        // The whole point of the `scale` resource: resize rights without
-        // redeploy rights (docs/autoscaling.md, docs/auth-and-acls.md).
-        let ident = self.check_acl(
-            &request,
-            AclResource::Scale,
-            AclAction::Write,
-            self.job_read_scope(&request.get_ref().name),
-        )?;
-        let inner = request.into_inner();
-        let idempotency_key = scoped_idempotency_key(
-            &ident,
-            "scale_task",
-            inner.idempotency_key.as_deref(),
-            &inner,
-        );
-        let name = inner.name;
-
-        if let Some(message) = self
-            .store
-            .idempotency_lookup(&idempotency_key)
-            .map_err(|e| map_store_error("Error checking idempotency", e))?
-        {
-            return Ok(Response::new(ScaleTaskReply {
-                message,
-                deduplicated: true,
-                deferred: false,
-            }));
-        }
-
-        if inner.count.is_none() && !inner.reset {
-            return Err(Status::invalid_argument(
-                "provide count (the desired replicas) or reset (return the count to the spec)",
-            ));
-        }
-        if inner.count.is_some() && inner.reset {
-            return Err(Status::invalid_argument(
-                "count and reset are mutually exclusive",
-            ));
-        }
-
-        let config = keyed_job_config(&self.store, &name)?;
-        let task = resolve_scalable_task(
-            &config,
-            &name,
-            inner.task_group.as_deref(),
-            inner.task_name.as_deref(),
-        )?;
-        let (task_group, task_name, spec_count) =
-            (task.group.clone(), task.name.clone(), task.count.num);
-        let job_config_id = config.id();
-        let reason = inner.reason.unwrap_or_default();
-        let previous = self
-            .store
-            .effective_task_count(&name, &task_group, &task_name, spec_count)
-            .map_err(|e| map_store_error("Error reading scale state", e))?;
-
-        let (message, deferred) = if inner.reset {
-            let existed = self
-                .store
-                .clear_task_scale(&name, &task_group, &task_name)
-                .map_err(|e| map_store_error("Error resetting scale", e))?;
-            if existed {
-                self.store
-                    .events()
-                    .scale_reset(&name, &task_group, &task_name, "explicit reset");
-                self.store
-                    .enqueue_eval(
-                        "job_scale",
-                        Some(&name),
-                        Some(&job_config_id),
-                        None,
-                        Some(self.store.default_eval_priority),
-                    )
-                    .map_err(|e| map_store_error("Error enqueueing scale eval", e))?;
-            }
-            (
-                format!(
-                    "{}/{}/{}: {} -> {} (override dropped; spec owns the count)",
-                    name, task_group, task_name, previous, spec_count
-                ),
-                false,
-            )
-        } else {
-            let count = inner.count.unwrap_or_default();
-            // Scale-out is new demand: a namespace policy's quota sees the
-            // job at its new count. Scale-in is never refused.
-            if count > previous {
-                let mut scaled = config.clone();
-                if let Some(task) = scaled
-                    .tasks
-                    .iter_mut()
-                    .find(|task| task.group == task_group && task.name == task_name)
-                {
-                    task.count.num = count;
-                }
-                self.store
-                    .check_namespace_admission(&scaled)
-                    .map_err(|e| map_store_error("Namespace policy refused the scale", e))?;
-            }
-            // The ECS rule (docs/autoscaling.md): scale-out applies during
-            // a rollout, scale-in defers until it finishes.
-            let active_rollout = self
-                .store
-                .list_rollouts(Some(&name), true)
-                .map_err(|e| map_store_error("Error checking rollouts", e))?
-                .into_iter()
-                .next();
-            match active_rollout {
-                Some(rollout) if count < previous => {
-                    self.store
-                        .set_task_scale_pending(
-                            &name,
-                            &task_group,
-                            &task_name,
-                            count,
-                            spec_count,
-                            "operator",
-                            &reason,
-                            &ident.principal,
-                        )
-                        .map_err(|e| map_store_error("Error recording pending scale", e))?;
-                    self.store.events().scale_deferred(
-                        &name,
-                        &task_group,
-                        &task_name,
-                        count,
-                        rollout.id,
-                        "operator",
-                        &reason,
-                    );
-                    (
-                        format!(
-                            "deferred: rollout {} is in progress; scale-in to {} applies when it completes",
-                            rollout.id, count
-                        ),
-                        true,
-                    )
-                }
-                _ => {
-                    self.store
-                        .set_task_scale_override(
-                            &name,
-                            &task_group,
-                            &task_name,
-                            count,
-                            spec_count,
-                            "operator",
-                            &reason,
-                            &ident.principal,
-                        )
-                        .map_err(|e| map_store_error("Error applying scale", e))?;
-                    self.store.events().scale_applied(
-                        &name,
-                        &task_group,
-                        &task_name,
-                        Some(previous),
-                        count,
-                        "operator",
-                        &reason,
-                    );
-                    self.store
-                        .enqueue_eval(
-                            "job_scale",
-                            Some(&name),
-                            Some(&job_config_id),
-                            None,
-                            Some(self.store.default_eval_priority),
-                        )
-                        .map_err(|e| map_store_error("Error enqueueing scale eval", e))?;
-                    (
-                        format!(
-                            "{}/{}/{}: {} -> {} (spec count {}; override active)",
-                            name, task_group, task_name, previous, count, spec_count
-                        ),
-                        false,
-                    )
-                }
-            }
-        };
-
-        self.store
-            .idempotency_record(&idempotency_key, "scale_task", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
-        Ok(Response::new(ScaleTaskReply {
-            message,
-            deduplicated: false,
-            deferred,
-        }))
+        // ACL: scale:write (in the handler).
+        self.scale_task_rpc(request).await
     }
 
     #[instrument(skip_all)]
@@ -6268,32 +6782,124 @@ impl Manager for ManagerDaemonService {
             .store
             .task_scales_for_job(&name)
             .map_err(|e| map_store_error("Error loading scale state", e))?;
-
-        let tasks = config
-            .tasks
-            .iter()
-            .map(|task| {
-                let scale = scales
-                    .iter()
-                    .find(|scale| scale.task_group == task.group && scale.task_name == task.name);
-                let override_count = scale.and_then(|scale| scale.count);
-                TaskScaleStatus {
-                    task_group: task.group.clone(),
-                    task_name: task.name.clone(),
-                    spec_count: task.count.num,
-                    override_count,
-                    pending_count: scale.and_then(|scale| scale.pending_count),
-                    effective_count: override_count.unwrap_or(task.count.num),
-                    source: scale.map(|scale| scale.source.clone()).unwrap_or_default(),
-                    reason: scale.map(|scale| scale.reason.clone()).unwrap_or_default(),
-                    updated_at: scale
-                        .map(|scale| scale.updated_at.clone())
-                        .unwrap_or_default(),
-                }
-            })
-            .collect();
+        // Every effective count through `effective_task_count`, the accessor
+        // placement uses (autoscaler-v2 plan §5, Phase 0 hardening).
+        let tasks = scaling_rpcs::task_scale_statuses(&self.store, &name, &config, &scales)
+            .map_err(|e| map_store_error("Error reading scale state", e))?;
 
         Ok(Response::new(GetJobScaleStatusReply { tasks }))
+    }
+
+    async fn get_scaling_inputs(
+        &self,
+        request: Request<crate::structs::GetScalingInputsRequest>,
+    ) -> Result<Response<crate::structs::GetScalingInputsReply>, Status> {
+        self.get_scaling_inputs_rpc(request).await
+    }
+
+    type WatchScalingPoliciesStream =
+        ReceiverStream<Result<crate::structs::ScalingPolicySet, Status>>;
+
+    // ACL: scale:read (in the handler).
+    async fn watch_scaling_policies(
+        &self,
+        request: Request<crate::structs::WatchScalingPoliciesRequest>,
+    ) -> Result<Response<Self::WatchScalingPoliciesStream>, Status> {
+        self.watch_scaling_policies_rpc(request).await
+    }
+
+    // ACL: operator:write (in the handler).
+    async fn apply_scaling_defaults(
+        &self,
+        request: Request<crate::structs::ApplyScalingDefaultsRequest>,
+    ) -> Result<Response<crate::structs::ApplyScalingDefaultsReply>, Status> {
+        self.apply_scaling_defaults_rpc(request).await
+    }
+
+    // ACL: scale:read on the namespace (in the handler).
+    async fn get_scaling_defaults(
+        &self,
+        request: Request<crate::structs::GetScalingDefaultsRequest>,
+    ) -> Result<Response<crate::structs::GetScalingDefaultsReply>, Status> {
+        self.get_scaling_defaults_rpc(request).await
+    }
+
+    // ACL: app-plane (in the handler).
+    async fn report_scaling_status(
+        &self,
+        request: Request<crate::structs::ReportScalingStatusRequest>,
+    ) -> Result<Response<crate::structs::ReportScalingStatusReply>, Status> {
+        self.report_scaling_status_rpc(request).await
+    }
+
+    // ACL: app-plane (in the handler).
+    async fn record_scaling_action(
+        &self,
+        request: Request<crate::structs::RecordScalingActionRequest>,
+    ) -> Result<Response<crate::structs::RecordScalingActionReply>, Status> {
+        self.record_scaling_action_rpc(request).await
+    }
+
+    // ACL: scale:read (in the handler).
+    async fn get_scaling_status(
+        &self,
+        request: Request<crate::structs::GetScalingStatusRequest>,
+    ) -> Result<Response<crate::structs::GetScalingStatusReply>, Status> {
+        self.get_scaling_status_rpc(request).await
+    }
+
+    // ACL: scale:read (in the handler).
+    async fn get_scale_history(
+        &self,
+        request: Request<crate::structs::GetScaleHistoryRequest>,
+    ) -> Result<Response<crate::structs::GetScaleHistoryReply>, Status> {
+        self.get_scale_history_rpc(request).await
+    }
+
+    // ACL: scale:write; operator:write for `all` (in the handler).
+    async fn pause_scaling(
+        &self,
+        request: Request<crate::structs::PauseScalingRequest>,
+    ) -> Result<Response<crate::structs::PauseScalingReply>, Status> {
+        self.pause_scaling_rpc(request).await
+    }
+
+    // ACL: scale:write, coarse then on the policy (in the handler).
+    async fn apply_scaling_policy(
+        &self,
+        request: Request<crate::structs::ApplyScalingPolicyRequest>,
+    ) -> Result<Response<crate::structs::ApplyScalingPolicyReply>, Status> {
+        self.apply_scaling_policy_rpc(request).await
+    }
+
+    // ACL: scale:write, coarse then on the policy (in the handler).
+    async fn delete_scaling_policy(
+        &self,
+        request: Request<crate::structs::DeleteScalingPolicyRequest>,
+    ) -> Result<Response<crate::structs::DeleteScalingPolicyReply>, Status> {
+        self.delete_scaling_policy_rpc(request).await
+    }
+
+    // ACL: scale:read, filtered (in the handler).
+    async fn list_scaling_policies(
+        &self,
+        request: Request<crate::structs::ListScalingPoliciesRequest>,
+    ) -> Result<Response<crate::structs::ListScalingPoliciesReply>, Status> {
+        self.list_scaling_policies_rpc(request).await
+    }
+
+    async fn get_capacity_demand(
+        &self,
+        request: Request<crate::structs::GetCapacityDemandRequest>,
+    ) -> Result<Response<crate::structs::GetCapacityDemandReply>, Status> {
+        self.get_capacity_demand_rpc(request).await
+    }
+
+    async fn forget_node(
+        &self,
+        request: Request<crate::structs::ForgetNodeRequest>,
+    ) -> Result<Response<crate::structs::ForgetNodeReply>, Status> {
+        self.forget_node_rpc(request).await
     }
 
     #[instrument(skip_all)]
@@ -6327,6 +6933,9 @@ impl Manager for ManagerDaemonService {
                 deduplicated: true,
             }));
         }
+        // An installed app's job is destroyed only once the app is
+        // uninstalled.
+        self.refuse_direct_app_job_write(&name, "destroying it")?;
 
         let _ = self.store.destroy_job(&name).map_err(|e| {
             self.job_lookup_error(&identity, &name, map_store_error("Error deleting job", e))
@@ -7861,8 +8470,8 @@ impl Manager for ManagerDaemonService {
 
         let Some(state) = self.workload_identity.as_ref() else {
             return Err(Status::failed_precondition(
-                "workload identity is not enabled on this manager \
-                 (set workloadIdentity.enabled: true in the manager config)",
+                "workload identity is turned off on this manager \
+                 (workloadIdentity.enabled = false; it is on by default)",
             ));
         };
 
@@ -8132,8 +8741,8 @@ impl Manager for ManagerDaemonService {
 
         let Some(state) = self.workload_identity.as_ref() else {
             return Err(Status::failed_precondition(
-                "workload identity is not enabled on this manager \
-                 (set workloadIdentity.enabled: true in the manager config)",
+                "workload identity is turned off on this manager \
+                 (workloadIdentity.enabled = false; it is on by default)",
             ));
         };
 
@@ -8379,6 +8988,12 @@ impl Manager for ManagerDaemonService {
                 .map(|a| (a.allocation_id, (a.job_id.clone(), a.task_name.clone())))
                 .collect();
             self.fold_net_edges(&req.net_edges, &callers);
+            // The same samples, for the scaling-input rollup: a map insert
+            // per sample, resolved to the service's task off this path
+            // (docs/autoscaling.md, "Scaling inputs").
+            self.store
+                .scaling_rollups()
+                .record_edges(&id, &req.net_edges);
         }
         // Reclaim work for this node. Re-sent every heartbeat until the worker
         // confirms, so a worker that dies mid-destroy simply retries.
@@ -8660,6 +9275,7 @@ impl Manager for ManagerDaemonService {
             edge_boot: worker_config.edge_boot,
             security: worker_config.security,
             container: worker_config.container,
+            namespaces: worker_config.namespaces,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -8680,10 +9296,26 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         let grant =
             self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
-        let request = request.into_inner();
+        let presented = self.presented_join_token(&grant, request.get_ref().join_token.as_deref());
+        let mut request = request.into_inner();
         let node_id = request.name.clone();
         self.enforce_registration_grant(&grant, None, Some((&node_id, &request.pool)))?;
         self.enforce_fleet_claim(&grant, &node_id, &request.config_attrs)?;
+        crate::structs::check_join_attributes(
+            &request.join_attributes,
+            crate::structs::JoinAttrSource::Host,
+        )
+        .map_err(Status::invalid_argument)?;
+        request.config_attrs =
+            self.pin_registration_attrs(&grant, &node_id, &request.config_attrs)?;
+        // Token, then `--attr`, then the worker type (node_group_rpcs).
+        request.config_attrs = self.apply_join_attributes(
+            &grant,
+            presented.as_ref(),
+            &node_id,
+            &request.config_attrs,
+            &request.join_attributes,
+        )?;
 
         // Protocol-version handshake (see docs/upgrades.md): accept workers
         // at or below our protocol version, warn on pre-versioning workers
@@ -8719,6 +9351,10 @@ impl Manager for ManagerDaemonService {
             } else {
                 request.build_version.as_str()
             },
+            // The hash of the worker's executable (docs/apps.md,
+            // "Upgrades"); empty from a worker that predates it, which keeps
+            // the node out of every bundled app's build marker.
+            "buildId": request.build_id.as_str(),
             "protocolVersion": request.protocol_version,
             // Optional features the worker implements (`checkpoint`, ...).
             // Feature-specific work is only sent to workers that list it.
@@ -8763,6 +9399,11 @@ impl Manager for ManagerDaemonService {
             health_checks: request.health_checks,
         };
 
+        // Last, so a registration refused for anything else does not spend
+        // one of the token's uses.
+        if let Some(token) = &presented {
+            self.consume_join_use(token, &node_id)?;
+        }
         self.store
             .insert_node(node_msg)
             .map_err(|e| map_store_error("Error registering worker", e))?;
@@ -10960,8 +11601,26 @@ impl Manager for ManagerDaemonService {
                 &AclScope::path(&entry.key),
             )
         });
+        // Locks on request, readable like entries; a lock id is its
+        // holder's secret and never listed.
+        let locks = if req.include_locks {
+            self.store
+                .list_kv_locks(&req.prefix)
+                .map_err(|e| map_store_error("Error listing kv locks", e))?
+                .into_iter()
+                .filter(|lock| {
+                    identity.allows(AclResource::Kv, AclAction::Read, &AclScope::path(&lock.key))
+                })
+                .map(|lock| crate::structs::KvLock {
+                    lock_id: String::new(),
+                    ..lock
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        Ok(Response::new(ListKvReply { entries }))
+        Ok(Response::new(ListKvReply { entries, locks }))
     }
 
     #[instrument(skip_all)]
@@ -11626,6 +12285,212 @@ impl Manager for ManagerDaemonService {
     }
 
     #[instrument(skip_all)]
+    async fn list_grants(
+        &self,
+        request: Request<ListGrantsRequest>,
+    ) -> Result<Response<ListGrantsReply>, Status> {
+        // Grants are ACL state: who may do what, and who said so.
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let job = req
+            .job
+            .as_deref()
+            .map(str::trim)
+            .filter(|job| !job.is_empty());
+        let grants = self
+            .store
+            .list_job_grants(job, req.include_revoked)
+            .map_err(|e| map_store_error("Error listing grants", e))?;
+        Ok(Response::new(ListGrantsReply {
+            grants: grants.into_iter().map(job_grant_to_proto).collect(),
+        }))
+    }
+
+    async fn list_apps(
+        &self,
+        request: Request<crate::structs::ListAppsRequest>,
+    ) -> Result<Response<crate::structs::ListAppsReply>, Status> {
+        self.list_apps_rpc(request).await
+    }
+
+    async fn get_app(
+        &self,
+        request: Request<crate::structs::GetAppRequest>,
+    ) -> Result<Response<crate::structs::GetAppReply>, Status> {
+        self.get_app_rpc(request).await
+    }
+
+    async fn install_app(
+        &self,
+        request: Request<crate::structs::InstallAppRequest>,
+    ) -> Result<Response<crate::structs::InstallAppReply>, Status> {
+        self.install_app_rpc(request).await
+    }
+
+    async fn upgrade_app(
+        &self,
+        request: Request<crate::structs::UpgradeAppRequest>,
+    ) -> Result<Response<crate::structs::UpgradeAppReply>, Status> {
+        self.upgrade_app_rpc(request).await
+    }
+
+    async fn uninstall_app(
+        &self,
+        request: Request<crate::structs::UninstallAppRequest>,
+    ) -> Result<Response<crate::structs::UninstallAppReply>, Status> {
+        self.uninstall_app_rpc(request).await
+    }
+
+    async fn set_app_enabled(
+        &self,
+        request: Request<crate::structs::SetAppEnabledRequest>,
+    ) -> Result<Response<crate::structs::SetAppEnabledReply>, Status> {
+        self.set_app_enabled_rpc(request).await
+    }
+
+    async fn update_app_settings(
+        &self,
+        request: Request<crate::structs::UpdateAppSettingsRequest>,
+    ) -> Result<Response<crate::structs::UpdateAppSettingsReply>, Status> {
+        self.update_app_settings_rpc(request).await
+    }
+
+    async fn set_app_config(
+        &self,
+        request: Request<crate::structs::SetAppConfigRequest>,
+    ) -> Result<Response<crate::structs::SetAppConfigReply>, Status> {
+        self.set_app_config_rpc(request).await
+    }
+
+    #[instrument(skip_all)]
+    async fn list_ui_extensions(
+        &self,
+        request: Request<crate::structs::ListUiExtensionsRequest>,
+    ) -> Result<Response<crate::structs::ListUiExtensionsReply>, Status> {
+        self.list_ui_extensions_rpc(request).await
+    }
+
+    #[instrument(skip_all, fields(app = %request.get_ref().app, view = %request.get_ref().view))]
+    async fn get_app_view(
+        &self,
+        request: Request<crate::structs::GetAppViewRequest>,
+    ) -> Result<Response<crate::structs::GetAppViewReply>, Status> {
+        self.get_app_view_rpc(request).await
+    }
+
+    #[instrument(skip_all, fields(app = %request.get_ref().app, action = %request.get_ref().action))]
+    async fn invoke_app_action(
+        &self,
+        request: Request<crate::structs::InvokeAppActionRequest>,
+    ) -> Result<Response<crate::structs::InvokeAppActionReply>, Status> {
+        self.invoke_app_action_rpc(request).await
+    }
+
+    #[instrument(skip_all, fields(app = %request.get_ref().app, page = %request.get_ref().page))]
+    async fn get_app_page(
+        &self,
+        request: Request<crate::structs::GetAppPageRequest>,
+    ) -> Result<Response<crate::structs::GetAppPageReply>, Status> {
+        self.get_app_page_rpc(request).await
+    }
+
+    // ACL: job:read (in the handler).
+    async fn get_job_schema(
+        &self,
+        request: Request<crate::structs::GetJobSchemaRequest>,
+    ) -> Result<Response<crate::structs::GetJobSchemaReply>, Status> {
+        self.get_job_schema_rpc(request).await
+    }
+
+    type WatchAppExtensionsStream =
+        ReceiverStream<Result<crate::structs::AppExtensionEvent, Status>>;
+
+    // ACL: app-plane (in the handler).
+    async fn watch_app_extensions(
+        &self,
+        request: Request<crate::structs::WatchAppExtensionsRequest>,
+    ) -> Result<Response<Self::WatchAppExtensionsStream>, Status> {
+        self.watch_app_extensions_rpc(request).await
+    }
+
+    #[instrument(skip_all, fields(job))]
+    async fn revoke_grant(
+        &self,
+        request: Request<RevokeGrantRequest>,
+    ) -> Result<Response<RevokeGrantReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let job = req.job.trim().to_string();
+        if job.is_empty() {
+            return Err(Status::invalid_argument("job is required"));
+        }
+        tracing::Span::current().record("job", job.as_str());
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "revoke_grant",
+            req.idempotency_key.as_deref(),
+            &req,
+        );
+        if let Some(recorded) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            let mut reply: RevokeGrantReply =
+                serde_json::from_str(&recorded).unwrap_or(RevokeGrantReply {
+                    message: recorded,
+                    ..Default::default()
+                });
+            reply.deduplicated = true;
+            return Ok(Response::new(reply));
+        }
+        let revoked = self
+            .store
+            .revoke_job_grants(&job, req.version, &identity.principal)
+            .map_err(|e| map_store_error("Error revoking grants", e))?;
+        info!(
+            job = %job,
+            revoked,
+            principal = %identity.principal,
+            "Job grants revoked"
+        );
+        let reply = RevokeGrantReply {
+            message: match (revoked, req.version) {
+                (0, _) => format!("job `{job}` had no live grant to revoke"),
+                (_, Some(version)) => format!(
+                    "revoked the grant of job `{job}` version {version}; its tokens lose it at \
+                     their next request"
+                ),
+                (n, None) => format!(
+                    "revoked {n} grant{} of job `{job}`; its tokens lose them at their next \
+                     request",
+                    if n == 1 { "" } else { "s" }
+                ),
+            },
+            revoked: u32::try_from(revoked).unwrap_or(u32::MAX),
+            deduplicated: false,
+        };
+        self.store
+            .idempotency_record(
+                &idempotency_key,
+                "revoke_grant",
+                &serde_json::to_string(&reply).unwrap_or_else(|_| reply.message.clone()),
+            )
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
     async fn get_auth_methods(
         &self,
         request: Request<GetAuthMethodsRequest>,
@@ -11674,14 +12539,23 @@ impl Manager for ManagerDaemonService {
                     .map_err(|e| Status::invalid_argument(format!("invalid ttl `{raw}`: {e}")))?,
             ),
         };
-        let (info, token) = self.auth.mint_join_token(
+        let (max_uses, attributes) = Self::join_token_limits(req.max_uses, req.attributes)?;
+        let (info, token) = self.auth.mint_join_token_for_nodes(
             &self.store,
             &self.advertise_addr,
             &worker_type,
             ttl,
             &req.description,
+            max_uses,
+            attributes,
         )?;
-        info!(id = %info.id, worker_type = %info.worker_type, "Join token created");
+        info!(
+            id = %info.id,
+            worker_type = %info.worker_type,
+            max_uses = ?info.max_uses,
+            attributes = info.attributes.len(),
+            "Join token created"
+        );
         if let Some(warning) = &self.join_address_warning {
             warn!(id = %info.id, "Join token names a loopback manager address: {warning}");
         }
@@ -11764,8 +12638,8 @@ impl Manager for ManagerDaemonService {
         }
         let Some(state) = self.workload_identity.as_ref() else {
             return Err(Status::failed_precondition(
-                "boot tickets are signed by the workload-identity issuer, which is not enabled \
-                 on this manager (set workloadIdentity.enabled: true)",
+                "boot tickets are signed by the workload-identity issuer, which is turned off \
+                 on this manager (workloadIdentity.enabled = false; it is on by default)",
             ));
         };
 
@@ -12181,6 +13055,30 @@ struct MintedTicketRecord {
 /// unambiguous whatever the parts contain, and the request's fingerprint
 /// follows the last `#` ([`Store::idempotency_lookup`] refuses a key whose
 /// record carries another one).
+/// A stored grant as the API shows it.
+fn job_grant_to_proto(record: crate::storage::acl_store::JobGrantRecord) -> JobGrant {
+    JobGrant {
+        job_id: record.job_id,
+        version: record.version,
+        job_config_id: record.job_config_id,
+        tasks: record
+            .tasks
+            .into_iter()
+            .map(|task| TaskGrantInfo {
+                group: task.group,
+                task: task.task,
+                permissions_json: serde_json::to_string(&task.permissions)
+                    .unwrap_or_else(|_| "[]".into()),
+                policies: task.policies,
+            })
+            .collect(),
+        granted_by: record.granted_by,
+        granted_at: record.granted_at,
+        revoked_at: record.revoked_at.unwrap_or_default(),
+        revoked_by: record.revoked_by.unwrap_or_default(),
+    }
+}
+
 fn scoped_idempotency_key(
     identity: &AclIdentity,
     operation: &str,
@@ -12191,10 +13089,18 @@ fn scoped_idempotency_key(
     if key.is_empty() {
         return String::new();
     }
-    let caller = identity
-        .accessor_id
-        .as_deref()
-        .unwrap_or(identity.principal.as_str());
+    // Who the caller is, by how it authenticated and then its accessor (a
+    // token) or its principal: a JWT subject spelled like a delegated
+    // identity (`alice via app autoscaler`), or like an accessor, is
+    // another caller and shares no scope with it.
+    let caller = match identity.accessor_id.as_deref() {
+        Some(accessor) => format!("{}:accessor:{accessor}", identity.source.as_str()),
+        None => format!(
+            "{}:principal:{}",
+            identity.source.as_str(),
+            identity.principal
+        ),
+    };
     format!(
         "{operation}/{}:{caller}/{key}#{}",
         caller.len(),
@@ -12241,7 +13147,7 @@ enum RegistrationGrant {
     /// live node, unless the caller also presented that node's own token
     /// (`caller_node`).
     JoinToken {
-        record: crate::storage::acl_store::JoinTokenRecord,
+        record: Box<crate::storage::acl_store::JoinTokenRecord>,
         caller_node: Option<String>,
     },
     /// A node token: may only re-register its own node, in its current pool.
@@ -12794,6 +13700,12 @@ fn template_eval_status(err: anyhow::Error) -> Status {
 /// possible.
 /// `block_in_place` needs the multi-thread runtime; current-thread callers
 /// (tests) run inline.
+/// [`run_blocking_admission`] for the manager's own loops (the app
+/// reconciler submits through the same blocking path RunJob takes).
+pub(crate) fn run_blocking<T>(work: impl FnOnce() -> T) -> T {
+    run_blocking_admission(work)
+}
+
 fn run_blocking_admission<T>(work: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
@@ -13977,7 +14889,9 @@ fn enforce_kv_credential_read<'a>(
 /// `templateKv` pointer) is rendered into the task, which can read it, so
 /// naming one needs the same right as reading it: `kv:read` on the path.
 /// Without this, `job:write` on any job was a way to read every KV secret.
-/// Applied to RunJob, template runs and renders, and PlanJob.
+/// Applied by [`resolve_jobspec_kv_references`] to every reference before
+/// any is resolved: RunJob, template runs and renders, PlanJob, and the
+/// apps' validate call.
 fn enforce_kv_reference_read(
     identity: &crate::structs::AclIdentity,
     references: &[KvReference],
@@ -14575,6 +15489,39 @@ mod tests {
     use serde_json::{json, Map, Value};
     use tempfile::Builder;
 
+    /// Two callers never share an idempotency scope, however their names
+    /// are spelled: a JWT subject named like a delegated identity, or like
+    /// a token's accessor, is another caller (hardening after the
+    /// adversarial review).
+    #[test]
+    fn idempotency_scopes_never_collide_across_identity_sources() {
+        use crate::structs::acl::AclSource;
+        let identity = |principal: &str, accessor: Option<&str>, source: AclSource| AclIdentity {
+            principal: principal.to_string(),
+            accessor_id: accessor.map(str::to_string),
+            is_management: false,
+            is_worker: false,
+            policies: Vec::new(),
+            rules: Vec::new(),
+            source,
+            expires_at: None,
+            audit_only: false,
+        };
+        let request = json!({ "name": "web" });
+        let key = |identity: &AclIdentity| {
+            scoped_idempotency_key(identity, "run_job", Some("k1"), &request)
+        };
+        let delegated = identity("alice via app autoscaler", None, AclSource::Delegated);
+        let jwt = identity("alice via app autoscaler", None, AclSource::Jwt);
+        assert_ne!(key(&delegated), key(&jwt));
+        let token = identity("deployer", Some("0f3a"), AclSource::Token);
+        let named_like_it = identity("0f3a", None, AclSource::Jwt);
+        assert_ne!(key(&token), key(&named_like_it));
+        // The same caller, the same request: the same scope.
+        assert_eq!(key(&token), key(&token.clone()));
+        assert!(scoped_idempotency_key(&token, "run_job", None, &request).is_empty());
+    }
+
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("legion-manager-server-")
@@ -14895,6 +15842,7 @@ mod tests {
                 file: Some(WorkloadIdentityFile {
                     path: "/var/run/legion/identity/aws/token".into(),
                     mode: Some("0400".into()),
+                    unknown_fields: Default::default(),
                 }),
                 ..Default::default()
             }],
@@ -14916,6 +15864,8 @@ mod tests {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(job_name)?.id();
@@ -14992,6 +15942,8 @@ mod tests {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         Ok(())
@@ -15074,6 +16026,8 @@ mod tests {
                 rollout: None,
                 rollout_by_group: Default::default(),
                 version: None,
+                pending_extensions: Default::default(),
+                extensions: Default::default(),
             })
         };
         store.handle_job_submit(
@@ -15141,6 +16095,8 @@ mod tests {
                 rollout: None,
                 rollout_by_group: Default::default(),
                 version: None,
+                pending_extensions: Default::default(),
+                extensions: Default::default(),
             },
             &[submission()],
         )?;
@@ -15277,6 +16233,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..aws_identity_task("db")
         };
@@ -15542,11 +16499,13 @@ mod tests {
                     path: "/var/lib/db".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -15557,6 +16516,8 @@ mod tests {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(job_name)?.id();
@@ -15768,6 +16729,8 @@ mod tests {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let launch = build_rollout_launch_config(&config)?;
         assert_eq!(launch.strategy.as_deref(), Some("default"));
@@ -15793,6 +16756,8 @@ mod tests {
             }),
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let launch = build_rollout_launch_config(&config)?;
         assert_eq!(launch.progression.as_deref(), Some("manual"));
@@ -15912,6 +16877,20 @@ mod tests {
             }))
         }
 
+        async fn forward_app_request(
+            &self,
+            request: Request<crate::structs::ForwardAppRequestRequest>,
+        ) -> Result<Response<crate::structs::ForwardAppRequestReply>, Status> {
+            let request = request.into_inner();
+            Ok(Response::new(crate::structs::ForwardAppRequestReply {
+                status: 200,
+                content_type: "application/json".into(),
+                body: json!({ "path": request.path, "allocation": request.allocation_id })
+                    .to_string()
+                    .into_bytes(),
+            }))
+        }
+
         type ExecTaskStream =
             tokio_stream::wrappers::ReceiverStream<Result<crate::structs::ExecServerFrame, Status>>;
 
@@ -15997,6 +16976,28 @@ mod tests {
             Some("node-1"),
             "the worker saw the restart"
         );
+
+        // An app view request takes the same authenticated hop
+        // (docs/apps.md, "Views and actions").
+        use crate::manager::app_forward::AppForwarder;
+        let forwarded = crate::manager::app_forward::WorkerPlaneForwarder
+            .forward(
+                &store,
+                "node-1",
+                crate::structs::ForwardAppRequestRequest {
+                    allocation_id: 7,
+                    job_id: "legion-system/fake".into(),
+                    port: "api".into(),
+                    method: "GET".into(),
+                    path: "/legion/v1/views/job?slot=job".into(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(forwarded.status, 200);
+        let echoed: Value = serde_json::from_slice(&forwarded.body)?;
+        assert_eq!(echoed["path"], "/legion/v1/views/job?slot=job");
+        assert_eq!(echoed["allocation"], 7);
 
         // A pre-mTLS worker (protocol 2, plaintext address) is never dialed.
         let old = Node {
@@ -16170,6 +17171,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
             .await?;
 
@@ -16251,6 +17253,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
             .await?;
 
@@ -16311,6 +17314,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
             .await?;
 
@@ -16367,6 +17371,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
             .await?;
         Ok(())
@@ -17549,7 +18554,7 @@ mod tests {
         .await?
         .remove(0);
         assert!(off.value.is_empty() && !off.absent);
-        assert!(off.error.contains("not enabled"), "{}", off.error);
+        assert!(off.error.contains("turned off"), "{}", off.error);
         Ok(())
     }
 
@@ -17824,6 +18829,8 @@ mod tests {
                 ..TaskConfig::new("api", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -17841,6 +18848,8 @@ mod tests {
                 ..TaskConfig::new("api", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -17879,6 +18888,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
             .await?;
 
@@ -17917,6 +18927,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -17934,6 +18946,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -18014,6 +19028,8 @@ mod tests {
             name: job_name.clone(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job_name)?.id();
@@ -18088,6 +19104,8 @@ mod tests {
                 ..TaskConfig::new("task", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -18140,6 +19158,7 @@ mod tests {
                 worker_type: "default".into(),
                 ttl: Some("1h".into()),
                 description: "warning test".into(),
+                ..Default::default()
             })
         };
         let warning = crate::structs::ServerConfigFull {
@@ -18183,6 +19202,8 @@ mod tests {
             name: "job".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -18249,6 +19270,8 @@ mod tests {
             name: "flaky".into(),
             tasks: vec![TaskConfig::new("store", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -18591,6 +19614,8 @@ mod tests {
                 ..TaskConfig::new("hog", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -18689,6 +19714,8 @@ mod tests {
             name: "artifact-fail-job".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -18758,6 +19785,8 @@ mod tests {
             name: "job-non-owner".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -18796,6 +19825,8 @@ mod tests {
             name: "health-upsert".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -18867,6 +19898,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -18884,6 +19917,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -18961,6 +19996,8 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -18996,6 +20033,8 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -19127,6 +20166,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -19142,6 +20183,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -19310,6 +20353,8 @@ mod tests {
                 ..TaskConfig::new("task", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19343,6 +20388,8 @@ mod tests {
                 ..TaskConfig::new("prep", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19421,6 +20468,8 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19513,6 +20562,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: Some("off-runtime-1".into()),
+                allow_unknown_fields: Default::default(),
             }))
             .await?
             .into_inner();
@@ -19543,6 +20593,7 @@ mod tests {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
         };
 
@@ -19584,6 +20635,8 @@ mod tests {
             name: "status-job".into(),
             tasks: vec![TaskConfig::new("api", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         async fn status_of(manager: &ManagerDaemonService) -> R<String> {
@@ -19643,6 +20696,8 @@ mod tests {
             name: format!("svc-{name}"),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19879,11 +20934,13 @@ mod tests {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new(name, "noop")
         }
@@ -19897,6 +20954,8 @@ mod tests {
             name: name.into(),
             tasks,
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(name)?.id();
@@ -20279,6 +21338,89 @@ mod tests {
             })))
             .expect_err("unknown instance");
         assert_eq!(status.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    /// A tenant admin's `exec` grant on `namespaces = ["*"]` does not reach
+    /// an app's allocation in `legion-system`, so it cannot borrow the app's
+    /// identity through a shell; a grant naming `legion-*` does
+    /// (docs/namespaces.md, "Reserved namespaces").
+    #[tokio::test]
+    async fn star_exec_grants_do_not_reach_legion_system_test() -> R<()> {
+        use crate::structs::acl::{AclIdentity, AclRule, AclSource};
+        let store = setup_store()?;
+        store.ensure_system_namespace()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        for name in ["legion-system/agent", "shell"] {
+            run_jobspec(
+                &manager,
+                json!({
+                    "name": name,
+                    "task": {
+                        "name": "main",
+                        "runtime": "exec",
+                        "config": { "command": ["sleep", "600"], "user": "nobody" },
+                    }
+                }),
+            )
+            .await?;
+        }
+        store.insert_node(NodeMsg {
+            id: "node-1".into(),
+            pool: "default".into(),
+            status: "active".into(),
+            availability: "available".into(),
+            config_attrs: json!({ "workerAddress": "https://10.0.3.17:4848" }).to_string(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: json!({
+                "protocolVersion": crate::manager::worker_plane::MIN_WORKER_PLANE_PROTOCOL
+            })
+            .to_string(),
+            health_checks: "{}".into(),
+            last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
+        })?;
+        let alloc_of = |job: &str| -> R<i64> {
+            let config = store.get_job_config(job)?.id();
+            let (task_id, _) = store
+                .get_task_configs_for_job_config(&config)?
+                .into_iter()
+                .next()
+                .context("task config")?;
+            Ok(store.place_alloc("node-1", task_id)?.id)
+        };
+        let system_alloc = alloc_of("legion-system/agent")?;
+        let tenant_alloc = alloc_of("shell")?;
+        let identity = |namespaces: Value| AclIdentity {
+            principal: "tester".into(),
+            accessor_id: Some("acc-1".into()),
+            is_management: false,
+            is_worker: false,
+            policies: vec!["p".into()],
+            rules: serde_json::from_value::<Vec<AclRule>>(json!([{
+                "resources": ["exec"], "namespaces": namespaces,
+                "actions": ["write"], "host": true
+            }]))
+            .expect("rules"),
+            source: AclSource::Token,
+            expires_at: None,
+            audit_only: false,
+        };
+        let start = |allocation_id: i64| crate::structs::ExecStart {
+            allocation_id,
+            command: vec!["/bin/sh".into()],
+            ..Default::default()
+        };
+        let tenant_admin = identity(json!(["*"]));
+        crate::manager::exec::resolve_for_test(&store, &tenant_admin, &start(tenant_alloc))
+            .expect("`*` reaches a tenant job");
+        let status =
+            crate::manager::exec::resolve_for_test(&store, &tenant_admin, &start(system_alloc))
+                .expect_err("`*` must not reach legion-system");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        let operator = identity(json!(["*", "legion-*"]));
+        crate::manager::exec::resolve_for_test(&store, &operator, &start(system_alloc))
+            .expect("a pattern naming legion- reaches it");
         Ok(())
     }
 

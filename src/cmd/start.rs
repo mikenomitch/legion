@@ -56,6 +56,7 @@ pub fn config() -> Command {
              list; prefer --token-file",
         ))
         .arg(crate::cmd::join::token_file_arg())
+        .arg(crate::cmd::join::attr_arg().conflicts_with("simulate"))
         // Exactly one of the two, and the usage error names both.
         .group(
             clap::ArgGroup::new("join-token")
@@ -183,7 +184,8 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             let advertise = arg_matches
                 .get_one::<String>("advertise-addr")
                 .map(String::as_str);
-            run_worker(&token, name, advertise).await
+            let attributes = crate::cmd::join::join_attributes_from(arg_matches)?;
+            run_worker(&token, name, advertise, attributes).await
         }
         Some(("gateway", arg_matches)) => {
             let listen = arg_matches

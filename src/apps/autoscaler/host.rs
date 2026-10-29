@@ -1,0 +1,896 @@
+//! The plugin host: every plugin the autoscaler's app config installs, ready
+//! to call (docs/autoscaling.md, "Plugins"; autoscaler-v2 plan §6.8).
+//!
+//! Builtins run in process ([`super::builtins`]); external plugins are
+//! [`Transport`]s, started on first use and kept running. Before a call
+//! carries a policy's config to a plugin, the host checks the plugin
+//! implements the kind the policy uses it as, and that the config matches
+//! the plugin's `policyConfigSchema`: a plugin never sees a config its
+//! schema refuses.
+//!
+//! Every plugin's calls in flight are capped ([`PluginEntry::concurrency`]:
+//! its `concurrency`, 8 by default, 1 for a program plugin), so a replica
+//! evaluating thousands of policies never asks a Prometheus, an HTTP
+//! endpoint, or a cloud API more than that at once; the rest wait their
+//! turn.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+
+use super::builtins::{ExecTarget, HttpSource, NoopTarget, PrometheusSource};
+use super::rpc::{CallError, Endpoint, PluginInfo, Transport};
+use crate::autoscaler::plugins::{Builtin, Install, Kind, PluginCatalog, PluginEntry, NOOP_TARGET};
+
+/// What a source answered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceReading {
+    /// A value. `windowed` when the source already averaged it over the
+    /// check's window (a Prometheus range, a plugin's series); otherwise the
+    /// app averages its own readings over the window, as for the `legion`
+    /// source.
+    Value {
+        /// The reading.
+        value: f64,
+        /// Whether it already covers the window.
+        windowed: bool,
+    },
+    /// No data, and why.
+    Missing(String),
+}
+
+impl SourceReading {
+    /// A value.
+    pub fn value(value: f64, windowed: bool) -> Self {
+        SourceReading::Value { value, windowed }
+    }
+}
+
+/// What a target holds now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetState {
+    /// Its count.
+    pub count: u32,
+    /// How many of them are ready.
+    pub ready: u32,
+    /// Its members, as the plugin described them.
+    pub members: Vec<Value>,
+}
+
+/// One `source/query`.
+#[derive(Debug, Clone)]
+pub struct SourceCall<'a> {
+    /// The policy's label (`web/default/web`, or a standalone policy's id).
+    pub policy: &'a str,
+    /// The check.
+    pub check: &'a str,
+    /// The policy's query.
+    pub query: &'a str,
+    /// The check's window.
+    pub window: Duration,
+}
+
+/// One `strategy/recommend`.
+#[derive(Debug, Clone)]
+pub struct RecommendCall<'a> {
+    /// The policy's label.
+    pub policy: &'a str,
+    /// The check.
+    pub check: &'a str,
+    /// The target's count.
+    pub current: u32,
+    /// Its ready replicas.
+    pub ready: u32,
+    /// The check's reading, when it has a query.
+    pub reading: Option<f64>,
+    /// The strategy's settings (every field but `name`).
+    pub config: Value,
+}
+
+enum Loaded {
+    External(Box<Transport>),
+    Prometheus(PrometheusSource),
+    Http(HttpSource),
+    Exec(ExecTarget),
+    Noop(NoopTarget),
+}
+
+/// Every installed plugin, plus the implicit `noop` target.
+pub struct PluginHost {
+    catalog: PluginCatalog,
+    plugins: HashMap<String, Loaded>,
+    /// Each plugin's cap on calls in flight.
+    limits: HashMap<String, Arc<tokio::sync::Semaphore>>,
+    noop: NoopTarget,
+    schemas: std::sync::Mutex<HashMap<String, Arc<jsonschema::JSONSchema>>>,
+    timeout_override: Option<Duration>,
+}
+
+/// Where an artifact plugin's files are: `<code root>/plugins/<name>/`, the
+/// directory the app reconciler fetches its `source` into.
+pub fn plugin_dir(code_root: &Path, name: &str) -> PathBuf {
+    code_root.join("plugins").join(name)
+}
+
+/// The endpoint of an external plugin. An artifact plugin runs in its
+/// directory, and a relative program path (`./aws-asg`) resolves there.
+pub fn endpoint_for(entry: &PluginEntry, code_root: Option<&Path>) -> Option<Endpoint> {
+    match &entry.install {
+        Install::Url(url) => Some(Endpoint::Url(url.clone())),
+        Install::Command { argv, source, .. } => {
+            let dir = match (source, code_root) {
+                (Some(_), Some(root)) => Some(plugin_dir(root, &entry.name)),
+                _ => None,
+            };
+            let mut argv = argv.clone();
+            if let (Some(dir), Some(program)) = (dir.as_ref(), argv.first_mut()) {
+                let path = Path::new(program.as_str());
+                if path.is_relative() && program.contains('/') {
+                    *program = dir.join(path).display().to_string();
+                }
+            }
+            Some(Endpoint::Command { argv, dir })
+        }
+        Install::Builtin(_) => None,
+    }
+}
+
+fn call_error(plugin: &str, method: &str, err: CallError) -> String {
+    format!("plugin {plugin}: {method}: {err}")
+}
+
+/// Why a policy cannot use a plugin.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Problem {
+    /// The policy is wrong for the plugin: it uses it as a kind it does not
+    /// implement, or its config does not match the plugin's
+    /// `policyConfigSchema`. The policy is held `invalid` until fixed.
+    Invalid(String),
+    /// The plugin could not be asked (not installed here, not starting, not
+    /// answering): its checks have no data, its target reports `error`.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Problem::Invalid(why) | Problem::Unavailable(why) => f.write_str(why),
+        }
+    }
+}
+
+impl PluginHost {
+    /// A host for `catalog`. `code_root` is where artifact plugins were
+    /// fetched (`$LEGION_TASK_DIR/code`). Nothing starts until it is used.
+    pub fn new(catalog: PluginCatalog, code_root: Option<&Path>) -> Self {
+        Self::build(catalog, code_root, None)
+    }
+
+    /// The same, with one timeout for every plugin call (tests).
+    pub fn with_timeout(
+        catalog: PluginCatalog,
+        code_root: Option<&Path>,
+        timeout: Duration,
+    ) -> Self {
+        Self::build(catalog, code_root, Some(timeout))
+    }
+
+    fn build(catalog: PluginCatalog, code_root: Option<&Path>, timeout: Option<Duration>) -> Self {
+        let client = reqwest::Client::new();
+        let mut plugins = HashMap::new();
+        let mut limits = HashMap::new();
+        for entry in catalog.entries() {
+            limits.insert(
+                entry.name.clone(),
+                Arc::new(tokio::sync::Semaphore::new(entry.concurrency() as usize)),
+            );
+            let loaded = match &entry.install {
+                Install::Builtin(Builtin::Prometheus) => {
+                    Loaded::Prometheus(PrometheusSource::new(&entry.config, client.clone()))
+                }
+                Install::Builtin(Builtin::Http) => {
+                    Loaded::Http(HttpSource::new(&entry.config, client.clone()))
+                }
+                Install::Builtin(Builtin::Exec) => Loaded::Exec(ExecTarget::new(&entry.config)),
+                Install::Builtin(Builtin::Noop) => Loaded::Noop(NoopTarget::default()),
+                _ => {
+                    let Some(endpoint) = endpoint_for(entry, code_root) else {
+                        continue;
+                    };
+                    let config = if entry.config.is_null() {
+                        json!({})
+                    } else {
+                        entry.config.clone()
+                    };
+                    let mut transport = Transport::new(&entry.name, endpoint, config);
+                    if let Some(timeout) = timeout {
+                        transport = transport.with_timeout(timeout);
+                    }
+                    Loaded::External(Box::new(transport))
+                }
+            };
+            plugins.insert(entry.name.clone(), loaded);
+        }
+        Self {
+            catalog,
+            plugins,
+            limits,
+            noop: NoopTarget::default(),
+            schemas: std::sync::Mutex::new(HashMap::new()),
+            timeout_override: timeout,
+        }
+    }
+
+    /// The catalog the host was built from.
+    pub fn catalog(&self) -> &PluginCatalog {
+        &self.catalog
+    }
+
+    /// Wait for a turn to call `name` (none needed for a plugin that is not
+    /// installed, or the implicit `noop`). Held for the whole call.
+    async fn turn(&self, name: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let limit = self.limits.get(name)?.clone();
+        limit.acquire_owned().await.ok()
+    }
+
+    /// How many more calls `name` may start now (tests, diagnostics).
+    pub fn free_turns(&self, name: &str) -> Option<usize> {
+        self.limits.get(name).map(|limit| limit.available_permits())
+    }
+
+    fn loaded(&self, name: &str) -> Result<&Loaded, String> {
+        self.plugins.get(name).ok_or_else(|| {
+            format!(
+                "plugin {name} is not installed in the autoscaler's app config \
+                 (`legion app config set autoscaler`)"
+            )
+        })
+    }
+
+    /// An external plugin's `initialize` answer, starting it if needed.
+    pub async fn info(&self, name: &str) -> Result<PluginInfo, String> {
+        match self.loaded(name)? {
+            Loaded::External(transport) => transport
+                .info()
+                .await
+                .map_err(|err| call_error(name, "initialize", err)),
+            _ => Err(format!("plugin {name} is built in")),
+        }
+    }
+
+    /// The external plugin `name`'s transport (the conformance suite).
+    pub fn transport(&self, name: &str) -> Option<&Transport> {
+        match self.plugins.get(name) {
+            Some(Loaded::External(transport)) => Some(transport.as_ref()),
+            _ => None,
+        }
+    }
+
+    fn compiled(&self, name: &str, schema: &Value) -> Result<Arc<jsonschema::JSONSchema>, String> {
+        let key = format!("{name}\u{0}{schema}");
+        let mut cache = self.schemas.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(compiled) = cache.get(&key) {
+            return Ok(compiled.clone());
+        }
+        let compiled = Arc::new(
+            crate::structs::app::compile_config_schema(schema)
+                .map_err(|err| format!("plugin {name}'s policyConfigSchema {err}"))?,
+        );
+        cache.insert(key, compiled.clone());
+        Ok(compiled)
+    }
+
+    /// Check that plugin `name` implements `kind`, and that a policy's
+    /// `config` for it matches its `policyConfigSchema`. Builtins check
+    /// their kind; their policy-level config is free-form.
+    pub async fn check(&self, name: &str, kind: Kind, config: &Value) -> Result<(), Problem> {
+        if kind == Kind::Target && name == NOOP_TARGET {
+            return Ok(());
+        }
+        match self.loaded(name).map_err(Problem::Unavailable)? {
+            Loaded::External(transport) => {
+                let info = transport
+                    .info()
+                    .await
+                    .map_err(|err| Problem::Unavailable(call_error(name, "initialize", err)))?;
+                if !info.kinds.contains(&kind) {
+                    return Err(Problem::Invalid(format!(
+                        "plugin {name} is not {} (it implements {})",
+                        match kind {
+                            Kind::Source => "a source",
+                            Kind::Strategy => "a strategy",
+                            Kind::Target => "a target",
+                        },
+                        info.kinds
+                            .iter()
+                            .map(|kind| kind.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                // A source has no policy-level config; strategies and
+                // targets do.
+                if let (Some(schema), false) = (&info.policy_config_schema, kind == Kind::Source) {
+                    let compiled = self.compiled(name, schema).map_err(Problem::Invalid)?;
+                    crate::structs::app::check_config(&compiled, config).map_err(|err| {
+                        Problem::Invalid(format!(
+                            "the config for plugin {name} does not match its \
+                             policyConfigSchema: {err}"
+                        ))
+                    })?;
+                }
+                Ok(())
+            }
+            loaded => {
+                let actual = match loaded {
+                    Loaded::Prometheus(_) | Loaded::Http(_) => Kind::Source,
+                    _ => Kind::Target,
+                };
+                if actual == kind {
+                    Ok(())
+                } else {
+                    Err(Problem::Invalid(format!(
+                        "plugin {name} is a built-in {actual}, not a {kind}"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Read one source.
+    pub async fn query(
+        &self,
+        source: &str,
+        call: &SourceCall<'_>,
+        now_ms: i64,
+    ) -> Result<SourceReading, String> {
+        let _turn = self.turn(source).await;
+        match self.loaded(source)? {
+            Loaded::Prometheus(prometheus) => {
+                prometheus.query(call.query, call.window, now_ms).await
+            }
+            Loaded::Http(http) => http.query(call.query).await,
+            Loaded::External(transport) => {
+                self.check(source, Kind::Source, &Value::Null)
+                    .await
+                    .map_err(|problem| problem.to_string())?;
+                let params = json!({
+                    "policy": call.policy,
+                    "check": call.check,
+                    "query": call.query,
+                    "window": crate::autoscaler::spec::format_duration(call.window),
+                    "windowSeconds": call.window.as_secs(),
+                });
+                let result = transport
+                    .call("source/query", params)
+                    .await
+                    .map_err(|err| call_error(source, "source/query", err))?;
+                parse_reading(&result, call.window, now_ms)
+                    .map_err(|err| format!("plugin {source}: source/query: {err}"))
+            }
+            _ => Err(format!("plugin {source} is a target, not a source")),
+        }
+    }
+
+    /// Ask a strategy plugin for a desired count: `(desired, note)`.
+    pub async fn recommend(
+        &self,
+        strategy: &str,
+        call: &RecommendCall<'_>,
+    ) -> Result<(u32, String), String> {
+        let Loaded::External(transport) = self.loaded(strategy)? else {
+            return Err(format!(
+                "plugin {strategy} is built in, and the builtins are sources and targets"
+            ));
+        };
+        let _turn = self.turn(strategy).await;
+        self.check(strategy, Kind::Strategy, &call.config)
+            .await
+            .map_err(|problem| problem.to_string())?;
+        let params = json!({
+            "policy": call.policy,
+            "check": call.check,
+            "current": call.current,
+            "ready": call.ready,
+            "reading": call.reading,
+            "config": call.config,
+        });
+        let result = transport
+            .call("strategy/recommend", params)
+            .await
+            .map_err(|err| call_error(strategy, "strategy/recommend", err))?;
+        parse_recommendation(&result)
+            .map_err(|err| format!("plugin {strategy}: strategy/recommend: {err}"))
+    }
+
+    /// What a target holds. `start` is the noop target's first count.
+    pub async fn status(
+        &self,
+        target: &str,
+        policy: &str,
+        config: &Value,
+        start: u32,
+    ) -> Result<TargetState, String> {
+        if target == NOOP_TARGET {
+            return Ok(self.noop.status(policy, start));
+        }
+        let _turn = self.turn(target).await;
+        match self.loaded(target)? {
+            Loaded::Noop(noop) => Ok(noop.status(policy, start)),
+            Loaded::Exec(exec) => {
+                let reply = exec
+                    .run("status", json!({ "policy": policy, "config": config }))
+                    .await
+                    .map_err(|err| format!("plugin {target}: status: {err}"))?;
+                parse_status(&reply).map_err(|err| format!("plugin {target}: status: {err}"))
+            }
+            Loaded::External(transport) => {
+                self.check(target, Kind::Target, config)
+                    .await
+                    .map_err(|problem| problem.to_string())?;
+                let result = transport
+                    .call(
+                        "target/status",
+                        json!({ "policy": policy, "config": config }),
+                    )
+                    .await
+                    .map_err(|err| call_error(target, "target/status", err))?;
+                parse_status(&result)
+                    .map_err(|err| format!("plugin {target}: target/status: {err}"))
+            }
+            _ => Err(format!("plugin {target} is a source, not a target")),
+        }
+    }
+
+    /// Move a target to `desired`.
+    pub async fn scale(
+        &self,
+        target: &str,
+        policy: &str,
+        config: &Value,
+        desired: u32,
+        decision: &str,
+    ) -> Result<(), String> {
+        if target == NOOP_TARGET {
+            self.noop.scale(policy, desired);
+            return Ok(());
+        }
+        let request =
+            json!({ "policy": policy, "config": config, "desired": desired, "decision": decision });
+        let _turn = self.turn(target).await;
+        match self.loaded(target)? {
+            Loaded::Noop(noop) => {
+                noop.scale(policy, desired);
+                Ok(())
+            }
+            Loaded::Exec(exec) => exec
+                .run("scale", request)
+                .await
+                .map(|_| ())
+                .map_err(|err| format!("plugin {target}: scale: {err}")),
+            Loaded::External(transport) => {
+                self.check(target, Kind::Target, config)
+                    .await
+                    .map_err(|problem| problem.to_string())?;
+                transport
+                    .call("target/scale", request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| call_error(target, "target/scale", err))
+            }
+            _ => Err(format!("plugin {target} is a source, not a target")),
+        }
+    }
+
+    /// Check that `target` can run a node group: a target that declares
+    /// `capabilities.nodes` (the `exec` builtin does, `noop` does not), with
+    /// `config` matching its schema.
+    pub async fn check_node_target(&self, target: &str, config: &Value) -> Result<(), Problem> {
+        if target == NOOP_TARGET {
+            return Err(Problem::Invalid(format!(
+                "the {NOOP_TARGET} target starts no machines, so it cannot run a node group. \
+                 Hint: install a node target (aws-asg, or the exec builtin)"
+            )));
+        }
+        self.check(target, Kind::Target, config).await?;
+        match self.loaded(target).map_err(Problem::Unavailable)? {
+            Loaded::External(transport) => {
+                let info = transport
+                    .info()
+                    .await
+                    .map_err(|err| Problem::Unavailable(call_error(target, "initialize", err)))?;
+                if info.nodes {
+                    Ok(())
+                } else {
+                    Err(Problem::Invalid(format!(
+                        "plugin {target} is a target, but does not declare capabilities.nodes: \
+                         it cannot terminate a node group's members"
+                    )))
+                }
+            }
+            Loaded::Exec(_) => Ok(()),
+            _ => Err(Problem::Invalid(format!(
+                "plugin {target} cannot run a node group: it is not a node target"
+            ))),
+        }
+    }
+
+    /// `target/scale` for a node group: the count, and `join` (the group's
+    /// join token and the attributes it stamps), which only a node target
+    /// receives.
+    pub async fn scale_nodes(
+        &self,
+        target: &str,
+        policy: &str,
+        config: &Value,
+        desired: u32,
+        decision: &str,
+        join: Value,
+    ) -> Result<(), String> {
+        let request = json!({
+            "policy": policy, "config": config, "desired": desired,
+            "decision": decision, "join": join,
+        });
+        let _turn = self.turn(target).await;
+        match self.loaded(target)? {
+            Loaded::Exec(exec) => exec
+                .run("scale", request)
+                .await
+                .map(|_| ())
+                .map_err(|err| format!("plugin {target}: scale: {err}")),
+            Loaded::External(transport) => {
+                self.check_node_target(target, config)
+                    .await
+                    .map_err(|problem| problem.to_string())?;
+                transport
+                    .call("target/scale", request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| call_error(target, "target/scale", err))
+            }
+            _ => Err(format!("plugin {target} is not a node target")),
+        }
+    }
+
+    /// `target/terminate`: stop the instances `ids` (provider ids) of a node
+    /// group.
+    pub async fn terminate(
+        &self,
+        target: &str,
+        policy: &str,
+        config: &Value,
+        ids: &[String],
+        decision: &str,
+    ) -> Result<(), String> {
+        let request =
+            json!({ "policy": policy, "config": config, "ids": ids, "decision": decision });
+        let _turn = self.turn(target).await;
+        match self.loaded(target)? {
+            Loaded::Exec(exec) => exec
+                .run("terminate", request)
+                .await
+                .map(|_| ())
+                .map_err(|err| format!("plugin {target}: terminate: {err}")),
+            Loaded::External(transport) => {
+                self.check_node_target(target, config)
+                    .await
+                    .map_err(|problem| problem.to_string())?;
+                transport
+                    .call("target/terminate", request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| call_error(target, "target/terminate", err))
+            }
+            _ => Err(format!("plugin {target} is not a node target")),
+        }
+    }
+
+    /// Whether every call uses one test timeout.
+    pub fn timeout_override(&self) -> Option<Duration> {
+        self.timeout_override
+    }
+}
+
+/// A `source/query` result: `{ value }`, `{ series: [[at_ms, value], …] }`
+/// (averaged over the window here), or `{ value: null, reason }`.
+pub fn parse_reading(
+    result: &Value,
+    window: Duration,
+    now_ms: i64,
+) -> Result<SourceReading, String> {
+    let object = result
+        .as_object()
+        .ok_or_else(|| format!("the result must be an object, got {result}"))?;
+    if let Some(series) = object.get("series") {
+        let points = series
+            .as_array()
+            .ok_or_else(|| "series must be a list of [unix ms, value] pairs".to_string())?;
+        let since = now_ms - i64::try_from(window.as_millis()).unwrap_or(i64::MAX / 4);
+        let mut values = Vec::new();
+        let mut last: Option<(i64, f64)> = None;
+        for point in points {
+            let pair = point
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or_else(|| format!("series point {point} is not a [unix ms, value] pair"))?;
+            let at = pair[0]
+                .as_i64()
+                .ok_or_else(|| format!("series point {point}: the time is not unix ms"))?;
+            let value = super::builtins::number(&pair[1])
+                .ok_or_else(|| format!("series point {point}: the value is not a number"))?;
+            if at > since {
+                values.push(value);
+            }
+            if last.is_none_or(|(when, _)| at >= when) {
+                last = Some((at, value));
+            }
+        }
+        if window.is_zero() {
+            return Ok(match last {
+                Some((_, value)) => SourceReading::value(value, true),
+                None => SourceReading::Missing("the series is empty".into()),
+            });
+        }
+        if values.is_empty() {
+            return Ok(SourceReading::Missing(
+                "no series points inside the window".into(),
+            ));
+        }
+        return Ok(SourceReading::value(
+            values.iter().sum::<f64>() / values.len() as f64,
+            true,
+        ));
+    }
+    match object.get("value") {
+        None => Err("the result needs value, series, or value: null with a reason".into()),
+        Some(Value::Null) => Ok(SourceReading::Missing(
+            object
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the plugin has no data")
+                .to_string(),
+        )),
+        Some(value) => super::builtins::number(value)
+            .map(|value| SourceReading::value(value, true))
+            .ok_or_else(|| format!("value {value} is not a finite number")),
+    }
+}
+
+/// A `strategy/recommend` result: `{ desired, note }`.
+pub fn parse_recommendation(result: &Value) -> Result<(u32, String), String> {
+    let desired = result
+        .get("desired")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("the result needs `desired`, a replica count; got {result}"))?;
+    let desired = u32::try_from(desired).map_err(|_| format!("desired {desired} is too large"))?;
+    let note = result
+        .get("note")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok((desired, note))
+}
+
+/// A `target/status` result: `{ count, ready, members }`.
+pub fn parse_status(result: &Value) -> Result<TargetState, String> {
+    let count = result
+        .get("count")
+        .and_then(Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| format!("the result needs `count`, a replica count; got {result}"))?;
+    let ready = match result.get("ready") {
+        None | Some(Value::Null) => count,
+        Some(value) => value
+            .as_u64()
+            .and_then(|ready| u32::try_from(ready).ok())
+            .ok_or_else(|| format!("ready {value} is not a count"))?
+            .min(count),
+    };
+    let members = match result.get("members") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(members)) => members.clone(),
+        Some(other) => return Err(format!("members must be a list, got {other}")),
+    };
+    Ok(TargetState {
+        count,
+        ready,
+        members,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plugin never has more calls in flight than its `concurrency`: an
+    /// `http` source capped at 2, asked 5 times at once by an endpoint that
+    /// never answers, has exactly 2 connections open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plugin_has_at_most_its_concurrency_in_flight_test() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            let mut open = Vec::new();
+            for stream in listener.incoming().flatten() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                open.push(stream);
+            }
+        });
+        let catalog = PluginCatalog::from_app_config(&json!({ "plugins": {
+            "slow": {
+                "builtin": "http",
+                "config": { "url": format!("http://127.0.0.1:{port}/metrics"), "timeout": "3s" },
+                "concurrency": 2,
+            },
+        } }))
+        .expect("catalog");
+        let host = Arc::new(PluginHost::new(catalog, None));
+        assert_eq!(host.free_turns("slow"), Some(2));
+        let mut calls = Vec::new();
+        for _ in 0..5 {
+            let host = host.clone();
+            calls.push(tokio::spawn(async move {
+                let call = SourceCall {
+                    policy: "web",
+                    check: "cpu",
+                    query: "/value",
+                    window: Duration::from_secs(60),
+                };
+                host.query("slow", &call, 0).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(host.free_turns("slow"), Some(0));
+        for call in calls {
+            call.abort();
+        }
+    }
+
+    #[test]
+    fn readings_parse_values_series_and_missing_test() {
+        let window = Duration::from_secs(60);
+        let now = 1_000_000;
+        assert_eq!(
+            parse_reading(&json!({ "value": 2310 }), window, now),
+            Ok(SourceReading::value(2310.0, true))
+        );
+        assert_eq!(
+            parse_reading(
+                &json!({ "series": [[now - 120_000, 100], [now - 30_000, 2], [now, 4]] }),
+                window,
+                now
+            ),
+            Ok(SourceReading::value(3.0, true))
+        );
+        assert_eq!(
+            parse_reading(&json!({ "series": [[now - 120_000, 100]] }), window, now),
+            Ok(SourceReading::Missing(
+                "no series points inside the window".into()
+            ))
+        );
+        assert_eq!(
+            parse_reading(
+                &json!({ "value": null, "reason": "no series" }),
+                window,
+                now
+            ),
+            Ok(SourceReading::Missing("no series".into()))
+        );
+        assert!(parse_reading(&json!({}), window, now).is_err());
+        assert!(parse_reading(&json!({ "value": "lots" }), window, now).is_err());
+        assert!(parse_reading(&json!({ "series": [[1]] }), window, now).is_err());
+    }
+
+    #[test]
+    fn statuses_and_recommendations_parse_test() {
+        assert_eq!(
+            parse_status(&json!({ "count": 7, "ready": 9 })).unwrap(),
+            TargetState {
+                count: 7,
+                ready: 7,
+                members: Vec::new()
+            }
+        );
+        assert!(parse_status(&json!({ "ready": 1 })).is_err());
+        assert!(parse_status(&json!({ "count": -1 })).is_err());
+        assert_eq!(
+            parse_recommendation(&json!({ "desired": 5, "note": "x" })),
+            Ok((5, "x".to_string()))
+        );
+        assert!(parse_recommendation(&json!({ "desired": 2.5 })).is_err());
+    }
+
+    #[test]
+    fn artifact_plugins_run_in_their_directory_test() {
+        let catalog = PluginCatalog::from_app_config(&json!({ "plugins": {
+            "asg": { "source": "https://example.com/asg.tar.gz" },
+            "cal": { "source": "https://example.com/cal.tgz", "command": ["python3", "cal.py"] },
+            "local": { "command": ["/usr/bin/forecast", "--serve"] },
+        } }))
+        .unwrap();
+        let root = Path::new("/task/code");
+        assert_eq!(
+            endpoint_for(catalog.get("asg").unwrap(), Some(root)),
+            Some(Endpoint::Command {
+                argv: vec!["/task/code/plugins/asg/./asg".into()],
+                dir: Some(PathBuf::from("/task/code/plugins/asg")),
+            })
+        );
+        assert_eq!(
+            endpoint_for(catalog.get("cal").unwrap(), Some(root)),
+            Some(Endpoint::Command {
+                argv: vec!["python3".into(), "cal.py".into()],
+                dir: Some(PathBuf::from("/task/code/plugins/cal")),
+            })
+        );
+        assert_eq!(
+            endpoint_for(catalog.get("local").unwrap(), Some(root)),
+            Some(Endpoint::Command {
+                argv: vec!["/usr/bin/forecast".into(), "--serve".into()],
+                dir: None,
+            })
+        );
+    }
+
+    /// A node group's target must declare `nodes` (the `exec` builtin
+    /// does, `noop` and sources do not); `target/scale` carries the join
+    /// token and `target/terminate` the provider ids.
+    #[tokio::test]
+    async fn node_targets_are_checked_and_get_the_join_and_the_ids_test() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("nodes.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nread -r request\necho \"$request\" > \"$(dirname \"$0\")/$1\"\necho '{}'\n",
+        )
+        .expect("write");
+        let catalog = PluginCatalog::from_app_config(&json!({ "plugins": {
+            "nodes": { "builtin": "exec", "config": { "command": ["sh", script.display().to_string()] } },
+            "prom": { "builtin": "prometheus", "config": { "address": "http://127.0.0.1:9" } },
+        } }))
+        .unwrap();
+        let host = PluginHost::new(catalog, None);
+        assert_eq!(host.check_node_target("nodes", &json!({})).await, Ok(()));
+        for (name, invalid) in [("noop", true), ("prom", true), ("missing", false)] {
+            match host.check_node_target(name, &json!({})).await {
+                Err(Problem::Invalid(_)) if invalid => {}
+                Err(Problem::Unavailable(_)) if !invalid => {}
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        host.scale_nodes(
+            "nodes",
+            "workers",
+            &json!({ "pool": "a" }),
+            3,
+            "d-1",
+            json!({ "token": "jt-secret", "attributes": { "legion.nodegroup": "workers" } }),
+        )
+        .await
+        .unwrap();
+        let scale: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("scale")).unwrap())
+                .unwrap();
+        assert_eq!(scale["desired"], 3);
+        assert_eq!(scale["join"]["token"], "jt-secret");
+        assert_eq!(scale["join"]["attributes"]["legion.nodegroup"], "workers");
+        host.terminate("nodes", "workers", &json!({}), &["i-1".to_string()], "d-2")
+            .await
+            .unwrap();
+        let terminate: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("terminate")).unwrap())
+                .unwrap();
+        assert_eq!(terminate["ids"], json!(["i-1"]));
+        assert_eq!(terminate["op"], "terminate");
+        assert_eq!(terminate["decision"], "d-2");
+        // The join token never reaches a trace.
+        let redacted = super::super::rpc::redact(&scale);
+        assert_eq!(redacted["join"], "<redacted>");
+    }
+}

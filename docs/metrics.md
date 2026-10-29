@@ -395,6 +395,17 @@ policy](namespaces.md#namespace-policies)'s quota is checked against
 yet placed (`legion namespace get` shows it), so the gauges can read lower
 while admitted work is still placing.
 
+### Apps
+
+- **`legion_apps{status}`** (gauge): installed [apps](apps.md) by status,
+  `running`, `upgrading`, `degraded`, `pending`, `stopped`, or `corrupt`, as
+  `legion app list` derives it. Set by the control-lane leader's app
+  reconciler after each pass (at least once a minute); zero on other
+  managers. A `stopped` or `degraded` count is worth an alert: a bundled app
+  (the autoscaler) that is not running is a cluster-health finding, not a
+  silent absence. A `corrupt` count is a record this manager cannot decode
+  (logged once, with the reason): `legion app uninstall <app>` removes it.
+
 ### Node usage
 
 Per-node gauges from the usage reports workers with
@@ -591,6 +602,26 @@ status transitions are replicated. See
   "nothing was marked lost" apart from "nothing was wrong".
 - **`legion_liveness_checkpoint_seconds`** (histogram): wall-clock time of one
   replicated liveness checkpoint (the display-only batched write).
+
+### Scaling inputs
+
+Every manager rolls up the usage and service-graph samples its workers send,
+per (node, task), every 10 seconds, and ships them to the status-lane leader
+on the liveness digest RPC. The leader merges them and serves
+`GetScalingInputs`. See [autoscaling.md](autoscaling.md#scaling-inputs).
+
+- **`legion_scaling_rollup_syncs_total{outcome}`** (counter): rollup ticks.
+  `local` on the status-lane leader, which merges its own rollups with no
+  RPC. Elsewhere: `ok` (shipped and applied), `resync` (the leader held
+  nothing for this manager, usually after a takeover, and took a full set),
+  `error` (not delivered: no leader, unreachable, or a refused resync; the
+  next tick sends a full set). A manager whose `error` rate keeps rising
+  leaves its nodes' tasks reading `missing` on the leader.
+- **`legion_scaling_rollup_rows{kind}`** (gauge): rollups, one per (node,
+  task). `kind="local"` is what this manager built from its own workers at
+  the last tick; `kind="merged"` is what it holds from every manager while it
+  leads the status lane, and `0` elsewhere. `merged` grows with how widely
+  tasks spread across nodes, not with replica count or sample rate.
 
 ### Async runtime
 

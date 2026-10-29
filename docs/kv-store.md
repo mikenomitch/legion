@@ -20,6 +20,13 @@ Primary objects:
   - `key`, `lock_id`, optional owner
   - acquired/expiry timestamps
 
+**The `legion/` prefix is reserved** for the leases and state of Legion's
+own jobs. An ACL `paths` glob reaches a key under it only when the pattern
+itself starts with `legion/`: `paths = ["*"]`, and a `kv` rule with no
+`paths`, stop short of it ([Auth & ACLs](auth-and-acls.md#policies)). Nothing
+stops a token that does hold `legion/*` from writing there, so keep tenant
+keys out of it.
+
 ## Encryption at rest
 
 The manager encrypts values before they reach the store. It uses AES-256-GCM
@@ -151,6 +158,13 @@ Optional lock enforcement for mutating operations:
 - Mutations that provide wrong/missing lock ID conflict when lock is active.
 
 `force` on acquire can take over an existing lock.
+
+`ListKvRequest.include_locks = true` also lists the unexpired locks under
+the prefix (`ListKvReply.locks`): each lock's key, `owner`, `acquired_at`
+and `expires_at`, filtered by `kv:read` like entries. A listed lock's
+`lock_id` is always empty: it is the holder's secret, and whoever has it can
+renew or release the lock. This is how the autoscaler's replicas see each
+other's leases ([autoscaling.md, "Replicas"](autoscaling.md#replicas)).
 
 ## JSON Patch
 

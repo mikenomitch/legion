@@ -505,6 +505,90 @@ impl Authenticator {
         ttl: Option<Duration>,
         description: &str,
     ) -> Result<(JoinTokenInfo, String), Status> {
+        self.mint_join_token_with(
+            store,
+            advertise_addr,
+            worker_type,
+            ttl,
+            description,
+            None,
+            None,
+            Default::default(),
+        )
+    }
+
+    /// [`Self::mint_join_token`] with a use limit and attributes stamped on
+    /// every node that registers with it (`CreateJoinToken.max_uses` and
+    /// `attributes`). The attributes must already be checked
+    /// (`check_join_attributes`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_join_token_for_nodes(
+        &self,
+        store: &Store,
+        advertise_addr: &str,
+        worker_type: &str,
+        ttl: Option<Duration>,
+        description: &str,
+        max_uses: Option<u32>,
+        attributes: std::collections::BTreeMap<String, String>,
+    ) -> Result<(JoinTokenInfo, String), Status> {
+        self.mint_join_token_with(
+            store,
+            advertise_addr,
+            worker_type,
+            ttl,
+            description,
+            None,
+            max_uses,
+            attributes,
+        )
+    }
+
+    /// [`Self::mint_join_token`] for a manager's own in-process worker: on a
+    /// raft follower the token's row is forwarded to the control lane's
+    /// leader (`ForwardLaneWrite`) instead of failing, so every manager can
+    /// start its system worker, not only the leader. Client RPCs keep the
+    /// non-forwarding mint, and follow the leader hint as before.
+    ///
+    /// `pinned_attrs` (a JSON object) are the node attributes a registration
+    /// through this token gets whatever the worker reports: the manager's
+    /// own settings for its worker's `namespaces` and `legion.role`.
+    pub fn mint_local_worker_join_token(
+        &self,
+        store: &Store,
+        advertise_addr: &str,
+        worker_type: &str,
+        ttl: Option<Duration>,
+        description: &str,
+        pinned_attrs: &Value,
+    ) -> Result<(JoinTokenInfo, String), Status> {
+        self.mint_join_token_with(
+            store,
+            advertise_addr,
+            worker_type,
+            ttl,
+            description,
+            Some(pinned_attrs.to_string()),
+            None,
+            Default::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mint_join_token_with(
+        &self,
+        store: &Store,
+        advertise_addr: &str,
+        worker_type: &str,
+        ttl: Option<Duration>,
+        description: &str,
+        // Set only for a manager's own in-process worker, whose token is
+        // also the one forwarded to the control leader.
+        pinned_attrs: Option<String>,
+        max_uses: Option<u32>,
+        attributes: std::collections::BTreeMap<String, String>,
+    ) -> Result<(JoinTokenInfo, String), Status> {
+        let forward_to_leader = pinned_attrs.is_some();
         let now = OffsetDateTime::now_utc();
         let secret = format!("{JOIN_SECRET_PREFIX}{}", random_hex(24));
         let expires_at = match ttl {
@@ -526,6 +610,10 @@ impl Authenticator {
             created_at: now
                 .format(&Rfc3339)
                 .map_err(|e| Status::internal(format!("clock error: {e}")))?,
+            pinned_attrs,
+            max_uses,
+            uses: 0,
+            attributes,
         };
         // The token pins the CA the managers sign with, so a joining worker
         // can tell its manager from whoever answers at `addr` (plan §6.5).
@@ -549,9 +637,12 @@ impl Authenticator {
                     format!("the cluster CA is unavailable, so a join token can't pin it: {e}"),
                 )
             })?;
-        store
-            .insert_join_token(&record)
-            .map_err(internal_acl_error)?;
+        if forward_to_leader {
+            store.insert_join_token_forwarding(&record)
+        } else {
+            store.insert_join_token(&record)
+        }
+        .map_err(internal_acl_error)?;
         let composite = JoinToken::new(advertise_addr, secret, worker_type, ca_hash)
             .encode()
             .map_err(|e| Status::internal(format!("failed to encode join token: {e:#}")))?;
@@ -727,7 +818,7 @@ impl StreamCredential {
 }
 
 /// Pulls a bearer credential from `authorization` or `x-legion-token`.
-fn extract_bearer(metadata: &MetadataMap) -> Option<String> {
+pub(crate) fn extract_bearer(metadata: &MetadataMap) -> Option<String> {
     if let Some(value) = metadata.get("authorization").and_then(|v| v.to_str().ok()) {
         let value = value.trim();
         if let Some(rest) = value
@@ -804,6 +895,19 @@ pub fn enforce(
             action.as_str(),
         )));
     }
+    // An app acting for a viewer holds one target's permission; a reach
+    // hint read off its rule ("this token can write scale in default")
+    // would suggest the whole namespace.
+    if identity.source == AclSource::Delegated {
+        return Err(Status::permission_denied(format!(
+            "permission denied: {}:{} is outside what {} delegates\n\
+             Hint: an app acting for a viewer holds only the action's declared permission on \
+             what the action was pressed for (`WhoAmI` through the same client shows it)",
+            resource.as_str(),
+            action.as_str(),
+            identity.principal,
+        )));
+    }
     // Where the token CAN act, from its own rules: the denial names no
     // target (a scope derived from a lookup would leak it), only the
     // caller's reach.
@@ -815,19 +919,45 @@ pub fn enforce(
     if !reach.is_empty() {
         return Err(Status::permission_denied(format!(
             "permission denied: {}:{} requires a policy granting it in this namespace
-             Hint: this token can {} {} in {}",
+             Hint: this token can {} {} in {}{}",
             resource.as_str(),
             action.as_str(),
             action.as_str(),
             resource.as_str(),
             reach.join(", "),
+            reserved_hint(scope),
         )));
     }
     Err(Status::permission_denied(format!(
-        "permission denied: {}:{} requires a policy granting it",
+        "permission denied: {}:{} requires a policy granting it{}",
         resource.as_str(),
         action.as_str(),
+        reserved_hint(scope),
     )))
+}
+
+/// The extra hint for a denial inside a reserved name: a `legion-*`
+/// namespace or a key under `legion/`, which a token's `*` does not reach
+/// (docs/namespaces.md, "Reserved namespaces"). It names only the rule, not
+/// the target, which the caller already sent.
+fn reserved_hint(scope: &AclScope) -> &'static str {
+    if scope
+        .namespace
+        .as_deref()
+        .is_some_and(crate::structs::namespace::is_reserved_namespace)
+    {
+        "\nHint: `*` does not reach reserved `legion-*` namespaces; a rule must name them, \
+         as `namespaces = [\"legion-system\"]` or `[\"*\", \"legion-*\"]`"
+    } else if scope
+        .path
+        .as_deref()
+        .is_some_and(|path| path.starts_with(crate::structs::acl::RESERVED_KV_PREFIX))
+    {
+        "\nHint: `*` does not reach keys under the reserved `legion/` prefix; a rule must \
+         name it, as `paths = [\"legion/*\"]`"
+    } else {
+        ""
+    }
 }
 
 /// How long a presented credential has left, from its RFC 3339 expiry. A

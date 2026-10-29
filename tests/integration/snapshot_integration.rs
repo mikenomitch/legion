@@ -197,11 +197,13 @@ fn workspace_job(
                 params: None,
                 retain_on_scale_in: None,
                 retain_on_stop: None,
+                unknown_fields: Default::default(),
             }),
             envelope: None,
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         snapshots,
         ..TaskConfig::new(TASK, runtime)
@@ -214,6 +216,8 @@ fn workspace_job(
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -477,6 +481,7 @@ async fn keep_and_ttl_expire_old_snapshots_through_the_node() -> R<()> {
             ttl: Some("1h".into()),
             keep: Some(2),
             memory: None,
+            unknown_fields: Default::default(),
         }),
         None,
     ))?;

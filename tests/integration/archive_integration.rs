@@ -300,6 +300,7 @@ fn job(archive: &str, on_restore_failure: Option<&str>) -> JobConfig {
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         suspend: Some(SuspendConfig {
             durability: Some("store".into()),
@@ -308,6 +309,7 @@ fn job(archive: &str, on_restore_failure: Option<&str>) -> JobConfig {
             wake: Some(legion::structs::suspend::WakeConfig {
                 port: "http".into(),
                 timeout: None,
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         }),
@@ -320,6 +322,8 @@ fn job(archive: &str, on_restore_failure: Option<&str>) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

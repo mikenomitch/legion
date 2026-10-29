@@ -16,10 +16,15 @@ to integrate with common providers.
 > refresh. [Node identities](#node-identities) are issued via
 > `IssueNodeIdentityToken` and used by the artifact system. The
 > [control-plane identity](#control-plane-identity) (`legion`) is verified
-> in-process and mapped to policies via `controlPlaneBindings`. Not yet
-> implemented: task-scoped `auth.identity` for artifacts (it needs the
-> fetching allocation's id), and a first-class control-plane authorization
-> model beyond binding rules. The feature is off by default.
+> in-process; what it may do is declared on the job
+> ([Permissions](#permissions)) and granted at submit, and inside the task
+> it reaches the cluster through a per-allocation
+> [API socket](#the-api-socket) with no setup. Not yet implemented:
+> task-scoped `auth.identity` for artifacts (it needs the fetching
+> allocation's id), and the API socket for sandboxes (they use the token
+> file). The feature is on by default: the issuer and its first signing key
+> need no configuration, and federating with an outside provider takes an
+> explicit public `issuer`.
 
 ## The token
 
@@ -136,6 +141,10 @@ A full runnable example is at
   "<name>" }`). Then the node injects the token into requests to that
   upstream and the identity may have no delivery at all, and no
   `changeMode`. See [Injecting a token into an upstream](#injecting-a-token-into-an-upstream).
+  The reserved `legion` identity needs neither: its token always goes to
+  `$LEGION_SECRETS_DIR/legion.token` ([Ambient env](#ambient-env)).
+- `permissions` and `policies` are accepted on the reserved `legion`
+  identity only ([Permissions](#permissions)).
 - `extraClaims` are static literals. Keys can't be a reserved JWT claim
   (`iss`/`sub`/`aud`/…) or use the `legion.io/*` namespace.
 - **Change mode and delivery must be compatible.** `env` with
@@ -207,7 +216,7 @@ restart. See [docs/task-runtime-container.md](task-runtime-container.md).
 # manager.ncl
 {
   workloadIdentity = {
-    enabled = true,                              # default false
+    enabled = true,                              # the default; false turns it off
     issuer = "https://manager.example.com:4747", # public HTTPS issuer URL
     jwksPath = "/.well-known/jwks.json",            # must start with '/'
     signingAlg = "ES256",                           # only ES256 is supported
@@ -228,8 +237,20 @@ also fail boot instead of falling back to a default. To federate with a
 provider, you only need to set `enabled` and `issuer`. The rest have
 defaults.
 
-The feature is off by default. Enabling it doesn't affect existing jobs or the
-worker join-token flow.
+The feature is on by default, because Legion's own `legion` identity needs it:
+apps such as the bundled autoscaler, and any job that calls Legion through its
+[API socket](#the-api-socket), authenticate with it. Nothing has to be
+configured for that: the issuer defaults to a cluster-internal name
+([The issuer](#the-issuer)), the first signing key is generated and replicated
+at first boot ([Signing-key persistence](#signing-key-persistence-and-restart-semantics)),
+and the discovery and JWKS routes below publish only public keys. Federating
+with an outside provider (AWS, GCP, Vault) still needs `issuer` set to a URL
+that provider can reach.
+
+`enabled = false` turns the whole feature off: no issuer, no routes, no
+tokens for any identity (including `legion`), so apps and API sockets have no
+credentials, and direct exec, edge boot tickets, and the `identity` material
+provider are refused.
 
 ### Public endpoints (discovery + JWKS)
 
@@ -627,12 +648,11 @@ and per-allocation backing directory.
 
 ## Testing this locally in a basic way
 
-1. Enable workload identity in `configs/manager.ncl` (the block is there,
-   commented):
+1. Workload identity is on by default. To set an issuer, use the block in
+   `configs/manager.ncl` (there, commented):
 
    ```nickel
    workloadIdentity = {
-     enabled = true,
      # optional; a single local manager defaults to its own address
      # issuer = "https://manager.example.com:4747",
    },
@@ -860,16 +880,26 @@ Vault can bind arbitrary claims, so you rarely need a custom `subTemplate`.
 
 A task can authenticate to Legion itself with the reserved identity name
 `legion`. Declare it like any other identity, but **omit `audience`**. The
-manager owns it and always sets `aud` to the cluster issuer:
+manager owns it and always sets `aud` to the cluster issuer. Say what the job
+may do in Legion with `permissions`, and, once workload identity is enabled,
+nothing else is needed: no other manager config, no address, and no token
+handling in the task.
 
 ```nickel
-identities = [
-  {
-    name = "legion",                 # reserved control-plane identity
-    # no `audience` — the manager sets it to the cluster issuer
-    file = { path = "/var/run/legion/identity/legion/token", mode = "0400" },
-  },
-]
+identities = [{
+  name = "legion",
+  # What this job may do as itself: inline ACL rules, in the shape
+  # `legion acl policy apply` takes.
+  permissions = [
+    { resources = ["kv"], actions = ["read", "write"], paths = ["certs/*"] },
+  ],
+}],
+```
+
+Inside the task, every `legion` command just works, as the job:
+
+```sh
+legion kv put certs/app.example.com "$(cat chain.pem key.pem)"
 ```
 
 Declaring `legion` with an `audience` is rejected at admission, because the
@@ -879,25 +909,192 @@ The manager verifies these tokens with the same in-process signer and JWKS it
 uses for everything else. Whenever workload identity is enabled, a built-in
 auth method named `legion` handles this, with no OIDC discovery or network
 round-trip. A workload presents its `legion` token as an
-`Authorization: Bearer` credential on a manager RPC (or via `legion login
---method legion --jwt <token>`). It authenticates as principal
+`Authorization: Bearer` credential on a manager RPC (the
+[API socket](#the-api-socket) does this for it), or exchanges it with
+`legion login --method legion --jwt <token>`. It authenticates as principal
 `legion:<sub>`.
 
-To map that verified identity to permissions, use binding rules under
-`workloadIdentity.controlPlaneBindings`. These work the same way as the
-claim-to-policy rules for external JWT auth methods:
+What the token may do comes from two places, added together:
+
+- **The job's grant**: the `permissions` and `policies` its `legion` identity
+  declared, granted at submit ([Permissions](#permissions)).
+- **`workloadIdentity.controlPlaneBindings`** in manager config: claim-based
+  rules for operators who map identities to policies wholesale
+  ([Bindings](#bindings)).
+
+A token with neither verifies to a principal and is allowed nothing.
+
+### Permissions
+
+The `legion` identity takes two fields:
+
+| Field | Meaning |
+| --- | --- |
+| `permissions` | Inline ACL rules, exactly what a policy holds (`resources`, `actions`, `effect`, and the `namespaces`, `names`, `pools`, `paths`, `actionNames`, `templates`, `bands`, `host` selectors; see [Auth and ACLs](auth-and-acls.md#policies)). Validated like `legion acl policy apply` validates a policy. |
+| `policies` | Names of existing ACL policies. Each must exist when the job is submitted, and is read by name when a token is verified, so a later edit to the policy applies to the job too. |
+
+**Granted only up to what the submitter holds.** Every path that stores a job
+config (`RunJob`, `RunJobTemplate`) checks that the token submitting it holds
+every requested permission, and every rule of every named policy. The check
+runs on every submit, an unchanged resubmit included, so write access to a
+job does not let anyone redeploy access they could not grant themselves. A
+submit that asks for more is refused before anything is stored:
+
+```console
+$ legion job run configs/jobs/cert-renewer.ncl
+Error: failed to run job: cert-renewer-app-example-com: identity 'legion' asks for kv:write on
+certs/*, which your token does not hold [code=PermissionDenied]
+Hint: have someone with that access submit this job, or ask for it to be granted to you
+```
+
+With `--json` the same text is the envelope's `error.message` and
+`error.hint`, with `code = "PermissionDenied"`.
+
+How the check decides that the submitter "holds" a rule is in
+[Auth and ACLs: Job grants](auth-and-acls.md#job-grants): exact for the
+rules people write, conservative in a few cases, and never fooled by a held
+`*` into granting a reserved `legion-*` namespace or `legion/` key.
+
+**Recorded per version.** A granted submit records the grant with the job
+config version it stored, in the submitter's name: `legion acl grants list`
+shows each one and who made it. A token resolves the grant of the version its
+allocation runs, so allocations of an old version mid-rollout keep that
+version's grant. Grants are keyed by the canonical job id (`team-a/web`), so a
+same-named job in another namespace gets nothing.
+
+**Revocation** takes effect at the next request:
+
+```console
+$ legion acl grants revoke cert-renewer-app-example-com
+revoked 1 grant of job `cert-renewer-app-example-com`; its tokens lose them at their next request
+```
+
+The token resolves its grant every time it is verified, and so does an ACL
+token minted from it with `legion login --method legion` (it carries a
+`grant:alloc/<id>` reference, not a copy). The allocations keep running. A
+revoke does not stick to the job: the next submit by someone who holds the
+access grants it again, as every submit does.
+
+When Legion itself stores a new version, re-rendering a job after a KV change
+([KV store](kv-store.md)), there is no submitter to check: the new version
+keeps the previous version's grant when it asks for exactly the same, and gets
+none when it asks for anything else.
+
+Like Kubernetes RBAC, a grant outlives the granter's own access: a job
+granted `kv:write certs/*` keeps it after the person who submitted it loses
+it, until someone revokes the grant or resubmits the job without that access
+(which is refused).
+
+[Apps](apps.md) use the same mechanism: an app's manifest lists the
+`permissions` its job's `legion` identity asks for, the check runs against
+whoever installs or upgrades the app, and the app reconciler renders the
+recorded grant into the app's job ([App grants](auth-and-acls.md#app-grants)).
+
+### The API socket
+
+Every allocation whose task declares the `legion` identity gets a unix socket
+at `$LEGION_SECRETS_DIR/legion.sock` (the host's `<task dir>/secrets/
+legion.sock`; `/legion/task/secrets/legion.sock` inside a container). The
+worker listens on it and proxies gRPC to the managers:
+
+- It forwards every call over the worker's own connection to the managers,
+  TLS pinned to the cluster CA, and fails over to the next manager when the
+  active one stops answering. A failed call through the socket counts toward
+  that failover the way a failed heartbeat does.
+- A call that carries no `authorization` header gets the allocation's current
+  `legion` token, which the worker keeps fresh. A call that carries its own
+  credential (a token from `legion login`) keeps it. Every other header
+  passes through as sent, so an app acting for a viewer adds the viewer's
+  assertion in `legion-on-behalf-of` and the socket still attaches the
+  app's own token ([Delegated identities](auth-and-acls.md#delegated-identities)).
+- The task needs no route to a manager. That matters where it runs by
+  default: the [host guard](network-handlers.md) drops a task's connections
+  to Legion's own ports on a manager's node, and a gated task has no route
+  out at all. The socket is the allocation's own resource, so neither
+  applies.
+
+**Who may connect.** Tasks can share a user, so the file's mode is not enough.
+Where every task is guaranteed a cgroup leaf (Linux with cgroup v2, and either
+resource enforcement or the kernel host guard on), the worker reads the
+connecting process's credentials (`SO_PEERCRED`) and its cgroup, and refuses a
+process outside the allocation's own leaf
+(`<cgroupParent>/{share,reserve}/legion-<alloc>`), whatever its user. The
+refusal is logged on the worker:
+
+```text
+WARN Refused an API socket connection: pid 4121 (uid 65534) runs in cgroup
+  /legion/share/legion-88, not in allocation 87's
+```
+
+Elsewhere (macOS, cgroup v1, enforcement and the host guard both off) only
+file modes protect the socket: it sits in the allocation's directory, which
+only the allocation's own user can reach, the same boundary that protects its
+token file. Two allocations running as the same user, or a process running as
+root, can reach each other's sockets there.
+
+### Ambient env
+
+A task that declares the `legion` identity gets, unless its own config sets
+them:
+
+| Variable | Value |
+| --- | --- |
+| `LEGION_ADDR` | `unix://$LEGION_SECRETS_DIR/legion.sock`, when the worker serves the allocation a socket. The CLI and the Rust client accept `unix://` addresses. |
+| `LEGION_SECRETS_DIR` | The directory holding the token file and socket, in the task's own view: `<task dir>/secrets` for `exec`, `/legion/task/secrets` in a container, `/legion/identity/secrets` in a sandbox guest. |
+| `LEGION_IDENTITY_TOKEN_FILE` | The `legion` token's file: `$LEGION_SECRETS_DIR/legion.token`, or the identity's own `file.path` when it declares one. Refreshed in place. For clients that cannot use a socket. |
+
+`LEGION_IDENTITY_TOKEN_FILE` is deliberately not `LEGION_TOKEN_FILE`: that is
+where `legion login` stores the token it mints, and it would overwrite the
+worker's. `legion login` inside a task stores its token under
+`~/.legion/tokens/` as anywhere else, and refuses to store it over the
+identity token file even when `LEGION_TOKEN_FILE` names it.
+
+### Sandboxes and other runtimes
+
+- **Containers** reach the socket through the task-directory mount they
+  already have.
+- **Sandboxes** cannot reach a socket on the host. They get the token file at
+  `/legion/identity/secrets/legion.token` (refreshed through the identity
+  disk, see [Sandboxes](#sandboxes)) and `LEGION_IDENTITY_TOKEN_FILE`, but no
+  `LEGION_ADDR`. Set `LEGION_ADDR` in the job to a manager the guest can
+  reach, and present the token as a bearer credential
+  (`LEGION_TOKEN=$(cat $LEGION_IDENTITY_TOKEN_FILE) legion ...`). That
+  connection is direct, so it is subject to the guest's network policy and
+  has no failover.
+- **The Apple `container` runtime** (macOS dev mode) shares the task
+  directory over its VM's file sharing, which does not carry unix sockets;
+  use the token file there too.
+
+### Bindings
+
+`workloadIdentity.controlPlaneBindings` maps verified claims to policies in
+manager config, the same way binding rules do for external JWT auth methods.
+It is the claim-based path for operators who map identities wholesale:
 
 ```nickel
 workloadIdentity = {
   enabled = true,
   controlPlaneBindings = [
-    # Grant the `kv-reader` policy to any workload whose job is `api`.
-    { claim = "legion.io/job", value = "api", policies = ["kv-reader"] },
+    # Grant the `kv-reader` policy to every workload in namespace `ops`.
+    { claim = "legion.io/namespace", value = "ops", policies = ["kv-reader"] },
   ],
 }
 ```
 
-With no binding rules (the default), a control-plane token still verifies to a
-principal but carries no policies. Broader control-plane authorization (a
-first-class policy model for workload-to-manager access) is not yet
-available.
+Manager config is read at startup, so a change needs a restart, and
+`legion.io/job` is the *bare* job name: a binding on it matches a job of that
+name in every namespace. Prefer [Permissions](#permissions) for one job's
+access.
+
+### Known limitations
+
+- **The coverage check is conservative.** A request covered only by several
+  held rules together (a held `a*` and `b*` for a requested `*`) is refused;
+  so is a request that leaves out a selector a held rule names. Have someone
+  whose policy covers it outright submit the job.
+- **A held deny rule** on a resource makes every grant on that resource need
+  `acl:write`.
+- **A named policy grants what it says at verification time**, not at submit:
+  an `acl:write` holder who edits the policy changes every job that names it.
+- **Sandboxes have no API socket** (see above).
+- **Without cgroup attribution** the socket is protected by file modes only.

@@ -766,6 +766,16 @@ impl Worker for SimWorkerService {
         ))
     }
 
+    async fn forward_app_request(
+        &self,
+        request: Request<crate::structs::ForwardAppRequestRequest>,
+    ) -> Result<Response<crate::structs::ForwardAppRequestReply>, Status> {
+        crate::worker::plane::require_manager(&request, "ForwardAppRequest")?;
+        Err(Status::unimplemented(
+            "simulated workers run no tasks, so they host no app to forward to",
+        ))
+    }
+
     type ExecTaskStream = crate::worker::exec::ExecTaskStream;
 
     async fn exec_task(
@@ -1375,6 +1385,9 @@ async fn register_sim_node_inner(
         health_checks: health_checks_json(),
         join_token: node.credentials.join_secret().cloned(),
         build_version: env!("CARGO_PKG_VERSION").to_string(),
+        // No build id: a simulated node runs nothing, so it never takes part
+        // in a bundled app's build marker (docs/apps.md, "Upgrades").
+        build_id: String::new(),
         protocol_version: PROTOCOL_VERSION,
         // A simulated node runs nothing it could checkpoint, unless it was
         // asked to fake the checkpoint channel.
@@ -1383,6 +1396,7 @@ async fn register_sim_node_inner(
         } else {
             Vec::new()
         },
+        join_attributes: Default::default(),
     });
     let reply = client.clone().worker_register(req).await?.into_inner();
     node.credentials.store_node_token(reply.node_token);

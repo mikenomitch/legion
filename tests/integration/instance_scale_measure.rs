@@ -113,6 +113,7 @@ fn submit_sandbox_job(store: &Store) -> R<()> {
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         suspend: Some(SuspendConfig {
             checkpoint: Some("memory".into()),
@@ -128,6 +129,8 @@ fn submit_sandbox_job(store: &Store) -> R<()> {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         },
         &[Submission {
             path: format!("{JOB}.json"),

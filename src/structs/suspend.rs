@@ -108,7 +108,7 @@ pub const MAX_WAKE_TIMEOUT: Duration = Duration::from_secs(300);
 /// through `legion start gateway` while it is suspended, and the gateway
 /// resumes it and holds the request until it is up (docs/gateway.md).
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct WakeConfig {
     /// The `network.ports` label the gateway sends requests to.
     pub port: String,
@@ -116,6 +116,10 @@ pub struct WakeConfig {
     /// Default `"30s"`, at most `"5m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// [`WakeConfig`] with defaults applied.
@@ -211,7 +215,7 @@ impl IdleSignal {
 
 /// The `suspend.idle` block, as written.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct IdleConfig {
     /// Quiet for this long, then suspend. Default `"3m"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +227,10 @@ pub struct IdleConfig {
     /// Default 0.02.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_below: Option<f64>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// [`IdleConfig`] with defaults applied.
@@ -486,7 +494,7 @@ impl ArchiveMode {
 
 /// The task-level `suspend` block, as written.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SuspendConfig {
     /// `memory` or `disk`. Unset: `memory` for a `sandbox` task, `disk` for
     /// every other runtime.
@@ -549,6 +557,10 @@ pub struct SuspendConfig {
     /// same node when the worker comes back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_worker_stop: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// [`SuspendConfig`] with defaults applied.
@@ -1154,6 +1166,33 @@ impl InstanceColdBoot {
     }
 }
 
+// Unknown-field capture (`structs::spec_fields`). `reserve` is parsed by
+// shape and stays strict on its own.
+crate::structs::spec_fields::spec_block!(
+    SuspendConfig,
+    [
+        "checkpoint",
+        "reserve",
+        "onRestoreFailure",
+        "resumeTimeout",
+        "onResume",
+        "durability",
+        "archive",
+        "idle",
+        "onPressure",
+        "wake",
+        "keepFor",
+        "checkpointEvery",
+        "onWorkerStop"
+    ],
+    |this, walk| {
+        walk.opt("idle", this.idle.as_mut());
+        walk.opt("wake", this.wake.as_mut());
+    }
+);
+crate::structs::spec_fields::spec_block!(WakeConfig, ["port", "timeout"]);
+crate::structs::spec_fields::spec_block!(IdleConfig, ["after", "signals", "cpuBelow"]);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1265,6 +1304,7 @@ mod tests {
                 "network".into(),
             ]),
             cpu_below: Some(0.1),
+            unknown_fields: Default::default(),
         }
         .resolve()
         .unwrap();
@@ -1285,6 +1325,8 @@ mod tests {
                     static_port: None,
                     to: None,
                     tls: None,
+                    pending_extensions: Default::default(),
+                    unknown_fields: Default::default(),
                 }],
                 ..Default::default()
             });
@@ -1341,9 +1383,21 @@ mod tests {
                 .unwrap_err();
             assert!(err.contains(needle), "{err}");
         }
-        let unknown: Result<SuspendConfig, _> =
-            serde_json::from_value(serde_json::json!({ "idle": { "afterr": "3m" } }));
-        assert!(unknown.is_err(), "a misspelled idle field is refused");
+        let unknown = serde_json::from_value::<crate::structs::JobConfig>(serde_json::json!({
+            "name": "workspace",
+            "task": {
+                "name": "workspace",
+                "runtime": "sandbox",
+                "suspend": { "idle": { "afterr": "3m" } }
+            }
+        }))
+        .expect_err("a misspelled idle field is refused");
+        assert!(
+            unknown.to_string().contains(
+                "unknown field `suspend.idle.afterr` (did you mean `suspend.idle.after`?)"
+            ),
+            "{unknown}"
+        );
     }
 
     #[test]

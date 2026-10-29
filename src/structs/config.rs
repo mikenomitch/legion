@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -145,6 +145,176 @@ pub struct ManagerConfig {
     /// in the replicated state store.
     #[serde(default)]
     pub cluster_ca: Option<ClusterCaConfig>,
+    /// The manager's in-process system worker
+    /// (docs/architecture-managers-workers.md, "The system worker"). On by
+    /// default: omitting the block runs one that accepts only
+    /// `legion-system` jobs, capped at 1 CPU and 1 GiB.
+    #[serde(default)]
+    pub system_worker: Option<SystemWorkerConfig>,
+    /// Seed-time settings for the apps bundled with Legion
+    /// (docs/apps.md, "Seeding"), by app name:
+    /// `apps = { autoscaler = { enabled = false } }`. Read only when the
+    /// first Control leader seeds an app's record; after that `legion app`
+    /// is the interface, and a manager that finds the block logs that it was
+    /// not applied.
+    #[serde(default)]
+    pub apps: Option<BTreeMap<String, AppSeedConfig>>,
+}
+
+/// One bundled app's seed-time settings (`apps.<name>`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppSeedConfig {
+    /// Seed the app enabled. Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// `managers`, `workers`, or `any`. Default: the manifest's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
+    /// Replicas. Default: the manifest's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<u32>,
+    /// The app's initial config, validated against its schema. Default: the
+    /// manifest's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+}
+
+/// Default `systemWorker.resources.cpu`, in MHz: one CPU's worth.
+pub const DEF_SYSTEM_WORKER_CPU: u64 = 1000;
+/// Default `systemWorker.resources.memory`, in MiB.
+pub const DEF_SYSTEM_WORKER_MEMORY: u64 = 1024;
+/// Default `systemWorker.port`: beside a standalone worker's 4848, so a
+/// manager and a worker joined on the same host do not collide.
+pub const DEF_SYSTEM_WORKER_PORT: u16 = 4849;
+/// Worker type, node pool and cgroup parent of a manager's system worker.
+pub const SYSTEM_WORKER_TYPE: &str = "legion-system";
+/// The node attribute that marks a node as a manager's own worker, and its
+/// value. Set on the system worker and on a `--run-worker` worker alike.
+pub const MANAGER_ROLE_ATTR: &str = "legion.role";
+pub const MANAGER_ROLE_VALUE: &str = "manager";
+
+/// The manager's `systemWorker` block: the in-process worker every manager
+/// runs by default, for Legion's own operational jobs.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SystemWorkerConfig {
+    /// Run the system worker. Default true; false keeps the manager free of
+    /// any allocation (`--run-worker` still starts its worker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Namespaces the system worker accepts, as names or globs. Default
+    /// `["legion-system"]`. Globs follow the reserved-prefix rule: `*` does
+    /// not reach `legion-system`, so "everything" is `["*", "legion-*"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespaces: Option<Vec<String>>,
+    /// What the manager lends its system worker: the node's whole capacity
+    /// as the scheduler sees it, and, on Linux with cgroup v2, the
+    /// `cpu.max`/`memory.max` of its cgroup parent. Default 1000 MHz and
+    /// 1024 MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<SystemWorkerResourcesConfig>,
+    /// The port the system worker's worker plane listens on. Default 4849,
+    /// so a standalone worker on the same host keeps 4848. Managers dial it
+    /// like any worker's (docs/architecture-managers-workers.md, "Ports").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+/// `systemWorker.resources`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SystemWorkerResourcesConfig {
+    /// CPU in MHz, the unit of a task's `resources.cpu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<u64>,
+    /// Memory in MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<u64>,
+}
+
+/// Resolved [`SystemWorkerConfig`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemWorkerConfigFull {
+    pub enabled: bool,
+    pub namespaces: Vec<String>,
+    pub resources: SystemWorkerResources,
+    pub port: u16,
+}
+
+/// Resolved `systemWorker.resources`: CPU in MHz, memory in MiB.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemWorkerResources {
+    pub cpu: u64,
+    pub memory: u64,
+}
+
+impl Default for SystemWorkerConfigFull {
+    fn default() -> Self {
+        SystemWorkerConfig::default().with_defaults()
+    }
+}
+
+impl SystemWorkerConfig {
+    pub fn with_defaults(&self) -> SystemWorkerConfigFull {
+        let resources = self.resources.clone().unwrap_or_default();
+        SystemWorkerConfigFull {
+            enabled: self.enabled.unwrap_or(true),
+            namespaces: self
+                .namespaces
+                .clone()
+                .unwrap_or_else(|| vec![crate::structs::namespace::SYSTEM_NAMESPACE.to_string()]),
+            resources: SystemWorkerResources {
+                cpu: resources.cpu.unwrap_or(DEF_SYSTEM_WORKER_CPU),
+                memory: resources.memory.unwrap_or(DEF_SYSTEM_WORKER_MEMORY),
+            },
+            port: self.port.unwrap_or(DEF_SYSTEM_WORKER_PORT),
+        }
+    }
+}
+
+impl From<SystemWorkerConfigFull> for SystemWorkerConfig {
+    fn from(full: SystemWorkerConfigFull) -> Self {
+        SystemWorkerConfig {
+            enabled: Some(full.enabled),
+            namespaces: Some(full.namespaces),
+            resources: Some(SystemWorkerResourcesConfig {
+                cpu: Some(full.resources.cpu),
+                memory: Some(full.resources.memory),
+            }),
+            port: Some(full.port),
+        }
+    }
+}
+
+impl SystemWorkerConfigFull {
+    /// Reject a block that would not do what it says, naming the field.
+    /// Called at manager startup, so a typo stops the manager instead of
+    /// leaving it without the worker its apps need.
+    pub fn validate(&self) -> R<()> {
+        if self.namespaces.is_empty() {
+            bail!(
+                "systemWorker.namespaces must not be empty; leave it out for \
+                 [\"legion-system\"], or set systemWorker.enabled = false for no system worker"
+            );
+        }
+        for pattern in &self.namespaces {
+            crate::structs::namespace_policy::validate_namespace_glob(pattern)
+                .map_err(|err| anyhow!("systemWorker.namespaces: {err}"))?;
+        }
+        if self.resources.cpu == 0 || self.resources.memory == 0 {
+            bail!(
+                "systemWorker.resources.cpu and .memory must be at least 1 (MHz and MiB); they \
+                 are what the manager lends its system worker"
+            );
+        }
+        if self.port == 0 {
+            bail!("systemWorker.port must be a port number, not 0");
+        }
+        Ok(())
+    }
 }
 
 /// Default `suspend.idleSweep`.
@@ -1757,7 +1927,15 @@ fn parse_humantime_or(raw: &str, fallback: &str) -> Duration {
 impl Default for WorkloadIdentityConfigFull {
     fn default() -> Self {
         WorkloadIdentityConfigFull {
-            enabled: false,
+            // On by default: Legion's own `legion` identity (apps such as
+            // the autoscaler, jobs that call Legion through their API
+            // socket) needs the issuer, and the defaults need no operator
+            // input: the issuer is cluster-internal, the first signing key
+            // is generated and replicated at first boot, and the discovery
+            // and JWKS routes publish only public keys. Federating with an
+            // outside provider still takes an explicit public `issuer`
+            // (docs/workload-identity.md).
+            enabled: true,
             issuer: None,
             jwks_path: DEF_WORKLOAD_IDENTITY_JWKS_PATH.into(),
             signing_alg: "ES256".into(),
@@ -2175,6 +2353,12 @@ pub struct ManagerConfigFull {
     pub suspend: SuspendManagerConfigFull,
     #[serde(default)]
     pub cluster_ca: ClusterCaConfigFull,
+    #[serde(default)]
+    pub system_worker: SystemWorkerConfigFull,
+    /// Seed-time bundled-app settings (`apps`); empty means every bundled
+    /// app is seeded with its manifest's defaults.
+    #[serde(default)]
+    pub apps: BTreeMap<String, AppSeedConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2382,6 +2566,8 @@ impl From<ManagerConfigFull> for ManagerConfig {
                 make_room: Some(val.suspend.make_room),
             }),
             cluster_ca: Some(val.cluster_ca.into()),
+            system_worker: Some(val.system_worker.into()),
+            apps: (!val.apps.is_empty()).then_some(val.apps),
         }
     }
 }
@@ -2475,6 +2661,12 @@ impl ManagerConfig {
                 .as_ref()
                 .map(ClusterCaConfig::with_defaults)
                 .unwrap_or_default(),
+            system_worker: self
+                .system_worker
+                .as_ref()
+                .map(SystemWorkerConfig::with_defaults)
+                .unwrap_or_default(),
+            apps: self.apps.clone().unwrap_or_default(),
         }
     }
 }
@@ -2506,6 +2698,8 @@ impl Default for ManagerConfigFull {
             encryption: EncryptionConfigFull::default(),
             suspend: SuspendManagerConfigFull::default(),
             cluster_ca: ClusterCaConfigFull::default(),
+            system_worker: SystemWorkerConfigFull::default(),
+            apps: BTreeMap::new(),
         }
     }
 }
@@ -2734,6 +2928,14 @@ pub struct WorkerConfigAlt {
     pub worker_type: String,
     pub additional_node_checks: Option<Vec<String>>,
     pub pool: Option<String>,
+    /// The namespaces whose jobs nodes of this type accept, as names or
+    /// `*`-globs (`["ci-*"]`). Absent means every namespace. A node
+    /// restriction rather than a permit: a job outside the list never lands
+    /// here, whatever its `permit` says. Globs follow the reserved-prefix
+    /// rule, so `["*"]` does not accept `legion-system`
+    /// (docs/namespaces.md, "Nodes that accept only some namespaces").
+    #[serde(default)]
+    pub namespaces: Option<Vec<String>>,
     pub attributes: Option<HashMap<String, String>>,
     pub name_prefix: Option<String>,
     pub resources: Option<Value>,
@@ -3638,6 +3840,66 @@ mod tests {
             config.with_defaults().heartbeat,
             HeartbeatConfigFull::default()
         );
+        Ok(())
+    }
+
+    /// configs/manager.ncl spells out the `systemWorker` defaults; they
+    /// must be the defaults an absent block gets.
+    #[test]
+    fn shipped_manager_config_resolves_to_the_default_system_worker_test() -> R<()> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs/manager.ncl");
+        let json = crate::config_lang::eval_file(path)?;
+        let config: ManagerConfig = serde_json::from_str(&json)?;
+        assert!(config.system_worker.is_some(), "the block is spelled out");
+        assert_eq!(
+            config.with_defaults().system_worker,
+            SystemWorkerConfigFull::default()
+        );
+        Ok(())
+    }
+
+    /// An absent block is on, accepts only `legion-system`, and lends 1 CPU
+    /// and 1 GiB; partial blocks fill the rest; validation names the field.
+    #[test]
+    fn system_worker_defaults_and_validation_test() -> R<()> {
+        let empty: ManagerConfig = serde_json::from_value(serde_json::json!({}))?;
+        let full = empty.with_defaults().system_worker;
+        assert!(full.enabled);
+        assert_eq!(full.namespaces, vec!["legion-system".to_string()]);
+        assert_eq!(
+            full.resources,
+            SystemWorkerResources {
+                cpu: 1000,
+                memory: 1024
+            }
+        );
+        assert_eq!(full.port, 4849);
+        full.validate()?;
+
+        let partial: ManagerConfig = serde_json::from_value(serde_json::json!({
+            "systemWorker": { "resources": { "cpu": 2000 } },
+        }))?;
+        let partial = partial.with_defaults().system_worker;
+        assert_eq!(partial.resources.cpu, 2000);
+        assert_eq!(partial.resources.memory, 1024);
+        assert!(serde_json::from_value::<ManagerConfig>(serde_json::json!({
+            "systemWorker": { "namespace": ["typo"] },
+        }))
+        .is_err());
+
+        for (block, says) in [
+            (serde_json::json!({ "namespaces": [] }), "namespaces"),
+            (serde_json::json!({ "namespaces": ["Bad*"] }), "namespaces"),
+            (
+                serde_json::json!({ "resources": { "memory": 0 } }),
+                "resources",
+            ),
+            (serde_json::json!({ "port": 0 }), "port"),
+        ] {
+            let config: SystemWorkerConfig = serde_json::from_value(block.clone())?;
+            let err = config.with_defaults().validate().unwrap_err();
+            assert!(err.to_string().contains(says), "{block}: {err}");
+        }
         Ok(())
     }
 

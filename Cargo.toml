@@ -26,14 +26,16 @@ include = [
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 # The workspace is this crate plus `guest/`, the in-guest agent that ships as
-# its own static binary (docs/task-runtime-sandbox.md, "The guest agent").
+# its own static binary (docs/task-runtime-sandbox.md, "The guest agent"),
+# and the scaling-plugin SDK (`legion-scaling-plugin`,
+# docs/autoscaling-plugins.md), so `cargo test --all` builds and tests it.
 # The example plugins under `plugins/` are separate crates built by build.rs
 # with their own lockfiles, so they stay out of it.
 [workspace]
 # Not ".": the root package is a member of its own workspace anyway, and
 # listing it makes every path under the root an explicit member, which
 # overrides `exclude` and breaks every plugin build.
-members = ["guest"]
+members = ["guest", "examples/scaling-plugins/rust"]
 exclude = ["plugins"]
 
 [dependencies]
@@ -103,6 +105,9 @@ rusqlite_migration = "1.0.2"
 humantime = "2.1.0"
 serde_rusqlite = "0.36.0"
 jsonschema = "0.17.1"
+# Did-you-mean suggestions for unknown jobspec fields (src/structs/spec_fields.rs).
+# Already in the tree through clap and nickel; same version.
+strsim = "0.11.1"
 rand = "0.8.5"
 argon2 = "0.5.3"
 base64 = "0.22"
@@ -139,6 +144,10 @@ regex = "1.11.1"
 semver = "1.0.25"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 cron = "0.15.0"
+# IANA time zones for autoscaling schedules (`schedule = [{ cron, timezone }]`,
+# src/autoscaler/schedule.rs), so a business-hours floor follows DST. The
+# zone table is pre-generated (phf only): no build script, no new C code.
+chrono-tz = "0.10.4"
 reqwest = { version = "0.12.12", default-features = false, features = ["blocking", "rustls-tls"] }
 url = "2.5.4"
 tempfile = "3"
@@ -202,6 +211,11 @@ name = "net_bench"
 path = "benchmarks/micro/net_bench.rs"
 harness = false
 
+[[bench]]
+name = "scaling_rollup_bench"
+path = "benchmarks/micro/scaling_rollup_bench.rs"
+harness = false
+
 # The AWS rig's native job submitter. Not part of the product: it exists
 # because the rig's per-job `legion job run` process spawn ceilinged at ~36-103
 # jobs/sec and was being reported as Legion's throughput. It links against this
@@ -254,6 +268,12 @@ debug = false
 # Optimizing every dependency bought ~10% more and doubled the clean
 # dependency build, so the rest stay at -O0.
 [profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
+# Workers hash their own executable at startup for their build id
+# (docs/apps.md, "Upgrades"). A debug binary is ~400 MB, which SHA-256 at
+# -O0 takes tens of seconds over; optimized, well under one.
+[profile.dev.package.sha2]
 opt-level = 3
 
 # Profile for shipped binaries: `cargo build --profile dist`.

@@ -748,6 +748,7 @@ async fn submit_one(
         priority: None,
         force_reschedule: false,
         idempotency_key: None,
+        allow_unknown_fields: Default::default(),
     });
 
     match client.run_job(request).await {

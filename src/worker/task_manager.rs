@@ -1511,6 +1511,16 @@ impl WorkerTaskManager {
         self.resources.enabled()
     }
 
+    /// Cap everything this worker runs at `limits`, on its cgroup parent
+    /// (a manager's system worker and its lend). See
+    /// [`NodeResourceGovernor::apply_parent_limits`].
+    pub fn cap_cgroup_parent(
+        &mut self,
+        limits: crate::worker::resources::ParentLimits,
+    ) -> R<(String, String)> {
+        self.resources.apply_parent_limits(limits)
+    }
+
     pub fn load_builtin_plugins(&mut self) {
         load_builtin_plugins_into(&mut self.registry);
     }
@@ -2263,21 +2273,61 @@ impl WorkerTaskManager {
         allocation_id: i64,
         task_name: &str,
         runtime: &str,
-    ) -> Option<(Option<&'static str>, PathBuf)> {
+    ) -> Option<crate::worker::identity::FileDeliveryBase> {
         if self.registry.load_plugin(runtime, false).is_err() {
             return None;
         }
         let plugin = self.registry.plugin(runtime)?;
         let mut host = task_dir_in(&self.alloc_dir(allocation_id), task_name);
+        self.ensure_task_dir(allocation_id, task_name, &host);
         let Some(root) = plugin.file_delivery_root() else {
             // The host's own filesystem: an absolute path is the real path,
             // and a relative one is below the task directory.
-            return Some((None, host));
+            return Some(crate::worker::identity::FileDeliveryBase {
+                in_task_root: None,
+                host_task_dir: host,
+                host_sockets: true,
+            });
         };
-        if let Some(subdir) = plugin.file_delivery_host_subdir() {
-            host.push(subdir);
+        // A runtime that projects only a subdirectory (a sandbox guest's
+        // identity files) cannot reach a socket bound on the host.
+        let host_sockets = match plugin.file_delivery_host_subdir() {
+            Some(subdir) => {
+                host.push(subdir);
+                false
+            }
+            None => true,
+        };
+        Some(crate::worker::identity::FileDeliveryBase {
+            in_task_root: Some(root),
+            host_task_dir: host,
+            host_sockets,
+        })
+    }
+
+    /// Make the allocation's task directory, owner-only, when it does not
+    /// exist yet. Identity tokens and the API socket are delivered before
+    /// the task's first launch makes it ([`Self::prepare_instance`] applies
+    /// the same modes then), and nothing delivered may sit in a directory
+    /// other users can reach, even for that moment.
+    fn ensure_task_dir(&self, allocation_id: i64, task_name: &str, task_dir: &std::path::Path) {
+        if task_dir.is_dir() || !crate::structs::job::is_safe_path_component(task_name) {
+            return;
         }
-        Some((Some(root), host))
+        let alloc_dir = self.alloc_dir(allocation_id);
+        let made = std::fs::create_dir_all(task_dir)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| crate::util::restrict_dir_to_traverse_only(&self.alloc_root))
+            .and_then(|()| crate::util::restrict_dir_to_owner(&alloc_dir))
+            .and_then(|()| crate::util::restrict_dir_to_owner(task_dir));
+        if let Err(err) = made {
+            warn!(
+                allocation_id,
+                dir = %task_dir.display(),
+                error = ?err,
+                "Failed to prepare the task directory for identity delivery"
+            );
+        }
     }
 
     /// Root of per-allocation directories (`<state>/allocs/`).
@@ -3321,6 +3371,58 @@ impl WorkerTaskManager {
             task.name.clone(),
             task.runtime.clone(),
         ))
+    }
+
+    /// Where `Worker.ForwardAppRequest` delivers an app view or action
+    /// request (docs/apps.md, "Views and actions"): allocation
+    /// `allocation_id`'s port `label`, dialed the way the ingress datapath
+    /// dials it. Refused unless the allocation runs here now and runs
+    /// `job_id`, and declares the label.
+    pub fn app_forward_target(
+        &self,
+        allocation_id: i64,
+        job_id: &str,
+        label: &str,
+    ) -> Result<crate::worker::netd::ingress::TaskTarget, tonic::Status> {
+        let key = self.local_key(allocation_id);
+        let running = self.instances.contains_key(&key) && !self.terminated.contains_key(&key);
+        let (Some(allocation), Some(task)) =
+            (self.allocations.get(&key), self.task_configs.get(&key))
+        else {
+            return Err(tonic::Status::not_found(format!(
+                "allocation {allocation_id} does not run on this node"
+            )));
+        };
+        if !running {
+            return Err(tonic::Status::not_found(format!(
+                "allocation {allocation_id} is not running on this node"
+            )));
+        }
+        if allocation.job_id != job_id {
+            return Err(tonic::Status::not_found(format!(
+                "allocation {allocation_id} runs {}, not {job_id}",
+                allocation.job_id
+            )));
+        }
+        let network = allocation.network.clone().unwrap_or_default();
+        let Some(port) = network.ports.iter().find(|port| port.name == label) else {
+            return Err(tonic::Status::failed_precondition(format!(
+                "allocation {allocation_id} declares no port {label:?}"
+            )));
+        };
+        let payload = TaskAllocation {
+            allocation_id: key,
+            task_runtime: task.runtime.clone(),
+            task_config: task.config.to_string(),
+            ..Default::default()
+        };
+        let attachment =
+            crate::worker::netd::attach::Attachment::of(&payload, &network, &self.alloc_root);
+        Ok(crate::worker::netd::ingress::TaskTarget {
+            dial: attachment.task_dial(),
+            label: label.to_string(),
+            port: port.bind_port(),
+        })
     }
 
     pub fn open_exec_session(
@@ -9850,6 +9952,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::ZERO,
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("stubborn", "exec")
         };
@@ -9892,6 +9995,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: Duration::from_secs(1),
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("stubborn", "exec")
         };
@@ -10029,6 +10133,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::ZERO,
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("victim", "exec")
         };
@@ -10247,6 +10352,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: Duration::from_secs(300),
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("stubborn", "exec")
         };
@@ -10419,6 +10525,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: Duration::from_secs(300),
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("drain", "exec")
         };
@@ -10468,6 +10575,7 @@ mod tests {
                     signal: "SIGTERM".into(),
                     kill_after: Duration::from_secs(300),
                     drain: None,
+                    unknown_fields: Default::default(),
                 }),
                 config: json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]}),
                 ..TaskConfig::new("box", "sandbox")
@@ -11412,6 +11520,7 @@ mod tests {
                 unhealthy_after_count: 3,
                 boot_grace_time: None,
                 unhealthy_after_count_timespan: None,
+                unknown_fields: Default::default(),
             }],
             ..TaskConfig::new("exec-task", "exec")
         };
@@ -11471,6 +11580,7 @@ mod tests {
                 mode: Some("serve".into()),
                 ratify_timeout: Some("10s".into()),
                 on_refused: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("box", "exec")
         };
@@ -11516,6 +11626,7 @@ mod tests {
                 policy: Some(crate::structs::RestartPolicy::Never),
                 delay: Some(Duration::from_secs(5)),
                 success_exit_codes: vec![0, 3],
+                unknown_fields: Default::default(),
             }),
             ..batch.clone()
         };
@@ -11700,6 +11811,7 @@ mod tests {
             unhealthy_after_count: 3,
             boot_grace_time: None,
             unhealthy_after_count_timespan: None,
+            unknown_fields: Default::default(),
         }
     }
 
@@ -11971,6 +12083,7 @@ mod tests {
                 unhealthy_after_count: 2,
                 boot_grace_time: Some(Duration::from_millis(300)),
                 unhealthy_after_count_timespan: None,
+                unknown_fields: Default::default(),
             }],
             ..TaskConfig::new("puller", "exec")
         };
@@ -12034,6 +12147,7 @@ mod tests {
                 unhealthy_after_count: 1,
                 boot_grace_time: Some(Duration::from_millis(500)),
                 unhealthy_after_count_timespan: None,
+                unknown_fields: Default::default(),
             }],
             ..TaskConfig::new("late-listener", "exec")
         };
@@ -12104,6 +12218,7 @@ mod tests {
                 // dead process.
                 boot_grace_time: Some(Duration::from_millis(400)),
                 unhealthy_after_count_timespan: None,
+                unknown_fields: Default::default(),
             }],
             ..TaskConfig::new("crasher", "exec")
         };

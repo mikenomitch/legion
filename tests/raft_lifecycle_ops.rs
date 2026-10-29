@@ -183,6 +183,7 @@ fn sandbox_job() -> JobConfig {
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         suspend: Some(SuspendConfig {
             checkpoint: Some("memory".into()),
@@ -197,6 +198,8 @@ fn sandbox_job() -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -260,10 +263,11 @@ impl Harness {
         Some(format!("ops-key-{next}"))
     }
 
-    /// Committed raft entries so far, across every lane this store runs.
+    /// Committed raft entries so far, across every lane this store runs,
+    /// from the state machine's applied marker (exact once a write returns;
+    /// the engine's metrics lag it, see `Store::raft_applied_entries`).
     fn entries(&self) -> R<u64> {
-        let status = self.store().raft_status().context("raft status")?;
-        Ok(status.lanes.iter().map(|lane| lane.applied_index).sum())
+        self.store().raft_applied_entries()
     }
 
     /// Run `body` and count what it committed.

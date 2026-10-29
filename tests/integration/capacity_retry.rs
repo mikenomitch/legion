@@ -81,6 +81,7 @@ impl Cluster {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new(TASK, "noop")
         };
@@ -92,6 +93,8 @@ impl Cluster {
                 rollout: None,
                 rollout_by_group: Default::default(),
                 version: None,
+                pending_extensions: Default::default(),
+                extensions: Default::default(),
             },
             &[Submission {
                 path: format!("{JOB}.json"),

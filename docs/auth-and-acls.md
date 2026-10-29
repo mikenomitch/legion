@@ -109,7 +109,7 @@ reports `aclEnabled: false`.
 | Resource | Covers | `read` | `write` |
 | --- | --- | --- | --- |
 | `job` | jobs, specs, plans, rollouts | list/inspect/plan | submit/stop/destroy/advance |
-| `node` | worker nodes, pools, ledger | list/inspect | restart, drain/attrs |
+| `node` | worker nodes, pools, ledger, join tokens | list/inspect, list join tokens, capacity demand (`GetCapacityDemand`, scoped by each template's pool; it names only jobs you can `job:read`) | restart, drain/attrs, forget (`ForgetNode`), create and revoke join tokens |
 | `kv` | KV entries and locks | get/list | put/patch/delete/locks |
 | `state` | raw state store, saved queries | SQL reads, schema | SQL writes, saved queries |
 | `operator` | raft, manager configs, observability | status/history/logs | raft commands, raft join tokens |
@@ -117,11 +117,12 @@ reports `aclEnabled: false`.
 | `exec` | exec into a running allocation | n/a | open a session, or mint an exec ticket for one (`host = true` for host-level runtimes) |
 | `action` | run declared actions on an allocation | n/a | run an action (scope with `actionNames`) |
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
-| `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name). Separate from `job:write`, so a principal can resize without redeploy rights. |
+| `scale` | task count overrides and autoscaling ([Autoscaling](autoscaling.md)) | scale status, the cluster-wide scaling inputs (`GetScalingInputs`: replicas, usage against reservations, service traffic), autoscaling status, explanations and history, the effective policies (`WatchScalingPolicies`), and a namespace's scaling defaults | `job scale` / reset / pins, pausing autoscaling for a job, and standalone scaling policies (`legion scaling apply|delete`, scoped like a job of the policy's name in its namespace). Separate from `job:write`, so a principal can resize without redeploy rights. The cluster's scaling defaults, the cluster-wide pause, and node-group policies (with `node:write`) need `operator:write`. |
 | `boot` | boot tickets ([Edge Boot](edge-boot.md)) | list outstanding tickets | mint a ticket (scope by job name). Separate from `job:write` for the same reason as `scale`: a platform's ticket minter can authorize individual starts without the right to redeploy the fleet. |
 | `net` | network policy and plugin objects ([Network Handlers](network-handlers.md), [Network Plugins](network-plugins.md)) | list policies, show or test a job's effective policy (scope by job name); list, describe, and read the status of plugins | apply or delete a policy. Scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write. Apply or delete a plugin: a `usableBy = "policies"` plugin's `nodePools` scope it the same way; a cluster-wide one, or any `usableBy = "jobs"` plugin, needs unscoped write. |
 | `snapshot` | instance snapshots ([Suspend and Resume](suspend-and-resume.md)) | list, inspect, warm a published one onto nodes, restore an instance from one, and create instances from one (restore and create also need `job:write`) | create (including `--publish`), delete, and name snapshots, suspend with a memory checkpoint, and fork (fork also needs `job:write`) (scope by job name and namespace) |
 | `namespace` | namespace objects ([Namespaces](namespaces.md)) | get a namespace (listing is per item: any allow in a namespace shows it) | create, update, and delete namespaces whose names match (scope with `namespaces`). A cascade delete also needs `job:write` there. |
+| `app` | [apps](apps.md): Legion's add-ons | list and show apps (scope with `names`, matched against app names), and see their views and sandboxed pages and run their actions, each also checked against the view's, page's, or action's own declared permission ([Apps: Who sees what](apps.md#who-sees-what)) | install, upgrade, uninstall, enable, disable, and change settings and config. Installing and upgrading also need every permission the manifest asks for, and a config change that touches a code field needs the app's whole grant: `app:write` alone never hands out an app's grant. Cluster-scoped. |
 
 Actions are `read` and `write`. `write` does not imply `read`, so grant both.
 Grant `state:read` sparingly, since it can read every table in the state
@@ -197,13 +198,29 @@ A policy is a named JSON array of rules:
 - **A rule over a namespaced resource** (`job`, `exec`, `action`, `scale`,
   `boot`, `snapshot`, `namespace`) **must carry `namespaces`**, and a rule
   over only cluster-scoped resources (`node`, `kv`, `state`, `operator`,
-  `acl`, `template`, `net`) must not. `namespaces = ["*"]` covers every
+  `acl`, `template`, `net`, `app`) must not. `namespaces = ["*"]` covers every
   namespace, including ones created later. A rule mixing the two kinds is
   refused, as is an empty selector; `resources = ["*"]` rules and deny rules
   are exempt. A rule naming an exact namespace that does not exist yet is
   accepted with a warning. See [Namespaces, ACLs](namespaces.md#acls).
 - List endpoints filter to what the caller can read: a token scoped to
   `paths = ["team-a/*"]` sees only `team-a/` keys in `legion kv list`.
+- **Reserved names skip `*`.** In an allow rule, a `namespaces` glob reaches
+  a reserved `legion-*` namespace (Legion's own `legion-system`) only when
+  the pattern itself starts with `legion-`, a `pools` glob reaches a
+  reserved `legion-*` pool (the managers' system workers, pool
+  `legion-system`) only when it starts with `legion-`, and a `paths` glob
+  reaches a key under `legion/` only when it starts with `legion/`, the way
+  a shell's `*` skips dotfiles. A rule with no `paths` or no `pools`, and a
+  `resources = ["*"]` rule with no `namespaces`, reach what `*` reaches. So
+  `namespaces = ["*"]`, `pools = ["*"]`, and `paths = ["*"]` cover every
+  tenant namespace, pool, and key but not what Legion runs for itself: a
+  `node` rule with `pools = ["*"]` (or none) does not list, cordon, or
+  drain a manager's system worker, or mint a join token into its pool. "Everything"
+  is `["*", "legion-*"]` and `["*", "legion/*"]`. Deny rules keep plain globs (a deny on `*` still
+  denies inside `legion-system`), and management tokens bypass rules. A
+  denial inside a reserved name says so in its hint. See [Namespaces,
+  Reserved namespaces](namespaces.md#reserved-namespaces).
 
 **Restricting an account to specific job templates.** A rule with a selector
 never matches a request that lacks that attribute. So a `job` rule carrying
@@ -303,13 +320,25 @@ only `job:write`. A stored `require` policy that imposes `mode = "host"`
 makes every job it matches host-level; writing one needs `net:write`, which
 is already an admin grant.
 
+In the reserved `legion-system` namespace, where tasks run on the managers,
+the last three rows are refused outright, host grant or not, and so are an
+`exec` task's files at absolute host paths, its own `config.cgroup`, and a
+negative OOM score (the worker does each as root); an `exec` task must name
+a non-root user
+([Namespaces: Reserved namespaces](namespaces.md#reserved-namespaces)). The
+app reconciler holds no host grant at all: an app's own `exec` task, which
+runs as the app's uid, is the one host-level task it may submit.
+
 #### KV references in a job
 
 Naming a KV key in a job is reading it: the value reaches the task (or the
-datapath, or an artifact source), so submitting the job needs `kv:read` on
-the key, on top of `job:write`. That covers every place a job can name one:
+datapath, or an artifact source, or a reply), so submitting the job needs
+`kv:read` on the key, on top of `job:write`. That covers every place a job
+can name one:
 
-- `$path/key` values anywhere in the spec,
+- `$path/key` values anywhere in the spec: a core field, an app's jobspec
+  key ([extension values](apps.md#jobspec-extensions)), or a pending key
+  kept under `--allow-unknown-fields`,
 - `kvInjections` env and files, the `{{ kv "…" }}` lookups in their
   templates, and a `templateKv` pointer,
 - an artifact's `auth.kv` (a path filled in by a cluster `artifacts.auth`
@@ -319,7 +348,11 @@ the key, on top of `job:write`. That covers every place a job can name one:
   [Sources](network-handlers.md#sources) the datapath fetches).
 
 `job run`, `job plan`, and template renders and runs check it before anything
-is placed:
+is placed, and the `$path` references and `kvInjections` keys are checked
+**before any of them is resolved**: nothing the submitter may not read is
+ever resolved, so no reply (a plan's extension values, a stored version), no
+parse or schema error (a value of the wrong type), and no app's validate
+call can carry it, and a missing key cannot be told from an unreadable one:
 
 ```console
 $ legion job run web.ncl
@@ -348,7 +381,11 @@ A team's whole policy is usually one glob:
 ]
 ```
 
-`names` then narrows by the job's bare name inside those namespaces.
+`names` then narrows by the job's bare name inside those namespaces. A
+tenant admin's `namespaces = ["*"]` does not reach `legion-system`: a token
+that could submit to or exec into Legion's own jobs could borrow the
+credentials they run with, so that reach is always written out
+(`["*", "legion-*"]`).
 `ListNamespaces` shows a namespace to anyone holding any allow there, and
 `WhoAmI` reports the set as `readable_namespaces`. A denial on a namespaced
 resource names where the token can act (`Hint: this token can write job in
@@ -362,6 +399,233 @@ is Nickel (`.ncl`) or JSON (`.json`), read by the same rules as every other
 Legion config (see [Configuration Language](configuration-language.md)). It
 can be a bare rules array or `{description, rules}`. `apply` prints a
 warning for each rule naming an exact namespace that does not exist yet.
+Policy names starting with `grant:` are reserved for [job grants](#job-grants).
+
+### Job grants
+
+A job can ask for access to Legion itself: `permissions` (inline rules, the
+same shape as a policy) and `policies` (policy names) on the reserved
+`legion` identity of a task ([Workload identity:
+Permissions](workload-identity.md#permissions)). The job's workload token then
+carries them, and its task reaches the API through a local socket with no
+token handling.
+
+**You can grant only what you hold.** Every path that stores a job config
+(`RunJob`, `RunJobTemplate`) checks that the submitting token holds every
+requested rule, and every rule of every named policy (which must exist).
+It runs on every submit, an unchanged one included. Management tokens pass;
+in audit-only mode a miss is logged under `acl_audit` and allowed. A miss
+names the first rule not held:
+
+```text
+cert-renewer-app-example-com: identity 'legion' asks for kv:write on certs/*, which your token does
+not hold
+Hint: have someone with that access submit this job, or ask for it to be granted to you
+```
+
+**What "holds" means.** Deciding exactly whether one set of glob rules
+contains another is set algebra; the check decides a sufficient condition
+instead, which is sound and occasionally conservative:
+
+- A requested `(resource, action)` is held when one allow rule covers the
+  same pair and every one of its selectors covers the requested one. A
+  requested `*` resource or action asks for each one.
+- A requested glob is covered when the requested pattern, as a string,
+  matches a held glob: a held `pay*` covers a requested `payments-*`, and a
+  held `certs/*` covers `certs/app.example.com`. For `*`-only globs that is
+  exact: every name the requested pattern reaches, the held one reaches too.
+- **Reserved names first.** A requested pattern that can reach a reserved
+  name (it starts with `legion-` for namespaces and pools, or `legion/` for
+  KV keys) is covered only by a held pattern with the same prefix. A held `*` does not
+  reach `legion-system`, so it does not cover a requested `legion-*`:
+  without this, a tenant admin could grant a job `exec:write` into Legion's
+  own jobs. The error says so when this is why.
+- A selector the request leaves out reaches more than any held selector, so
+  it is covered only by a held rule that leaves it out too (a held
+  `names = ["*"]` does not cover a request with no `names`).
+- `host = true` on a request needs `host = true` on the held rule.
+- **Deny rules.** When the submitter holds any deny rule on a resource, a
+  grant on that resource also needs `acl:write`: subtracting denies is not
+  attempted, and `acl:write` can write any policy anyway.
+- A requested deny rule only takes access away, and is never checked.
+
+Conservative cases have someone whose own policy covers the request outright
+submit the job: a request covered only by two held rules together (`a*` and
+`b*` for `*`), or a cluster-scoped resource requested from a held rule that
+names `namespaces` (which never matches a cluster-scoped request).
+
+**Grants are per version and revocable.** The grant is recorded with the job
+config version it was checked for, in the submitter's name, and resolved
+every time the job's token is verified:
+
+```console
+$ legion acl grants list
+ job                          | version | grants                     | granted_by | granted_at           | revoked
+------------------------------+---------+----------------------------+------------+----------------------+---------
+ cert-renewer-app-example-com | 1       | kv:read,write on certs/*   | ops-alice  | 2026-10-28T10:02:11Z | -
+
+$ legion acl grants revoke cert-renewer-app-example-com
+revoked 1 grant of job `cert-renewer-app-example-com`; its tokens lose them at their next request
+```
+
+`list` takes `--job` (with `-n` for a namespaced job) and `--all` to include
+revoked grants; `revoke` takes `--version` to revoke one version only and
+`--idempotency-key` for retries; both take `--json`. `ListGrants` needs
+`acl:read` and `RevokeGrant` `acl:write`. A revoke applies at the workload's
+next request, including ACL tokens minted from its identity with `legion login
+--method legion`, which carry a `grant:alloc/<id>` reference rather than a
+copy. The next submit of the job by someone who holds the access grants it
+again. A grant outlives the granter's own access, as in Kubernetes RBAC:
+revoke it when that matters.
+
+### App grants
+
+An [app](apps.md)'s job carries a grant the same way a job does, through the
+`permissions` of its `legion` identity, but the grant is recorded on the app
+record when the app is installed or upgraded, and checked against whoever
+does it (`InstallApp`, `UpgradeApp`), with the coverage rules above. The app
+reconciler's submits of the app's job are then checked against that recorded
+grant, so they keep working after the installer's own access changes; anyone
+else submitting the app's job directly still needs everything it asks for. A
+`SetAppConfig` that changes one of the manifest's code fields re-runs the
+check against the caller. Bundled apps' grants are recorded at seed time by
+`legion:bootstrap`, the one grant that is not checked against a person.
+
+The same check bounds what else an app can reach through other people:
+
+- **Pages.** Every permission behind each RPC a sandboxed page lists is
+  checked against the installer (and upgrader), everywhere the RPC reaches,
+  reserved scopes included, because a page calls its RPCs as whoever views
+  it ([Apps: Which RPCs a page may call](apps.md#which-rpcs-a-page-may-call)).
+  No page may list an ACL, token, grant, or app write.
+- **Placement.** Installing an app placed anywhere but `managers`, or
+  changing an app's placement or pool, needs `operator:write`: it decides
+  which nodes hold the app's token ([Apps: Placement](apps.md#placement)).
+- **Host-level work.** The reconciler holds no `host` grant. An app's job
+  may contain nothing host-level besides its own `exec` tasks, which run as
+  the app's own uid; an `exec` health check, a `file://` artifact, or
+  `auth.nodeIdentity` is refused in `legion-system` for everyone
+  ([Host-level jobs](#host-level-jobs)).
+
+```text
+Error: app gitops 0.2.0 asks for job:write in team-*, which your token does not hold
+Hint: have someone who holds it do this, or ask for it to be granted to you
+```
+
+**The app plane.** Two RPCs are for the bundled autoscaler alone:
+`ReportScalingStatus` (its heartbeat and per-task state) and
+`RecordScalingAction` (a dry-run policy's "would" rows, and the
+compare-and-set action intents and outcomes of a standalone policy or a
+node group, which a pause refuses). They take no ACL
+rule; instead they accept only a credential whose job grant belongs to an
+allocation of `legion-system/autoscaler` (its `legion` token, or an ACL token
+minted from it), or a management token. Anyone else gets `PermissionDenied`
+(`Unauthenticated` without a credential), so a principal with `scale:write`
+cannot forge the autoscaler's status. The autoscaler acting for a viewer
+([Delegated identities](#delegated-identities)) is not the app plane, and is
+refused too. `ScaleTask`'s `source = "autoscaler"` is honored on the same
+test ([autoscaling.md](autoscaling.md#access-control)).
+
+### App views and the viewer assertion
+
+An app's grant is the app's power, not its viewers'. A button on an app's
+panel is pressed by a viewer who may hold much less, so the manager
+authorizes every view and action **as the viewer** before the app is asked:
+`app:read` on the app, then the permission the view or action declares,
+checked on the job, task, or node it is shown for. Only then does it forward
+the request to the app, with a **viewer assertion**: a 60-second JWT signed
+with the workload-identity key, `aud = app:<name>`, naming the viewer, the
+permission checked, and the context. The app verifies it and acts only on
+that context, so a viewer can press a button only where they hold the
+permission the manifest declares for it. What the app then does on the
+press it does **as the viewer**, through a [delegated
+identity](#delegated-identities), so the declared permission is also what
+the press can do. Every action is recorded as an `app.action` event.
+[Apps: Views and actions](apps.md#views-and-actions) has the details.
+
+An app's **sandboxed page** is fetched the same way (`GetAppPage`: `app:read`
+on the app, then the page's declared permission, then a viewer assertion
+for the page), and then runs in the browser, in an opaque-origin iframe that
+holds no token. It reaches Legion only through the SPA, which makes each
+call **as the viewer** with the viewer's own token: only the RPCs the page's
+manifest lists, with every write confirmed by the viewer first. The SPA
+stamps those calls `legion-app-page: <app>/<page>`, and the manager refuses
+one whose RPC the page's current manifest does not list (with one answer for
+every such refusal, since the check runs before authentication). That header
+narrows what a page may ask for; it never widens what the viewer may do,
+which the RPC's own ACL check decides as for any call. A page can still read
+what its viewer can read through its RPCs and send it elsewhere
+([Apps: What the sandbox does not stop](apps.md#what-the-sandbox-does-not-stop)),
+but only through RPCs whose permissions its installer held everywhere.
+
+### Delegated identities
+
+An app acts on a viewer's button press **as the viewer**, not with its own
+grant. The action's viewer assertion carries a **delegation**: the action's
+declared permission (and `read` on the same resource, when the viewer holds
+it there), on exactly the scope the manager checked (the job, or the node's
+pool). The app sends the assertion back with its own calls, in one gRPC
+metadata entry, beside its own credential:
+
+```text
+authorization: Bearer <the app's legion token>       (attached by the API socket)
+legion-on-behalf-of: <the action's viewer assertion>
+```
+
+The manager answers such a call with a **delegated identity**:
+
+| | |
+| --- | --- |
+| principal | `alice via app autoscaler` |
+| rules | one allow rule: the delegated resource and actions, with exact `namespaces`, `names`, `templates`, or `pools` selectors for the scope; plus the app's and the viewer's deny rules |
+| bounded by | the app's own grant: an action the app does not hold on the scope is dropped |
+| `WhoAmI.source` | `delegated` (`rules_json` shows the one rule) |
+| lifetime | the assertion's 60 seconds, and the app credential's own expiry |
+
+Before it builds one, the manager checks that:
+
+- **the caller is the app** the assertion was signed for: its credential's
+  job grant belongs to an allocation of `legion-system/<app>` (its `legion`
+  token, or an ACL token minted from it). Anyone else presenting the
+  assertion, a management token included, is refused, so an assertion is
+  useless outside its app;
+- the assertion **verifies** against the cluster's workload-identity keys
+  for `aud = app:<app>`, has **not expired** (no clock leeway), and is an
+  action's, carrying a delegation;
+- the **viewer still may**: when the viewer used an ACL token, it is
+  looked up again on every call, so a deleted or expired token, or a policy
+  that no longer grants the permission, ends the delegation at once. A
+  viewer who signed in with a JWT bearer has no token to look up; the
+  assertion's 60 seconds bound them.
+
+A call that fails any check is `Unauthenticated` or `PermissionDenied`,
+names `legion-on-behalf-of` in its message, and is logged as an `ACL
+denial` under `acl_audit` (with `resource = delegation`), audit-only mode
+or not. It never falls back to the app's own identity. A delegated identity
+is also refused by **streams** (`StreamEvents`, `WatchScalingPolicies`,
+`WatchAppExtensions`, `ExecAllocation`), which re-check their caller every
+30 seconds from the bearer credential alone, and by the **app plane**
+(`ReportScalingStatus`, `RecordScalingAction`), which takes an app's own
+identity only. With ACLs disabled the header is ignored, like every
+credential.
+
+The delegated principal is what history records: a pause from the
+autoscaler's panel is `paused by alice via app autoscaler`, in `legion
+scaling status`, `legion scaling history`, and the `scale.paused` event. A
+call outside the delegation is denied as any call is, logged with `alice
+via app autoscaler` as the principal:
+
+```text
+PermissionDenied: permission denied: scale:write is outside what alice via app autoscaler delegates
+Hint: an app acting for a viewer holds only the action's declared permission on what the action was pressed for (`WhoAmI` through the same client shows it)
+```
+
+Delegation is how a well-behaved app acts as the viewer; it does not stop
+an app from calling with its own client, whose power is its grant
+([App grants](#app-grants)). The manifest's declared permission bounds an
+action's delegated calls, and the grant bounds everything the app does.
+[Apps: Acting as the viewer](apps.md#acting-as-the-viewer) shows the app
+side.
 
 ### Tokens
 
@@ -549,6 +813,76 @@ Workers get their attributes from their worker type's template (pool,
 attributes, and resources from `workerConfigPath`) plus worker-side
 fingerprinting. The join token pins which template applies.
 
+#### Limiting a token's uses
+
+`--max-uses N` makes a token admit at most N new nodes. Use it whenever the
+number of machines is known when the token is minted: a fleet bring-up, or a
+node group asking its provider for N machines:
+
+```bash
+legion join-token create --type default --ttl 1h --max-uses 3
+legion join-token list
+# ID        WORKER_TYPE  DESCRIPTION  USES  ATTRIBUTES  EXPIRES_AT
+# 3f9c2a1b  default                   2/3               2026-10-28T13:00:00Z
+```
+
+- Each new node that registers with the token uses it once. A spent token
+  refuses the next new node with `PermissionDenied: join token <id> is spent:
+  3 of its 3 uses (max_uses) are taken`.
+- A node re-registering under its own name is not a new use: a restart that
+  falls back to the join token, or a node that went `lost` and rejoins. (A
+  restart with the node token never touches the join token at all.)
+- A node removed with [`legion node forget`](architecture-managers-workers.md#forgetting-a-node)
+  is new again, so a spent token cannot bring a forgotten machine back.
+- The limit holds with ACLs off too, for a worker that presents the token.
+  `--max-uses 0` is refused; leave the flag out for no limit.
+
+#### Node attributes from the join
+
+A node's config attributes come from three places, and the more specific one
+wins:
+
+1. the join token's attributes (`legion join-token create --attr k=v`,
+   repeatable), stamped on every node that joins with it;
+2. the host's own `--attr k=v` on `legion join` or `legion start worker`
+   (repeatable), for what only that machine knows;
+3. the worker type's `attributes`.
+
+```bash
+# The minter (an operator, or whatever provisions the group) says which group:
+legion join-token create --type default --max-uses 5 \
+  --attr legion.nodegroup=workers-general
+# The host says which machine it is:
+legion join --token-file /etc/legion/join-token \
+  --attr legion.provider-id=$(curl -s http://169.254.169.254/latest/meta-data/instance-id) \
+  --attr rack=r12
+```
+
+Constraints, `distinct`, and `legion node info` see the merged attributes.
+The token's attributes survive the node's restarts: they are recorded on the
+node as `legion.join` (`{"token": "<id>", "attributes": {...}}`) and applied
+again whenever the node re-registers with its node token.
+
+Keys under `legion.` are reserved. With ACLs enforced, a worker cannot report
+one itself: a `legion.*` attribute reaches the node only if the join token
+sets it, the worker type sets it, or (on a restart) the node's own record
+already has it. One the worker reports that nothing vouches for is dropped
+with a warning, so a host cannot claim `legion.nodegroup = gpu-expensive` and
+attract that group's work. `--attr` may set only the per-host reserved keys,
+today `legion.provider-id`; any other `legion.*` key, and any key Legion
+reads as node structure (`namespaces`, `restriction`, `resources`,
+`reservedResources`, `maxAllocations`, `capacity`, `oversubscribe`,
+`workerAddress`, ...), is refused with `InvalidArgument` (the CLI checks
+before it starts the worker). A token may set any `legion.*` label except
+`legion.role` and `legion.join`, which Legion writes itself, and no
+structural key. Keys are at most 128 bytes, values 1024, and a token or a
+registration carries at most 64.
+
+`legion.provider-id` is a claim the host makes about itself, like every
+`--attr`. Anything that acts on a machine by that id (a script that
+terminates instances, say) should check it against the provider's own list
+of instances first.
+
 When ACLs are enforced:
 
 - `WorkerPreRegister`/`WorkerRegister` require a valid join secret, or the
@@ -576,8 +910,8 @@ When ACLs are enforced:
   working). Re-registering with the node token keeps it: the reply carries no
   new token, so a crash during a restart can never leave the worker holding
   a revoked one.
-- If the manager refuses the persisted node token (the node was removed, or
-  ACL state was reset), or a heartbeat comes back `Unauthenticated`, the
+- If the manager refuses the persisted node token (the node was removed or
+  forgotten, or ACL state was reset), or a heartbeat comes back `Unauthenticated`, the
   worker discards it and registers with its join secret. If that is gone
   too, the worker exits with `Unauthenticated: unknown or revoked join
   token`; mint a new join token for that host and run `legion join` again.
@@ -623,8 +957,9 @@ manager's private key never leaves the managers:
 
 - The listener is always mutual TLS with the node's certificate from the
   cluster CA.
-- `PostWork`, `GetTaskLogs`, `RestartWorker`, and `StopSessions` admit only a
-  caller that presents a manager certificate (`legion://manager/<id>`). `ExecTask` admits
+- `PostWork`, `GetTaskLogs`, `RestartWorker`, `StopSessions`, and
+  `ForwardAppRequest` admit only a caller that presents a manager certificate
+  (`legion://manager/<id>`). `ExecTask` admits
   a manager, or a holder of an exec ticket on a worker that opts in to
   [direct exec](exec-and-actions.md#direct-exec). `StartClaim` admits a holder
   of a valid boot ticket.
@@ -744,7 +1079,9 @@ a version with it: a manager from before it cannot talk to one after.
 `legion_acl_whoami` MCP tool all report whether ACLs are enabled, how the
 caller was authenticated, which policies apply, and which namespaces the
 caller can read (`readable_namespaces`). Start here when
-debugging a `PermissionDenied`.
+debugging a `PermissionDenied`. An app debugging its viewer client calls
+`WhoAmI` through it: `source = delegated`, the principal `<viewer> via app
+<app>`, and the rule the delegation holds.
 
 ### Recovery
 

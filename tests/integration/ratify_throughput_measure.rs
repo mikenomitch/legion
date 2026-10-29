@@ -141,11 +141,13 @@ fn sandbox_job() -> JobConfig {
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         speculative_start: Some(SpeculativeStartConfig {
             mode: Some("boot".into()),
             ratify_timeout: Some("5s".into()),
             on_refused: None,
+            unknown_fields: Default::default(),
         }),
         resources: json!({ "memory": 64, "cores": 1 }),
         permit: json!({ "pool": POOL }),
@@ -158,6 +160,8 @@ fn sandbox_job() -> JobConfig {
         name: JOB.into(),
         tasks: vec![task],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

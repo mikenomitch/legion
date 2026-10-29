@@ -30,7 +30,7 @@
                     port = "http",   # label -> resolves to the assigned dynamic port
                     every = "5s",
                     timeout = "2s",
-                    unhealthy_after_count = 2,
+                    unhealthyAfterCount = 2,
                 },
             ],
             resources = { memory = 128 },

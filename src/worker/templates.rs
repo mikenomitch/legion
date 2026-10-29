@@ -631,6 +631,7 @@ mod tests {
                 change_signal: Some("SIGHUP".into()),
                 splay: Some("0s".into()),
                 coalesce: Some("10s".into()),
+                unknown_fields: Default::default(),
             },
             ConnectTemplate {
                 name: "static".into(),
@@ -640,6 +641,7 @@ mod tests {
                 change_signal: None,
                 splay: None,
                 coalesce: None,
+                unknown_fields: Default::default(),
             },
         ];
         let context = TemplateContext {

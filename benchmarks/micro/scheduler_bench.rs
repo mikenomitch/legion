@@ -105,6 +105,8 @@ fn make_jobs(total_allocations: usize) -> Vec<JobConfig> {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         });
     }
     jobs
@@ -219,6 +221,8 @@ fn make_constrained_job(task_count: usize, per_task: u32) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -315,6 +319,8 @@ fn fill_fleet(store: &Store, node_count: usize, per_node: usize) -> anyhow::Resu
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
             .pop()
@@ -348,6 +354,8 @@ fn make_fill_job(name: &str) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -496,6 +504,8 @@ fn make_api_job(name: &str) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -888,6 +898,8 @@ fn make_locality_job(with_content: bool) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -1029,6 +1041,8 @@ fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
         .pop()
@@ -1172,6 +1186,8 @@ fn setup_budget_placements(
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
         .pop()
@@ -1272,6 +1288,8 @@ fn setup_keyed_population(store: &Store, resident: usize) -> anyhow::Result<Stri
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
         .pop()

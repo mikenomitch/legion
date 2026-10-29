@@ -60,10 +60,10 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_namespace_delete` | yes | Delete a namespace; refused while it holds anything unless `cascade`. `dry_run` lists the contents. Supports `idempotency_key`. |
 | `legion_namespace_policy_list` / `_get` | no | Namespace policies (quota, counts, pools, runtimes, host volumes); needs `acl:read`. |
 | `legion_namespace_policy_apply` / `_delete` | yes | Write a namespace policy (needs `acl:write`). Run `dry_run` first: it lists what the policy would have refused among existing jobs. |
-| `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). For a [gang](gang-scheduling.md), `blocked.gang` says how many replicas fit (`placeable`, `running`) against the quorum it must place together (`min`), and, when it sets `placementTimeout`, when it gives up (`deadline`, Unix seconds): wait until then, or add capacity. A gang job past its deadline, or one whose `onMemberLoss` failed it, reports `status: failed` and places nothing until `legion job run`. |
+| `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). For a [gang](gang-scheduling.md), `blocked.gang` says how many replicas fit (`placeable`, `running`) against the quorum it must place together (`min`), and, when it sets `placementTimeout`, when it gives up (`deadline`, Unix seconds): wait until then, or add capacity. A gang job past its deadline, or one whose `onMemberLoss` failed it, reports `status: failed` and places nothing until `legion job run`. With `scale:read`, `scalingInputs` adds request vs usage per task, cluster-wide: replicas (ready, placed, desired, unplaced), measured CPU and memory against the reservation, requests into a service the task backs (internal callers only), and `freshness.state`. Act on usage only when the state is `current`; `missing` and `resyncing` mean no data, not zero load ([Scaling inputs](autoscaling.md#scaling-inputs)). |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
-| `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
-| `legion_job_validate` | no | Validate a rendered jobspec (JSON). |
+| `legion_job_schema` | no | This cluster's jobspec JSON Schema (`GetJobSchema`): the core fields and task runtimes, plus each key installed apps add at its point and in its qualified spelling `apps.<app>`. Without a reachable manager, the compiled-in schema, and `$comment` says installed keys are not included. |
+| `legion_job_validate` | no | Validate a rendered jobspec (JSON). An unknown key is an error naming its path and the closest known key (installed apps' keys included); values for installed apps' keys are checked against their schemas when a manager answers (`installedKeys: checked`; offline, `unchecked`, and keys at extension points are reported as not checked); `allow_unknown_fields` shows what a submit with the flag would keep and drop (`warnings`, `unknownFields`). |
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
 | `legion_instance_list` | no | List a job's stateful instances (slot + keyed), then its running [sessions](session-mode.md) (`mode: "session"`, `durable: false`) from the session index. The reply is `{ instances, nextIdlePageToken, complete, asOf }`: `complete: false` means some node that runs the job's sessions has not reported yet, so sessions may be missing. `include_idle: true` also lists instances [archived](suspend-and-resume.md#archiving-idle-instances) with `manifestOnly`, which have no row, from the bucket a page at a time (`idle_page_token`, `idle_page_size`); page until the token is empty, since a page can come back short. |
@@ -78,6 +78,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_node_usage` | no | One node's memory and CPU: capacity, reservations, and measured usage per allocation (current and peak memory, CPU, idle seconds). Also the node's oversubscription ratio and memory pressure status, and each allocation's place in the pressure order (`pressure_rank`, `pressure_steps`): which allocations a short node would stop first. Use it to compare reservations with real use before resizing a job ([resource-enforcement.md](resource-enforcement.md#memory-pressure)). |
 | `legion_node_usage_list` | no | Memory and CPU for many nodes in one call (`ListNodeUsage`): per node, capacity with the oversubscription ratio, reservations, measured use, and memory pressure status, plus CPU `cores` and `usedMillicores` (filled even where the platform reports no clock speed). Per-allocation rows only with `include_allocations`. Empty `node_ids` means every node, up to 500. Use it to find tight or pressured nodes before drilling in with `legion_node_usage` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
 | `legion_node_content` | no | What one node holds for content locality: the content it advertises to the manager's location index (digest, bytes, holder count, and the snapshot and part role it belongs to), whether its worker can publish and checkpoint, and its snapshots with `parts_here` of `parts_total`. `index_reported: false` means no content report reached this manager. Use it to see why placement preferred a node, or whether a node is warm for a snapshot before a resume or fork ([artifacts.md](artifacts.md)). |
+| `legion_scaling_demand` | no | How many nodes of each node-group template the pending work needs (`GetCapacityDemand`): the replicas the scheduler left unplaced, packed onto copies of each template with the scheduler's own rules. Per template, `nodes`, `replicas`, requested vs offered CPU and memory, and `refusals` with the rule; plus `unfittable` replicas no template can host (a jobspec problem, not capacity) and `awaiting_scheduler` jobs not tried yet. Needs `node:read`; names only jobs you can read ([Capacity demand](autoscaling.md#capacity-demand)). |
 | `legion_scheduler_concurrency` | no | How many evals the manager will plan at once, and why: the current limit against `evalThreads`, the plan-conflict and fallback rates, goodput, and a `state` of steady/throttled/probing/**saturated**. `throttled` means work will drain, so wait. `saturated` means the conflicts are capacity-driven, so ask for nodes rather than resubmitting ([adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md)). |
 | `legion_manager_list` | no | Every manager in the control plane from the replicated raft membership: role (`leader`, `follower`, `learner`, or `standalone` outside raft), advertised address, whether the answering manager reached it just now (with the probe error when not), and each reachable member's term and applied index. Any manager answers with the full list. Use it to find the leader or a manager that is down or lagging ([raft-operations.md](raft-operations.md#members)). |
 | `legion_keyring_status` | no | KV encryption at rest on the answering manager ([kv-encryption.md](kv-encryption.md)): `state` (`unlocked`, `locked`, `pending_upgrade`, …), the root key provider and location, each data key with how many values it protects, plaintext rows, rewrap progress, and a one-line `hint` with the next step when something needs doing. |
@@ -98,6 +99,10 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_net_ca_rotate` | **yes** | Rotate the built-in cluster CA in two steps: the new CA, cross-signed by the old one, signs at once and the old one stays trusted for 24 hours, so no connection breaks. Every node re-issues within one heartbeat. A `file` or `exec` CA rotates outside Legion: this returns `FailedPrecondition` with the procedure. |
 | `legion_net_policy_apply` | **yes** | Create or replace a network policy object. `dry_run` validates and lists affected allocations without writing. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
+| `legion_acl_grants_list` | no | Job grants: what each job version's `legion` identity was granted at submit (inline `permissions` and `policies`), who granted it, and whether it was revoked (`include_revoked`). `job` narrows to one job's canonical id. Needs `acl:read`. Revoking is `legion acl grants revoke` on the CLI, not an MCP tool. |
+| `legion_app_list` | no | Installed [apps](apps.md) (Legion's add-ons): each app's version, source, status (`running`, `degraded`, `pending`, `stopped`, with `statusDetail` saying why), placement, replicas running against desired (`running`, `desired`), the nodes it runs on, and its UI slots. Needs `app:read`; the list is filtered by the `names` selector. |
+| `legion_app_status` | no | One app (`app`): its record (`manifest`, `settings`, `config`), its grant (`grant.rules`, who approved it), its job's status, the app reconciler's last action and error (`reconcile`), its build marker and what it waits for (`reconcile.markerReason`), and `notes` (no system worker, workload identity off). Changing an app (install, config, settings) is `legion app` on the CLI, not an MCP tool. |
+| `legion_app_view` | no | One of an app's declarative views ([Apps: Views and actions](apps.md#views-and-actions)): what its panel on a job, task, or node page, its sidebar page, or its overview card shows a person, as JSON. Takes `app`, `slot` (`nav`, `overview`, `job`, `task`, `node`), the slot's context (`job` with `namespace`, `task`, `group`, `node`), and optionally `view`. Returns `document` (the validated `legion-view/1` blocks), `actions` (each with `allowed` and `mutating`), and which allocation answered. Checked as the caller: `app:read` and the view's declared permission on the context, before the app is asked. The same data as `legion app view -j`. Actions are not run over MCP. |
 | `legion_events` | no | List scheduler events. Poll with `after_id` to tail. `instance_id` narrows to one stateful instance (its own events plus its allocations'), `allocation_id` to one allocation. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job, including allocations removed in the last 24 hours (`removed`, `removalCause`). |
 | `legion_state_query` | no | Read-only SQL against the state store. |
@@ -105,12 +110,18 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_template_list` | no | List job templates (name, latest version, variable count). |
 | `legion_template_get` | no | One template version: declared variables, source, version history. |
 | `legion_template_render` | no | Dry-run a template: validate variables and return the rendered jobspec without submitting. |
-| `legion_job_run` | **yes** | Submit/update a job from rendered JSON. |
+| `legion_job_run` | **yes** | Submit/update a job from rendered JSON. `allow_unknown_fields` accepts keys Legion does not know, as `--allow-unknown-fields` does; the reply's `warnings` lists each one kept or dropped. |
 | `legion_job_stop` | **yes** | Stop a job. |
-| `legion_job_scale` | **yes** | Change a task's count without a new job version or rollout ([autoscaling.md](autoscaling.md)). Supports `idempotency_key`. |
-| `legion_job_scale_status` | no | Per-task spec vs override vs effective counts. |
+| `legion_job_scale` | **yes** | Change a task's count without a new job version or rollout ([autoscaling.md](autoscaling.md)). On an autoscaled task a count is a time-boxed pin and needs `for` (refused otherwise, with a hint); `min`/`max` with `for` pin a floor or ceiling; `release` ends a pin. Supports `idempotency_key`. |
+| `legion_job_scale_status` | no | Per-task spec vs override vs effective counts. The effective count is the one placement converges to: an override laid over a different spec count does not bind and is not reported. For an autoscaled task, also its policy in one line, its pin and pause, and the autoscaler's state. |
+| `legion_scaling_status` | no | Task autoscaling ([autoscaling.md](autoscaling.md)): every autoscaled task's `now`, `want`, bounds, mode, and `state` (`ok`, `scaled`, `held`, `limited`, `deferred`, `pinned`, `paused`, `dry-run`, `missing-data`, `invalid`, `stale`, `not-evaluated`), its last change, the replica that evaluated it (`instance`), and `app.state` (`running`, `not-running`, `starting`, `disabled`), with `app.replicas` listing every [autoscaler replica](autoscaling.md#replicas), its shards, and its last report. An agent should treat `not-running` as "nothing is scaling", and `stale` as "this target's numbers are old". |
+| `legion_scaling_explain` | no | Why an autoscaled task (or, with `policy`, a standalone policy's target or a node group: each stage, the members chosen for scale-in, the ones protected and why, and the actions taken) is at its count, as data: the last evaluation's checks (reading, desired) and every safeguard stage (`before`, `after`, `note`), and the effective policy with each field's origin (`built-in`, `cluster defaults`, `namespace policy <name>`, `jobspec`). Read this before changing a policy. |
+| `legion_scaling_history` | no | The durable record of a job's (or, with `policy`, a standalone policy's) count changes, newest first: source (`operator`, `autoscaler`), principal, from/to, the one-line why, dry-run rows (`kind = would`, `applied = false`), and failed target calls (`kind = failed`). |
+| `legion_scaling_simulate` | no | Run a policy over up to an hour of recorded history, or a CSV series, and return the count changes it makes ([Simulating a policy](autoscaling.md#simulating-a-policy)). `job` simulates the live policy (`mode = replay`: the decisions the autoscaler made); `spec` takes an edited jobspec or a standalone policy as JSON (`mode = follow`: what it would have done). Writes nothing. Call it before submitting a policy change, and compare its changes with `legion_scaling_history`. |
+| `legion_scaling_apply` | **yes** | Create or update a standalone scaling policy (an external target scaled through a target plugin) or a [node group](autoscaling.md#node-groups) (machines a node target plugin starts, which Legion drains and terminates), from `spec` as JSON ([Standalone policies](autoscaling.md#standalone-policies)). `dry_run = true` validates and returns the field-by-field `diff` against the stored version without writing: use it first. Applying an unchanged spec writes nothing. A node group needs `operator:write` and `node:write`. Supports `idempotency_key`. |
+| `legion_scaling_pause` | **yes** | Pause (or `resume=true`) autoscaling for a job, a task, a standalone `policy`, or the cluster (`all`, needs `operator:write`), optionally `for` a duration. Supports `idempotency_key`. Prefer a pause over fighting the autoscaler with `legion_job_scale`; on an autoscaled task a manual count needs `for` anyway (a pin). |
 | `legion_job_destroy` | **yes** | Destroy a job. |
-| `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key`). |
+| `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key` and `allow_unknown_fields`). |
 | `legion_template_upsert` | **yes** | Store Nickel as the next immutable version of a template. |
 | `legion_template_delete` | **yes** | Delete a template and all of its versions (running jobs are unaffected). |
 | `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id, supports `idempotency_key`). `from_snapshot` restores the new instance(s) from a snapshot of the job (an id or a name), on the snapshot's node, at most 64 per call. Needs `snapshot:read` too. On a [session task](session-mode.md), omitting `instance_id` starts an unnamed session with no raft write: the reply has `mode: "session"`, `durable: false`, and `nodeId`. Always pass `idempotency_key` there: the session id is derived from it, so a retry finds the same session. |
@@ -120,6 +131,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_instance_start` | **yes** | Start a stopped keyed instance, or resume a suspended one from its checkpoint (`cold = true` boots fresh instead). Returns at once with `resumingFrom`. Poll `legion_instance_get` until `state` is `active` with no `pendingOp`, or read `instance.resumed` / `instance.restore_failed`. Then check `coldBoot`: when set, the restore failed and the instance booted fresh on its volume (`onRestoreFailure = "cold"`), so its running processes are gone. Supports `idempotency_key`. On a suspended [session](session-mode.md#idle-sessions) it resumes it on its node and answers when it runs; `RESOURCE_EXHAUSTED` (envelope full) is retryable and keeps the checkpoint, `NOT_FOUND` "evicted" means the session is gone for good, and `UNAVAILABLE` names a node that is not answering. A session whose task sets `suspend.durability = "store"` [moves](session-mode.md#moving-a-session) to another node from its manifest instead, and the message names the node it moved from; `UNAVAILABLE` `running_elsewhere` means the manifest says it runs on a silent node that is not marked down: retry later, or pass `force_move: true` only once that node is known to be gone. `ABORTED` `superseded` means a racing resume won; the message ends in `[winner node=<id> generation=<g>]`. |
 | `legion_instance_fork` | **yes** | [Fork](suspend-and-resume.md#fork) a running keyed instance into `count` new instances (`<id>-f<n>`), each with its own cloned volume and identity, on the origin's node, or with `spread: true` each on its own node from a published checkpoint. The origin keeps running. Returns the fork ids at once. Poll `legion_snapshot_get` on the returned `snapshot` until `local` (forks being placed, or `published` for a spread fork) or `failed` (origin unaffected, forks terminated). Needs `job:write` and `snapshot:write`. Supports `idempotency_key`, and a retry returns the same forks. |
 | `legion_instance_replace` | **yes** | Force-replace an instance's allocation that is stuck on a LOST node. Skips the `onLost.replaceAfter` loss-confirmation gate, so it risks split-brain if the node is only partitioned. Supports `idempotency_key`. |
+| `legion_node_forget` | **yes** | Forget a dead node: remove its record and revoke its node token in one write ([Forgetting a node](architecture-managers-workers.md#forgetting-a-node)). Refused with `FailedPrecondition`, naming what to do, while the node has allocations, is live and not cordoned, or holds node-local volumes; `force = true` asserts the machine is gone for good. Supports `idempotency_key` (a repeat replays the result with `deduplicated = true`). |
 | `legion_volume_delete` | **yes** | Delete a volume and reclaim its storage. DESTROYS DATA. `force = true` tombstones without driver confirmation, for a node that is gone for good. Supports `idempotency_key`. |
 | `legion_snapshot_create` | **yes** | Snapshot a running instance: `kind = "disk"` (default) or `"memory"` (sandbox tasks with a `snapshots` block). `publish = true` uploads it to the node's `contentStore` once captured, so it restores on any compatible node. Returns in state `capturing`, so poll `legion_snapshot_get` until `local` (or `published`) or `failed`. A memory snapshot contains the workload's in-memory secrets. Supports `idempotency_key`. |
 | `legion_snapshot_delete` | **yes** | Delete a snapshot. Its node reclaims the bytes on its next heartbeat. Supports `idempotency_key`. |
@@ -243,17 +255,34 @@ Agents write jobspecs far more reliably against a schema than against free-form
 Nickel.
 
 ```bash
-# Get the jobspec JSON Schema, including the live per-runtime task config schemas:
+# Get this cluster's jobspec JSON Schema, including the live per-runtime task
+# config schemas and the keys installed apps add:
 legion job schema --json
 
 # Render and deeply validate a jobspec WITHOUT submitting it:
 legion job validate ./configs/jobs/demo.ncl --json
+
+# The keys installed apps add, with their schemas and examples:
+legion app extensions --json
 ```
 
 `job validate` runs the same validation the manager applies on submit
 (`validate_job_config`), so an agent can fix mistakes before touching the
 cluster. The schema includes the built-in task-runtime config schemas (`exec`,
 `container`, …) under `taskRuntimes`, derived from the typed Rust structs.
+
+**The schema is the cluster's.** With a manager reachable, `job schema`,
+`job validate`, and the `legion_job_schema` and `legion_job_validate` MCP
+tools use `GetJobSchema` (`job:read`): the core schema plus every key an
+installed [app](apps.md#jobspec-extensions) adds, as a property at its
+extension point (`backup` on volume entries, `dns` on ports, …) described as
+"From the backup app, 0.3.1: …", and under that point's `apps` record in
+its qualified spelling. `job validate` checks values for those keys against
+their schemas and lists what only a submit checks (a key's `requires`, an
+app's own validate call). Offline, both fall back to the compiled-in schema
+and say so: `job schema` in `$comment`, `job validate` with
+`"installedKeys": "unchecked"` and one warning per key at an extension point
+it could not resolve.
 
 **Write the spec as `.json`, not `.ncl`.** The JSON path exists for
 machine-generated specs like these. `legion job schema` describes the JSON, an
@@ -280,6 +309,34 @@ node runs gated by default and denies every outbound connection that nothing
 allows, so a task with no `network.egress` (and no policy object covering it)
 is warned about before its first `403 gated-default`. Each warning line ends
 with a `hint:` naming the fix.
+
+**Unknown keys are errors.** A key the jobspec does not know, at any level,
+fails `job validate`, `job plan`, and `job run` with `InvalidArgument`. The
+message lists every unknown key with its path and, when one is close, the
+known key it most likely meant; the envelope's `hint` says how to submit
+anyway:
+
+```json
+{ "ok": false, "error": { "code": "InvalidArgument",
+  "message": "failed to run job: Error parsing jobspec: web: task web: unknown field `cuont` (did you mean `count`?)",
+  "hint": "fix or remove each field above. To submit anyway, pass --allow-unknown-fields …",
+  "retryable": false } }
+```
+
+An installed app's key is a suggestion too (`did you mean `backup`, the
+backup app's key?`), and a value that fails an installed key's schema is an
+error naming its full path (`orders-db: task postgres: volume data:
+backup.keep: 0 is less than the minimum of 1`) that no flag excuses.
+
+Fix the spec: the suggestion is usually the whole fix. `--allow-unknown-fields`
+(`allow_unknown_fields` on the RPCs and MCP tools) is for a key Legion cannot
+know yet, such as one meant for an app that is not installed: keys on the
+job, a task, a volume, a port, or a service are kept as pending, the rest are
+dropped, each one is a line in `warnings` (`job run`, `job plan`,
+`job validate`, `template run`), and the set is recorded on the version
+(`unknownFields` in `legion job info -j`). Don't set it by default; a spec
+that needs it should say why. See
+[Unknown Fields](jobs-tasks-and-scheduling.md#unknown-fields).
 
 ### Job templates: authoring by parameter instead of by spec
 
@@ -461,6 +518,8 @@ legion job destroy demo     --idempotency-key destroy-demo-001
 legion instance create sandbox-demo --id user-42 --idempotency-key sbx-user-42
 legion instance destroy user-42     --idempotency-key destroy-user-42
 legion snapshot create user-42 --name before-refactor --idempotency-key snap-user-42-001
+legion scaling pause web --for 1h  --idempotency-key pause-web-001
+legion scaling defaults apply defaults.ncl --idempotency-key defaults-v3
 ```
 
 The manager records the first outcome for a key and replays it for any later
@@ -736,6 +795,55 @@ Every refusal uses the standard error envelope, with `retryable` and a
 `manager_unavailable`). `legion instance get -j` shows the task's `wake`
 block and, while the instance runs, its `endpoints`.
 
+## 6d. Reading what an app's panel shows (`legion app view`)
+
+Apps add panels to the UI as declarative views, never as code
+([Apps: Views and actions](apps.md#views-and-actions)). The same views are
+data an agent can read: whatever a person sees on a panel, an agent sees too.
+
+```bash
+legion app view gitops                       # what the app shows you, and where
+legion app view gitops job web -j            # the job panel for `web`, as JSON
+legion app view gitops task web sync -j      # a task's badge view
+legion app view gitops node wkr-3 -j         # the node panel
+```
+
+`-j` (and the `legion_app_view` MCP tool) returns the validated
+`legion-view/1` document under `document` (typed blocks: `stats`, `series`,
+`table`, `timeline`, `keyValue`, `notice`, `markdown`, `actions`), plus
+`actions`, each with `allowed` (whether you hold its permission there) and
+`mutating`. Every read is checked as the caller (`app:read`, then the view's
+declared permission on the context) before the app is asked, so a
+`PERMISSION_DENIED` means the view is not yours to see, and the app saw
+nothing. Running an action (`InvokeAppAction`) is mutating, audited as
+`app.action`, and takes an idempotency key; agents read views only for now.
+An agent that does call `InvokeAppAction` is the viewer like anyone else:
+the app acts on its behalf, holding only the action's declared permission
+on that context, and what it writes is recorded as `<agent's token name>
+via app <app>` ([Delegated identities](auth-and-acls.md#delegated-identities)).
+
+**Changing apps safely.** Every `legion app` write has a dry run:
+`install`, `upgrade`, `set`, `config set`, `enable`, `disable`, and
+`uninstall` take `--dry-run`, validate everything the real call would
+(install, upgrade, `set` and `config set` also run the app's job through the
+submit's admission chain), and change nothing. `upgrade --dry-run -j`
+reports `uncovered` (the permission your token lacks, empty when it holds
+them all) and `orphanedJobs` (jobs whose jobspec values the new manifest
+would orphan; the real upgrade then needs `--force`), so an agent never
+parses a message to learn it would be refused. An app's status
+(`legion app status -j`, `legion_app_status`) reads `upgrading`,
+`degraded` with `upgrade failing: …`, or `corrupt` when an upgrade has not
+taken or a record cannot be read. Direct writes to an installed app's job
+(`legion job run|scale|stop|destroy` on `legion-system/<app>`) are refused
+with `FAILED_PRECONDITION` and the `legion app` verb to use instead.
+
+An app may also ship **sandboxed pages** (`ui.pages`), single-file HTML the
+UI mounts in an iframe ([Apps: Sandboxed pages](apps.md#sandboxed-pages)).
+They are for people: `legion app view <app>` lists them, and
+`GetAppPage` (capability `app.page`) returns the bundle, but there is no MCP
+tool, because an agent cannot run a page. Everything a page does is an
+ordinary Manager RPC an agent can call itself.
+
 ## 7. State store introspection + saved query library
 
 The SQL state store is the agent's main introspection tool. It is read-only by
@@ -757,7 +865,9 @@ Explorer. See `AGENT_SAVED_QUERIES` in [`src/cmd/state.rs`](../src/cmd/state.rs)
 
 All client commands and the MCP server read:
 
-- `LEGION_ADDR`: manager address (default `http://127.0.0.1:4747`).
+- `LEGION_ADDR`: manager address (default `http://127.0.0.1:4747`), or a
+  `unix://` socket path, which is what a task with the `legion` identity
+  gets ([below](#agents-that-run-as-legion-jobs)).
 - `LEGION_TLS_CA_CERT`: CA certificate path for `https`/`grpcs` addresses.
 - `LEGION_TOKEN`: ACL token sent as a bearer credential. ACLs are on by
   default, so the CLI and the MCP server need a token for every call. Falls
@@ -784,6 +894,29 @@ All client commands and the MCP server read:
 
 Both timeouts take a duration (`45s`, `2m`) or bare seconds, and `0` turns
 the timeout off.
+
+### Agents that run as Legion jobs
+
+An agent that runs as a task needs no address or token in its spec. Give
+its task the reserved `legion` identity, with what it may do as
+`permissions`, and submit it with a token that holds them
+([Workload identity: Permissions](workload-identity.md#permissions)):
+
+```nickel
+identities = [{
+  name = "legion",
+  permissions = [{ resources = ["job"], actions = ["read"], namespaces = ["agents-dev"] }],
+}],
+```
+
+Inside the task, `LEGION_ADDR` is already `unix://…/legion.sock`, a socket
+the worker proxies to the managers with the task's own identity attached, so
+`legion …` commands and `legion mcp serve` work with nothing set and no route
+to a manager. `LEGION_IDENTITY_TOKEN_FILE` names the raw token for clients
+that cannot use a socket. What the job may do is listed with `legion acl
+grants list` (`legion_acl_grants_list`) and taken back with `legion acl grants
+revoke`, effective at its next call. See [Workload identity: The API
+socket](workload-identity.md#the-api-socket).
 
 ### Namespaces for agents
 

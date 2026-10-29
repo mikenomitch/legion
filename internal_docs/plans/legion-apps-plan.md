@@ -2,8 +2,91 @@
 
 > **Judgement calls:** [legion-apps-plan_calls.md](../calls/legion-apps-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-19; reconciler and upgrade details,
-jobspec extensions, and strict unknown fields added 2026-10-27). Nothing is built. It has six phases (§8),
+> **§6.5's actions are extended by
+> [app-actions-as-viewer-plan.md](app-actions-as-viewer-plan.md)** (2026-10-29):
+> an app now acts on a press as the viewer (`alice via app <app>`), bounded by
+> the declared permission and its grant, rather than with its own grant.
+> That plan wins where they differ; the text below is kept as written.
+
+> **Hardened after an adversarial security review** (2026-10-29; calls
+> entries 99-110 win where they differ from the text below, which is kept as
+> written): every KV reference needs `kv:read` before it is resolved; an
+> app's job may hold nothing host-level, and the reconciler has no `host`
+> grant; each app runs as its own uid recorded on the app, replacing
+> `systemWorker.appUser` (§6.2, §6.3); a page's `rpcs` are bounded by its
+> installer's rights and exclude ACL, token and app writes (§6.5);
+> placement changes take `operator:write`; an app's identity needs the
+> reconciler's `managedBy` stamp.
+
+> **Hardened after an adversarial correctness and operability review**
+> (2026-10-29; calls entries 111-129 win where they differ from the text
+> below, which is kept as written): direct edits to an installed app's job
+> are **refused**, not reverted (§6.3, §12); the reconciler's submit is
+> compare-and-set on the record; stored records read leniently and a
+> corrupt one is isolated; status counts only the job's latest version; a
+> failed job restarts with backoff; bundled markers agree on the version;
+> a bundled upgrade whose schema refuses the stored config is held; install
+> and upgrade run the job's admission chain. Rollback is deferred.
+
+**Status: SHIPPED** (every phase, A1-A6, by 2026-10-29; written 2026-10-19; reconciler and upgrade
+details, jobspec extensions, and strict unknown fields added 2026-10-27).
+**A1 shipped 2026-10-28** (the `legion-system` namespace, the reserved-glob
+rule, node-side `namespaces`, and the system worker; docs:
+[namespaces.md](../../docs/namespaces.md#reserved-namespaces),
+[architecture-managers-workers.md](../../docs/architecture-managers-workers.md#the-system-worker)).
+Where A1 differs from this text, calls entries 18-28 say how and why; the
+largest differences are that a node's `namespaces` is a config attribute,
+not a column (entry 19), and that the system worker has its own port and
+state directory (entry 20). **A2 shipped 2026-10-28** (`permissions` and
+`policies` on the `legion` identity, granted at submit up to what the
+submitter holds; per-version grants with `legion acl grants list|revoke`;
+the per-allocation API socket with ambient `LEGION_ADDR=unix://…`; and
+registration-pinned node `namespaces` and `legion.role`; docs:
+[workload-identity.md](../../docs/workload-identity.md#control-plane-identity),
+[auth-and-acls.md](../../docs/auth-and-acls.md#job-grants)). Calls entries
+29-41 record where A2 differs: a token resolves its grant through a
+`grant:alloc/<id>` reference (entry 29), grants are per task (entry 33),
+registration pins from the token for in-process workers (entry 32), and
+sandboxes get the token file but no socket yet (entry 37). **A3 shipped
+2026-10-28** (app manifests and Control-lane records; the app reconciler
+with the `managedBy` digest stamp, per-transition idempotency keys, revert
+of direct edits, restart of stopped jobs, backoff and parked refusals;
+`legion:self`; the build marker from a new worker-reported `buildId`;
+seeding with the `apps` block; the `app` ACL resource, eight RPCs,
+`legion app`, app events, `legion_apps{status}`, and the MCP read tools;
+docs: [apps.md](../../docs/apps.md)). Calls entries 42-57 record where A3
+differs: the reconciler submits as an identity holding exactly the recorded
+grant (entry 42), bundled apps cannot be uninstalled (entry 43), only
+`artifact = true` code fields become artifacts (entry 46), and workload
+identity stays off by default, so apps hold no credentials until it is on
+(entry 56). **A6a shipped 2026-10-28** (unknown jobspec keys are submit
+errors with a did-you-mean; `--allow-unknown-fields` keeps keys at extension
+points in `pendingExtensions` and drops the rest, recorded on the version;
+docs: [jobs-tasks-and-scheduling.md](../../docs/jobs-tasks-and-scheduling.md#unknown-fields)).
+Calls entries 58-67 record where A6a differs: every `JobConfig` parse is
+strict (entry 58), network policy blocks and value sources stay strict even
+with the flag (entry 59), and free-form maps such as `resources` are not
+checked (entry 60). **A4 and A5 shipped 2026-10-28** (app views and
+actions in the `nav`, `overview`, `job`, `task`, and `node` slots, authorized
+as the viewer and forwarded with a signed viewer assertion over a narrow
+worker-plane RPC; `legion app view`; and sandboxed single-file pages behind a
+`postMessage` bridge with an allowlist the manager re-checks; docs:
+[apps.md](../../docs/apps.md#views-and-actions)). Calls entries 68-84 record
+where they differ: running an action needs `app:read` plus the action's
+declared permission rather than `app:write` (entry 68), the forward is its
+own RPC until the reverse proxy lands (entry 70), and pages live only in the
+sidebar (entry 82). **A6b shipped 2026-10-29** (app-declared jobspec
+extension keys at the job, group, task, volume, port, and service points,
+the `apps.<app>` spelling, install-time collision checks and `--key`
+renames, schema validation with defaults, `requires`, the fail-open validate
+call, `GetJobSchema`, `WatchAppExtensions`, pending adoption, and in-place
+moves for extension-only changes; docs:
+[apps.md](../../docs/apps.md#jobspec-extensions)), with the A1 follow-ups
+(per-worker host-guard names, reserved `legion-` pools, a list
+`pools.default`). Calls entries 85-97 record where they differ: values live
+in one job-level list with state worked out on read (entry 85), pending
+values are adopted on read (entry 86), and the validate call fails open
+(entry 87). It has six phases (§8),
 and each ships alone. The first consumer is the autoscaler
 ([autoscaler-v2-plan.md](autoscaler-v2-plan.md)). GitOps is the second, and
 this plan checks the substrate against it (§6.8). Deliberately deferred:
@@ -1271,9 +1354,11 @@ on the CLI's `job validate`, and a per-repo setting for GitOps.
   at that point is installed, it validates and adopts the pending values
   (and its install prompt reports them). A pending value no app ever claims
   stays inert, and `job info` shows it.
-- **An unknown key anywhere else is dropped**: inside `resources`, a
-  `rollout` block, and so on. Nothing could ever own it there. Each dropped
-  key is listed in the reply's `warnings`.
+- **An unknown key anywhere else is dropped**: inside `stop`, a `rollout`
+  block, and so on. Nothing could ever own it there. Each dropped key is
+  listed in the reply's `warnings`. (Free-form maps such as `resources`,
+  `meta`, and `constraints` take any key, so they have nothing to check;
+  calls entry 60.)
 - **A value for an installed app's key that fails its schema is still an
   error.** The flag is about keys Legion doesn't know, not values it knows
   are wrong.
@@ -1281,12 +1366,12 @@ on the CLI's `job validate`, and a per-repo setting for GitOps.
 
 ```console
 $ legion job run orders-db.ncl --allow-unknown-fields
-warning: task postgres: dropped unknown field `resources.memoryMax2`
+warning: task postgres: dropped unknown field `stop.signall`
 warning: task postgres: volume data: kept `backup` as pending (no installed app declares it)
 orders-db: submitted version 3
 $ legion job info orders-db
 ...
-submitted with --allow-unknown-fields: dropped resources.memoryMax2; backup on volume data
+submitted with --allow-unknown-fields: dropped stop.signall; backup on volume data
 pending (no installed app declares it)
 ```
 
@@ -1385,7 +1470,9 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
   - `ListGrants`, `RevokeGrant`;
   - `WorkloadIdentity` gains `repeated AclRule permissions` and
     `repeated string policies`;
-  - `Node` gains `repeated string namespaces`.
+  - `Node` gains `repeated string namespaces`. *A1 adds
+    `WorkerConfig.namespaces` instead; the node carries the list as a config
+    attribute (calls entry 19).*
 - **ACL.** A new resource `app` (cluster-scoped, `names` selector). Every
   RPC above goes in `tests/integration/acl_endpoints.rs`. Glob matching
   gains the reserved-prefix rule for `legion-*` namespaces and `legion/` KV
@@ -1401,7 +1488,8 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
     write that stores a version;
   - reconciler status columns on `app` (last digest, last action, last
     error, the held version marker and its reason);
-  - `node.namespaces` (JSON array).
+  - `node.namespaces` (JSON array). *A1 carries it as the node's
+    `namespaces` config attribute instead (calls entry 19).*
   - Bootstrap creates `legion-system` and its namespace policy
     (`pools.default = "legion-system"`).
 - **Scheduler.** A namespace check in `scan_base_eligible` and in the

@@ -44,6 +44,8 @@ still be happy with at fifty thousand nodes.
   [rollouts](docs/rollouts.md), [ACLs](docs/auth-and-acls.md) on by default,
   [namespaces](docs/namespaces.md) with per-team quotas,
   [workload identity (OIDC)](docs/workload-identity.md), and a [web UI](#web-ui).
+  Add-ons run as [apps](docs/apps.md): jobs on the managers that Legion keeps
+  running, each with a grant it shows you before you install it.
 - **Readable job specs.** [Nickel](docs/configuration-language.md) gives you
   types, imports, and functions for DRY specs. You don't need YAML or Helm
   charts.
@@ -437,7 +439,8 @@ start:
   [Adaptive Scheduler Concurrency](docs/adaptive-scheduler-concurrency.md)
 - **Running workloads:** [Task Runtimes](docs/task-runtime-plugins.md) ·
   [Artifacts](docs/artifacts.md) · [Rollouts](docs/rollouts.md) ·
-  [Scaling Jobs](docs/autoscaling.md) ·
+  [Autoscaling](docs/autoscaling.md) ·
+  [Autoscaling Plugins](docs/autoscaling-plugins.md) ·
   [Gang Scheduling](docs/gang-scheduling.md) ·
   [Task Supervision](docs/task-supervision.md) ·
   [Resource Enforcement](docs/resource-enforcement.md)

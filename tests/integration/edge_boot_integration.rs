@@ -76,11 +76,13 @@ fn sandbox_task() -> TaskConfig {
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         speculative_start: Some(legion::structs::edge_boot::SpeculativeStartConfig {
             mode: Some("boot".into()),
             ratify_timeout: Some("5s".into()),
             on_refused: None,
+            unknown_fields: Default::default(),
         }),
         resources: json!({ "memory": 512, "cores": 1 }),
         // Edge nodes live in their own pool; without this the task's implicit
@@ -98,6 +100,8 @@ fn submit(store: &Store) -> R<String> {
         name: JOB.into(),
         tasks: vec![sandbox_task()],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     store.handle_job_submit(
         &config,

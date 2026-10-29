@@ -4,14 +4,16 @@
 //!
 //! See docs/auth-and-acls.md for the policy schema and workflows.
 
-use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
+use crate::cmd::helpers::{
+    connect_manager_client, job_arg, json_flag, namespace_flag, print_table, required_job_arg,
+};
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
     AclPolicy, AclTokenInfo, AclUser, CreateAclTokenRequest, DeleteAclPolicyRequest,
-    DeleteAclTokenRequest, DeleteAclUserRequest, GetAclPolicyRequest, ListAclPoliciesRequest,
-    ListAclTokensRequest, ListAclUsersRequest, UpsertAclPolicyRequest, UpsertAclUserRequest,
-    WhoAmIRequest,
+    DeleteAclTokenRequest, DeleteAclUserRequest, GetAclPolicyRequest, JobGrant,
+    ListAclPoliciesRequest, ListAclTokensRequest, ListAclUsersRequest, ListGrantsRequest,
+    RevokeGrantRequest, UpsertAclPolicyRequest, UpsertAclUserRequest, WhoAmIRequest,
 };
 use tabled::Tabled;
 
@@ -148,6 +150,59 @@ pub fn config() -> Command {
                 .arg(json_flag()),
         );
 
+    let grants_cmd = Command::new("grants")
+        .about(
+            "List and revoke job grants: what jobs' `legion` identities were granted at submit \
+             (docs/workload-identity.md, \"Permissions\")",
+        )
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("list")
+                .about("List job grants and who made them")
+                .arg(
+                    Arg::new("job")
+                        .long("job")
+                        .value_name("JOB")
+                        .help("Only this job's grants (`name`, or `namespace/name`)"),
+                )
+                .arg(namespace_flag())
+                .arg(
+                    Arg::new("all")
+                        .long("all")
+                        .short('a')
+                        .action(ArgAction::SetTrue)
+                        .help("Include revoked grants"),
+                )
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("revoke")
+                // `--version` is the job config version here, as on
+                // `legion template`, not the binary's.
+                .disable_version_flag(true)
+                .about(
+                    "Revoke a job's grants; its tokens lose them at their next request. The \
+                     next submit by someone who holds the access grants them again",
+                )
+                .arg(Arg::new("job").value_name("JOB").required(true))
+                .arg(namespace_flag())
+                .arg(
+                    Arg::new("version")
+                        .long("version")
+                        .value_name("VERSION")
+                        .value_parser(clap::value_parser!(i64))
+                        .help("Revoke only this job config version's grant (default: every version's)"),
+                )
+                .arg(
+                    Arg::new("idempotency-key")
+                        .long("idempotency-key")
+                        .value_name("KEY")
+                        .help("Dedupe retries: a repeat with the same key returns the first reply"),
+                )
+                .arg(json_flag()),
+        );
+
     Command::new("acl")
         .about("Administer authentication and ACLs")
         .subcommand_required(true)
@@ -156,6 +211,7 @@ pub fn config() -> Command {
         .subcommand(policy_cmd)
         .subcommand(token_cmd)
         .subcommand(user_cmd)
+        .subcommand(grants_cmd)
 }
 
 #[instrument(skip_all)]
@@ -192,6 +248,11 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                     .context("Must provide accessor ID")?;
                 token_delete(accessor, OutputFormat::from_matches(arg_matches)).await
             }
+            _ => unreachable!(),
+        },
+        Some(("grants", grants_matches)) => match grants_matches.subcommand() {
+            Some(("list", arg_matches)) => grants_list(arg_matches).await,
+            Some(("revoke", arg_matches)) => grants_revoke(arg_matches).await,
             _ => unreachable!(),
         },
         Some(("user", user_matches)) => match user_matches.subcommand() {
@@ -672,6 +733,144 @@ async fn user_delete(username: &str, format: OutputFormat) -> R<()> {
         output::print_success(&json!({ "message": message }));
     } else {
         println!("{message}");
+    }
+    Ok(())
+}
+
+fn grant_json(grant: &JobGrant) -> Value {
+    json!({
+        "jobId": grant.job_id,
+        "version": grant.version,
+        "jobConfigId": grant.job_config_id,
+        "tasks": grant.tasks.iter().map(|task| json!({
+            "group": task.group,
+            "task": task.task,
+            "permissions": serde_json::from_str::<Value>(&task.permissions_json)
+                .unwrap_or(Value::Null),
+            "policies": task.policies,
+        })).collect::<Vec<_>>(),
+        "grantedBy": grant.granted_by,
+        "grantedAt": grant.granted_at,
+        "revokedAt": (!grant.revoked_at.is_empty()).then_some(&grant.revoked_at),
+        "revokedBy": (!grant.revoked_by.is_empty()).then_some(&grant.revoked_by),
+    })
+}
+
+/// One line per granted rule or policy, for the table: `kv:read,write on
+/// certs/*`, `policy cert-writer`.
+fn grant_summary(grant: &JobGrant) -> String {
+    let mut lines = Vec::new();
+    for task in &grant.tasks {
+        let rules: Vec<crate::structs::acl::AclRule> =
+            serde_json::from_str(&task.permissions_json).unwrap_or_default();
+        for rule in rules {
+            let mut line = format!(
+                "{}{}:{}",
+                if rule.is_deny() { "deny " } else { "" },
+                rule.resources.join(","),
+                rule.actions.join(",")
+            );
+            if let Some(paths) = &rule.paths {
+                line.push_str(&format!(" on {}", paths.join(",")));
+            }
+            if let Some(names) = &rule.names {
+                line.push_str(&format!(" on jobs {}", names.join(",")));
+            }
+            if let Some(namespaces) = &rule.namespaces {
+                line.push_str(&format!(" in {}", namespaces.join(",")));
+            }
+            lines.push(if grant.tasks.len() > 1 {
+                format!("{}: {line}", task.task)
+            } else {
+                line
+            });
+        }
+        for policy in &task.policies {
+            lines.push(if grant.tasks.len() > 1 {
+                format!("{}: policy {policy}", task.task)
+            } else {
+                format!("policy {policy}")
+            });
+        }
+    }
+    lines.join("\n")
+}
+
+#[derive(Tabled)]
+struct GrantPrint {
+    job: String,
+    version: i64,
+    grants: String,
+    granted_by: String,
+    granted_at: String,
+    revoked: String,
+}
+
+async fn grants_list(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let job = job_arg(arg_matches, "job")?;
+    let mut client = connect_manager_client().await?;
+    let response = output::resolve(
+        format,
+        "Failed to list grants",
+        client
+            .list_grants(tonic::Request::new(ListGrantsRequest {
+                job,
+                include_revoked: arg_matches.get_flag("all"),
+            }))
+            .await,
+    )?;
+    let grants = response.into_inner().grants;
+    if format.is_json() {
+        output::print_success(&grants.iter().map(grant_json).collect::<Vec<_>>());
+    } else if grants.is_empty() {
+        println!("No grants");
+    } else {
+        print_table(
+            grants
+                .iter()
+                .map(|grant| GrantPrint {
+                    job: grant.job_id.clone(),
+                    version: grant.version,
+                    grants: grant_summary(grant),
+                    granted_by: grant.granted_by.clone(),
+                    granted_at: grant.granted_at.clone(),
+                    revoked: if grant.revoked_at.is_empty() {
+                        "-".to_string()
+                    } else {
+                        format!("{} by {}", grant.revoked_at, grant.revoked_by)
+                    },
+                })
+                .collect(),
+        );
+    }
+    Ok(())
+}
+
+async fn grants_revoke(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let job = required_job_arg(arg_matches, "job")?;
+    let mut client = connect_manager_client().await?;
+    let response = output::resolve(
+        format,
+        "Failed to revoke grants",
+        client
+            .revoke_grant(tonic::Request::new(RevokeGrantRequest {
+                job,
+                version: arg_matches.get_one::<i64>("version").copied(),
+                idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
+            }))
+            .await,
+    )?;
+    let reply = response.into_inner();
+    if format.is_json() {
+        output::print_success(&json!({
+            "message": reply.message,
+            "revoked": reply.revoked,
+            "deduplicated": reply.deduplicated,
+        }));
+    } else {
+        println!("{}", reply.message);
     }
     Ok(())
 }

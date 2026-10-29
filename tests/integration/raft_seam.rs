@@ -56,6 +56,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "delete_acl_policy",
     "delete_acl_token",
     "delete_acl_user",
+    "consume_join_token_use",
     "delete_exec_key",
     "delete_join_token",
     "delete_kv",
@@ -88,6 +89,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "renew_kv_lock",
     "replace_job_kv_references",
     "request_job_restart",
+    "revoke_job_grants",
     "set_node_availability",
     // Count overrides (`legion job scale`): operator/autoscaler intent,
     // control-owned so the submit-time ownership arbitration rides the
@@ -271,6 +273,7 @@ fn lane_for(method: &str) -> Lane {
         | "delete_acl_policy"
         | "delete_acl_token"
         | "delete_acl_user"
+        | "consume_join_token_use"
         | "delete_exec_key"
         | "delete_join_token"
         | "delete_kv"
@@ -300,6 +303,7 @@ fn lane_for(method: &str) -> Lane {
         | "renew_kv_lock"
         | "replace_job_kv_references"
         | "request_job_restart"
+        | "revoke_job_grants"
         | "set_node_availability"
         | "set_task_scale_override"
         | "set_task_scale_pending"

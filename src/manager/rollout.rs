@@ -2460,6 +2460,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -2480,6 +2482,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -2528,6 +2532,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -2548,6 +2554,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -2595,6 +2603,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -2676,6 +2686,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -2694,6 +2706,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -2755,6 +2769,8 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 
@@ -2959,15 +2975,19 @@ mod tests {
                         path: "/var/lib/postgresql/data".into(),
                         retain_on_scale_in: None,
                         retain_on_stop: None,
+                        unknown_fields: Default::default(),
                     }),
                     envelope: None,
                     promote: None,
                     placement: None,
                     fence_after: None,
+                    unknown_fields: Default::default(),
                 }),
                 ..TaskConfig::new("postgres", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 
@@ -3048,6 +3068,8 @@ mod tests {
                             ..TaskConfig::new("fill", "noop")
                         }],
                         version: None,
+                        pending_extensions: Default::default(),
+                        extensions: Default::default(),
                     };
                     store.handle_job_submit(&filler, &[submission()])?;
                     let filler_id = store.get_job_config("filler")?.id();

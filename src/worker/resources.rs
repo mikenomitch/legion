@@ -224,6 +224,43 @@ pub struct NodeResourceGovernor {
     /// next one rebuilds the hierarchy. Shared with [`PendingCgroup`], which
     /// creates leaves without the task-manager lock.
     hierarchy_ready: Arc<AtomicBool>,
+    /// A ceiling on the whole hierarchy root (`cpu.max`, `memory.max`):
+    /// set for a manager's system worker, whose allocations together may
+    /// use only what the manager lends them ([`Self::apply_parent_limits`]).
+    parent_limits: Option<ParentLimits>,
+}
+
+/// What a whole worker may use, written on its cgroup parent: the
+/// allocations under it share this, however their own `cpu.weight` lets
+/// them burst. A manager's system worker sets it to the manager's lend
+/// (`systemWorker.resources`), so raft and the manager keep the rest of the
+/// host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentLimits {
+    /// CPU in MHz, turned into a `cpu.max` quota over this host's clock.
+    pub cpu_mhz: u64,
+    /// Memory in MiB, written as `memory.max`.
+    pub memory_mib: u64,
+}
+
+/// The `cpu.max` scheduling period, in microseconds (the kernel default).
+const CPU_MAX_PERIOD_US: u64 = 100_000;
+
+impl ParentLimits {
+    /// The `cpu.max` line for `cpu_mhz`: a quota of `cpu_mhz / mhz_per_core`
+    /// CPUs per period. A host that reports no plausible clock counts 1000
+    /// MHz as one CPU, the figure Legion's defaults are written in. The
+    /// kernel refuses a quota under 1ms, so that is the floor.
+    pub fn cpu_max(&self, mhz_per_core: Option<f64>) -> String {
+        let per_core = mhz_per_core.filter(|mhz| *mhz > 0.0).unwrap_or(1000.0);
+        let quota = (self.cpu_mhz as f64 / per_core * CPU_MAX_PERIOD_US as f64).round() as u64;
+        format!("{} {CPU_MAX_PERIOD_US}", quota.max(1000))
+    }
+
+    /// The `memory.max` value, in bytes.
+    pub fn memory_max(&self) -> String {
+        (self.memory_mib << 20).to_string()
+    }
 }
 
 /// A task's cgroup leaf, to create before the task starts but without the
@@ -265,6 +302,7 @@ impl NodeResourceGovernor {
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
             hierarchy_ready: Arc::default(),
+            parent_limits: None,
         }
     }
 
@@ -283,6 +321,7 @@ impl NodeResourceGovernor {
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
             hierarchy_ready: Arc::default(),
+            parent_limits: None,
         })
     }
 
@@ -345,11 +384,33 @@ impl NodeResourceGovernor {
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
             hierarchy_ready: Arc::default(),
+            parent_limits: None,
         }
     }
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Cap the whole hierarchy at `limits`: create the root (delegating its
+    /// controllers, as the first allocation would) and write its `cpu.max`
+    /// and `memory.max`. Kept, and rewritten whenever the hierarchy is
+    /// rebuilt. Returns the two values written. Fails when this node does
+    /// not enforce (not Linux, no cgroup v2, enforcement off) or the kernel
+    /// refuses a write, and then nothing caps the worker but the capacity it
+    /// advertises; the caller says so.
+    pub fn apply_parent_limits(&mut self, limits: ParentLimits) -> R<(String, String)> {
+        if !self.enabled {
+            bail!("this node does not enforce resources (not Linux, no cgroup v2, or off)");
+        }
+        self.parent_limits = Some(limits);
+        self.ensure_hierarchy()?;
+        let root = self.fs_root.join(&self.root);
+        let cpu = limits.cpu_max(crate::worker::idle::local_mhz_per_core());
+        let memory = limits.memory_max();
+        write_cgroup_file(&root.join("cpu.max"), &cpu)?;
+        write_cgroup_file(&root.join("memory.max"), &memory)?;
+        Ok((cpu, memory))
     }
 
     /// CPUs not currently reserved by any allocation — the share slice's mask.
@@ -730,6 +791,17 @@ impl NodeResourceGovernor {
                 debug!(path = %dir.display(), error = ?err, "Could not set memory.low on a parent cgroup");
             }
         }
+        // A rebuilt root (someone removed it) gets its ceiling back.
+        // Best-effort here: `apply_parent_limits` reported whether the
+        // kernel takes it when the worker started.
+        if let Some(limits) = self.parent_limits {
+            let cpu = limits.cpu_max(crate::worker::idle::local_mhz_per_core());
+            for (file, value) in [("cpu.max", cpu), ("memory.max", limits.memory_max())] {
+                if let Err(err) = write_cgroup_file(&root.join(file), &value) {
+                    debug!(path = %root.display(), error = ?err, "Could not rewrite the cgroup parent's ceiling");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -988,6 +1060,7 @@ mod tests {
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
             hierarchy_ready: Arc::default(),
+            parent_limits: None,
         }
     }
 
@@ -1004,6 +1077,7 @@ mod tests {
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
             hierarchy_ready: Arc::default(),
+            parent_limits: None,
         };
         let task: TaskConfig = serde_json::from_value(serde_json::json!({
             "name": "web", "runtime": "exec",
@@ -1357,6 +1431,59 @@ mod tests {
             .unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
     }
 
+    /// A system worker's lend lands on its cgroup parent as `cpu.max` and
+    /// `memory.max`, and comes back when the hierarchy is rebuilt.
+    #[test]
+    fn parent_limits_cap_the_whole_hierarchy_test() -> R<()> {
+        let fs = tempfile::tempdir()?;
+        let mut governor = scratch_governor(fs.path(), &[0, 1, 2]);
+        let limits = ParentLimits {
+            cpu_mhz: 1000,
+            memory_mib: 1024,
+        };
+        let (cpu, memory) = governor.apply_parent_limits(limits)?;
+        let root = fs.path().join("legion");
+        assert_eq!(read(root.join("cpu.max")), cpu);
+        assert_eq!(read(root.join("memory.max")), (1024u64 << 20).to_string());
+        assert_eq!(memory, (1024u64 << 20).to_string());
+        assert_eq!(
+            missing_controllers(&root.join("cgroup.subtree_control")),
+            Vec::<&str>::new()
+        );
+
+        std::fs::remove_file(root.join("memory.max"))?;
+        governor.ensure_hierarchy()?;
+        assert_eq!(read(root.join("memory.max")), (1024u64 << 20).to_string());
+
+        let mut off = NodeResourceGovernor::disabled();
+        assert!(off.apply_parent_limits(limits).is_err());
+        Ok(())
+    }
+
+    /// 1000 MHz is one CPU on a 1000 MHz clock and less on a faster one; an
+    /// unknown clock counts 1000 MHz as a CPU; the kernel's 1ms floor holds.
+    #[test]
+    fn parent_cpu_max_scales_with_the_clock_test() {
+        let lend = ParentLimits {
+            cpu_mhz: 1000,
+            memory_mib: 1,
+        };
+        assert_eq!(lend.cpu_max(Some(1000.0)), "100000 100000");
+        assert_eq!(lend.cpu_max(Some(2500.0)), "40000 100000");
+        assert_eq!(lend.cpu_max(None), "100000 100000");
+        assert_eq!(lend.cpu_max(Some(0.0)), "100000 100000");
+        let two = ParentLimits {
+            cpu_mhz: 2000,
+            memory_mib: 1,
+        };
+        assert_eq!(two.cpu_max(Some(1000.0)), "200000 100000");
+        let tiny = ParentLimits {
+            cpu_mhz: 1,
+            memory_mib: 1,
+        };
+        assert_eq!(tiny.cpu_max(Some(3000.0)), "1000 100000");
+    }
+
     /// The spot-check P0: the slices themselves must delegate their
     /// controllers, or a leaf under them gets no `memory.max` to write and
     /// every governed task fails to start.
@@ -1582,6 +1709,7 @@ mod tests {
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
             hierarchy_ready: Arc::default(),
+            parent_limits: None,
         };
         let assignment = governor
             .assign(

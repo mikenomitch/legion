@@ -17,15 +17,17 @@ infer it.
 | API and ACLs | scopes every namespaced RPC and list (`job`, `exec`, `action`, `scale`, `boot`, `snapshot`, `namespace`) | hide cluster-scoped views: `node:read` sees every allocation's job id in the ledger, the state explorer is raw SQL over everything, `operator:read` sees every event | not granting `node`, `state` or `operator` to tenants |
 | Service discovery and mesh | resolves service names inside the namespace; reaching another namespace is written on both sides ([Services](#services-and-the-mesh)) | stop a process from dialing an address it already knows | `network.mode = "gated"` plus net policies that select namespaces |
 | Network | nothing by itself | filter packets | `gated` networking plus net policies |
-| Compute | nothing, unless a [namespace policy](#namespace-policies) restricts its pools | separate nodes, kernels or caches | node pools; the `sandbox` runtime |
-| KV | nothing | KV is path-scoped and cluster-wide | ACL `paths` selectors |
+| Compute | nothing, unless a [namespace policy](#namespace-policies) restricts its pools or a worker type [accepts only some namespaces](#nodes-that-accept-only-some-namespaces) | separate kernels or caches | node pools; node-side `namespaces` lists; the `sandbox` runtime |
+| KV | nothing | KV is path-scoped and cluster-wide | ACL `paths` selectors (the `legion/` prefix is [reserved](#reserved-namespaces)) |
 | Workload identity | makes subjects distinct and adds a `legion.io/namespace` claim | — | IdP trust policies that match the namespace |
 | Capacity | nothing, unless a namespace policy sets a quota | — | [namespace policies](#namespace-policies) |
 | Observability | stamps events and metrics; tenants read their own events | — | — |
 
 `default` always exists and cannot be deleted. A cluster that never creates
 another namespace behaves exactly like one without the feature: every job
-lives in `default` and keeps its bare name.
+lives in `default` and keeps its bare name. Legion creates one namespace of
+its own, `legion-system`, for the jobs it runs on the managers
+([Reserved namespaces](#reserved-namespaces)).
 
 ## Quick start
 
@@ -153,7 +155,8 @@ $ legion namespace delete payments-old --cascade    # stop and destroy it all, t
 
 - **Names are DNS labels**: lowercase letters, digits and `-`, starting and
   ending alphanumeric, at most 63 characters. The `legion-` prefix is
-  reserved. Namespaces cannot be renamed.
+  [reserved](#reserved-namespaces): nobody can create a `legion-*`
+  namespace. Namespaces cannot be renamed.
 - **`description` and `meta`** are free-form; Legion never reads `meta`.
   The namespace object carries nothing policy-bearing, so whoever may write
   a namespace cannot loosen anything by editing it.
@@ -186,7 +189,144 @@ it refuse rather than succeed falsely.
 A cascade needs `job:write` in the namespace (and `snapshot:write` when it
 holds snapshots) on top of `namespace:write`, so the right to delete an
 environment is never a back door to destroying workloads you could not
-otherwise touch. `default` cannot be deleted.
+otherwise touch. `default` cannot be deleted, and neither can a reserved
+`legion-*` namespace.
+
+## Reserved namespaces
+
+Names starting `legion-` belong to Legion. Today there is one:
+**`legion-system`**, where Legion's own operational jobs run, on the
+managers' [system workers](architecture-managers-workers.md#the-system-worker).
+
+- **Created on an empty store.** The first manager to lead the control lane
+  of a new cluster creates `legion-system`, together with a namespace policy
+  of the same name:
+
+  ```nickel
+  { name = "legion-system", namespaces = ["legion-system"],
+    pools = { default = ["legion-system", "default"] } }
+  ```
+
+  A job in `legion-system` whose permit names no pool therefore may run in
+  the `legion-system` pool, which is where the managers' system workers are,
+  or in `default`, where a `--run-worker` manager's worker is (a dev
+  cluster). It does not reach ordinary workers in `default`: their
+  `namespaces` (by default `["*"]`) refuse `legion-system`, and that, not
+  the pool, is the boundary ([Nodes that accept only some namespaces](#nodes-that-accept-only-some-namespaces)).
+  The policy is an ordinary one: an operator may edit or delete it, and
+  Legion never writes it again. A cluster created before this release keeps
+  the single-pool default it was created with.
+- **Nobody can create, rename, or delete one.** `legion namespace create
+  legion-x` is refused, and so is deleting `legion-system`:
+
+  ```text
+  namespace 'legion-system' is reserved for Legion and cannot be deleted
+  ```
+- **`*` does not reach them.** In an allow rule's `namespaces` selector, a
+  glob matches a `legion-*` namespace only when the pattern itself starts
+  with `legion-`, the way a shell's `*` skips dotfiles. `["*"]` covers every
+  tenant namespace, today's and tomorrow's, but not `legion-system`;
+  `["legion-*"]` or `["legion-system"]` reach it, and "every namespace,
+  reserved ones included" is `["*", "legion-*"]`. The same holds for an
+  allow rule with `resources = ["*"]` and no selector: it reaches what `*`
+  reaches. A tenant admin holding `namespaces = ["*"]` therefore cannot
+  submit to, scale, or exec into a job in `legion-system` and borrow the
+  credential it runs with:
+
+  ```text
+  $ legion job run agent.ncl -n legion-system
+  error: permission denied: job:write requires a policy granting it in this namespace
+    Hint: this token can write job in *
+    Hint: `*` does not reach reserved `legion-*` namespaces; a rule must name them,
+    as `namespaces = ["legion-system"]` or `["*", "legion-*"]`
+  ```
+
+  Deny rules keep plain globs, because the rule exists to keep grants from
+  reaching too far and a deny that reached less would grant more: a deny on
+  `["*"]` still denies inside `legion-system`. Management tokens bypass
+  rules, as always.
+- **The `legion/` KV prefix is reserved the same way.** An allow rule's
+  `paths` pattern reaches a key under `legion/` only when it starts with
+  `legion/`; `paths = ["*"]`, and a `kv` rule with no `paths`, stop short of
+  it. It is set aside for the leases and state of Legion's own jobs.
+- **Namespace policies skip them too.** A policy whose selector is `["*"]`
+  does not govern `legion-system`, so a tenant-wide quota, runtime list, or
+  default pool never lands on what Legion runs for itself. A selector
+  starting `legion-` governs it.
+- **Tasks there run unprivileged.** They run on the managers, where root
+  could read the manager's data directory and raft state, delete the host
+  guard's rules, or leave its cgroup. Submit refuses an `exec` task with no
+  `user`, or `user = "root"` / `"0"`, and a `container` that opts out of the
+  privilege floor (`security.userNamespace = false` or
+  `security.seccomp = "unconfined"`):
+
+  ```text
+  task "agent" runs as root, and tasks in namespace legion-system may not: they
+  run on the managers' system workers, where root could read the manager's state
+  and leave its limits.
+  Hint: set user = "nobody" (or another unprivileged user) in the task's config
+  ```
+
+  Nor may any task there have the worker act for it on the node, whatever
+  its runtime and user, and whoever submits it: an `exec` health check (the
+  worker runs its command), a `file://` or `git::file://` artifact or image
+  (the worker copies node files in), an artifact with `auth.nodeIdentity`
+  (the worker presents the node's credential), or, for an `exec` task, a
+  file the worker writes at an absolute host path (`config.files`,
+  `kvInjections.files`, an identity's `file`, a `connect.templates`
+  destination), a `config.cgroup` of its own, or an OOM score below 0. On a
+  manager the worker is root, so each would make the task root there:
+
+  ```text
+  task "agent" declares exec health check "probe", which the worker runs on
+  the host, and tasks in namespace legion-system may not: they run on the
+  managers' system workers, where the worker that would do it is root.
+  Hint: use an `http` or `tcp` health check, and fetch artifacts from a URL
+  ```
+
+  `legion job validate` applies the same check offline when the jobspec
+  names its namespace (`namespace = "legion-system"`); the manager applies
+  it on every submit. Apps' tasks also run as each app's own uid
+  ([Apps: What Legion renders](apps.md#what-legion-renders)).
+
+## Nodes that accept only some namespaces
+
+A worker type can reserve its nodes for some namespaces:
+
+```nickel
+# configs/workers/ci.ncl
+{ workerType = "ci", pool = "ci", namespaces = ["ci-*"] }
+```
+
+A node whose worker type sets `namespaces` runs only jobs from a namespace
+one of its patterns matches. It is a restriction of the node, not a
+toleration a job writes: a job in `payments` stays off a `ci` node even with
+`permit = { pool = "ci" }`, and nothing in a jobspec can change that. Pools
+still apply as well, so a `ci-main` job lands on these nodes only if its
+permit names the `ci` pool. Without `namespaces` (the default), a node
+accepts every namespace, reserved ones included.
+
+- **Names or `*`-globs**, following the [reserved rule](#reserved-namespaces):
+  `["*"]` accepts every tenant namespace but not `legion-system`. An empty
+  list is refused when the manager loads the worker type; leave the field out
+  to accept everything.
+- **Where it is checked.** In the scheduler's candidate filter, beside the
+  permit, so a plan never offers a refused node; again in the apply
+  transaction that commits the plan; and in the blocked-eval wake pass, so a
+  node that accepts only other namespaces joining a job's pool never wakes
+  that job ([scheduler-and-eval-loop.md](scheduler-and-eval-loop.md)).
+- **Diagnostics.** When the restriction is why a task cannot place, the
+  failure (in `legion job plan`, and in `legion job info`'s blocked reason)
+  names it:
+
+  ```text
+  Failed to place task web: no available nodes matching constraints, permit, or
+  resources; 3 nodes accept only namespaces [legion-system]. ...
+  ```
+- **On the node.** The worker records the list as its `namespaces` config
+  attribute, which `legion node info` shows. `namespaces` (and the
+  `capacity` and `legion.role` attributes Legion sets on system workers) may
+  not be used as a worker type `attributes` key.
 
 ## ACLs
 
@@ -215,7 +355,9 @@ into two rules, one with a `namespaces` selector and one without
 `resources = ["*"]` rules and deny rules are exempt from the first check:
 a `*` rule is explicit about its reach already, and a deny can only narrow.
 "Every namespace, including future ones" is always something an admin
-wrote (`["*"]`), never something they forgot.
+wrote (`["*"]`), never something they forgot. It does not include the
+reserved `legion-*` namespaces, which only a pattern starting `legion-`
+reaches ([Reserved namespaces](#reserved-namespaces)).
 
 A rule naming an exact namespace that does not exist yet is accepted with a
 warning (`rule 0 names namespace 'payments-prdo', which does not exist`),
@@ -234,12 +376,12 @@ a prefix without one also matches `paymentsx`.
 ```
 
 Deny rules compose with globs, so "everything except the platform's
-namespaces" can be written:
+namespaces" can be written (`*` already leaves out `legion-*`):
 
 ```nickel
 [
   { resources = ["job"], actions = ["read"], namespaces = ["*"] },
-  { resources = ["job"], actions = ["read"], namespaces = ["legion-*", "platform-*"],
+  { resources = ["job"], actions = ["read"], namespaces = ["platform-*"],
     effect = "deny" },
 ]
 ```
@@ -445,14 +587,15 @@ purpose:
 | Field | Meaning |
 | --- | --- |
 | `name` | Unique: letters, digits, `-`, `_`, `.` |
-| `namespaces` | Required, non-empty: namespace names or `*`-globs |
+| `namespaces` | Required, non-empty: namespace names or `*`-globs. A glob reaches a reserved `legion-*` namespace only when it starts with `legion-` |
 | `quota` | Band (`critical` … `background`) → `{ cpu (MHz), memory (MiB, or a size like "64Gi"), cores }`; each dimension optional |
 | `maxJobs` | Jobs (any state) across every matching namespace |
 | `maxNamespaces` | Namespaces matching the policy |
 | `pools.allowed` | Pool names or globs every task must run in |
-| `pools.default` | The pool a task whose permit names none lands in (must be within `allowed`) |
+| `pools.default` | The pool a task whose permit names none lands in, or a list of pools it may land in (`["legion-system", "default"]`, rendered as a `pool matches ^(…)$` permit). Each must be within `allowed`, and a pool name, not a glob |
 | `runtimes` | Allowed task runtimes, names or globs |
 | `hostVolumes` | Allowed host volumes (`driver = "host"`, by `params.name`), names or globs |
+| `autoscale` | Autoscaling defaults for every task in the matching namespaces: the jobspec `autoscale` record without `checks`, overriding the cluster's scaling defaults field by field, and live ([autoscaling.md](autoscaling.md#overriding-the-defaults)). Its `min` must be a multiple of `count` of at least `"1x"` |
 
 For `pools.allowed`, `runtimes` and `hostVolumes`, **unset allows
 everything and an empty list allows nothing.**
@@ -559,6 +702,13 @@ Had it been in force, it would have refused (admitted work keeps running):
   [maxJobs] payments, payments-*: 312 jobs across payments, payments-*, over maxJobs 300
 ```
 
+An `autoscale` record is checked against every autoscaled task it would
+govern: a change that would leave some task's effective policy invalid (two
+policies setting one field differently, a floor above a task's ceiling) is
+listed under `[autoscale]` by `--dry-run`, and refused by a plain apply.
+`--force` applies it anyway, and those tasks hold with state `invalid` until
+fixed ([autoscaling.md](autoscaling.md#overriding-the-defaults)).
+
 ```console
 $ legion namespace policy list
 $ legion namespace policy get payments      # limits, aggregate and per-namespace usage
@@ -618,6 +768,12 @@ namespace's manifests can land under a fence prefix.
 | `namespace policy 'p' caps band …` | over an aggregate quota | `legion namespace get <ns>`; lower the count or band, or raise the quota |
 | `… must name its pool exactly` | a policy restricts pools and the permit uses `!=`/`matches` | write `pool = "<name>"` |
 | `namespace 'x' is not empty: 3 jobs` | delete with contents | `--dry-run` to see them, `--cascade` to remove them |
+| `namespace "legion-x" uses the reserved prefix "legion-"` | creating a `legion-*` namespace | pick another name; only Legion creates them |
+| `namespace 'legion-system' is reserved for Legion and cannot be deleted` | deleting a reserved namespace | expected |
+| permission denied in `legion-system` with a `namespaces = ["*"]` token | `*` does not reach reserved namespaces | a rule with `namespaces = ["legion-system"]` (or `["*", "legion-*"]`) |
+| `task "x" runs as root, and tasks in namespace legion-system may not` | an exec task with no `user` (or root) in a reserved namespace | `config.user = "nobody"` |
+| `task "x" sets security.userNamespace = false, … may not run privileged` | a container opting out of the privilege floor in a reserved namespace | remove the setting |
+| `N nodes accept only namespaces [ci-*]` in a placement failure | nodes the job's permit allows reserve themselves for other namespaces | run the job in an accepted namespace, or widen the worker type's `namespaces` |
 | a tenant's event stream stops | its grant was revoked | expected: streams re-check grants |
 
 ## Known limitations
@@ -645,6 +801,21 @@ namespace's manifests can land under a fence prefix.
 - **Rollout, volume and snapshot replies** carry the canonical `job_id`
   rather than a separate `namespace` field; split it at the first `/`.
 - Namespaces cannot be renamed or nested.
+- **Node `namespaces` lists are pinned at registration.** The manager takes
+  a node's `namespaces` (and its `legion.role`) from what admits the
+  registration, whatever the worker reports: the join token's worker type,
+  the settings a manager pinned on its own system worker's token, or, when a
+  node re-registers with its node token, what it first registered with. A
+  worker that forges its registration can neither drop its restriction nor
+  claim to be a manager's. With ACLs off, or a management token, nothing
+  about the caller is proven, so the reported values stand.
+- **There is no soft form** of the node restriction (no "prefer not"); a
+  node accepts a namespace or it does not.
+- **List selection is not ACL.** `-n '*'` on a list command selects every
+  namespace, `legion-system` included; what the caller may read still
+  filters the items.
+- **`legion-system` and its policy are created once**, on an empty store. A
+  deleted `legion-system` policy is not recreated.
 
 ## See also
 

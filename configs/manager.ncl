@@ -22,18 +22,53 @@
   # exec = { enabled = true },
   # Direct exec tickets (`legion exec --direct`, `MintExecTicket`): how long a
   # ticket can be redeemed and how long its session may run. Signed with the
-  # workload-identity key, so `workloadIdentity.enabled` must be true to mint.
+  # workload-identity key (on by default; `workloadIdentity.enabled = false`
+  # turns tickets off with it).
   # exec = { tickets = { defaultTtl = "60s", maxTtl = "10m", maxSession = "1h" } },
   # Telemetry: Prometheus /metrics plus /healthz + /readyz probes
   # (docs/metrics.md). Enabled by default; binds server.port + 2 (4749 here)
   # unless `port` is set. Set `enabled = false` to turn the listener off.
   # telemetry = { enabled = true, port = 4749 },
+  # The system worker (docs/architecture-managers-workers.md, "The system
+  # worker"): every manager runs one in-process worker for Legion's own jobs,
+  # the ones in the reserved legion-system namespace. These are the defaults:
+  # write nothing to get them, or `enabled = false` to keep this manager free
+  # of allocations. `legion start manager --run-worker` runs a worker for
+  # every namespace instead, in the default pool, and ignores this block.
+  systemWorker = {
+    enabled = true,
+    # Namespaces it accepts. Globs skip reserved `legion-*` names, so
+    # "everything" is ["*", "legion-*"].
+    namespaces = ["legion-system"],
+    # What this manager lends its system worker, in MHz and MiB: the node's
+    # whole capacity as the scheduler sees it and, on Linux with cgroup v2,
+    # the cpu.max / memory.max of its `legion-system` cgroup parent.
+    resources = { cpu = 1000, memory = 1024 },
+    # Its worker plane port. A standalone worker on this host keeps 4848.
+    port = 4849,
+  },
+  # Seed-time settings for the apps bundled with Legion (docs/apps.md,
+  # "Seeding"), by app name. Read ONLY when the first Control leader seeds an
+  # app's record on a new cluster; after that `legion app` is the interface,
+  # and a manager that finds this block for an existing app logs that it was
+  # not applied. Leave it out to seed every bundled app enabled, with its
+  # manifest's defaults.
+  #
+  # apps = {
+  #   autoscaler = {
+  #     enabled = false,          # seed it disabled (`legion app enable` later)
+  #     placement = "managers",   # managers | workers | any
+  #     replicas = 1,
+  #     config = { plugins = {} },  # validated against its config schema
+  #   },
+  # },
   # Edge boot (docs/edge-boot.md): boot tickets and edge-initiated starts.
   # OFF BY DEFAULT, and turning it on is an explicit security decision — it
   # grants nodes the ability to start work on a capability, growing a
   # compromised node's blast radius from "runs what it was given" to "runs
   # anything a live ticket names". Tickets are signed by the
-  # workload-identity issuer, so `workloadIdentity.enabled` must also be true.
+  # workload-identity issuer (on by default), so `workloadIdentity.enabled`
+  # must not be false.
   #
   # A job's own `speculativeStart` block does NOT need this switch: pre-commit
   # dispatch from the manager opens no new authorization surface.
@@ -244,7 +279,8 @@
     containerImageDesugar = false,
   },
   # Workload identity (OIDC issuer; see docs/workload-identity.md).
-  # Off by default. When enabled the manager signs short-lived per-task JWTs
+  # On by default: apps (the bundled autoscaler) and API sockets authenticate
+  # with Legion's own `legion` identity. The manager signs short-lived per-task JWTs
   # and serves the OIDC discovery document + JWKS over plain HTTP on the main
   # listener. `issuer` is the externally-published URL relying parties trust
   # (it must be reachable by AWS/GCP/Vault — typically via an HTTPS proxy).
@@ -255,7 +291,7 @@
   # tasks — referenced by artifact `auth.nodeIdentity` and cluster
   # artifact-auth matchers.
   # workloadIdentity = {
-  #   enabled = true,
+  #   enabled = true,          # the default; false turns workload identity off
   #   issuer = "https://manager.example.com:4747",
   #   jwksPath = "/.well-known/jwks.json",
   #   signingAlg = "ES256",

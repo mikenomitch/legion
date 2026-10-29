@@ -14,7 +14,7 @@
 //! ## Safety
 //!
 //! By default only read-only / introspection tools are exposed. Mutating tools
-//! (`legion_job_run`, `legion_job_stop`, `legion_job_scale`,
+//! (`legion_job_run`, `legion_job_stop`, `legion_job_scale`, `legion_scaling_pause`,
 //! `legion_job_destroy`, `legion_instance_create`, `legion_instance_stop`,
 //! `legion_instance_start`, `legion_instance_promote`,
 //! `legion_instance_destroy`) are gated behind `--allow-write`, mirroring the
@@ -156,9 +156,10 @@ fn namespace_policy_apply_schema() -> Value {
         "properties": {
             "policy": {
                 "type": "object",
-                "description": "The policy object: { name, description?, namespaces: [glob], quota?: { <band>: { cpu? (MHz), memory? (MiB or \"64Gi\"), cores? } }, maxJobs?, maxNamespaces?, pools?: { allowed?: [glob], default? }, runtimes?: [glob], hostVolumes?: [glob] }. An unset allowlist allows everything; an empty one allows nothing."
+                "description": "The policy object: { name, description?, namespaces: [glob], quota?: { <band>: { cpu? (MHz), memory? (MiB or \"64Gi\"), cores? } }, maxJobs?, maxNamespaces?, pools?: { allowed?: [glob], default? }, runtimes?: [glob], hostVolumes?: [glob], autoscale?: { the jobspec autoscale record without checks; min must be a multiple of count of at least \"1x\" } }. An unset allowlist allows everything; an empty one allows nothing."
             },
-            "dry_run": { "type": "boolean", "description": "Validate and list what the policy would have refused among existing jobs and counts, without writing." },
+            "dry_run": { "type": "boolean", "description": "Validate and list what the policy would have refused among existing jobs and counts (and autoscaled tasks whose policy it would invalidate), without writing." },
+            "force": { "type": "boolean", "description": "Apply even when the policy's autoscale leaves some autoscaled tasks' policies invalid; they are held until fixed." },
             "idempotency_key": { "type": "string" }
         },
         "required": ["policy"],
@@ -253,7 +254,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_info",
-            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`), and `deadline` (Unix seconds, 0 for none) when its `placementTimeout` fails the job if it is still short. A gang job with status `failed` (timed out, or failed by its `onMemberLoss`) places nothing until it is run again (docs/gang-scheduling.md).",
+            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`), and `deadline` (Unix seconds, 0 for none) when its `placementTimeout` fails the job if it is still short. A gang job with status `failed` (timed out, or failed by its `onMemberLoss`) places nothing until it is run again (docs/gang-scheduling.md). With `scale:read`, `scalingInputs` adds one entry per task with request vs usage, cluster-wide: ready/placed/desired/unplaced replicas, measured CPU (MHz, utilization against the reservation, per-replica histogram) and memory, requests per second, error ratio, and latency into a service the task backs (internal callers only), whether a rollout is active, and `freshness.state` (`current`, `missing`, `resyncing`; act only on `current`) (docs/autoscaling.md, \"Scaling inputs\").",
             input_schema: name_arg_schema,
             mutates: false,
         },
@@ -265,16 +266,19 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_schema",
-            description: "Get the JSON Schema for jobspecs and built-in task runtimes. Use this before authoring a jobspec.",
+            description: "Get this cluster's jobspec JSON Schema: the core fields and built-in task runtimes, plus each key installed apps add at its point (job, task, volume, port, service; `apps.<app>` is the qualified spelling). Without a reachable manager it is the compiled-in schema, and `$comment` says installed keys are not included. Use this before authoring a jobspec.",
             input_schema: empty_schema,
             mutates: false,
         },
         ToolDef {
             name: "legion_job_validate",
-            description: "Validate a rendered jobspec (JSON) without submitting it.",
+            description: "Validate a rendered jobspec (JSON) without submitting it. An unknown key is an error that names its path and the closest known key (`web: task web: unknown field `cuont` (did you mean `count`?)`), installed apps' keys included; fix it, or pass `allow_unknown_fields` to see what a submit with the flag would keep and drop. Values for installed apps' keys are checked against their schemas when a manager answers (`installedKeys: checked`); offline, keys at extension points are reported as not checked (`installedKeys: unchecked`).",
             input_schema: || json!({
                 "type": "object",
-                "properties": { "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." } },
+                "properties": {
+                    "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." },
+                    "allow_unknown_fields": { "type": "boolean", "description": "Accept keys Legion does not know (default false: each one is an error naming it and the closest known key). When true, keys on the job, a task, a volume, a port, or a service are kept as pending and the rest are dropped; each is listed in `warnings`." }
+                },
                 "required": ["spec_json"],
                 "additionalProperties": false
             }),
@@ -285,7 +289,10 @@ fn tool_defs() -> Vec<ToolDef> {
             description: "Dry-run a rendered jobspec: which nodes its allocations would land on, and — the reason to run this before submitting — which RUNNING allocations the submit would preempt, with their job, task, priority band and grace window. A non-empty `preemptions` list means the submit costs somebody else something; treat it as requiring confirmation. `preemptionMode` says whether an empty list means \"nothing would be displaced\" or \"preemption is off\". `gangReports` has one entry per task that sets `gang`: `wouldPlace: false` means the job would place NOTHING and wait (blocked, holding nothing) until `min - running` replicas fit together, with `placeable`, `eligibleNodes` and `reason` saying how far it got — resize the gang, wait, or add capacity (docs/gang-scheduling.md).",
             input_schema: || json!({
                 "type": "object",
-                "properties": { "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." } },
+                "properties": {
+                    "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." },
+                    "allow_unknown_fields": { "type": "boolean", "description": "Accept keys Legion does not know (default false: each one is an error naming it and the closest known key). When true, keys on the job, a task, a volume, a port, or a service are kept as pending and the rest are dropped; each is listed in `warnings`." }
+                },
                 "required": ["spec_json"],
                 "additionalProperties": false
             }),
@@ -645,9 +652,111 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: true,
         },
         ToolDef {
+            name: "legion_node_forget",
+            description: "Forget a dead node: remove its record and revoke its node token in one write, so a worker still running there can no longer heartbeat or re-register under that identity. Refused (FailedPrecondition, with what to do) while the node has allocations, is live and not cordoned, or holds node-local volumes, unless force is true, which asserts the machine is gone for good and releases its allocations for replacement at once. Mutating; retry-safe with idempotency_key (a repeat replays the result with deduplicated = true).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "Node ID." },
+                    "force": { "type": "boolean", "description": "Forget it whatever the guard says (default false)." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["node_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_scaling_demand",
+            description: "How many nodes of each node-group template the pending work needs (GetCapacityDemand, docs/autoscaling.md \"Capacity demand\"): every replica the scheduler left unplaced is packed onto copies of the template with the scheduler's own rules (permit and pool, node namespaces, constraints, distinct, static ports, resources, gang quorum). Per template: nodes, replicas hosted, requested vs offered CPU and memory, and what it refuses with the rule. Also the pending work considered, `unfittable` replicas no template can host (a jobspec problem, not capacity), and jobs the scheduler has not tried yet. Read-only; needs node:read, and names only jobs you can read.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "templates": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 64,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "Node group name (also its legion.nodegroup attribute)." },
+                                "worker_type": { "type": "string", "description": "Worker type members join as (default: default)." },
+                                "pool": { "type": "string", "description": "Pool members join (default: the worker type's)." },
+                                "cpu": { "type": "integer", "minimum": 1, "description": "CPU of one member, MHz." },
+                                "memory": { "type": "integer", "minimum": 1, "description": "Memory of one member, MiB." },
+                                "cores": { "type": "integer", "minimum": 1, "description": "Whole cores of one member." },
+                                "attributes": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Node attributes every member has." },
+                                "resources": { "type": "object", "description": "Custom resources of one member: {\"gpu\": 2}." },
+                                "max_allocations": { "type": "integer", "minimum": 0 },
+                                "like_node": { "type": "string", "description": "Copy an existing member's capacity and attributes." },
+                                "upcoming": { "type": "integer", "minimum": 0, "description": "Members asked for that have not joined." }
+                            },
+                            "required": ["name"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["templates"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_acl_whoami",
             description: "Show whether ACLs are enabled and what access the current credentials grant. Use this to diagnose PermissionDenied errors.",
             input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_app_list",
+            description: "List installed apps (Legion's add-ons: the bundled autoscaler, and apps installed from manifests): each app's version, source, status (running, degraded, pending, stopped, with why), placement, replicas running, the nodes it runs on, and its UI slots. Needs app:read.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_app_status",
+            description: "Show one app: its record (manifest, settings, config), its grant (what its job's `legion` identity may do, and who approved it), its job's status, the app reconciler's last action and error, its build marker and what it waits for, and notes. Needs app:read on the app.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "app": { "type": "string", "description": "The app's name (for example `autoscaler`)." }
+                },
+                "required": ["app"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_app_view",
+            description: "Render one of an app's declarative views as JSON: what its panel on a job, task, or node page, its sidebar page, or its overview card shows a human. The same data as `legion app view`. Returns the validated `legion-view/1` document (stats, series, table, timeline, keyValue, notice, markdown, and actions blocks), the actions it offers with whether you may run them, and which allocation answered. Needs app:read on the app and the view's declared permission on the context (checked by the manager before the app sees anything). Omit `view` for the slot's first view you may see. Call legion_app_status for the app's slots.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "app": { "type": "string", "description": "The app's name (for example `autoscaler`)." },
+                    "slot": { "type": "string", "enum": ["nav", "overview", "job", "task", "node"], "description": "Where the view is shown: nav (a sidebar page), overview (a card), job (a panel on a job's page), task (a task row's badge and the task's page), node (a panel on a node's page)." },
+                    "view": { "type": "string", "description": "The view's name; omit for the slot's first view you may see." },
+                    "job": { "type": "string", "description": "For the job and task slots: the job, `name` (in `namespace`, default `default`) or `namespace/name`." },
+                    "namespace": { "type": "string", "description": "The job's namespace, when `job` is a bare name." },
+                    "task": { "type": "string", "description": "For the task slot: the task's name." },
+                    "group": { "type": "string", "description": "For the task slot: the task's group, when it has one." },
+                    "node": { "type": "string", "description": "For the node slot: the node's id." }
+                },
+                "required": ["app", "slot"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_acl_grants_list",
+            description: "List job grants: what each job version's `legion` identity was granted at submit (inline permissions and policy names), who granted it, and whether it was revoked. Needs acl:read.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Only this job's grants: its canonical id (`name` in default, else `namespace/name`)." },
+                    "include_revoked": { "type": "boolean", "description": "Also list revoked grants (default false)." }
+                },
+                "additionalProperties": false
+            }),
             mutates: false,
         },
         ToolDef {
@@ -947,7 +1056,8 @@ fn tool_defs() -> Vec<ToolDef> {
                 "properties": {
                     "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." },
-                    "force_reschedule": { "type": "boolean", "description": "Reschedule even if unchanged." }
+                    "force_reschedule": { "type": "boolean", "description": "Reschedule even if unchanged." },
+                    "allow_unknown_fields": { "type": "boolean", "description": "Accept keys Legion does not know (default false: each one is an error naming it and the closest known key). When true, keys on the job, a task, a volume, a port, or a service are kept as pending and the rest are dropped; each is listed in `warnings`." }
                 },
                 "required": ["spec_json"],
                 "additionalProperties": false
@@ -970,7 +1080,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_scale",
-            description: "Change a task's count without a new job version or rollout (count override; docs/autoscaling.md). Pass count for a target, or reset=true to return ownership to the spec. Mutating.",
+            description: "Change a task's count without a new job version or rollout (count override; docs/autoscaling.md). Pass count for a target, or reset=true to return ownership to the spec. On an autoscaled task a count is a time-boxed pin and needs `for`; min/max with `for` pin a floor or ceiling; release=true ends a pin. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -980,6 +1090,10 @@ fn tool_defs() -> Vec<ToolDef> {
                     "group": { "type": "string", "description": "Task group, when the job has more than one scalable task." },
                     "task": { "type": "string", "description": "Task name, when the job has more than one scalable task." },
                     "reason": { "type": "string", "description": "Audit note recorded with the override." },
+                    "for": { "type": "string", "description": "On an autoscaled task: pin the count (or min/max) for this long, e.g. \"2h\". Required with count on an autoscaled task." },
+                    "min": { "type": "integer", "minimum": 0, "description": "With for: pin a floor on an autoscaled task (still autoscaled above it)." },
+                    "max": { "type": "integer", "minimum": 0, "description": "With for: pin a ceiling on an autoscaled task." },
+                    "release": { "type": "boolean", "description": "End an autoscaled task's pin; autoscaling resumes from the current count." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["name"],
@@ -992,6 +1106,107 @@ fn tool_defs() -> Vec<ToolDef> {
             description: "Per-task spec vs override vs effective counts for a job (read-only).",
             input_schema: name_arg_schema,
             mutates: false,
+        },
+        ToolDef {
+            name: "legion_scaling_status",
+            description: "Task autoscaling status (docs/autoscaling.md): every autoscaled task's count (`now`), what the autoscaler wants, bounds, mode, state (ok, scaled, held, limited, deferred, pinned, paused, dry-run, missing-data, invalid, stale, not-evaluated), its pin and pause, the last change, the autoscaler replica that evaluated it (`instance`), and whether the autoscaler app is running (`app.state`: running, not-running, starting, disabled; `app.replicas` lists every replica with its shards and last report). Pass job for one job, or namespaces (names or globs) to list. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Only this job." },
+                    "namespaces": { "type": "array", "items": { "type": "string" }, "description": "Namespaces to list (names or globs); default `default`." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_scaling_explain",
+            description: "Why an autoscaled task (or a standalone policy or node group, with `policy`) is at its count, as structured data: the last evaluation's checks (reading, desired) and every safeguard stage (before, after, note), the effective policy with the level each field came from (built-in, cluster defaults, namespace policy, jobspec), pins, and pauses. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job name." },
+                    "policy": { "type": "string", "description": "A standalone policy (`namespace/name`) instead of a job." },
+                    "group": { "type": "string", "description": "Task group, when the job has several autoscaled tasks." },
+                    "task": { "type": "string", "description": "Task name, when the job has several autoscaled tasks." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_scaling_history",
+            description: "The durable record of a job's (or, with `policy`, a standalone policy's) count changes, newest first: who (operator or autoscaler), from and to, the one-line why, the policy digest, dry-run \"would\" rows (`applied = false`), and a standalone target's `failed` rows. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job name." },
+                    "policy": { "type": "string", "description": "A standalone policy (`namespace/name`) instead of a job." },
+                    "group": { "type": "string" },
+                    "task": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Rows (default 50)." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_scaling_pause",
+            description: "Pause (or with resume=true, resume) autoscaling for a job, one of its tasks, a standalone policy (`policy`), or the whole cluster (all=true, needs operator:write), optionally for a duration. While paused the server refuses the autoscaler's writes; people can still scale by hand. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job name; omit with all=true or policy." },
+                    "policy": { "type": "string", "description": "A standalone policy (`namespace/name`) instead of a job." },
+                    "group": { "type": "string" },
+                    "task": { "type": "string" },
+                    "all": { "type": "boolean", "description": "Every autoscaled task in the cluster." },
+                    "for": { "type": "string", "description": "How long, e.g. \"1h\"; default until resumed." },
+                    "reason": { "type": "string", "description": "Why, shown on every status surface." },
+                    "resume": { "type": "boolean", "description": "Lift the pause at this scope instead." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_scaling_simulate",
+            description: "Run a scaling policy over the last hour of history (or a CSV series) and return the decisions it makes, without writing anything (docs/autoscaling.md, \"Simulating a policy\"). Give `job` for its live policy (replayed against the real count by default: it reproduces the live autoscaler's decisions), or `spec` (a jobspec, or a standalone policy, as JSON) for an edited policy (followed by default: what it would have done, with utilizations rescaled to its own count). `series_csv` (header `time,ready,total,<check>...`) replaces history; it is required for a standalone policy, whose sources have no history in Legion. Returns the changes, how many evaluations ran, and the checks the input had no readings for. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "A running job: simulate its live policy." },
+                    "spec": { "type": "object", "description": "A jobspec or a standalone policy (as JSON) to simulate instead." },
+                    "namespace": { "type": "string", "description": "Namespace for a bare job name or a spec that names none." },
+                    "group": { "type": "string" },
+                    "task": { "type": "string" },
+                    "since": { "type": "string", "description": "How much history (default \"1h\", at most an hour)." },
+                    "series_csv": { "type": "string", "description": "A CSV series instead of history." },
+                    "mode": { "type": "string", "enum": ["replay", "follow"], "description": "replay: the real count; follow: the policy's own (defaults: replay for job, follow for spec and series_csv)." },
+                    "cold": { "type": "boolean", "description": "Start the simulated engine cold (the scale-in hold after a restart)." },
+                    "all": { "type": "boolean", "description": "Also return every evaluation with its stages." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_scaling_apply",
+            description: "Create or update a standalone scaling policy (docs/autoscaling.md, \"Standalone policies\"): a policy for a target that is not a Legion task, through a target plugin installed in the autoscaler's app config (or the built-in `noop`). `spec` is the jobspec `autoscale` record plus name, namespace, description and target = { plugin, config }, with min, max and checks required; or a node group (docs/autoscaling.md, \"Node groups\"): name, target = { nodes = { pool, workerType, shape, plugin, config } }, min, max, up, down, which is cluster-scoped. dry_run=true validates and returns the diff without writing. Needs scale:write on the policy's namespace; a node group needs operator:write and node:write. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "spec": { "type": "object", "description": "The policy, as JSON." },
+                    "namespace": { "type": "string", "description": "Namespace when the spec names none (default `default`)." },
+                    "dry_run": { "type": "boolean", "description": "Validate and diff; write nothing." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["spec"],
+                "additionalProperties": false
+            }),
+            mutates: true,
         },
         ToolDef {
             name: "legion_job_destroy",
@@ -1017,7 +1232,8 @@ fn tool_defs() -> Vec<ToolDef> {
                     "version": { "type": "integer", "description": "Version to render (default: latest)." },
                     "variables": { "type": "object", "description": "Variable values keyed by variable key." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." },
-                    "force_reschedule": { "type": "boolean", "description": "Reschedule even if unchanged." }
+                    "force_reschedule": { "type": "boolean", "description": "Reschedule even if unchanged." },
+                    "allow_unknown_fields": { "type": "boolean", "description": "Accept keys Legion does not know (default false: each one is an error naming it and the closest known key). When true, keys on the job, a task, a volume, a port, or a service are kept as pending and the rest are dropped; each is listed in `warnings`." }
                 },
                 "required": ["name"],
                 "additionalProperties": false
@@ -1409,14 +1625,15 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             Ok(serde_json::to_value(crate::cmd::capabilities::catalog())
                 .map_err(|e| e.to_string())?)
         }
-        "legion_job_schema" => Ok(crate::cmd::job::build_jobspec_schema()),
-        "legion_job_validate" => validate_tool(args),
+        "legion_job_schema" => Ok(crate::cmd::job::jobspec_schema_for_cli().await.0),
+        "legion_job_validate" => validate_tool(args).await,
         "legion_job_plan" => {
             let parsed_jobspec = str_arg(&args, "spec_json")?;
             let mut client = connect().await?;
             grpc(client.plan_job(PlanJobRequest {
                 parsed_jobspec,
                 namespace: opt_str_arg(&args, "namespace"),
+                allow_unknown_fields: allow_unknown_fields_arg(&args),
             }))
             .await
         }
@@ -1514,6 +1731,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                     idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                    force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
                 }),
             )
             .await
@@ -1532,7 +1750,20 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_job_info" => {
             let name = job_arg(&args, "name")?;
             let mut client = connect().await?;
-            grpc(client.get_job_info(GetJobInfoRequest { name })).await
+            let mut reply =
+                grpc(client.get_job_info(GetJobInfoRequest { name: name.clone() })).await?;
+            // Request vs usage, as `legion job info` shows it; left out when
+            // the caller lacks `scale:read` (docs/autoscaling.md).
+            if let (Some(object), Some(usage)) = (
+                reply.as_object_mut(),
+                crate::cmd::job::scaling_inputs_for_job(&mut client, &name).await,
+            ) {
+                object.insert(
+                    "scalingInputs".to_string(),
+                    serde_json::to_value(usage).map_err(|e| e.to_string())?,
+                );
+            }
+            Ok(reply)
         }
         "legion_job_spec" => {
             let name = job_arg(&args, "name")?;
@@ -1659,6 +1890,23 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
             .map(decode_node_attrs)
         }
+        "legion_node_forget" => {
+            let node_id = str_arg(&args, "node_id")?;
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.forget_node(crate::structs::ForgetNodeRequest {
+                node_id,
+                force,
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            }))
+            .await
+        }
+        "legion_scaling_demand" => {
+            let templates = demand_templates(&args)?;
+            let mut client = connect().await?;
+            grpc(client.get_capacity_demand(crate::structs::GetCapacityDemandRequest { templates }))
+                .await
+        }
         "legion_boot_ticket_create" => {
             let scope = opt_str_arg(&args, "scope").unwrap_or_else(|| "boot".to_string());
             let session = scope == "session";
@@ -1709,6 +1957,77 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_acl_whoami" => {
             let mut client = connect().await?;
             grpc(client.who_am_i(crate::structs::WhoAmIRequest {})).await
+        }
+        "legion_app_list" => {
+            let mut client = connect().await?;
+            let reply = client
+                .list_apps(crate::structs::ListAppsRequest {})
+                .await
+                .map_err(|status| {
+                    let err = CliError::from_status("request failed", &status);
+                    serde_json::to_string(&err).unwrap_or_else(|_| status.message().to_string())
+                })?
+                .into_inner();
+            Ok(json!({
+                "apps": reply.apps.iter().map(crate::cmd::app::app_json).collect::<Vec<_>>(),
+            }))
+        }
+        "legion_app_status" => {
+            let name = str_arg(&args, "app")?;
+            let mut client = connect().await?;
+            let reply = client
+                .get_app(crate::structs::GetAppRequest { name })
+                .await
+                .map_err(|status| {
+                    let err = CliError::from_status("request failed", &status);
+                    serde_json::to_string(&err).unwrap_or_else(|_| status.message().to_string())
+                })?
+                .into_inner();
+            Ok(reply
+                .app
+                .as_ref()
+                .map(crate::cmd::app::app_json)
+                .unwrap_or(Value::Null))
+        }
+        "legion_app_view" => {
+            let app = str_arg(&args, "app")?;
+            let slot = str_arg(&args, "slot")?;
+            let field = |name: &str| opt_str_arg(&args, name).unwrap_or_default();
+            let context = crate::structs::AppViewContext {
+                slot,
+                namespace: field("namespace"),
+                job: field("job"),
+                group: field("group"),
+                task: field("task"),
+                node: field("node"),
+            };
+            let mut client = connect().await?;
+            let reply = client
+                .get_app_view(crate::structs::GetAppViewRequest {
+                    app,
+                    view: field("view"),
+                    context: Some(context),
+                })
+                .await
+                .map_err(|status| {
+                    let err = CliError::from_status("request failed", &status);
+                    serde_json::to_string(&err).unwrap_or_else(|_| status.message().to_string())
+                })?
+                .into_inner();
+            Ok(crate::cmd::app_view::view_json(&reply))
+        }
+        "legion_acl_grants_list" => {
+            let job = opt_str_arg(&args, "job").filter(|job| !job.trim().is_empty());
+            let include_revoked = args
+                .get("include_revoked")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.list_grants(crate::structs::ListGrantsRequest {
+                job,
+                include_revoked,
+            }))
+            .await
         }
         "legion_action_list" => {
             let job = job_arg(&args, "job")?;
@@ -2517,6 +2836,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 force_reschedule,
                 idempotency_key,
                 namespace: opt_str_arg(&args, "namespace"),
+                allow_unknown_fields: allow_unknown_fields_arg(&args),
             }))
             .await
         }
@@ -2550,6 +2870,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 force_reschedule,
                 idempotency_key,
                 namespace: opt_str_arg(&args, "namespace"),
+                allow_unknown_fields: allow_unknown_fields_arg(&args),
             }))
             .await
         }
@@ -2574,15 +2895,212 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 .get("reset")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
+            let pin_for_seconds = match opt_str_arg(&args, "for") {
+                Some(text) => Some(
+                    humantime::parse_duration(text.trim())
+                        .map_err(|err| format!("for {text:?}: {err} (write it like 2h)"))?
+                        .as_secs()
+                        .max(1),
+                ),
+                None => None,
+            };
+            let bound = |key: &str| args.get(key).and_then(Value::as_u64).map(|n| n as u32);
             let mut client = connect().await?;
-            grpc(client.scale_task(crate::structs::ScaleTaskRequest {
-                name,
+            grpc(
+                client.scale_task(crate::structs::ScaleTaskRequest {
+                    name,
+                    task_group: opt_str_arg(&args, "group"),
+                    task_name: opt_str_arg(&args, "task"),
+                    count,
+                    reset,
+                    reason: opt_str_arg(&args, "reason"),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                    pin_for_seconds,
+                    min: bound("min"),
+                    max: bound("max"),
+                    release: args
+                        .get("release")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    ..Default::default()
+                }),
+            )
+            .await
+        }
+        "legion_scaling_status" => {
+            let job = opt_str_arg(&args, "job").unwrap_or_default();
+            let namespaces = args
+                .get("namespaces")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut client = connect().await?;
+            grpc(
+                client.get_scaling_status(crate::structs::GetScalingStatusRequest {
+                    job,
+                    namespaces,
+                    ..Default::default()
+                }),
+            )
+            .await
+        }
+        "legion_scaling_explain" => {
+            let policy = opt_str_arg(&args, "policy").unwrap_or_default();
+            let job = if policy.is_empty() {
+                job_arg(&args, "job")?
+            } else {
+                String::new()
+            };
+            let mut client = connect().await?;
+            let mut value = grpc(client.get_scaling_status(
+                crate::structs::GetScalingStatusRequest {
+                    job,
+                    task_group: opt_str_arg(&args, "group"),
+                    task_name: opt_str_arg(&args, "task"),
+                    detail: true,
+                    policy,
+                    ..Default::default()
+                },
+            ))
+            .await?;
+            // The decision and policy travel as JSON text; hand them over
+            // as structured data.
+            if let Some(targets) = value.get_mut("targets").and_then(Value::as_array_mut) {
+                for target in targets {
+                    if let Value::Object(object) = target {
+                        for (text, key) in [
+                            ("decisionJson", "decision"),
+                            ("policyJson", "effectivePolicy"),
+                        ] {
+                            let parsed = object
+                                .remove(text)
+                                .and_then(|raw| {
+                                    raw.as_str()
+                                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                                })
+                                .unwrap_or(Value::Null);
+                            object.insert(key.to_string(), parsed);
+                        }
+                    }
+                }
+            }
+            Ok(value)
+        }
+        "legion_scaling_history" => {
+            let policy = opt_str_arg(&args, "policy").unwrap_or_default();
+            let job = if policy.is_empty() {
+                job_arg(&args, "job")?
+            } else {
+                String::new()
+            };
+            let mut client = connect().await?;
+            grpc(
+                client.get_scale_history(crate::structs::GetScaleHistoryRequest {
+                    job,
+                    task_group: opt_str_arg(&args, "group"),
+                    task_name: opt_str_arg(&args, "task"),
+                    limit: args.get("limit").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    detail: false,
+                    policy,
+                }),
+            )
+            .await
+        }
+        "legion_scaling_simulate" => {
+            let spec = args
+                .get("spec")
+                .filter(|spec| !spec.is_null())
+                .map(Value::to_string);
+            let job = if spec.is_some() {
+                None
+            } else {
+                Some(job_arg(&args, "job")?)
+            };
+            let series_csv = opt_str_arg(&args, "series_csv");
+            let since = match opt_str_arg(&args, "since") {
+                Some(text) => humantime::parse_duration(text.trim())
+                    .map_err(|err| format!("since {text:?}: {err} (write it like 30m)"))?,
+                None => crate::cmd::scaling_simulate::HISTORY_MAX,
+            };
+            let follow = match opt_str_arg(&args, "mode").as_deref() {
+                Some("replay") => false,
+                Some("follow") => true,
+                Some(other) => return Err(format!("mode {other:?}: use replay or follow")),
+                None => spec.is_some() || series_csv.is_some(),
+            };
+            let request = crate::cmd::scaling_simulate::SimulateArgs {
+                job,
+                spec_json: spec,
+                namespace: opt_str_arg(&args, "namespace"),
                 task_group: opt_str_arg(&args, "group"),
                 task_name: opt_str_arg(&args, "task"),
-                count,
-                reset,
-                reason: opt_str_arg(&args, "reason"),
+                since,
+                series_csv,
+                follow,
+                cold: args.get("cold").and_then(Value::as_bool).unwrap_or(false),
+                start: None,
+            };
+            let mut client = connect().await?;
+            let mut report = crate::cmd::scaling_simulate::run(&mut client, &request)
+                .await
+                .map_err(|err| format!("{err:#}"))?;
+            if !args.get("all").and_then(Value::as_bool).unwrap_or(false) {
+                report.decisions.clear();
+            }
+            serde_json::to_value(&report).map_err(|err| err.to_string())
+        }
+        "legion_scaling_apply" => {
+            let spec = args
+                .get("spec")
+                .filter(|spec| spec.is_object())
+                .ok_or_else(|| "spec (the policy, as a JSON object) is required".to_string())?;
+            let mut client = connect().await?;
+            grpc(
+                client.apply_scaling_policy(crate::structs::ApplyScalingPolicyRequest {
+                    spec_json: spec.to_string(),
+                    namespace: opt_str_arg(&args, "namespace").unwrap_or_default(),
+                    dry_run: args
+                        .get("dry_run")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
+        "legion_scaling_pause" => {
+            let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+            let policy = opt_str_arg(&args, "policy").unwrap_or_default();
+            let job = if all || !policy.is_empty() {
+                String::new()
+            } else {
+                job_arg(&args, "job")?
+            };
+            let for_seconds = match opt_str_arg(&args, "for") {
+                Some(text) => Some(
+                    humantime::parse_duration(text.trim())
+                        .map_err(|err| format!("for {text:?}: {err} (write it like 1h)"))?
+                        .as_secs()
+                        .max(1),
+                ),
+                None => None,
+            };
+            let mut client = connect().await?;
+            grpc(client.pause_scaling(crate::structs::PauseScalingRequest {
+                job,
+                task_group: opt_str_arg(&args, "group"),
+                task_name: opt_str_arg(&args, "task"),
+                all,
+                for_seconds,
+                reason: opt_str_arg(&args, "reason").unwrap_or_default(),
+                resume: args.get("resume").and_then(Value::as_bool).unwrap_or(false),
                 idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                policy,
             }))
             .await
         }
@@ -2607,16 +3125,52 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
     }
 }
 
-/// Validate a rendered jobspec locally (no manager required).
-fn validate_tool(args: Value) -> Result<Value, String> {
+/// The `allow_unknown_fields` argument of the job-submitting tools.
+fn allow_unknown_fields_arg(args: &Value) -> bool {
+    args.get("allow_unknown_fields")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Validate a rendered jobspec without submitting it, with the unknown-key
+/// rules a submit applies. Installed apps' keys are checked against their
+/// schemas when a manager answers; offline they are reported as unchecked.
+async fn validate_tool(args: Value) -> Result<Value, String> {
     let spec_json = str_arg(&args, "spec_json")?;
-    let config: JobConfig = serde_json::from_str(&spec_json)
+    let mode =
+        crate::structs::spec_fields::UnknownFieldMode::from_allow(allow_unknown_fields_arg(&args));
+    // Parse first: a spec that is not JSON needs no manager to say so.
+    serde_json::from_str::<Value>(&spec_json)
         .map_err(|e| format!("jobspec is not a valid job configuration: {e}"))?;
+    let registry = crate::cmd::job::cluster_job_schema()
+        .await
+        .ok()
+        .map(|reply| {
+            crate::structs::extensions::ExtensionRegistry::from_keys(
+                reply
+                    .extensions
+                    .iter()
+                    .filter_map(|key| {
+                        crate::structs::extensions::InstalledKey::from_proto(key).ok()
+                    })
+                    .collect(),
+            )
+        });
+    let check = match registry.as_ref() {
+        Some(registry) => crate::structs::spec_fields::ExtensionCheck::Installed(registry),
+        None => crate::structs::spec_fields::ExtensionCheck::Offline,
+    };
+    let (config, unknown_fields) = JobConfig::parse_submitted_str(&spec_json, mode, check)
+        .map_err(|e| format!("jobspec is not a valid job configuration: {e:#}"))?;
     validate_job_config(&config).map_err(|e| format!("jobspec failed validation: {e}"))?;
     Ok(json!({
         "valid": true,
         "job": config.name,
         "tasks": config.tasks.len(),
+        "warnings": unknown_fields.warnings(),
+        "unknownFields": unknown_fields,
+        "installedKeys": if registry.is_some() { "checked" } else { "unchecked" },
+        "extensions": config.extensions,
     }))
 }
 
@@ -2754,6 +3308,55 @@ fn decode_node_attrs(mut reply: Value) -> Value {
         nodes.iter_mut().for_each(decode);
     }
     reply
+}
+
+/// `legion_scaling_demand`'s templates, as `GetCapacityDemand` takes them.
+fn demand_templates(args: &Value) -> Result<Vec<crate::structs::NodeGroupTemplate>, String> {
+    let items = args
+        .get("templates")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| "templates must be a non-empty array".to_string())?;
+    items
+        .iter()
+        .map(|item| {
+            let u64_of = |key: &str| item.get(key).and_then(Value::as_u64);
+            let u32_of = |key: &str| u64_of(key).and_then(|v| u32::try_from(v).ok());
+            let attributes = match item.get("attributes") {
+                None | Some(Value::Null) => Default::default(),
+                Some(Value::Object(map)) => map
+                    .iter()
+                    .map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (key.clone(), value.to_string()))
+                            .ok_or_else(|| format!("attributes.{key} must be a string"))
+                    })
+                    .collect::<Result<_, _>>()?,
+                Some(_) => return Err("attributes must be an object".to_string()),
+            };
+            Ok(crate::structs::NodeGroupTemplate {
+                name: str_arg(item, "name")?,
+                worker_type: opt_str_arg(item, "worker_type").unwrap_or_default(),
+                pool: opt_str_arg(item, "pool"),
+                shape: Some(crate::structs::NodeGroupShape {
+                    cpu: u64_of("cpu"),
+                    memory: u64_of("memory"),
+                    cores: u32_of("cores"),
+                    attributes,
+                    resources_json: item
+                        .get("resources")
+                        .filter(|value| !value.is_null())
+                        .map(Value::to_string)
+                        .unwrap_or_default(),
+                    max_allocations: u32_of("max_allocations"),
+                }),
+                like_node: opt_str_arg(item, "like_node"),
+                upcoming: u32_of("upcoming").unwrap_or(0),
+                ..Default::default()
+            })
+        })
+        .collect()
 }
 
 fn str_arg(args: &Value, key: &str) -> Result<String, String> {
@@ -2991,6 +3594,27 @@ mod tests {
     fn job_logs_tool_is_read_only() {
         let names: Vec<&str> = available_tools(false).iter().map(|t| t.name).collect();
         assert!(names.contains(&"legion_job_logs"));
+    }
+
+    /// The app read tools are listed without `--allow-write`
+    /// (docs/apps.md).
+    #[test]
+    fn app_tools_are_read_only() {
+        let names: Vec<&str> = available_tools(false).iter().map(|t| t.name).collect();
+        assert!(names.contains(&"legion_app_list"));
+        assert!(names.contains(&"legion_app_status"));
+        assert!(names.contains(&"legion_app_view"));
+        let view = tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "legion_app_view")
+            .expect("legion_app_view");
+        assert!(!view.mutates);
+        assert_eq!((view.input_schema)()["required"], json!(["app", "slot"]));
+        let status = tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "legion_app_status")
+            .expect("legion_app_status");
+        assert_eq!((status.input_schema)()["required"], json!(["app"]));
     }
 
     #[test]

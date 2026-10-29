@@ -23,6 +23,14 @@ pub fn cluster_gate() -> MutexGuard<'static, ()> {
     CLUSTER_GATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Serializes the tests that bind ports from the scheduler's dynamic range
+/// (from 20000) on this host. Every cluster in this binary hands out the
+/// same ports, so two such tests at once take each other's: the wake test
+/// binds its instance's advertised port, and the apps end-to-end test runs
+/// the bundled autoscaler, which binds its own. Async tests `.lock().await`
+/// it; plain tests `.blocking_lock()` it.
+pub static DYNAMIC_PORT_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The per-process root for test directories that must outlive their
 /// `TempDir` guard: create them with `tempdir_in(scratch_root())` before
 /// calling `keep()`.
@@ -51,8 +59,103 @@ pub fn scratch_root() -> &'static Path {
 
 extern "C" fn remove_scratch_root() {
     if let Some(root) = SCRATCH_ROOT.get() {
+        kill_task_processes_under(root);
         // Best effort: a background thread still writing into a store can
         // race the removal, and the process is exiting either way.
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+/// Kill the task processes a test cluster under `dir` started: those whose
+/// `LEGION_ALLOC_DIR` is inside it. A worker that stops leaves its tasks
+/// running on purpose (the next start re-adopts them;
+/// docs/architecture-managers-workers.md), so a test that starts a real
+/// worker calls this once the worker has exited, or its tasks outlive the
+/// test and keep holding their ports. Linux only (it reads `/proc`); a no-op
+/// elsewhere.
+pub fn kill_task_processes_under(dir: &Path) {
+    for pid in task_processes_under(dir) {
+        // SAFETY: plain kill(2) on a task process this test started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+/// The task processes a test cluster under `dir` started: those whose
+/// `LEGION_ALLOC_DIR` is inside it (Linux; elsewhere, none are found).
+pub fn task_processes_under(dir: &Path) -> Vec<libc::pid_t> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let pid = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<libc::pid_t>().ok())?;
+                let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+                environ
+                    .split(|byte| *byte == 0)
+                    .filter_map(|var| var.strip_prefix(b"LEGION_ALLOC_DIR="))
+                    .any(|value| Path::new(std::ffi::OsStr::from_bytes(value)).starts_with(dir))
+                    .then_some(pid)
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        Vec::new()
+    }
+}
+
+/// A fresh store in its own directory under [`scratch_root`].
+pub fn temp_store(prefix: &str) -> anyhow::Result<legion::storage::store::Store> {
+    use anyhow::Context;
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(scratch_root())?
+        .keep();
+    legion::storage::store::Store::start_storage(&legion::structs::config::ManagerConfigFull {
+        store_path: dir.to_str().context("store path")?.to_string(),
+        ..Default::default()
+    })
+}
+
+/// A manager service over a fresh store with ACLs enforced, and the
+/// management token's secret.
+pub fn acl_service(
+    prefix: &str,
+) -> anyhow::Result<(legion::manager::server::ManagerDaemonService, String)> {
+    let store = temp_store(prefix)?;
+    let authenticator = std::sync::Arc::new(legion::manager::acl::Authenticator::from_config(
+        &legion::structs::config::AclConfig {
+            enabled: Some(true),
+            ..Default::default()
+        }
+        .with_defaults(),
+    )?);
+    let (_, management) = authenticator
+        .mint_initial_management_token(&store, None)
+        .map_err(|status| anyhow::anyhow!(status.to_string()))?
+        .ok_or_else(|| anyhow::anyhow!("a fresh store has no management token"))?;
+    Ok((
+        legion::manager::server::ManagerDaemonService::with_acl(store, authenticator),
+        management,
+    ))
+}
+
+/// A request carrying `token` as its bearer credential, when given.
+pub fn authed<T>(inner: T, token: Option<&str>) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(inner);
+    if let Some(token) = token {
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("ascii token"),
+        );
+    }
+    request
 }

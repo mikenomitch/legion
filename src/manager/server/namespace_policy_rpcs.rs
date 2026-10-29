@@ -337,8 +337,12 @@ impl ManagerDaemonService {
             .store
             .get_namespace_policy(&policy.name)
             .map_err(|e| map_store_error("Error loading namespace policy", e))?;
+        // `autoscale`: every autoscaled task the policy governs must still
+        // resolve (docs/autoscaling.md, "Overriding the defaults").
+        let autoscale_violations = self.autoscale_policy_violations(&policy)?;
         if inner.dry_run {
-            let violations = self.namespace_policy_violations(&policy)?;
+            let mut violations = self.namespace_policy_violations(&policy)?;
+            violations.extend(autoscale_violations);
             let (created_at, updated_at) = existing
                 .as_ref()
                 .map(|record| (record.created_at.clone(), record.updated_at.clone()))
@@ -373,6 +377,21 @@ impl ManagerDaemonService {
                     deduplicated: true,
                 }));
             }
+        }
+        if !autoscale_violations.is_empty() && !inner.force {
+            let listed: Vec<String> = autoscale_violations
+                .iter()
+                .take(10)
+                .map(|violation| format!("  {}", violation.message))
+                .collect();
+            return Err(Status::failed_precondition(format!(
+                "namespace policy '{}': its autoscale would leave {} autoscaled task(s) with an \
+                 invalid policy:\n{}\nHint: fix those tasks first, or apply with --force to \
+                 hold them `invalid` until fixed",
+                policy.name,
+                autoscale_violations.len(),
+                listed.join("\n")
+            )));
         }
         let (record, created) = self
             .store

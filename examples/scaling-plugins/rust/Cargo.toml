@@ -1,0 +1,19 @@
+[package]
+name = "legion-scaling-plugin"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Write Legion autoscaler plugins (metric sources, strategies, targets) in Rust: the legion-scaling/1 JSON-RPC protocol over stdio"
+repository = "https://github.com/mikenomitch/legion"
+publish = false
+
+# A workspace member (the root Cargo.toml), so `cargo test --all` builds and
+# tests it with the rest of Legion. It deliberately does not depend on the
+# `legion` crate: a plugin should not need Legion's build to compile.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[[example]]
+name = "queue-ratio"
+path = "examples/queue_ratio.rs"

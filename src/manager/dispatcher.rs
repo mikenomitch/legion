@@ -1273,6 +1273,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -1297,12 +1298,14 @@ mod tests {
                 on_lost: Some(crate::structs::StatefulOnLostConfig {
                     self_terminate_after: Some("30s".into()),
                     replace_after: Some("2m".into()),
+                    unknown_fields: Default::default(),
                 }),
                 storage: None,
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -1509,11 +1512,13 @@ mod tests {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("workspace", "exec")
         };
@@ -1541,11 +1546,13 @@ mod tests {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("workspace", "exec")
         };

@@ -1,0 +1,2301 @@
+//! Apps (apps plan §9 and §12, phase A3; docs/apps.md).
+//!
+//! In process, against a manager service with ACLs on, an app reconciler
+//! driven one pass at a time, and simulated nodes reporting `buildVersion`
+//! and `buildId`:
+//!
+//! - seeding happens once, honors the manager config's `apps` block only
+//!   then, and grants bundled apps' permissions as `legion:bootstrap`;
+//! - an unchanged record submits nothing (the digests match, though the
+//!   stored config was normalized);
+//! - a direct submit is reverted within one pass, and the event names who
+//!   made it; the same edit twice is reverted twice;
+//! - disable then enable runs the job again; a direct `job stop` is
+//!   restarted;
+//! - a KV re-render keeps the `managedBy` stamp; a RunJobTemplate by another
+//!   principal clears it;
+//! - a leader killed between the submit and recording it leaves one version;
+//! - a burst of record changes coalesces;
+//! - a validation-refused submit waits for the next change;
+//! - uninstall stops the job and revokes the grant; a placement change
+//!   re-renders permits and constraints;
+//! - a code-field config change is refused for `app:write` without the
+//!   app's grant;
+//! - the build marker: agreement, one roll for a rolling upgrade, a rebuild
+//!   with a new `buildId` rolls, an older node joining does not move it
+//!   back, `unknown` is left out, the constraint, the straggler status, and
+//!   manifest adoption only when the leader runs the marker's build;
+//! - the §6.8 GitOps-shaped manifest: the prompt, the grant, the job.
+//!
+//! The end to end case, `legion app list` on a fresh single-manager cluster
+//! showing the autoscaler running on the system worker, starts the real
+//! binary (`fresh_cluster_runs_the_autoscaler_on_the_system_worker`).
+
+// Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
+#![allow(clippy::result_large_err)]
+
+use anyhow::{anyhow, Context};
+use legion::manager::acl::Authenticator;
+use legion::manager::apps::{AppReconciler, PassOutcome, ReconcilerSettings};
+use legion::manager::server::ManagerDaemonService;
+use legion::storage::store::Store;
+use legion::structs::app::{app_job_id, BuildMarker, BOOTSTRAP_PRINCIPAL};
+use legion::structs::config::AppSeedConfig;
+use legion::structs::manager_server::Manager;
+use legion::structs::*;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use tonic::{Code, Request};
+
+type R<T> = anyhow::Result<T>;
+
+const AUTOSCALER: &str = "legion-system/autoscaler";
+
+struct Fixture {
+    svc: Arc<ManagerDaemonService>,
+    store: Store,
+    admin: String,
+    /// The store's directory (its database is `store.sqlite`).
+    dir: std::path::PathBuf,
+}
+
+fn req<T>(inner: T, token: &str) -> Request<T> {
+    let mut request = Request::new(inner);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().expect("ascii token"),
+    );
+    request
+}
+
+fn fixture() -> R<Fixture> {
+    let dir = tempfile::Builder::new()
+        .prefix("legion-apps-")
+        .tempdir_in(crate::support::scratch_root())?
+        .keep();
+    let store = Store::start_storage(&ManagerConfigFull {
+        store_path: dir.to_str().context("store path")?.to_string(),
+        ..Default::default()
+    })?;
+    store.ensure_system_namespace()?;
+    let auth = Arc::new(Authenticator::from_config(
+        &AclConfig {
+            enabled: Some(true),
+            ..Default::default()
+        }
+        .with_defaults(),
+    )?);
+    let (_, admin) = auth
+        .mint_initial_management_token(&store, None)
+        .map_err(|s| anyhow!(s.to_string()))?
+        .context("a fresh store has no management token")?;
+    let svc = Arc::new(ManagerDaemonService::with_acl(store.clone(), auth));
+    Ok(Fixture {
+        svc,
+        store,
+        admin,
+        dir,
+    })
+}
+
+/// A manager's system worker on `version`/`build`.
+fn manager_node(id: &str, version: &str, build: &str) -> NodeMsg {
+    NodeMsg {
+        id: id.into(),
+        pool: "legion-system".into(),
+        status: "active".into(),
+        availability: "available".into(),
+        config_attrs: json!({
+            "legion.role": "manager",
+            "namespaces": ["legion-system"],
+            "maxAllocations": 10,
+        })
+        .to_string(),
+        fingerprint_attrs: "{}".into(),
+        dynamic_attrs: json!({ "buildVersion": version, "buildId": build }).to_string(),
+        health_checks: "{}".into(),
+        last_heartbeat: String::new(),
+        heartbeat_source: String::new(),
+    }
+}
+
+fn marker(version: &str, build: &str) -> BuildMarker {
+    BuildMarker {
+        version: version.into(),
+        build_id: build.into(),
+    }
+}
+
+impl Fixture {
+    fn reconciler(&self, own: BuildMarker) -> AppReconciler {
+        self.reconciler_seeded(own, BTreeMap::new())
+    }
+
+    fn reconciler_seeded(
+        &self,
+        own: BuildMarker,
+        seed: BTreeMap<String, AppSeedConfig>,
+    ) -> AppReconciler {
+        AppReconciler::new(
+            self.svc.clone(),
+            ReconcilerSettings {
+                seed,
+                own_build: own,
+            },
+        )
+    }
+
+    async fn token(&self, name: &str, rules: Value) -> R<String> {
+        self.svc
+            .upsert_acl_policy(req(
+                UpsertAclPolicyRequest {
+                    name: name.into(),
+                    description: String::new(),
+                    rules_json: rules.to_string(),
+                },
+                &self.admin,
+            ))
+            .await?;
+        Ok(self
+            .svc
+            .create_acl_token(req(
+                CreateAclTokenRequest {
+                    name: name.into(),
+                    token_type: "client".into(),
+                    policies: vec![name.into()],
+                    ttl: None,
+                },
+                &self.admin,
+            ))
+            .await?
+            .into_inner()
+            .secret)
+    }
+
+    /// A token that holds the autoscaler's grant and may write its job:
+    /// someone who could edit the app's job directly.
+    async fn editor(&self, name: &str) -> R<String> {
+        self.token(name, editor_rules()).await
+    }
+
+    fn version(&self, job: &str) -> R<Option<legion::storage::app_store::AppJobVersion>> {
+        self.store.app_job_version(job)
+    }
+
+    fn version_number(&self, job: &str) -> R<i64> {
+        Ok(self
+            .version(job)?
+            .map(|version| version.version)
+            .unwrap_or(0))
+    }
+
+    fn app(&self, name: &str) -> R<legion::structs::app::AppRecord> {
+        self.store.get_app(name)?.context("app record")
+    }
+
+    /// The stored config of `job`'s latest version, as JSON.
+    fn stored(&self, job: &str) -> R<Value> {
+        Ok(serde_json::to_value(self.store.get_job_config(job)?)?)
+    }
+
+    /// Submit `spec` as `token` through RunJob.
+    async fn run(&self, spec: &Value, token: &str) -> Result<RunJobReply, tonic::Status> {
+        self.svc
+            .run_job(req(
+                RunJobRequest {
+                    parsed_jobspec: spec.to_string(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    fn events(&self, kind: &str) -> R<Vec<legion::storage::events::SchedulerEventRecord>> {
+        self.store
+            .list_scheduler_events(&legion::storage::events::SchedulerEventFilter {
+                kind: Some(kind.into()),
+                limit: Some(500),
+                ..Default::default()
+            })
+    }
+
+    async fn set_enabled(&self, app: &str, enabled: bool) -> R<()> {
+        self.svc
+            .set_app_enabled(req(
+                SetAppEnabledRequest {
+                    name: app.into(),
+                    enabled,
+                    idempotency_key: None,
+                    ..Default::default()
+                },
+                &self.admin,
+            ))
+            .await?;
+        Ok(())
+    }
+
+    async fn set_config(&self, app: &str, config: Value, token: &str) -> Result<(), tonic::Status> {
+        self.svc
+            .set_app_config(req(
+                SetAppConfigRequest {
+                    name: app.into(),
+                    config_json: config.to_string(),
+                    idempotency_key: None,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ())
+    }
+
+    async fn get_app(&self, app: &str) -> R<App> {
+        self.svc
+            .get_app(req(GetAppRequest { name: app.into() }, &self.admin))
+            .await?
+            .into_inner()
+            .app
+            .context("app")
+    }
+}
+
+/// Rules that hold the autoscaler's grant and `job:write` (host) on its job.
+fn editor_rules() -> Value {
+    json!([
+        { "resources": ["job", "scale"], "actions": ["read", "write"],
+          "namespaces": ["*", "legion-*"], "host": true },
+        { "resources": ["node"], "actions": ["read", "write"] },
+        { "resources": ["kv"], "actions": ["read", "write"], "paths": ["legion/*"] },
+    ])
+}
+
+/// A fixture with three managers on one build, the autoscaler seeded, and
+/// its job submitted once.
+async fn seeded() -> R<(Fixture, AppReconciler)> {
+    let fx = fixture()?;
+    for id in ["m1", "m2", "m3"] {
+        fx.store.insert_node(manager_node(id, "0.1.0", "a"))?;
+    }
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    assert_eq!(reconciler.seed()?, vec!["autoscaler".to_string()]);
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(
+        matches!(&outcome, PassOutcome::Submitted { action, deduplicated: false } if action == "created the job"),
+        "{outcome:?}"
+    );
+    Ok((fx, reconciler))
+}
+
+fn submitted(outcome: &PassOutcome) -> bool {
+    matches!(outcome, PassOutcome::Submitted { .. })
+}
+
+/// Seeding happens once, honors the manager config's `apps` block only
+/// then, and records bundled grants as granted by `legion:bootstrap`.
+#[tokio::test(flavor = "multi_thread")]
+async fn seeding_happens_once_test() -> R<()> {
+    let fx = fixture()?;
+    let mut seed = BTreeMap::new();
+    seed.insert(
+        "autoscaler".to_string(),
+        AppSeedConfig {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    );
+    let reconciler = fx.reconciler_seeded(marker("0.1.0", "a"), seed);
+    assert_eq!(reconciler.seed()?, vec!["autoscaler".to_string()]);
+    let record = fx.app("autoscaler")?;
+    assert!(!record.enabled, "the seed-time override applied");
+    assert_eq!(record.grant.granted_by, BOOTSTRAP_PRINCIPAL);
+    assert_eq!(record.installed_by, BOOTSTRAP_PRINCIPAL);
+    assert_eq!(
+        record.grant.rules,
+        legion::apps::bundled_manifest("autoscaler")
+            .context("bundled")?
+            .permissions
+    );
+    assert_eq!(fx.events("app.installed")?.len(), 1);
+
+    // An operator enables it; a later leader's seed pass, with a config
+    // that still says disabled, changes nothing.
+    fx.set_enabled("autoscaler", true).await?;
+    let mut seed = BTreeMap::new();
+    seed.insert(
+        "autoscaler".to_string(),
+        AppSeedConfig {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    );
+    let later = fx.reconciler_seeded(marker("0.1.0", "a"), seed);
+    assert!(later.seed()?.is_empty());
+    assert!(fx.app("autoscaler")?.enabled);
+    assert_eq!(fx.events("app.installed")?.len(), 1);
+    Ok(())
+}
+
+/// An unchanged record makes no submit, although the stored config was
+/// normalized: the reconciler compares digests, not jobs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unchanged_record_makes_no_submit_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    let stamp = fx.version(AUTOSCALER)?.context("job")?.managed_by;
+    assert_eq!(
+        stamp.as_ref().map(|stamp| stamp.app.as_str()),
+        Some("autoscaler")
+    );
+    // The stored config is normalized (defaults filled in), so it is not
+    // the render; the digest is what matches.
+    let rendered =
+        legion::manager::apps::render_for(&fx.app("autoscaler")?, Some(&marker("0.1.0", "a")))
+            .map_err(|err| anyhow!(err))?;
+    assert_ne!(fx.stored(AUTOSCALER)?, rendered.jobspec);
+    for _ in 0..3 {
+        assert_eq!(
+            reconciler.reconcile_app("autoscaler").await,
+            PassOutcome::Unchanged
+        );
+    }
+    assert_eq!(fx.version_number(AUTOSCALER)?, 1);
+    assert_eq!(fx.app("autoscaler")?.state.last_digest, rendered.digest);
+    let info = fx
+        .svc
+        .get_job_info(req(
+            GetJobInfoRequest {
+                name: AUTOSCALER.into(),
+            },
+            &fx.admin,
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(
+        info.managed_by.map(|stamp| stamp.digest),
+        Some(rendered.digest)
+    );
+    Ok(())
+}
+
+/// Every direct write to an installed app's job is refused, for every
+/// caller, a management token included, and names the `legion app` verb
+/// that does it (hardening after the adversarial review, M3, which
+/// supersedes reverting them): a submit, a plan of one, a scale override (the
+/// review's `job scale --count 0` that silently disabled the app), a stop,
+/// a destroy. A version that reached the job some other way (a store a
+/// release before this one wrote) is still reverted, and the event names
+/// who made it.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_writes_to_an_app_job_are_refused_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    let alice = fx.editor("alice").await?;
+    let mut edited: Value = serde_json::to_value(fx.store.get_job_config(AUTOSCALER)?)?;
+    edited["tasks"][0]["count"] = json!(2);
+    edited["version"] = Value::Null;
+
+    for token in [&alice, &fx.admin] {
+        let refused = fx.run(&edited, token).await.expect_err("an app's job");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+        assert!(
+            refused
+                .message()
+                .contains("job legion-system/autoscaler is app autoscaler's")
+                && refused.message().contains("`legion app set autoscaler`"),
+            "{}",
+            refused.message()
+        );
+    }
+    let planned = fx
+        .svc
+        .plan_job(req(
+            PlanJobRequest {
+                parsed_jobspec: edited.to_string(),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("a plan predicts the refusal");
+    assert_eq!(planned.code(), Code::FailedPrecondition);
+    let scaled = fx
+        .svc
+        .scale_task(req(
+            ScaleTaskRequest {
+                name: AUTOSCALER.into(),
+                task_name: Some("agent".into()),
+                count: Some(0),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("scaling an app's job");
+    assert_eq!(scaled.code(), Code::FailedPrecondition);
+    assert!(
+        scaled.message().contains("scaling it directly"),
+        "{}",
+        scaled.message()
+    );
+    let stopped = fx
+        .svc
+        .stop_job(req(
+            StopJobRequest {
+                name: AUTOSCALER.into(),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("stopping an app's job");
+    assert!(stopped.message().contains("legion app disable autoscaler"));
+    let destroyed = fx
+        .svc
+        .destroy_job(req(
+            DestroyJobRequest {
+                name: AUTOSCALER.into(),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("destroying an app's job");
+    assert_eq!(destroyed.code(), Code::FailedPrecondition);
+    assert_eq!(fx.version_number(AUTOSCALER)?, 1, "nothing was written");
+    assert!(!fx.version(AUTOSCALER)?.context("job")?.is_stopped());
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged
+    );
+
+    // A version stored some other way is reverted, and the event names who.
+    let config: JobConfig = serde_json::from_value(edited)?;
+    fx.store.handle_job_submit_as(
+        &config,
+        &[Submission {
+            path: "job.json".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }],
+        None,
+        "alice",
+        None,
+    )?;
+    let version = fx.version(AUTOSCALER)?.context("job")?;
+    assert_eq!(version.managed_by, None);
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert_eq!(
+        outcome,
+        PassOutcome::Submitted {
+            action: "reverted a direct edit by alice".into(),
+            deduplicated: false,
+        }
+    );
+    assert_eq!(fx.stored(AUTOSCALER)?["tasks"][0]["count"], 1);
+    Ok(())
+}
+
+/// Disable stops the job; enable within the hour runs it again (a new key,
+/// from `stopped-<version>`); a direct `job stop` of an enabled app is
+/// restarted.
+#[tokio::test(flavor = "multi_thread")]
+async fn disable_enable_and_a_direct_stop_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    fx.set_enabled("autoscaler", false).await?;
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Stopped
+    );
+    assert!(fx.version(AUTOSCALER)?.context("job")?.is_stopped());
+    assert_eq!(fx.get_app("autoscaler").await?.status, "stopped");
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged
+    );
+
+    fx.set_enabled("autoscaler", true).await?;
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(submitted(&outcome), "{outcome:?}");
+    assert!(!fx.version(AUTOSCALER)?.context("job")?.is_stopped());
+
+    // A stop that reached the job some other way (StopJob itself is
+    // refused for an app's job).
+    fx.store.stop_job(AUTOSCALER)?;
+    assert!(fx.version(AUTOSCALER)?.context("job")?.is_stopped());
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(
+        matches!(&outcome, PassOutcome::Submitted { action, .. } if action.starts_with("started the job")),
+        "{outcome:?}"
+    );
+    assert!(!fx.version(AUTOSCALER)?.context("job")?.is_stopped());
+    // Restarting an unchanged spec stores no new version.
+    assert_eq!(fx.version_number(AUTOSCALER)?, 1);
+    Ok(())
+}
+
+/// A KV re-render (Legion storing the version itself) keeps the stamp, so
+/// the reconciler leaves it alone; RunJobTemplate by another principal
+/// clears it, and the reconciler reverts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_rerenders_keep_the_stamp_and_template_submits_clear_it_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    let stamp = fx.version(AUTOSCALER)?.context("job")?.managed_by;
+
+    // What the KV re-render path stores: the job with re-rendered values.
+    let mut rerendered = fx.store.get_job_config(AUTOSCALER)?;
+    rerendered.tasks[0]
+        .config
+        .as_object_mut()
+        .context("config")?
+        .insert("cwd".into(), json!("/tmp"));
+    rerendered.version = None;
+    fx.store.handle_job_submit(
+        &rerendered,
+        &[Submission {
+            path: "rerender.json".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }],
+    )?;
+    let version = fx.version(AUTOSCALER)?.context("job")?;
+    assert_eq!(version.version, 2);
+    assert_eq!(version.managed_by, stamp, "a re-render keeps the stamp");
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged
+    );
+
+    // A template submit by the admin is refused, like any direct submit.
+    let mut through_template: Value = serde_json::to_value(&rerendered)?;
+    through_template["tasks"][0]["count"] = json!(3);
+    fx.svc
+        .upsert_job_template(req(
+            UpsertJobTemplateRequest {
+                name: "autoscaler-template".into(),
+                source_nickel: format!(
+                    "{{ description = \"apps\", variables = [], job | not_exported = fun vars \
+                     => std.deserialize 'Json {} }}",
+                    serde_json::to_string(&through_template.to_string())?
+                ),
+            },
+            &fx.admin,
+        ))
+        .await?;
+    let refused = fx
+        .svc
+        .run_job_template(req(
+            RunJobTemplateRequest {
+                name: "autoscaler-template".into(),
+                variables_json: "{}".into(),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("a template submit to an app's job");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    let version = fx.version(AUTOSCALER)?.context("job")?;
+    assert_eq!(version.version, 2);
+    assert_eq!(version.managed_by, stamp, "nothing cleared the stamp");
+    Ok(())
+}
+
+/// A leader killed between submitting and recording that it did: the next
+/// leader's pass finds the stamp and does nothing, and a resubmit with the
+/// same key is deduplicated. Either way, one version.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_killed_mid_reconcile_leaves_one_version_test() -> R<()> {
+    let fx = fixture()?;
+    fx.store.insert_node(manager_node("m1", "0.1.0", "a"))?;
+    let reconciler = fx.reconciler(marker("0.1.0", "a"));
+    reconciler.seed()?;
+    let record = fx.app("autoscaler")?;
+    let rendered = legion::manager::apps::render_for(&record, Some(&marker("0.1.0", "a")))
+        .map_err(|err| anyhow!(err))?;
+    let key = format!("app:autoscaler:{}:none", rendered.digest);
+
+    // The old leader's submit landed; it died before recording anything.
+    let first = legion::manager::apps::submit_rendered(&fx.svc, &record, &rendered, &key)?;
+    assert!(!first.1, "the first submit is not deduplicated");
+    assert_eq!(fx.version_number(AUTOSCALER)?, 1);
+    assert_eq!(fx.app("autoscaler")?.state.last_digest, "");
+
+    // A retry with the same key is deduplicated.
+    let again = legion::manager::apps::submit_rendered(&fx.svc, &record, &rendered, &key)?;
+    assert!(again.1, "the same transition's key is deduplicated");
+
+    // The new leader's pass sees the stamp and submits nothing.
+    let mut new_leader = fx.reconciler(marker("0.1.0", "a"));
+    assert_eq!(
+        new_leader.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged
+    );
+    assert_eq!(fx.version_number(AUTOSCALER)?, 1);
+    assert_eq!(fx.app("autoscaler")?.state.last_digest, rendered.digest);
+    Ok(())
+}
+
+/// A burst of record changes makes one submit per settled state, not one
+/// per change: the loop coalesces what arrives during a pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burst_of_changes_coalesces_test() -> R<()> {
+    let fx = fixture()?;
+    fx.store.insert_node(manager_node("m1", "0.1.0", "a"))?;
+    let nudge = legion::manager::apps::spawn_reconciler(
+        fx.svc.clone(),
+        ReconcilerSettings {
+            seed: BTreeMap::new(),
+            own_build: marker("0.1.0", "a"),
+        },
+    );
+    fx.svc.set_app_nudge(nudge);
+    // The loop seeds and submits on its own.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while fx.version_number(AUTOSCALER)? == 0 {
+        assert!(std::time::Instant::now() < deadline, "no first submit");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(fx.version_number(AUTOSCALER)?, 1);
+
+    let changes = 8;
+    for replicas in 0..changes {
+        fx.svc
+            .update_app_settings(req(
+                UpdateAppSettingsRequest {
+                    name: "autoscaler".into(),
+                    replicas: Some(2 + replicas),
+                    ..Default::default()
+                },
+                &fx.admin,
+            ))
+            .await?;
+    }
+    // Settled: the job carries the final record's digest.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let record = fx.app("autoscaler")?;
+        let rendered = legion::manager::apps::render_for(&record, Some(&marker("0.1.0", "a")))
+            .map_err(|err| anyhow!(err))?;
+        let stamp = fx.version(AUTOSCALER)?.and_then(|v| v.managed_by);
+        if stamp.as_ref().map(|stamp| stamp.digest.as_str()) == Some(rendered.digest.as_str()) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never settled");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let versions = fx.version_number(AUTOSCALER)?;
+    assert!(
+        versions < 1 + i64::from(changes),
+        "{changes} changes in a burst made {} submits",
+        versions - 1
+    );
+    assert_eq!(fx.stored(AUTOSCALER)?["tasks"][0]["count"], 2 + changes - 1);
+    Ok(())
+}
+
+/// A manifest whose job installs but that submit refuses: it reads a KV key
+/// its grant does not cover (install checks the job's shape, not its reads).
+fn refused_manifest() -> Value {
+    json!({
+        "name": "rooted",
+        "version": "1.0.0",
+        "job": { "task": { "name": "main", "runtime": "exec",
+                            "config": { "command": ["sleep", "1000"],
+                                        "env": { "DB_PASSWORD": "$secret/db" } } } },
+    })
+}
+
+async fn install(
+    fx: &Fixture,
+    manifest: &Value,
+    token: &str,
+) -> Result<InstallAppReply, tonic::Status> {
+    fx.svc
+        .install_app(req(
+            InstallAppRequest {
+                manifest_json: manifest.to_string(),
+                source: "file".into(),
+                source_ref: "./app.ncl".into(),
+                ..Default::default()
+            },
+            token,
+        ))
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// Install runs the submit's admission chain (hardening after the
+/// adversarial review, M8): a job the reconciler's submit would refuse is
+/// refused at install, naming why, and nothing is recorded. A submit refused
+/// on validation later (a record written without those checks, as an older
+/// release could leave one) does not retry on its own: it waits for the next
+/// change to the app.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_submit_waits_for_a_change_test() -> R<()> {
+    let fx = fixture()?;
+    let refused = install(&fx, &refused_manifest(), &fx.admin)
+        .await
+        .expect_err("the job reads a KV key its grant does not cover");
+    assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+    assert!(
+        refused
+            .message()
+            .starts_with("app rooted's job would be refused when the reconciler submits it")
+            && refused.message().contains("secret/db"),
+        "{}",
+        refused.message()
+    );
+    assert!(fx.store.get_app("rooted")?.is_none(), "nothing installed");
+    let dry = fx
+        .svc
+        .install_app(req(
+            InstallAppRequest {
+                manifest_json: refused_manifest().to_string(),
+                dry_run: true,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("a dry run refuses it too");
+    assert_eq!(dry.code(), Code::PermissionDenied);
+
+    let manifest = legion::structs::app::AppManifest::from_json(&refused_manifest().to_string())
+        .map_err(|err| anyhow!(err))?;
+    let mut record = legion::manager::apps::seed_record(&manifest, None);
+    record.source = legion::structs::app::AppSource::File;
+    fx.store.insert_app(record)?;
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    let outcome = reconciler.reconcile_app("rooted").await;
+    assert!(
+        matches!(&outcome, PassOutcome::Refused(message) if message.contains("secret/db")),
+        "{outcome:?}"
+    );
+    let app = fx.get_app("rooted").await?;
+    assert_eq!(app.status, "degraded");
+    assert!(
+        app.status_detail.starts_with("reconcile refused:"),
+        "{}",
+        app.status_detail
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            reconciler.reconcile_app("rooted").await,
+            PassOutcome::Skipped
+        );
+    }
+    assert_eq!(fx.events("app.reconcile_failed")?.len(), 1);
+    assert!(fx.version(&app_job_id("rooted"))?.is_none());
+
+    // A change to the app is a new input: tried again. (A settings change
+    // would be refused up front now, by the same admission.)
+    fx.set_enabled("rooted", true).await?;
+    assert!(matches!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Refused(_)
+    ));
+    Ok(())
+}
+
+/// The §6.8 GitOps-shaped manifest: the prompt says what runs where, as
+/// whom, with what grant and UI; a token lacking the grant cannot install
+/// it; the admin can, the grant is recorded in their name, and the
+/// reconciled job carries it. Uninstall stops the job and revokes the grant.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
+    let fx = fixture()?;
+    let manifest = json!({
+        "name": "gitops",
+        "version": "0.2.0",
+        "placement": "managers",
+        "job": { "task": { "name": "sync", "runtime": "exec",
+            "artifacts": ["https://example.com/gitops/0.2.0/legion-gitops-linux-amd64.tar.gz"],
+            "config": { "command": ["legion-gitops"] },
+            "network": { "ports": [{ "name": "api" }] } } },
+        "permissions": [
+            { "resources": ["job"], "actions": ["read", "write"], "namespaces": ["team-*"] },
+            { "resources": ["template"], "actions": ["read"] },
+            { "resources": ["kv"], "actions": ["read"], "paths": ["legion/apps/gitops/*"] },
+        ],
+        "ui": {
+            "nav": [{ "title": "GitOps", "view": "repos" }],
+            "job": [{ "title": "Sync", "view": "job-sync",
+                      "permission": { "resource": "job", "action": "read" } }],
+            "actions": [{ "name": "sync-now", "title": "Sync now",
+                          "permission": { "resource": "job", "action": "write" } }],
+        },
+        "config": {
+            "schema": { "type": "object", "properties": { "repos": { "type": "array" } } },
+            "default": { "repos": [] },
+        },
+    });
+
+    // The prompt, from a dry run.
+    let preview = fx
+        .svc
+        .install_app(req(
+            InstallAppRequest {
+                manifest_json: manifest.to_string(),
+                source: "url".into(),
+                source_ref: "https://example.com/gitops/0.2.0/app.ncl".into(),
+                dry_run: true,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?
+        .into_inner();
+    let prompt = preview.prompt.join("\n");
+    assert!(
+        prompt.starts_with(
+            "gitops 0.2.0 runs its own code (1 artifact) on your managers, as its own \
+             unprivileged user,"
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("in legion-system, and asks for:"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("namespaces: team-*"), "{prompt}");
+    assert!(
+        prompt.contains(
+            "UI: a GitOps page, a Sync panel on job pages, one action (Sync now, needs job:write)"
+        ),
+        "{prompt}"
+    );
+    assert!(preview.uncovered.is_empty());
+    assert!(
+        fx.store.get_app("gitops")?.is_none(),
+        "a dry run installs nothing"
+    );
+
+    // `app:write` alone does not cover the grant.
+    let operator = fx
+        .token(
+            "operator",
+            json!([{ "resources": ["app"], "actions": ["read", "write"] }]),
+        )
+        .await?;
+    let refused = install(&fx, &manifest, &operator)
+        .await
+        .expect_err("the operator holds none of the grant");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        refused.message().starts_with(
+            "app gitops 0.2.0 asks for job:write in team-*, which your token does not hold"
+        ),
+        "{}",
+        refused.message()
+    );
+
+    let installed = install(&fx, &manifest, &fx.admin).await?;
+    assert_eq!(
+        installed.message,
+        "installed gitops 0.2.0; job legion-system/gitops starting"
+    );
+    let record = fx.app("gitops")?;
+    assert_eq!(record.grant.rules.len(), 3);
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    let outcome = reconciler.reconcile_app("gitops").await;
+    assert!(submitted(&outcome), "{outcome:?}");
+    let stored = fx.stored("legion-system/gitops")?;
+    assert_eq!(stored["tasks"][0]["identities"][0]["name"], "legion");
+    assert_eq!(
+        stored["tasks"][0]["identities"][0]["permissions"],
+        serde_json::to_value(&record.grant.rules)?
+    );
+    assert_eq!(
+        stored["tasks"][0]["config"]["user"],
+        json!(record.uid.to_string())
+    );
+    assert!(record.uid >= legion::structs::app::APP_UID_BASE);
+    let grants = fx
+        .svc
+        .list_grants(req(
+            ListGrantsRequest {
+                job: Some("legion-system/gitops".into()),
+                include_revoked: false,
+            },
+            &fx.admin,
+        ))
+        .await?
+        .into_inner()
+        .grants;
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert!(grants[0].granted_by.ends_with("(app gitops)"), "{grants:?}");
+
+    // Editing the job directly is refused.
+    let mut edited = stored.clone();
+    edited["tasks"][0]["count"] = json!(2);
+    edited["version"] = Value::Null;
+    let refused = fx.run(&edited, &fx.admin).await.expect_err("an app's job");
+    assert!(
+        refused.message().contains("`legion app uninstall gitops`"),
+        "{}",
+        refused.message()
+    );
+
+    // Uninstall: the job stops, its grants are revoked, the record is gone.
+    // A retry with the same key gets the first reply back, whole.
+    let uninstall = || {
+        fx.svc.uninstall_app(req(
+            UninstallAppRequest {
+                name: "gitops".into(),
+                idempotency_key: Some("uninstall-gitops".into()),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+    };
+    let reply = uninstall().await?.into_inner();
+    assert!(reply.revoked_grants >= 1, "{reply:?}");
+    assert!(!reply.deduplicated);
+    let again = uninstall().await?.into_inner();
+    assert!(again.deduplicated);
+    assert_eq!(
+        (again.revoked_grants, again.message.as_str()),
+        (reply.revoked_grants, reply.message.as_str())
+    );
+    assert!(fx.store.get_app("gitops")?.is_none());
+    assert!(fx
+        .version("legion-system/gitops")?
+        .context("job")?
+        .is_stopped());
+    let live = fx
+        .svc
+        .list_grants(req(
+            ListGrantsRequest {
+                job: Some("legion-system/gitops".into()),
+                include_revoked: false,
+            },
+            &fx.admin,
+        ))
+        .await?
+        .into_inner()
+        .grants;
+    assert!(live.is_empty(), "{live:?}");
+    assert_eq!(
+        reconciler.reconcile_app("gitops").await,
+        PassOutcome::Missing
+    );
+    // With the app gone, its stopped job is an ordinary job.
+    fx.svc
+        .destroy_job(req(
+            DestroyJobRequest {
+                name: "legion-system/gitops".into(),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    // A bundled app cannot be uninstalled.
+    reconciler.seed()?;
+    let refused = fx
+        .svc
+        .uninstall_app(req(
+            UninstallAppRequest {
+                name: "autoscaler".into(),
+                idempotency_key: None,
+                force: false,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("bundled");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    Ok(())
+}
+
+/// A placement change re-renders the permit and the constraints.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placement_change_rerenders_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    let before = fx.stored(AUTOSCALER)?;
+    assert!(before["tasks"][0]["constraints"]
+        .to_string()
+        .contains("legion.role"));
+    fx.svc
+        .update_app_settings(req(
+            UpdateAppSettingsRequest {
+                name: "autoscaler".into(),
+                placement: Some("any".into()),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(
+        matches!(&outcome, PassOutcome::Submitted { action, .. } if action == "settings changed (placement managers → any)"),
+        "{outcome:?}"
+    );
+    let after = fx.stored(AUTOSCALER)?;
+    assert!(
+        after["tasks"][0]["affinities"]
+            .to_string()
+            .contains("legion.role"),
+        "{after}"
+    );
+    assert!(
+        !after["tasks"][0]["constraints"]
+            .to_string()
+            .contains("legion.role"),
+        "{after}"
+    );
+    // `any` permits both pools, as `managers` does; `workers` permits
+    // only the worker pool.
+    assert_eq!(before["tasks"][0]["permit"], after["tasks"][0]["permit"]);
+    fx.svc
+        .update_app_settings(req(
+            UpdateAppSettingsRequest {
+                name: "autoscaler".into(),
+                placement: Some("workers".into()),
+                pool: Some("ops".into()),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    assert!(submitted(&reconciler.reconcile_app("autoscaler").await));
+    let workers = fx.stored(AUTOSCALER)?;
+    assert_eq!(
+        workers["tasks"][0]["permit"],
+        json!([{ "key": "pool", "value": "ops" }])
+    );
+    assert!(
+        workers["tasks"][0]["constraints"]
+            .to_string()
+            .contains("is_not_set"),
+        "{workers}"
+    );
+    Ok(())
+}
+
+/// A config change that touches a code field needs the app's whole grant;
+/// `app:write` covers the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_code_field_change_needs_the_grant_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    let operator = fx
+        .token(
+            "operator",
+            json!([{ "resources": ["app"], "actions": ["read", "write"] }]),
+        )
+        .await?;
+    // Not a code field: a builtin plugin's config.
+    fx.set_config(
+        "autoscaler",
+        json!({ "plugins": { "prom": { "builtin": "prometheus", "config": { "address": "http://p:9090" } } } }),
+        &operator,
+    )
+    .await?;
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(
+        matches!(&outcome, PassOutcome::Submitted { action, .. } if action == "config changed"),
+        "{outcome:?}"
+    );
+
+    // A plugin source is code.
+    let with_source = json!({ "plugins": {
+        "prom": { "builtin": "prometheus", "config": { "address": "http://p:9090" } },
+        "aws": {
+            "source": "https://example.com/aws.tar.gz",
+            "checksum": format!("sha256:{}", "0".repeat(64)),
+        },
+    } });
+    let refused = fx
+        .set_config("autoscaler", with_source.clone(), &operator)
+        .await
+        .expect_err("app:write is not the grant");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        refused.message().contains("/plugins/aws/source"),
+        "{}",
+        refused.message()
+    );
+    // So is an `exec` target's command: a program the app would run.
+    let refused = fx
+        .set_config(
+            "autoscaler",
+            json!({ "plugins": {
+                "prom": { "builtin": "prometheus", "config": { "address": "http://p:9090" } },
+                "run": { "builtin": "exec", "config": { "command": ["/bin/sh", "-c", "id"] } },
+            } }),
+            &operator,
+        )
+        .await
+        .expect_err("an exec command is code");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        refused.message().contains("/plugins/run/config/command"),
+        "{}",
+        refused.message()
+    );
+    // Someone holding the grant (and app:write) may.
+    let mut holder_rules = editor_rules();
+    holder_rules
+        .as_array_mut()
+        .context("rules")?
+        .push(json!({ "resources": ["app"], "actions": ["read", "write"] }));
+    let holder_with_apps = fx.token("holder", holder_rules).await?;
+    fx.set_config("autoscaler", with_source, &holder_with_apps)
+        .await
+        .map_err(|status| anyhow!("{status}"))?;
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(submitted(&outcome), "{outcome:?}");
+    // The plugin source is now an artifact of the app's job.
+    let stored = fx.stored(AUTOSCALER)?;
+    assert!(
+        stored["tasks"][0]["artifacts"]
+            .to_string()
+            .contains("https://example.com/aws.tar.gz"),
+        "{stored}"
+    );
+    let changed = fx.events("app.config_changed")?;
+    assert_eq!(changed.len(), 2);
+    Ok(())
+}
+
+/// Move one manager's build.
+fn rebuild(fx: &Fixture, id: &str, version: &str, build: &str) -> R<()> {
+    fx.store.insert_node(manager_node(id, version, build))?;
+    Ok(())
+}
+
+/// The build marker: defined only when the eligible ready nodes agree; a
+/// rolling upgrade of three managers rolls the app once, after the third;
+/// the straggler is named; the constraint keeps it off older nodes; an
+/// older node joining later does not move it back; `unknown` is left out; a
+/// rebuild with a new `buildId` rolls it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_build_marker_rolls_once_per_agreed_build_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    let constraint = |fx: &Fixture| -> R<String> {
+        Ok(fx.stored(AUTOSCALER)?["tasks"][0]["constraints"].to_string())
+    };
+    assert!(constraint(&fx)?.contains(">=0.1.0"));
+    let mut rolls = 0;
+    for (index, id) in ["m1", "m2", "m3"].iter().enumerate() {
+        rebuild(&fx, id, "0.2.0", "b")?;
+        let outcome = reconciler.reconcile_app("autoscaler").await;
+        if submitted(&outcome) {
+            rolls += 1;
+        }
+        if index < 2 {
+            assert_eq!(outcome, PassOutcome::Unchanged, "after {id}");
+            let app = fx.get_app("autoscaler").await?;
+            let reconcile = app.reconcile.context("reconcile")?;
+            assert_eq!(reconcile.build_marker, "0.1.0+a");
+            assert!(
+                reconcile.marker_reason.starts_with(&format!(
+                    "upgrade waiting: {} of 3 eligible nodes on 0.2.0 (waiting for",
+                    index + 1
+                )),
+                "{}",
+                reconcile.marker_reason
+            );
+            assert!(
+                reconcile.marker_reason.contains("m3"),
+                "{}",
+                reconcile.marker_reason
+            );
+        }
+    }
+    assert_eq!(rolls, 1, "one roll, after the last manager");
+    assert!(constraint(&fx)?.contains(">=0.2.0"));
+    assert_eq!(
+        fx.app("autoscaler")?.state.marker,
+        Some(marker("0.2.0", "b"))
+    );
+    assert_eq!(fx.version_number(AUTOSCALER)?, 2);
+
+    // An older node joining later holds nothing back and moves nothing.
+    fx.store.insert_node(manager_node("late", "0.1.0", "a"))?;
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged
+    );
+    assert_eq!(
+        fx.app("autoscaler")?.state.marker,
+        Some(marker("0.2.0", "b"))
+    );
+    // It is out of placement: the constraint does not match it.
+    let late = fx.store.get_node("late")?;
+    let constraints = legion::constraints::ConstraintSet::new(
+        &fx.stored(AUTOSCALER)?["tasks"][0]["constraints"],
+    )?;
+    assert!(!constraints.is_satisfied(&late, None));
+    rebuild(&fx, "late", "0.2.0", "b")?;
+
+    // A node reporting `unknown` (a worker from before versions) is left
+    // out of the marker.
+    fx.store.insert_node(manager_node("old", "unknown", ""))?;
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged
+    );
+    assert!(fx.app("autoscaler")?.state.marker_reason.is_empty());
+
+    // A rebuild without a version bump rolls it: same version, new id.
+    for id in ["m1", "m2", "m3", "late"] {
+        rebuild(&fx, id, "0.2.0", "c")?;
+    }
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(submitted(&outcome), "{outcome:?}");
+    assert_eq!(
+        fx.app("autoscaler")?.state.marker,
+        Some(marker("0.2.0", "c"))
+    );
+    assert_eq!(fx.version_number(AUTOSCALER)?, 3);
+    Ok(())
+}
+
+/// With no eligible ready node there is no marker yet, and the app waits
+/// instead of submitting.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_eligible_node_means_no_marker_test() -> R<()> {
+    let fx = fixture()?;
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    reconciler.seed()?;
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(
+        matches!(&outcome, PassOutcome::Waiting(reason) if reason.contains("waiting for an eligible node")),
+        "{outcome:?}"
+    );
+    assert!(fx.version(AUTOSCALER)?.is_none());
+    let app = fx.get_app("autoscaler").await?;
+    assert_eq!(app.status, "pending");
+    assert!(
+        app.status_detail.contains("eligible node"),
+        "{}",
+        app.status_detail
+    );
+    assert!(
+        app.notes
+            .iter()
+            .any(|note| note.contains("no manager runs a system worker")),
+        "{:?}",
+        app.notes
+    );
+    fx.store.insert_node(manager_node("m1", "0.1.0", "a"))?;
+    assert!(submitted(&reconciler.reconcile_app("autoscaler").await));
+    Ok(())
+}
+
+/// A new bundled manifest is adopted only when the leader runs the
+/// marker's build; its permissions are then recorded as granted by
+/// `legion:bootstrap`, and the upgrade is reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_bundled_manifest_is_adopted_with_the_leaders_build_test() -> R<()> {
+    let fx = fixture()?;
+    for id in ["m1", "m2"] {
+        fx.store.insert_node(manager_node(id, "0.1.0", "a"))?;
+    }
+    // The record an older build seeded: the same app with fewer
+    // permissions (none; so another manifest digest).
+    let current = legion::apps::bundled_manifest("autoscaler").context("bundled")?;
+    assert!(!current.permissions.is_empty());
+    let mut older = current.clone();
+    older.permissions.clear();
+    let mut record = legion::manager::apps::seed_record(&older, None);
+    record.manifest_digest = older.digest();
+    assert!(fx.store.seed_app(record)?);
+
+    // This leader runs build b; the nodes still run a: no adoption.
+    let mut reconciler = fx.reconciler(marker("0.2.0", "b"));
+    assert!(submitted(&reconciler.reconcile_app("autoscaler").await));
+    let record = fx.app("autoscaler")?;
+    assert_eq!(record.manifest_digest, older.digest());
+    assert!(record.grant.rules.is_empty());
+
+    // The nodes move to b, the leader's build: adopted, one roll.
+    for id in ["m1", "m2"] {
+        rebuild(&fx, id, "0.2.0", "b")?;
+    }
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(submitted(&outcome), "{outcome:?}");
+    let record = fx.app("autoscaler")?;
+    assert_eq!(record.manifest_digest, current.digest());
+    assert_eq!(record.grant.rules, current.permissions);
+    assert_eq!(record.grant.granted_by, BOOTSTRAP_PRINCIPAL);
+    let upgraded = fx.events("app.upgraded")?;
+    assert_eq!(upgraded.len(), 1);
+    assert!(
+        upgraded[0].message.contains(&format!(
+            "{} permission(s) added",
+            current.permissions.len()
+        )),
+        "{}",
+        upgraded[0].message
+    );
+    let stored = fx.stored(AUTOSCALER)?;
+    assert_eq!(
+        stored["tasks"][0]["identities"][0]["permissions"],
+        serde_json::to_value(&current.permissions)?
+    );
+    assert_eq!(fx.version_number(AUTOSCALER)?, 2);
+    Ok(())
+}
+
+/// `app:read` scoped by name filters the list; anonymous is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn app_reads_filter_by_name_test() -> R<()> {
+    let fx = fixture()?;
+    fx.reconciler(marker("0.1.0", "a")).seed()?;
+    install(&fx, &lite_manifest("other"), &fx.admin).await?;
+    let reader = fx
+        .token(
+            "reader",
+            json!([{ "resources": ["app"], "actions": ["read"], "names": ["auto*"] }]),
+        )
+        .await?;
+    let apps = fx
+        .svc
+        .list_apps(req(ListAppsRequest {}, &reader))
+        .await?
+        .into_inner()
+        .apps;
+    let names: Vec<&str> = apps.iter().map(|app| app.name.as_str()).collect();
+    assert_eq!(names, vec!["autoscaler"]);
+    let denied = fx
+        .svc
+        .get_app(req(
+            GetAppRequest {
+                name: "other".into(),
+            },
+            &reader,
+        ))
+        .await
+        .expect_err("not readable");
+    assert_eq!(denied.code(), Code::PermissionDenied);
+    Ok(())
+}
+
+/// `app:write` cannot put a host-level construct in an app's job, whoever
+/// installs it (hardening after the adversarial review): an exec health
+/// check, a `file://` artifact, `auth.nodeIdentity`, a file written at a
+/// host path, or a cgroup of its own would have the worker act for it on
+/// the managers as root, so install refuses each, and a code field cannot
+/// add a `file://` artifact either.
+#[tokio::test(flavor = "multi_thread")]
+async fn app_jobs_carry_no_host_level_constructs_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    let operator = fx
+        .token(
+            "operator",
+            json!([{ "resources": ["app"], "actions": ["read", "write"] }]),
+        )
+        .await?;
+    let app = |name: &str, task: Value| json!({ "name": name, "version": "1.0.0", "job": { "task": task } });
+    let exec = |extra: Value| {
+        let mut task = json!({ "name": "main", "runtime": "exec",
+                               "config": { "command": ["sleep", "600"] } });
+        for (key, value) in extra.as_object().expect("object") {
+            task[key] = value.clone();
+        }
+        task
+    };
+    let cases = [
+        (
+            "checker",
+            json!({ "name": "main", "runtime": "container",
+                   "config": { "image": "alpine", "command": ["true"] },
+                    "checks": [{ "type": "health", "kind": "exec", "every": "10s",
+                                 "command": ["/bin/sh", "-c", "id"] }] }),
+            "exec health check",
+        ),
+        (
+            "copier",
+            exec(json!({ "artifacts": ["file:///var/lib/legion/"] })),
+            "node's own filesystem",
+        ),
+        (
+            "presenter",
+            exec(
+                json!({ "artifacts": [{ "source": "https://evil.example/x.tgz",
+                                         "auth": { "nodeIdentity": "pull" } }] }),
+            ),
+            "nodeIdentity",
+        ),
+        (
+            "writer",
+            exec(json!({ "config": { "command": ["sleep", "600"],
+                                     "files": [{ "path": "/etc/cron.d/x", "content": "x" }] } })),
+            "host's own filesystem",
+        ),
+        (
+            "escaper",
+            exec(json!({ "config": { "command": ["sleep", "600"], "cgroup": "/" } })),
+            "cgroup",
+        ),
+    ];
+    for (name, task, says) in cases {
+        for token in [&operator, &fx.admin] {
+            let refused = install(&fx, &app(name, task.clone()), token)
+                .await
+                .expect_err("a host-level construct in an app's job");
+            assert_eq!(refused.code(), Code::InvalidArgument, "{name}: {refused}");
+            assert!(refused.message().contains(says), "{name}: {refused}");
+        }
+        assert!(fx.store.get_app(name)?.is_none(), "{name} was installed");
+    }
+
+    // A code field that would fetch node files, even from someone who holds
+    // the app's whole grant.
+    let mut holder_rules = editor_rules();
+    holder_rules
+        .as_array_mut()
+        .context("rules")?
+        .push(json!({ "resources": ["app"], "actions": ["read", "write"] }));
+    let holder = fx.token("holder", holder_rules).await?;
+    let refused = fx
+        .set_config(
+            "autoscaler",
+            json!({ "plugins": { "local": {
+                "source": "file:///var/lib/legion/",
+                "checksum": format!("sha256:{}", "0".repeat(64)),
+            } } }),
+            &holder,
+        )
+        .await
+        .expect_err("a file:// plugin source");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused}");
+    assert!(
+        refused.message().contains("node's own filesystem"),
+        "{refused}"
+    );
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged
+    );
+    Ok(())
+}
+
+/// Every app runs as its own uid (hardening after the adversarial review):
+/// two apps' exec tasks never share a user, so one cannot read the other's
+/// `secrets/`.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_app_runs_as_its_own_uid_test() -> R<()> {
+    let fx = fixture()?;
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    for name in ["one", "two"] {
+        install(
+            &fx,
+            &json!({ "name": name, "version": "1.0.0",
+                     "job": { "task": { "name": "main", "runtime": "exec",
+                                        "config": { "command": ["sleep", "600"] } } } }),
+            &fx.admin,
+        )
+        .await?;
+        let outcome = reconciler.reconcile_app(name).await;
+        assert!(submitted(&outcome), "{name}: {outcome:?}");
+    }
+    let user = |name: &str| -> R<Value> {
+        Ok(fx.stored(&app_job_id(name))?["tasks"][0]["config"]["user"].clone())
+    };
+    let (one, two) = (user("one")?, user("two")?);
+    assert_ne!(one, two, "two apps share a user");
+    for (name, user) in [("one", one), ("two", two)] {
+        let uid = fx.app(name)?.uid;
+        assert!(uid >= legion::structs::app::APP_UID_BASE, "{name}: {uid}");
+        assert_eq!(user, json!(uid.to_string()), "{name}");
+    }
+    // A manifest may not pick a user: it could pick another app's.
+    let refused = install(
+        &fx,
+        &json!({ "name": "three", "version": "1.0.0",
+                 "job": { "task": { "name": "main", "runtime": "exec",
+                                    "config": { "command": ["sleep", "600"],
+                                                "user": fx.app("one")?.uid.to_string() } } } }),
+        &fx.admin,
+    )
+    .await
+    .expect_err("a manifest that names a user");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused}");
+    assert!(refused.message().contains("config.user"), "{refused}");
+    Ok(())
+}
+
+/// Moving an app off the managers, or to another pool, is a security
+/// decision (its token lands on those nodes), so it needs `operator:write`
+/// beside `app:write`, and so does installing an app placed elsewhere
+/// (hardening after the adversarial review).
+#[tokio::test(flavor = "multi_thread")]
+async fn placement_needs_operator_write_test() -> R<()> {
+    let (fx, _reconciler) = seeded().await?;
+    let operator = fx
+        .token(
+            "operator",
+            json!([{ "resources": ["app"], "actions": ["read", "write"] }]),
+        )
+        .await?;
+    let settings = |placement: Option<&str>, pool: Option<&str>, replicas: Option<u32>| {
+        UpdateAppSettingsRequest {
+            name: "autoscaler".into(),
+            placement: placement.map(str::to_string),
+            pool: pool.map(str::to_string),
+            replicas,
+            ..Default::default()
+        }
+    };
+    for (placement, pool) in [(Some("workers"), Some("ci")), (Some("any"), None)] {
+        let refused = fx
+            .svc
+            .update_app_settings(req(settings(placement, pool, None), &operator))
+            .await
+            .expect_err("app:write alone moves the app");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+        assert!(refused.message().contains("operator:write"), "{refused}");
+    }
+    // Replicas are not placement.
+    fx.svc
+        .update_app_settings(req(settings(None, None, Some(2)), &operator))
+        .await?;
+
+    let elsewhere = json!({ "name": "elsewhere", "version": "1.0.0", "placement": "workers",
+                            "job": { "task": { "name": "main", "runtime": "container",
+                   "config": { "image": "alpine", "command": ["true"] } } } });
+    let refused = install(&fx, &elsewhere, &operator)
+        .await
+        .expect_err("app:write alone installs an app placed on workers");
+    assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+    assert!(refused.message().contains("operator:write"), "{refused}");
+
+    let placer = fx
+        .token(
+            "placer",
+            json!([
+                { "resources": ["app"], "actions": ["read", "write"] },
+                { "resources": ["operator"], "actions": ["write"] },
+            ]),
+        )
+        .await?;
+    install(&fx, &elsewhere, &placer).await?;
+    fx.svc
+        .update_app_settings(req(settings(Some("workers"), Some("ci"), None), &placer))
+        .await?;
+    Ok(())
+}
+
+/// A small installed app: one `exec` task, no permissions.
+fn lite_manifest(name: &str) -> Value {
+    json!({
+        "name": name,
+        "version": "1.0.0",
+        "job": { "task": { "name": "main", "runtime": "exec",
+                            "config": { "command": ["sleep", "3600"] } } },
+    })
+}
+
+async fn uninstall_app(
+    fx: &Fixture,
+    name: &str,
+    purge: bool,
+    dry_run: bool,
+) -> Result<UninstallAppReply, tonic::Status> {
+    fx.svc
+        .uninstall_app(req(
+            UninstallAppRequest {
+                name: name.into(),
+                purge,
+                dry_run,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+fn live_grants(fx: &Fixture, job: &str) -> R<usize> {
+    Ok(fx
+        .store
+        .list_job_grants(Some(job), false)?
+        .into_iter()
+        .filter(|grant| grant.revoked_at.is_none())
+        .count())
+}
+
+/// An uninstall that lands while a reconciler submit is in flight (the
+/// submit had read the record, then spent seconds resolving pins) leaves no
+/// job running (hardening after the adversarial review, H2): the submit is
+/// compare-and-set on the record, in the same entry as the version, so it is
+/// refused; and a job that still comes back stamped for an app with no
+/// record is stopped, and its grants revoked, by the next pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uninstall_racing_a_submit_leaves_no_job_running_test() -> R<()> {
+    let fx = fixture()?;
+    install(&fx, &lite_manifest("racer"), &fx.admin).await?;
+    let record = fx.app("racer")?;
+    let rendered = legion::manager::apps::render_for(&record, None).map_err(|err| anyhow!(err))?;
+    uninstall_app(&fx, "racer", false, false).await?;
+    let late =
+        legion::manager::apps::submit_rendered(&fx.svc, &record, &rendered, "app:racer:x:none")
+            .expect_err("the record is gone");
+    assert!(
+        format!("{late:#}").contains("app racer's job was not submitted: it was uninstalled"),
+        "{late:#}"
+    );
+    assert!(fx.version(&app_job_id("racer"))?.is_none(), "no job");
+
+    // The same for a disable, and for any other write in between.
+    install(&fx, &lite_manifest("flipper"), &fx.admin).await?;
+    let record = fx.app("flipper")?;
+    let rendered = legion::manager::apps::render_for(&record, None).map_err(|err| anyhow!(err))?;
+    fx.set_enabled("flipper", false).await?;
+    let late =
+        legion::manager::apps::submit_rendered(&fx.svc, &record, &rendered, "app:flipper:x:none")
+            .expect_err("the record was disabled");
+    assert!(format!("{late:#}").contains("it was disabled"), "{late:#}");
+    fx.set_enabled("flipper", true).await?;
+    let late =
+        legion::manager::apps::submit_rendered(&fx.svc, &record, &rendered, "app:flipper:y:none")
+            .expect_err("the record changed");
+    assert!(
+        format!("{late:#}").contains("its record changed"),
+        "{late:#}"
+    );
+    // The reconciler's own pass renders from the current record.
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    assert!(submitted(&reconciler.reconcile_app("flipper").await));
+
+    // A job left running, stamped for an app whose record is gone: found by
+    // a full pass, stopped, and its grants revoked.
+    let mut orphan = lite_manifest("orphan");
+    orphan["permissions"] = json!([{ "resources": ["node"], "actions": ["read"] }]);
+    install(&fx, &orphan, &fx.admin).await?;
+    assert!(submitted(&reconciler.reconcile_app("orphan").await));
+    let job = app_job_id("orphan");
+    assert!(live_grants(&fx, &job)? >= 1);
+    assert!(fx.store.delete_app("orphan")?);
+    let mut fresh = fx.reconciler(marker("0.1.0", "a"));
+    let outcomes = fresh.reconcile_all().await;
+    assert!(
+        outcomes.contains(&("orphan".to_string(), PassOutcome::Stopped)),
+        "{outcomes:?}"
+    );
+    assert!(fx.version(&job)?.context("job")?.is_stopped());
+    assert_eq!(live_grants(&fx, &job)?, 0);
+    assert_eq!(fresh.reconcile_app("orphan").await, PassOutcome::Missing);
+    Ok(())
+}
+
+/// One app record that does not decode breaks nothing else (hardening after
+/// the adversarial review, H3): every job submit still works, the list shows
+/// it `corrupt` beside the others, the reconciler skips it, and uninstall
+/// removes it by name; a bundled app's is seeded again. A field this build
+/// does not know (a record another release wrote) is no corruption at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_that_does_not_decode_breaks_nothing_else_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    install(&fx, &lite_manifest("lite"), &fx.admin).await?;
+    assert!(submitted(&reconciler.reconcile_app("lite").await));
+    let db = rusqlite::Connection::open(fx.dir.join("store.sqlite"))?;
+    db.execute(
+        "UPDATE app SET manifest = json_set(manifest, '$.renamedLater', 1) WHERE name = 'autoscaler';",
+        [],
+    )?;
+    assert_eq!(fx.app("autoscaler")?.name, "autoscaler", "read leniently");
+    db.execute(
+        "UPDATE app SET manifest = json_set(manifest, '$.replicas', 'three'), \
+         updated_at = 'corrupted' WHERE name = 'lite';",
+        [],
+    )?;
+
+    // A submit reads the installed jobspec keys: the bad row is skipped.
+    fx.run(
+        &json!({ "name": "web", "task": { "name": "main", "runtime": "exec",
+                 "config": { "command": ["true"] } } }),
+        &fx.admin,
+    )
+    .await?;
+
+    let apps = fx
+        .svc
+        .list_apps(req(ListAppsRequest::default(), &fx.admin))
+        .await?
+        .into_inner()
+        .apps;
+    let status = |name: &str| {
+        apps.iter()
+            .find(|app| app.name == name)
+            .map(|app| (app.status.clone(), app.status_detail.clone()))
+    };
+    let (lite, detail) = status("lite").context("lite listed")?;
+    assert_eq!(lite, "corrupt");
+    assert!(detail.starts_with("corrupt: app.manifest:"), "{detail}");
+    assert_ne!(
+        status("autoscaler").context("autoscaler listed")?.0,
+        "corrupt"
+    );
+    assert_eq!(fx.get_app("lite").await?.status, "corrupt");
+
+    let outcomes = reconciler.reconcile_all().await;
+    assert!(
+        outcomes.contains(&("autoscaler".to_string(), PassOutcome::Unchanged)),
+        "{outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .any(|(name, outcome)| name == "lite" && matches!(outcome, PassOutcome::Corrupt(_))),
+        "{outcomes:?}"
+    );
+
+    // Uninstall works by name; the job stops.
+    uninstall_app(&fx, "lite", false, false).await?;
+    assert!(!fx.store.app_exists("lite")?);
+    assert!(fx
+        .version(&app_job_id("lite"))?
+        .context("job")?
+        .is_stopped());
+
+    // A bundled app's record that does not decode is removed the same way,
+    // and seeded again from this build.
+    db.execute(
+        "UPDATE app SET settings = 'not json' WHERE name = 'autoscaler';",
+        [],
+    )?;
+    assert_eq!(fx.get_app("autoscaler").await?.status, "corrupt");
+    uninstall_app(&fx, "autoscaler", false, false).await?;
+    assert_eq!(reconciler.seed()?, vec!["autoscaler".to_string()]);
+    assert_eq!(fx.app("autoscaler")?.settings.replicas, 1);
+    Ok(())
+}
+
+/// A job that failed (its reschedule policy gave up, a KV `onDelete =
+/// "fail"`, a gang that lost its quorum) is restarted, with backoff, and
+/// status says so (hardening after the adversarial review, M2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_job_restarts_with_backoff_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    fx.store.mark_job_failed(AUTOSCALER)?;
+    let app = fx.get_app("autoscaler").await?;
+    assert_eq!(app.status, "degraded");
+    assert!(
+        app.status_detail.contains("job failed"),
+        "{}",
+        app.status_detail
+    );
+
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert_eq!(
+        outcome,
+        PassOutcome::Submitted {
+            action: "restarted the job, which had failed (restart 1)".into(),
+            deduplicated: false,
+        }
+    );
+    assert!(!fx.version(AUTOSCALER)?.context("job")?.is_failed());
+    assert_eq!(
+        fx.version_number(AUTOSCALER)?,
+        1,
+        "the same version runs again"
+    );
+
+    // It fails again at once: the next restart waits for the backoff.
+    fx.store.mark_job_failed(AUTOSCALER)?;
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Skipped
+    );
+    let app = fx.get_app("autoscaler").await?;
+    assert!(
+        app.status_detail.contains("restarting it in") && app.status_detail.contains("(restart 2)"),
+        "{}",
+        app.status_detail
+    );
+    assert!(reconciler.next_retry().is_some(), "the loop wakes for it");
+    Ok(())
+}
+
+/// `legion app enable` on an enabled app whose job does not run healthy at
+/// the version the record renders (an upgrade whose rollout failed or rolled
+/// back, here a job nothing placed) resubmits it, once (hardening after the
+/// adversarial review, M1); a pass with no write in between leaves it be.
+#[tokio::test(flavor = "multi_thread")]
+async fn enable_retries_a_job_not_healthy_at_its_version_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged,
+        "no write, no retry"
+    );
+    fx.set_enabled("autoscaler", true).await?;
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(
+        matches!(&outcome, PassOutcome::Submitted { action, .. }
+            if action.starts_with("resubmitted the job, which did not run healthy at version 1")),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged
+    );
+    assert_eq!(fx.version_number(AUTOSCALER)?, 1, "no new version");
+    Ok(())
+}
+
+/// A fleet whose eligible nodes run one version as different binaries
+/// (amd64 and arm64 managers) agrees on a build marker, and a leader of that
+/// version adopts the new bundled manifest (hardening after the adversarial
+/// review, M5): before, the marker never settled and the app never started.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mixed_architecture_fleet_agrees_and_adopts_test() -> R<()> {
+    let fx = fixture()?;
+    fx.store
+        .insert_node(manager_node("m-amd", "0.2.0", "amd64"))?;
+    fx.store
+        .insert_node(manager_node("m-arm", "0.2.0", "arm64"))?;
+    let current = legion::apps::bundled_manifest("autoscaler").context("bundled")?;
+    let mut older = current.clone();
+    older.permissions.clear();
+    assert!(fx
+        .store
+        .seed_app(legion::manager::apps::seed_record(&older, None))?);
+    let mut reconciler = fx.reconciler(marker("0.2.0", "amd64"));
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(submitted(&outcome), "{outcome:?}");
+    let record = fx.app("autoscaler")?;
+    let held = record.state.marker.clone().context("a marker")?;
+    assert_eq!(held.version, "0.2.0");
+    assert_eq!(
+        held.build_id,
+        legion::structs::app::mixed_build_id(["amd64", "arm64"])
+    );
+    assert!(record.state.marker_reason.is_empty());
+    assert_eq!(record.manifest_digest, current.digest(), "adopted");
+    Ok(())
+}
+
+/// A bundled build whose config schema the stored config no longer matches
+/// is held (hardening after the adversarial review, M6): the job stays on
+/// the previous build, status is `degraded: upgrade held: …`, the hold is
+/// announced once, and a config that matches the new schema (set although
+/// the stored schema refuses it) lets the upgrade through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundled_upgrade_that_tightens_the_config_is_held_test() -> R<()> {
+    let fx = fixture()?;
+    for id in ["m1", "m2"] {
+        fx.store.insert_node(manager_node(id, "0.1.0", "a"))?;
+    }
+    let current = legion::apps::bundled_manifest("autoscaler").context("bundled")?;
+    let mut older = current.clone();
+    let spec = older.config.clone().context("a config")?;
+    let mut schema = spec.schema.clone();
+    schema["properties"]["legacyKnob"] = json!({ "type": "boolean" });
+    schema["required"] = json!(["legacyKnob"]);
+    older.config = Some(legion::structs::app::AppConfigSpec {
+        schema,
+        default: json!({ "legacyKnob": true }),
+    });
+    assert!(fx
+        .store
+        .seed_app(legion::manager::apps::seed_record(&older, None))?);
+    let mut reconciler = fx.reconciler(marker("0.2.0", "b"));
+    assert!(submitted(&reconciler.reconcile_app("autoscaler").await));
+    for id in ["m1", "m2"] {
+        rebuild(&fx, id, "0.2.0", "b")?;
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            reconciler.reconcile_app("autoscaler").await,
+            PassOutcome::Unchanged,
+            "held: the job stays on build a"
+        );
+    }
+    assert_eq!(fx.version_number(AUTOSCALER)?, 1);
+    let app = fx.get_app("autoscaler").await?;
+    assert_eq!(app.status, "degraded");
+    assert!(
+        app.status_detail
+            .starts_with("upgrade held: build 0.2.0+b changes autoscaler's config schema"),
+        "{}",
+        app.status_detail
+    );
+    assert_eq!(app.reconcile.context("reconcile")?.build_marker, "0.1.0+a");
+    let held = fx.events("app.reconcile_failed")?;
+    assert_eq!(held.len(), 1, "announced once");
+    assert_eq!(fx.app("autoscaler")?.manifest_digest, older.digest());
+
+    // `{}` fails the stored schema (it requires legacyKnob) and matches the
+    // new one: accepted, and the next pass adopts and rolls.
+    fx.set_config("autoscaler", json!({}), &fx.admin).await?;
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(submitted(&outcome), "{outcome:?}");
+    let record = fx.app("autoscaler")?;
+    assert_eq!(record.manifest_digest, current.digest());
+    assert_eq!(record.state.marker, Some(marker("0.2.0", "b")));
+    assert!(record.state.marker_reason.is_empty());
+    // A config that matches neither is still refused.
+    let refused = fx
+        .set_config("autoscaler", json!({ "nope": 1 }), &fx.admin)
+        .await
+        .expect_err("not in the schema");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    Ok(())
+}
+
+/// A parked refusal never hides a job that already runs the render (another
+/// leader got it submitted), and a new leadership term forgets what an
+/// earlier one parked (hardening after the adversarial review, L1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_term_retries_and_a_current_job_is_not_parked_test() -> R<()> {
+    let fx = fixture()?;
+    let manifest = legion::structs::app::AppManifest::from_json(&refused_manifest().to_string())
+        .map_err(|err| anyhow!(err))?;
+    let mut record = legion::manager::apps::seed_record(&manifest, None);
+    record.source = legion::structs::app::AppSource::File;
+    fx.store.insert_app(record)?;
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    assert!(matches!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Refused(_)
+    ));
+    assert_eq!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Skipped
+    );
+
+    // The job reaches the render some other way (another leader's submit).
+    let record = fx.app("rooted")?;
+    let rendered = legion::manager::apps::render_for(&record, None).map_err(|err| anyhow!(err))?;
+    let mut config: JobConfig = serde_json::from_value(rendered.jobspec.clone())?;
+    config.name = app_job_id("rooted");
+    fx.store.handle_job_submit_managed(
+        &config,
+        &[Submission {
+            path: "job.json".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }],
+        "legion:bootstrap (app rooted)",
+        legion::structs::app::ManagedBy {
+            app: "rooted".into(),
+            digest: rendered.digest.clone(),
+        },
+        &record.updated_at,
+    )?;
+    assert_eq!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Unchanged,
+        "the job runs the render: nothing is parked"
+    );
+
+    // Parked again (its job stopped, the restart refused); a new term tries
+    // again instead of trusting the earlier term.
+    fx.store.stop_job(&app_job_id("rooted"))?;
+    assert!(matches!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Refused(_)
+    ));
+    assert_eq!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Skipped
+    );
+    reconciler.reset_runtime();
+    assert!(matches!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Refused(_)
+    ));
+    Ok(())
+}
+
+/// Uninstall leaves an app's KV (`legion/apps/<app>/`) unless `--purge`
+/// (which needs `kv:write` there), says how many keys it left or deleted,
+/// and a later install of an app with the same name is told about what it
+/// would inherit (hardening after the adversarial review, L3).
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstall_keeps_the_apps_kv_unless_purged_test() -> R<()> {
+    let fx = fixture()?;
+    install(&fx, &lite_manifest("stateful"), &fx.admin).await?;
+    fx.svc
+        .put_kv(req(
+            PutKvRequest {
+                key: "legion/apps/stateful/cursor".into(),
+                value: "42".into(),
+                value_type: KvValueType::String as i32,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    let reply = uninstall_app(&fx, "stateful", false, false).await?;
+    assert_eq!((reply.kv_keys, reply.purged), (1, false));
+    assert!(reply.message.contains("stay"), "{}", reply.message);
+    assert!(fx.store.get_kv("legion/apps/stateful/cursor")?.is_some());
+
+    let dry = fx
+        .svc
+        .install_app(req(
+            InstallAppRequest {
+                manifest_json: lite_manifest("stateful").to_string(),
+                dry_run: true,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?
+        .into_inner();
+    assert!(
+        dry.prompt.iter().any(|line| line
+            .starts_with("1 KV key under legion/apps/stateful/ was left by an earlier install")),
+        "{:?}",
+        dry.prompt
+    );
+
+    install(&fx, &lite_manifest("stateful"), &fx.admin).await?;
+    // `--purge` is a KV write: `app:write` alone is not enough.
+    let apps_only = fx
+        .token(
+            "apps-only",
+            json!([{ "resources": ["app"], "actions": ["read", "write"] }]),
+        )
+        .await?;
+    let refused = fx
+        .svc
+        .uninstall_app(req(
+            UninstallAppRequest {
+                name: "stateful".into(),
+                purge: true,
+                ..Default::default()
+            },
+            &apps_only,
+        ))
+        .await
+        .expect_err("purge needs kv:write");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(fx.store.app_exists("stateful")?);
+    let reply = uninstall_app(&fx, "stateful", true, false).await?;
+    assert_eq!((reply.kv_keys, reply.purged), (1, true));
+    assert!(fx.store.get_kv("legion/apps/stateful/cursor")?.is_none());
+    Ok(())
+}
+
+/// `--dry-run` on `set`, `config set`, `enable`, `disable`, and
+/// `uninstall` validates and says what would change, and changes nothing
+/// (hardening after the adversarial review, the CLI gaps).
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_runs_change_nothing_test() -> R<()> {
+    let (fx, _reconciler) = seeded().await?;
+    install(&fx, &lite_manifest("lite"), &fx.admin).await?;
+    let before = fx.app("autoscaler")?;
+    let settings = fx
+        .svc
+        .update_app_settings(req(
+            UpdateAppSettingsRequest {
+                name: "autoscaler".into(),
+                replicas: Some(3),
+                dry_run: true,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?
+        .into_inner();
+    assert!(
+        settings
+            .message
+            .starts_with("dry run: autoscaler: settings changed (replicas 1 → 3)"),
+        "{}",
+        settings.message
+    );
+    let config = fx
+        .svc
+        .set_app_config(req(
+            SetAppConfigRequest {
+                name: "autoscaler".into(),
+                config_json: json!({ "interval": "30s" }).to_string(),
+                dry_run: true,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?
+        .into_inner();
+    assert!(config.message.starts_with("dry run:"), "{}", config.message);
+    let refused = fx
+        .svc
+        .set_app_config(req(
+            SetAppConfigRequest {
+                name: "autoscaler".into(),
+                config_json: json!({ "nope": 1 }).to_string(),
+                dry_run: true,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("a dry run validates");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    for enabled in [false, true] {
+        let reply = fx
+            .svc
+            .set_app_enabled(req(
+                SetAppEnabledRequest {
+                    name: "autoscaler".into(),
+                    enabled,
+                    dry_run: true,
+                    ..Default::default()
+                },
+                &fx.admin,
+            ))
+            .await?
+            .into_inner();
+        assert!(reply.message.starts_with("dry run:"), "{}", reply.message);
+    }
+    let reply = uninstall_app(&fx, "lite", false, true).await?;
+    assert!(
+        reply.message.starts_with("dry run: uninstalling lite"),
+        "{}",
+        reply.message
+    );
+    assert!(fx.store.app_exists("lite")?);
+    let after = fx.app("autoscaler")?;
+    assert_eq!(
+        (
+            after.updated_at,
+            after.enabled,
+            after.settings,
+            after.config
+        ),
+        (
+            before.updated_at,
+            before.enabled,
+            before.settings,
+            before.config
+        )
+    );
+    Ok(())
+}
+
+/// Install never takes over a `legion-system/<name>` job the app does not
+/// already manage (hardening after the adversarial review): an operator's
+/// own job by that name is refused; the stopped job an uninstall left is
+/// the app's, so reinstalling works.
+#[tokio::test(flavor = "multi_thread")]
+async fn install_refuses_a_job_it_does_not_manage_test() -> R<()> {
+    let fx = fixture()?;
+    fx.run(
+        &json!({ "name": "takeover", "namespace": "legion-system",
+                 "task": { "name": "main", "runtime": "container",
+                           "config": { "image": "alpine", "command": ["true"] } } }),
+        &fx.admin,
+    )
+    .await?;
+    let manifest = |name: &str| {
+        json!({ "name": name, "version": "1.0.0",
+                "job": { "task": { "name": "main", "runtime": "container",
+                   "config": { "image": "alpine", "command": ["true"] } } } })
+    };
+    let refused = install(&fx, &manifest("takeover"), &fx.admin)
+        .await
+        .expect_err("the job is not the app's");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    assert!(
+        refused.message().contains("legion-system/takeover"),
+        "{refused}"
+    );
+    assert!(fx.store.get_app("takeover")?.is_none());
+
+    install(&fx, &manifest("again"), &fx.admin).await?;
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    assert!(submitted(&reconciler.reconcile_app("again").await));
+    fx.svc
+        .uninstall_app(req(
+            UninstallAppRequest {
+                name: "again".into(),
+                idempotency_key: None,
+                force: false,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    install(&fx, &manifest("again"), &fx.admin).await?;
+    Ok(())
+}
+
+/// Scenario A (apps plan §3 and §12 A3), with the real binary: a fresh
+/// single manager with no workers seeds the autoscaler, and `legion app
+/// list` shows it running on the manager's system worker, from the node's
+/// own binary (`legion:self`). The worker reports its build id, the app's
+/// job carries the build marker, and `job info` says the job is managed.
+///
+/// An app's exec task runs as the app's own uid, which takes a worker
+/// that can switch users: run unprivileged, the test checks the placement
+/// instead of the process.
+#[cfg(unix)]
+#[test]
+fn fresh_cluster_runs_the_autoscaler_on_the_system_worker_test() {
+    let _serial = crate::system_worker::SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The autoscaler binds a port from the dynamic range.
+    let _ports = crate::support::DYNAMIC_PORT_GATE.blocking_lock();
+    let cluster = crate::system_worker::Cluster::start_with_autoscaler(false);
+    let node = cluster.first_node_id().expect("start waited for the node");
+    // SAFETY: geteuid has no preconditions.
+    let privileged = unsafe { libc::geteuid() } == 0;
+    let autoscaler = |list: &Value| -> Option<Value> {
+        list["data"]["apps"]
+            .as_array()?
+            .iter()
+            .find(|app| app["name"] == "autoscaler")
+            .cloned()
+    };
+    cluster.wait_for("the autoscaler to run on the system worker", || {
+        let list = cluster.cli_json(&["app", "list"]);
+        let Some(app) = autoscaler(&list) else {
+            return false;
+        };
+        if privileged {
+            app["status"] == "running"
+                && app["runningOn"]
+                    .as_array()
+                    .is_some_and(|nodes| nodes.iter().any(|id| id == node.as_str()))
+        } else {
+            cluster.usage(&node)["allocations"]
+                .as_array()
+                .is_some_and(|allocations| {
+                    allocations
+                        .iter()
+                        .any(|allocation| allocation["jobId"] == AUTOSCALER)
+                })
+        }
+    });
+
+    let list = cluster.cli(&["app", "list"]);
+    let table = String::from_utf8_lossy(&list.stdout);
+    assert!(table.contains("autoscaler"), "{table}");
+    assert!(table.contains("bundled"), "{table}");
+
+    let status = cluster.cli_json(&["app", "status", "autoscaler"]);
+    assert_eq!(status["ok"], true, "{status}");
+    let app = &status["data"];
+    assert_eq!(app["grant"]["grantedBy"], BOOTSTRAP_PRINCIPAL, "{app}");
+    assert_eq!(app["source"], "bundled", "{app}");
+    let marker = app["reconcile"]["buildMarker"].as_str().unwrap_or_default();
+    assert!(
+        marker.starts_with(&format!("{}+", env!("CARGO_PKG_VERSION"))),
+        "{app}"
+    );
+    let node_info = cluster.cli_json(&["node", "info", &node]);
+    let build_id = node_info["data"]["dynamicAttrs"]["buildId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(build_id.len(), 32, "{node_info}");
+    assert!(marker.ends_with(&build_id), "{marker} vs {build_id}");
+
+    let info = cluster.cli(&["job", "info", AUTOSCALER]);
+    let text = String::from_utf8_lossy(&info.stdout);
+    assert!(
+        text.contains("managed by app autoscaler"),
+        "{text} / {}",
+        String::from_utf8_lossy(&info.stderr)
+    );
+}

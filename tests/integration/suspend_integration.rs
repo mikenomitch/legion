@@ -292,11 +292,13 @@ fn job(runtime: &str, suspend: Option<SuspendConfig>) -> JobConfig {
                 params: None,
                 retain_on_scale_in: None,
                 retain_on_stop: None,
+                unknown_fields: Default::default(),
             }),
             envelope: None,
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         suspend,
         ..TaskConfig::new(TASK, runtime)
@@ -308,6 +310,8 @@ fn job(runtime: &str, suspend: Option<SuspendConfig>) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

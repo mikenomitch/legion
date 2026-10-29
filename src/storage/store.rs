@@ -13,6 +13,15 @@ use crate::storage::events::{drafts, EventDraft, SchedulerEventFilter, Scheduler
 use crate::storage::keyring::Keyring;
 use crate::storage::migrations::get_migrations;
 
+/// The `task_scale` columns [`Store::task_scale_from_row`] reads, in order,
+/// as a literal for `concat!`.
+macro_rules! task_scale_columns {
+    () => {
+        "job_id, task_group, task_name, count, pending_count, base_count, source, reason, \
+         principal, updated_at, version, pin_until_ms, pin_min, pin_max, pin_by, pin_reason"
+    };
+}
+
 // KV encryption keyring operations (initialization, rotation, rewrap, reset)
 // live in their own file so the keyring's write paths read as one unit.
 mod keyring_ops;
@@ -41,12 +50,34 @@ mod gang_waits;
 mod gang_losses;
 // Gang members: each gang allocation's rank, size, and leader address.
 mod gang_members;
+// Scaling inputs: the reads behind the rollup loop and GetScalingInputs.
+mod scaling_ops;
+// Task autoscaling's state: scale writes with compare-and-set, pins,
+// history, pauses, the cluster's scaling defaults, policy snapshots.
+mod autoscale_ops;
+// Standalone scaling policies (`legion scaling apply`).
+mod scaling_policy_ops;
+// Their action intents (`RecordScalingAction`), compare-and-set.
+mod scaling_action_ops;
+// Jobspec extensions: the jobs holding values, and cheap fingerprints.
+mod extension_ops;
+pub use extension_ops::ExtensionJob;
+// GetCapacityDemand's pending work, and ForgetNode (autoscaler v2 plan
+// §6.11).
+mod demand_ops;
+mod forget_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
 };
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
+pub use autoscale_ops::{
+    covering_pause, HistoryRow, NewHistory, PauseRow, ScaleWrite, ScaleWriteOp, ScaleWriteOutcome,
+    ScalingDefaultsRow, HISTORY_CAP, PAUSE_ANY, TASK_SCALE_COUNTER,
+};
+pub use demand_ops::{NodeAllocationRow, PendingTaskRow, PendingWork};
+pub use forget_ops::ForgetOutcome;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use gang_losses::GangLoss;
 pub use gang_members::GangMember;
@@ -57,6 +88,9 @@ pub use reschedule_holds::{
     move_backoff, summarize_reason, FailedMove, FailedRemoval, MovePolicy, MoveVerdict,
     RescheduleHold, MOVE_DELAY_MAX,
 };
+pub use scaling_action_ops::{ActionHistory, ActionWrite, ScalingActionRow};
+pub use scaling_ops::{ScalingAllocRow, ScalingReplicaRow};
+pub use scaling_policy_ops::{PutScalingPolicy, ScalingPolicyRow};
 pub use session_ops::{PromoteSession, PromotedSession};
 pub use snapshot_ops::{
     DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,
@@ -77,6 +111,7 @@ use crate::storage::queries::{
     NODE_JOINED_FROM, SEED_NODE_HEALTH, UPDATE_SIGNING_KEY_STATE, UPSERT_INSTANCE,
     UPSERT_MANAGER_CONFIG,
 };
+use crate::structs::spec_fields::{PendingExtensions, UnknownFieldsRecord, PENDING_EXTENSIONS_KEY};
 use crate::structs::{
     slot_instance_id, Allocation, AllocationHealth, Band, Eval, Instance, InstanceMode,
     InstanceState, Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType,
@@ -86,6 +121,10 @@ use crate::structs::{
     TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, Volume, WorkerConfig,
 };
 use crate::util::random_string;
+
+/// `job_config.meta` key for what a submit's `allow_unknown_fields` kept and
+/// dropped (docs/jobs-tasks-and-scheduling.md, "Unknown fields").
+const UNKNOWN_FIELDS_META_KEY: &str = "unknownFields";
 
 use lazy_static::lazy_static;
 use rand::{thread_rng, Rng};
@@ -122,6 +161,11 @@ pub struct JobSubmitRequest {
     pub config: JobConfig,
     pub subs: Vec<Submission>,
     pub template: Option<JobTemplateProvenance>,
+    /// How the stored version's grant is recorded (`job_grant`).
+    pub grant: crate::storage::acl_store::GrantSource,
+    /// What `allow_unknown_fields` kept and dropped, recorded on the
+    /// version (`job_config.meta.unknownFields`).
+    pub unknown_fields: Option<UnknownFieldsRecord>,
 }
 
 /// One eval to enqueue, for the batched [`Store::enqueue_evals`].
@@ -957,11 +1001,57 @@ pub struct TaskScale {
     /// The spec count the override was laid over — the resubmit-ownership
     /// arbiter (see `handle_job_submit_apply`).
     pub base_count: u32,
-    /// `operator` today; `autoscaler` when the policy evaluator ships.
+    /// `operator`, `autoscaler`, or `wake`.
     pub source: String,
     pub reason: String,
     pub principal: String,
     pub updated_at: String,
+    /// The compare-and-set version (`ScaleTaskRequest.expected_version`): a
+    /// value of the `task_scale` counter, stamped on every write of the row,
+    /// so it never repeats across a delete and recreate.
+    pub version: u64,
+    /// The time-boxed pin, while one is recorded (it may have expired; see
+    /// [`TaskScalePin::active`]).
+    pub pin: Option<TaskScalePin>,
+}
+
+/// A pin on an autoscaled task (`legion job scale --for`): a floor and/or a
+/// ceiling the autoscaler stays within until `until_ms`. A count pin is
+/// `min == max`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskScalePin {
+    /// Unix milliseconds.
+    pub until_ms: i64,
+    pub min: Option<u32>,
+    pub max: Option<u32>,
+    pub by: String,
+    pub reason: String,
+}
+
+impl TaskScalePin {
+    /// Whether the pin still holds at `now_ms`.
+    pub fn active(&self, now_ms: i64) -> bool {
+        self.until_ms > now_ms
+    }
+
+    /// The pinned count, when the pin is a count pin (`min == max`).
+    pub fn count(&self) -> Option<u32> {
+        match (self.min, self.max) {
+            (Some(min), Some(max)) if min == max => Some(min),
+            _ => None,
+        }
+    }
+}
+
+impl TaskScale {
+    /// Whether this override binds to a spec whose count is `spec_count`.
+    /// An override binds only to the spec count it was laid over
+    /// (`base_count`); submit arbitration clears mismatches, and this keeps
+    /// every reader honest about the ones it has not cleared yet. The one
+    /// rule behind [`Store::effective_task_count`] and `GetJobScaleStatus`.
+    pub fn binds_to(&self, spec_count: u32) -> bool {
+        self.base_count == spec_count
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1394,6 +1484,15 @@ pub struct Store {
     // Which node runs which session (docs/session-mode.md): soft state like
     // the content index, folded from this manager's workers' heartbeats.
     sessions: Arc<crate::storage::session_index::SessionIndex>,
+    // Scaling inputs (docs/autoscaling.md, "Scaling inputs"): this
+    // manager's edge samples since the last rollup, and, on the status-lane
+    // leader, every manager's merged per-(node, task) rollups. Soft state
+    // like liveness; never written to the store.
+    scaling_rollups: Arc<crate::manager::scaling_inputs::ScalingRollups>,
+    /// The autoscaler app's reports (`ReportScalingStatus`), held in memory
+    /// on the manager that receives them: the status-lane leader, which
+    /// every other manager forwards to (docs/autoscaling.md).
+    scaling_status: Arc<crate::manager::scaling_status::ScalingStatusBoard>,
     // Queued snapshot warms (WarmSnapshot), per node. Leader-local soft
     // state like the content index: best effort, never replicated.
     snapshot_warms: Arc<crate::storage::snapshot_warm::SnapshotWarmQueue>,
@@ -2083,6 +2182,8 @@ impl Store {
             liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
             content_locations: Arc::new(crate::storage::content_index::ContentLocationIndex::new()),
             sessions: Arc::new(crate::storage::session_index::SessionIndex::new()),
+            scaling_rollups: Arc::new(crate::manager::scaling_inputs::ScalingRollups::new()),
+            scaling_status: Arc::new(crate::manager::scaling_status::ScalingStatusBoard::default()),
             snapshot_warms: Arc::new(crate::storage::snapshot_warm::SnapshotWarmQueue::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2257,6 +2358,31 @@ impl Store {
         }
     }
 
+    /// Refuse with the typed not-the-leader error unless this manager leads
+    /// `lane`, for a read only the lane's leader can answer (its state lives
+    /// in that manager's memory, like the merged scaling inputs). The
+    /// leader-forward layer replays a request refused this way to the
+    /// leader, so callers of any manager get the leader's answer. Always
+    /// `Ok` outside raft mode.
+    pub(crate) fn require_lane_leader(&self, lane: Lane, what: &str) -> R<()> {
+        let Some(driver) = self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+        else {
+            return Ok(());
+        };
+        if driver.is_leader(lane) {
+            return Ok(());
+        }
+        Err(
+            anyhow::Error::new(driver.not_leader_error(lane)).context(format!(
+                "{what} is answered by the {} lane's leader",
+                lane.wire_name()
+            )),
+        )
+    }
+
     /// `host:port` of the manager that leads `lane`, when this node knows one.
     /// `None` outside raft mode and mid-election.
     pub(crate) fn lane_leader_hint(&self, lane: crate::storage::Lane) -> Option<String> {
@@ -2346,6 +2472,29 @@ impl Store {
                     .await
             }
             None => crate::storage::liveness::DigestOutcome::NoEngine,
+        }
+    }
+
+    /// Ship this manager's scaling-input rollups to the status-lane leader on
+    /// the liveness digest RPC (docs/autoscaling.md, "Scaling inputs").
+    /// Returns the outcome and whether the leader asked for a full resync.
+    /// `NoEngine` outside raft mode, where this manager merges its own.
+    pub async fn report_scaling_rollups(
+        &self,
+        observer_manager_id: &str,
+        sync: crate::structs::RollupSync,
+    ) -> (crate::storage::liveness::DigestOutcome, bool) {
+        match self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+        {
+            Some(driver) => {
+                driver
+                    .send_rollup_digest(observer_manager_id.to_string(), sync)
+                    .await
+            }
+            None => (crate::storage::liveness::DigestOutcome::NoEngine, false),
         }
     }
 
@@ -2885,7 +3034,7 @@ impl Store {
     /// real execution failure on the leader, which propagates as itself —
     /// callers' tolerance logic sees exactly the surface it saw before
     /// forwarding existed, plus successes it could not have had.
-    fn forward_after_rejection<T: serde::de::DeserializeOwned>(
+    pub(crate) fn forward_after_rejection<T: serde::de::DeserializeOwned>(
         &self,
         op: crate::storage::raft::forward::ForwardableLaneWrite,
         original: anyhow::Error,
@@ -2961,6 +3110,33 @@ impl Store {
             max_index = max_index.max(log_id.index);
         }
         Ok(max_index)
+    }
+
+    /// The raft log entries this store has applied, summed over its lanes,
+    /// as the state machine recorded them in `raft_applied` (`0` for a
+    /// non-raft store).
+    ///
+    /// The marker commits in the same transaction as each entry's effects,
+    /// so this is exact the moment a replicated write returns. The
+    /// `applied_index` of [`Self::raft_status`] comes from the raft
+    /// engine's metrics, which are published a moment after the apply: a
+    /// count taken right after a write can miss it, and a later count then
+    /// sees one entry "appear" from nowhere. Tests that count the entries
+    /// an operation writes read this instead.
+    pub fn raft_applied_entries(&self) -> R<u64> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare("SELECT last_applied FROM raft_applied;")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))?;
+        let mut total = 0u64;
+        for row in rows {
+            let Some(bytes) = row? else {
+                continue;
+            };
+            let log_id: openraft::LogId<u64> = serde_json::from_slice(&bytes)
+                .context("failed decoding raft_applied last_applied")?;
+            total += log_id.index;
+        }
+        Ok(total)
     }
 
     /// Write a consistent point-in-time backup of the state database to
@@ -3375,7 +3551,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions, autoscale
             FROM task_config;
             "#,
         )?;
@@ -3426,6 +3602,8 @@ impl Store {
                 restart: parse_json_column(26, row.get(26)?)?,
                 stop: parse_json_column(27, row.get(27)?)?,
                 disruption: parse_json_column(28, row.get(28)?)?,
+                pending_extensions: parse_json_column(33, row.get(33)?)?.unwrap_or_default(),
+                autoscale: parse_json_column(34, row.get(34)?)?,
             };
             let job_config_id: String = row.get(17)?;
             Ok((job_config_id, id, task))
@@ -7158,6 +7336,13 @@ impl Store {
             edge_boot: row.get(12)?,
             container: row.get(13)?,
             security: row.get(14)?,
+            namespaces: row
+                .get::<_, String>(15)?
+                .split(',')
+                .map(str::trim)
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_string)
+                .collect(),
         })
     }
 
@@ -7377,6 +7562,8 @@ impl Store {
             snapshots: parse_json_column(31, row.get(31)?)?,
             suspend: parse_json_column(32, row.get(32)?)?,
             gang: parse_json_column(33, row.get(33)?)?,
+            pending_extensions: parse_json_column(34, row.get(34)?)?.unwrap_or_default(),
+            autoscale: parse_json_column(35, row.get(35)?)?,
         };
 
         Ok(task_config)
@@ -8680,6 +8867,16 @@ impl Store {
         &self.sessions
     }
 
+    /// Scaling-input rollups (see [`crate::manager::scaling_inputs`]).
+    pub fn scaling_rollups(&self) -> &Arc<crate::manager::scaling_inputs::ScalingRollups> {
+        &self.scaling_rollups
+    }
+
+    /// The autoscaler app's reports (see the field).
+    pub fn scaling_status(&self) -> &Arc<crate::manager::scaling_status::ScalingStatusBoard> {
+        &self.scaling_status
+    }
+
     /// The cluster CA provider (docs/cluster-ca.md).
     pub fn cluster_ca(&self) -> &crate::manager::cluster_ca::ClusterCa {
         &self.cluster_ca
@@ -9235,6 +9432,7 @@ impl Store {
             ":edge_boot": config.edge_boot,
             ":container": config.container,
             ":security": config.security,
+            ":namespaces": config.namespaces.join(","),
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -9659,6 +9857,10 @@ impl Store {
         tx.execute(delete_sql, [name])?;
         // Count overrides die with the job (control-owned, same capture).
         tx.execute("DELETE FROM task_scale WHERE job_id = ?;", [&job.id])?;
+        // A destroyed job's scaling record goes with it (a recreated job of
+        // the same name starts with no history and no pause).
+        tx.execute("DELETE FROM scale_history WHERE job_id = ?;", [&job.id])?;
+        tx.execute("DELETE FROM scaling_pause WHERE job_id = ?;", [&job.id])?;
 
         for submission_hash in submission_hashes {
             let reference_count: i64 = tx.query_row(
@@ -9736,6 +9938,8 @@ impl Store {
             .query_row([name], |row| {
                 let job_config_id: String = row.get(0)?;
                 let meta: Value = row.get(3)?;
+                let pending_extensions = Self::pending_extensions_from_meta(&meta);
+                let extensions = Self::extensions_from_meta(&meta);
                 let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
                 Ok((
                     JobConfig {
@@ -9745,6 +9949,8 @@ impl Store {
                         rollout,
                         rollout_by_group,
                         version: Some(row.get(4)?),
+                        pending_extensions,
+                        extensions,
                     },
                     job_config_id,
                 ))
@@ -9770,6 +9976,8 @@ impl Store {
                 let tasks_to_replace = vec![];
                 let job_config_id = row.get(0)?;
                 let meta: Value = row.get(3)?;
+                let pending_extensions = Self::pending_extensions_from_meta(&meta);
+                let extensions = Self::extensions_from_meta(&meta);
                 let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
                 let jc = JobConfig {
                     name: row.get(1)?,
@@ -9778,6 +9986,8 @@ impl Store {
                     rollout,
                     rollout_by_group,
                     version: Some(row.get(4)?),
+                    pending_extensions,
+                    extensions,
                 };
 
                 Ok((jc, job_config_id))
@@ -9807,6 +10017,8 @@ impl Store {
                 let tasks_to_replace = vec![];
                 let job_config_id = row.get(0)?;
                 let meta: Value = row.get(3)?;
+                let pending_extensions = Self::pending_extensions_from_meta(&meta);
+                let extensions = Self::extensions_from_meta(&meta);
                 let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
                 let jc = JobConfig {
                     name: row.get(1)?,
@@ -9815,6 +10027,8 @@ impl Store {
                     rollout,
                     rollout_by_group,
                     version: Some(row.get(4)?),
+                    pending_extensions,
+                    extensions,
                 };
 
                 Ok((jc, job_config_id))
@@ -9875,6 +10089,8 @@ impl Store {
                     return Ok((status, None));
                 };
                 let meta: Value = row.get(3)?;
+                let pending_extensions = Self::pending_extensions_from_meta(&meta);
+                let extensions = Self::extensions_from_meta(&meta);
                 let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
                 let config = JobConfig {
                     name: row.get(2)?,
@@ -9883,6 +10099,8 @@ impl Store {
                     rollout,
                     rollout_by_group,
                     version: Some(row.get(4)?),
+                    pending_extensions,
+                    extensions,
                 };
                 Ok((status, Some((config_id, config))))
             })
@@ -10034,6 +10252,59 @@ impl Store {
         Self::collect_rows(rows)
     }
 
+    /// The job-level keys a submit kept under `allow_unknown_fields`
+    /// (`job_config.meta.pendingExtensions`).
+    fn pending_extensions_from_meta(meta: &Value) -> PendingExtensions {
+        meta.get(PENDING_EXTENSIONS_KEY)
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// The installed apps' extension values a version stores
+    /// (`job_config.meta.extensions`). A value this build cannot read is
+    /// dropped with a warning rather than failing the read.
+    fn extensions_from_meta(meta: &Value) -> Vec<crate::structs::extensions::ExtensionValue> {
+        match meta.get(crate::structs::extensions::EXTENSIONS_KEY) {
+            None | Some(Value::Null) => Vec::new(),
+            Some(value) => serde_json::from_value(value.clone()).unwrap_or_else(|err| {
+                warn!(error = %err, "Unreadable stored extension values; reading none");
+                Vec::new()
+            }),
+        }
+    }
+
+    /// What `allow_unknown_fields` kept and dropped when a version was
+    /// submitted (`job_config.meta.unknownFields`).
+    fn unknown_fields_from_meta(meta: Option<Value>) -> Option<UnknownFieldsRecord> {
+        meta.as_ref()
+            .and_then(|meta| meta.get(UNKNOWN_FIELDS_META_KEY))
+            .and_then(|value| serde_json::from_value::<UnknownFieldsRecord>(value.clone()).ok())
+            .filter(|record| !record.is_empty())
+    }
+
+    /// What `allow_unknown_fields` kept and dropped when the job's latest
+    /// config version was submitted, or `None` when it kept and dropped
+    /// nothing. `GetJobInfoReply.unknown_fields`.
+    #[instrument(err, skip_all)]
+    pub fn job_unknown_fields_record(&self, job_name: &str) -> R<Option<UnknownFieldsRecord>> {
+        let conn = self.read_connection()?;
+        let meta: Option<Value> = conn
+            .query_row(
+                r#"
+                SELECT jc.meta
+                FROM job_config jc
+                INNER JOIN job j ON j.id = jc.job_id
+                WHERE j.name = ?
+                ORDER BY jc.version DESC
+                LIMIT 1;
+                "#,
+                [job_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(Self::unknown_fields_from_meta(meta))
+    }
+
     fn template_provenance_from_meta(meta: Option<Value>) -> Option<JobTemplateProvenance> {
         meta.as_ref()
             .and_then(|meta| meta.get("jobTemplate"))
@@ -10118,13 +10389,81 @@ impl Store {
     /// [`Self::sync_missing_task_volume_claims`], run from the
     /// node-status-checker loop) once the control rows replicate to it.
     /// Every other error on those halves still fails the submit.
+    ///
+    /// The version's grant (what its `legion` identities may do) is carried
+    /// forward from the version it replaces, when that one's grant asks for
+    /// exactly the same: this is the path Legion's own re-renders take. A
+    /// principal's submit, checked against what they hold, goes through
+    /// [`Self::handle_job_submit_as`] instead.
     #[allow(dead_code)]
     pub fn handle_job_submit(
         &self,
         config: &JobConfig,
         subs: &[Submission],
     ) -> R<JobSubmitOutcome> {
-        self.handle_job_submit_inner(config, subs, None)
+        self.handle_job_submit_inner(
+            config,
+            subs,
+            None,
+            crate::storage::acl_store::GrantSource::CarryForward,
+            None,
+        )
+    }
+
+    /// [`Self::handle_job_submit`] for a principal's submit that passed the
+    /// grant check (docs/workload-identity.md, "Permissions"): the stored
+    /// version's grant is recorded in `granted_by`'s name, an unchanged
+    /// resubmit included, so a revoked grant is restored by a resubmit from
+    /// someone who holds the access. `template` stamps provenance as
+    /// [`Self::handle_job_submit_from_template`] does, and `unknown_fields`
+    /// records what `allow_unknown_fields` kept and dropped
+    /// (`job_config.meta.unknownFields`).
+    pub fn handle_job_submit_as(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+        granted_by: &str,
+        unknown_fields: Option<&UnknownFieldsRecord>,
+    ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner(
+            config,
+            subs,
+            template,
+            crate::storage::acl_store::GrantSource::Submitter(granted_by.to_string()),
+            unknown_fields,
+        )
+    }
+
+    /// [`Self::handle_job_submit_as`] for the app reconciler (apps plan
+    /// §6.3): the version's grant is recorded in `granted_by`'s name (the
+    /// principal who approved the app's grant), and the version is stamped
+    /// `managedBy = { app, digest }`. An unchanged submit stamps the latest
+    /// version in place when its stamp differs, so a job a direct edit left
+    /// byte-identical to the render still reads as managed.
+    ///
+    /// Compare-and-set on the app record: refused (`Aborted`) unless app
+    /// `managed_by.app` still exists, is enabled, and is at
+    /// `record_updated_at`.
+    pub fn handle_job_submit_managed(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        granted_by: &str,
+        managed_by: crate::structs::app::ManagedBy,
+        record_updated_at: &str,
+    ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner(
+            config,
+            subs,
+            None,
+            crate::storage::acl_store::GrantSource::App {
+                granted_by: granted_by.to_string(),
+                managed_by,
+                record_updated_at: record_updated_at.to_string(),
+            },
+            None,
+        )
     }
 
     /// Like `handle_job_submit`, stamping the template that rendered this
@@ -10136,7 +10475,13 @@ impl Store {
         subs: &[Submission],
         template: &JobTemplateProvenance,
     ) -> R<JobSubmitOutcome> {
-        self.handle_job_submit_inner(config, subs, Some(template))
+        self.handle_job_submit_inner(
+            config,
+            subs,
+            Some(template),
+            crate::storage::acl_store::GrantSource::CarryForward,
+            None,
+        )
     }
 
     fn handle_job_submit_inner(
@@ -10144,11 +10489,15 @@ impl Store {
         config: &JobConfig,
         subs: &[Submission],
         template: Option<&JobTemplateProvenance>,
+        grant: crate::storage::acl_store::GrantSource,
+        unknown_fields: Option<&UnknownFieldsRecord>,
     ) -> R<JobSubmitOutcome> {
         let request = JobSubmitRequest {
             config: config.clone(),
             subs: subs.to_vec(),
             template: template.cloned(),
+            grant,
+            unknown_fields: unknown_fields.filter(|record| !record.is_empty()).cloned(),
         };
         // A submit raised from INSIDE another op's capture must stay part of
         // that capture (`replicated` short-circuits there); routing it
@@ -10162,9 +10511,17 @@ impl Store {
                 config,
                 subs,
                 template,
+                grant,
+                unknown_fields,
             } = request;
             self.replicated(Lane::Control, "handle_job_submit", move |s| {
-                s.handle_job_submit_apply(&config, &subs, template.as_ref())
+                s.handle_job_submit_apply(
+                    &config,
+                    &subs,
+                    template.as_ref(),
+                    &grant,
+                    unknown_fields.as_ref(),
+                )
             })?
         } else {
             let coalescer = Arc::clone(&self.job_submit_coalescer);
@@ -10431,10 +10788,13 @@ impl Store {
         config: &JobConfig,
         subs: &[Submission],
         template: Option<&JobTemplateProvenance>,
+        grant: &crate::storage::acl_store::GrantSource,
+        unknown_fields: Option<&UnknownFieldsRecord>,
     ) -> R<JobSubmitOutcome> {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
-        let (outcome, staged) = self.handle_job_submit_tx(&tx, config, subs, template)?;
+        let (outcome, staged) =
+            self.handle_job_submit_tx(&tx, config, subs, template, grant, unknown_fields)?;
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))?;
         drop(conn);
@@ -10492,6 +10852,8 @@ impl Store {
                 &request.config,
                 &request.subs,
                 request.template.as_ref(),
+                &request.grant,
+                request.unknown_fields.as_ref(),
             ) {
                 Ok((outcome, staged)) => {
                     if let Err(err) = tx.execute_batch("RELEASE legion_submit_item;") {
@@ -10543,6 +10905,8 @@ impl Store {
                         &request.config,
                         &request.subs,
                         request.template.as_ref(),
+                        &request.grant,
+                        request.unknown_fields.as_ref(),
                     )
                 }),
             ];
@@ -10566,6 +10930,8 @@ impl Store {
                                 &request.config,
                                 &request.subs,
                                 request.template.as_ref(),
+                                &request.grant,
+                                request.unknown_fields.as_ref(),
                             )
                         })
                     })
@@ -10576,6 +10942,64 @@ impl Store {
                 (0..size).map(|_| Err(anyhow!(msg.clone()))).collect()
             }
         }
+    }
+
+    /// A job config version's meta, read through the submit's transaction.
+    fn version_meta_tx(tx: &Connection, job_config_id: &str) -> R<Option<Value>> {
+        Ok(tx
+            .query_row(
+                "SELECT meta FROM job_config WHERE id = ?1;",
+                [job_config_id],
+                |row| row.get::<_, Option<Value>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Set a version's `managedBy` stamp in place, when it differs.
+    fn stamp_managed_by_tx(
+        tx: &Connection,
+        job_config_id: &str,
+        managed_by: &crate::structs::app::ManagedBy,
+    ) -> R<()> {
+        let mut meta = Self::version_meta_tx(tx, job_config_id)?.unwrap_or_else(|| json!({}));
+        let stamp = serde_json::to_value(managed_by)?;
+        if meta.get("managedBy") == Some(&stamp) {
+            return Ok(());
+        }
+        if !meta.is_object() {
+            meta = json!({});
+        }
+        meta["managedBy"] = stamp;
+        tx.execute(
+            "UPDATE job_config SET meta = ?2 WHERE id = ?1;",
+            params![job_config_id, meta],
+        )?;
+        Ok(())
+    }
+
+    /// Refuse an app reconciler submit unless app `app`'s record still
+    /// exists, is enabled, and is at `updated_at` (`Aborted`: the reconciler
+    /// renders again from the new record).
+    fn check_app_record_tx(tx: &Connection, app: &str, updated_at: &str) -> R<()> {
+        let row: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT enabled, updated_at FROM app WHERE name = ?1;",
+                [app],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let why = match row {
+            None => "it was uninstalled",
+            Some((0, _)) => "it was disabled",
+            Some((_, stored)) if stored != updated_at => "its record changed",
+            Some(_) => return Ok(()),
+        };
+        Err(anyhow::Error::new(StorageError::Aborted {
+            message: format!(
+                "app {app}'s job was not submitted: {why} while the job was being rendered"
+            ),
+        }))
     }
 
     /// The whole submit write, against a caller-owned transaction, with the
@@ -10589,8 +11013,26 @@ impl Store {
         config: &JobConfig,
         subs: &[Submission],
         template: Option<&JobTemplateProvenance>,
+        grant: &crate::storage::acl_store::GrantSource,
+        unknown_fields: Option<&UnknownFieldsRecord>,
     ) -> R<(JobSubmitOutcome, Vec<SchedulerEventRecord>)> {
         let config = self.normalize_job_config(config)?;
+        // The app reconciler's submit is compare-and-set on the app record
+        // it rendered from, in this same entry: an uninstall, a disable, or
+        // any other write that landed while the render was admitted (pin
+        // resolution can take seconds) refuses it, so a job never comes back
+        // with a fresh grant for an app that is gone.
+        if let crate::storage::acl_store::GrantSource::App {
+            managed_by,
+            record_updated_at,
+            ..
+        } = grant
+        {
+            Self::check_app_record_tx(tx, &managed_by.app, record_updated_at)?;
+        }
+        // What this version's `legion` identities ask for; its grant row is
+        // written in this same transaction, next to the version itself.
+        let requested = crate::structs::grant::requested_grants(&config.tasks);
 
         let mut next_version = 1;
         let mut last_versions_id: Option<String> = None;
@@ -10599,12 +11041,29 @@ impl Store {
         if let Some(latest_job_config) = self.latest_job_config_tx(tx, &config.name)? {
             // if latest_job_config is deep equal to config, return unchanged
             if latest_job_config.is_same_as(&config) {
-                return Ok((
-                    JobSubmitOutcome::Unchanged {
-                        job_config_id: latest_job_config.id(),
-                    },
-                    Vec::new(),
-                ));
+                let job_config_id = latest_job_config.id();
+                // A principal's unchanged resubmit passed the same check, so
+                // it (re)grants; Legion's own re-render of an unchanged
+                // version leaves the grant as it is.
+                if grant.granter().is_some() {
+                    Self::record_job_grant_tx(
+                        tx,
+                        &config.name,
+                        &job_config_id,
+                        i64::from(latest_job_config.version.unwrap_or(0)),
+                        None,
+                        &requested,
+                        grant,
+                    )?;
+                }
+                // The app reconciler's render equals the stored version but
+                // the version does not carry its stamp (a direct submit left
+                // it identical): stamp it, so the digests compare equal from
+                // here on. Nothing else about the version changes.
+                if let crate::storage::acl_store::GrantSource::App { managed_by, .. } = grant {
+                    Self::stamp_managed_by_tx(tx, &job_config_id, managed_by)?;
+                }
+                return Ok((JobSubmitOutcome::Unchanged { job_config_id }, Vec::new()));
             } else {
                 next_version = latest_job_config.version.unwrap_or(0) + 1;
                 last_versions_id = Some(latest_job_config.id());
@@ -10663,6 +11122,44 @@ impl Store {
         if let Some(template) = template {
             meta["jobTemplate"] = serde_json::to_value(template)?;
         }
+        // Who stored the version, and the app reconciler's `managedBy`
+        // stamp (apps plan §6.3): set by the reconciler's submits, carried
+        // by Legion's own re-renders, and absent from every other submit's
+        // version, which is how a direct edit to an app's job is noticed.
+        match grant {
+            crate::storage::acl_store::GrantSource::Submitter(principal) => {
+                meta["submittedBy"] = json!(principal);
+            }
+            crate::storage::acl_store::GrantSource::App { managed_by, .. } => {
+                meta["submittedBy"] = json!(crate::structs::app::RECONCILER_PRINCIPAL);
+                meta["managedBy"] = serde_json::to_value(managed_by)?;
+            }
+            crate::storage::acl_store::GrantSource::CarryForward => {
+                if let Some(previous) = last_versions_id.as_deref() {
+                    if let Some(stamp) = Self::version_meta_tx(tx, previous)?
+                        .and_then(|meta| meta.get("managedBy").cloned())
+                    {
+                        meta["managedBy"] = stamp;
+                    }
+                }
+            }
+        }
+        // Job-level pending keys live in meta (task-level ones in
+        // `task_config.pending_extensions`, the rest inside their blocks'
+        // JSON columns), and so does the record of what the submit's
+        // `allow_unknown_fields` kept and dropped.
+        if !config.pending_extensions.is_empty() {
+            meta[PENDING_EXTENSIONS_KEY] = serde_json::to_value(&config.pending_extensions)?;
+        }
+        // Installed apps' extension values, at every point, live in meta
+        // too: one list, by app (apps plan §6.6).
+        if !config.extensions.is_empty() {
+            meta[crate::structs::extensions::EXTENSIONS_KEY] =
+                serde_json::to_value(&config.extensions)?;
+        }
+        if let Some(record) = unknown_fields.filter(|record| !record.is_empty()) {
+            meta[UNKNOWN_FIELDS_META_KEY] = serde_json::to_value(record)?;
+        }
         let config_params = named_params! {
             ":id": format!("{}-{}", config.name, next_version.to_string()),
             ":name": config.name,
@@ -10685,10 +11182,21 @@ impl Store {
                         rollout_by_group: config.rollout_by_group.clone(),
                         version: Some(row.get(4)?),
                         tasks,
+                        pending_extensions: config.pending_extensions.clone(),
+                        extensions: config.extensions.clone(),
                     },
                     row.get(0)?,
                 ))
             })?;
+        Self::record_job_grant_tx(
+            tx,
+            &config.name,
+            &job_config_id,
+            i64::from(next_version),
+            last_versions_id.as_deref(),
+            &requested,
+            grant,
+        )?;
 
         for t in &config.tasks {
             let checks = serde_json::to_string(&t.checks)?;
@@ -10742,7 +11250,17 @@ impl Store {
                 .transpose()?;
             let suspend = t.suspend.as_ref().map(serde_json::to_string).transpose()?;
             let gang = t.gang.as_ref().map(serde_json::to_string).transpose()?;
+            let pending_extensions = if t.pending_extensions.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&t.pending_extensions)?)
+            };
             let schedule = t.schedule.as_ref().map(ToString::to_string);
+            let autoscale = t
+                .autoscale
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             let task_params = named_params! {
                 ":name": t.name,
                 ":runtime": t.runtime,
@@ -10777,6 +11295,8 @@ impl Store {
                 ":snapshots": snapshots,
                 ":suspend": suspend,
                 ":gang": gang,
+                ":pending_extensions": pending_extensions,
+                ":autoscale": autoscale,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -10827,30 +11347,116 @@ impl Store {
         // version no longer declares are orphans and cleared too.
         // `task_scale` is control-owned precisely so this rides the same
         // capture as the config write.
+        //
+        // An autoscaled task is different (autoscaler-v2 plan §6.3): its
+        // policy owns the live count, and `count` is the default floor. The
+        // override is kept, rebased onto the new spec count, and clamped
+        // into the new bounds, in this same transaction: raising `count`
+        // from 2 to 4 lifts a task at 3 to 4 at once and leaves one at 6
+        // alone; lowering it only lowers the floor. When `autoscale` is
+        // removed, the rule above applies again on the same submit.
         let mut scale_reset_events = Vec::new();
+        let autoscale_layers = if config
+            .tasks
+            .iter()
+            .any(crate::manager::autoscale::is_autoscaled)
+        {
+            Some(crate::manager::autoscale::AutoscaleLayers::load_tx(tx)?)
+        } else {
+            None
+        };
+        let now_ms = OffsetDateTime::now_utc().unix_timestamp() * 1000;
         for t in &config.tasks {
-            let existing: Option<i64> = tx
+            let existing: Option<(i64, Option<i64>)> = tx
                 .query_row(
-                    "SELECT base_count FROM task_scale \
+                    "SELECT base_count, count FROM task_scale \
                      WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
                     params![job.id, t.group, t.name],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            if let Some(base_count) = existing {
-                if i64::from(t.count.num) != base_count {
+            let Some((base_count, count)) = existing else {
+                continue;
+            };
+            // The policy that owns this task's count: its own, or the one
+            // on its group's autoscaled task.
+            let owner = config.tasks.iter().find(|other| {
+                other.group == t.group && crate::manager::autoscale::is_autoscaled(other)
+            });
+            if let (Some(owner), Some(layers)) = (owner, autoscale_layers.as_ref()) {
+                let bounds = layers
+                    .resolve(&job.id, owner)
+                    .ok()
+                    .flatten()
+                    .map(|resolved| (resolved.policy.min, resolved.policy.max));
+                let spec = t.count.num;
+                let next = count.map(|count| {
+                    let count = count.max(0) as u32;
+                    match bounds {
+                        Some((min, max)) => count.clamp(min.min(max), max),
+                        None => count,
+                    }
+                });
+                let rebased = i64::from(spec) != base_count;
+                let moved = next
+                    .zip(count)
+                    .is_some_and(|(next, count)| i64::from(next) != count);
+                if rebased || moved {
+                    let version = Self::next_scaling_counter_tx(tx, TASK_SCALE_COUNTER)?;
                     tx.execute(
-                        "DELETE FROM task_scale \
-                         WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
-                        params![job.id, t.group, t.name],
+                        "UPDATE task_scale SET base_count = ?4, count = COALESCE(?5, count), \
+                         version = ?6 WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+                        params![job.id, t.group, t.name, spec, next, version as i64],
                     )?;
-                    scale_reset_events.push(drafts::scale_reset(
+                }
+                if moved && owner.name == t.name {
+                    let (from, to) = (
+                        count.unwrap_or_default().max(0) as u32,
+                        next.unwrap_or_default(),
+                    );
+                    Self::insert_history_tx(
+                        tx,
                         &job.id,
                         &t.group,
                         &t.name,
-                        "resubmit changed the spec count; the spec owns the count again",
-                    ));
+                        now_ms,
+                        from,
+                        to,
+                        "operator",
+                        "",
+                        "scaled",
+                        true,
+                        &autoscale_ops::NewHistory {
+                            summary: format!(
+                                "resubmit moved the bounds; the count moves {from} -> {to} into them"
+                            ),
+                            ..Default::default()
+                        },
+                        "",
+                    )?;
                 }
+                continue;
+            }
+            if i64::from(t.count.num) != base_count {
+                tx.execute(
+                    "DELETE FROM task_scale \
+                     WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
+                    params![job.id, t.group, t.name],
+                )?;
+                scale_reset_events.push(drafts::scale_reset(
+                    &job.id,
+                    &t.group,
+                    &t.name,
+                    "resubmit changed the spec count; the spec owns the count again",
+                ));
+            } else {
+                // Not autoscaled (any more): a pin has nothing to hold.
+                tx.execute(
+                    "UPDATE task_scale SET pin_until_ms = NULL, pin_min = NULL, pin_max = NULL \
+                     WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3 \
+                     AND pin_until_ms IS NOT NULL;",
+                    params![job.id, t.group, t.name],
+                )?;
             }
         }
         tx.execute(
@@ -14690,14 +15296,14 @@ impl Store {
         tx: &Connection,
         task_id: i64,
     ) -> R<AllocationConstraintState> {
-        let (constraints, permit): (Value, Value) = tx.query_row(
-            "SELECT constraints, permit FROM task_config WHERE id = ?;",
+        let (constraints, permit, job_id): (Value, Value, String) = tx.query_row(
+            "SELECT constraints, permit, job_id FROM task_config WHERE id = ?;",
             [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let constraint_set = ConstraintSet::new(&constraints)
             .with_context(|| format!("Failed to parse constraints for task {task_id}"))?;
-        let permit_set = PermitSet::new(&permit)
+        let permit_set = PermitSet::new(&permit, crate::structs::namespace::job_namespace(&job_id))
             .with_context(|| format!("Failed to parse permit for task {task_id}"))?;
         let distinct_keys = constraint_set.distinct_keys();
         let distinct = if distinct_keys.is_empty() {
@@ -14727,16 +15333,17 @@ impl Store {
     }
 
     fn load_allocation_task_state(&self, tx: &Connection, task_id: i64) -> R<AllocationTaskState> {
-        let (job_config_id, resources, constraints, permit, network_raw, connect_raw): (
+        let (job_config_id, resources, constraints, permit, network_raw, connect_raw, job_id): (
             String,
             Value,
             Value,
             Value,
             Option<String>,
             Option<String>,
+            String,
         ) = tx
             .prepare_cached(
-                "SELECT job_config_id, resources, constraints, permit, network, connect FROM task_config WHERE id = ?;",
+                "SELECT job_config_id, resources, constraints, permit, network, connect, job_id FROM task_config WHERE id = ?;",
             )?
             .query_row([task_id], |row| {
                 Ok((
@@ -14746,12 +15353,13 @@ impl Store {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             })?;
 
         let constraint_set = ConstraintSet::new(&constraints)
             .with_context(|| format!("Failed to parse constraints for task {task_id}"))?;
-        let permit_set = PermitSet::new(&permit)
+        let permit_set = PermitSet::new(&permit, crate::structs::namespace::job_namespace(&job_id))
             .with_context(|| format!("Failed to parse permit for task {task_id}"))?;
         let distinct_keys = constraint_set.distinct_keys();
         let distinct = if distinct_keys.is_empty() {
@@ -15829,10 +16437,10 @@ impl Store {
 
     /// Set (or update) a task's count override: the applied count wins over
     /// the spec's `count.num` for every reader of desired count. Clears any
-    /// pending scale-in (a fresh override is newer intent). `base_count`
-    /// must be the CURRENT spec count — it is the resubmit-ownership
-    /// arbiter (`handle_job_submit_apply` clears the override when a
-    /// resubmit changes the spec count away from it).
+    /// pending scale-in (a fresh override is newer intent) and keeps any
+    /// pin. `base_count` must be the CURRENT spec count — it is the
+    /// resubmit-ownership arbiter (`handle_job_submit_apply` clears the
+    /// override when a resubmit changes the spec count away from it).
     #[instrument(err, skip(self, reason, principal))]
     pub fn set_task_scale_override(
         &self,
@@ -15878,15 +16486,50 @@ impl Store {
         reason: &str,
         principal: &str,
     ) -> R<()> {
-        let now = Self::now_rfc3339()?;
         let conn = self.write_connection()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO task_scale \
-             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9);",
-            params![job_id, task_group, task_name, count, base_count, source, reason, principal, now],
+        Self::upsert_task_scale_override_tx(
+            &conn, job_id, task_group, task_name, count, base_count, source, reason, principal,
         )?;
         Ok(())
+    }
+
+    /// The write behind [`Store::set_task_scale_override`], on a connection
+    /// or transaction the caller holds. Returns the row's new version.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsert_task_scale_override_tx(
+        conn: &Connection,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        count: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<u64> {
+        let now = Self::now_rfc3339()?;
+        let version = Self::next_scaling_counter_tx(conn, TASK_SCALE_COUNTER)?;
+        conn.execute(
+            "INSERT INTO task_scale \
+             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at, version) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(job_id, task_group, task_name) DO UPDATE SET \
+             count = ?4, pending_count = NULL, base_count = ?5, source = ?6, reason = ?7, \
+             principal = ?8, updated_at = ?9, version = ?10;",
+            params![
+                job_id,
+                task_group,
+                task_name,
+                count,
+                base_count,
+                source,
+                reason,
+                principal,
+                now,
+                version as i64
+            ],
+        )?;
+        Ok(version)
     }
 
     /// Record a scale-in that must WAIT for the active rollout to finish
@@ -15939,22 +16582,55 @@ impl Store {
         reason: &str,
         principal: &str,
     ) -> R<()> {
-        let now = Self::now_rfc3339()?;
         let conn = self.write_connection()?;
-        // Upsert preserving the applied `count` when a row already exists.
-        conn.execute(
-            "INSERT INTO task_scale \
-             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at) \
-             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9) \
-             ON CONFLICT(job_id, task_group, task_name) DO UPDATE SET \
-             pending_count = ?4, base_count = ?5, source = ?6, reason = ?7, principal = ?8, updated_at = ?9;",
-            params![job_id, task_group, task_name, pending, base_count, source, reason, principal, now],
+        Self::upsert_task_scale_pending_tx(
+            &conn, job_id, task_group, task_name, pending, base_count, source, reason, principal,
         )?;
         Ok(())
     }
 
-    /// Drop a task's override (and any pending scale-in), returning count
-    /// ownership to the job spec. Returns whether a row existed.
+    /// The write behind [`Store::set_task_scale_pending`]. Returns the row's
+    /// new version.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsert_task_scale_pending_tx(
+        conn: &Connection,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        pending: u32,
+        base_count: u32,
+        source: &str,
+        reason: &str,
+        principal: &str,
+    ) -> R<u64> {
+        let now = Self::now_rfc3339()?;
+        let version = Self::next_scaling_counter_tx(conn, TASK_SCALE_COUNTER)?;
+        // Upsert preserving the applied `count` when a row already exists.
+        conn.execute(
+            "INSERT INTO task_scale \
+             (job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at, version) \
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(job_id, task_group, task_name) DO UPDATE SET \
+             pending_count = ?4, base_count = ?5, source = ?6, reason = ?7, principal = ?8, \
+             updated_at = ?9, version = ?10;",
+            params![
+                job_id,
+                task_group,
+                task_name,
+                pending,
+                base_count,
+                source,
+                reason,
+                principal,
+                now,
+                version as i64
+            ],
+        )?;
+        Ok(version)
+    }
+
+    /// Drop a task's override (and any pending scale-in and pin), returning
+    /// count ownership to the job spec. Returns whether a row existed.
     #[instrument(err, skip(self))]
     pub fn clear_task_scale(&self, job_id: &str, task_group: &str, task_name: &str) -> R<bool> {
         let (job_id, task_group, task_name) = (
@@ -15991,17 +16667,31 @@ impl Store {
     fn promote_pending_task_scales_apply(&self, job_id: &str) -> R<Vec<TaskScale>> {
         let now = Self::now_rfc3339()?;
         let conn = self.write_connection()?;
-        let mut stmt = conn.prepare(
-            "UPDATE task_scale SET count = pending_count, pending_count = NULL, updated_at = ?2 \
-             WHERE job_id = ?1 AND pending_count IS NOT NULL \
-             RETURNING job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at;",
+        let pending: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task_scale WHERE job_id = ?1 AND pending_count IS NOT NULL;",
+            [job_id],
+            |row| row.get(0),
         )?;
-        let promoted =
-            Self::collect_rows(stmt.query_map(params![job_id, now], Self::task_scale_from_row)?)?;
+        if pending == 0 {
+            return Ok(Vec::new());
+        }
+        // Every promoted row gets a fresh version: the count changed.
+        let version = Self::next_scaling_counter_tx(&conn, TASK_SCALE_COUNTER)?;
+        let mut stmt = conn.prepare(concat!(
+            "UPDATE task_scale SET count = pending_count, pending_count = NULL, updated_at = ?2, \
+             version = ?3 WHERE job_id = ?1 AND pending_count IS NOT NULL RETURNING ",
+            task_scale_columns!(),
+            ";"
+        ))?;
+        let promoted = Self::collect_rows(stmt.query_map(
+            params![job_id, now, version as i64],
+            Self::task_scale_from_row,
+        )?)?;
         Ok(promoted)
     }
 
-    fn task_scale_from_row(row: &Row<'_>) -> Result<TaskScale, rusqlite::Error> {
+    pub(crate) fn task_scale_from_row(row: &Row<'_>) -> Result<TaskScale, rusqlite::Error> {
+        let pin_until: Option<i64> = row.get(11)?;
         Ok(TaskScale {
             job_id: row.get(0)?,
             task_group: row.get(1)?,
@@ -16013,6 +16703,17 @@ impl Store {
             reason: row.get(7)?,
             principal: row.get(8)?,
             updated_at: row.get(9)?,
+            version: row.get::<_, i64>(10)?.max(0) as u64,
+            pin: match pin_until {
+                Some(until_ms) => Some(TaskScalePin {
+                    until_ms,
+                    min: row.get::<_, Option<i64>>(12)?.map(|n| n.max(0) as u32),
+                    max: row.get::<_, Option<i64>>(13)?.map(|n| n.max(0) as u32),
+                    by: row.get(14)?,
+                    reason: row.get(15)?,
+                }),
+                None => None,
+            },
         })
     }
 
@@ -16025,10 +16726,11 @@ impl Store {
     ) -> R<Option<TaskScale>> {
         let conn = self.read_connection()?;
         let scale = conn
-            .prepare_cached(
-                "SELECT job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at \
-                 FROM task_scale WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
-            )?
+            .prepare_cached(concat!(
+                "SELECT ",
+                task_scale_columns!(),
+                " FROM task_scale WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;"
+            ))?
             .query_row(
                 params![job_id, task_group, task_name],
                 Self::task_scale_from_row,
@@ -16040,10 +16742,11 @@ impl Store {
     /// Every override row for a job.
     pub fn task_scales_for_job(&self, job_id: &str) -> R<Vec<TaskScale>> {
         let conn = self.read_connection()?;
-        let mut stmt = conn.prepare(
-            "SELECT job_id, task_group, task_name, count, pending_count, base_count, source, reason, principal, updated_at \
-             FROM task_scale WHERE job_id = ?1 ORDER BY task_group, task_name;",
-        )?;
+        let mut stmt = conn.prepare(concat!(
+            "SELECT ",
+            task_scale_columns!(),
+            " FROM task_scale WHERE job_id = ?1 ORDER BY task_group, task_name;"
+        ))?;
         let scales = Self::collect_rows(stmt.query_map([job_id], Self::task_scale_from_row)?)?;
         Ok(scales)
     }
@@ -16067,7 +16770,7 @@ impl Store {
             // submit arbitration clears mismatches), and it keeps dry-run
             // plans over an EDITED spec honest about what a submit would
             // converge to.
-            .filter(|scale| scale.base_count == spec_count)
+            .filter(|scale| scale.binds_to(spec_count))
             .and_then(|scale| scale.count)
             .unwrap_or(spec_count))
     }
@@ -19248,6 +19951,26 @@ impl Store {
             .collect())
     }
 
+    /// The unexpired locks whose keys start with `prefix`, by key, lock ids
+    /// included (callers outside the store redact them).
+    #[instrument(err, skip_all)]
+    pub fn list_kv_locks(&self, prefix: &str) -> R<Vec<KvLock>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT key, lock_id, owner, acquired_at, expires_at FROM kv_lock \
+             WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key ASC;",
+        )?;
+        let rows = stmt.query_map([prefix], |row| self.kv_lock_from_row(row))?;
+        let now = OffsetDateTime::now_utc();
+        let mut live = Vec::new();
+        for lock in Self::collect_rows(rows)? {
+            if Self::parse_rfc3339(&lock.expires_at)? > now {
+                live.push(lock);
+            }
+        }
+        Ok(live)
+    }
+
     fn list_kv_raw(&self, prefix: &str) -> R<Vec<KvRaw>> {
         let raws = {
             let conn = self.read_connection()?;
@@ -21407,6 +22130,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let mut v2 = v1.clone();
         v2.tasks[0].count = TaskCount::new(2);
@@ -21420,11 +22145,15 @@ mod tests {
                 config: v1,
                 subs: vec![sub("v1")],
                 template: None,
+                grant: crate::storage::acl_store::GrantSource::CarryForward,
+                unknown_fields: None,
             },
             JobSubmitRequest {
                 config: v2,
                 subs: vec![sub("v2")],
                 template: None,
+                grant: crate::storage::acl_store::GrantSource::CarryForward,
+                unknown_fields: None,
             },
         ];
         let results = store.handle_job_submits_apply(&batch);
@@ -21453,6 +22182,8 @@ mod tests {
             config: latest.clone(),
             subs: vec![sub("v2")],
             template: None,
+            grant: crate::storage::acl_store::GrantSource::CarryForward,
+            unknown_fields: None,
         };
         let fresh = JobSubmitRequest {
             config: JobConfig {
@@ -21465,9 +22196,13 @@ mod tests {
                     ..TaskConfig::new("api", "noop")
                 }],
                 version: None,
+                pending_extensions: Default::default(),
+                extensions: Default::default(),
             },
             subs: vec![sub("other")],
             template: None,
+            grant: crate::storage::acl_store::GrantSource::CarryForward,
+            unknown_fields: None,
         };
         let results = store.handle_job_submits_apply(&[unchanged, fresh]);
         assert!(matches!(
@@ -22279,6 +23014,8 @@ mod tests {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let submission = Submission {
             path: "pool-prop.ncl".into(),
@@ -22431,6 +23168,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: "/var/run/legion/identity/aws/token".into(),
                 mode: Some("0400".into()),
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         };
@@ -22445,6 +23183,8 @@ mod tests {
             name: "identity-persist".into(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -22482,9 +23222,11 @@ mod tests {
                 min: None,
                 max: None,
                 sensitive: false,
+                unknown_fields: Default::default(),
             }],
             tty: false,
             timeout: None,
+            unknown_fields: Default::default(),
         }];
         let job = JobConfig {
             priority: Default::default(),
@@ -22493,6 +23235,8 @@ mod tests {
             name: "actions-persist".into(),
             tasks: vec![t.clone()],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -22518,6 +23262,8 @@ mod tests {
             name: "no-identity-persist".into(),
             tasks: vec![task("worker")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -22545,6 +23291,8 @@ mod tests {
             name: "cache-allocs".into(),
             tasks: vec![task("worker")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -22592,6 +23340,8 @@ mod tests {
             name: "cache-tasks".into(),
             tasks: vec![task("alpha")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -22623,6 +23373,8 @@ mod tests {
                 ..task("beta")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -22671,6 +23423,7 @@ mod tests {
             max_allocations: None,
             artifacts: String::new(),
             heartbeat_seconds: Some(5),
+            namespaces: vec!["ci-*".to_string(), "legion-system".to_string()],
         };
 
         let returned_config = store.insert_worker_type(&worker_config)?;
@@ -22681,6 +23434,7 @@ mod tests {
         assert_eq!(returned_config.pool, worker_config.pool);
         assert_eq!(returned_config.heartbeat_seconds, Some(5));
         assert_eq!(returned_config.container, "");
+        assert_eq!(returned_config.namespaces, worker_config.namespaces);
 
         // The `container` payload (capability allowlist) round-trips, and
         // an update replaces it.
@@ -22726,12 +23480,14 @@ mod tests {
             max_allocations: None,
             artifacts: String::new(),
             heartbeat_seconds: None,
+            namespaces: vec![],
         };
 
         store.insert_worker_type(&worker_config)?;
 
         let returned_config = store.get_worker_type(worker_config.name.clone())?;
         assert!(returned_config.additional_node_checks.is_empty());
+        assert!(returned_config.namespaces.is_empty(), "every namespace");
         assert_eq!(returned_config.heartbeat_seconds, None);
 
         Ok(())
@@ -22787,6 +23543,8 @@ mod tests {
             name: "lost-reschedule".into(),
             tasks: vec![task("worker")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -22826,6 +23584,7 @@ mod tests {
                 stateful.on_lost = Some(StatefulOnLostConfig {
                     self_terminate_after: self_terminate_after.map(String::from),
                     replace_after: replace_after.map(String::from),
+                    unknown_fields: Default::default(),
                 });
             }
         }
@@ -23268,6 +24027,8 @@ mod tests {
             name: job_name.clone(),
             tasks: task_configs.clone(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let store = setup_store()?;
 
@@ -23336,6 +24097,8 @@ mod tests {
             name: job_name.clone(),
             tasks: vec![task_one],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let store = setup_store()?;
@@ -23383,6 +24146,8 @@ mod tests {
             name: "jobname".into(),
             tasks: orig_task_configs.clone(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let store = setup_store()?;
@@ -23498,6 +24263,8 @@ mod tests {
             name: "jobname".into(),
             tasks: orig_task_configs.clone(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let store = setup_store()?;
@@ -23543,6 +24310,8 @@ mod tests {
             name: job_one_name.clone(),
             tasks: vec![task_one.clone(), task_two.clone()],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let job_one_subs = vec![Submission {
             path: "job-one-sub.ncl".into(),
@@ -23568,6 +24337,8 @@ mod tests {
             name: job_two_name.clone(),
             tasks: vec![task_three.clone()],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let job_two_subs = vec![Submission {
             path: "job-two-sub.ncl".into(),
@@ -23667,6 +24438,8 @@ mod tests {
             name: job_name.clone(),
             tasks,
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(&job_config, &submissions)?;
@@ -23726,6 +24499,8 @@ mod tests {
             name: "job-one".into(),
             tasks: tasks.clone(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let job_two_config = JobConfig {
@@ -23735,6 +24510,8 @@ mod tests {
             name: "job-two".into(),
             tasks,
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let job_one_subs = vec![shared_submission.clone()];
@@ -24491,6 +25268,8 @@ mod tests {
             name: "job-one".into(),
             tasks: vec![TaskConfig::new("task-one", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let job_two = JobConfig {
             priority: Default::default(),
@@ -24499,6 +25278,8 @@ mod tests {
             name: "job-two".into(),
             tasks: vec![TaskConfig::new("task-two", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let submission = [Submission {
@@ -24569,6 +25350,8 @@ mod tests {
             name: "job-epoch".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -24601,6 +25384,8 @@ mod tests {
             name: "job-migrate".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job_v1,
@@ -24624,6 +25409,8 @@ mod tests {
             name: "job-migrate".into(),
             tasks: vec![v2_task],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job_v2,
@@ -24664,6 +25451,8 @@ mod tests {
             name: "job-candidates".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -24734,6 +25523,8 @@ mod tests {
             name: "job-generation".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -24777,6 +25568,8 @@ mod tests {
             name: "job-lazy".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -24820,6 +25613,8 @@ mod tests {
             name: name.into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -25324,6 +26119,8 @@ mod tests {
             name: "job-stale".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -25384,6 +26181,8 @@ mod tests {
             name: "job-snap".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -25455,6 +26254,8 @@ mod tests {
             name: "job-iso".into(),
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -25510,6 +26311,8 @@ mod tests {
                 name: name.into(),
                 tasks: vec![TaskConfig::new(task_name, "noop")],
                 version: None,
+                pending_extensions: Default::default(),
+                extensions: Default::default(),
             };
 
             let submissions = [Submission {
@@ -25593,6 +26396,8 @@ mod tests {
             name: "job-constraints".into(),
             tasks: vec![constrained_task],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -26683,6 +27488,8 @@ mod tests {
             tasks: vec![task],
             priority: Band::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -26892,7 +27699,10 @@ mod tests {
                     static_port: Some(18080),
                     to: None,
                     tls: None,
+                    pending_extensions: Default::default(),
+                    unknown_fields: Default::default(),
                 }],
+                unknown_fields: Default::default(),
             });
             task
         };
@@ -26996,7 +27806,10 @@ mod tests {
                 static_port: Some(18080),
                 to: None,
                 tls: None,
+                pending_extensions: Default::default(),
+                unknown_fields: Default::default(),
             }],
+            unknown_fields: Default::default(),
         });
         let (job_config_id, task_id) = submit_walk_job(&store, "walk-port-pair", port_task)?;
 
@@ -27165,6 +27978,8 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -27217,6 +28032,8 @@ mod tests {
                 ..TaskConfig::new("prep", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -27297,6 +28114,8 @@ mod tests {
                 ..TaskConfig::new("prep", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -27368,6 +28187,8 @@ mod tests {
                     ..TaskConfig::new("main", "exec")
                 }],
                 version: None,
+                pending_extensions: Default::default(),
+                extensions: Default::default(),
             };
             store.handle_job_submit(
                 &job,
@@ -27426,6 +28247,8 @@ mod tests {
             name: "artifact-events".into(),
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -27505,6 +28328,8 @@ mod tests {
             name: job_name.into(),
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -27537,6 +28362,8 @@ mod tests {
                 ..TaskConfig::new("web", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -27725,6 +28552,8 @@ mod tests {
             name: "health-demo".into(),
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -27870,6 +28699,8 @@ mod tests {
             name: "inst".into(),
             tasks: vec![TaskConfig::new("box", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[])?;
         let job_config_id = store.get_job_config("inst")?.id();
@@ -28110,6 +28941,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[])?;
         store.enqueue_eval("job_submit", Some(&job.name), None, None, None)?;
@@ -28148,6 +28981,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -28166,6 +29001,8 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -28237,6 +29074,8 @@ mod tests {
             name: "reconcile-incomplete".into(),
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &v1,
@@ -28258,6 +29097,8 @@ mod tests {
                 ..TaskConfig::new("web", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &v2,
@@ -28310,6 +29151,8 @@ mod tests {
             name: "reconcile-incomplete-loop".into(),
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &v1,
@@ -28331,6 +29174,8 @@ mod tests {
                 ..TaskConfig::new("web", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &v2,
@@ -28382,11 +29227,13 @@ mod tests {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new(name, "noop")
         }
@@ -28400,6 +29247,8 @@ mod tests {
             name: name.into(),
             tasks,
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &config,
@@ -28817,11 +29666,13 @@ mod tests {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: Some(false),
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -28980,11 +29831,13 @@ mod tests {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: Some(false),
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -29063,11 +29916,13 @@ mod tests {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: Some(false),
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("drop-db", "noop")
         };
@@ -29140,11 +29995,13 @@ mod tests {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new(name, "noop")
         }
@@ -30135,6 +30992,8 @@ mod tests {
             name: name.into(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -30303,6 +31162,8 @@ mod tests {
                 static_port: None,
                 to: Some(8080),
                 tls: None,
+                pending_extensions: Default::default(),
+                unknown_fields: Default::default(),
             }],
             ..Default::default()
         });
@@ -30321,6 +31182,8 @@ mod tests {
             name: name.into(),
             tasks,
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -30640,6 +31503,8 @@ mod tests {
             rollout_by_group: BTreeMap::new(),
             tasks: vec![TaskConfig::new("main", "noop")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let submission = Submission {
             path: "template://tpl/1".into(),
@@ -31242,6 +32107,8 @@ mod tests {
                 name: "proj-demo".into(),
                 tasks: vec![task("web")],
                 version: None,
+                pending_extensions: Default::default(),
+                extensions: Default::default(),
             };
             store.handle_job_submit(
                 &job,
@@ -31667,6 +32534,8 @@ mod tests {
             name: "reseed-demo".into(),
             tasks: vec![task("web")],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let subs = [Submission {
             path: "job.ncl".into(),
@@ -31889,6 +32758,8 @@ mod tests {
                 static_port: None,
                 to: None,
                 tls: None,
+                pending_extensions: Default::default(),
+                unknown_fields: Default::default(),
             }],
             ..Default::default()
         });

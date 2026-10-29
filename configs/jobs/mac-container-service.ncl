@@ -48,7 +48,7 @@
         port = "http",
         every = "5s",
         timeout = "2s",
-        unhealthy_after_count = 3,
+        unhealthyAfterCount = 3,
       },
     ],
     actions = [

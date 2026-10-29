@@ -187,7 +187,7 @@ impl OnRefused {
 /// Absent from every jobspec by default; an absent block means `off`, which
 /// costs nothing and changes no wire payload.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SpeculativeStartConfig {
     /// How far a node may get before the placement is durable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,6 +199,10 @@ pub struct SpeculativeStartConfig {
     /// What to do when ratification is refused. Default `kill`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_refused: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// A resolved `speculativeStart` block: every default applied, every value
@@ -560,6 +564,12 @@ impl SessionTicketClaims {
     }
 }
 
+// Unknown-field capture (`structs::spec_fields`).
+crate::structs::spec_fields::spec_block!(
+    SpeculativeStartConfig,
+    ["mode", "ratifyTimeout", "onRefused"]
+);
+
 #[cfg(test)]
 mod edge_boot_test {
     use super::*;
@@ -666,6 +676,7 @@ mod edge_boot_test {
             mode: Some("serve".into()),
             ratify_timeout: Some("30s".into()),
             on_refused: Some("stop".into()),
+            unknown_fields: Default::default(),
         }
         .resolve()
         .expect("resolve");

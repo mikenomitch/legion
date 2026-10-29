@@ -44,7 +44,12 @@ const JOB_SECTIONS = new Map([
 // Sections with detail pages but no index page: `/allocations/7` is a page,
 // `/allocations` is not, so the section crumb is a label, not a link, and the
 // bare path stays unknown.
-const DETAIL_ONLY_SECTIONS = new Map([['allocations', 'Allocations']])
+const DETAIL_ONLY_SECTIONS = new Map([
+  ['allocations', 'Allocations'],
+  // An app's page (`/apps/<app>/<view>`, the nav slot, or
+  // `/apps/<app>/pages/<page>`, a sandboxed page): there is no index.
+  ['apps', 'Apps'],
+])
 
 /** True when the first path segment is a section the app has a page for. */
 export const isKnownSection = (segment: string | undefined): boolean =>
@@ -82,6 +87,9 @@ const labelForSegment = (segments: readonly string[], index: number): string => 
   if (previous === 'tasks') return decoded
   if (previous === 'instances') return decoded
   if (previous === 'allocations') return `#${decoded}`
+  if (previous === 'apps') return decoded
+  // `/apps/<app>/pages/<page>`: an app's sandboxed page.
+  if (segments[0] === 'apps' && index === 3) return decoded
 
   // `/jobs/<namespace>/<name>/<section>/<item>`: the namespace, the job,
   // then the job's sections.
@@ -99,6 +107,7 @@ const labelForSegment = (segments: readonly string[], index: number): string => 
 const crumbHref = (segments: readonly string[], index: number, path: string): string | undefined => {
   if (unlinkedSegments.has(segments[index])) return undefined
   if (index === 0 && DETAIL_ONLY_SECTIONS.has(segments[0])) return undefined
+  if (segments[0] === 'apps') return undefined
   if (segments[0] === 'jobs' && index === 1) return `/jobs?ns=${segments[1]}`
   if (segments[0] === 'jobs' && index === 3 && JOB_SECTIONS.has(segments[3])) return `/jobs/${segments[1]}/${segments[2]}`
   return path

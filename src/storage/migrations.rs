@@ -2148,6 +2148,252 @@ fn migration_list() -> Vec<M<'static>> {
         INSERT OR IGNORE INTO net_plugin_meta (id, generation) VALUES (1, 0);",
         )
         .down("DROP TABLE IF EXISTS net_plugin; DROP TABLE IF EXISTS net_plugin_meta;"),
+        // Worker-type `namespaces` (docs/namespaces.md, "Nodes that accept
+        // only some namespaces"): the namespaces whose jobs the type's nodes
+        // accept, comma-joined like `additional_node_checks` (namespace
+        // names and globs never hold a comma). Empty on every existing row,
+        // which reads as "every namespace". Control lane, like the rest of
+        // `worker_type`.
+        M::up("ALTER TABLE worker_type ADD COLUMN namespaces TEXT NOT NULL DEFAULT '';").down(""),
+        // Job grants (apps plan §6.4, docs/workload-identity.md,
+        // "Permissions"): what each job config version's `legion` identities
+        // were granted at submit, by whom, and whether it was revoked. One
+        // row per version that asks for anything; `tasks` is a JSON array of
+        // `{group, task, permissions, policies}`. A token resolves its
+        // allocation's version's row on every verification, so a revoke
+        // takes effect at the next request. Control lane with `job_config`,
+        // so the row and the version it grants are one entry, and a version
+        // pruned or destroyed takes its grant with it.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS job_grant (
+            job_config_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            tasks TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            granted_at TEXT NOT NULL,
+            revoked_at TEXT,
+            revoked_by TEXT,
+            FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_grant_job ON job_grant(job_id);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_job_grant_job;
+        DROP TABLE IF EXISTS job_grant;",
+        ),
+        // Join tokens a manager mints for its own in-process worker pin the
+        // node's `namespaces` restriction and `legion.role` (JSON object), so
+        // registration takes them from the token rather than from what the
+        // worker reports (apps plan calls entry 19). Empty for tokens minted
+        // by `CreateJoinToken`, whose worker type supplies both.
+        M::up("ALTER TABLE join_token ADD COLUMN pinned_attrs TEXT NOT NULL DEFAULT '';")
+            .down(""),
+        // Apps (apps plan §6.3, docs/apps.md): one row per installed app, on
+        // the Control lane with the jobs the app reconciler submits. The
+        // manifest, settings, config and granted rules are JSON; the
+        // reconciler's bookkeeping (last digest, action, error, the build
+        // marker it holds and why, and what the last record write changed)
+        // has its own columns, written without moving `updated_at`, which
+        // operator writes compare-and-set on.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS app (
+            name TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            source_ref TEXT NOT NULL DEFAULT '',
+            manifest TEXT NOT NULL,
+            manifest_digest TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            settings TEXT NOT NULL,
+            config TEXT NOT NULL,
+            grant_rules TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            granted_at TEXT NOT NULL,
+            installed_by TEXT NOT NULL,
+            installed_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_digest TEXT NOT NULL DEFAULT '',
+            last_action TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            last_at TEXT NOT NULL DEFAULT '',
+            build_marker TEXT NOT NULL DEFAULT '',
+            marker_reason TEXT NOT NULL DEFAULT '',
+            pending_change TEXT NOT NULL DEFAULT ''
+        );",
+        )
+        .down("DROP TABLE IF EXISTS app;"),
+        // Strict jobspec fields (docs/jobs-tasks-and-scheduling.md, "Unknown
+        // fields"): `task_config.pending_extensions` is the JSON object of
+        // unknown task-level keys a submit kept under
+        // `allow_unknown_fields`, NULL when there are none. Appended at the
+        // end, since raft changesets bind columns by position. Control lane,
+        // like the rest of `task_config`. The job-level map and the record
+        // of what the flag kept and dropped ride `job_config.meta`.
+        M::up("ALTER TABLE task_config ADD COLUMN pending_extensions TEXT;").down(""),
+        // Task autoscaling (docs/autoscaling.md; autoscaler-v2 plan Phase 2).
+        // `task_config.autoscale` is the jobspec `autoscale` field exactly as
+        // written (`true`, or the sparse record), NULL without one: the
+        // defaults it inherits are resolved live, never frozen here.
+        M::up("ALTER TABLE task_config ADD COLUMN autoscale TEXT;").down(""),
+        // The override row gains its compare-and-set version (a value of the
+        // `task_scale` counter in `scaling_counter`, stamped on every write,
+        // so it never repeats across a delete and recreate) and a time-boxed
+        // pin (`legion job scale --for`): a floor and/or ceiling the
+        // autoscaler stays within until `pin_until_ms` (unix ms); a count pin
+        // is `pin_min = pin_max`. Appended, since raft changesets bind
+        // columns by position.
+        M::up(
+            "ALTER TABLE task_scale ADD COLUMN version INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE task_scale ADD COLUMN pin_until_ms INTEGER;
+             ALTER TABLE task_scale ADD COLUMN pin_min INTEGER;
+             ALTER TABLE task_scale ADD COLUMN pin_max INTEGER;
+             ALTER TABLE task_scale ADD COLUMN pin_by TEXT NOT NULL DEFAULT '';
+             ALTER TABLE task_scale ADD COLUMN pin_reason TEXT NOT NULL DEFAULT '';",
+        )
+        .down(""),
+        // Named counters that never go backwards, even when the rows they
+        // stamp are deleted (`task_scale` versions).
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_counter (
+            name TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_counter;"),
+        // The cluster's scaling defaults (`legion scaling defaults apply`):
+        // one row, the record as written.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_defaults (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            record TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            updated_by TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_defaults;"),
+        // The durable record of scaling changes, capped per task.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scale_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            task_group TEXT NOT NULL,
+            task_name TEXT NOT NULL,
+            at_ms INTEGER NOT NULL,
+            from_count INTEGER NOT NULL,
+            to_count INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            principal TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            applied INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            policy_digest TEXT NOT NULL DEFAULT '',
+            decision_id TEXT NOT NULL DEFAULT '',
+            decision TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS scale_history_target
+            ON scale_history (job_id, task_group, task_name, id);
+        CREATE INDEX IF NOT EXISTS scale_history_digest
+            ON scale_history (policy_digest);",
+        )
+        .down("DROP TABLE IF EXISTS scale_history;"),
+        // Pauses (`legion scaling pause`): one row per scope. The
+        // cluster-wide pause is `job_id = '*'`; a whole job's is
+        // `task_group = '*'`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_pause (
+            job_id TEXT NOT NULL,
+            task_group TEXT NOT NULL,
+            task_name TEXT NOT NULL,
+            until_ms INTEGER,
+            reason TEXT NOT NULL,
+            principal TEXT NOT NULL,
+            created_ms INTEGER NOT NULL,
+            PRIMARY KEY (job_id, task_group, task_name)
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_pause;"),
+        // Effective policies by digest, so a `scale_history` row's digest
+        // always resolves to the policy that decided. Pruned when no history
+        // row references a digest.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_policy_snapshot (
+            digest TEXT PRIMARY KEY,
+            policy TEXT NOT NULL,
+            first_used_ms INTEGER NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_policy_snapshot;"),
+        // Join tokens for node groups (autoscaler v2 plan §6.11): `max_uses`
+        // caps the new nodes a token may introduce (NULL: no limit), `uses`
+        // counts them, and `attributes` (a JSON object, empty for none) is
+        // stamped on every node that registers with it. Control lane, like
+        // the rest of `join_token`.
+        M::up(
+            "ALTER TABLE join_token ADD COLUMN max_uses INTEGER;
+        ALTER TABLE join_token ADD COLUMN uses INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE join_token ADD COLUMN attributes TEXT NOT NULL DEFAULT '';",
+        )
+        .down(""),
+        // Standalone scaling policies (`legion scaling apply`; autoscaler v2
+        // plan §6.2, §7): one row per policy, its spec as written, on the
+        // Control lane with the rest of the scaling state. `namespace` is
+        // empty for a cluster-scoped policy (a node group). `version` is a
+        // value of the `scaling_policy` counter in `scaling_counter`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_policy (
+            namespace TEXT NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            spec TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL,
+            created_ms INTEGER NOT NULL,
+            updated_by TEXT NOT NULL,
+            updated_ms INTEGER NOT NULL,
+            PRIMARY KEY (namespace, name)
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_policy;"),
+        // Action intents for targets outside Legion (`RecordScalingAction`;
+        // autoscaler v2 plan §6.9, calls entry 12): one row per standalone
+        // policy, compare-and-set on `version`, a value of the
+        // `scaling_action` counter in `scaling_counter`. Control lane.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_action (
+            policy TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            intent TEXT NOT NULL,
+            owner TEXT NOT NULL DEFAULT '',
+            principal TEXT NOT NULL DEFAULT '',
+            opened_ms INTEGER NOT NULL,
+            closed_ms INTEGER,
+            detail TEXT NOT NULL DEFAULT ''
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_action;"),
+        // A job's tasks across config versions (`WHERE tc.job_id = ?`): the
+        // autoscaler's batched inputs read every autoscaled job's replicas
+        // this way, which without it scanned every task config per job
+        // (quadratic at 10,000 jobs; docs/benchmarks.md, "The autoscaler at
+        // 10,000 policies").
+        M::up("CREATE INDEX IF NOT EXISTS idx_task_config_job_id ON task_config(job_id);")
+            .down("DROP INDEX IF EXISTS idx_task_config_job_id;"),
+        // Each app's own uid (docs/apps.md, "Trust model"): the uid and gid
+        // its exec tasks run as, so no two apps share a user. Assigned on
+        // insert, the lowest free one from `APP_UID_BASE` (1900000000);
+        // apps installed before this get one each, in name order. Unique
+        // among assigned ones. Appended at the end, since raft changesets
+        // bind columns by position.
+        M::up(
+            "ALTER TABLE app ADD COLUMN uid INTEGER NOT NULL DEFAULT 0;
+        UPDATE app SET uid = 1900000000
+            + (SELECT COUNT(*) FROM app AS earlier WHERE earlier.name < app.name);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_app_uid ON app(uid) WHERE uid > 0;",
+        )
+        .down("DROP INDEX IF EXISTS idx_app_uid;"),
     ]
 }
 
