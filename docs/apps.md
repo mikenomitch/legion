@@ -1863,6 +1863,14 @@ them, and which allocation answered. The MCP server exposes
   `1900000000` up, with no passwd entry; a host whose own users sit in that
   range would share them. Container tasks get their own per-allocation
   user namespace instead, and sandbox tasks their VM.
+- **An app's uid must be able to reach the binary it runs.** A bundled app
+  runs the `legion` binary itself, in place, as its own uid, which has no
+  group or ownership on the host. So every directory on the path to the
+  binary needs search (`x`) permission for others, and the binary needs
+  read and execute for others. Install it under `/usr/local/bin` or similar
+  rather than a home directory: a `legion` under a `0700` path such as
+  `/root` starts its bundled apps with `Permission denied (os error 13)`,
+  and `legion app status` shows them restarting.
 - **No host-level constructs in an app's job, even for an admin.** An app
   that would need an `exec` health check, a node file, or the node's
   identity cannot be an app; run it as an ordinary job.
