@@ -1562,3 +1562,98 @@ async fn install_adopts_pending_upgrade_revalidates_and_uninstall_orphans_test()
     fx.run_as(&job("later", Some(2)), true, &fx.admin).await?;
     Ok(())
 }
+
+/// A `$path` KV reference needs `kv:read` on its key wherever it sits in a
+/// jobspec, and the check comes before anything resolves it (hardening
+/// after the adversarial review): in a pending key planned with
+/// `--allow-unknown-fields`, in an installed key's value (which the app's
+/// validate call would otherwise see), and in a core field whose parse
+/// error would otherwise echo the value.
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_references_need_kv_read_wherever_they_are_test() -> R<()> {
+    const SECRET: &str = "hunter2";
+    const KEY: &str = "team-b/db/password";
+    let fx = fixture().await?;
+    fx.svc
+        .put_kv(req(
+            PutKvRequest {
+                key: KEY.into(),
+                value: SECRET.into(),
+                value_type: KvValueType::String as i32,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    let tenant = fx
+        .token(
+            "tenant",
+            json!([{ "resources": ["job"], "actions": ["read", "write"], "namespaces": ["*"] }]),
+        )
+        .await?;
+    let refused = |outcome: Result<String, tonic::Status>, what: &str| match outcome {
+        Ok(shown) => panic!("{what} was not refused, and showed: {shown}"),
+        Err(status) => {
+            assert_eq!(status.code(), Code::PermissionDenied, "{what}: {status}");
+            assert!(
+                !status.message().contains(SECRET),
+                "{what} leaked: {status}"
+            );
+            assert!(status.message().contains(KEY), "{what}: {status}");
+        }
+    };
+    let noop = json!({ "name": "t", "runtime": "container",
+                       "config": { "image": "alpine", "command": ["true"] } });
+
+    // A pending key: `job:read` was enough to read any key back.
+    let leak = json!({ "name": "planned", "leak": format!("${KEY}"), "task": noop });
+    let plan = fx
+        .svc
+        .plan_job(req(
+            PlanJobRequest {
+                parsed_jobspec: leak.to_string(),
+                allow_unknown_fields: true,
+                ..Default::default()
+            },
+            &tenant,
+        ))
+        .await
+        .map(|reply| format!("{:?}", reply.into_inner().extensions));
+    refused(plan, "PlanJob with a pending key");
+
+    // An installed key's value: nobody's app hears it, nothing is stored.
+    let before = fx.forwarder.calls.load(Ordering::SeqCst);
+    let stored = json!({ "name": "stored", "uptime": { "url": format!("${KEY}") }, "task": noop });
+    let run = fx
+        .run_as(&stored, false, &tenant)
+        .await
+        .map(|reply| reply.message);
+    refused(run, "RunJob with an installed key");
+    assert_eq!(
+        fx.forwarder.calls.load(Ordering::SeqCst),
+        before,
+        "the validate call heard a value its submitter may not read"
+    );
+    assert!(fx.store.get_job_config_optional("stored")?.is_none());
+
+    // A core field whose type the value does not fit.
+    let echoed = json!({ "name": "echoed", "priority": format!("${KEY}"), "task": noop });
+    let run = fx
+        .run_as(&echoed, false, &tenant)
+        .await
+        .map(|reply| reply.message);
+    refused(run, "RunJob with a mistyped core field");
+
+    // Holding `kv:read` on the key is what it takes.
+    let reader = fx
+        .token(
+            "reader",
+            json!([
+                { "resources": ["job"], "actions": ["read", "write"], "namespaces": ["*"] },
+                { "resources": ["kv"], "actions": ["read"], "paths": ["team-b/*"] },
+            ]),
+        )
+        .await?;
+    fx.run_as(&stored, false, &reader).await?;
+    Ok(())
+}

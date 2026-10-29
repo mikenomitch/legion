@@ -388,7 +388,10 @@ impl ManagerDaemonService {
     ///
     /// Runs before the submit itself, on the async side, and only when an
     /// installed key asks for it. A jobspec that does not parse, or that the
-    /// caller may not submit, asks nobody: the submit reports why.
+    /// caller may not submit, asks nobody: the submit reports why. Nor does
+    /// one that names a KV key the caller may not read: the parse enforces
+    /// `kv:read` on every reference before it resolves any, so an app never
+    /// hears a value its submitter could not read.
     pub(super) async fn ask_apps_to_validate(
         &self,
         identity: &AclIdentity,
@@ -401,7 +404,14 @@ impl ManagerDaemonService {
             return Ok(Vec::new());
         }
         let parsed = run_blocking_admission(|| {
-            resolve_jobspec_kv_references(&self.store, jobspec, mode, &registry)
+            resolve_jobspec_kv_references(
+                &self.store,
+                identity,
+                jobspec,
+                mode,
+                &registry,
+                "Error parsing jobspec",
+            )
         });
         let Ok((mut config, _, _)) = parsed else {
             return Ok(Vec::new());
