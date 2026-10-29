@@ -188,6 +188,20 @@ fn status_doc(row: &AppObjectStatusRow) -> StatusDoc {
     }
 }
 
+/// What `ListObjects --authority-lapsed` says of an object's authority
+/// (`ObjectAuthority.check`).
+pub(crate) struct AuthorityCheck;
+
+impl AuthorityCheck {
+    /// The authorizer still holds every recorded permission.
+    pub(crate) const HELD: &'static str = "held";
+    /// It no longer does: its token is gone or expired, or lost a
+    /// permission.
+    pub(crate) const LAPSED: &'static str = "lapsed";
+    /// It cannot be re-resolved (no accessor).
+    pub(crate) const UNKNOWN: &'static str = "unknown";
+}
+
 /// What turning a row into its proto needs beyond the row.
 pub(crate) struct ProtoContext<'a> {
     pub kind: Option<&'a InstalledKind>,
@@ -262,6 +276,8 @@ pub(crate) fn object_proto(row: &AppObjectRow, ctx: &ProtoContext<'_>) -> AppObj
             authorized_by: authority.authorized_by,
             accessor: authority.accessor.unwrap_or_default(),
             authorized_at_unix_ms: authority.authorized_ms,
+            check: String::new(),
+            check_detail: String::new(),
         }),
         managed_by: row.managed_by.clone(),
         deleting: row.is_deleting(),
@@ -1358,6 +1374,16 @@ impl ManagerDaemonService {
                 Some(kind),
             )
         };
+        // Re-resolving the authorizers' tokens reveals what other
+        // principals hold now: ACL state, behind `acl:read`.
+        if inner.authority_lapsed {
+            acl::enforce(
+                &identity,
+                AclResource::Acl,
+                AclAction::Read,
+                &AclScope::none(),
+            )?;
+        }
         let rows = self
             .store
             .app_objects(&filter)
@@ -1366,6 +1392,7 @@ impl ManagerDaemonService {
             .store
             .app_object_statuses(filter.app.as_deref())
             .map_err(|e| map_store_error("Error reading object statuses", e))?;
+        let mut authorizers = BTreeMap::new();
         let mut seen = BTreeMap::new();
         let mut objects = Vec::new();
         for row in rows
@@ -1399,8 +1426,17 @@ impl ManagerDaemonService {
             if !readable {
                 continue;
             }
+            let check = if inner.authority_lapsed {
+                let check = self.authority_check(row, &mut authorizers);
+                if check.0 == AuthorityCheck::HELD {
+                    continue;
+                }
+                Some(check)
+            } else {
+                None
+            };
             let running = self.app_running(&row.key.app, &mut seen);
-            objects.push(object_proto(
+            let mut object = object_proto(
                 row,
                 &ProtoContext {
                     kind,
@@ -1409,7 +1445,12 @@ impl ManagerDaemonService {
                     reveal: false,
                     shard: 0,
                 },
-            ));
+            );
+            if let (Some((check, detail)), Some(authority)) = (check, object.authority.as_mut()) {
+                authority.check = check.to_string();
+                authority.check_detail = detail;
+            }
+            objects.push(object);
         }
         let mut kinds: Vec<ObjectKind> = Vec::new();
         let mut listed = BTreeSet::new();
@@ -1425,6 +1466,82 @@ impl ManagerDaemonService {
             }
         }
         Ok(Response::new(ListObjectsReply { objects, kinds }))
+    }
+
+    /// Whether the principal that last authorized `row` still holds every
+    /// permission of its recorded authority (`ListObjects` with
+    /// `authority_lapsed`): re-resolved through its token's accessor, as a
+    /// request with that token would authenticate now. `authorizers`
+    /// caches the resolution per accessor for one listing. Nothing lapses
+    /// with ACLs off, or for an object whose authority is empty.
+    fn authority_check(
+        &self,
+        row: &AppObjectRow,
+        authorizers: &mut BTreeMap<String, Result<Option<AclIdentity>, Status>>,
+    ) -> (&'static str, String) {
+        if !self.auth.enabled {
+            return (AuthorityCheck::HELD, String::new());
+        }
+        let authority: AuthorityDoc = serde_json::from_str(&row.authority).unwrap_or_default();
+        if authority.permissions.is_empty() {
+            return (AuthorityCheck::HELD, String::new());
+        }
+        let who = authority.authorized_by.clone();
+        let Some(accessor) = authority.accessor.as_deref().filter(|a| !a.is_empty()) else {
+            return (
+                AuthorityCheck::UNKNOWN,
+                format!(
+                    "{who} authorized it without an ACL token (a JWT or SSO login, or a \
+                     workload identity), so its rights cannot be re-resolved"
+                ),
+            );
+        };
+        let resolved = authorizers
+            .entry(accessor.to_string())
+            .or_insert_with(|| self.auth.identity_for_accessor(accessor, &self.store));
+        match resolved {
+            Ok(None) => (
+                AuthorityCheck::LAPSED,
+                format!("{who}'s token (accessor {accessor}) was deleted"),
+            ),
+            Err(status) if status.code() == tonic::Code::Unauthenticated => (
+                AuthorityCheck::LAPSED,
+                format!("{who}'s token (accessor {accessor}): {}", status.message()),
+            ),
+            Err(status) => (
+                AuthorityCheck::UNKNOWN,
+                format!(
+                    "{who}'s token (accessor {accessor}) could not be read: {}",
+                    status.message()
+                ),
+            ),
+            Ok(Some(holder)) => {
+                let missing: Vec<String> = authority
+                    .permissions
+                    .iter()
+                    .filter(|permission| {
+                        match (
+                            AclResource::parse(&permission.resource),
+                            AclAction::parse(&permission.action),
+                        ) {
+                            (Some(resource), Some(action)) => {
+                                !holder.would_allow(resource, action, &permission.scope())
+                            }
+                            _ => true,
+                        }
+                    })
+                    .map(ResolvedPermission::label)
+                    .collect();
+                if missing.is_empty() {
+                    (AuthorityCheck::HELD, String::new())
+                } else {
+                    (
+                        AuthorityCheck::LAPSED,
+                        format!("{who} no longer holds {}", missing.join("; ")),
+                    )
+                }
+            }
+        }
     }
 
     /// Delete one object as `identity`, after `enforce_access`: the managed

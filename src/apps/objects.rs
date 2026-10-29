@@ -26,6 +26,16 @@
 //! object being deleted goes to the cleanup handler
 //! ([`Reconciler::on_cleanup`]) instead, and is released when it returns.
 //!
+//! **Acting for the object.** The handler's [`ObjectRequest::client`] calls
+//! Legion *for* the object (`legion-for-object`; docs/app-objects.md,
+//! "Acting for an object"): the manager holds those calls to the object's
+//! recorded authority (what its writer was checked for) within the app's
+//! grant, and stamps the jobs they submit with the object. That is the
+//! client a handler should deploy with; [`ObjectRequest::app_client`] is
+//! the app's own, for what the app does for itself (its own KV state, say).
+//! Outside the loop, [`crate::apps::AppContext::client_for`] makes the same
+//! client for any object the app owns.
+//!
 //! [`ObjectCache`], [`watch_objects`] and [`write_object_status`] are the
 //! pieces the loop is made of, for an app that wants its own;
 //! [`run_object_watch`] keeps a cache current, and [`StatusBook`] writes
@@ -39,8 +49,9 @@
 //! [`Reconciler::shards_from`] and [`run_object_watch`] follow, opening a
 //! new watch whenever it changes.
 
-use crate::cmd::helpers::AuthedManagerClient;
+use crate::cmd::helpers::{AuthedManagerClient, ManagerConnection};
 use crate::prelude::*;
+use crate::structs::acl::ActingFor;
 use crate::structs::app_object::{
     CONDITION_ACCEPTED, CONDITION_READY, MAX_CONDITION_MESSAGE_BYTES,
 };
@@ -633,21 +644,86 @@ impl StatusBook {
     }
 }
 
+/// The reference an app names `object` with when it acts for it
+/// (`legion-for-object: <app>/<Kind>/<namespace>/<name>#<uid>@<generation>`),
+/// at the generation the app read.
+pub fn acting_for(object: &AppObject) -> ActingFor {
+    ActingFor {
+        app: object.app.clone(),
+        kind: object.kind.clone(),
+        namespace: object.namespace.clone(),
+        name: object.name.clone(),
+        uid: object.uid,
+        generation: object.generation,
+    }
+}
+
 /// One object handed to a reconcile or cleanup handler.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ObjectRequest {
     /// The object as the watch delivered it, `writeOnly` fields included.
     pub object: AppObject,
     /// Its effective spec: the stored spec with the schema's defaults.
     pub spec: Value,
+    /// The app's connection to Legion, when the loop runs over one
+    /// ([`Reconciler::connection`]; set by
+    /// [`crate::apps::AppContext::start_reconciler`]).
+    connection: Option<ManagerConnection>,
+}
+
+impl std::fmt::Debug for ObjectRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectRequest")
+            .field("object", &self.object.id)
+            .field("uid", &self.object.uid)
+            .field("generation", &self.object.generation)
+            .field("connected", &self.connection.is_some())
+            .finish()
+    }
 }
 
 impl ObjectRequest {
-    fn new(object: AppObject) -> ObjectRequest {
+    fn new(object: AppObject, connection: Option<ManagerConnection>) -> ObjectRequest {
         let spec = serde_json::from_str(&object.effective_json)
             .or_else(|_| serde_json::from_str(&object.spec_json))
             .unwrap_or(Value::Null);
-        ObjectRequest { object, spec }
+        ObjectRequest {
+            object,
+            spec,
+            connection,
+        }
+    }
+
+    /// The reference this request's calls name the object with.
+    pub fn acting_for(&self) -> ActingFor {
+        acting_for(&self.object)
+    }
+
+    /// A Legion client that acts **for this object** (docs/app-objects.md,
+    /// "Acting for an object"): every call carries `legion-for-object`, and
+    /// the manager runs it as `<app> for <Kind> <namespace>/<name>`, holding
+    /// only the object's recorded authority (what its writer was checked
+    /// for) within the app's grant, `via = "objects"` rules included. Jobs
+    /// it submits are stamped with the object. Anything else is
+    /// `PermissionDenied`, whatever the app's own grant allows. Errors when
+    /// the loop runs without a connection (a test's stand-in plane).
+    pub fn client(&self) -> R<AuthedManagerClient> {
+        self.connection()?.client_for_object(&self.acting_for())
+    }
+
+    /// The app's own client: its full grant, without `via = "objects"`
+    /// rules, for what the app does for itself rather than for the object.
+    pub fn app_client(&self) -> R<AuthedManagerClient> {
+        Ok(self.connection()?.client())
+    }
+
+    fn connection(&self) -> R<&ManagerConnection> {
+        self.connection.as_ref().ok_or_else(|| {
+            anyhow!(
+                "this reconcile loop has no Legion connection (start it with \
+                 AppContext::start_reconciler, or give it Reconciler::connection)"
+            )
+        })
     }
 
     /// The spec as the app's own type.
@@ -681,6 +757,7 @@ pub struct Reconciler {
     dynamic_shards: Option<tokio::sync::watch::Receiver<ShardSelection>>,
     concurrency: usize,
     cleanup: Option<CleanupHandler>,
+    connection: Option<ManagerConnection>,
 }
 
 impl std::fmt::Debug for Reconciler {
@@ -694,6 +771,7 @@ impl std::fmt::Debug for Reconciler {
             .field("dynamic_shards", &self.dynamic_shards.is_some())
             .field("concurrency", &self.concurrency)
             .field("cleanup", &self.cleanup.is_some())
+            .field("connection", &self.connection.is_some())
             .finish()
     }
 }
@@ -711,7 +789,16 @@ impl Reconciler {
             dynamic_shards: None,
             concurrency: DEFAULT_CONCURRENCY,
             cleanup: None,
+            connection: None,
         }
+    }
+
+    /// The connection handlers' clients are made from
+    /// ([`ObjectRequest::client`], [`ObjectRequest::app_client`]): the app's
+    /// own, which [`crate::apps::AppContext::start_reconciler`] sets.
+    pub fn connection(mut self, connection: ManagerConnection) -> Reconciler {
+        self.connection = Some(connection);
+        self
     }
 
     /// Reconcile every object again this often (default 5 minutes).
@@ -821,6 +908,7 @@ async fn reconcile_one<P: ObjectPlane>(
     plane: P,
     handler: ReconcileHandler,
     cleanup: Option<CleanupHandler>,
+    connection: Option<ManagerConnection>,
     object: AppObject,
     reported: Option<Reported>,
 ) -> Done {
@@ -833,7 +921,8 @@ async fn reconcile_one<P: ObjectPlane>(
     };
     if object.deleting {
         if let Some(cleanup) = cleanup {
-            if let Err(err) = cleanup(ObjectRequest::new(object.clone())).await {
+            if let Err(err) = cleanup(ObjectRequest::new(object.clone(), connection.clone())).await
+            {
                 return done(Err(format!("cleanup: {err:#}")), reported, false);
             }
         }
@@ -859,7 +948,7 @@ async fn reconcile_one<P: ObjectPlane>(
             ),
         };
     }
-    let outcome = match handler(ObjectRequest::new(object.clone())).await {
+    let outcome = match handler(ObjectRequest::new(object.clone(), connection)).await {
         Ok(outcome) => outcome,
         Err(err) => {
             // Keep what the app said about acceptance; report the failure
@@ -1101,14 +1190,18 @@ async fn reconcile_loop<P: ObjectPlane>(
                         entry.due = None;
                         running += 1;
                         let reported = entry.reported.clone();
-                        let (plane, handler, cleanup, tx) = (
+                        let (plane, handler, cleanup, connection, tx) = (
                             plane.clone(),
                             handler.clone(),
                             config.cleanup.clone(),
+                            config.connection.clone(),
                             done_tx.clone(),
                         );
                         tokio::spawn(async move {
-                            let done = reconcile_one(plane, handler, cleanup, object, reported).await;
+                            let done = reconcile_one(
+                                plane, handler, cleanup, connection, object, reported,
+                            )
+                            .await;
                             let _ = tx.send(done);
                         });
                     }
@@ -1145,7 +1238,8 @@ impl super::AppContext {
     }
 
     /// Run `reconciler` with `handler` over the app's own client until the
-    /// app stops.
+    /// app stops. Handlers get [`ObjectRequest::client`], which acts for
+    /// the object, and [`ObjectRequest::app_client`], the app's own.
     pub fn start_reconciler<F, Fut>(
         &self,
         reconciler: Reconciler,
@@ -1155,8 +1249,22 @@ impl super::AppContext {
         F: Fn(ObjectRequest) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = R<ObjectOutcome>> + Send + 'static,
     {
-        let client = self.connection()?.client();
-        Ok(reconciler.run(client, self.stop.clone(), handler))
+        let connection = self.connection()?;
+        let client = connection.client();
+        Ok(reconciler
+            .connection(connection)
+            .run(client, self.stop.clone(), handler))
+    }
+
+    /// A Legion client that acts for `object`, one of the app's own
+    /// (docs/app-objects.md, "Acting for an object"): it wraps
+    /// [`Self::connection`] the way
+    /// [`crate::apps::ui::ActionRequest::client_as_viewer`] does, sending
+    /// `legion-for-object` on every call. The manager holds those calls to
+    /// the object's recorded authority within the app's grant and stamps
+    /// the jobs they submit with the object. Not for streams.
+    pub fn client_for(&self, object: &AppObject) -> R<AuthedManagerClient> {
+        self.connection()?.client_for_object(&acting_for(object))
     }
 }
 
@@ -1235,6 +1343,28 @@ mod tests {
             vec![CacheChange::Deleted(1), CacheChange::Upserted(3)]
         );
         assert_eq!(cache.len(), 1);
+    }
+
+    /// A handler's request names its object for `legion-for-object` at
+    /// the generation it read; without a connection (a stand-in plane) it
+    /// has no client to give.
+    #[test]
+    fn requests_act_for_their_object_test() {
+        let request = ObjectRequest::new(object(17, 3, 9), None);
+        assert_eq!(
+            request.acting_for().header_value(),
+            "gitops/Repo/default/r17#17@3"
+        );
+        let mut cluster = object(9, 1, 1);
+        cluster.namespace = String::new();
+        assert_eq!(acting_for(&cluster).header_value(), "gitops/Repo//r9#9@1");
+        let err = request.client().err().expect("no connection");
+        assert!(
+            format!("{err:#}").contains("no Legion connection"),
+            "{err:#}"
+        );
+        assert!(request.app_client().is_err());
+        assert!(format!("{request:?}").contains("connected: false"));
     }
 
     #[test]

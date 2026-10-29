@@ -31,12 +31,12 @@ use crate::manager::delegation::{
     delegated_identity, for_object_refusal, names_a_viewer, names_an_object,
     object_scoped_identity, presented_assertion, presented_object, refusal_message,
 };
-use crate::structs::acl::{ActingFor, AclSource};
+use crate::structs::acl::{AclSource, ActingFor};
 use crate::structs::app_object::ObjectAuthority as AuthorityRecord;
-use crate::structs::app_ui::{FOR_OBJECT_HEADER, ON_BEHALF_OF_HEADER};
 use crate::structs::app_ui::{
     assertion_audience, AssertionKind, ViewerAssertion, ASSERTION_CLAIM, ASSERTION_TTL_SECS,
 };
+use crate::structs::app_ui::{FOR_OBJECT_HEADER, ON_BEHALF_OF_HEADER};
 
 impl ManagerDaemonService {
     /// The app a credential speaks for: the first job-grant reference among
@@ -108,7 +108,11 @@ impl ManagerDaemonService {
     /// the caller is the app that owns it and the object exists under that
     /// uid. The generation the app names is advisory: the object's current
     /// recorded authority applies (it changes only on an apply).
-    fn act_for_object(&self, caller: &AclIdentity, actor: ActingFor) -> Result<AclIdentity, Status> {
+    fn act_for_object(
+        &self,
+        caller: &AclIdentity,
+        actor: ActingFor,
+    ) -> Result<AclIdentity, Status> {
         let label = actor.header_value();
         if caller.source == AclSource::Anonymous {
             return Err(refuse(

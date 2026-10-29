@@ -2291,9 +2291,12 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
   /**
    * Set when the job's latest version was submitted by the app reconciler:
    * the job belongs to an app (docs/apps.md), and direct writes to it are
-   * refused while the app is installed. Unset for every other job, and for
-   * an app's job whose latest version was stored some other way (which the
-   * reconciler reverts).
+   * refused while the app is installed. Also set, with `object`, when an
+   * app acting for one of its objects (`legion-for-object`) wrote the
+   * latest version: a person may still submit over it, and the app will
+   * likely write it back (docs/app-objects.md, "Acting for an object").
+   * Unset for every other job, and for an app's job whose latest version
+   * was stored some other way (which the reconciler reverts).
    *
    * @generated from field: optional legion.ManagedByInfo managed_by = 3;
    */
@@ -2565,11 +2568,22 @@ export class ManagedByInfo extends Message<ManagedByInfo> {
   /**
    * The digest of the render the reconciler submitted. The reconciler
    * compares it with the digest of a fresh render of the app record; a
-   * difference resubmits the job.
+   * difference resubmits the job. Empty when `object` is set.
    *
    * @generated from field: string digest = 2;
    */
   digest = "";
+
+  /**
+   * The object the app wrote this version for, acting for it
+   * (`legion-for-object`): `<app>/<Kind>/<namespace>/<name>#<uid>`, the
+   * namespace empty for a cluster kind. `legion job status` shows it as
+   * `managed by gitops for Repo team-a/storefront`. Empty for the app
+   * reconciler's own stamp on an app's job.
+   *
+   * @generated from field: string object = 3;
+   */
+  object = "";
 
   constructor(data?: PartialMessage<ManagedByInfo>) {
     super();
@@ -2581,6 +2595,7 @@ export class ManagedByInfo extends Message<ManagedByInfo> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "object", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ManagedByInfo {
@@ -33298,7 +33313,10 @@ export class WhoAmIReply extends Message<WhoAmIReply> {
    * `delegated` (an app's own credential presenting a viewer's assertion in
    * `legion-on-behalf-of`: `principal` is `<viewer> via app <app>`, and
    * `rules_json` the one rule the delegation holds, plus any deny rules the
-   * app or the viewer carry).
+   * app or the viewer carry), `for-object` (an app's own credential naming
+   * one of its objects in `legion-for-object`: `principal` is `<app> for
+   * <Kind> <namespace>/<name>`, and `rules_json` the object's recorded
+   * authority the app's grant covers, plus the app's deny rules).
    *
    * @generated from field: string source = 3;
    */
@@ -36652,6 +36670,25 @@ export class ObjectAuthority extends Message<ObjectAuthority> {
    */
   authorizedAtUnixMs = protoInt64.zero;
 
+  /**
+   * Whether the authorizer still holds the authority, when the request
+   * asked (`ListObjectsRequest.authority_lapsed`): `held`, `lapsed` (the
+   * token was deleted or expired, or no longer holds a permission), or
+   * `unknown` (no accessor to re-resolve: a JWT or SSO login, or an app's
+   * workload identity). Empty when not asked.
+   *
+   * @generated from field: string check = 6;
+   */
+  check = "";
+
+  /**
+   * Why, for `lapsed` and `unknown`: `the token (accessor 0f3a…) was
+   * deleted`, `no longer holds job:write in team-b`.
+   *
+   * @generated from field: string check_detail = 7;
+   */
+  checkDetail = "";
+
   constructor(data?: PartialMessage<ObjectAuthority>) {
     super();
     proto3.util.initPartial(data, this);
@@ -36665,6 +36702,8 @@ export class ObjectAuthority extends Message<ObjectAuthority> {
     { no: 3, name: "authorized_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "accessor", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "authorized_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "check", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "check_detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ObjectAuthority {
@@ -37256,6 +37295,26 @@ export class ListObjectsRequest extends Message<ListObjectsRequest> {
    */
   labels: { [key: string]: string } = {};
 
+  /**
+   * Only objects whose recorded authority may have lapsed: the principal
+   * that last authorized the object (`authority.authorized_by`) no longer
+   * holds every permission it was checked for, or cannot be re-resolved.
+   * Each listed object's `authority.check` says which (`lapsed` or
+   * `unknown`) and `authority.check_detail` why. The authorizer is
+   * re-resolved through its ACL token's accessor, as a request with that
+   * token would authenticate now: a deleted or expired token is `lapsed`;
+   * a writer with no accessor (a JWT or SSO login, or an app's workload
+   * identity) is `unknown`. Authority is never revoked by this: an app
+   * keeps acting within it until someone re-applies the object, which
+   * re-authorizes it as them (docs/app-objects.md, "Acting for an
+   * object"). Needs `acl:read` besides read on the listed objects, since it
+   * reveals what other principals hold. Ignored when ACLs are disabled
+   * (nothing lapses).
+   *
+   * @generated from field: bool authority_lapsed = 4;
+   */
+  authorityLapsed = false;
+
   constructor(data?: PartialMessage<ListObjectsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -37267,6 +37326,7 @@ export class ListObjectsRequest extends Message<ListObjectsRequest> {
     { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 3, name: "labels", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 4, name: "authority_lapsed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListObjectsRequest {

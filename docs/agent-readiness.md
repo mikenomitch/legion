@@ -104,7 +104,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_app_status` | no | One app (`app`): its record (`manifest`, `settings`, `config`), its grant (`grant.rules`, who approved it), its job's status, the app reconciler's last action and error (`reconcile`), its build marker and what it waits for (`reconcile.markerReason`), and `notes` (no system worker, workload identity off). Changing an app (install, config, settings) is `legion app` on the CLI, not an MCP tool. |
 | `legion_app_view` | no | One of an app's declarative views ([Apps: Views and actions](apps.md#views-and-actions)): what its panel on a job, task, or node page, its sidebar page, or its overview card shows a person, as JSON. Takes `app`, `slot` (`nav`, `overview`, `job`, `task`, `node`), the slot's context (`job` with `namespace`, `task`, `group`, `node`), and optionally `view`. Returns `document` (the validated `legion-view/1` blocks), `actions` (each with `allowed` and `mutating`), and which allocation answered. Checked as the caller: `app:read` and the view's declared permission on the context, before the app is asked. The same data as `legion app view -j`. Actions are not run over MCP. |
 | `legion_object_kinds` | no | The object kinds installed apps declare ([App Objects](app-objects.md)), with each kind's spec and status JSON Schemas (decoded), examples, scope, access, `requires`, immutable fields, cleanup window, and state, so an agent can write a valid object. Takes optional `app`. |
-| `legion_object_list` | no | Objects of one kind (`kind`, qualified or a unique short name) or of every kind, in `namespaces` (`["*"]` for all you can read), filtered by `labels`: spec, status (conditions, `observedGeneration`, fields), and `summary` (`Ready`, `Accepted`, `Pending`, `NotReady: <reason>`, `Rejected: <reason>`, `Stale`, `Invalid`, `Deleting`, `Orphaned`). |
+| `legion_object_list` | no | Objects of one kind (`kind`, qualified or a unique short name) or of every kind, in `namespaces` (`["*"]` for all you can read), filtered by `labels`: spec, status (conditions, `observedGeneration`, fields), and `summary` (`Ready`, `Accepted`, `Pending`, `NotReady: <reason>`, `Rejected: <reason>`, `Stale`, `Invalid`, `Deleting`, `Orphaned`). `authorityLapsed: true` (needs `acl:read`) lists only objects whose writer no longer holds what the object records (`authority.check` = `lapsed`, or `unknown` when the writer had no token to re-resolve, with `authority.checkDetail`); the app keeps acting within that authority until someone re-applies the object. |
 | `legion_object_get` | no | One object (`kind`, `name`, optional `namespace`): spec with `writeOnly` values redacted, effective spec, status, summary, `specVersion` (for `expected_version`), `managedBy`, and the authority recorded at its last write. |
 | `legion_object_apply` | **yes** | Create or update an object (`object`: `{ kind: "<app>/<Kind>", name, namespace?, labels?, spec }`). Checks the closed schema (unknown fields fail with a did-you-mean), immutable fields, and what the kind `requires` of the writer, then asks the app (advice). `dry_run` returns the field diff; `expected_version` is compare-and-set (`0`: create only); `force` changes an object an app manages; `wait` (with `timeout_seconds`) returns once the app has reported on the new generation, failing on `Rejected`/`NotReady`; `idempotency_key`. |
 | `legion_object_delete` | **yes** | Delete an object; a kind with a cleanup window marks it Deleting until its app releases it (`now` skips the window). Takes `expected_version`, `force`, `idempotency_key`. |
@@ -644,6 +644,18 @@ namespace), and reads the per-tick numbers with `legion_scaling_status` and
 `legion_scaling_explain` (with `object`). Deleting a node group with `wait`
 blocks until the autoscaler has drained and terminated its members and
 released it, or its 15-minute cleanup window ends.
+
+**Agents that are apps.** An app that owns a kind can act for one of its
+objects by naming it in `legion-for-object:
+<app>/<Kind>/<namespace>/<name>#<uid>@<generation>`: its calls then hold
+only what that object's writer was checked for, within the app's grant,
+and the jobs they submit are stamped with the object (`legion job info -j`
+shows `managedBy.object`). `WhoAmI` through such a client reports `source:
+for-object` and the rules it holds, so an agent can see its bounds before
+it acts ([App Objects: Acting for an
+object](app-objects.md#acting-for-an-object)). To audit what such apps may
+still do, `legion object list -A --authority-lapsed -j` lists the objects
+whose writers have since lost the rights they recorded.
 
 Other signals an agent can use to close the loop:
 

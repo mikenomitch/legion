@@ -34,6 +34,10 @@ Two rules shape everything below:
   refuse a write runs in the manager. The app's own check is advice and
   fails open.
 
+And the app is held to the first rule too: when it acts on an object, it
+can [act for the object](#acting-for-an-object), with exactly what the
+object's writer was checked for, rather than with its own grant.
+
 ## Declaring a kind
 
 A manifest's `kinds` lists them. The shipped example,
@@ -222,7 +226,9 @@ the validate call's errors.
 
 An object written by an app's own identity (its `legion` token, not a
 viewer the app acts for) records **managed by** that app, as the jobs an
-app submits do. A person's apply or delete of a managed object is refused
+app submits do. So does one the app writes while [acting for another
+object](#acting-for-an-object) (cert-manager creating a child for its
+parent). A person's apply or delete of a managed object is refused
 without `--force`, since the app would likely overwrite the change.
 
 ## Access
@@ -514,6 +520,196 @@ not written in Rust calls the three RPCs and serves
 `POST /legion/v1/objects/validate` itself; `proto/legion.proto` documents
 them.
 
+## Acting for an object
+
+`requires` checks a Repo's author when the Repo is written. Without more,
+gitops would then deploy it with its own grant, which has to reach every
+namespace any Repo could target: the grant, not the author, would bound
+what gitops does. Acting for the object closes that gap. The app names the
+object it is working on, and the manager holds the call to what that
+object's writer was checked for.
+
+### The header
+
+An app's call names one of its objects in `legion-for-object`, beside its
+own credential:
+
+```text
+legion-for-object: gitops/Repo/team-a/storefront#812@4
+```
+
+The value is `<app>/<Kind>/<namespace>/<name>#<uid>@<generation>`; a
+cluster kind's object has an empty namespace
+(`autoscaler/NodeGroup//workers#17@3`). The call runs as **`gitops for Repo
+team-a/storefront`**:
+
+- its allow rules are the object's **recorded authority**, the concrete
+  permissions its `requires` resolved to and its writer was checked for at
+  its last apply, each as an exact rule (the namespace, the job name or
+  every job, the band, the KV key, host-level or not, as checked);
+- **intersected with the app's grant**: a permission the app's grant does
+  not cover whole is dropped, so the identity never holds more than the
+  app could do, nor more than the writer could;
+- plus the app's deny rules. It is not a management identity, carries no
+  policies, and expires with the app's credential.
+
+```console
+$ legion object get repo storefront -n team-a
+...
+authority (checked against alice): job:write in team-a on storefront (from spec.jobs); job:write in team-a on storefront-worker (from spec.jobs)
+```
+
+So gitops, acting for `team-a/storefront`, may write `team-a/storefront`
+and `team-a/storefront-worker` at band `normal`, and nothing else: not
+`team-a/billing`, nothing in `team-b`, not a host-level job, not a read of
+the job (unless the kind requires one), not KV. Anything else is:
+
+```text
+PermissionDenied: permission denied: job:write is outside what gitops for Repo team-a/storefront holds
+Hint: an app acting for an object holds only the permissions the object's writer was checked for (its recorded authority, `legion object get`), within the app's own grant; re-applying the object as someone who holds more records more
+```
+
+The manager refuses the header, `Unauthenticated` or `PermissionDenied`
+naming `legion-for-object`, when the caller is not **the owning app's own
+identity** (a management token, a person, another app, an app acting for
+a viewer), when **no object has the uid** or it is not the object the
+reference names, or when the kind is orphaned. It never falls back to the
+app's own identity, and logs each refusal under `acl_audit`. A **deleting**
+object may be named, so the app's cleanup can act for it. Streams
+(`WatchObjects`, `StreamEvents`, ...) and the app plane (`UpdateObjectStatus`,
+`ReleaseObject`, the autoscaler's RPCs) take the app's own credential and
+refuse the header. A call may act for an object or for a viewer
+(`legion-on-behalf-of`), never both (`InvalidArgument`). With ACLs off the
+header is ignored, like every credential, and nothing is stamped.
+
+The **generation is advisory.** The object's current authority applies,
+whatever generation the app read: authority changes only when someone
+applies the object, so a stale generation can do no more than the current
+one. The app sends it so the audit log can say what it acted on.
+
+### `via = "objects"`
+
+A manifest permission may say `via = "objects"`:
+
+```nickel
+permissions = [
+  { resources = ["job"], actions = ["read"], namespaces = ["team-*"] },
+  { resources = ["job"], actions = ["write"], namespaces = ["*"], via = "objects" },
+  { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/gitops/*"] },
+],
+```
+
+Such a rule is part of the app's grant **only when it acts for one of its
+objects**, where it is intersected with that object's authority. The app's
+own credential cannot use it at all: gitops above writes no job on its
+own, anywhere. The install prompt says so:
+
+```text
+gitops 0.2.0 runs its own code (1 artifact) on your managers, as its own unprivileged user,
+in legion-system, and asks for:
+  job       read          namespaces: team-*
+  job       write         namespaces: *; only for its objects (bounded by each object's recorded authority)
+  kv        read, write   paths: legion/apps/gitops/*
+  (rules marked "only for its objects" hold only while gitops acts for one of its gitops/Repo objects, and only as far as that object's writer was checked for: gitops writes them only where an object's author could)
+```
+
+The installer must hold a `via` rule like any other permission, and
+`legion acl grants list` shows it with `(via objects)`. An app with no
+kinds may not ask for one, and a stored ACL policy may not carry one (no
+token ever acts for an object). Acting as a viewer
+(`legion-on-behalf-of`) is bounded by the app's plain grant: a `via` rule
+plays no part there, so an action that deploys acts for the object
+instead.
+
+### In the app
+
+The framework hands each reconcile handler a client that acts for the
+object, and the app's own client beside it:
+
+```rust
+context.reconcile("Repo", |request| async move {
+    let spec: RepoSpec = request.spec_as()?;
+    let mut legion = request.client()?;          // legion-for-object: this Repo
+    for job in render(&spec).await? {
+        legion.run_job(job).await?;              // held to the Repo's authority, stamped
+    }
+    let mut own = request.app_client()?;         // the app's own grant (its KV state)
+    own.put_kv(state_entry(&request)).await?;
+    Ok(ObjectOutcome::ready())
+})?;
+```
+
+Outside the loop, `context.client_for(&object)` makes the same client for
+any object the app owns, and `legion::apps::objects::acting_for(&object)`
+gives the header's value for an app that calls Legion its own way. Not for
+streams.
+
+### Stamps
+
+A job submitted for an object (`RunJob`, `RunJobTemplate`) is stamped with
+it: its version's `managedBy` is `{ app, object }`, and its grant, if the
+job asks for one, is recorded in the object-scoped principal's name.
+
+```console
+$ legion job status storefront -n team-a
+...
+managed by gitops for Repo team-a/storefront; gitops will likely write back a version you submit
+```
+
+`GetJobInfo.managed_by.object` carries the reference
+(`gitops/Repo/team-a/storefront#812`), and `legion job status -j` shows it
+as `managedBy.object` with its `label`. A person may still submit over
+such a job, with no `--force`: the namespace's owner can always take a job
+over, as in an incident. The submit replaces the version and its stamp,
+and says who will likely write it back:
+
+```text
+warning: team-a/storefront was managed by gitops for Repo team-a/storefront; this version replaces it, and gitops will likely write the job back on its next reconcile
+```
+
+Other writes made for an object are not stamped; their audit records and
+events carry the principal (`gitops for Repo team-a/storefront`). An
+object the app writes while acting for another object is `managedBy` the
+app.
+
+### Authority is recorded, not revoked
+
+The authority an object carries is what its writer held **when they
+applied it**. If the writer later loses a right, or leaves and their token
+is deleted, the object keeps it, and the app keeps deploying within it.
+This is the Kubernetes and Flux model: a departing engineer does not break
+production deploys, and nobody has to find every object a person ever
+wrote before revoking their access. The cost is that power outlives the
+person who held it, so Legion makes it findable:
+
+```console
+$ legion object list repos -A --authority-lapsed
+NAME        NAMESPACE  STATUS  AGE  AUTHORITY                                                   AUTHORIZED BY
+storefront  team-a     Ready   3d   lapsed: alice no longer holds job:write in team-a on storefront  alice
+billing     team-a     Ready   9d   lapsed: bob's token (accessor 0f3a…) was deleted            bob
+reports     team-b     Ready   2d   unknown: sso:carol authorized it without an ACL token ...    sso:carol
+```
+
+The manager re-resolves each object's authorizer through its token's
+accessor, as a request with that token would authenticate now:
+
+- **lapsed**: the token was deleted or has expired, or no longer holds a
+  permission the object records;
+- **unknown**: the writer had no accessor to re-resolve (a JWT or SSO
+  login, or an app's workload identity).
+
+`--authority-lapsed` needs `acl:read` besides read on the objects, since
+it reveals what other principals hold now. With ACLs off nothing lapses.
+**Re-applying an object re-authorizes it** as whoever applies it (who must
+hold what it requires); deleting it ends the app's authority over it once
+the object is gone (a deleting object keeps it for its cleanup).
+`ListObjects.authority_lapsed`, and `authorityLapsed` on the MCP
+`legion_object_list` tool, do the same.
+
+An upgrade that changes a kind's `requires` changes later writes only:
+objects keep the authority they were written with until re-applied (the
+upgrade prompt counts them).
+
 ## A worked example: the autoscaler
 
 The bundled [autoscaler](autoscaling.md) owns two kinds, and is the
@@ -566,6 +762,16 @@ autoscaler/ScalingPolicy  namespaced  scale:write in the object's namespace     
   a `ScalingPolicy default/workers` never share state, and a deleted and
   recreated object never inherits a pause or a half-done drain. The
   managers sweep the scaling state of deleted objects.
+- **Its own grant, not its objects'.** The autoscaler does not [act for
+  its objects](#acting-for-an-object). What its objects make it do happens
+  mostly outside Legion's ACLs (a target plugin scales an external
+  service; a node group's provider starts and stops machines), where an
+  object-scoped credential bounds nothing; its Legion calls for them are
+  the app plane (`RecordScalingAction`, `ReportScalingStatus`), which take
+  its own identity; and draining a node group's members is governed by the
+  kind's access (`node`), which a NodeGroup's writer is checked for at
+  write but which its authority does not record. Writing a NodeGroup
+  already needs `node:write` and `operator:write`.
 
 ## Events and metrics
 
@@ -592,9 +798,10 @@ a caller who may read that kind on that object's scope (or holds
 | `legion object explain <KIND>[.<field path>]` | `ListObjectKinds` |
 | `legion object apply -f FILE [-n NS] [--dry-run] [--expected-version N] [--force] [--wait [--timeout D]] [--idempotency-key K]` | `ApplyObject` |
 | `legion object get <KIND> <NAME> [-n NS]` | `GetObject` |
-| `legion object list [KIND] [-n NS \| -A] [-l k=v]` | `ListObjects` |
+| `legion object list [KIND] [-n NS \| -A] [-l k=v] [--authority-lapsed]` | `ListObjects` |
 | `legion object delete <KIND> <NAME> [-n NS] [--expected-version N] [--now] [--force] [--wait [--timeout D]] [--idempotency-key K]` | `DeleteObject` |
 | (the owning app) | `WatchObjects`, `UpdateObjectStatus`, `ReleaseObject` |
+| (the owning app, acting for an object) | any RPC, with `legion-for-object` |
 
 Every command takes `--json`. The MCP server lists `legion_object_kinds`
 (with each kind's schemas and examples, so an agent can write a valid
@@ -622,6 +829,10 @@ objects in one pass converges on retry.
 | `... was not checked by the gitops app (...)` (warning) | the validate call failed open | nothing: the write went through; check the app |
 | summary `Stale` | the app is disabled or not healthy | `legion app status <app>` |
 | summary `Pending` that stays | the app has not reported on this generation | `legion app logs <app>` |
+| `... is outside what gitops for Repo team-a/x holds` | the app acted for an object beyond its recorded authority (or the app's grant) | re-apply the object as someone who holds what it needs, or widen the kind's `requires` |
+| `legion-for-object: ... is not an app's` / `acts only for its own objects` | the header came from a person, a management token, or another app | only the owning app's own credential names its objects |
+| `legion-for-object: ... no object has uid N` | the object was deleted (or recreated with a new uid) | act for the current object; the watch carries its uid |
+| `--authority-lapsed` lists an object | its writer lost a right or their token | re-apply it as someone who holds it, or delete it |
 
 ## Limitations
 
@@ -637,10 +848,20 @@ objects in one pass converges on retry.
 - **One schema version per kind.** There is no conversion between schema
   versions; an upgrade that tightens a schema leaves non-conforming objects
   `Invalid` until rewritten.
-- **Authority is recorded, not enforced on the app.** The record says what
-  an object's writer was checked for; the app still acts with its own
-  grant. Bounding an app's calls by an object's authority is planned, not
-  shipped.
+- **Acting for an object is the app's choice.** An app bounded by its
+  objects' authority is one that uses `legion-for-object` (the framework's
+  default client in a reconcile handler) and keeps its own grant small,
+  with `via = "objects"` on what only its objects should make it do. Its
+  plain grant is still everything its own credential can do.
+- **Authority is not revoked** when its writer loses rights;
+  `--authority-lapsed` finds such objects, and a re-apply re-authorizes.
+  An authorizer without a token accessor (JWT, SSO, workload identity)
+  reads `unknown`.
+- **The intersection is per permission.** A recorded permission the app's
+  grant covers only in part (the grant names some jobs, the authority every
+  job in a namespace) is dropped, not narrowed.
+- **Only job submits are stamped** with the object; other writes made for
+  an object name it only in their actor.
 - **`writeOnly` values are stored like any spec**, in the replicated state
   store, and readable by the owning app and anyone with `state:read`.
   Keep real credentials in KV (encrypted at rest) and name them by path

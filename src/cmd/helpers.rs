@@ -32,12 +32,15 @@ pub type AuthedManagerClient = ManagerClient<InterceptedService<Channel, AuthInt
 /// token is available (no-op otherwise, matching ACL-disabled clusters),
 /// gives each bounded request its deadline, and, for an app acting as a
 /// viewer, stamps the viewer's assertion in `legion-on-behalf-of`
-/// ([`ManagerConnection::client_on_behalf_of`]).
+/// ([`ManagerConnection::client_on_behalf_of`]), or, for an app acting for
+/// one of its objects, the object in `legion-for-object`
+/// ([`ManagerConnection::client_for_object`]).
 #[derive(Clone)]
 pub struct AuthInterceptor {
     token: Option<MetadataValue<Ascii>>,
     request_timeout: Option<Duration>,
     on_behalf_of: Option<MetadataValue<Ascii>>,
+    for_object: Option<MetadataValue<Ascii>>,
 }
 
 impl Interceptor for AuthInterceptor {
@@ -52,6 +55,11 @@ impl Interceptor for AuthInterceptor {
                 crate::structs::app_ui::ON_BEHALF_OF_HEADER,
                 assertion.clone(),
             );
+        }
+        if let Some(object) = &self.for_object {
+            request
+                .metadata_mut()
+                .insert(crate::structs::app_ui::FOR_OBJECT_HEADER, object.clone());
         }
         if let Some(timeout) = self.request_timeout {
             let unbounded = request
@@ -388,6 +396,7 @@ fn auth_interceptor(address: &str, request_timeout: Option<Duration>) -> AuthInt
         token,
         request_timeout,
         on_behalf_of: None,
+        for_object: None,
     }
 }
 
@@ -419,6 +428,29 @@ impl ManagerConnection {
             .context("the viewer assertion has non-ASCII characters")?;
         let mut interceptor = self.interceptor.clone();
         interceptor.on_behalf_of = Some(assertion);
+        interceptor.for_object = None;
+        Ok(ManagerClient::with_interceptor(
+            self.channel.clone(),
+            interceptor,
+        ))
+    }
+
+    /// A client that also names `object` in `legion-for-object` on every
+    /// call (docs/app-objects.md, "Acting for an object"): the manager then
+    /// authenticates it as `<app> for <Kind> <namespace>/<name>`, holding
+    /// the object's recorded authority within the app's own grant. Only the
+    /// app that owns the object may name it; streams refuse it.
+    pub fn client_for_object(
+        &self,
+        object: &crate::structs::acl::ActingFor,
+    ) -> R<AuthedManagerClient> {
+        let value = object
+            .header_value()
+            .parse::<MetadataValue<Ascii>>()
+            .context("the object reference has non-ASCII characters")?;
+        let mut interceptor = self.interceptor.clone();
+        interceptor.for_object = Some(value);
+        interceptor.on_behalf_of = None;
         Ok(ManagerClient::with_interceptor(
             self.channel.clone(),
             interceptor,
@@ -478,6 +510,7 @@ pub fn manager_connection_with_token(
             token: Some(token),
             request_timeout: timeouts.request,
             on_behalf_of: None,
+            for_object: None,
         },
     })
 }
@@ -1138,6 +1171,7 @@ mod tests {
             token: None,
             request_timeout: timeout,
             on_behalf_of: None,
+            for_object: None,
         };
         interceptor
             .call(request)
@@ -1152,6 +1186,7 @@ mod tests {
             token: Some("Bearer app".parse().unwrap()),
             request_timeout: None,
             on_behalf_of: None,
+            for_object: None,
         };
         let mut viewer = own.clone();
         viewer.on_behalf_of = Some("a.b.c".parse().unwrap());

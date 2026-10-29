@@ -191,6 +191,12 @@ A policy is a named JSON array of rules:
 
 - `resources` / `actions` accept `*`.
 - `effect` is `allow` (default) or `deny`.
+- `via = "objects"` (allow rules in an app manifest's `permissions` only):
+  the rule holds only while the app acts for one of its objects, within
+  that object's recorded authority ([Object-scoped
+  identities](#object-scoped-identities)). It grants nothing to any plain
+  credential, the app's own included, and a stored policy may not carry
+  it.
 - Scope selectors narrow a rule with `*`-globs: `namespaces`
   ([Namespaces](namespaces.md)), `names` (bare job names), `pools`
   (node pools), `paths` (KV keys), `actionNames` (declared actions),
@@ -627,7 +633,80 @@ an app from calling with its own client, whose power is its grant
 ([App grants](#app-grants)). The manifest's declared permission bounds an
 action's delegated calls, and the grant bounds everything the app does.
 [Apps: Acting as the viewer](apps.md#acting-as-the-viewer) shows the app
-side.
+side. A delegation is bounded by the app's plain grant: `via = "objects"`
+rules play no part in it.
+
+### Object-scoped identities
+
+An app that owns an [object kind](app-objects.md) can act **for one of its
+objects**, with what the object's writer was checked for rather than with
+its own grant. It names the object in one gRPC metadata entry, beside its
+own credential:
+
+```text
+authorization: Bearer <the app's legion token>       (attached by the API socket)
+legion-for-object: gitops/Repo/team-a/storefront#812@4
+```
+
+The value is `<app>/<Kind>/<namespace>/<name>#<uid>@<generation>`; a
+cluster kind's object has an empty namespace
+(`autoscaler/NodeGroup//workers#17@3`). The manager answers with an
+**object-scoped identity**:
+
+| | |
+| --- | --- |
+| principal | `gitops for Repo team-a/storefront` |
+| rules | one exact allow rule per permission of the object's recorded **authority** (what its `requires` resolved to and its writer was checked for, at its last apply), kept only when the app's grant covers it whole, `via = "objects"` rules included; plus the app's deny rules |
+| bounded by | the object's authority **and** the app's grant: never more than either |
+| `WhoAmI.source` | `for-object` (`rules_json` shows the rules) |
+| not | management, no policies, no accessor; it expires with the app's credential |
+
+Before it builds one, the manager checks that the caller is **the app that
+owns the object** (its credential's job grant belongs to an allocation of
+`legion-system/<app>` running the reconciler's render, as for a
+delegation), that **an object with that uid exists** and is the one the
+reference names (a deleting object counts, for its cleanup), and that its
+kind is not orphaned. The generation is advisory: the object's current
+recorded authority applies, which changes only when someone applies it. A
+call that fails is `Unauthenticated` or `PermissionDenied`, names
+`legion-for-object`, and is logged under `acl_audit` (`resource =
+delegation`, `action = for-object`); it never falls back to the app's own
+identity. Streams and the app plane refuse it, as they refuse a delegated
+identity, and a call carrying both `legion-for-object` and
+`legion-on-behalf-of` is `InvalidArgument`. With ACLs disabled the header is
+ignored.
+
+A call outside the authority is denied with the identity's principal:
+
+```text
+PermissionDenied: permission denied: job:write is outside what gitops for Repo team-a/storefront holds
+Hint: an app acting for an object holds only the permissions the object's writer was checked for (its recorded authority, `legion object get`), within the app's own grant; re-applying the object as someone who holds more records more
+```
+
+**`via = "objects"`** makes this the only way an app can use a permission:
+
+```nickel
+permissions = [
+  { resources = ["job"], actions = ["read"], namespaces = ["team-*"] },
+  { resources = ["job"], actions = ["write"], namespaces = ["*"], via = "objects" },
+]
+```
+
+gitops's own credential then writes no job anywhere; acting for a Repo, it
+writes exactly the jobs that Repo's author was checked for. The rule is
+granted like any other: the installer must hold it (`legion acl grants
+list` shows it with `(via objects)`), and the install prompt says what it
+means:
+
+```text
+  job       write         namespaces: *; only for its objects (bounded by each object's recorded authority)
+```
+
+Jobs submitted this way (`RunJob`, `RunJobTemplate`) record their grant in
+the object-scoped principal's name and are stamped `managedBy = { app,
+object }`; other writes carry the principal in their audit and event actor.
+[App Objects: Acting for an object](app-objects.md#acting-for-an-object)
+covers the app side, the stamps, and lapsed authority.
 
 ### Tokens
 

@@ -156,7 +156,7 @@ complete example with comments.
 | `placement` | Where the app runs by default ([Placement](#placement)). |
 | `replicas` | Each task's `count` by default. |
 | `job` | A jobspec without `name` or `namespace`, which Legion sets. Must define `task` or `tasks`, and parse as a jobspec. An `exec` task may not set `user`, and nothing in it may be host-level besides the `exec` runtime itself ([Trust model](#trust-model)). |
-| `permissions` | ACL rules in the shape `legion acl policy apply` takes: what the app's `legion` identity asks to be granted. |
+| `permissions` | ACL rules in the shape `legion acl policy apply` takes: what the app's `legion` identity asks to be granted. A rule with `via = "objects"` holds only while the app acts for one of its objects, within that object's recorded authority; its own credential cannot use it, and an app with no `kinds` may not ask for one ([App Objects: Acting for an object](app-objects.md#acting-for-an-object)). The installer must hold every rule, `via` ones included. |
 | `ui` | UI registrations: the slots the app's views appear in, the actions they offer, the port they are served on, and the refresh interval ([Views and actions](#views-and-actions)). Unknown fields are errors. |
 | `extensions` | The keys the app adds to the jobspec, one per extension point, each with a JSON Schema ([Jobspec extensions](#jobspec-extensions)). |
 | `config.schema` | A JSON Schema (draft 7) the config must match. It must describe an object, be at most 64 KiB, and use only local `$ref`s (`"#/…"`); a remote ref is refused before anything is fetched. Default: any object. |
@@ -1054,7 +1054,9 @@ manager authenticates every call made with it as **`alice via app
   is `PermissionDenied`, whatever the app's own grant allows;
 - only what the app's own grant also holds there: a delegation never
   widens the app, and an action the grant lacks on the scope is dropped
-  (with nothing left, the call is refused);
+  (with nothing left, the call is refused). That is the app's plain grant:
+  a `via = "objects"` rule plays no part, so an action that should deploy
+  [acts for the object](app-objects.md#acting-for-an-object) instead;
 - nothing the app or the viewer is denied by a deny rule.
 
 It lasts as long as the assertion (60 seconds), covers any number of unary
@@ -1723,6 +1725,24 @@ it to drop a kind that has objects, needs `--force` and leaves the objects
 orphaned (readable and deletable, never written) until the app is
 installed again, which adopts them.
 
+An app that owns kinds can **act for one of its objects**: it names the
+object in `legion-for-object`, and the manager holds the call to what the
+object's writer was checked for, within the app's grant. Permissions marked
+`via = "objects"` in the manifest hold only that way:
+
+```nickel
+permissions = [
+  { resources = ["job"], actions = ["read"], namespaces = ["team-*"] },
+  { resources = ["job"], actions = ["write"], namespaces = ["*"], via = "objects" },
+],
+```
+
+so gitops writes jobs only where a Repo's author could, and the jobs it
+writes are stamped with the Repo. The framework's reconcile handlers get
+that client by default (`request.client()`, with `request.app_client()`
+for the app's own), and `context.client_for(&object)` makes one anywhere
+([App Objects: Acting for an object](app-objects.md#acting-for-an-object)).
+
 ## Inside an app
 
 The app's tasks get, in their environment:
@@ -1738,7 +1758,10 @@ The app's tasks get, in their environment:
 So `legion kv get legion/apps/gitops/state` inside the task just works,
 with the app's grant and no token handling. To act as a viewer from an
 action, the app's calls add the action's assertion in
-`legion-on-behalf-of` ([Acting as the viewer](#acting-as-the-viewer)).
+`legion-on-behalf-of` ([Acting as the viewer](#acting-as-the-viewer)); to
+act for one of its objects, they name it in `legion-for-object`
+([App Objects: Acting for an object](app-objects.md#acting-for-an-object)).
+Never both on one call.
 
 **`legion app run <name>`** is the entrypoint bundled apps run. It reads
 `$LEGION_APP_CONFIG` (validated against the app's schema), serves the app's

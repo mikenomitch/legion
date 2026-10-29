@@ -13,10 +13,16 @@ branch): the autoscaler's standalone policies and node groups are its
 and `legion_scaling_apply` are gone (public pages
 [docs/autoscaling.md](../../docs/autoscaling.md#standalone-policies) and
 [docs/app-objects.md](../../docs/app-objects.md#a-worked-example-the-autoscaler));
-what the build decided is calls entries 32-43. **Phases O3-O4** are
-planned here and not started: O3 lets an app act for an object with the
-authority its writer recorded, O4 adds CEL `rules` (and with them restores
-the fail-closed `min <= max` check O2 moved to the app, calls entry 33).
+what the build decided is calls entries 32-43. **Phase O3** is built
+(2026-10-29, same branch): an app acts for one of its objects with
+`legion-for-object`, holding the object's recorded authority within its
+grant, `via = "objects"` permissions hold only that way, jobs written so
+are stamped with the object, and `legion object list --authority-lapsed`
+finds objects whose writers lost their rights (public page
+[docs/app-objects.md](../../docs/app-objects.md#acting-for-an-object));
+what the build decided is calls entries 44-52. **Phase O4** is planned
+here and not started: CEL `rules` (and with them the fail-closed `min <=
+max` check O2 moved to the app, calls entry 33).
 Deliberately deferred: schema versions and conversion, owner references and
 core garbage collection (bounded `cleanup` replaces finalizers), a generic
 object browser in the SPA, `since_version` watch resume, per-namespace
@@ -25,8 +31,8 @@ yet.
 
 **Revised after adversarial review (2026-10-29).** Three reviews of this
 plan and of the apps substrate changed O1 before it shipped; calls entries
-1-43 are the decisions as they stand (28-31 from O1's build, 32-43 from
-O2's), and the superseded originals are kept at the end of the calls doc. What changed:
+1-52 are the decisions as they stand (28-31 from O1's build, 32-43 from
+O2's, 44-52 from O3's), and the superseded originals are kept at the end of the calls doc. What changed:
 - a guiding principle (§1): an object can never make its app do more than
   its writer could, and the write path never depends on the app being up;
 - **kind identity** is `<app>/<Kind>`; files and the API require it, short
@@ -908,7 +914,21 @@ list` loses standalone policies to `legion object list`, so the UI's
 autoscaling page and `scaling status` must read objects; the cross-field
 regression above.
 
-**O3: objects carry their authority.** The app calls with
+**O3: objects carry their authority** (built 2026-10-29). As built,
+beyond what follows: the identity is one exact rule per recorded
+permission that the app's grant covers whole (calls entries 44 and 49:
+dropped, not narrowed), the generation is advisory (entry 50), `via =
+"objects"` is a rule flag the evaluator never matches (entry 45), only job
+submits are stamped and a person's submit over one warns rather than
+needing `--force` (entry 46), `--authority-lapsed` needs `acl:read`
+(entry 47), the bundled autoscaler keeps its own grant (entry 48), and the
+identity is its own source, `for-object`, refused by streams and the app
+plane and ignored with ACLs off (entry 51). The example gitops manifest
+writes jobs `via = "objects"`, and the framework's reconcile handlers get
+the object-scoped client by default (`ObjectRequest::client`, with
+`app_client` for the app's own; `AppContext::client_for`).
+
+The app calls with
 `legion-for-object: gitops/Repo/team-a/storefront#<uid>@<generation>`; the
 manager evaluates the call as "gitops for Repo team-a/storefront": the
 app's grant intersected with the object's recorded `authority`, reusing

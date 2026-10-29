@@ -199,6 +199,15 @@ pub enum GrantSource {
         /// entry as the version).
         record_updated_at: String,
     },
+    /// An app acting for one of its objects submitted the job
+    /// (`legion-for-object`; docs/app-objects.md, "Acting for an object"),
+    /// checked against what it holds for the object: recorded like a
+    /// submitter's, in `granted_by`'s name (`<app> for <Kind> <ns>/<name>`),
+    /// and the version is stamped `managedBy = { app, object }`.
+    Object {
+        granted_by: String,
+        managed_by: crate::structs::app::ManagedBy,
+    },
 }
 
 impl GrantSource {
@@ -208,7 +217,19 @@ impl GrantSource {
         match self {
             GrantSource::Submitter(principal) => Some(principal),
             GrantSource::App { granted_by, .. } => Some(granted_by),
+            GrantSource::Object { granted_by, .. } => Some(granted_by),
             GrantSource::CarryForward => None,
+        }
+    }
+
+    /// The `managedBy` stamp the stored version carries: the app
+    /// reconciler's, or an app's acting for an object.
+    pub fn stamp(&self) -> Option<&crate::structs::app::ManagedBy> {
+        match self {
+            GrantSource::App { managed_by, .. } | GrantSource::Object { managed_by, .. } => {
+                Some(managed_by)
+            }
+            GrantSource::Submitter(_) | GrantSource::CarryForward => None,
         }
     }
 }
@@ -505,6 +526,10 @@ impl Store {
         match source {
             GrantSource::Submitter(principal)
             | GrantSource::App {
+                granted_by: principal,
+                ..
+            }
+            | GrantSource::Object {
                 granted_by: principal,
                 ..
             } => {

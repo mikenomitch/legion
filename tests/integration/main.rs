@@ -30,6 +30,7 @@ mod acl_endpoints;
 mod api_socket;
 mod app_action_delegation;
 mod app_extensions;
+mod app_object_authority;
 mod app_objects;
 mod app_pages;
 mod app_views;

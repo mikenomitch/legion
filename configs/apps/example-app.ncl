@@ -68,7 +68,16 @@
   # task, `legion ...` reaches the cluster through the allocation's API
   # socket with this grant, when workloadIdentity.enabled is on.
   permissions = [
-    { resources = ["job"], actions = ["read", "write"], namespaces = ["team-*"] },
+    { resources = ["job"], actions = ["read"], namespaces = ["team-*"] },
+    # `via = "objects"`: gitops writes jobs only while it acts for one of its
+    # Repos (`legion-for-object`), and the manager holds each such call to
+    # what that Repo's author was checked for when they applied it (the
+    # Repo's recorded authority; see `requires` below). Its own credential
+    # writes no job anywhere, and the install prompt says so: "only for its
+    # objects". The installer must still hold it, as any permission here.
+    # The jobs it writes this way are stamped `managedBy` the Repo
+    # (docs/app-objects.md, "Acting for an object").
+    { resources = ["job"], actions = ["write"], namespaces = ["*"], via = "objects" },
     { resources = ["template"], actions = ["read"] },
     # Apps keep their state under the reserved `legion/` KV prefix, which a
     # plain `*` path never reaches.
@@ -96,6 +105,9 @@
     # Buttons a view's `actions` block can show. Pressed on a job, task, or
     # node (never in nav or overview), checked as the viewer, audited as
     # `app.action`, and confirmed first when the permission is a write.
+    # gitops answers `sync-now` by acting for the Repo that deploys the job:
+    # acting as the viewer is bounded by its own grant, which (job:write
+    # being `via = "objects"`) writes no job.
     actions = [
       {
         name = "sync-now",
@@ -237,8 +249,9 @@
       access = { resource = "object" },
       # What writing (or deleting) a Repo also needs of its writer, scoped
       # from the object: write on the jobs it names (`/spec/jobs`; every job
-      # when it names none) in its namespace. A Repo can never make gitops
-      # deploy more than its author could.
+      # when it names none) in its namespace. What was checked is recorded
+      # on the Repo as its authority, and bounds what gitops can do for it:
+      # a Repo can never make gitops deploy more than its author could.
       requires = [
         { resource = "job", actions = ["write"], name = "/spec/jobs" },
       ],

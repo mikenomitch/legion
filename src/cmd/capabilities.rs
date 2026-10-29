@@ -172,9 +172,9 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "object.list",
-            cli: "legion object list [KIND] [-n NS|-A] [-l k=v]",
+            cli: "legion object list [KIND] [-n NS|-A] [-l k=v] [--authority-lapsed]",
             grpc: Some("Manager/ListObjects"),
-            summary: "List objects with their status summary and the kind's columns.",
+            summary: "List objects with their status summary and the kind's columns; --authority-lapsed lists those whose writer no longer holds what the object records.",
             mutates: false,
             read_only_safe: true,
         },

@@ -38,7 +38,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::structs::acl::{
-    ActingFor, AclAction, AclIdentity, AclResource, AclRule, AclScope, AclSource,
+    AclAction, AclIdentity, AclResource, AclRule, AclScope, AclSource, ActingFor,
 };
 use crate::structs::app_object::ResolvedPermission;
 use crate::structs::app_ui::{Delegation, FOR_OBJECT_HEADER, ON_BEHALF_OF_HEADER};
@@ -292,7 +292,7 @@ pub fn object_scoped_identity(
             source: AclSource::ForObject,
             expires_at: caller.expires_at.clone(),
             audit_only: caller.audit_only,
-            acting_for: Some(actor.clone()),
+            acting_for: Some(Box::new(actor.clone())),
         },
         dropped,
     }
@@ -568,5 +568,210 @@ mod delegation_test {
         assert!(presented_assertion(&metadata).is_err());
         metadata.insert(ON_BEHALF_OF_HEADER, "a.b.c".parse().unwrap());
         assert_eq!(presented_assertion(&metadata), Ok(Some("a.b.c".into())));
+    }
+
+    fn repo_actor() -> ActingFor {
+        ActingFor::parse("gitops/Repo/team-a/storefront#17@3").expect("actor")
+    }
+
+    /// A permission as `requires` resolves it: job:write in `namespace`,
+    /// namespace-wide unless `name` is given, band `normal`.
+    fn job_write(namespace: &str, name: Option<&str>) -> ResolvedPermission {
+        ResolvedPermission {
+            resource: "job".into(),
+            action: "write".into(),
+            namespace: Some(namespace.into()),
+            name: Some(name.unwrap_or("*").into()),
+            path: None,
+            pool: None,
+            band: Some("normal".into()),
+            template: None,
+            host: false,
+            from: Vec::new(),
+        }
+    }
+
+    /// gitops: job read in team-*, job write everywhere only for objects,
+    /// and a deny on `secret-*` jobs.
+    fn gitops() -> AclIdentity {
+        identity(
+            "gitops",
+            r#"[{"resources": ["job"], "actions": ["read"], "namespaces": ["team-*"]},
+                {"resources": ["job"], "actions": ["write"], "namespaces": ["*"], "via": "objects"},
+                {"resources": ["job"], "actions": ["write"], "effect": "deny", "names": ["secret-*"]}]"#,
+        )
+    }
+
+    /// An object's recorded authority becomes exact rules within the app's
+    /// grant, `via = "objects"` rules included: the identity writes jobs
+    /// exactly where the authority says, never elsewhere, never more.
+    #[test]
+    fn an_object_scoped_identity_holds_its_authority_test() {
+        let scoped = object_scoped_identity(&gitops(), &repo_actor(), &[job_write("team-a", None)]);
+        assert!(scoped.dropped.is_empty(), "{:?}", scoped.dropped);
+        let id = scoped.identity;
+        assert_eq!(id.principal, "gitops for Repo team-a/storefront");
+        assert_eq!(id.source, AclSource::ForObject);
+        assert_eq!(id.acting_for.as_deref(), Some(&repo_actor()));
+        assert!(id.accessor_id.is_none() && id.policies.is_empty() && !id.is_management);
+        let submit = |job: &str| AclScope::job(job).with_band(crate::structs::Band::default());
+        // Any job in team-a, at band normal.
+        assert!(id.allows(AclResource::Job, AclAction::Write, &submit("team-a/web")));
+        assert!(id.allows(AclResource::Job, AclAction::Write, &submit("team-a/api")));
+        // Not another namespace, a host-level job, another band, another
+        // action, another resource.
+        assert!(!id.allows(AclResource::Job, AclAction::Write, &submit("team-b/web")));
+        assert!(!id.allows(
+            AclResource::Job,
+            AclAction::Write,
+            &submit("team-a/web").with_host(true)
+        ));
+        assert!(!id.allows(
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job("team-a/web").with_band(crate::structs::Band::parse("high").unwrap())
+        ));
+        assert!(!id.allows(
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::job("team-a/web")
+        ));
+        assert!(!holds_any(&id, AclResource::Kv));
+        assert!(!holds_any(&id, AclResource::Object));
+
+        // Named jobs: only those.
+        let named = object_scoped_identity(
+            &gitops(),
+            &repo_actor(),
+            &[job_write("team-a", Some("storefront"))],
+        )
+        .identity;
+        assert!(named.allows(
+            AclResource::Job,
+            AclAction::Write,
+            &submit("team-a/storefront")
+        ));
+        assert!(!named.allows(
+            AclResource::Job,
+            AclAction::Write,
+            &submit("team-a/billing")
+        ));
+    }
+
+    /// It never exceeds the app's grant: a permission the grant does not
+    /// cover whole is dropped, the app's deny rules carry over, and with
+    /// no `via` rule (or none that reaches) there is nothing to hold.
+    #[test]
+    fn an_object_scoped_identity_never_exceeds_the_apps_grant_test() {
+        // The reserved namespace is outside the grant's `*`.
+        let scoped = object_scoped_identity(
+            &gitops(),
+            &repo_actor(),
+            &[job_write("legion-system", None), job_write("team-a", None)],
+        );
+        assert_eq!(scoped.dropped.len(), 1, "{:?}", scoped.dropped);
+        assert!(scoped.dropped[0].contains("legion-system"));
+        // The app's deny carries over and wins over the authority.
+        let team_a =
+            object_scoped_identity(&gitops(), &repo_actor(), &[job_write("team-a", None)]).identity;
+        let submit = |job: &str| AclScope::job(job).with_band(crate::structs::Band::default());
+        assert!(team_a.allows(AclResource::Job, AclAction::Write, &submit("team-a/web")));
+        assert!(!team_a.allows(
+            AclResource::Job,
+            AclAction::Write,
+            &submit("team-a/secret-db")
+        ));
+        // An app that may write jobs only in team-b, plainly: team-a's
+        // authority is dropped, and the plain rule still bounds it.
+        let narrow = identity(
+            "narrow",
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["team-b"]}]"#,
+        );
+        let scoped = object_scoped_identity(&narrow, &repo_actor(), &[job_write("team-a", None)]);
+        assert_eq!(scoped.dropped.len(), 1);
+        assert!(!holds_any(&scoped.identity, AclResource::Job));
+        // A grant narrower than the permission (names) does not cover it
+        // whole: dropped, not narrowed.
+        let some_names = identity(
+            "names",
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["team-a"], "names": ["web-*"]}]"#,
+        );
+        let scoped =
+            object_scoped_identity(&some_names, &repo_actor(), &[job_write("team-a", None)]);
+        assert_eq!(scoped.dropped.len(), 1);
+        // The caller's expiry and audit mode carry over.
+        let mut caller = gitops();
+        caller.expires_at = Some("2026-01-01T00:00:00Z".into());
+        caller.audit_only = true;
+        let scoped = object_scoped_identity(&caller, &repo_actor(), &[]).identity;
+        assert_eq!(scoped.expires_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert!(scoped.audit_only);
+    }
+
+    /// Each recorded attribute becomes an exact selector; a `*` the writer
+    /// was checked on literally (not the namespace-wide name, not the
+    /// cluster object's namespace) cannot be named exactly and grants
+    /// nothing.
+    #[test]
+    fn authority_rules_are_exact_test() {
+        let kv = ResolvedPermission {
+            resource: "kv".into(),
+            action: "read".into(),
+            namespace: None,
+            name: None,
+            path: Some("teams/a/deploy-key".into()),
+            pool: None,
+            band: None,
+            template: None,
+            host: false,
+            from: Vec::new(),
+        };
+        let rule = authority_rule(&kv).expect("a rule");
+        assert_eq!(rule.paths, Some(vec!["teams/a/deploy-key".to_string()]));
+        assert!(rule.namespaces.is_none() && rule.names.is_none());
+        let mut host = job_write("team-a", Some("web"));
+        host.host = true;
+        let rule = authority_rule(&host).expect("a rule");
+        assert_eq!(rule.host, Some(true));
+        assert_eq!(rule.names, Some(vec!["web".to_string()]));
+        assert_eq!(rule.bands, Some(vec!["normal".to_string()]));
+        let cluster_object = job_write("*", None);
+        assert_eq!(
+            authority_rule(&cluster_object).expect("a rule").namespaces,
+            Some(vec!["*".to_string()])
+        );
+        assert!(authority_rule(&job_write("team-a", Some("web-*"))).is_none());
+        let mut glob_path = kv.clone();
+        glob_path.path = Some("teams/*".into());
+        assert!(authority_rule(&glob_path).is_none());
+        let mut unknown = kv;
+        unknown.resource = "nothing".into();
+        assert!(authority_rule(&unknown).is_none());
+        // The grant with `via` made plain.
+        let grant = object_grant(&gitops());
+        assert!(grant.rules.iter().all(|rule| rule.via.is_none()));
+        assert!(grant.allows(
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job("team-a/web")
+        ));
+    }
+
+    #[test]
+    fn the_object_header_is_read_and_parsed_test() {
+        let mut metadata = MetadataMap::new();
+        assert_eq!(presented_object(&metadata), Ok(None));
+        assert!(!names_an_object(&metadata) && !names_a_viewer(&metadata));
+        metadata.insert(FOR_OBJECT_HEADER, " ".parse().unwrap());
+        assert!(presented_object(&metadata).is_err());
+        assert!(names_an_object(&metadata));
+        metadata.insert(FOR_OBJECT_HEADER, "gitops/Repo".parse().unwrap());
+        assert!(presented_object(&metadata).is_err());
+        metadata.insert(
+            FOR_OBJECT_HEADER,
+            "gitops/Repo/team-a/storefront#17@3".parse().unwrap(),
+        );
+        assert_eq!(presented_object(&metadata), Ok(Some(repo_actor())));
+        assert!(for_object_refusal("x").starts_with("legion-for-object: "));
     }
 }

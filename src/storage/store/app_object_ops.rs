@@ -469,10 +469,12 @@ impl Store {
     /// is unique).
     pub fn app_object_by_uid(&self, uid: u64) -> R<Option<AppObjectRow>> {
         let conn = self.read_connection()?;
-        Ok(conn
-            .prepare_cached(&format!("SELECT {COLUMNS} FROM app_object WHERE uid = ?1;"))?
+        let mut stmt =
+            conn.prepare_cached(&format!("SELECT {COLUMNS} FROM app_object WHERE uid = ?1;"))?;
+        let row = stmt
             .query_row([i64::try_from(uid).unwrap_or(i64::MAX)], from_row)
-            .optional()?)
+            .optional()?;
+        Ok(row)
     }
 
     /// Objects, by app, kind, namespace, and name: every one, an app's

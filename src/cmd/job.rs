@@ -2946,10 +2946,15 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
         let mut value = job_info_json(reply.job, usage.as_deref());
         if let Some(object) = value.as_object_mut() {
             if let Some(managed_by) = &reply.managed_by {
-                object.insert(
-                    "managedBy".to_string(),
-                    json!({ "app": managed_by.app, "digest": managed_by.digest }),
-                );
+                let mut stamp = json!({ "app": managed_by.app });
+                if managed_by.object.is_empty() {
+                    stamp["digest"] = json!(managed_by.digest);
+                } else {
+                    stamp["object"] = json!(managed_by.object);
+                    stamp["label"] =
+                        json!(crate::structs::acl::object_stamp_label(&managed_by.object));
+                }
+                object.insert("managedBy".to_string(), stamp);
             }
             // `unknownFields` when the latest version was submitted with
             // --allow-unknown-fields and that kept or dropped something.
@@ -2972,13 +2977,23 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
         let backoff_lines = reschedule_backoff_lines(&job.reschedule_backoffs);
         let printable_job: JobPrint = job.into();
         print_table(vec![printable_job]);
-        // An app's job (docs/apps.md): the reconciler owns its spec.
+        // An app's job (docs/apps.md): the reconciler owns its spec. Or a
+        // job an app wrote for one of its objects (docs/app-objects.md,
+        // "Acting for an object"): the app will likely write it back.
         if let Some(managed_by) = &reply.managed_by {
-            let digest: String = managed_by.digest.chars().take(8).collect();
-            println!(
-                "managed by app {} (digest {digest}…); direct edits are refused. Use `legion app`.",
-                managed_by.app
-            );
+            if managed_by.object.is_empty() {
+                let digest: String = managed_by.digest.chars().take(8).collect();
+                println!(
+                    "managed by app {} (digest {digest}…); direct edits are refused. Use `legion app`.",
+                    managed_by.app
+                );
+            } else {
+                println!(
+                    "managed by {}; {} will likely write back a version you submit",
+                    crate::structs::acl::object_stamp_label(&managed_by.object),
+                    managed_by.app
+                );
+            }
         }
         for line in backoff_lines {
             println!("{line}");

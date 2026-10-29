@@ -193,7 +193,8 @@ fn object_list_schema() -> Value {
         "properties": {
             "kind": { "type": "string", "description": "The kind: <app>/<Kind> (gitops/Repo), or a short name exactly one installed kind has (repo, repos). Omit for every kind." },
             "namespaces": { "type": "array", "items": { "type": "string" }, "description": "Namespaces or globs; [\"*\"] for every namespace you can read. Default: `default`." },
-            "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Only objects carrying all of these labels." }
+            "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Only objects carrying all of these labels." },
+            "authorityLapsed": { "type": "boolean", "description": "Only objects whose recorded authorizer no longer holds every permission it was checked for (authority.check = lapsed) or cannot be re-resolved (unknown), with authority.checkDetail saying why. The app keeps acting within the recorded authority until the object is re-applied. Needs acl:read." }
         },
         "additionalProperties": false
     })
@@ -331,7 +332,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_object_list",
-            description: "List objects of one kind, or of every kind, with their spec, the app-reported status (conditions Accepted/Ready, observedGeneration, fields) and a summary (Ready, Accepted, Pending, NotReady: <reason>, Rejected: <reason>, Stale, Invalid, Deleting, Orphaned). Needs read on each kind's access.",
+            description: "List objects of one kind, or of every kind, with their spec, the app-reported status (conditions Accepted/Ready, observedGeneration, fields) and a summary (Ready, Accepted, Pending, NotReady: <reason>, Rejected: <reason>, Stale, Invalid, Deleting, Orphaned). Needs read on each kind's access. authorityLapsed lists only objects whose writer no longer holds what the object records (the app still acts within it until someone re-applies the object).",
             input_schema: object_list_schema,
             mutates: false,
         },
@@ -1845,11 +1846,17 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 })
                 .unwrap_or_default();
             let mut client = connect().await?;
-            grpc(client.list_objects(crate::structs::ListObjectsRequest {
-                kind: opt_str_arg(&args, "kind").unwrap_or_default(),
-                namespaces: namespaces_arg(&args),
-                labels,
-            }))
+            grpc(
+                client.list_objects(crate::structs::ListObjectsRequest {
+                    kind: opt_str_arg(&args, "kind").unwrap_or_default(),
+                    namespaces: namespaces_arg(&args),
+                    labels,
+                    authority_lapsed: args
+                        .get("authorityLapsed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                }),
+            )
             .await
             .map(decode_object_json)
         }

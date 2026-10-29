@@ -26,6 +26,23 @@ package legion;
 //   app's own identity. Streaming RPCs and app-plane RPCs refuse it
 //   (PermissionDenied). Ignored when ACLs are disabled. See
 //   docs/auth-and-acls.md, "Delegated identities".
+// - `legion-for-object: <app>/<Kind>/<namespace>/<name>#<uid>@<generation>`:
+//   an app acting for one of its objects (an empty namespace for a cluster
+//   kind: `autoscaler/NodeGroup//workers#17@3`). The app's own credential
+//   names the object, and the call is authenticated as `<app> for <Kind>
+//   <namespace>/<name>`: one exact rule per permission of the object's
+//   recorded `authority` (what its writer was checked for when it was last
+//   applied) that the app's own grant covers, its `via = "objects"` rules
+//   included, plus the app's deny rules. The generation is advisory: the
+//   object's current authority applies. A deleting object may be named
+//   (for cleanup). Named by anyone but the owning app's own identity, for a
+//   uid that does not exist or names another object, or for an orphaned
+//   kind, the call is Unauthenticated or PermissionDenied; it never falls
+//   back to the app's own identity. RunJob and RunJobTemplate submits made
+//   this way stamp the version `managedBy = { app, object }`. Streaming RPCs
+//   and app-plane RPCs refuse it (PermissionDenied). A call carrying both
+//   this header and `legion-on-behalf-of` is InvalidArgument. Ignored when
+//   ACLs are disabled. See docs/app-objects.md, "Acting for an object".
 
 // === MANAGER ===
 
@@ -4193,9 +4210,12 @@ message GetJobInfoReply {
 
   // Set when the job's latest version was submitted by the app reconciler:
   // the job belongs to an app (docs/apps.md), and direct writes to it are
-  // refused while the app is installed. Unset for every other job, and for
-  // an app's job whose latest version was stored some other way (which the
-  // reconciler reverts).
+  // refused while the app is installed. Also set, with `object`, when an
+  // app acting for one of its objects (`legion-for-object`) wrote the
+  // latest version: a person may still submit over it, and the app will
+  // likely write it back (docs/app-objects.md, "Acting for an object").
+  // Unset for every other job, and for an app's job whose latest version
+  // was stored some other way (which the reconciler reverts).
   optional ManagedByInfo managed_by = 3;
 
   // What `allow_unknown_fields` kept and dropped when the job's latest
@@ -4283,8 +4303,15 @@ message ManagedByInfo {
 
   // The digest of the render the reconciler submitted. The reconciler
   // compares it with the digest of a fresh render of the app record; a
-  // difference resubmits the job.
+  // difference resubmits the job. Empty when `object` is set.
   string digest = 2;
+
+  // The object the app wrote this version for, acting for it
+  // (`legion-for-object`): `<app>/<Kind>/<namespace>/<name>#<uid>`, the
+  // namespace empty for a cluster kind. `legion job status` shows it as
+  // `managed by gitops for Repo team-a/storefront`. Empty for the app
+  // reconciler's own stamp on an app's job.
+  string object = 3;
 }
 
 // One jobspec key Legion did not know, as `allow_unknown_fields` handled it.
@@ -14490,7 +14517,10 @@ message WhoAmIReply {
   // `delegated` (an app's own credential presenting a viewer's assertion in
   // `legion-on-behalf-of`: `principal` is `<viewer> via app <app>`, and
   // `rules_json` the one rule the delegation holds, plus any deny rules the
-  // app or the viewer carry).
+  // app or the viewer carry), `for-object` (an app's own credential naming
+  // one of its objects in `legion-for-object`: `principal` is `<app> for
+  // <Kind> <namespace>/<name>`, and `rules_json` the object's recorded
+  // authority the app's grant covers, plus the app's deny rules).
   string source = 3;
 
   // Human-readable principal: token name, `user:<name>`, JWT subject, or
@@ -15340,6 +15370,17 @@ message ObjectAuthority {
   string authorized_by = 3;
   string accessor = 4;
   int64 authorized_at_unix_ms = 5;
+
+  // Whether the authorizer still holds the authority, when the request
+  // asked (`ListObjectsRequest.authority_lapsed`): `held`, `lapsed` (the
+  // token was deleted or expired, or no longer holds a permission), or
+  // `unknown` (no accessor to re-resolve: a JWT or SSO login, or an app's
+  // workload identity). Empty when not asked.
+  string check = 6;
+
+  // Why, for `lapsed` and `unknown`: `the token (accessor 0f3a…) was
+  // deleted`, `no longer holds job:write in team-b`.
+  string check_detail = 7;
 }
 
 // One object of an app-declared kind.
@@ -15513,6 +15554,22 @@ message ListObjectsRequest {
 
   // Only objects carrying every one of these labels with these values.
   map<string, string> labels = 3;
+
+  // Only objects whose recorded authority may have lapsed: the principal
+  // that last authorized the object (`authority.authorized_by`) no longer
+  // holds every permission it was checked for, or cannot be re-resolved.
+  // Each listed object's `authority.check` says which (`lapsed` or
+  // `unknown`) and `authority.check_detail` why. The authorizer is
+  // re-resolved through its ACL token's accessor, as a request with that
+  // token would authenticate now: a deleted or expired token is `lapsed`;
+  // a writer with no accessor (a JWT or SSO login, or an app's workload
+  // identity) is `unknown`. Authority is never revoked by this: an app
+  // keeps acting within it until someone re-applies the object, which
+  // re-authorizes it as them (docs/app-objects.md, "Acting for an
+  // object"). Needs `acl:read` besides read on the listed objects, since it
+  // reveals what other principals hold. Ignored when ACLs are disabled
+  // (nothing lapses).
+  bool authority_lapsed = 4;
 }
 
 // Reply payload for ListObjects.

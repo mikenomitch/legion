@@ -512,7 +512,7 @@ How to use it:
 | PR | What it lands | Notes |
 | --- | --- | --- |
 | [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after adversarial security and correctness reviews | All three plans SHIPPED; their items, and both hardening passes, are checked off and in Done; the reviews' open and design-level items are under *Ecosystem apps* |
-| branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phases O1 and O2 | Builds on #60; O1 and O2 are checked off and in Done; O3, O4, and the deferrals and follow-ups are open under Ecosystem apps |
+| branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phases O1, O2, and O3 | Builds on #60; O1, O2, and O3 are checked off and in Done; O4, and the deferrals and follow-ups are open under Ecosystem apps |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -4598,7 +4598,7 @@ plan.
         kinds** below.
 
 - [ ] **App-owned object kinds** (Legion's CRDs):
-      [plan](plans/app-object-kinds-plan.md) (IN EXECUTION; O1 and O2 in Done) ·
+      [plan](plans/app-object-kinds-plan.md) (IN EXECUTION; O1, O2, and O3 in Done) ·
       [calls](calls/app-object-kinds-plan_calls.md) · docs:
       [app-objects.md](../docs/app-objects.md)
   - [ ] Follow-ups from O2 ([calls 32-43](calls/app-object-kinds-plan_calls.md)):
@@ -4631,11 +4631,27 @@ plan.
           ([calls 37](calls/app-object-kinds-plan_calls.md)).
     - [ ] **`legion scaling simulate` checks no plugins** when it resolves
           a ScalingPolicy file ([calls 43](calls/app-object-kinds-plan_calls.md)).
-  - [ ] **O3: objects carry their authority** (plan §8): the
-        `legion-for-object` header, the app's grant intersected with the
-        object's recorded `authority`, `managedBy = { app, object uid }`,
-        `via = "objects"` permissions, and `legion object list
-        --authority-lapsed` ([calls 1, 26](calls/app-object-kinds-plan_calls.md)).
+  - [ ] Follow-ups from O3 ([calls 44-52](calls/app-object-kinds-plan_calls.md)):
+    - [ ] **Only job submits are stamped with the object**: a KV entry, a
+          scaling pause, or a volume an app writes for an object names it
+          only in the actor of its audit line and event
+          ([calls 46](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **The intersection drops what the app's grant covers only in
+          part** (a grant naming some jobs, an authority naming every job
+          in a namespace) instead of narrowing it
+          ([calls 49](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **JWT and SSO authorizers read `unknown`** in
+          `--authority-lapsed`: there is no accessor to re-resolve; an
+          auth-method hook that re-checks a subject's groups would close
+          it ([calls 47](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **The bundled autoscaler does not act for its objects**; the
+          example gitops manifest is the only shipped user of `via =
+          "objects"` ([calls 48](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **With ACLs off `legion-for-object` is ignored**, so nothing is
+          stamped on such a cluster
+          ([calls 51](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **No SPA surface** shows a job's object stamp or the lapsed
+          list; the CLI, API, and MCP do.
   - [ ] **O4: CEL `rules`** on kinds, evaluated in the manager; `rules` is
         refused until then ([calls 10](calls/app-object-kinds-plan_calls.md)).
         Restores the fail-closed `min <= max` check on the autoscaler's
@@ -6439,6 +6455,45 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       Federation still needs an explicit public `issuer`.
 
 ## Ecosystem apps
+
+- [x] **App-owned object kinds, Phase O3: objects carry their authority**
+      (2026-10-29, branch `claude/app-objects`;
+      [plan](plans/app-object-kinds-plan.md) §8 ·
+      [calls 44-52](calls/app-object-kinds-plan_calls.md) · docs:
+      [app-objects.md](../docs/app-objects.md#acting-for-an-object),
+      [auth-and-acls.md](../docs/auth-and-acls.md#object-scoped-identities),
+      [apps.md](../docs/apps.md#object-kinds),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] `legion-for-object: <app>/<Kind>/<ns>/<name>#<uid>@<generation>`
+        (`FOR_OBJECT_HEADER`), honored in `authenticate_acl`: only the
+        owning app's own identity, an existing uid matching the reference
+        (deleting included, orphaned kinds refused), and the identity `<app>
+        for <Kind> <ns>/<name>` (`AclSource::ForObject`): the recorded
+        authority as exact rules within the app's grant, plus its deny
+        rules; refusals audited, never a fallback; streams, the app plane,
+        and both headers at once refused.
+  - [x] `via = "objects"` on manifest permissions: inert in the evaluator,
+        used by the intersection, covered at install like any rule, marked
+        in the install prompt and `legion acl grants list`, refused in
+        stored policies and in manifests without kinds.
+  - [x] Stamps: `RunJob`/`RunJobTemplate` for an object store `managedBy =
+        { app, object }` (`GetJobInfo.managed_by.object`, `legion job
+        status`); a person's submit over one warns who will write it back;
+        an object stamp never makes a job an app's own.
+  - [x] `legion object list --authority-lapsed` (`ListObjects`,
+        `authorityLapsed` on the MCP tool, the capability entry): `lapsed`
+        or `unknown`, with why; needs `acl:read`.
+  - [x] Framework: `ObjectRequest::client` (acting for the object, the
+        reconcile handler's default) and `app_client`,
+        `AppContext::client_for`, `ManagerConnection::client_for_object`;
+        the example gitops manifest writes jobs `via = "objects"`.
+  - [x] Tests: `tests/integration/app_object_authority.rs` (within and
+        outside the authority, never beyond the grant, other apps,
+        management, people, both headers, wrong and deleted objects, a
+        deleting object, streams and the app plane, the plain credential
+        and `via`, installers, stamps and takeover, lapsed and
+        re-authorized), and unit tests for the identity, the rule shapes,
+        coverage, the header, and the prompt.
 
 - [x] **App-owned object kinds, Phase O2: the autoscaler's policies become
       its objects** (2026-10-29, branch `claude/app-objects`;

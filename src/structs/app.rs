@@ -1737,9 +1737,8 @@ pub fn describe_rule(rule: &AclRule) -> String {
         selectors.push("host".to_string());
     }
     if rule.is_via_objects() {
-        selectors.push(
-            "only for its objects (bounded by each object's recorded authority)".to_string(),
-        );
+        selectors
+            .push("only for its objects (bounded by each object's recorded authority)".to_string());
     }
     let effect = if rule.is_deny() { "deny " } else { "" };
     format!(
@@ -2428,6 +2427,7 @@ mod app_tests {
             bands: Some(vec![]),
             host: Some(true),
             kinds: Some(vec![]),
+            via: Some(crate::structs::acl::VIA_OBJECTS.into()),
         };
         let value = serde_json::to_value(&rule).expect("rule");
         let mut fields: Vec<&str> = value
@@ -2458,6 +2458,61 @@ mod app_tests {
             code.as_object().map(|o| o.len()),
             Some(CODE_FIELD_SPEC_FIELDS.len())
         );
+    }
+
+    /// `via = "objects"`: the prompt says the rule holds only for the app's
+    /// objects, and names them; an app with no kinds may not ask for one.
+    #[test]
+    fn via_objects_permissions_in_the_prompt_test() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/configs/apps/example-app.ncl");
+        let json = crate::config_lang::eval_file(path).expect("evaluates");
+        let example = AppManifest::from_json(&json).expect("parses");
+        let prompt = install_prompt(&example).join("\n");
+        assert!(
+            prompt.contains(
+                "job       write         namespaces: *; only for its objects (bounded by each \
+                 object's recorded authority)"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("while gitops acts for one of its gitops/Repo objects"),
+            "{prompt}"
+        );
+        let without_kinds = manifest(json!({
+            "permissions": [{ "resources": ["job"], "actions": ["write"],
+                              "namespaces": ["*"], "via": "objects" }],
+        }));
+        let refused = without_kinds.validate(false).unwrap_err();
+        assert!(refused.contains("declares no kinds"), "{refused}");
+    }
+
+    /// The reconciler's stamp serializes as it always did; an object's
+    /// stamp carries the object and no digest.
+    #[test]
+    fn managed_by_stamps_test() {
+        let reconciler = ManagedBy {
+            app: "gitops".into(),
+            digest: "abc".into(),
+            object: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&reconciler).expect("json"),
+            json!({ "app": "gitops", "digest": "abc" })
+        );
+        assert_eq!(reconciler.label(), "gitops");
+        let actor = crate::structs::acl::ActingFor::parse("gitops/Repo/team-a/storefront#17@3")
+            .expect("actor");
+        let stamp = ManagedBy::for_object(&actor);
+        assert_eq!(
+            serde_json::to_value(&stamp).expect("json"),
+            json!({ "app": "gitops", "object": "gitops/Repo/team-a/storefront#17" })
+        );
+        assert_eq!(stamp.label(), "gitops for Repo team-a/storefront");
+        let read: ManagedBy =
+            serde_json::from_value(json!({ "app": "gitops", "object": "gitops/Repo/x/y#1" }))
+                .expect("reads");
+        assert_eq!(read.digest, "");
     }
 
     #[test]

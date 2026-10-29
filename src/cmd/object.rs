@@ -159,6 +159,16 @@ pub fn config() -> Command {
                         .action(ArgAction::Append)
                         .help("Only objects with this label (repeatable, or comma-separated)"),
                 )
+                .arg(
+                    Arg::new("authority-lapsed")
+                        .long("authority-lapsed")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Only objects whose recorded authorizer no longer holds every \
+                             permission it was checked for (lapsed), or cannot be re-resolved \
+                             (unknown); needs acl:read. Re-applying an object re-authorizes it",
+                        ),
+                )
                 .arg(json_flag()),
         )
         .subcommand(
@@ -923,6 +933,7 @@ async fn list(matches: &ArgMatches) -> R<()> {
                 kind: kind.clone(),
                 namespaces: namespace_selection(matches),
                 labels: labels.into_iter().collect(),
+                authority_lapsed: matches.get_flag("authority-lapsed"),
             })
             .await,
     )?
@@ -931,8 +942,16 @@ async fn list(matches: &ArgMatches) -> R<()> {
         output::print_success(&reply);
         return Ok(());
     }
+    let lapsed = matches.get_flag("authority-lapsed");
     if reply.objects.is_empty() {
-        println!("no objects");
+        println!(
+            "{}",
+            if lapsed {
+                "no objects with lapsed authority"
+            } else {
+                "no objects"
+            }
+        );
         return Ok(());
     }
     let many_kinds = kind.is_empty();
@@ -955,6 +974,9 @@ async fn list(matches: &ArgMatches) -> R<()> {
         header.push("NAMESPACE".to_string());
     }
     header.extend(["STATUS".to_string(), "AGE".to_string()]);
+    if lapsed {
+        header.extend(["AUTHORITY".to_string(), "AUTHORIZED BY".to_string()]);
+    }
     header.extend(columns.iter().map(|column| column.name.clone()));
     let mut builder = tabled::builder::Builder::default();
     builder.push_record(header);
@@ -974,6 +996,15 @@ async fn list(matches: &ArgMatches) -> R<()> {
         }
         row.push(object.summary.clone());
         row.push(age(object.created_at_unix_ms));
+        if lapsed {
+            let authority = object.authority.clone().unwrap_or_default();
+            row.push(if authority.check_detail.is_empty() {
+                authority.check
+            } else {
+                format!("{}: {}", authority.check, authority.check_detail)
+            });
+            row.push(authority.authorized_by);
+        }
         row.extend(
             columns
                 .iter()

@@ -2708,17 +2708,41 @@ impl ManagerDaemonService {
             &origin,
             unknown_field_mode,
         )?;
+        // A person's submit over a version an app wrote for one of its
+        // objects replaces it, stamp and all (no `--force`: the object's
+        // namespace owner may always take a job over); say who will likely
+        // write it back.
+        let object_stamp = match (&origin, &identity.acting_for) {
+            (SubmitOrigin::Principal, None) => self
+                .store
+                .job_managed_by(&config.name)
+                .ok()
+                .flatten()
+                .filter(|stamp| stamp.object.is_some()),
+            _ => None,
+        };
         // The version's grant is recorded in the submitter's name, in the
         // same entry as the version (`enforce_identity_grants` above checked
-        // they hold it).
+        // they hold it). An app acting for an object (`legion-for-object`)
+        // stamps the version with the object.
         let submit_outcome = match origin {
-            SubmitOrigin::Principal => self.store.handle_job_submit_as(
-                &config,
-                &subs,
-                template,
-                &identity.principal,
-                Some(&unknown_fields),
-            ),
+            SubmitOrigin::Principal => match &identity.acting_for {
+                Some(actor) => self.store.handle_job_submit_for_object(
+                    &config,
+                    &subs,
+                    template,
+                    &identity.principal,
+                    crate::structs::app::ManagedBy::for_object(actor),
+                    Some(&unknown_fields),
+                ),
+                None => self.store.handle_job_submit_as(
+                    &config,
+                    &subs,
+                    template,
+                    &identity.principal,
+                    Some(&unknown_fields),
+                ),
+            },
             SubmitOrigin::App {
                 granted_by,
                 managed_by,
@@ -2809,6 +2833,7 @@ impl ManagerDaemonService {
                 .len();
         }
 
+        let replaced_version = !matches!(submit_outcome, JobSubmitOutcome::Unchanged { .. });
         let in_place = if matches!(submit_outcome, JobSubmitOutcome::Updated { .. }) {
             self.update_in_place(&config, &job_config_id)?
         } else {
@@ -2977,6 +3002,15 @@ impl ManagerDaemonService {
             }
         }
 
+        let takeover = object_stamp.filter(|_| replaced_version).map(|stamp| {
+            format!(
+                "{} was managed by {}; this version replaces it, and {} will likely write the \
+                 job back on its next reconcile",
+                config.name,
+                stamp.label(),
+                stamp.app
+            )
+        });
         Ok(SubmittedJob {
             message,
             job_name: config.name.clone(),
@@ -2985,6 +3019,7 @@ impl ManagerDaemonService {
             warnings: unknown_fields
                 .warnings()
                 .into_iter()
+                .chain(takeover)
                 .chain(app_warnings)
                 .chain(self.band_submit_warnings(&config))
                 .chain(autoscale_warnings)
@@ -5483,6 +5518,7 @@ impl Manager for ManagerDaemonService {
             .map(|stamp| ManagedByInfo {
                 app: stamp.app,
                 digest: stamp.digest,
+                object: stamp.object.unwrap_or_default(),
             });
         let unknown_fields = self
             .store
@@ -11980,6 +12016,20 @@ impl Manager for ManagerDaemonService {
             AclScope::none(),
         )?;
         let req = request.into_inner();
+        // `via = "objects"` belongs in an app manifest's permissions: a
+        // token holding a policy never acts for an object, so the rule
+        // would silently grant nothing.
+        if let Some(index) = crate::structs::acl::parse_rules(&req.rules_json)
+            .unwrap_or_default()
+            .iter()
+            .position(crate::structs::acl::AclRule::is_via_objects)
+        {
+            return Err(Status::invalid_argument(format!(
+                "rule {index}: `via = \"objects\"` is for an app manifest's permissions (the app \
+                 uses it only when it acts for one of its objects); a policy's rules apply to \
+                 tokens, which never do. Remove `via`"
+            )));
+        }
         let policy = self
             .store
             .upsert_acl_policy(&req.name, &req.description, &req.rules_json)

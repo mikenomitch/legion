@@ -970,7 +970,9 @@ impl ActingFor {
             .ok_or_else(|| format!("uid {uid:?} is not a positive number; {shape}"))?;
         let parts: Vec<&str> = reference.split('/').collect();
         let [app, kind, namespace, name] = parts.as_slice() else {
-            return Err(format!("{reference:?} is not four `/`-separated parts; {shape}"));
+            return Err(format!(
+                "{reference:?} is not four `/`-separated parts; {shape}"
+            ));
         };
         if app.is_empty() || kind.is_empty() || name.is_empty() {
             return Err(format!(
@@ -1055,7 +1057,8 @@ pub struct AclIdentity {
     pub audit_only: bool,
     /// The object an app acts for ([`AclSource::ForObject`]): what the
     /// writes it makes are stamped with. `None` for every other identity.
-    pub acting_for: Option<ActingFor>,
+    /// Boxed: identities are cloned per request and kept in enums.
+    pub acting_for: Option<Box<ActingFor>>,
 }
 
 impl AclIdentity {
@@ -2191,5 +2194,103 @@ mod acl_rules_test {
         };
         assert!(ident.allows(AclResource::Job, AclAction::Write, &AclScope::any()));
         assert!(!ident.would_allow(AclResource::Job, AclAction::Write, &AclScope::any()));
+    }
+
+    /// A `via = "objects"` rule is inert on every identity that holds it:
+    /// no scope, no list gate, no namespace reach, no hint, no kind gate.
+    /// It parses only on an allow rule, and only as `objects`.
+    #[test]
+    fn via_objects_rules_grant_nothing_to_a_plain_identity_test() {
+        let held = rules(
+            r#"[{"resources": ["job"], "actions": ["read"], "namespaces": ["team-a"]},
+                {"resources": ["job", "object"], "actions": ["write"], "namespaces": ["*"], "via": "objects"}]"#,
+        );
+        let ident = AclIdentity {
+            rules: held,
+            is_management: false,
+            ..AclIdentity::acl_disabled()
+        };
+        let web = AclScope::job("team-a/web");
+        assert!(ident.allows(AclResource::Job, AclAction::Read, &web));
+        assert!(!ident.allows(AclResource::Job, AclAction::Write, &web));
+        assert!(!ident.allows(AclResource::Job, AclAction::Write, &AclScope::any()));
+        assert!(!ident.reaches_namespace("team-b"));
+        assert!(ident
+            .namespaces_granting(AclResource::Job, AclAction::Write)
+            .is_empty());
+        assert!(!ident.allows_kind_somewhere(AclResource::Object, AclAction::Write, "gitops/Repo"));
+        // The same rule without `via` is an ordinary grant.
+        let plain = AclIdentity {
+            rules: ident
+                .rules
+                .iter()
+                .map(|rule| AclRule {
+                    via: None,
+                    ..rule.clone()
+                })
+                .collect(),
+            ..ident.clone()
+        };
+        assert!(plain.allows(AclResource::Job, AclAction::Write, &web));
+
+        let refused = parse_rules(
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["*"], "via": "viewers"}]"#,
+        )
+        .unwrap_err();
+        assert!(refused.contains("unknown `via`"), "{refused}");
+        let refused = parse_rules(
+            r#"[{"resources": ["job"], "actions": ["write"], "effect": "deny", "via": "objects"}]"#,
+        )
+        .unwrap_err();
+        assert!(refused.contains("deny rule cannot say `via`"), "{refused}");
+    }
+
+    /// The `legion-for-object` value: four parts (an empty namespace for a
+    /// cluster kind), a positive uid, a generation; it round-trips, and
+    /// names its principal and stamp.
+    #[test]
+    fn acting_for_references_parse_and_print_test() {
+        let repo = ActingFor::parse("gitops/Repo/team-a/storefront#17@3").expect("parses");
+        assert_eq!(
+            repo,
+            ActingFor {
+                app: "gitops".into(),
+                kind: "Repo".into(),
+                namespace: "team-a".into(),
+                name: "storefront".into(),
+                uid: 17,
+                generation: 3,
+            }
+        );
+        assert_eq!(repo.header_value(), "gitops/Repo/team-a/storefront#17@3");
+        assert_eq!(repo.object_ref(), "gitops/Repo/team-a/storefront#17");
+        assert_eq!(repo.principal(), "gitops for Repo team-a/storefront");
+        assert_eq!(
+            object_stamp_label(&repo.object_ref()),
+            "gitops for Repo team-a/storefront"
+        );
+        let group = ActingFor::parse(" autoscaler/NodeGroup//workers#9@1 ").expect("cluster");
+        assert_eq!(group.namespace, "");
+        assert_eq!(group.principal(), "autoscaler for NodeGroup workers");
+        assert_eq!(group.header_value(), "autoscaler/NodeGroup//workers#9@1");
+        for bad in [
+            "",
+            "gitops/Repo/team-a/storefront#17",
+            "gitops/Repo/team-a/storefront@3",
+            "gitops/Repo/storefront#17@3",
+            "gitops/Repo/team-a/storefront/x#17@3",
+            "gitops/Repo/team-a/storefront#0@3",
+            "gitops/Repo/team-a/storefront#x@3",
+            "gitops/Repo/team-a/storefront#17@-1",
+            "/Repo/team-a/storefront#17@3",
+            "gitops/Repo/team-a/#17@3",
+        ] {
+            assert!(ActingFor::parse(bad).is_err(), "{bad:?} parsed");
+        }
+        // A stamp that does not parse labels as itself.
+        assert_eq!(object_stamp_label("not a stamp"), "not a stamp");
+        assert!(AclSource::ForObject.is_acting() && AclSource::Delegated.is_acting());
+        assert!(!AclSource::Token.is_acting());
+        assert_eq!(AclSource::ForObject.as_str(), "for-object");
     }
 }
