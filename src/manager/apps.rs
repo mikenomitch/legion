@@ -486,6 +486,18 @@ fn seed_bundled_apps_noting(
     Ok(seeded)
 }
 
+/// What adopting a bundled app's embedded manifest came to.
+enum Adoption {
+    /// Nothing to adopt: the same manifest, no embedded one, or this
+    /// manager does not run the marker's version.
+    Kept,
+    /// The record now holds the embedded manifest.
+    Adopted(Box<AppRecord>),
+    /// The stored config does not match the embedded manifest's config
+    /// schema: the reason, for `marker_reason`.
+    Held(String),
+}
+
 impl AppReconciler {
     pub fn new(svc: Arc<ManagerDaemonService>, settings: ReconcilerSettings) -> Self {
         AppReconciler {
@@ -642,19 +654,39 @@ impl AppReconciler {
     }
 
     /// Adopt the bundled manifest this binary carries for `record`, when it
-    /// differs from the stored one and this manager runs the marker's build
-    /// (apps plan §6.3, "New bundled manifests"). Its permissions are
-    /// recorded as granted by `legion:bootstrap`. Returns the re-read record.
-    fn adopt_bundled_manifest(&self, record: &AppRecord, marker: &BuildMarker) -> R<AppRecord> {
-        if *marker != self.settings.own_build {
-            return Ok(record.clone());
+    /// differs from the stored one and this manager runs the marker's
+    /// version (apps plan §6.3, "New bundled manifests"). The version, not
+    /// the build id: builds of one version for other architectures or
+    /// packagings carry the same manifest, and a fleet that mixes them
+    /// would otherwise never adopt. Its permissions are recorded as granted
+    /// by `legion:bootstrap`.
+    ///
+    /// A stored config that does not match the new manifest's config schema
+    /// holds the adoption: the new build's app would refuse that config and
+    /// crash-loop, so the job stays on the previous marker until a config
+    /// that matches is set (`legion app config set` accepts one that matches
+    /// the held manifest).
+    fn adopt_bundled_manifest(&self, record: &AppRecord, marker: &BuildMarker) -> R<Adoption> {
+        if marker.version != self.settings.own_build.version {
+            return Ok(Adoption::Kept);
         }
         let Some(embedded) = crate::apps::bundled_manifest(&record.name) else {
-            return Ok(record.clone());
+            return Ok(Adoption::Kept);
         };
         let digest = embedded.digest();
         if digest == record.manifest_digest {
-            return Ok(record.clone());
+            return Ok(Adoption::Kept);
+        }
+        if let Err(err) = crate::structs::app::validate_app_config(embedded, &record.config) {
+            return Ok(Adoption::Held(format!(
+                "{}build {} changes {}'s config schema, and the stored config does not match it \
+                 ({err}); the app stays on its previous build until `legion app config set {} \
+                 <file>` sets a config that does",
+                crate::structs::app::UPGRADE_HELD,
+                marker.short(),
+                record.name,
+                record.name
+            )));
         }
         let diff = crate::structs::app::permission_diff(&record.grant.rules, &embedded.permissions);
         let now = now_rfc3339();
@@ -673,19 +705,6 @@ impl AppReconciler {
                 "; permissions: {} added, {} removed (granted by legion:bootstrap)",
                 diff.added.len(),
                 diff.removed.len()
-            ));
-        }
-        // A new schema re-checks the stored config: kept either way (the
-        // operator's config is never dropped), and reported when it fails.
-        if let Err(err) = crate::structs::app::validate_app_config(embedded, &record.config) {
-            warn!(
-                app = %record.name,
-                "The stored config does not match the config schema of build {}: {err}",
-                marker.short()
-            );
-            change.push_str(&format!(
-                "; the stored config does not match the new schema ({err}); set one with \
-                 `legion app config set`"
             ));
         }
         adopted.state.pending_change = change;
@@ -713,9 +732,11 @@ impl AppReconciler {
             removed = diff.removed.len(),
             "Adopted the bundled manifest of the app's new build"
         );
-        self.store()
-            .get_app(&record.name)?
-            .context("the app vanished while its manifest was adopted")
+        Ok(Adoption::Adopted(Box::new(
+            self.store()
+                .get_app(&record.name)?
+                .context("the app vanished while its manifest was adopted")?,
+        )))
     }
 
     fn write_state(&self, name: &str, before: &AppReconcileState, after: AppReconcileState) {
@@ -859,12 +880,28 @@ impl AppReconciler {
                 self.write_state(name, &before, state);
                 return Ok(PassOutcome::Waiting(reason));
             };
-            let adopted = self.adopt_bundled_manifest(&record, &marker)?;
-            if adopted.manifest_digest != record.manifest_digest {
-                state.pending_change = adopted.state.pending_change.clone();
-                record = adopted;
+            match self.adopt_bundled_manifest(&record, &marker)? {
+                Adoption::Kept => Some(marker),
+                Adoption::Adopted(adopted) => {
+                    state.pending_change = adopted.state.pending_change.clone();
+                    record = *adopted;
+                    Some(marker)
+                }
+                Adoption::Held(reason) => {
+                    // The job stays where it is: rendered for the marker it
+                    // already has (or, with none yet, the agreed one).
+                    if before.marker_reason != reason {
+                        warn!(app = name, "{reason}");
+                        self.store()
+                            .events()
+                            .app_reconcile_failed(name, &reason, true);
+                    }
+                    let held = record.state.marker.clone().unwrap_or(marker);
+                    state.marker = Some(held.clone());
+                    state.marker_reason = reason;
+                    Some(held)
+                }
             }
-            Some(marker)
         } else {
             None
         };

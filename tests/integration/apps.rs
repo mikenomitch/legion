@@ -1792,6 +1792,106 @@ async fn enable_retries_a_job_not_healthy_at_its_version_test() -> R<()> {
     Ok(())
 }
 
+/// A fleet whose eligible nodes run one version as different binaries
+/// (amd64 and arm64 managers) agrees on a build marker, and a leader of that
+/// version adopts the new bundled manifest (hardening after the adversarial
+/// review, M5): before, the marker never settled and the app never started.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mixed_architecture_fleet_agrees_and_adopts_test() -> R<()> {
+    let fx = fixture()?;
+    fx.store
+        .insert_node(manager_node("m-amd", "0.2.0", "amd64"))?;
+    fx.store
+        .insert_node(manager_node("m-arm", "0.2.0", "arm64"))?;
+    let current = legion::apps::bundled_manifest("autoscaler").context("bundled")?;
+    let mut older = current.clone();
+    older.permissions.clear();
+    assert!(fx
+        .store
+        .seed_app(legion::manager::apps::seed_record(&older, None))?);
+    let mut reconciler = fx.reconciler(marker("0.2.0", "amd64"));
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(submitted(&outcome), "{outcome:?}");
+    let record = fx.app("autoscaler")?;
+    let held = record.state.marker.clone().context("a marker")?;
+    assert_eq!(held.version, "0.2.0");
+    assert_eq!(
+        held.build_id,
+        legion::structs::app::mixed_build_id(["amd64", "arm64"])
+    );
+    assert!(record.state.marker_reason.is_empty());
+    assert_eq!(record.manifest_digest, current.digest(), "adopted");
+    Ok(())
+}
+
+/// A bundled build whose config schema the stored config no longer matches
+/// is held (hardening after the adversarial review, M6): the job stays on
+/// the previous build, status is `degraded: upgrade held: …`, the hold is
+/// announced once, and a config that matches the new schema (set although
+/// the stored schema refuses it) lets the upgrade through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundled_upgrade_that_tightens_the_config_is_held_test() -> R<()> {
+    let fx = fixture()?;
+    for id in ["m1", "m2"] {
+        fx.store.insert_node(manager_node(id, "0.1.0", "a"))?;
+    }
+    let current = legion::apps::bundled_manifest("autoscaler").context("bundled")?;
+    let mut older = current.clone();
+    let spec = older.config.clone().context("a config")?;
+    let mut schema = spec.schema.clone();
+    schema["properties"]["legacyKnob"] = json!({ "type": "boolean" });
+    schema["required"] = json!(["legacyKnob"]);
+    older.config = Some(legion::structs::app::AppConfigSpec {
+        schema,
+        default: json!({ "legacyKnob": true }),
+    });
+    assert!(fx
+        .store
+        .seed_app(legion::manager::apps::seed_record(&older, None))?);
+    let mut reconciler = fx.reconciler(marker("0.2.0", "b"));
+    assert!(submitted(&reconciler.reconcile_app("autoscaler").await));
+    for id in ["m1", "m2"] {
+        rebuild(&fx, id, "0.2.0", "b")?;
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            reconciler.reconcile_app("autoscaler").await,
+            PassOutcome::Unchanged,
+            "held: the job stays on build a"
+        );
+    }
+    assert_eq!(fx.version_number(AUTOSCALER)?, 1);
+    let app = fx.get_app("autoscaler").await?;
+    assert_eq!(app.status, "degraded");
+    assert!(
+        app.status_detail
+            .starts_with("upgrade held: build 0.2.0+b changes autoscaler's config schema"),
+        "{}",
+        app.status_detail
+    );
+    assert_eq!(app.reconcile.context("reconcile")?.build_marker, "0.1.0+a");
+    let held = fx.events("app.reconcile_failed")?;
+    assert_eq!(held.len(), 1, "announced once");
+    assert_eq!(fx.app("autoscaler")?.manifest_digest, older.digest());
+
+    // `{}` fails the stored schema (it requires legacyKnob) and matches the
+    // new one: accepted, and the next pass adopts and rolls.
+    fx.set_config("autoscaler", json!({}), &fx.admin).await?;
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(submitted(&outcome), "{outcome:?}");
+    let record = fx.app("autoscaler")?;
+    assert_eq!(record.manifest_digest, current.digest());
+    assert_eq!(record.state.marker, Some(marker("0.2.0", "b")));
+    assert!(record.state.marker_reason.is_empty());
+    // A config that matches neither is still refused.
+    let refused = fx
+        .set_config("autoscaler", json!({ "nope": 1 }), &fx.admin)
+        .await
+        .expect_err("not in the schema");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    Ok(())
+}
+
 /// A parked refusal never hides a job that already runs the render (another
 /// leader got it submitted), and a new leadership term forgets what an
 /// earlier one parked (hardening after the adversarial review, L1).

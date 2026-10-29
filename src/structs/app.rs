@@ -901,6 +901,12 @@ impl std::fmt::Display for BuildMarker {
     }
 }
 
+/// How `marker_reason` starts while a bundled app's new build is held
+/// because the stored config does not match its config schema: the app's
+/// status is `degraded` with this reason, and its job stays on the previous
+/// build marker until a config that matches is set.
+pub const UPGRADE_HELD: &str = "upgrade held: ";
+
 /// The reconciler's bookkeeping on an app record.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
@@ -1514,17 +1520,36 @@ pub struct MarkerDecision {
     pub reason: String,
 }
 
+/// The build id a marker carries when the eligible nodes agree on a
+/// version but run different binaries of it (amd64 and arm64, a distro
+/// package and a tarball): `mixed-` and a digest of the sorted distinct ids,
+/// so a rebuild of any one of them still moves the marker.
+pub fn mixed_build_id<'a>(ids: impl IntoIterator<Item = &'a str>) -> String {
+    use sha2::Digest;
+    let ids: BTreeSet<&str> = ids.into_iter().collect();
+    let joined = ids.into_iter().collect::<Vec<_>>().join(",");
+    let digest = sha2::Sha256::digest(joined.as_bytes());
+    let hex: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("mixed-{hex}")
+}
+
 /// Decide a bundled app's build marker from its eligible nodes (apps plan
-/// §6.3, "Upgrades"; calls entry 14):
+/// §6.3, "Upgrades"; calls entries 14 and 119):
 ///
 /// - nodes that are not ready, or report `unknown`, an unparsable version, or
 ///   no build id, are left out;
-/// - when every remaining node reports the same (`buildVersion`, `buildId`),
-///   that pair is the marker, whatever it was before (a deliberate downgrade
-///   of the whole set moves it back too);
-/// - while they disagree, the marker keeps its last value, so a late older
-///   node never moves it backwards, and the reason names who is behind the
-///   newest build;
+/// - when every remaining node reports the same `buildVersion`, that version
+///   is the marker's, whatever it was before (a deliberate downgrade of the
+///   whole set moves it back too). Its build id is the one id they all run,
+///   or, when they run different binaries of that version (another
+///   architecture, another packaging), [`mixed_build_id`] of the set, so a
+///   mixed fleet still agrees and a rebuild of any one binary still rolls;
+/// - while they disagree on the version, the marker keeps its last value, so
+///   a late older node never moves it backwards, and the reason names who is
+///   behind the newest version;
 /// - with no usable node there is no new information: the marker stays
 ///   (`None` on a fresh cluster).
 pub fn decide_build_marker(
@@ -1545,39 +1570,38 @@ pub fn decide_build_marker(
             },
         };
     }
-    let mut counts: BTreeMap<BuildMarker, Vec<&str>> = BTreeMap::new();
+    // Nodes by version, newest last; each version with the build ids it
+    // runs as.
+    let mut by_version: BTreeMap<semver::Version, (String, BTreeSet<String>, Vec<&str>)> =
+        BTreeMap::new();
     for (node, build) in &usable {
-        counts
-            .entry(build.clone())
-            .or_default()
-            .push(node.node_id.as_str());
+        let version = semver::Version::parse(&build.version).expect("usable");
+        let entry = by_version
+            .entry(version)
+            .or_insert_with(|| (build.version.clone(), BTreeSet::new(), Vec::new()));
+        entry.1.insert(build.build_id.clone());
+        entry.2.push(node.node_id.as_str());
     }
-    if counts.len() == 1 {
-        let (marker, _) = counts.into_iter().next().expect("one build");
+    if by_version.len() == 1 {
+        let (_, (version, ids, _)) = by_version.into_iter().next().expect("one version");
+        let build_id = if ids.len() == 1 {
+            ids.into_iter().next().expect("one id")
+        } else {
+            mixed_build_id(ids.iter().map(String::as_str))
+        };
         return MarkerDecision {
-            marker: Some(marker),
+            marker: Some(BuildMarker { version, build_id }),
             reason: String::new(),
         };
     }
-    // The newest build is where the upgrade is going; ties between two
-    // builds of one version go to the one more nodes run.
-    let target = counts
-        .iter()
-        .max_by(|(a, a_nodes), (b, b_nodes)| {
-            let a_version = semver::Version::parse(&a.version).expect("usable");
-            let b_version = semver::Version::parse(&b.version).expect("usable");
-            a_version
-                .cmp(&b_version)
-                .then(a_nodes.len().cmp(&b_nodes.len()))
-                .then(b.build_id.cmp(&a.build_id))
-        })
-        .map(|(build, _)| build.clone())
-        .expect("two builds");
-    let on_target = counts.get(&target).map(Vec::len).unwrap_or(0);
-    let mut behind: Vec<&str> = counts
-        .iter()
-        .filter(|(build, _)| **build != target)
-        .flat_map(|(_, nodes)| nodes.iter().copied())
+    // The newest version is where the upgrade is going.
+    let (_, (target, _, on_target)) = by_version.iter().next_back().expect("two versions");
+    let target = target.clone();
+    let on_target = on_target.len();
+    let mut behind: Vec<&str> = by_version
+        .values()
+        .filter(|(version, _, _)| *version != target)
+        .flat_map(|(_, _, nodes)| nodes.iter().copied())
         .collect();
     behind.sort_unstable();
     let shown: Vec<&str> = behind.iter().copied().take(5).collect();
@@ -1594,9 +1618,8 @@ pub fn decide_build_marker(
     MarkerDecision {
         marker: current.cloned(),
         reason: format!(
-            "{lead}: {on_target} of {} eligible nodes on {} (waiting for {}{more})",
+            "{lead}: {on_target} of {} eligible nodes on {target} (waiting for {}{more})",
             usable.len(),
-            target.version,
             shown.join(", ")
         ),
     }

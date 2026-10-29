@@ -1262,9 +1262,26 @@ impl ManagerDaemonService {
         }
         let record = self.load_app(&name)?;
         let config = parse_config(&inner.config_json)?;
-        validate_app_config(&record.manifest, &config).map_err(|err| {
-            Status::invalid_argument(format!("the config does not match {name}'s schema: {err}"))
-        })?;
+        if let Err(err) = validate_app_config(&record.manifest, &config) {
+            // A bundled app whose new build is held because the stored
+            // config no longer matches that build's schema: the config that
+            // unblocks it matches the held manifest (this build's), which the
+            // reconciler then adopts.
+            let held = record.is_bundled()
+                && record
+                    .state
+                    .marker_reason
+                    .starts_with(crate::structs::app::UPGRADE_HELD)
+                && crate::apps::bundled_manifest(&name).is_some_and(|embedded| {
+                    embedded.digest() != record.manifest_digest
+                        && validate_app_config(embedded, &config).is_ok()
+                });
+            if !held {
+                return Err(Status::invalid_argument(format!(
+                    "the config does not match {name}'s schema: {err}"
+                )));
+            }
+        }
         let mut changed = record.clone();
         changed.config = config.clone();
         self.check_app_job(&changed)?;
