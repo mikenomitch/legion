@@ -320,13 +320,23 @@ only `job:write`. A stored `require` policy that imposes `mode = "host"`
 makes every job it matches host-level; writing one needs `net:write`, which
 is already an admin grant.
 
+In the reserved `legion-system` namespace, where tasks run on the managers,
+the last three rows are refused outright, host grant or not, and an `exec`
+task must name a non-root user
+([Namespaces: Reserved namespaces](namespaces.md#reserved-namespaces)). The
+app reconciler holds no host grant at all: an app's own `exec` task, which
+runs as the app's uid, is the one host-level task it may submit.
+
 #### KV references in a job
 
 Naming a KV key in a job is reading it: the value reaches the task (or the
-datapath, or an artifact source), so submitting the job needs `kv:read` on
-the key, on top of `job:write`. That covers every place a job can name one:
+datapath, or an artifact source, or a reply), so submitting the job needs
+`kv:read` on the key, on top of `job:write`. That covers every place a job
+can name one:
 
-- `$path/key` values anywhere in the spec,
+- `$path/key` values anywhere in the spec: a core field, an app's jobspec
+  key ([extension values](apps.md#jobspec-extensions)), or a pending key
+  kept under `--allow-unknown-fields`,
 - `kvInjections` env and files, the `{{ kv "…" }}` lookups in their
   templates, and a `templateKv` pointer,
 - an artifact's `auth.kv` (a path filled in by a cluster `artifacts.auth`
@@ -336,7 +346,11 @@ the key, on top of `job:write`. That covers every place a job can name one:
   [Sources](network-handlers.md#sources) the datapath fetches).
 
 `job run`, `job plan`, and template renders and runs check it before anything
-is placed:
+is placed, and the `$path` references and `kvInjections` keys are checked
+**before any of them is resolved**: nothing the submitter may not read is
+ever resolved, so no reply (a plan's extension values, a stored version), no
+parse or schema error (a value of the wrong type), and no app's validate
+call can carry it, and a missing key cannot be told from an unreadable one:
 
 ```console
 $ legion job run web.ncl
@@ -475,6 +489,22 @@ else submitting the app's job directly still needs everything it asks for. A
 check against the caller. Bundled apps' grants are recorded at seed time by
 `legion:bootstrap`, the one grant that is not checked against a person.
 
+The same check bounds what else an app can reach through other people:
+
+- **Pages.** Every permission behind each RPC a sandboxed page lists is
+  checked against the installer (and upgrader), everywhere the RPC reaches,
+  reserved scopes included, because a page calls its RPCs as whoever views
+  it ([Apps: Which RPCs a page may call](apps.md#which-rpcs-a-page-may-call)).
+  No page may list an ACL, token, grant, or app write.
+- **Placement.** Installing an app placed anywhere but `managers`, or
+  changing an app's placement or pool, needs `operator:write`: it decides
+  which nodes hold the app's token ([Apps: Placement](apps.md#placement)).
+- **Host-level work.** The reconciler holds no `host` grant. An app's job
+  may contain nothing host-level besides its own `exec` tasks, which run as
+  the app's own uid; an `exec` health check, a `file://` artifact, or
+  `auth.nodeIdentity` is refused in `legion-system` for everyone
+  ([Host-level jobs](#host-level-jobs)).
+
 ```text
 Error: app gitops 0.2.0 asks for job:write in team-*, which your token does not hold
 Hint: have someone who holds it do this, or ask for it to be granted to you
@@ -518,11 +548,13 @@ holds no token. It reaches Legion only through the SPA, which makes each
 call **as the viewer** with the viewer's own token: only the RPCs the page's
 manifest lists, with every write confirmed by the viewer first. The SPA
 stamps those calls `legion-app-page: <app>/<page>`, and the manager refuses
-one whose RPC the page's current manifest does not list. That header narrows
-what a page may ask for; it never widens what the viewer may do, which the
-RPC's own ACL check decides as for any call. A page can still read what its
-viewer can read through its RPCs and send it elsewhere
-([Apps: What the sandbox does not stop](apps.md#what-the-sandbox-does-not-stop)).
+one whose RPC the page's current manifest does not list (with one answer for
+every such refusal, since the check runs before authentication). That header
+narrows what a page may ask for; it never widens what the viewer may do,
+which the RPC's own ACL check decides as for any call. A page can still read
+what its viewer can read through its RPCs and send it elsewhere
+([Apps: What the sandbox does not stop](apps.md#what-the-sandbox-does-not-stop)),
+but only through RPCs whose permissions its installer held everywhere.
 
 ### Delegated identities
 

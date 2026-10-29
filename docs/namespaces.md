@@ -267,9 +267,24 @@ managers' [system workers](architecture-managers-workers.md#the-system-worker).
   Hint: set user = "nobody" (or another unprivileged user) in the task's config
   ```
 
+  Nor may any task there have the worker act for it on the node, whatever
+  its runtime and user, and whoever submits it: an `exec` health check (the
+  worker runs its command), a `file://` or `git::file://` artifact or image
+  (the worker copies node files in), or an artifact with `auth.nodeIdentity`
+  (the worker presents the node's credential). On a manager the worker is
+  root, so each would make the task root there:
+
+  ```text
+  task "agent" declares exec health check "probe", which the worker runs on
+  the host, and tasks in namespace legion-system may not: they run on the
+  managers' system workers, where the worker that would do it is root.
+  Hint: use an `http` or `tcp` health check, and fetch artifacts from a URL
+  ```
+
   `legion job validate` applies the same check offline when the jobspec
   names its namespace (`namespace = "legion-system"`); the manager applies
-  it on every submit.
+  it on every submit. Apps' tasks also run as each app's own uid
+  ([Apps: What Legion renders](apps.md#what-legion-renders)).
 
 ## Nodes that accept only some namespaces
 

@@ -14,6 +14,10 @@ follow-up that made actions run as the viewer
 ([app-actions-as-viewer-plan.md](../plans/app-actions-as-viewer-plan.md)),
 whose own calls are in
 [app-actions-as-viewer-plan_calls.md](app-actions-as-viewer-plan_calls.md).
+Entries 99-110 are the hardening after an adversarial security review of
+the apps subsystem, ranked among themselves (the two critical holes first,
+the accepted design-level risks at 105-106); they revise entries 5, 42, 80,
+81, and 93, and supersede 55, each of which says so.
 Autoscaler-specific calls are in
 [autoscaler-v2-plan_calls.md](autoscaler-v2-plan_calls.md).
 
@@ -207,6 +211,10 @@ privilege gained. Re-checking on every submit is what stops someone with
 `job:write` on an app's namespace from laundering its grant by editing it.
 
 ## 5. Apps run unprivileged, and changing an app's code needs its whole grant
+
+> **Revised by entries 100 and 101** (hardening): apps also may not hold
+> anything host-level, and each runs as its own uid; `systemWorker.appUser`
+> is gone.
 
 **Call.**
 - Tasks in reserved namespaces may not run as root: exec tasks need a
@@ -1322,6 +1330,10 @@ fields follow.
 
 ## 42. The reconciler submits as an identity that holds exactly the app's recorded grant, plus `job:write` on the app's job (A3)
 
+> **Revised by entry 100** (hardening): the `job:write` rule no longer has
+> `host = true`; an app's own `exec` task is not host-level for the
+> reconciler, and nothing else host-level may be in an app's job.
+
 **Call.** "Reconciler submits are checked against the recorded grant"
 (plan §6.4) is implemented by what the reconciler *is*, not by a bypass: its
 submits go through the ordinary submit path as an `AclIdentity` named
@@ -1576,6 +1588,10 @@ have to upgrade?"; naming them after "waiting for" answers it without
 knowing which build the app runs.
 
 ## 55. Exec tasks get `systemWorker.appUser` only when the manifest names no user, from the leading manager's config (A3)
+
+> **Superseded by entry 101** (hardening): each app runs as its own uid,
+> recorded on the app; manifests may not name `user`, and
+> `systemWorker.appUser` is removed.
 
 **Call.** The render sets `user` on an `exec` task that has none, to the
 leader's `systemWorker.appUser`; a manifest that names a (non-root) user
@@ -1995,6 +2011,10 @@ by its NotFound case.
 
 ## 80. Page-callable RPCs are a closed allowlist classified by effect (A5)
 
+> **Revised by entry 102** (hardening): each entry also names its
+> permissions, which install checks against the installer, and ACL,
+> token, grant, app writes and key rotations were removed.
+
 **Call.** A sandboxed page may name only RPCs in `PAGE_RPCS`, each marked
 read or write by what it does (`RestoreInstance` is a write). Refused
 outright: RPCs that return credentials (`Login`, `CreateAclToken`,
@@ -2011,6 +2031,9 @@ it.
 **Why (security).** Safe by default.
 
 ## 81. The manager re-checks a bridged call against the page's current manifest (A5)
+
+> **Revised by entry 108** (hardening): every refusal now reads the same,
+> since the check runs before authentication.
 
 **Call.** The SPA stamps bridged calls with `legion-app-page: <app>/<page>`;
 a manager layer refuses a stamped call the page's current `rpcs` don't
@@ -2199,6 +2222,9 @@ core schema plus every installed key at its point under
 
 ## 93. KV references in extension values resolve once, at submit (A6b)
 
+> **Revised by entry 99** (hardening): their `kv:read` is checked like any
+> reference's, before resolution; only the dependency edge is dropped.
+
 **Call.** A `{ kv = … }` reference inside an extension value is resolved
 when the job is submitted, like the rest of the spec; a reference whose
 pointer does not resolve in the stored config is dropped.
@@ -2288,3 +2314,333 @@ the header); an app's own client still works in a handler.
 **Why (security).** The manifest's declared permission becomes a bound the
 cluster enforces, and history names the person.
 
+
+## 99. Every KV reference needs `kv:read`, checked before any is resolved (revises entry 93)
+
+*Hardening after adversarial review.*
+
+**Call.** `resolve_jobspec_kv_references` takes the caller and enforces
+`kv:read` on every `$path/key` string in the jobspec, and on every key a
+task's `kvInjections` read (the `templateKv` pointer first), **before** it
+resolves any of them. The dependency-edge `retain` of entry 93 still drops
+the edges of references inside extension values and pending keys, but no
+longer their read check. A miss is `PermissionDenied` naming the key:
+
+```text
+error: permission denied: ... (the jobspec reads kv team-b/db/password; the submitter needs kv read on it)
+```
+
+RunJob, RunJobTemplate, RenderJobTemplate, PlanJob, and the apps' validate
+call all parse through it, so the order holds on every path.
+
+**Alternatives.**
+- (a) Enforce read on the dropped references after the parse, as the
+  reviewer's smallest fix said.
+- (b) Refuse `$` references inside extension values and pending keys.
+- (c) Never echo resolved values in errors (redact parse and schema
+  messages).
+
+**Trade-off.** A submit that names a key the caller cannot read now fails
+with `PermissionDenied` even when the key is missing (it used to be
+`InvalidArgument: kv entry ... not found`), and a template stored in KV is
+read only after its `templateKv` key's check.
+
+**Why (security boundary).** Checking before resolving is the one order in
+which nothing the caller may not read exists in memory to leak: not in a
+plan's extension values, a stored version, a serde error ("unknown priority
+band `hunter2`"), a schema error, or the body posted to an app's validate
+endpoint, and a missing key cannot be told from an unreadable one. (a)
+leaves every echo that happens between resolution and the check; (b) takes
+away a working feature and leaves core fields; (c) has to find every
+message that can quote a value, now and later.
+
+## 100. No host-level construct in an app's job, whoever installs it; the reconciler holds no `host` grant (revises entries 5 and 42)
+
+*Hardening after adversarial review.*
+
+**Call.**
+- `validate_reserved_namespace_task` refuses, in `legion-system`, for
+  every submitter, the constructs that make the worker act for a task on
+  the node: an `exec` health check, a `file://` or `git::file://` artifact
+  or image, and an artifact with `auth.nodeIdentity`.
+- Install, upgrade, and `SetAppConfig` render the app's job and run that
+  check plus the host-level classification, so the person making the
+  change hears the refusal (`InvalidArgument`), not the reconciler later.
+- `reconciler_identity` drops `host = true`. For a submit with
+  `SubmitOrigin::App`, `app_task_host_level_reason` does not count the
+  `exec` runtime itself (its task runs as the app's own uid, entry 101);
+  everything else host-level still needs a host grant the reconciler never
+  holds.
+
+```text
+Error: app checker: task "main" declares exec health check "probe", which the worker runs on the host, and tasks in namespace legion-system may not: ...
+```
+
+**Alternatives.**
+- (a) Let an installer who holds host-level `job:write` in `legion-system`
+  put host-level constructs in an app (record `host` in the grant, keep it
+  on the reconciler identity only then).
+- (b) Keep `host = true` on the reconciler and rely on the namespace check
+  alone.
+- (c) Check only at install.
+
+**Trade-off.** An app that would need an `exec` health check, a node file,
+or the node's identity cannot be an app, even for an admin; it has to be an
+ordinary job. Container `network.mode = "host"`, `dev` sandboxes, and
+plugin runtimes are also refused for apps (they are host-level and the
+reconciler has no grant), though a human with the host grant may still run
+them in `legion-system`.
+
+**Why (security boundary, simplicity).** On a manager the worker is root,
+so each construct was root on the managers for anyone with `app:write`.
+Apps don't need them (health is `http`, code comes from a URL), so
+"never" is simpler to state and to check than (a)'s "unless the installer
+held host", which would also have to track the grant through upgrades and
+config changes. (b) leaves whatever host-level construct the namespace
+check does not name (a host-network container, a plugin runtime) open to
+`app:write`. (c) misses `SetAppConfig`, whose artifact code fields render
+new artifacts.
+
+## 101. Each app runs as its own uid from a fixed range, assigned by the store; `systemWorker.appUser` is removed (supersedes entry 55)
+
+*Hardening after adversarial review.*
+
+**Call.** The app record gains `uid`. `insert_app` assigns the lowest free
+uid from `APP_UID_BASE` (1900000000; 65,536 of them) inside the replicated
+write, so two installs never pick the same one, and a unique index holds
+it; a migration numbers existing apps in name order. The render always sets
+an `exec` task's `user` to that uid (gid the same number), a manifest may
+not name `user`, and the exec runtime runs a bare numeric uid with no
+passwd entry (`HOME=/nonexistent`). `systemWorker.appUser` is gone.
+
+```text
+gitops 0.2.0 runs its own code (1 artifact) on your managers, as its own unprivileged user,
+```
+
+**Alternatives.**
+- (a) Per-allocation uids picked by the worker, like the container
+  user-namespace pool.
+- (b) A uid hashed from the app's name.
+- (c) Named users (`legion-app-<name>`) the operator creates.
+- (d) Keep one `appUser` and protect `secrets/` with per-allocation groups.
+
+**Trade-off.** The range is fixed and undocumented hosts could already use
+it (documented: keep it free). A freed uid is reused by the next install,
+so files a removed app left outside its allocation directory (none by
+default) would be readable by the next. Breaking: `systemWorker.appUser`
+and manifests' `user` on exec tasks are refused.
+
+**Why (security boundary, simplicity).** One shared `nobody` let any app
+read the autoscaler's token from its `secrets/` (owner-only files are
+nothing between processes of one uid). A uid per app in the record is one
+number the render, the docs, and an operator's `ps` agree on; it survives
+restarts and moves between nodes. (a) gives two replicas of one app
+different users and needs worker-side bookkeeping for no gain between
+apps; (b) collides; (c) needs host provisioning before an install works;
+(d) still shares the uid for everything else (the config file, `/proc`).
+Forcing the user closes the remaining hole: a manifest that could name a
+user could name another app's uid.
+
+## 102. A page's `rpcs` are bounded by its installer's rights, checked at install as a grant; ACL, token, app writes and key rotations leave `PAGE_RPCS` (revises entries 80 and 81)
+
+*Hardening after adversarial review.*
+
+**Call.** `PAGE_RPCS` names the permissions behind each RPC (its gate, plus
+the extra checks a few make: `RestoreInstance` is `snapshot:read` and
+`job:write`). Install and upgrade turn each listed RPC into requested rules
+covering everywhere it reaches, reserved scopes included (`namespaces = ["*",
+"legion-*"]`, `paths = ["*", "legion/*"]`, `pools = ["*", "legion-*"]`), and
+run the grant check against the caller. ACL policy, user, token, exec-key,
+grant and namespace-policy writes, `DeleteJoinToken`, every app write, and
+`RotateDataKey`, `RewrapKv`, `RotateMeshCa` are no longer page-callable. An
+integration test checks each entry's first permission against the
+`acl_endpoints` gate table.
+
+```text
+Error: page "console" lists GetKv, which runs as whoever views the page, so it asks for kv:read on legion/*, which your token does not hold (...)
+```
+
+**Alternatives.**
+- (a) Bound every bridged call at runtime by viewer ∩ a page grant the
+  installer recorded, in `authenticate_acl` (the reviewer's second fix).
+- (b) Require the permissions only on non-reserved scopes (`*`).
+
+**Trade-off.** Installing a page with broad RPCs takes a near-management
+token, and a page whose installer later loses rights keeps working
+("grants outlive their granter", a TODO). The bound is per RPC's own
+checks, not per request: a viewer still decides what a write targets.
+
+**Why (security boundary, simplicity).** A static check is the grant check
+everyone already knows, with its messages and dry run; (a) needs an
+intersection of glob rule sets the ACL engine does not have, applied on
+every call's identity, including the management viewers who bypass rules.
+Asking for reserved scopes too is what makes "a page can never make a
+viewer do what its installer couldn't" true without (a): a viewer's call
+can target `legion-system` and `legion/` keys. Writes that change who may
+do what are refused outright, because a "Run as me" from an administrator
+would be a full takeover.
+
+## 103. Default filling is bounded, and a schema that applies itself to the same value is refused at install
+
+*Hardening after adversarial review.*
+
+**Call.** `fill_defaults` does not follow a `$ref` back into a schema it is
+already inside of without descending into the value, nor at all inside a
+value a default just supplied, and fails past 10,000 added values or
+100,000 schema applications. `compile_schema` (extension and config
+schemas) refuses a schema whose `$ref`/`allOf`/`anyOf`/`oneOf`/`not`/`if`
+chain comes back to itself on the same value, which the validator follows
+until its stack overflows and aborts the process (verified: `{"allOf":
+[{"$ref": "#"}]}` crashed the test binary).
+
+**Alternatives.** Only the reviewer's insertion cap; recursing into no
+inserted default at all.
+
+**Trade-off.** A recursive schema fills defaults one level into a value it
+supplied (it still fills everything the value spells out); a schema with a
+same-value loop, which no validator could finish, is refused at install.
+
+**Why (performance, robustness).** Other code is about to reuse the fill
+for app object kinds, so it has to be safe on any schema, not just the
+reviewer's; the cycle guard keeps legitimate recursion (trees, linked
+lists) working where a blanket "no recursion into defaults" would lose a
+default's own nested defaults.
+
+## 104. Placement takes `operator:write` (not the app's grant)
+
+*Hardening after adversarial review.*
+
+**Call.** `UpdateAppSettings` that changes placement or pool, and
+`InstallApp` of a manifest whose `placement` is not `managers`, need
+`operator:write` beside `app:write`. Replicas and resources do not.
+
+```text
+Error: changing the placement or pool decides which nodes hold app autoscaler's token and run its code with its grant, so it needs operator:write as well as app:write
+```
+
+**Alternatives.** Require the app's whole grant, as a code field does (the
+reviewer's first fix); refuse pools whose worker types do not list
+`legion-system`.
+
+**Trade-off.** A person who may manage an app but not operate the cluster
+can no longer move it; seeding (`apps.<name>.placement` in the manager
+config) is the operator's and unchanged.
+
+**Why (security boundary).** Placement decides where the token lands: a
+statement about the cluster's nodes, which is what `operator` means. The
+app's grant says nothing about who has root on which pool, and refusing
+pools by worker type would break `any` and `workers` placement, which are
+features.
+
+## 105. Delegations stay coarse: a permission on a scope, for 60 seconds (accepted)
+
+*Hardening after adversarial review.*
+
+**Call.** Not changed. A delegation is `resource:action` on the pressed
+context, usable for its 60 seconds on any RPC that permission gates; a
+"Pause" press lets the app call `ScaleTask(count = 0)` on that job as the
+viewer.
+
+**Alternatives.** Bind a delegation to named RPCs, or to one call.
+
+**Trade-off.** The app can do more as the viewer than the button says,
+within the permission the viewer approved on that one context; an app can
+also skip delegation and use its own grant.
+
+**Why (simplicity).** The bound that matters is the scope and the
+permission, which the manifest declares and the viewer holds; RPC-level
+binding needs a per-RPC permission model the ACLs do not have (entry 102
+is the first table of one). Recorded in TODO.md as a follow-up.
+
+## 106. A view entry without a permission answers with the app's grant (accepted for now)
+
+*Hardening after adversarial review.*
+
+**Call.** Not changed. `job`, `task`, and `node` entries may omit
+`permission`; then any `app:read` holder can ask for the view on any
+context, and the app answers from its own grant.
+
+**Alternatives.** Default the permission to `job:read` (or `node:read`) on
+the context.
+
+**Trade-off.** An app whose view shows more than names leaks it to every
+`app:read` holder; the bundled autoscaler declares a permission on every
+entry.
+
+**Why (scope).** Changing a default is its own decision (it changes what
+existing manifests show to whom); the hardening pass leaves it as a TODO,
+with the default the reviewer suggests.
+
+## 107. A bridged write is confirmed for the message it will send, and the dialog arms
+
+*Hardening after adversarial review.*
+
+**Call.** The SPA refuses a request that spells a field both ways (`nodeId`
+and `node_id`), derives the confirmation's target and detail from the
+decoded message's JSON, keeps "Run as me" disabled for 500 ms after each
+confirmation appears (re-armed for each queued one), and focuses Cancel.
+
+**Alternatives.** Pick a spelling and drop the other; a longer delay; a
+typed confirmation.
+
+**Trade-off.** A page that sends both spellings gets `invalid_argument`
+rather than a guess; every approval waits half a second.
+
+**Why (safety).** The decoder keeps the last spelling, so showing the raw
+request let a page show one node and forget another; refusing is clearer
+than silently choosing. The delay stops a double-click from approving the
+next queued call.
+
+## 108. The page guard answers every refusal alike, before authentication
+
+*Hardening after adversarial review.*
+
+**Call.** `check_page_call` returns one `PermissionDenied` for an
+uninstalled or disabled app, an undeclared page, and an unlisted RPC, and
+logs the reason instead.
+
+**Alternatives.** Run the check inside `authenticate_acl`, after
+authentication, with detailed messages for authenticated callers.
+
+**Trade-off.** A page author debugging a refusal reads the manager's log
+(the SPA already refuses most cases itself, with details).
+
+**Why (simplicity).** The tower layer sees every route, Open ones
+included; moving the check into `authenticate_acl` would skip RPCs that
+never authenticate (`Login`), and the detailed message helps no one the
+SPA's own check does not already help.
+
+## 109. An app is its stamped job: install takes over no job, and identity needs `managedBy`
+
+*Hardening after adversarial review.*
+
+**Call.** Install refuses (`FailedPrecondition`) when `legion-system/<name>`
+exists and its latest version is not stamped `managedBy` this app.
+`app_of_identity` counts an allocation as the app's only when the version
+it runs carries the stamp for that app, and views, actions, pages, and
+validate calls are forwarded only to such allocations.
+
+**Alternatives.** Check the stamp at install only.
+
+**Trade-off.** An operator's own job named like a future app blocks that
+app's install until it is destroyed.
+
+**Why (security boundary).** The job name alone is not the app: allocations
+of a version someone submitted straight to the job would otherwise speak
+for the app (app-plane RPCs, delegations) and receive its viewers'
+assertions.
+
+## 110. Idempotency scopes include how the caller authenticated
+
+*Hardening after adversarial review.*
+
+**Call.** A scope is `<source>:accessor:<id>` or `<source>:principal:<name>`.
+
+**Alternatives.** Prefix with the source only for callers without an
+accessor.
+
+**Trade-off.** Retries recorded before the change are not recognized
+(nothing to keep: no installed base).
+
+**Why (simplicity).** One shape for every caller; a JWT subject named like a
+delegated identity or an accessor can never share another's scope.

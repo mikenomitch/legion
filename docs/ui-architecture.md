@@ -809,8 +809,10 @@ runs in the browser, and it runs outside the SPA's origin.
   `"null"` (opaque), and only while the frame holds its first document: the
   frame's second `load` (the page navigated away) closes the bridge for good.
   At most 16 calls run at once, and 4 confirmations wait.
-- **Calls.** `call` is refused unless the RPC is in the allowlist and unary.
-  The request is parsed from proto3 JSON with the generated message type
+- **Calls.** `call` is refused unless the RPC is in the allowlist and unary,
+  and refused (`invalid_argument`) when the request spells a field both
+  ways (`nodeId` and `node_id`, `aliasedField`), since the decoder would
+  keep only one of them. The request is parsed from proto3 JSON with the generated message type
   (`Manager.methods`), a write waits for the dialog, and the call goes out
   through `managerClient` (so it carries the viewer's token) with the
   `legion-app-page: <app>/<page>` header, which the manager checks against
@@ -818,8 +820,12 @@ runs in the browser, and it runs outside the SPA's origin.
   `action` use `GetAppView` and `InvokeAppAction` for the page's own app;
   every action is confirmed. `navigate` takes in-app routes only.
 - **Confirmation.** A modal the SPA draws over everything, outside the frame,
-  naming the app, the RPC (or action), and the target taken from the request
-  (`job`, `name`, `node`, `path`, ...), with the request itself below.
+  naming the app, the RPC (or action), and the target taken from the
+  **decoded** request (`message.toJson()`: `job`, `name`, `nodeId`, `path`,
+  ...), with that message below, so it names what will be sent. One shows
+  at a time; **Run as me** is disabled for `CONFIRM_ARM_MS` (500 ms) after
+  each appears, and Cancel has the focus, so a double-click cannot approve
+  the next one.
 
 ## Namespaces
 

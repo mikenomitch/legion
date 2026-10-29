@@ -146,7 +146,7 @@ complete example with comments.
 | `version` | Required for an installed app, any non-blank string without spaces; a bundled manifest has none. |
 | `placement` | Where the app runs by default ([Placement](#placement)). |
 | `replicas` | Each task's `count` by default. |
-| `job` | A jobspec without `name` or `namespace`, which Legion sets. Must define `task` or `tasks`, and parse as a jobspec. |
+| `job` | A jobspec without `name` or `namespace`, which Legion sets. Must define `task` or `tasks`, and parse as a jobspec. An `exec` task may not set `user`, and nothing in it may be host-level besides the `exec` runtime itself ([Trust model](#trust-model)). |
 | `permissions` | ACL rules in the shape `legion acl policy apply` takes: what the app's `legion` identity asks to be granted. |
 | `ui` | UI registrations: the slots the app's views appear in, the actions they offer, the port they are served on, and the refresh interval ([Views and actions](#views-and-actions)). Unknown fields are errors. |
 | `extensions` | The keys the app adds to the jobspec, one per extension point, each with a JSON Schema ([Jobspec extensions](#jobspec-extensions)). |
@@ -165,9 +165,14 @@ it (and, for a bundled app, the build marker):
 - the placement becomes each task's `permit`, constraints, and affinities
   (below), replacing the manifest's permit and adding to its constraints;
 - `resources` from `legion app set --cpu/--memory` override each task's;
-- an `exec` task that names no `user` runs as `systemWorker.appUser`
-  (default `nobody`). Tasks in `legion-system` may not run as root
-  ([Namespaces](namespaces.md#reserved-namespaces));
+- every `exec` task runs as the **app's own uid** (and a gid of the same
+  number): one per app, the lowest free one from `1900000000` up, assigned
+  when the app is installed or seeded and kept on its record (`legion app
+  status` shows it, and `GetApp` returns it as `uid`). No two apps share
+  one, so one app cannot read another's `secrets/` (its `legion` token) or
+  config file. The uid needs no passwd entry on the node (its
+  `HOME` is `/nonexistent`); keep `1900000000`-`1900065535` free of other
+  users. A manifest may not name an exec task's `user`;
 - every task's `legion` identity carries the app's recorded grant, as its
   `permissions` (a `policies` list in the manifest is dropped);
 - the config is written as a file into each `exec` and `container` task's
@@ -184,6 +189,17 @@ it (and, for a bundled app, the build marker):
 Placement is a setting, not part of the build: `legion app set autoscaler
 --placement workers` changes the record, and the reconciler resubmits the
 job (a normal rollout).
+
+**Placement takes `operator:write`.** Where an app runs is where its
+`legion` token lands and where its code runs with its grant, so changing
+`--placement` or `--pool`, or installing a manifest whose `placement` is not
+`managers`, needs `operator:write` as well as `app:write`. With `app:write`
+alone, a person could move an app with a broad grant onto a pool where they
+have root, and read its token there.
+
+```text
+Error: changing the placement or pool decides which nodes hold app autoscaler's token and run its code with its grant, so it needs operator:write as well as app:write
+```
 
 | `placement` | Permit | Constraint / affinity |
 | --- | --- | --- |
@@ -204,7 +220,7 @@ false` on every manager, `managers` placement has nowhere to run, and
 
 ```console
 $ legion app install https://example.com/gitops/0.2.0/app.ncl
-gitops 0.2.0 runs its own code (1 artifact) on your managers, as user nobody,
+gitops 0.2.0 runs its own code (1 artifact) on your managers, as its own unprivileged user,
 in legion-system, and asks for:
   job       read, write   namespaces: team-*
   template  read
@@ -236,14 +252,38 @@ Error: app gitops 0.2.0 asks for job:write in team-*, which your token does not 
 Hint: have someone who holds it do this, or ask for it to be granted to you
 ```
 
+**A page's `rpcs` count too.** Every permission behind an RPC a sandboxed
+page lists is checked the same way, everywhere the RPC reaches, reserved
+scopes included ([Which RPCs a page may call](#which-rpcs-a-page-may-call)):
+a page runs its RPCs as whoever views it, so installing it takes holding
+what it can make them do. A placement other than `managers` takes
+`operator:write` ([Placement](#placement)).
+
+**Nothing host-level.** Install renders the app's job and refuses one that
+would make the worker act for it on the node: an `exec` health check, a
+`file://` (or local `git::file://`) artifact or image, or an artifact with
+`auth.nodeIdentity`. On a manager the worker is root, so any of them would
+be root on the managers. Apps don't need them: health checks are `http` or
+`tcp`, and code comes from a URL. The refusal holds for every installer,
+management tokens included; a job that needs one is an ordinary job.
+
+```text
+Error: app checker: task "main" declares exec health check "probe", which the worker runs on the host, and tasks in namespace legion-system may not: they run on the managers' system workers, where the worker that would do it is root.
+Hint: use an `http` or `tcp` health check, and fetch artifacts from a URL
+```
+
 A bundled app's name cannot be installed, and an installed name cannot be
-installed again (`legion app upgrade` replaces a manifest).
+installed again (`legion app upgrade` replaces a manifest). Install never
+takes over a job: if `legion-system/<name>` exists and its latest version is
+not stamped `managedBy` this app (an operator's own job, say), install is
+refused (`FailedPrecondition`); destroy the job or pick another name. The
+stopped job an uninstall leaves is still the app's, so reinstalling works.
 
 ### Upgrading
 
 ```console
 $ legion app upgrade gitops ./gitops-0.3.0.ncl
-gitops 0.3.0 runs its own code (1 artifact) on your managers, as user nobody, ...
+gitops 0.3.0 runs its own code (1 artifact) on your managers, as its own unprivileged user, ...
 Permission changes:
   + net       read
   - template  read
@@ -252,8 +292,9 @@ upgraded gitops 0.2.0 → 0.3.0
 ```
 
 A new manifest is new code running with the grant, so upgrading needs
-`app:write` and every permission of the **new** manifest, as installing
-does. When the new manifest asks for anything the installed one did not, the
+`app:write` and every permission of the **new** manifest, and of its pages'
+`rpcs`, as installing does; its job is held to the same rules (nothing
+host-level, no `user`). When the new manifest asks for anything the installed one did not, the
 upgrade needs approval (`--yes`, or the question); one that only keeps or
 drops permissions upgrades without asking. The stored config must match the
 new schema; `--config <file>` replaces it in the same step. `--dry-run`
@@ -288,6 +329,10 @@ Error: changing app autoscaler's code (/plugins/aws/source) runs code with its g
 scale:write in *, which your token does not hold
 ```
 
+The job a new config renders is held to the install rules too: an artifact
+code field set to a `file://` source is refused (`InvalidArgument`) for
+everyone, grant or not.
+
 ### Settings, enable, disable
 
 ```console
@@ -298,9 +343,11 @@ $ legion app disable autoscaler     # stops the job; keeps the record, config, a
 $ legion app enable autoscaler
 ```
 
-`--pool` picks the worker pool for `workers` and `any` placement. Enabling
-an app that is already enabled is not a no-op: it is a record write, which
-retries a reconcile a refusal parked ([Failures](#failures)).
+`--pool` picks the worker pool for `workers` and `any` placement. Changing
+`--placement` or `--pool` needs `operator:write` as well as `app:write`
+([Placement](#placement)); replicas and resources need only `app:write`.
+Enabling an app that is already enabled is not a no-op: it is a record
+write, which retries a reconcile a refusal parked ([Failures](#failures)).
 
 ### Uninstalling
 
@@ -472,13 +519,26 @@ Limits:
   Bundled apps are the exception: their grants are recorded by
   `legion:bootstrap` at seed time, without a check, because the manifest is
   part of the binary you chose to run, which is already the manager.
-- **`app:write` is not the grant.** It changes settings, config outside code
-  fields, and enabled state; it cannot add code to an app.
-- **Apps run unprivileged.** Tasks in `legion-system` may not run as root,
-  and privileged containers are refused there
-  ([Namespaces](namespaces.md#reserved-namespaces)). Root on a manager could
-  read the raft state and the data directory, so an app's blast radius stays
-  its grant.
+- **`app:write` is not the grant.** It changes replicas, resources, config
+  outside code fields, and enabled state; it cannot add code to an app, and
+  it cannot move one (placement takes `operator:write`,
+  [Placement](#placement)).
+- **Apps run unprivileged, each as its own user.** Tasks in `legion-system`
+  may not run as root, and privileged containers are refused there
+  ([Namespaces](namespaces.md#reserved-namespaces)). Every app's `exec`
+  tasks run as the app's own uid, so one app cannot read another's
+  `secrets/` and borrow its grant. Root on a manager could read the raft
+  state and the data directory, so an app's blast radius stays its grant.
+- **Nothing host-level in an app's job.** An `exec` health check, a
+  `file://` artifact, or `auth.nodeIdentity` would have the worker, root on
+  a manager, act for the app; they are refused in `legion-system` whoever
+  submits them, and install, upgrade, and `config set` refuse a render that
+  holds one. The reconciler holds no `host` grant: an app's own `exec` task,
+  which runs as its uid, is the one host-level construct it may submit.
+- **An app is its stamped job.** Only an allocation of a `legion-system/<app>`
+  version the reconciler stamped `managedBy` that app speaks for the app
+  (app-plane RPCs, delegations) or receives its viewer assertions; a version
+  someone submits straight to the job does not.
 - **Tenants cannot reach apps.** ACL globs do not match the reserved
   `legion-*` namespaces or the `legion/` KV prefix unless the pattern names
   them, so a tenant admin with `namespaces = ["*"]` cannot edit, exec into,
@@ -492,8 +552,11 @@ Limits:
   reaches Legion only through the bridge, as its viewer, within its `rpcs`,
   with every write confirmed. What a page *can* do is read what its viewer
   can read through those RPCs and send it elsewhere
-  ([What the sandbox does not stop](#what-the-sandbox-does-not-stop)), so a
-  page's app is trusted with its viewers' read access.
+  ([What the sandbox does not stop](#what-the-sandbox-does-not-stop)). That
+  reach is bounded by its installer: listing an RPC takes holding its
+  permissions everywhere, so a page never makes a viewer do what whoever
+  installed it could not, and no page may change ACLs, tokens, grants, or
+  apps.
 
 ## ACLs
 
@@ -509,9 +572,10 @@ with a `names` selector, matched against app names:
 | --- | --- |
 | `ListApps` | `app:read` (the list is filtered by `names`) |
 | `GetApp` | `app:read` on the app |
-| `InstallApp` | `app:write` on the app, and every permission the manifest asks for |
-| `UpgradeApp` | `app:write`, and every permission the new manifest asks for |
-| `UninstallApp`, `SetAppEnabled`, `UpdateAppSettings` | `app:write` |
+| `InstallApp` | `app:write` on the app, every permission the manifest asks for, every permission behind its pages' `rpcs`, and `operator:write` for a placement other than `managers` |
+| `UpgradeApp` | `app:write`, every permission the new manifest asks for, and every permission behind its pages' `rpcs` |
+| `UninstallApp`, `SetAppEnabled` | `app:write` |
+| `UpdateAppSettings` | `app:write`, and `operator:write` to change placement or pool |
 | `SetAppConfig` | `app:write`, and the app's whole grant when a code field changes |
 | `ListUiExtensions` | `app:read` (filtered by `names`, and by each entry's permission) |
 | `GetAppView` | `app:read` on the app, and the entry's permission on the context |
@@ -950,7 +1014,8 @@ its pages may do with a viewer's access.
 ### Which RPCs a page may call
 
 `rpcs` is checked at install against a fixed list of the Manager RPCs pages
-may call, each classified by what it does:
+may call, each classified by what it does, and against what the installer
+holds:
 
 - **Reads** (`GetJobInfo`, `ListJobs`, `GetScalingStatus`, `GetKv`, ...)
   run as the viewer without asking.
@@ -963,6 +1028,13 @@ may call, each classified by what it does:
     `CreateAclToken`, `CreateJoinToken`, `GetRaftJoinToken`,
     `MintExecTicket`, `CreateExecKey`, `IssueBootTicket`,
     `GetStateBackup`): a page must never hold one;
+  - RPCs that change who may do what: ACL policy, user, token, exec-key,
+    and grant writes (`UpsertAclPolicy`, `DeleteAclToken`, `RevokeGrant`,
+    ...), namespace policies, and `DeleteJoinToken`;
+  - app writes (`InstallApp`, `UpgradeApp`, `UninstallApp`,
+    `SetAppEnabled`, `UpdateAppSettings`, `SetAppConfig`): an app's grant
+    and pages reach other people;
+  - key rotations (`RotateDataKey`, `RewrapKv`, `RotateMeshCa`);
   - break-glass operations (`IssueRaftCommand`, `ResetKeyring`,
     `RewrapRootKey`);
   - streaming RPCs (`StreamEvents`, `WatchScalingPolicies`,
@@ -976,6 +1048,21 @@ may call, each classified by what it does:
 
 ```
 error: app gitops: ui.pages[0]: page "console": RPC "CreateAclToken" returns a credential or the cluster's secrets, which a page must never hold
+```
+
+**A page is bounded by its installer.** A page calls its RPCs as whoever
+views it, an administrator included, so installing or upgrading to a page
+that lists an RPC takes holding every permission behind it, **everywhere the
+RPC reaches**: `job:read` in `*` and `legion-*` for `GetJobInfo`, `kv:read`
+on `*` and `legion/*` for `GetKv`, `node:read` in pools `*` and `legion-*`
+for `GetNodes`, and so on (`RestoreInstance` takes `snapshot:read` and
+`job:write`). The check is the grant check
+([Job grants](auth-and-acls.md#job-grants)), so a page can never make a
+viewer do what its installer could not. In practice, installing a page with
+broad RPCs takes a broad token.
+
+```text
+Error: page "console" lists GetKv, which runs as whoever views the page, so it asks for kv:read on legion/*, which your token does not hold (`*` does not reach reserved `legion-*` namespaces or `legion/` keys; only a rule that names them covers a request for them)
 ```
 
 ### How a page is served
@@ -1058,15 +1145,26 @@ the frame, naming the app, the RPC, and its target: `gitops wants to run
 RunJob on team-a/web as you`, with the request below. The page waits for the
 answer; nothing is sent until the viewer says yes.
 
+- The target and the request shown are the **decoded message the call
+  will send**, not the page's own JSON. A request that spells a field both
+  ways (`nodeId` and `node_id`, which the decoder would resolve to one of
+  them) is refused with `invalid_argument` and never shown.
+- **Run as me** stays disabled for half a second after each confirmation
+  appears, and Cancel has the focus, so a click or double-click aimed at
+  something else cannot approve it. Confirmations come one at a time, each
+  armed afresh.
+
 **The allowlist is checked twice.** The SPA refuses an RPC outside `rpcs`
 before anything is sent, and stamps every call it does send with the
 `legion-app-page: <app>/<page>` header. The manager checks that header
 against the app's **current** manifest and refuses (`PermissionDenied`) an
 RPC the page does not list, so an upgrade that narrows `rpcs` holds even for
 a page that is already open, and a bug in the SPA cannot widen a page's
-reach. The manager logs each such call with the page. Neither check
-authorizes the viewer: every call is still the viewer's own, checked
-against the viewer's ACLs like any other.
+reach. The check runs before the caller is authenticated, so every refusal
+reads the same (`this sandboxed page may not make this call: ...`) and names
+neither the apps installed nor a page's `rpcs`; the manager's log says
+which it was. Neither check authorizes the viewer: every call is still the
+viewer's own, checked against the viewer's ACLs like any other.
 
 **Only the page is heard.** The SPA accepts a message only from the page's
 own frame (its window, in the opaque origin) and only while the frame still
@@ -1083,6 +1181,8 @@ frame navigates, but whatever the page read before that is gone.
 
 So treat a page's app as **trusted with its viewers' read access** through
 the RPCs it lists, and read the install prompt's `rpcs` with that in mind.
+That access never exceeds what its installer holds: install checks every
+permission behind the page's `rpcs` against the installer, everywhere.
 Writes are different: each one needs the viewer's yes, every time. And a
 page never holds a token: the most it can do is what its viewer could do,
 narrowed by its `rpcs`, while its viewer has it open.
@@ -1095,7 +1195,9 @@ narrowed by its `rpcs`, while its viewer has it open.
 | `... could not serve this page: ... answered ... with "application/json"; a page is served as text/html` | the app's answer is not HTML | serve `text/html` |
 | `... a page is at most 1048576` | the bundle is over 1 MiB | inline less |
 | `not_allowed` in the page | the RPC is not in the page's `rpcs` | add it to the manifest (and upgrade) |
-| `permission_denied` in the page | the viewer lacks the RPC's permission, or the manager refused an RPC the current manifest does not list | |
+| `permission_denied` in the page | the viewer lacks the RPC's permission, or the manager refused a call the page's current manifest does not allow (`this sandboxed page may not make this call`; the manager's log names the reason) | |
+| `invalid_argument` in the page, `sets ... under both of its names` | the request spells a field both ways (`nodeId` and `node_id`) | send one spelling |
+| install refused: `page "..." lists ..., which runs as whoever views the page, so it asks for ...` | the installer does not hold a permission behind the page's `rpcs` everywhere | have someone who does install it, or list fewer RPCs |
 | `The page left the bundle ...; its bridge to Legion is closed` | the page navigated its frame | reload |
 
 ## Jobspec extensions
@@ -1501,7 +1603,9 @@ them, and which allocation answered. The MCP server exposes
   installed keys either (there is no importable jobspec contract yet), so a
   wrong value is caught at submit or by `legion job validate`.
 - **A KV reference inside an extension value is resolved once**, at submit,
-  and not re-rendered when the key changes.
+  and not re-rendered when the key changes. Like any reference, it needs
+  `kv:read` on the key, checked before it is resolved
+  ([KV references in a job](auth-and-acls.md#kv-references-in-a-job)).
 - **Adoption is read-side.** A pending value an installed app claims is
   reported as that app's (`adopted`), but stays stored as pending until the
   job is resubmitted; uninstalling the app makes it pending again rather
@@ -1565,9 +1669,13 @@ them, and which allocation answered. The MCP server exposes
   whose job names a KV key (a template, a reference) needs `kv:read` on it in
   its own `permissions`; otherwise the submit is refused and the app shows
   `reconcile refused`.
-- **Managers should agree on `systemWorker.appUser`.** The leading manager's
-  value is rendered into exec tasks, so a manager with another value renders
-  a different job, and resubmits the app when it takes over.
+- **App uids are a fixed range.** Apps' `exec` tasks run as uids from
+  `1900000000` up, with no passwd entry; a host whose own users sit in that
+  range would share them. Container tasks get their own per-allocation
+  user namespace instead, and sandbox tasks their VM.
+- **No host-level constructs in an app's job, even for an admin.** An app
+  that would need an `exec` health check, a node file, or the node's
+  identity cannot be an app; run it as an ordinary job.
 - **Backoff is the leader's memory.** A new leader retries a failing or
   refused app once, then backs off from scratch.
 - **`config get` prints JSON**, not Nickel. JSON is valid input for `config

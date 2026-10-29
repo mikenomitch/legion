@@ -8,6 +8,16 @@
 > the declared permission and its grant, rather than with its own grant.
 > That plan wins where they differ; the text below is kept as written.
 
+> **Hardened after an adversarial security review** (2026-10-29; calls
+> entries 99-110 win where they differ from the text below, which is kept as
+> written): every KV reference needs `kv:read` before it is resolved; an
+> app's job may hold nothing host-level, and the reconciler has no `host`
+> grant; each app runs as its own uid recorded on the app, replacing
+> `systemWorker.appUser` (§6.2, §6.3); a page's `rpcs` are bounded by its
+> installer's rights and exclude ACL, token and app writes (§6.5);
+> placement changes take `operator:write`; an app's identity needs the
+> reconciler's `managedBy` stamp.
+
 **Status: SHIPPED** (every phase, A1-A6, by 2026-10-29; written 2026-10-19; reconciler and upgrade
 details, jobspec extensions, and strict unknown fields added 2026-10-27).
 **A1 shipped 2026-10-28** (the `legion-system` namespace, the reserved-glob
