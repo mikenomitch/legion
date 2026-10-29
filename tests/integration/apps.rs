@@ -1507,6 +1507,70 @@ fn live_grants(fx: &Fixture, job: &str) -> R<usize> {
         .count())
 }
 
+/// An uninstall that lands while a reconciler submit is in flight (the
+/// submit had read the record, then spent seconds resolving pins) leaves no
+/// job running (hardening after the adversarial review, H2): the submit is
+/// compare-and-set on the record, in the same entry as the version, so it is
+/// refused; and a job that still comes back stamped for an app with no
+/// record is stopped, and its grants revoked, by the next pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uninstall_racing_a_submit_leaves_no_job_running_test() -> R<()> {
+    let fx = fixture()?;
+    install(&fx, &lite_manifest("racer"), &fx.admin).await?;
+    let record = fx.app("racer")?;
+    let rendered = legion::manager::apps::render_for(&record, None).map_err(|err| anyhow!(err))?;
+    uninstall_app(&fx, "racer", false, false).await?;
+    let late =
+        legion::manager::apps::submit_rendered(&fx.svc, &record, &rendered, "app:racer:x:none")
+            .expect_err("the record is gone");
+    assert!(
+        format!("{late:#}").contains("app racer's job was not submitted: it was uninstalled"),
+        "{late:#}"
+    );
+    assert!(fx.version(&app_job_id("racer"))?.is_none(), "no job");
+
+    // The same for a disable, and for any other write in between.
+    install(&fx, &lite_manifest("flipper"), &fx.admin).await?;
+    let record = fx.app("flipper")?;
+    let rendered = legion::manager::apps::render_for(&record, None).map_err(|err| anyhow!(err))?;
+    fx.set_enabled("flipper", false).await?;
+    let late =
+        legion::manager::apps::submit_rendered(&fx.svc, &record, &rendered, "app:flipper:x:none")
+            .expect_err("the record was disabled");
+    assert!(format!("{late:#}").contains("it was disabled"), "{late:#}");
+    fx.set_enabled("flipper", true).await?;
+    let late =
+        legion::manager::apps::submit_rendered(&fx.svc, &record, &rendered, "app:flipper:y:none")
+            .expect_err("the record changed");
+    assert!(
+        format!("{late:#}").contains("its record changed"),
+        "{late:#}"
+    );
+    // The reconciler's own pass renders from the current record.
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    assert!(submitted(&reconciler.reconcile_app("flipper").await));
+
+    // A job left running, stamped for an app whose record is gone: found by
+    // a full pass, stopped, and its grants revoked.
+    let mut orphan = lite_manifest("orphan");
+    orphan["permissions"] = json!([{ "resources": ["node"], "actions": ["read"] }]);
+    install(&fx, &orphan, &fx.admin).await?;
+    assert!(submitted(&reconciler.reconcile_app("orphan").await));
+    let job = app_job_id("orphan");
+    assert!(live_grants(&fx, &job)? >= 1);
+    assert!(fx.store.delete_app("orphan")?);
+    let mut fresh = fx.reconciler(marker("0.1.0", "a"));
+    let outcomes = fresh.reconcile_all().await;
+    assert!(
+        outcomes.contains(&("orphan".to_string(), PassOutcome::Stopped)),
+        "{outcomes:?}"
+    );
+    assert!(fx.version(&job)?.context("job")?.is_stopped());
+    assert_eq!(live_grants(&fx, &job)?, 0);
+    assert_eq!(fresh.reconcile_app("orphan").await, PassOutcome::Missing);
+    Ok(())
+}
+
 /// One app record that does not decode breaks nothing else (hardening after
 /// the adversarial review, H3): every job submit still works, the list shows
 /// it `corrupt` beside the others, the reconciler skips it, and uninstall

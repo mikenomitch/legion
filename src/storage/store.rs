@@ -10441,12 +10441,17 @@ impl Store {
     /// `managedBy = { app, digest }`. An unchanged submit stamps the latest
     /// version in place when its stamp differs, so a job a direct edit left
     /// byte-identical to the render still reads as managed.
+    ///
+    /// Compare-and-set on the app record: refused (`Aborted`) unless app
+    /// `managed_by.app` still exists, is enabled, and is at
+    /// `record_updated_at`.
     pub fn handle_job_submit_managed(
         &self,
         config: &JobConfig,
         subs: &[Submission],
         granted_by: &str,
         managed_by: crate::structs::app::ManagedBy,
+        record_updated_at: &str,
     ) -> R<JobSubmitOutcome> {
         self.handle_job_submit_inner(
             config,
@@ -10455,6 +10460,7 @@ impl Store {
             crate::storage::acl_store::GrantSource::App {
                 granted_by: granted_by.to_string(),
                 managed_by,
+                record_updated_at: record_updated_at.to_string(),
             },
             None,
         )
@@ -10972,6 +10978,30 @@ impl Store {
         Ok(())
     }
 
+    /// Refuse an app reconciler submit unless app `app`'s record still
+    /// exists, is enabled, and is at `updated_at` (`Aborted`: the reconciler
+    /// renders again from the new record).
+    fn check_app_record_tx(tx: &Connection, app: &str, updated_at: &str) -> R<()> {
+        let row: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT enabled, updated_at FROM app WHERE name = ?1;",
+                [app],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let why = match row {
+            None => "it was uninstalled",
+            Some((0, _)) => "it was disabled",
+            Some((_, stored)) if stored != updated_at => "its record changed",
+            Some(_) => return Ok(()),
+        };
+        Err(anyhow::Error::new(StorageError::Aborted {
+            message: format!(
+                "app {app}'s job was not submitted: {why} while the job was being rendered"
+            ),
+        }))
+    }
+
     /// The whole submit write, against a caller-owned transaction, with the
     /// version derivation reading THROUGH that transaction (see
     /// `latest_job_config_tx`). Stages events but does not publish them and
@@ -10987,6 +11017,19 @@ impl Store {
         unknown_fields: Option<&UnknownFieldsRecord>,
     ) -> R<(JobSubmitOutcome, Vec<SchedulerEventRecord>)> {
         let config = self.normalize_job_config(config)?;
+        // The app reconciler's submit is compare-and-set on the app record
+        // it rendered from, in this same entry: an uninstall, a disable, or
+        // any other write that landed while the render was admitted (pin
+        // resolution can take seconds) refuses it, so a job never comes back
+        // with a fresh grant for an app that is gone.
+        if let crate::storage::acl_store::GrantSource::App {
+            managed_by,
+            record_updated_at,
+            ..
+        } = grant
+        {
+            Self::check_app_record_tx(tx, &managed_by.app, record_updated_at)?;
+        }
         // What this version's `legion` identities ask for; its grant row is
         // written in this same transaction, next to the version itself.
         let requested = crate::structs::grant::requested_grants(&config.tasks);

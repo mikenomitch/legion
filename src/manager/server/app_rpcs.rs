@@ -303,12 +303,13 @@ impl ManagerDaemonService {
             &jobspec,
             vec![primary],
             None,
-            false,
+            force_reschedule,
             None,
             Some(SYSTEM_NAMESPACE),
             SubmitOrigin::App {
                 granted_by: format!("{} (app {})", record.grant.granted_by, record.name),
                 managed_by,
+                record_updated_at: record.updated_at.clone(),
             },
             // The render is Legion's own output: an unknown key in it is a
             // manifest bug, so the reconciler submits strictly.

@@ -387,15 +387,45 @@ impl AppReconciler {
         seed_bundled_apps(self.store(), &self.settings.seed, &self.settings.own_build)
     }
 
-    /// Reconcile every installed app once.
+    /// [`Self::seed`] without repeating what the manager config's `apps`
+    /// block did not apply: the full pass's re-seed, after the first of a
+    /// term.
+    fn seed_quietly(&self) -> R<Vec<String>> {
+        seed_bundled_apps_noting(
+            self.store(),
+            &self.settings.seed,
+            &self.settings.own_build,
+            false,
+        )
+    }
+
+    /// Forget every app's failures, backoffs and parked refusals: what a
+    /// manager does when it (re)acquires Control leadership, so a new term
+    /// retries everything once instead of trusting what an earlier term of
+    /// its own decided.
+    pub fn reset_runtime(&mut self) {
+        self.runtime.clear();
+    }
+
+    /// Reconcile every installed app once, and every job in
+    /// `legion-system` still stamped for an app that is no longer installed.
     pub async fn reconcile_all(&mut self) -> Vec<(String, PassOutcome)> {
-        let names: Vec<String> = match self.store().list_apps() {
-            Ok(apps) => apps.into_iter().map(|app| app.name).collect(),
+        let mut names: BTreeSet<String> = match self.store().app_names() {
+            Ok(names) => names.into_iter().collect(),
             Err(err) => {
                 warn!(error = ?err, "App reconciler could not list apps");
                 return Vec::new();
             }
         };
+        let installed = names.clone();
+        match self.store().stamped_app_jobs() {
+            Ok(jobs) => names.extend(
+                jobs.into_iter()
+                    .filter(|(_, app, status)| status != "stopped" && !installed.contains(app))
+                    .map(|(_, app, _)| app),
+            ),
+            Err(err) => warn!(error = ?err, "App reconciler could not list app jobs"),
+        }
         let mut outcomes = Vec::new();
         for name in names {
             let outcome = self.reconcile_app(&name).await;
@@ -584,10 +614,70 @@ impl AppReconciler {
         }
     }
 
-    async fn reconcile_app_inner(&mut self, name: &str) -> R<PassOutcome> {
-        let Some(mut record) = self.store().get_app(name)? else {
-            self.runtime.remove(name);
+    /// No record for `name`: stop and revoke a job still stamped for it.
+    /// An uninstall that raced a submit in flight could otherwise leave
+    /// `legion-system/<name>` running, with a fresh grant and nothing that
+    /// manages it.
+    fn sweep_orphan(&mut self, name: &str) -> R<PassOutcome> {
+        let job_id = crate::structs::app::app_job_id(name);
+        let Some(version) = self.store().app_job_version(&job_id)? else {
             return Ok(PassOutcome::Missing);
+        };
+        let stamped = version
+            .managed_by
+            .as_ref()
+            .is_some_and(|stamp| stamp.app == name);
+        if !stamped || version.is_stopped() {
+            return Ok(PassOutcome::Missing);
+        }
+        let key = format!("app:{name}:orphan-stop:{}", version.job_config_id);
+        let svc = self.svc.clone();
+        let stop_job = job_id.clone();
+        crate::manager::server::run_blocking(move || svc.stop_app_job(&stop_job, &key)).map_err(
+            |status| {
+                anyhow!(
+                    "stopping the job of uninstalled app {name}: {}",
+                    status.message()
+                )
+            },
+        )?;
+        let revoked = self.store().revoke_job_grants(
+            &job_id,
+            None,
+            crate::structs::app::RECONCILER_PRINCIPAL,
+        )?;
+        warn!(
+            app = name,
+            job = %job_id,
+            revoked,
+            "Stopped a job stamped for an app that is not installed (an uninstall raced its submit)"
+        );
+        self.store().events().app_reconciled(
+            name,
+            "stopped the job of an app that is not installed",
+            &version
+                .managed_by
+                .as_ref()
+                .map(|stamp| stamp.digest.clone())
+                .unwrap_or_default(),
+            &format!("{revoked} grant(s) revoked"),
+        );
+        Ok(PassOutcome::Stopped)
+    }
+
+    async fn reconcile_app_inner(&mut self, name: &str) -> R<PassOutcome> {
+        let mut record = match self.store().get_app_row(name)? {
+            None => {
+                self.runtime.remove(name);
+                return self.sweep_orphan(name);
+            }
+            Some(Err(corrupt)) => {
+                // Nothing to render from: the job is left as it is, and
+                // status says why (`legion app uninstall` removes it).
+                self.runtime.remove(name);
+                return Ok(PassOutcome::Corrupt(corrupt.error));
+            }
+            Some(Ok(record)) => record,
         };
         let job_id = record.job_id();
         let runtime = self.runtime.entry(name.to_string()).or_default().clone();
@@ -726,6 +816,13 @@ impl AppReconciler {
                     action,
                     deduplicated: submit.deduplicated,
                 })
+            }
+            Err(status) if status.code() == tonic::Code::Aborted => {
+                // The record moved under the submit (compare-and-set): the
+                // write that moved it has queued a pass of its own, which
+                // renders from the new record.
+                debug!(app = name, "{}", status.message());
+                Ok(PassOutcome::Skipped)
             }
             Err(status) => {
                 Ok(self.failed(name, &record, &before, state, &status, &rendered.digest))

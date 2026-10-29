@@ -229,6 +229,7 @@ fn store_error_status(action: &str, err: &anyhow::Error) -> Status {
         StorageError::Conflict { .. } => Status::already_exists(message),
         StorageError::InvalidInput { .. } => Status::invalid_argument(message),
         StorageError::FailedPrecondition { .. } => Status::failed_precondition(message),
+        StorageError::Aborted { .. } => Status::aborted(message),
         StorageError::ForeignKey { .. } => Status::failed_precondition(message),
         StorageError::DatabaseBusy | StorageError::DatabaseLocked => Status::unavailable(message),
         StorageError::DatabaseReadOnly => Status::failed_precondition(message),
@@ -2606,9 +2607,14 @@ impl ManagerDaemonService {
             SubmitOrigin::App {
                 granted_by,
                 managed_by,
-            } => self
-                .store
-                .handle_job_submit_managed(&config, &subs, &granted_by, managed_by),
+                record_updated_at,
+            } => self.store.handle_job_submit_managed(
+                &config,
+                &subs,
+                &granted_by,
+                managed_by,
+                &record_updated_at,
+            ),
         }
         .map_err(|e| map_store_error("Error running job", e))?;
         if !unknown_fields.is_empty() {
