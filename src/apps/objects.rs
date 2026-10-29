@@ -719,12 +719,15 @@ async fn reconcile_one<P: ObjectPlane>(
     }
 }
 
-/// A refusal that means the object moved on (deleted, replaced, or a newer
-/// generation): the watch brings the change, so the loop waits for it.
+/// A refusal that means the object moved on (deleted, replaced, or its kind
+/// orphaned): the watch brings the change, so the loop waits for it. An
+/// `ABORTED` status write (this manager has not caught up with the
+/// generation yet, or a newer status is stored) is not stale: it retries
+/// with backoff.
 fn is_stale(status: &Status) -> bool {
     matches!(
         status.code(),
-        tonic::Code::NotFound | tonic::Code::Aborted | tonic::Code::FailedPrecondition
+        tonic::Code::NotFound | tonic::Code::FailedPrecondition
     )
 }
 
@@ -1010,6 +1013,14 @@ mod tests {
             vec![CacheChange::Deleted(1), CacheChange::Upserted(3)]
         );
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn only_a_moved_object_waits_for_the_watch_test() {
+        assert!(is_stale(&Status::not_found("gone")));
+        assert!(is_stale(&Status::failed_precondition("orphaned")));
+        assert!(!is_stale(&Status::aborted("ahead of this manager")));
+        assert!(!is_stale(&Status::unavailable("no leader")));
     }
 
     #[test]
