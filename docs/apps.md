@@ -261,8 +261,10 @@ what it can make them do. A placement other than `managers` takes
 
 **Nothing host-level.** Install renders the app's job and refuses one that
 would make the worker act for it on the node: an `exec` health check, a
-`file://` (or local `git::file://`) artifact or image, or an artifact with
-`auth.nodeIdentity`. On a manager the worker is root, so any of them would
+`file://` (or local `git::file://`) artifact or image, an artifact with
+`auth.nodeIdentity`, or an `exec` task's file at an absolute host path, its
+own `config.cgroup`, or a negative OOM score
+([Namespaces](namespaces.md#reserved-namespaces) has the list). On a manager the worker is root, so any of them would
 be root on the managers. Apps don't need them: health checks are `http` or
 `tcp`, and code comes from a URL. The refusal holds for every installer,
 management tokens included; a job that needs one is an ordinary job.
@@ -530,8 +532,8 @@ Limits:
   `secrets/` and borrow its grant. Root on a manager could read the raft
   state and the data directory, so an app's blast radius stays its grant.
 - **Nothing host-level in an app's job.** An `exec` health check, a
-  `file://` artifact, or `auth.nodeIdentity` would have the worker, root on
-  a manager, act for the app; they are refused in `legion-system` whoever
+  `file://` artifact, `auth.nodeIdentity`, or a file written at a host path
+  would have the worker, root on a manager, act for the app; they are refused in `legion-system` whoever
   submits them, and install, upgrade, and `config set` refuse a render that
   holds one. The reconciler holds no `host` grant: an app's own `exec` task,
   which runs as its uid, is the one host-level construct it may submit.

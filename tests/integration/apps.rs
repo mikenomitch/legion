@@ -1263,8 +1263,9 @@ async fn app_reads_filter_by_name_test() -> R<()> {
 
 /// `app:write` cannot put a host-level construct in an app's job, whoever
 /// installs it (hardening after the adversarial review): an exec health
-/// check, a `file://` artifact, or `auth.nodeIdentity` would run on the
-/// managers as the worker, so install refuses each, and a code field cannot
+/// check, a `file://` artifact, `auth.nodeIdentity`, a file written at a
+/// host path, or a cgroup of its own would have the worker act for it on
+/// the managers as root, so install refuses each, and a code field cannot
 /// add a `file://` artifact either.
 #[tokio::test(flavor = "multi_thread")]
 async fn app_jobs_carry_no_host_level_constructs_test() -> R<()> {
@@ -1305,6 +1306,17 @@ async fn app_jobs_carry_no_host_level_constructs_test() -> R<()> {
                                          "auth": { "nodeIdentity": "pull" } }] }),
             ),
             "nodeIdentity",
+        ),
+        (
+            "writer",
+            exec(json!({ "config": { "command": ["sleep", "600"],
+                                     "files": [{ "path": "/etc/cron.d/x", "content": "x" }] } })),
+            "host's own filesystem",
+        ),
+        (
+            "escaper",
+            exec(json!({ "config": { "command": ["sleep", "600"], "cgroup": "/" } })),
+            "cgroup",
         ),
     ];
     for (name, task, says) in cases {

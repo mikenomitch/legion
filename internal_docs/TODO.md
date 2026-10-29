@@ -6682,7 +6682,8 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         none reaches a plan, a stored version, an error, or an app's
         validate call
   - [x] No host-level construct in an app's job (exec health checks,
-        `file://` artifacts, `auth.nodeIdentity` are refused in
+        `file://` artifacts, `auth.nodeIdentity`, and an exec task's files
+        at host paths, own cgroup, or negative OOM score are refused in
         `legion-system` for everyone, and install, upgrade and config
         changes check the render); the reconciler holds no `host` grant
   - [x] Each app runs as its own uid (`1900000000` up, on the record);

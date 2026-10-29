@@ -2643,8 +2643,9 @@ service Manager {
   // The app's job, as rendered, may hold nothing host-level besides its
   // own `exec` tasks, which run as the app's own uid (assigned here, from
   // 1900000000 up, and never shared): no `exec` health check, `file://`
-  // artifact, or `auth.nodeIdentity`, whoever installs it. A manifest may
-  // not name an exec task's `user`.
+  // artifact, `auth.nodeIdentity`, file at an absolute host path, cgroup of
+  // its own, or negative OOM score, whoever installs it. A manifest may not
+  // name an exec task's `user`.
   //
   // `dry_run` validates the manifest and the installer's coverage and
   // returns the prompt (`prompt`) without installing, which is how the CLI

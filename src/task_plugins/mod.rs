@@ -1745,9 +1745,18 @@ pub fn app_task_host_level_reason(task: &crate::structs::TaskConfig) -> Option<S
 /// What makes a task host-level whatever its runtime and user: the worker
 /// itself acts for it on the node, as root or as the node. An `exec` health
 /// check, a `file://` (or local git) artifact or image, or an artifact that
-/// presents `auth.nodeIdentity`.
+/// presents `auth.nodeIdentity`; and for an `exec` task, which shares the
+/// host's filesystem, a file the worker writes at an absolute host path
+/// (`config.files`, `kvInjections.files`, an identity's `file`, a
+/// `connect.templates` destination), a `config.cgroup` the worker joins it
+/// to, or an OOM score below 0, which only root may set.
 pub fn node_reaching_reason(task: &crate::structs::TaskConfig) -> Option<String> {
     let name = &task.name;
+    if task.runtime == "exec" {
+        if let Some(reason) = exec_root_assist_reason(task) {
+            return Some(reason);
+        }
+    }
     // An `exec` health check is a command the worker runs on the host,
     // whatever the task's runtime, so declaring one is running on the host.
     if let Some(check) = task
@@ -1793,6 +1802,65 @@ pub fn node_reaching_reason(task: &crate::structs::TaskConfig) -> Option<String>
             artifact.redacted_source()
         ))
     })
+}
+
+/// What the root worker does for an `exec` task before it drops to the
+/// task's user, beyond its own allocation: writing a file at an absolute
+/// host path, joining a cgroup the task names, or setting a negative OOM
+/// score ([`node_reaching_reason`]).
+fn exec_root_assist_reason(task: &crate::structs::TaskConfig) -> Option<String> {
+    let name = &task.name;
+    let absolute = |path: &str| std::path::Path::new(path.trim()).is_absolute();
+    let config_files = task
+        .config
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|file| file.get("path").and_then(Value::as_str));
+    let injected = task
+        .kv_injections
+        .iter()
+        .flat_map(|injections| injections.files.iter().map(|file| file.path.as_str()));
+    let identities = task
+        .identities
+        .iter()
+        .filter_map(|identity| identity.file.as_ref().map(|file| file.path.as_str()));
+    let templates = task
+        .connect
+        .iter()
+        .flat_map(|connect| connect.templates.iter().map(|t| t.destination.as_str()));
+    if let Some(path) = config_files
+        .chain(injected)
+        .chain(identities)
+        .chain(templates)
+        .find(|path| absolute(path))
+    {
+        return Some(format!(
+            "{name:?} has the worker write {:?} on the host's own filesystem",
+            path.trim()
+        ));
+    }
+    if let Some(cgroup) = task
+        .config
+        .get("cgroup")
+        .and_then(Value::as_str)
+        .filter(|cgroup| !cgroup.trim().is_empty())
+    {
+        return Some(format!(
+            "{name:?} names cgroup {cgroup:?}, which the worker joins it to, outside its \
+             allocation's limits"
+        ));
+    }
+    let oom = ["oom_score_adj", "oom_adj"]
+        .iter()
+        .find_map(|key| task.config.get(*key).and_then(Value::as_i64));
+    if let Some(score) = oom.filter(|score| *score < 0) {
+        return Some(format!(
+            "{name:?} sets an OOM score of {score}, below 0, which only root may"
+        ));
+    }
+    None
 }
 
 /// Whether an artifact source reads the node's filesystem: `file://`, or a
@@ -2333,6 +2401,26 @@ mod tests {
                                                     "auth": { "nodeIdentity": "pull" } }] }),
                 "auth.nodeIdentity",
             ),
+            (
+                serde_json::json!({ "config": { "command": ["true"], "user": "nobody",
+                    "files": [{ "path": "/etc/cron.d/x", "content": "* * * * * root id" }] } }),
+                "host's own filesystem",
+            ),
+            (
+                serde_json::json!({ "identities": [{ "name": "cloud", "audience": ["sts"],
+                                                     "file": { "path": "/etc/token" } }] }),
+                "host's own filesystem",
+            ),
+            (
+                serde_json::json!({ "config": { "command": ["true"], "user": "nobody",
+                                                "cgroup": "/" } }),
+                "cgroup",
+            ),
+            (
+                serde_json::json!({ "config": { "command": ["true"], "user": "nobody",
+                                                "oom_score_adj": -1000 } }),
+                "OOM score",
+            ),
         ] {
             let err =
                 validate_reserved_namespace_task(&unprivileged(extra.clone()), "legion-system")
@@ -2346,10 +2434,12 @@ mod tests {
             &unprivileged(serde_json::json!({
                 "checks": [{ "type": "health", "kind": "http", "path": "/healthz", "port": "api" }],
                 "artifacts": ["https://example.com/x.tgz"],
+                "config": { "command": ["true"], "user": "nobody", "oom_score_adj": 500,
+                            "files": [{ "path": "legion-app-config.json", "content": "{}" }] },
             })),
             "legion-system",
         )
-        .expect("an http check and a URL artifact are fine");
+        .expect("an http check, a URL artifact, a task-dir file and a high OOM score are fine");
     }
 
     /// An app's `exec` task is not host-level for the reconciler (it runs as

@@ -321,8 +321,10 @@ makes every job it matches host-level; writing one needs `net:write`, which
 is already an admin grant.
 
 In the reserved `legion-system` namespace, where tasks run on the managers,
-the last three rows are refused outright, host grant or not, and an `exec`
-task must name a non-root user
+the last three rows are refused outright, host grant or not, and so are an
+`exec` task's files at absolute host paths, its own `config.cgroup`, and a
+negative OOM score (the worker does each as root); an `exec` task must name
+a non-root user
 ([Namespaces: Reserved namespaces](namespaces.md#reserved-namespaces)). The
 app reconciler holds no host grant at all: an app's own `exec` task, which
 runs as the app's uid, is the one host-level task it may submit.

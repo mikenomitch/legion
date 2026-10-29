@@ -2362,7 +2362,13 @@ message that can quote a value, now and later.
 - `validate_reserved_namespace_task` refuses, in `legion-system`, for
   every submitter, the constructs that make the worker act for a task on
   the node: an `exec` health check, a `file://` or `git::file://` artifact
-  or image, and an artifact with `auth.nodeIdentity`.
+  or image, an artifact with `auth.nodeIdentity`, and, for an `exec` task,
+  a file the worker writes at an absolute host path (`config.files`,
+  `kvInjections.files`, an identity's `file`, a `connect.templates`
+  destination), a `config.cgroup` it joins, or a negative OOM score. The
+  review named the first three; the rest came up while scoping the `exec`
+  exemption below, since each is the root worker acting before it drops
+  to the task's user.
 - Install, upgrade, and `SetAppConfig` render the app's job and run that
   check plus the host-level classification, so the person making the
   change hears the refusal (`InvalidArgument`), not the reconciler later.

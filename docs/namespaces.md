@@ -270,9 +270,12 @@ managers' [system workers](architecture-managers-workers.md#the-system-worker).
   Nor may any task there have the worker act for it on the node, whatever
   its runtime and user, and whoever submits it: an `exec` health check (the
   worker runs its command), a `file://` or `git::file://` artifact or image
-  (the worker copies node files in), or an artifact with `auth.nodeIdentity`
-  (the worker presents the node's credential). On a manager the worker is
-  root, so each would make the task root there:
+  (the worker copies node files in), an artifact with `auth.nodeIdentity`
+  (the worker presents the node's credential), or, for an `exec` task, a
+  file the worker writes at an absolute host path (`config.files`,
+  `kvInjections.files`, an identity's `file`, a `connect.templates`
+  destination), a `config.cgroup` of its own, or an OOM score below 0. On a
+  manager the worker is root, so each would make the task root there:
 
   ```text
   task "agent" declares exec health check "probe", which the worker runs on
