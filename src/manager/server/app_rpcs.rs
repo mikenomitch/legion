@@ -14,7 +14,7 @@
 //! grant recorded here.
 
 use super::*;
-use crate::storage::app_store::AppJobVersion;
+use crate::storage::app_store::CorruptApp;
 use crate::structs::acl::AclRule;
 use crate::structs::app::{
     changed_code_fields, install_prompt, permission_diff, validate_app_config, AppGrant,
@@ -540,19 +540,25 @@ impl ManagerDaemonService {
     ) -> Result<Response<ListAppsReply>, Status> {
         let identity =
             self.check_acl(&request, AclResource::App, AclAction::Read, AclScope::any())?;
-        let records = self
+        // Row by row: a record this manager cannot decode is listed as
+        // `corrupt`, and never hides the others.
+        let rows = self
             .store
-            .list_apps()
+            .list_app_rows()
             .map_err(|e| map_store_error("Error listing apps", e))?;
         let mut apps = Vec::new();
-        for record in records.iter().filter(|record| {
-            identity.allows(
-                AclResource::App,
-                AclAction::Read,
-                &AclScope::app(&record.name),
-            )
-        }) {
-            apps.push(self.app_info(record)?);
+        for row in &rows {
+            let name = match row {
+                Ok(record) => &record.name,
+                Err(corrupt) => &corrupt.name,
+            };
+            if !identity.allows(AclResource::App, AclAction::Read, &AclScope::app(name)) {
+                continue;
+            }
+            apps.push(match row {
+                Ok(record) => self.app_info(record)?,
+                Err(corrupt) => self.corrupt_app_info(corrupt),
+            });
         }
         Ok(Response::new(ListAppsReply { apps }))
     }
@@ -568,10 +574,16 @@ impl ManagerDaemonService {
             AclAction::Read,
             AclScope::app(&name),
         )?;
-        let record = self.load_app(&name)?;
-        Ok(Response::new(GetAppReply {
-            app: Some(self.app_info(&record)?),
-        }))
+        let app = match self
+            .store
+            .get_app_row(&name)
+            .map_err(|e| map_store_error("Error loading the app", e))?
+        {
+            None => return Err(not_found(&name)),
+            Some(Ok(record)) => self.app_info(&record)?,
+            Some(Err(corrupt)) => self.corrupt_app_info(&corrupt),
+        };
+        Ok(Response::new(GetAppReply { app: Some(app) }))
     }
 
     pub(super) async fn install_app_rpc(

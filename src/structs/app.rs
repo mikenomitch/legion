@@ -240,6 +240,114 @@ pub struct AppManifest {
     pub code_fields: Vec<CodeField>,
 }
 
+/// [`AppManifest`]'s fields, by their JSON names (a test keeps them in step
+/// with its schema).
+const MANIFEST_FIELDS: &[&str] = &[
+    "name",
+    "description",
+    "version",
+    "namespace",
+    "placement",
+    "replicas",
+    "job",
+    "permissions",
+    "ui",
+    "extensions",
+    "config",
+    "codeFields",
+];
+/// [`AppConfigSpec`]'s fields.
+const CONFIG_SPEC_FIELDS: &[&str] = &["schema", "default"];
+/// [`CodeFieldSpec`]'s fields.
+const CODE_FIELD_SPEC_FIELDS: &[&str] = &["pointer", "artifact"];
+/// [`AclRule`]'s fields (a test keeps them in step with its serialization).
+const ACL_RULE_FIELDS: &[&str] = &[
+    "resources",
+    "actions",
+    "effect",
+    "namespaces",
+    "names",
+    "pools",
+    "paths",
+    "actionNames",
+    "templates",
+    "bands",
+    "host",
+];
+
+/// Drop the keys of `object` that are not in `known`; returns them, as
+/// `<prefix><key>`.
+fn retain_known(object: &mut Value, known: &[&str], prefix: &str) -> Vec<String> {
+    let Some(object) = object.as_object_mut() else {
+        return Vec::new();
+    };
+    let unknown: Vec<String> = object
+        .keys()
+        .filter(|key| !known.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    for key in &unknown {
+        object.remove(key);
+    }
+    unknown
+        .into_iter()
+        .map(|key| format!("{prefix}{key}"))
+        .collect()
+}
+
+fn strip_unknown_rule_fields(rules: &mut Value, prefix: &str) -> Vec<String> {
+    let mut dropped = Vec::new();
+    if let Some(rules) = rules.as_array_mut() {
+        for (index, rule) in rules.iter_mut().enumerate() {
+            dropped.extend(retain_known(
+                rule,
+                ACL_RULE_FIELDS,
+                &format!("{prefix}[{index}]."),
+            ));
+        }
+    }
+    dropped
+}
+
+/// Drop every key of a stored manifest that this build's typed parts do not
+/// know (the free-form `job`, `ui` and `extensions` are left as they are);
+/// returns the dropped paths.
+fn strip_unknown_manifest_fields(manifest: &mut Value) -> Vec<String> {
+    let mut dropped = retain_known(manifest, MANIFEST_FIELDS, "");
+    if let Some(config) = manifest.get_mut("config") {
+        dropped.extend(retain_known(config, CONFIG_SPEC_FIELDS, "config."));
+    }
+    if let Some(fields) = manifest.get_mut("codeFields").and_then(Value::as_array_mut) {
+        for (index, field) in fields.iter_mut().enumerate() {
+            if field.is_object() {
+                dropped.extend(retain_known(
+                    field,
+                    CODE_FIELD_SPEC_FIELDS,
+                    &format!("codeFields[{index}]."),
+                ));
+            }
+        }
+    }
+    if let Some(rules) = manifest.get_mut("permissions") {
+        dropped.extend(strip_unknown_rule_fields(rules, "permissions"));
+    }
+    dropped
+}
+
+/// Decode the grant rules the store holds, as leniently as
+/// [`AppManifest::from_stored`].
+pub fn rules_from_stored(text: &str) -> Result<Vec<AclRule>, String> {
+    let strict = match serde_json::from_str::<Vec<AclRule>>(text) {
+        Ok(rules) => return Ok(rules),
+        Err(err) => err.to_string(),
+    };
+    let mut value: Value = serde_json::from_str(text).map_err(|err| err.to_string())?;
+    if strip_unknown_rule_fields(&mut value, "rules").is_empty() {
+        return Err(strict);
+    }
+    serde_json::from_value(value).map_err(|err| err.to_string())
+}
+
 /// An app name: lowercase letters, digits and `-`, starting with a letter,
 /// not ending with `-`, at most [`MAX_APP_NAME_LEN`].
 pub fn validate_app_name(name: &str) -> Result<(), String> {
@@ -272,6 +380,29 @@ impl AppManifest {
             ));
         }
         serde_json::from_str(text).map_err(|err| format!("invalid app manifest: {err}"))
+    }
+
+    /// Decode a manifest the store holds: strictly when it can, and
+    /// otherwise with the fields this build does not know dropped, so a
+    /// record written by another release (a renamed or removed field, a
+    /// downgrade) still reads (docs/apps.md, "Upgrading Legion"; calls entry
+    /// 112). Installs and upgrades parse strictly ([`AppManifest::from_json`]):
+    /// a typo is the author's to fix, a field from another release is not.
+    pub fn from_stored(text: &str) -> Result<Self, String> {
+        let strict = match serde_json::from_str::<AppManifest>(text) {
+            Ok(manifest) => return Ok(manifest),
+            Err(err) => err.to_string(),
+        };
+        let mut value: Value = serde_json::from_str(text).map_err(|err| err.to_string())?;
+        let dropped = strip_unknown_manifest_fields(&mut value);
+        if dropped.is_empty() {
+            return Err(strict);
+        }
+        debug!(
+            ?dropped,
+            "Read a stored app manifest without the fields this build does not know"
+        );
+        serde_json::from_value(value).map_err(|err| err.to_string())
     }
 
     /// The config schema, or one that takes any object.
@@ -2067,6 +2198,154 @@ mod app_tests {
             ],
         );
         assert_eq!(decision.marker, Some(marker("0.15.0", "b")));
+    }
+
+    /// A fleet that agrees on the version but runs different binaries of it
+    /// (amd64 and arm64) agrees on a marker; a rebuild of either moves it,
+    /// and a version split still holds it (hardening after the adversarial
+    /// review, M5).
+    #[test]
+    fn a_mixed_architecture_fleet_agrees_on_a_marker() {
+        let mixed = decide_build_marker(
+            None,
+            &[
+                node("m1", "0.15.0", "amd64-a"),
+                node("w1", "0.15.0", "arm64-a"),
+                node("w2", "0.15.0", "arm64-a"),
+            ],
+        );
+        let first = mixed.marker.clone().expect("agreed");
+        assert_eq!(first.version, "0.15.0");
+        assert_eq!(first.build_id, mixed_build_id(["amd64-a", "arm64-a"]));
+        assert!(mixed.reason.is_empty(), "{}", mixed.reason);
+        // The order the nodes come in does not matter.
+        let again = decide_build_marker(
+            None,
+            &[
+                node("w1", "0.15.0", "arm64-a"),
+                node("m1", "0.15.0", "amd64-a"),
+            ],
+        );
+        assert_eq!(again.marker, Some(first.clone()));
+        // A rebuild of one binary rolls.
+        let rebuilt = decide_build_marker(
+            Some(&first),
+            &[
+                node("m1", "0.15.0", "amd64-b"),
+                node("w1", "0.15.0", "arm64-a"),
+            ],
+        );
+        assert_ne!(rebuilt.marker, Some(first.clone()));
+        // A newer version on one node holds the marker and names the rest.
+        let split = decide_build_marker(
+            Some(&first),
+            &[
+                node("m1", "0.16.0", "amd64-c"),
+                node("w1", "0.15.0", "arm64-a"),
+            ],
+        );
+        assert_eq!(split.marker, Some(first));
+        assert_eq!(
+            split.reason,
+            "upgrade waiting: 1 of 2 eligible nodes on 0.16.0 (waiting for w1)"
+        );
+    }
+
+    /// A stored manifest or grant from another release (a field this build
+    /// does not know) still decodes, with the field dropped; an install
+    /// still refuses it (hardening after the adversarial review, H3).
+    #[test]
+    fn stored_records_read_leniently_and_installs_stay_strict() {
+        let mut stored = serde_json::to_value(manifest(json!({
+            "permissions": [{ "resources": ["node"], "actions": ["read"] }],
+            "config": { "schema": { "type": "object" }, "default": {} },
+            "codeFields": [{ "pointer": "/a", "artifact": true }],
+        })))
+        .expect("manifest");
+        stored["renamedField"] = json!(1);
+        stored["config"]["oldKnob"] = json!(true);
+        stored["codeFields"][0]["legacy"] = json!("x");
+        stored["permissions"][0]["sinceRemoved"] = json!(["*"]);
+        let text = stored.to_string();
+        assert!(
+            AppManifest::from_json(&text).is_err(),
+            "installs are strict"
+        );
+        let mut top_only = serde_json::to_value(manifest(json!({}))).expect("manifest");
+        top_only["renamedField"] = json!(1);
+        let err = AppManifest::from_json(&top_only.to_string()).expect_err("strict");
+        assert!(err.contains("renamedField"), "{err}");
+        let read = AppManifest::from_stored(&text).expect("lenient");
+        assert_eq!(read.permissions.len(), 1);
+        assert!(read.code_fields[0].is_artifact());
+        let rules = json!([{ "resources": ["node"], "actions": ["read"], "gone": 1 }]);
+        let rules = rules_from_stored(&rules.to_string()).expect("lenient rules");
+        assert_eq!(rules[0].resources, vec!["node".to_string()]);
+        // A type change is still an error.
+        let mut broken = stored.clone();
+        broken["replicas"] = json!("three");
+        assert!(AppManifest::from_stored(&broken.to_string()).is_err());
+    }
+
+    /// The field lists the lenient decode keeps are the structs' own.
+    #[test]
+    fn the_stored_field_lists_match_the_structs() {
+        let schema = schemars::schema_for!(AppManifest);
+        let mut fields: Vec<String> = schema
+            .schema
+            .object
+            .as_ref()
+            .expect("an object schema")
+            .properties
+            .keys()
+            .cloned()
+            .collect();
+        fields.sort();
+        let mut known: Vec<String> = MANIFEST_FIELDS.iter().map(|f| f.to_string()).collect();
+        known.sort();
+        assert_eq!(fields, known);
+        let rule = AclRule {
+            resources: vec!["job".into()],
+            actions: vec!["read".into()],
+            effect: Some("allow".into()),
+            namespaces: Some(vec![]),
+            names: Some(vec![]),
+            pools: Some(vec![]),
+            paths: Some(vec![]),
+            action_names: Some(vec![]),
+            templates: Some(vec![]),
+            bands: Some(vec![]),
+            host: Some(true),
+        };
+        let value = serde_json::to_value(&rule).expect("rule");
+        let mut fields: Vec<&str> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        let mut known = ACL_RULE_FIELDS.to_vec();
+        known.sort_unstable();
+        assert_eq!(fields, known);
+        let spec = serde_json::to_value(AppConfigSpec::default()).expect("spec");
+        let mut fields: Vec<&str> = spec
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(fields, vec!["default", "schema"]);
+        let code = serde_json::to_value(CodeFieldSpec {
+            pointer: "/a".into(),
+            artifact: true,
+        })
+        .expect("code field");
+        assert_eq!(
+            code.as_object().map(|o| o.len()),
+            Some(CODE_FIELD_SPEC_FIELDS.len())
+        );
     }
 
     #[test]

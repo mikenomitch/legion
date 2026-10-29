@@ -56,6 +56,8 @@ struct Fixture {
     svc: Arc<ManagerDaemonService>,
     store: Store,
     admin: String,
+    /// The store's directory (its database is `store.sqlite`).
+    dir: std::path::PathBuf,
 }
 
 fn req<T>(inner: T, token: &str) -> Request<T> {
@@ -89,7 +91,12 @@ fn fixture() -> R<Fixture> {
         .map_err(|s| anyhow!(s.to_string()))?
         .context("a fresh store has no management token")?;
     let svc = Arc::new(ManagerDaemonService::with_acl(store.clone(), auth));
-    Ok(Fixture { svc, store, admin })
+    Ok(Fixture {
+        svc,
+        store,
+        admin,
+        dir,
+    })
 }
 
 /// A manager's system worker on `version`/`build`.
@@ -1226,13 +1233,7 @@ async fn a_new_bundled_manifest_is_adopted_with_the_leaders_build_test() -> R<()
 async fn app_reads_filter_by_name_test() -> R<()> {
     let fx = fixture()?;
     fx.reconciler(marker("0.1.0", "a")).seed()?;
-    install(
-        &fx,
-        &json!({ "name": "other", "version": "1",
-                 "job": { "task": { "name": "main", "runtime": "noop", "config": {} } } }),
-        &fx.admin,
-    )
-    .await?;
+    install(&fx, &lite_manifest("other"), &fx.admin).await?;
     let reader = fx
         .token(
             "reader",
@@ -1464,6 +1465,128 @@ async fn placement_needs_operator_write_test() -> R<()> {
     fx.svc
         .update_app_settings(req(settings(Some("workers"), Some("ci"), None), &placer))
         .await?;
+    Ok(())
+}
+
+/// A small installed app: one `exec` task, no permissions.
+fn lite_manifest(name: &str) -> Value {
+    json!({
+        "name": name,
+        "version": "1.0.0",
+        "job": { "task": { "name": "main", "runtime": "exec",
+                            "config": { "command": ["sleep", "3600"] } } },
+    })
+}
+
+async fn uninstall_app(
+    fx: &Fixture,
+    name: &str,
+    purge: bool,
+    dry_run: bool,
+) -> Result<UninstallAppReply, tonic::Status> {
+    fx.svc
+        .uninstall_app(req(
+            UninstallAppRequest {
+                name: name.into(),
+                purge,
+                dry_run,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+fn live_grants(fx: &Fixture, job: &str) -> R<usize> {
+    Ok(fx
+        .store
+        .list_job_grants(Some(job), false)?
+        .into_iter()
+        .filter(|grant| grant.revoked_at.is_none())
+        .count())
+}
+
+/// One app record that does not decode breaks nothing else (hardening after
+/// the adversarial review, H3): every job submit still works, the list shows
+/// it `corrupt` beside the others, the reconciler skips it, and uninstall
+/// removes it by name; a bundled app's is seeded again. A field this build
+/// does not know (a record another release wrote) is no corruption at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_that_does_not_decode_breaks_nothing_else_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    install(&fx, &lite_manifest("lite"), &fx.admin).await?;
+    assert!(submitted(&reconciler.reconcile_app("lite").await));
+    let db = rusqlite::Connection::open(fx.dir.join("store.sqlite"))?;
+    db.execute(
+        "UPDATE app SET manifest = json_set(manifest, '$.renamedLater', 1) WHERE name = 'autoscaler';",
+        [],
+    )?;
+    assert_eq!(fx.app("autoscaler")?.name, "autoscaler", "read leniently");
+    db.execute(
+        "UPDATE app SET manifest = json_set(manifest, '$.replicas', 'three'), \
+         updated_at = 'corrupted' WHERE name = 'lite';",
+        [],
+    )?;
+
+    // A submit reads the installed jobspec keys: the bad row is skipped.
+    fx.run(
+        &json!({ "name": "web", "task": { "name": "main", "runtime": "exec",
+                 "config": { "command": ["true"] } } }),
+        &fx.admin,
+    )
+    .await?;
+
+    let apps = fx
+        .svc
+        .list_apps(req(ListAppsRequest::default(), &fx.admin))
+        .await?
+        .into_inner()
+        .apps;
+    let status = |name: &str| {
+        apps.iter()
+            .find(|app| app.name == name)
+            .map(|app| (app.status.clone(), app.status_detail.clone()))
+    };
+    let (lite, detail) = status("lite").context("lite listed")?;
+    assert_eq!(lite, "corrupt");
+    assert!(detail.starts_with("corrupt: app.manifest:"), "{detail}");
+    assert_ne!(
+        status("autoscaler").context("autoscaler listed")?.0,
+        "corrupt"
+    );
+    assert_eq!(fx.get_app("lite").await?.status, "corrupt");
+
+    let outcomes = reconciler.reconcile_all().await;
+    assert!(
+        outcomes.contains(&("autoscaler".to_string(), PassOutcome::Unchanged)),
+        "{outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .any(|(name, outcome)| name == "lite" && matches!(outcome, PassOutcome::Corrupt(_))),
+        "{outcomes:?}"
+    );
+
+    // Uninstall works by name; the job stops.
+    uninstall_app(&fx, "lite", false, false).await?;
+    assert!(!fx.store.app_exists("lite")?);
+    assert!(fx
+        .version(&app_job_id("lite"))?
+        .context("job")?
+        .is_stopped());
+
+    // A bundled app's record that does not decode is removed the same way,
+    // and seeded again from this build.
+    db.execute(
+        "UPDATE app SET settings = 'not json' WHERE name = 'autoscaler';",
+        [],
+    )?;
+    assert_eq!(fx.get_app("autoscaler").await?.status, "corrupt");
+    uninstall_app(&fx, "autoscaler", false, false).await?;
+    assert_eq!(reconciler.seed()?, vec!["autoscaler".to_string()]);
+    assert_eq!(fx.app("autoscaler")?.settings.replicas, 1);
     Ok(())
 }
 

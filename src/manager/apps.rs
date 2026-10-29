@@ -112,9 +112,12 @@ pub enum PassOutcome {
     Failed(String),
     /// The manager refused the submit; waiting for a change.
     Refused(String),
+    /// The record does not decode; nothing is done until it is uninstalled.
+    Corrupt(String),
 }
 
-/// Per-app memory of failures, leader-local.
+/// Per-app memory of failures, leader-local. Cleared when this manager
+/// (re)acquires Control leadership: a new leader retries everything once.
 #[derive(Debug, Clone, Default)]
 struct AppRuntime {
     failures: u32,
@@ -335,8 +338,8 @@ pub fn seed_bundled_apps(
     let mut seeded = Vec::new();
     for manifest in manifests {
         let configured = seed.get(&manifest.name);
-        if store.get_app(&manifest.name)?.is_some() {
-            if configured.is_some() {
+        if store.app_exists(&manifest.name)? {
+            if configured.is_some() && note {
                 info!(
                     app = %manifest.name,
                     "The manager config's apps.{} applies only when the cluster is first seeded; \
@@ -932,6 +935,22 @@ pub fn spawn_reconciler(svc: Arc<ManagerDaemonService>, settings: ReconcilerSett
             let work = pending.take();
             if work.full {
                 last_full = Some(Instant::now());
+                // Every full pass, not only at acquisition: a bundled app
+                // whose record was removed (a corrupt one, uninstalled) is
+                // seeded again from this build's manifest.
+                let seeded = if first_pass {
+                    reconciler.seed()
+                } else {
+                    reconciler.seed_quietly()
+                };
+                first_pass = false;
+                match seeded {
+                    Ok(seeded) if !seeded.is_empty() => {
+                        info!(apps = ?seeded, "Seeded bundled apps")
+                    }
+                    Ok(_) => {}
+                    Err(err) => warn!(error = ?err, "Failed seeding bundled apps"),
+                }
                 reconciler.reconcile_all().await;
                 reconciler.publish_metrics();
             } else if !work.apps.is_empty() {

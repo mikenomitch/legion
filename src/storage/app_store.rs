@@ -71,80 +71,267 @@ fn invalid(message: String) -> anyhow::Error {
     anyhow::Error::new(StorageError::InvalidInput { message })
 }
 
-fn json_column<T: serde::de::DeserializeOwned>(raw: String, column: &str) -> rusqlite::Result<T> {
-    serde_json::from_str(&raw).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            format!("app.{column}: {err}").into(),
-        )
-    })
+fn json_column<T: serde::de::DeserializeOwned>(raw: &str, column: &str) -> Result<T, String> {
+    serde_json::from_str(raw).map_err(|err| format!("app.{column}: {err}"))
 }
 
-impl Store {
-    fn app_from_row(row: &Row<'_>) -> rusqlite::Result<AppRecord> {
-        let source: String = row.get(1)?;
-        let marker: String = row.get(18)?;
-        Ok(AppRecord {
+/// An app row that does not decode: its name, the columns that are plain
+/// text, and why. `legion app list` and `status` show it as `corrupt`, the
+/// reconciler and the registry of jobspec keys skip it, and `legion app
+/// uninstall` removes it by name (docs/apps.md, "Upgrading Legion").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptApp {
+    pub name: String,
+    pub source: String,
+    pub source_ref: String,
+    pub enabled: bool,
+    pub installed_by: String,
+    pub installed_at: String,
+    pub updated_at: String,
+    pub uid: u32,
+    pub error: String,
+}
+
+/// One `app` row's columns, before the JSON ones are decoded.
+struct RawAppRow {
+    name: String,
+    source: String,
+    source_ref: String,
+    manifest: String,
+    manifest_digest: String,
+    enabled: bool,
+    settings: String,
+    config: String,
+    grant_rules: String,
+    granted_by: String,
+    granted_at: String,
+    installed_by: String,
+    installed_at: String,
+    updated_at: String,
+    last_digest: String,
+    last_action: String,
+    last_error: String,
+    last_at: String,
+    build_marker: String,
+    marker_reason: String,
+    pending_change: String,
+    uid: u32,
+}
+
+impl RawAppRow {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<RawAppRow> {
+        Ok(RawAppRow {
             name: row.get(0)?,
-            source: AppSource::parse(&source).map_err(|err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    err.into(),
-                )
-            })?,
+            source: row.get(1)?,
             source_ref: row.get(2)?,
-            manifest: json_column::<AppManifest>(row.get(3)?, "manifest")?,
+            manifest: row.get(3)?,
             manifest_digest: row.get(4)?,
             enabled: row.get::<_, i64>(5)? != 0,
-            settings: json_column::<AppSettings>(row.get(6)?, "settings")?,
-            config: json_column::<Value>(row.get(7)?, "config")?,
-            grant: AppGrant {
-                rules: json_column(row.get(8)?, "grant_rules")?,
-                granted_by: row.get(9)?,
-                granted_at: row.get(10)?,
-            },
+            settings: row.get(6)?,
+            config: row.get(7)?,
+            grant_rules: row.get(8)?,
+            granted_by: row.get(9)?,
+            granted_at: row.get(10)?,
             installed_by: row.get(11)?,
             installed_at: row.get(12)?,
             updated_at: row.get(13)?,
-            state: AppReconcileState {
-                last_digest: row.get(14)?,
-                last_action: row.get(15)?,
-                last_error: row.get(16)?,
-                last_at: row.get(17)?,
-                marker: if marker.is_empty() {
-                    None
-                } else {
-                    Some(json_column::<BuildMarker>(marker, "build_marker")?)
-                },
-                marker_reason: row.get(19)?,
-                pending_change: row.get(20)?,
-            },
+            last_digest: row.get(14)?,
+            last_action: row.get(15)?,
+            last_error: row.get(16)?,
+            last_at: row.get(17)?,
+            build_marker: row.get(18)?,
+            marker_reason: row.get(19)?,
+            pending_change: row.get(20)?,
             uid: row.get(21)?,
         })
     }
 
-    /// Every installed app, by name.
+    /// The record, or why it does not decode. Stored manifests and grants
+    /// decode leniently ([`AppManifest::from_stored`]): a field another
+    /// release wrote or dropped is not an error, a changed type is.
+    fn decode(self) -> Result<AppRecord, CorruptApp> {
+        let decoded = (|| -> Result<AppRecord, String> {
+            let manifest = AppManifest::from_stored(&self.manifest)
+                .map_err(|err| format!("app.manifest: {err}"))?;
+            let marker = if self.build_marker.is_empty() {
+                None
+            } else {
+                Some(json_column::<BuildMarker>(
+                    &self.build_marker,
+                    "build_marker",
+                )?)
+            };
+            Ok(AppRecord {
+                name: self.name.clone(),
+                source: AppSource::parse(&self.source)?,
+                source_ref: self.source_ref.clone(),
+                manifest,
+                manifest_digest: self.manifest_digest.clone(),
+                enabled: self.enabled,
+                settings: json_column::<AppSettings>(&self.settings, "settings")?,
+                config: json_column::<Value>(&self.config, "config")?,
+                grant: AppGrant {
+                    rules: crate::structs::app::rules_from_stored(&self.grant_rules)
+                        .map_err(|err| format!("app.grant_rules: {err}"))?,
+                    granted_by: self.granted_by.clone(),
+                    granted_at: self.granted_at.clone(),
+                },
+                installed_by: self.installed_by.clone(),
+                installed_at: self.installed_at.clone(),
+                updated_at: self.updated_at.clone(),
+                state: AppReconcileState {
+                    last_digest: self.last_digest.clone(),
+                    last_action: self.last_action.clone(),
+                    last_error: self.last_error.clone(),
+                    last_at: self.last_at.clone(),
+                    marker,
+                    marker_reason: self.marker_reason.clone(),
+                    pending_change: self.pending_change.clone(),
+                },
+                uid: self.uid,
+            })
+        })();
+        decoded.map_err(|error| CorruptApp {
+            name: self.name,
+            source: self.source,
+            source_ref: self.source_ref,
+            enabled: self.enabled,
+            installed_by: self.installed_by,
+            installed_at: self.installed_at,
+            updated_at: self.updated_at,
+            uid: self.uid,
+            error,
+        })
+    }
+}
+
+/// Corrupt rows already logged, by (name, `updated_at`, error): each is
+/// logged once per manager, not on every read.
+static REPORTED_CORRUPT: std::sync::Mutex<Option<std::collections::BTreeSet<String>>> =
+    std::sync::Mutex::new(None);
+
+fn report_corrupt(corrupt: &CorruptApp) {
+    let key = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        corrupt.name, corrupt.updated_at, corrupt.error
+    );
+    let mut reported = REPORTED_CORRUPT
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if reported.get_or_insert_with(Default::default).insert(key) {
+        error!(
+            app = %corrupt.name,
+            error = %corrupt.error,
+            "App record does not decode; skipping it (`legion app uninstall {}` removes it)",
+            corrupt.name
+        );
+    }
+}
+
+impl Store {
+    /// Every app row, by name: each decoded on its own, so one row that does
+    /// not decode is that row's problem, never every other app's (or every
+    /// job submit's, which reads the installed jobspec keys).
     #[instrument(err, skip_all)]
-    pub fn list_apps(&self) -> R<Vec<AppRecord>> {
+    pub fn list_app_rows(&self) -> R<Vec<Result<AppRecord, CorruptApp>>> {
         let conn = self.read_connection()?;
         let mut stmt =
             conn.prepare(&format!("SELECT {APP_COLUMNS} FROM app ORDER BY name ASC;"))?;
-        let rows = stmt.query_map([], Self::app_from_row)?;
-        Self::collect_rows(rows)
+        let rows = stmt
+            .query_map([], RawAppRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().map(RawAppRow::decode).collect())
     }
 
+    /// Every installed app that decodes, by name. A row that does not is
+    /// logged (once) and left out; [`Self::list_app_rows`] has it.
+    pub fn list_apps(&self) -> R<Vec<AppRecord>> {
+        Ok(self
+            .list_app_rows()?
+            .into_iter()
+            .filter_map(|row| match row {
+                Ok(record) => Some(record),
+                Err(corrupt) => {
+                    report_corrupt(&corrupt);
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// App `name`'s row: `Some(Err)` when it does not decode.
     #[instrument(err, skip_all, fields(app = name))]
-    pub fn get_app(&self, name: &str) -> R<Option<AppRecord>> {
+    pub fn get_app_row(&self, name: &str) -> R<Option<Result<AppRecord, CorruptApp>>> {
         let conn = self.read_connection()?;
-        conn.query_row(
-            &format!("SELECT {APP_COLUMNS} FROM app WHERE name = ?;"),
-            [name],
-            Self::app_from_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        let raw = conn
+            .query_row(
+                &format!("SELECT {APP_COLUMNS} FROM app WHERE name = ?;"),
+                [name],
+                RawAppRow::from_row,
+            )
+            .optional()?;
+        Ok(raw.map(RawAppRow::decode))
+    }
+
+    /// App `name`, or `None`. A row that does not decode is an error that
+    /// names it and says how to remove it.
+    pub fn get_app(&self, name: &str) -> R<Option<AppRecord>> {
+        match self.get_app_row(name)? {
+            None => Ok(None),
+            Some(Ok(record)) => Ok(Some(record)),
+            Some(Err(corrupt)) => {
+                report_corrupt(&corrupt);
+                Err(anyhow::Error::new(StorageError::failed_precondition(
+                    format!(
+                        "app {name}'s record does not decode ({}); `legion app uninstall {name}` \
+                         removes it",
+                        corrupt.error
+                    ),
+                )))
+            }
+        }
+    }
+
+    /// Whether an app named `name` is installed, decoded or not.
+    pub fn app_exists(&self, name: &str) -> R<bool> {
+        let conn = self.read_connection()?;
+        Ok(conn
+            .query_row("SELECT 1 FROM app WHERE name = ?;", [name], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Every installed app's name, decoded or not.
+    pub fn app_names(&self) -> R<Vec<String>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare("SELECT name FROM app ORDER BY name ASC;")?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(names)
+    }
+
+    /// The jobs in `legion-system` whose latest version the reconciler
+    /// stamped: (job id, the stamp's app, the job's status). With
+    /// [`Self::app_names`], the jobs no installed app manages any more.
+    #[instrument(err, skip_all)]
+    pub fn stamped_app_jobs(&self) -> R<Vec<(String, String, String)>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT j.name, json_extract(jc.meta, '$.managedBy.app'), j.status
+             FROM job j
+             INNER JOIN job_config jc ON jc.id = (
+                 SELECT latest.id FROM job_config latest
+                 WHERE latest.job_id = j.id
+                 ORDER BY latest.version DESC LIMIT 1
+             )
+             WHERE j.name LIKE 'legion-system/%'
+               AND json_extract(jc.meta, '$.managedBy.app') IS NOT NULL;",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String, String)>>>()?;
+        Ok(rows)
     }
 
     /// Install an app: refused when one of that name exists.
