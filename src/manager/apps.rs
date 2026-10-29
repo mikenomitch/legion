@@ -164,7 +164,8 @@ fn backoff_for(failures: u32) -> Duration {
 }
 
 /// Whether the manager refused a submit for a reason a retry cannot fix:
-/// the job fails validation, the grant check, or a quota.
+/// the job fails validation, the grant check, or a quota. A source that
+/// could not be reached is `Unavailable`, and retried with backoff.
 fn is_refusal(status: &tonic::Status) -> bool {
     use tonic::Code;
     match status.code() {

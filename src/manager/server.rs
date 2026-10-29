@@ -3816,13 +3816,16 @@ impl ManagerDaemonService {
                 {
                     continue;
                 }
-                let resolved = self.resolve_pin(spec).with_context(|| {
-                    format!(
-                        "resolve artifact {} at submit failed; fix the reference or set \
-                         resolve: \"always\" to re-resolve at staging instead",
-                        spec.redacted_source()
-                    )
-                })?;
+                let resolved = self
+                    .resolve_pin(spec)
+                    .map_err(crate::artifacts::fetcher::PinResolveFailure::classify)
+                    .with_context(|| {
+                        format!(
+                            "resolve artifact {} at submit failed; fix the reference or set \
+                             resolve: \"always\" to re-resolve at staging instead",
+                            spec.redacted_source()
+                        )
+                    })?;
                 notes.push(ArtifactPin {
                     task: task.name.clone(),
                     from: spec.redacted_source(),
@@ -6095,10 +6098,7 @@ impl Manager for ManagerDaemonService {
         // Artifact admission for plan mirrors run: pins resolve here too so
         // the plan shows the digests a submit would ship.
         let pin_notes = run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true))
-            .map_err(|e| {
-                error!("Error normalizing artifacts: {:?}", e);
-                Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
-            })?;
+            .map_err(artifact_admission_status)?;
         let config = config;
 
         let scheduler = Scheduler::new(&self.store).map_err(|e| {
