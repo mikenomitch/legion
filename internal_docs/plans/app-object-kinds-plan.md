@@ -3,7 +3,10 @@
 > **Judgement calls:** [app-object-kinds-plan_calls.md](../calls/app-object-kinds-plan_calls.md)
 
 **Status: IN EXECUTION** (planned 2026-10-29, on top of PR #60). **Phase O1**
-(the generic system) is being built with this plan. **Phases O2-O4** are
+(the generic system) is built (2026-10-29, branch `claude/app-objects`;
+public page [docs/app-objects.md](../../docs/app-objects.md)); what the
+build decided beyond this plan is calls entries 28-31 and the note under
+entry 11 (the `Accepted` summary). **Phases O2-O4** are
 planned here and not started: O2 moves the autoscaler's standalone scaling
 policies and node groups onto kinds it owns, O3 lets an app act for an
 object with the authority its writer recorded, O4 adds CEL `rules`.
@@ -15,7 +18,7 @@ yet.
 
 **Revised after adversarial review (2026-10-29).** Three reviews of this
 plan and of the apps substrate changed O1 before it shipped; calls entries
-1-27 are the decisions as they stand, and the superseded originals are kept
+1-31 are the decisions as they stand (28-31 from the build), and the superseded originals are kept
 at the end of the calls doc. What changed:
 - a guiding principle (§1): an object can never make its app do more than
   its writer could, and the write path never depends on the app being up;
