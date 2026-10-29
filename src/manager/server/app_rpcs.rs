@@ -198,6 +198,57 @@ fn parse_config(config_json: &str) -> Result<Value, Status> {
         .map_err(|err| Status::invalid_argument(format!("the config is not JSON: {err}")))
 }
 
+/// App `name`'s own KV prefix: `legion/apps/<name>/`.
+fn app_kv_prefix(name: &str) -> String {
+    format!("legion/apps/{name}/")
+}
+
+/// A refusal from the dry run of an app's job, worded for the person
+/// changing the app: the reconciler's submit would refuse the same.
+fn app_admission_refusal(name: &str, status: Status) -> Status {
+    let message = format!(
+        "app {name}'s job would be refused when the reconciler submits it: {}",
+        status.message()
+    );
+    match status.code() {
+        tonic::Code::Unavailable => Status::unavailable(message),
+        tonic::Code::PermissionDenied => Status::permission_denied(message),
+        tonic::Code::FailedPrecondition => Status::failed_precondition(message),
+        tonic::Code::ResourceExhausted => Status::resource_exhausted(message),
+        tonic::Code::NotFound => Status::failed_precondition(message),
+        tonic::Code::Internal => Status::internal(message),
+        _ => Status::invalid_argument(message),
+    }
+}
+
+/// What an upgrade keeps that the new manifest's defaults would set
+/// otherwise: the operator's replicas and placement are theirs, and stay.
+fn kept_settings_notes(record: &AppRecord, manifest: &AppManifest) -> Vec<String> {
+    let mut notes = Vec::new();
+    if manifest.replicas != record.manifest.replicas
+        && manifest.replicas != record.settings.replicas
+    {
+        notes.push(format!(
+            "Keeps replicas {} (this version's default is {}; `legion app set {} --replicas {}` \
+             takes it).",
+            record.settings.replicas, manifest.replicas, record.name, manifest.replicas
+        ));
+    }
+    if manifest.placement != record.manifest.placement
+        && manifest.placement != record.settings.placement
+    {
+        notes.push(format!(
+            "Keeps placement {} (this version's default is {}; `legion app set {} --placement {}` \
+             takes it).",
+            record.settings.placement.as_str(),
+            manifest.placement.as_str(),
+            record.name,
+            manifest.placement.as_str()
+        ));
+    }
+    notes
+}
+
 fn not_found(name: &str) -> Status {
     Status::not_found(format!(
         "no app named {name:?} is installed (`legion app list` shows the installed apps)"
@@ -243,6 +294,118 @@ impl ManagerDaemonService {
             }
         }
         Ok(())
+    }
+
+    /// Run `record`'s job through the submit's admission chain as the
+    /// reconciler would submit it (its grant, the job's namespace policies
+    /// and quota, KV reads, artifacts and pins, volumes, capabilities), and
+    /// write nothing: install, upgrade, and config and settings changes
+    /// refuse up front what the reconciler's submit would refuse later.
+    fn admit_app_job(&self, record: &AppRecord) -> Result<(), Status> {
+        let mut record = record.clone();
+        if record.uid == 0 {
+            record.uid = crate::structs::app::APP_UID_BASE;
+        }
+        // A bundled app renders for its marker; admission is the same for
+        // any marker, so it is checked with the one it holds.
+        let rendered = crate::structs::app::render_app_job(
+            &record,
+            crate::structs::app::RenderContext {
+                marker: record.state.marker.as_ref(),
+            },
+        )
+        .map_err(Status::invalid_argument)?;
+        let jobspec = serde_json::to_string(&rendered.jobspec)
+            .map_err(|err| Status::internal(format!("rendering the app's job: {err}")))?;
+        let identity = reconciler_identity(&record);
+        let admitted = self
+            .admit_rendered_job(
+                &identity,
+                &jobspec,
+                None,
+                Some(SYSTEM_NAMESPACE),
+                &SubmitOrigin::App {
+                    granted_by: record.grant.granted_by.clone(),
+                    managed_by: ManagedBy {
+                        app: record.name.clone(),
+                        digest: rendered.digest.clone(),
+                    },
+                    record_updated_at: record.updated_at.clone(),
+                },
+                crate::structs::spec_fields::UnknownFieldMode::Reject,
+            )
+            .map_err(|status| app_admission_refusal(&record.name, status))?;
+        // Quota and `maxJobs` run inside the submit's entry; ask them now.
+        self.store
+            .check_namespace_admission(&admitted.config)
+            .map_err(|e| {
+                app_admission_refusal(
+                    &record.name,
+                    map_store_error("Namespace policy refused the job", e),
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Refuse a direct write to an installed app's job (docs/apps.md,
+    /// "Editing an app's job"): the app reconciler owns it, and the
+    /// `legion app` verbs are how it changes. A job in `legion-system` whose
+    /// app is not installed (left behind by an uninstall) is an ordinary job.
+    pub(crate) fn refuse_direct_app_job_write(
+        &self,
+        job_id: &str,
+        what: &str,
+    ) -> Result<(), Status> {
+        let Some(app) = crate::structs::app::app_name_of_job(job_id) else {
+            return Ok(());
+        };
+        let installed = self
+            .store
+            .app_exists(app)
+            .map_err(|e| map_store_error("Error loading the app", e))?;
+        if !installed {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "job {job_id} is app {app}'s, and the app reconciler owns it, so {what} is refused \
+             (docs/apps.md, \"Editing an app's job\")\nHint: `legion app set {app}` changes its \
+             replicas, placement and resources, `legion app config set {app}` its config, `legion \
+             app disable {app}` stops it, and `legion app uninstall {app}` removes the app, after \
+             which the job is an ordinary job"
+        )))
+    }
+
+    /// The `App` message for a record this manager cannot decode: what the
+    /// plain columns say, status `corrupt`, and why.
+    fn corrupt_app_info(&self, corrupt: &CorruptApp) -> App {
+        App {
+            name: corrupt.name.clone(),
+            source: corrupt.source.clone(),
+            source_ref: corrupt.source_ref.clone(),
+            enabled: corrupt.enabled,
+            status: "corrupt".to_string(),
+            status_detail: format!(
+                "corrupt: {} (`legion app uninstall {}` removes the record)",
+                corrupt.error, corrupt.name
+            ),
+            job_id: crate::structs::app::app_job_id(&corrupt.name),
+            installed_by: corrupt.installed_by.clone(),
+            installed_at: corrupt.installed_at.clone(),
+            updated_at: corrupt.updated_at.clone(),
+            uid: corrupt.uid,
+            ..Default::default()
+        }
+    }
+
+    /// The KV keys under app `name`'s prefix (`legion/apps/<name>/`).
+    fn app_kv_keys(&self, name: &str) -> Result<Vec<String>, Status> {
+        Ok(self
+            .store
+            .list_kv_keys(&app_kv_prefix(name))
+            .map_err(|e| map_store_error("Error listing the app's KV keys", e))?
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect())
     }
 
     fn nudge_app(&self, name: &str) {
@@ -428,11 +591,13 @@ impl ManagerDaemonService {
             );
         }
         if record.enabled && record.settings.placement == Placement::Managers {
-            let manager_nodes = self
+            // (registered, up): a manager's system worker that is down or
+            // lost is no place to run either.
+            let (registered, up) = self
                 .store
                 .get_nodes()
                 .map(|nodes| {
-                    nodes
+                    let managers: Vec<_> = nodes
                         .iter()
                         .filter(|node| {
                             node.config_attrs
@@ -440,13 +605,25 @@ impl ManagerDaemonService {
                                 .and_then(Value::as_str)
                                 == Some(MANAGER_ROLE_VALUE)
                         })
-                        .count()
+                        .collect();
+                    let up = managers
+                        .iter()
+                        .filter(|node| matches!(node.status.as_str(), "active" | "ready"))
+                        .count();
+                    (managers.len(), up)
                 })
-                .unwrap_or(0);
-            if manager_nodes == 0 {
+                .unwrap_or((0, 0));
+            if registered == 0 {
                 notes.push(format!(
                     "no manager runs a system worker, so `placement = managers` has nowhere to run; \
                      `legion app set {} --placement any` runs it on workers",
+                    record.name
+                ));
+            } else if up == 0 {
+                notes.push(format!(
+                    "none of the {registered} managers' system workers is up, so `placement = \
+                     managers` has nowhere to run right now; `legion app set {} --placement any` \
+                     runs it on workers",
                     record.name
                 ));
             }
@@ -705,6 +882,24 @@ impl ManagerDaemonService {
             uid: 0,
         };
         self.check_app_job(&record)?;
+        // The rest of the submit's admission, as the reconciler will submit
+        // the job: refused here rather than parked as `reconcile refused`.
+        self.admit_app_job(&record)?;
+        // State an earlier app of this name left (uninstalled without
+        // `--purge`): this app's grant may reach it, so the installer hears
+        // about it before approving.
+        let left = self.app_kv_keys(&name)?;
+        if !left.is_empty() {
+            prompt.push(format!(
+                "{} KV key{} under {} {} left by an earlier install of an app named {name}; this \
+                 app takes {} over (`legion app uninstall --purge` removes an app's keys).",
+                left.len(),
+                if left.len() == 1 { "" } else { "s" },
+                app_kv_prefix(&name),
+                if left.len() == 1 { "was" } else { "were" },
+                if left.len() == 1 { "it" } else { "them" },
+            ));
+        }
         if !decls.is_empty() {
             // What installing does to values already stored: pending ones
             // it adopts, and how they fare against its schemas.
@@ -756,21 +951,25 @@ impl ManagerDaemonService {
         }
         crate::storage::app_store::check_record(&record)
             .map_err(|e| map_store_error("Error installing the app", e))?;
-        self.store
-            .insert_app(record.clone())
-            .map_err(|e| map_store_error("Error installing the app", e))?;
         let version = manifest.version.clone().unwrap_or_default();
-        self.store
-            .events()
-            .app_installed(&name, &version, source.as_str(), &identity.principal);
-        info!(app = %name, version = %version, by = %identity.principal, "Installed app");
         let message = format!(
             "installed {name} {version}; job {} starting",
             record.job_id()
         );
+        // The record and the idempotency key land in one entry: a retry
+        // after a crash finds both or neither.
         self.store
-            .idempotency_record(&idempotency_key, "install_app", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+            .insert_app_recorded(record.clone(), &idempotency_key, &message)
+            .map_err(|e| map_store_error("Error installing the app", e))?;
+        let record = self
+            .store
+            .get_app(&name)
+            .map_err(|e| map_store_error("Error loading the app", e))?
+            .unwrap_or(record);
+        self.store
+            .events()
+            .app_installed(&name, &version, source.as_str(), &identity.principal);
+        info!(app = %name, version = %version, by = %identity.principal, "Installed app");
         self.nudge_app(&name);
         Ok(Response::new(InstallAppReply {
             app: Some(self.app_info(&record)?),
@@ -853,51 +1052,95 @@ impl ManagerDaemonService {
             unchanged_json: rules_json(&diff.unchanged),
         };
         let mut prompt = install_prompt(&manifest);
+        prompt.extend(kept_settings_notes(&record, &manifest));
         let from = record.display_version();
         let to = manifest.version.clone().unwrap_or_default();
-        if !decls.is_empty() || !existing.is_empty() {
-            // Every stored value for the app, checked against the new
-            // schemas (apps plan §6.6, "Lifecycle").
-            let mut upgraded = record.clone();
-            upgraded.manifest = manifest.clone();
-            upgraded.manifest_digest = manifest.digest();
-            upgraded.settings.keys = keys.clone();
-            let next = registry
-                .with_record(&upgraded)
-                .map_err(Status::invalid_argument)?;
-            prompt.extend(super::extension_rpcs::lifecycle_report(
-                &name,
-                &self.extension_jobs()?,
-                &next,
-                false,
-            ));
+
+        // The record the upgrade writes.
+        let mut next = record.clone();
+        next.manifest_digest = manifest.digest();
+        next.manifest = manifest.clone();
+        next.config = config;
+        next.settings.keys = keys;
+        if !inner.source_ref.trim().is_empty() {
+            next.source_ref = inner.source_ref.trim().to_string();
+            if next.source_ref.starts_with("http://") || next.source_ref.starts_with("https://") {
+                next.source = AppSource::Url;
+            } else {
+                next.source = AppSource::File;
+            }
         }
-        let mut upgraded = record.clone();
-        upgraded.manifest = manifest.clone();
-        upgraded.config = config.clone();
-        self.check_app_job(&upgraded)?;
+        next.grant = AppGrant {
+            rules: next.manifest.permissions.clone(),
+            granted_by: identity.principal.clone(),
+            granted_at: now_rfc3339(),
+        };
+        next.state.pending_change = format!("upgraded {from} → {to}");
+
+        // Every stored value for the app, checked against the new schemas
+        // (apps plan §6.6, "Lifecycle"), and the jobs whose values a point
+        // the new manifest drops would orphan.
+        let mut orphaned_jobs = Vec::new();
+        if !decls.is_empty() || !existing.is_empty() {
+            let upgraded = registry
+                .with_record(&next)
+                .map_err(Status::invalid_argument)?;
+            let jobs = self.extension_jobs()?;
+            prompt.extend(super::extension_rpcs::lifecycle_report(
+                &name, &jobs, &upgraded, false,
+            ));
+            orphaned_jobs = super::extension_rpcs::orphaned_jobs(&name, &jobs, &upgraded);
+        }
+        self.check_app_job(&next)?;
+        self.admit_app_job(&next)?;
         let who = format!("app {name} {to}");
         // A new manifest is new code running with the grant: the caller must
         // hold all of it, as at install.
         let uncovered = app_grant_refusal(&identity, &who, &manifest.permissions)
             .or_else(|| page_rpc_refusal(&identity, &manifest));
+        let orphan_refusal = (!orphaned_jobs.is_empty() && !inner.force).then(|| {
+            let shown: Vec<&str> = orphaned_jobs.iter().map(String::as_str).take(10).collect();
+            let more = if orphaned_jobs.len() > shown.len() {
+                format!(", and {} more", orphaned_jobs.len() - shown.len())
+            } else {
+                String::new()
+            };
+            format!(
+                "{name} {to} no longer declares a jobspec key that {} job{} set{}: {}{more}. \
+                 Upgrading leaves their values stored, flagged orphaned, and each job's next \
+                 submit fails until the key is removed (or --allow-unknown-fields is passed)\
+                 \nHint: pass --force to upgrade anyway",
+                orphaned_jobs.len(),
+                if orphaned_jobs.len() == 1 { "" } else { "s" },
+                if orphaned_jobs.len() == 1 { "s" } else { "" },
+                shown.join(", ")
+            )
+        });
         if inner.dry_run {
             return Ok(Response::new(UpgradeAppReply {
                 app: Some(self.app_info(&record)?),
                 diff: Some(diff_message),
                 upgraded: false,
-                message: match uncovered {
-                    None => format!("dry run: {name} {from} → {to} can be upgraded by this token"),
-                    Some(refusal) => format!("dry run: {refusal}"),
+                message: match (&uncovered, &orphan_refusal) {
+                    (Some(refusal), _) => format!("dry run: {refusal}"),
+                    (None, Some(refusal)) => format!("dry run: {refusal}"),
+                    (None, None) => {
+                        format!("dry run: {name} {from} → {to} can be upgraded by this token")
+                    }
                 },
                 deduplicated: false,
                 prompt,
+                uncovered: uncovered.unwrap_or_default(),
+                orphaned_jobs,
             }));
         }
         if let Some(refusal) = uncovered {
             return Err(Status::permission_denied(format!(
                 "{refusal}\n{GRANT_HINT}"
             )));
+        }
+        if let Some(refusal) = orphan_refusal {
+            return Err(Status::failed_precondition(refusal));
         }
         if !diff.added.is_empty() && !inner.approve {
             return Ok(Response::new(UpgradeAppReply {
@@ -911,6 +1154,8 @@ impl ManagerDaemonService {
                 ),
                 deduplicated: false,
                 prompt,
+                uncovered: String::new(),
+                orphaned_jobs,
             }));
         }
         let idempotency_key = scoped_idempotency_key(
@@ -931,27 +1176,10 @@ impl ManagerDaemonService {
                 message,
                 deduplicated: true,
                 prompt,
+                uncovered: String::new(),
+                orphaned_jobs,
             }));
         }
-        let mut next = record.clone();
-        next.manifest_digest = manifest.digest();
-        next.manifest = manifest;
-        next.config = config;
-        next.settings.keys = keys;
-        if !inner.source_ref.trim().is_empty() {
-            next.source_ref = inner.source_ref.trim().to_string();
-            if next.source_ref.starts_with("http://") || next.source_ref.starts_with("https://") {
-                next.source = AppSource::Url;
-            } else {
-                next.source = AppSource::File;
-            }
-        }
-        next.grant = AppGrant {
-            rules: next.manifest.permissions.clone(),
-            granted_by: identity.principal.clone(),
-            granted_at: now_rfc3339(),
-        };
-        next.state.pending_change = format!("upgraded {from} → {to}");
         let next = self.write_app(&record, next)?;
         self.store.events().app_upgraded(
             &name,
@@ -961,7 +1189,14 @@ impl ManagerDaemonService {
             diff.removed.len(),
             &identity.principal,
         );
-        let message = format!("upgraded {name} {from} → {to}");
+        let mut message = format!("upgraded {name} {from} → {to}");
+        if !orphaned_jobs.is_empty() {
+            message.push_str(&format!(
+                "; {} job(s) keep orphaned values: {}",
+                orphaned_jobs.len(),
+                orphaned_jobs.join(", ")
+            ));
+        }
         self.store
             .idempotency_record(&idempotency_key, "upgrade_app", &message)
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
@@ -973,6 +1208,8 @@ impl ManagerDaemonService {
             message,
             deduplicated: false,
             prompt,
+            uncovered: String::new(),
+            orphaned_jobs,
         }))
     }
 
@@ -988,65 +1225,129 @@ impl ManagerDaemonService {
             AclScope::app(&name),
         )?;
         let inner = request.into_inner();
+        let prefix = app_kv_prefix(&name);
+        if inner.purge {
+            // The app's own state is KV; deleting it is a KV write.
+            acl::enforce(
+                &identity,
+                AclResource::Kv,
+                AclAction::Write,
+                &AclScope::path(&format!("{prefix}*")),
+            )?;
+        }
         let idempotency_key = scoped_idempotency_key(
             &identity,
             "uninstall_app",
             inner.idempotency_key.as_deref(),
             &inner,
         );
-        if let Some(message) = self
+        if !inner.dry_run {
+            if let Some(stored) = self
+                .store
+                .idempotency_lookup(&idempotency_key)
+                .map_err(|e| map_store_error("Error checking idempotency", e))?
+            {
+                // The first reply, whole.
+                let mut reply: UninstallAppReply =
+                    serde_json::from_str(&stored).unwrap_or_else(|_| UninstallAppReply {
+                        message: stored.clone(),
+                        ..Default::default()
+                    });
+                reply.deduplicated = true;
+                return Ok(Response::new(reply));
+            }
+        }
+        // By name: a record that does not decode is removed like any other
+        // (its jobspec keys were never in force, and a bundled app's is
+        // seeded again from this build).
+        let row = self
             .store
-            .idempotency_lookup(&idempotency_key)
-            .map_err(|e| map_store_error("Error checking idempotency", e))?
-        {
+            .get_app_row(&name)
+            .map_err(|e| map_store_error("Error loading the app", e))?
+            .ok_or_else(|| not_found(&name))?;
+        let (enabled, using) = match &row {
+            Ok(record) => {
+                if record.is_bundled() {
+                    return Err(Status::failed_precondition(format!(
+                        "{name} is bundled with Legion and cannot be uninstalled; `legion app \
+                         disable {name}` stops it and keeps its settings"
+                    )));
+                }
+                // Jobs that set the app's jobspec keys keep their values,
+                // orphaned: only with `force` (apps plan §6.6, "Lifecycle").
+                let registry = self.extension_registry()?;
+                let using = self.jobs_using_app(&name, &registry)?;
+                if !using.is_empty() && !inner.force && !inner.dry_run {
+                    let shown: Vec<&str> = using.iter().map(String::as_str).take(10).collect();
+                    let more = if using.len() > shown.len() {
+                        format!(", and {} more", using.len() - shown.len())
+                    } else {
+                        String::new()
+                    };
+                    return Err(Status::failed_precondition(format!(
+                        "{} job{} set{} {name}'s jobspec keys: {}{more}. Uninstalling leaves \
+                         their values stored, flagged orphaned, and each job's next submit fails \
+                         until the key is removed (or --allow-unknown-fields is passed)\nHint: \
+                         pass --force to uninstall anyway",
+                        using.len(),
+                        if using.len() == 1 { "" } else { "s" },
+                        if using.len() == 1 { "s" } else { "" },
+                        shown.join(", ")
+                    )));
+                }
+                (record.enabled, using)
+            }
+            Err(corrupt) => (corrupt.enabled, Vec::new()),
+        };
+        let job_id = crate::structs::app::app_job_id(&name);
+        let kv_keys = self.app_kv_keys(&name)?;
+        if inner.dry_run {
+            let mut message = format!(
+                "dry run: uninstalling {name} stops job {job_id}, revokes its grants, and \
+                 deletes the record"
+            );
+            if !using.is_empty() {
+                message.push_str(&format!(
+                    "; {} job(s) would keep orphaned values for its keys{}: {}",
+                    using.len(),
+                    if inner.force { "" } else { " (needs --force)" },
+                    using.join(", ")
+                ));
+            }
+            if !kv_keys.is_empty() {
+                message.push_str(&format!(
+                    "; {} KV key(s) under {prefix} {}",
+                    kv_keys.len(),
+                    if inner.purge {
+                        "would be deleted"
+                    } else {
+                        "would stay (--purge deletes them)"
+                    }
+                ));
+            }
             return Ok(Response::new(UninstallAppReply {
                 message,
                 revoked_grants: 0,
-                deduplicated: true,
-                orphaned_jobs: Vec::new(),
+                deduplicated: false,
+                orphaned_jobs: using,
+                kv_keys: u32::try_from(kv_keys.len()).unwrap_or(u32::MAX),
+                purged: false,
             }));
         }
-        let record = self.load_app(&name)?;
-        if record.is_bundled() {
-            return Err(Status::failed_precondition(format!(
-                "{name} is bundled with Legion and cannot be uninstalled; `legion app disable \
-                 {name}` stops it and keeps its settings"
-            )));
-        }
-        // Jobs that set the app's jobspec keys keep their values, orphaned:
-        // only with `force` (apps plan §6.6, "Lifecycle").
-        let registry = self.extension_registry()?;
-        let using = self.jobs_using_app(&name, &registry)?;
-        if !using.is_empty() && !inner.force {
-            let shown: Vec<&str> = using.iter().map(String::as_str).take(10).collect();
-            let more = if using.len() > shown.len() {
-                format!(", and {} more", using.len() - shown.len())
-            } else {
-                String::new()
-            };
-            return Err(Status::failed_precondition(format!(
-                "{} job{} set{} {name}'s jobspec keys: {}{more}. Uninstalling leaves their values \
-                 stored, flagged orphaned, and each job's next submit fails until the key is \
-                 removed (or --allow-unknown-fields is passed)\nHint: pass --force to uninstall \
-                 anyway",
-                using.len(),
-                if using.len() == 1 { "" } else { "s" },
-                if using.len() == 1 { "s" } else { "" },
-                shown.join(", ")
-            )));
-        }
         // Disable first, so a reconcile pass that runs in the middle stops
-        // the job rather than restarting it, and a retry after a failure
-        // below finds the record and finishes.
-        let record = if record.enabled {
-            let mut next = record.clone();
-            next.enabled = false;
-            next.state.pending_change = "uninstalling".to_string();
-            self.write_app(&record, next)?
-        } else {
-            record
-        };
-        let job_id = record.job_id();
+        // the job rather than restarting it, a submit already in flight
+        // loses its compare-and-set on the record, and a retry after a
+        // failure below finds the record and finishes. A record that does
+        // not decode cannot be rewritten; the reconciler leaves its job
+        // alone anyway.
+        if let Ok(record) = &row {
+            if enabled {
+                let mut next = record.clone();
+                next.enabled = false;
+                next.state.pending_change = "uninstalling".to_string();
+                self.write_app(record, next)?;
+            }
+        }
         let running = self
             .store
             .app_job_version(&job_id)
@@ -1059,13 +1360,6 @@ impl ManagerDaemonService {
             .store
             .revoke_job_grants(&job_id, None, &identity.principal)
             .map_err(|e| map_store_error("Error revoking the app's grants", e))?;
-        self.store
-            .delete_app(&name)
-            .map_err(|e| map_store_error("Error uninstalling the app", e))?;
-        self.store
-            .events()
-            .app_uninstalled(&name, &identity.principal, revoked);
-        info!(app = %name, by = %identity.principal, revoked, "Uninstalled app");
         let mut message = format!(
             "uninstalled {name}; job {job_id} stopped and {revoked} grant(s) revoked (`legion job \
              destroy {job_id}` removes the job)"
@@ -1077,15 +1371,51 @@ impl ManagerDaemonService {
                 using.join(", ")
             ));
         }
-        self.store
-            .idempotency_record(&idempotency_key, "uninstall_app", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
-        Ok(Response::new(UninstallAppReply {
-            message,
+        if !kv_keys.is_empty() {
+            if inner.purge {
+                message.push_str(&format!(
+                    "; deleted {} KV key(s) under {prefix}",
+                    kv_keys.len()
+                ));
+            } else {
+                message.push_str(&format!(
+                    "; {} KV key(s) under {prefix} stay (`legion kv delete`, or uninstall with \
+                     --purge, removes them; an app installed later under this name is told \
+                     about them)",
+                    kv_keys.len()
+                ));
+            }
+        }
+        let reply = UninstallAppReply {
+            message: message.clone(),
             revoked_grants: u32::try_from(revoked).unwrap_or(u32::MAX),
             deduplicated: false,
             orphaned_jobs: using,
-        }))
+            kv_keys: u32::try_from(kv_keys.len()).unwrap_or(u32::MAX),
+            purged: inner.purge && !kv_keys.is_empty(),
+        };
+        // The record's deletion, the purge, and the idempotency key (with
+        // the whole reply, so a retry gets it back) in one entry.
+        let purged = self
+            .store
+            .delete_app_recorded(
+                &name,
+                inner.purge.then_some(prefix.as_str()),
+                &idempotency_key,
+                &serde_json::to_string(&reply).unwrap_or_default(),
+            )
+            .map_err(|e| map_store_error("Error uninstalling the app", e))?;
+        if !purged.is_empty() {
+            let changes: Vec<(String, bool)> = purged.into_iter().map(|key| (key, true)).collect();
+            if let Err(status) = super::reconcile_kv_changes(&self.store, &changes) {
+                warn!(app = %name, error = %status.message(), "Reconciling jobs after purging the app's KV keys failed");
+            }
+        }
+        self.store
+            .events()
+            .app_uninstalled(&name, &identity.principal, revoked);
+        info!(app = %name, by = %identity.principal, revoked, purge = inner.purge, "Uninstalled app");
+        Ok(Response::new(reply))
     }
 
     pub(super) async fn set_app_enabled_rpc(
@@ -1100,6 +1430,26 @@ impl ManagerDaemonService {
             AclScope::app(&name),
         )?;
         let inner = request.into_inner();
+        if inner.dry_run {
+            let record = self.load_app(&name)?;
+            let message = match (record.enabled, inner.enabled) {
+                (false, true) => format!("dry run: enabling {name} starts its job"),
+                (true, false) => format!(
+                    "dry run: disabling {name} stops its job and keeps its settings, config and \
+                     grant"
+                ),
+                (true, true) => format!(
+                    "dry run: {name} is enabled; enabling it again reconciles it, and resubmits \
+                     its job if it does not run healthy at its current version"
+                ),
+                (false, false) => format!("dry run: {name} is already disabled"),
+            };
+            return Ok(Response::new(SetAppEnabledReply {
+                app: Some(self.app_info(&record)?),
+                message,
+                deduplicated: false,
+            }));
+        }
         let idempotency_key = scoped_idempotency_key(
             &identity,
             "set_app_enabled",
@@ -1216,6 +1566,16 @@ impl ManagerDaemonService {
         let mut next = record.clone();
         next.settings = settings;
         next.state.pending_change = change.clone();
+        // More replicas, another pool: the job's admission (quota, pool
+        // policy) is checked now, not at the reconciler's submit.
+        self.admit_app_job(&next)?;
+        if inner.dry_run {
+            return Ok(Response::new(UpdateAppSettingsReply {
+                app: Some(self.app_info(&record)?),
+                message: format!("dry run: {name}: {change}"),
+                deduplicated: false,
+            }));
+        }
         let next = self.write_app(&record, next)?;
         info!(app = %name, by = %identity.principal, change = %change, "Changed app settings");
         let message = format!("{name}: {change}");
@@ -1304,6 +1664,23 @@ impl ManagerDaemonService {
                 app: Some(self.app_info(&record)?),
                 message: format!("{name}: config unchanged"),
                 code_fields_changed: Vec::new(),
+                deduplicated: false,
+            }));
+        }
+        self.admit_app_job(&changed)?;
+        if inner.dry_run {
+            return Ok(Response::new(SetAppConfigReply {
+                app: Some(self.app_info(&record)?),
+                message: if code_fields.is_empty() {
+                    format!("dry run: {name}: the config can be set; its job would roll with it")
+                } else {
+                    format!(
+                        "dry run: {name}: the config can be set, including code fields {}; its \
+                         job would roll with it",
+                        code_fields.join(", ")
+                    )
+                },
+                code_fields_changed: code_fields,
                 deduplicated: false,
             }));
         }

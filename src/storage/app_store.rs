@@ -353,12 +353,26 @@ impl Store {
         })
     }
 
+    /// Install an app and record the install's idempotency key in the same
+    /// replicated entry: a retry after a crash finds the key (and is
+    /// `deduplicated`) exactly when it finds the record.
+    #[instrument(err, skip_all, fields(app = %record.name))]
+    pub fn insert_app_recorded(&self, record: AppRecord, key: &str, reply: &str) -> R<()> {
+        let key = key.to_owned();
+        let reply = reply.to_owned();
+        self.replicated(Lane::Control, "insert_app", move |s| {
+            s.insert_app_apply(&record, false)?;
+            s.idempotency_record(&key, "install_app", &reply)?;
+            Ok(())
+        })
+    }
+
     /// Seed a bundled app: inserted only when no app of that name exists, so
     /// every later leader's seed pass changes nothing. Returns whether it
     /// inserted.
     #[instrument(err, skip_all, fields(app = %record.name))]
     pub fn seed_app(&self, record: AppRecord) -> R<bool> {
-        if self.get_app(&record.name)?.is_some() {
+        if self.app_exists(&record.name)? {
             return Ok(false);
         }
         self.replicated(Lane::Control, "seed_app", move |s| {
@@ -546,6 +560,53 @@ impl Store {
         self.replicated(Lane::Control, "delete_app", move |s| {
             let conn = s.write_connection()?;
             Ok(conn.execute("DELETE FROM app WHERE name = ?;", [&name])? > 0)
+        })
+    }
+
+    /// Delete an app record, and with `purge` every KV key under that
+    /// prefix (and its locks), and record the uninstall's idempotency key
+    /// with `reply`, all in one replicated entry. Returns the KV keys it
+    /// deleted.
+    #[instrument(err, skip_all, fields(app = name))]
+    pub fn delete_app_recorded(
+        &self,
+        name: &str,
+        purge: Option<&str>,
+        key: &str,
+        reply: &str,
+    ) -> R<Vec<String>> {
+        let name = name.to_owned();
+        let purge = purge.map(str::to_owned);
+        let key = key.to_owned();
+        let reply = reply.to_owned();
+        self.replicated(Lane::Control, "delete_app", move |s| {
+            let purged = {
+                let conn = s.write_connection()?;
+                conn.execute("DELETE FROM app WHERE name = ?;", [&name])?;
+                match &purge {
+                    Some(prefix) => {
+                        let mut stmt = conn.prepare(
+                            "SELECT key FROM kv_entry WHERE substr(key, 1, length(?1)) = ?1;",
+                        )?;
+                        let keys = stmt
+                            .query_map([prefix], |row| row.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<Vec<String>>>()?;
+                        drop(stmt);
+                        conn.execute(
+                            "DELETE FROM kv_entry WHERE substr(key, 1, length(?1)) = ?1;",
+                            [prefix],
+                        )?;
+                        conn.execute(
+                            "DELETE FROM kv_lock WHERE substr(key, 1, length(?1)) = ?1;",
+                            [prefix],
+                        )?;
+                        keys
+                    }
+                    None => Vec::new(),
+                }
+            };
+            s.idempotency_record(&key, "uninstall_app", &reply)?;
+            Ok(purged)
         })
     }
 

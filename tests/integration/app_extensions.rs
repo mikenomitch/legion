@@ -1725,3 +1725,83 @@ async fn only_a_stamped_allocation_speaks_for_its_app_test() -> R<()> {
     assert_eq!(status.code(), Code::PermissionDenied, "{status}");
     Ok(())
 }
+
+/// An upgrade that drops an extension point jobs set a key at is refused
+/// without `force`, naming the jobs, as uninstall is; the dry run lists the
+/// jobs and reports their values as orphaned, not as passing (hardening
+/// after the adversarial review, M7).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upgrade_that_drops_a_used_point_needs_force_test() -> R<()> {
+    let fx = fixture().await?;
+    let two = small_manifest(
+        "pair",
+        "0.1.0",
+        json!([
+            { "point": "task", "key": "slaTier",
+              "schema": object_schema(json!({ "level": { "type": "string" } }), &[]) },
+            { "point": "job", "key": "costCenter",
+              "schema": object_schema(json!({ "team": { "type": "string" } }), &[]) },
+        ]),
+    );
+    let one = small_manifest(
+        "pair",
+        "0.2.0",
+        json!([
+            { "point": "job", "key": "costCenter",
+              "schema": object_schema(json!({ "team": { "type": "string" } }), &[]) },
+        ]),
+    );
+    fx.install(&two, &[]).await?;
+    fx.run(&json!({
+        "name": "tiered",
+        "costCenter": { "team": "a" },
+        "task": { "name": "main", "runtime": "exec", "config": { "command": ["true"] },
+                  "slaTier": { "level": "gold" } },
+    }))
+    .await?;
+    let upgrade = |dry_run: bool, force: bool| {
+        fx.svc.upgrade_app(req(
+            UpgradeAppRequest {
+                name: "pair".into(),
+                manifest_json: one.to_string(),
+                dry_run,
+                force,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+    };
+    let dry = upgrade(true, false).await?.into_inner();
+    assert_eq!(dry.orphaned_jobs, vec!["tiered".to_string()]);
+    assert!(dry.uncovered.is_empty());
+    assert!(dry.message.contains("--force"), "{}", dry.message);
+    assert!(
+        dry.prompt
+            .iter()
+            .any(|line| line.starts_with("1 value of slaTier on tasks is orphaned")),
+        "{:?}",
+        dry.prompt
+    );
+    assert!(
+        !dry.prompt
+            .iter()
+            .any(|line| line.contains("slaTier") && line.contains("every value passes")),
+        "an orphaned value is not passing: {:?}",
+        dry.prompt
+    );
+    let refused = upgrade(false, false)
+        .await
+        .expect_err("jobs use the dropped point");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert!(
+        refused.message().contains("tiered") && refused.message().contains("--force"),
+        "{}",
+        refused.message()
+    );
+    let reply = upgrade(false, true).await?.into_inner();
+    assert!(reply.upgraded, "{}", reply.message);
+    assert_eq!(reply.orphaned_jobs, vec!["tiered".to_string()]);
+    let info = fx.info("tiered").await?;
+    assert_eq!(find(&info.extensions, "task", "slaTier")?.state, "orphaned");
+    Ok(())
+}

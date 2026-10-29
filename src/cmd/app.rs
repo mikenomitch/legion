@@ -53,6 +53,13 @@ fn name_arg() -> Arg {
         .help("The app's name")
 }
 
+fn dry_run_flag(help: &'static str) -> Arg {
+    Arg::new("dry-run")
+        .long("dry-run")
+        .action(ArgAction::SetTrue)
+        .help(help)
+}
+
 fn yes_flag(help: &'static str) -> Arg {
     Arg::new("yes")
         .long("yes")
@@ -135,6 +142,9 @@ pub fn config() -> Command {
                                 .value_hint(ValueHint::FilePath)
                                 .help("The config (.ncl or .json)"),
                         )
+                        .arg(dry_run_flag(
+                            "Validate the config and say what would change; change nothing",
+                        ))
                         .arg(idempotency_arg())
                         .arg(json_flag()),
                 )
@@ -183,13 +193,20 @@ pub fn config() -> Command {
                         .value_parser(clap::value_parser!(u64))
                         .help("Memory per task, in MiB (0 clears the override)"),
                 )
+                .arg(dry_run_flag(
+                    "Validate the change and say what would change; change nothing",
+                ))
                 .arg(idempotency_arg())
                 .arg(json_flag()),
         )
         .subcommand(
             Command::new("enable")
-                .about("Enable an app: its job runs again")
+                .about(
+                    "Enable an app: its job runs again. On an enabled app, resubmits a job that \
+                     does not run healthy at its current version (a failed upgrade, a failed job)",
+                )
                 .arg(name_arg())
+                .arg(dry_run_flag("Say what enabling would do; change nothing"))
                 .arg(idempotency_arg())
                 .arg(json_flag()),
         )
@@ -197,6 +214,7 @@ pub fn config() -> Command {
             Command::new("disable")
                 .about("Disable an app: its job stops; its record, config, and grant are kept")
                 .arg(name_arg())
+                .arg(dry_run_flag("Say what disabling would do; change nothing"))
                 .arg(idempotency_arg())
                 .arg(json_flag()),
         )
@@ -264,6 +282,15 @@ pub fn config() -> Command {
                 )
                 .arg(yes_flag("Approve new permissions without asking"))
                 .arg(
+                    Arg::new("force")
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Upgrade even though jobs set a jobspec key the new manifest no \
+                             longer declares; their values stay stored, flagged orphaned",
+                        ),
+                )
+                .arg(
                     Arg::new("dry-run")
                         .long("dry-run")
                         .action(ArgAction::SetTrue)
@@ -285,6 +312,18 @@ pub fn config() -> Command {
                              stored, flagged orphaned",
                         ),
                 )
+                .arg(
+                    Arg::new("purge")
+                        .long("purge")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Also delete the app's KV keys under legion/apps/<app>/ (needs \
+                             kv:write there)",
+                        ),
+                )
+                .arg(dry_run_flag(
+                    "Say what uninstalling would stop, revoke, orphan, and delete; change nothing",
+                ))
                 .arg(idempotency_arg())
                 .arg(json_flag()),
         )
@@ -683,6 +722,7 @@ async fn config_set(matches: &ArgMatches) -> R<()> {
                 name,
                 config_json,
                 idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
+                dry_run: matches.get_flag("dry-run"),
             })
             .await,
     )?
@@ -690,6 +730,7 @@ async fn config_set(matches: &ArgMatches) -> R<()> {
     if format.is_json() {
         output::print_success(&json!({
             "message": reply.message,
+            "dryRun": matches.get_flag("dry-run"),
             "deduplicated": reply.deduplicated,
             "codeFieldsChanged": reply.code_fields_changed,
             "app": reply.app.as_ref().map(app_json),
@@ -711,6 +752,7 @@ async fn set(matches: &ArgMatches) -> R<()> {
         memory: matches.get_one::<u64>("memory").copied(),
         pool: matches.get_one::<String>("pool").cloned(),
         idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
+        dry_run: matches.get_flag("dry-run"),
     };
     if request.replicas.is_none()
         && request.placement.is_none()
@@ -728,6 +770,7 @@ async fn set(matches: &ArgMatches) -> R<()> {
         ));
     }
     let mut client = connect_manager_client().await?;
+    let dry_run = request.dry_run;
     let reply = output::resolve(
         format,
         "update app settings",
@@ -737,6 +780,7 @@ async fn set(matches: &ArgMatches) -> R<()> {
     if format.is_json() {
         output::print_success(&json!({
             "message": reply.message,
+            "dryRun": dry_run,
             "deduplicated": reply.deduplicated,
             "app": reply.app.as_ref().map(app_json),
         }));
@@ -757,6 +801,7 @@ async fn set_enabled(matches: &ArgMatches, enabled: bool) -> R<()> {
                 name: name_of(matches),
                 enabled,
                 idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
+                dry_run: matches.get_flag("dry-run"),
             })
             .await,
     )?
@@ -764,6 +809,7 @@ async fn set_enabled(matches: &ArgMatches, enabled: bool) -> R<()> {
     if format.is_json() {
         output::print_success(&json!({
             "message": reply.message,
+            "dryRun": matches.get_flag("dry-run"),
             "deduplicated": reply.deduplicated,
             "app": reply.app.as_ref().map(app_json),
         }));
@@ -968,6 +1014,7 @@ async fn upgrade(matches: &ArgMatches) -> R<()> {
     let dry_run = matches.get_flag("dry-run");
     let yes = matches.get_flag("yes");
     let mut client = connect_manager_client().await?;
+    let force = matches.get_flag("force");
     let request = |dry_run: bool, approve: bool| UpgradeAppRequest {
         name: name.clone(),
         manifest_json: manifest_json.clone(),
@@ -976,6 +1023,7 @@ async fn upgrade(matches: &ArgMatches) -> R<()> {
         dry_run,
         idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
         config_json: config_json.clone(),
+        force,
     };
     let preview = output::resolve(
         format,
@@ -992,6 +1040,8 @@ async fn upgrade(matches: &ArgMatches) -> R<()> {
                 "dryRun": true,
                 "message": preview.message,
                 "prompt": preview.prompt,
+                "uncovered": preview.uncovered,
+                "orphanedJobs": preview.orphaned_jobs,
                 "diff": {
                     "added": parse_json_field(&diff.added_json),
                     "removed": parse_json_field(&diff.removed_json),
@@ -1017,6 +1067,29 @@ async fn upgrade(matches: &ArgMatches) -> R<()> {
             println!("{}", preview.message);
             return Ok(());
         }
+    }
+    // A token that cannot grant the new manifest, or an upgrade that would
+    // orphan values without --force, is refused before anything is asked.
+    if !preview.uncovered.is_empty() || (!preview.orphaned_jobs.is_empty() && !force) {
+        let (code, message, hint) = if preview.uncovered.is_empty() {
+            (
+                "FailedPrecondition",
+                preview.message.trim_start_matches("dry run: ").to_string(),
+                None,
+            )
+        } else {
+            (
+                "PermissionDenied",
+                preview.uncovered.clone(),
+                Some(
+                    "have someone who holds it upgrade the app, or ask for it to be granted to you",
+                ),
+            )
+        };
+        return Err(output::fail_local(
+            format,
+            CliError::local(code, message, hint),
+        ));
     }
     let approve = if added.is_empty() || yes {
         true
@@ -1056,6 +1129,7 @@ async fn upgrade(matches: &ArgMatches) -> R<()> {
             "upgraded": reply.upgraded,
             "message": reply.message,
             "deduplicated": reply.deduplicated,
+            "orphanedJobs": reply.orphaned_jobs,
             "app": reply.app.as_ref().map(app_json),
         }));
     } else {
@@ -1083,6 +1157,8 @@ async fn uninstall(matches: &ArgMatches) -> R<()> {
                 name: name_of(matches),
                 idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
                 force: matches.get_flag("force"),
+                purge: matches.get_flag("purge"),
+                dry_run: matches.get_flag("dry-run"),
             })
             .await,
     )?
@@ -1090,9 +1166,12 @@ async fn uninstall(matches: &ArgMatches) -> R<()> {
     if format.is_json() {
         output::print_success(&json!({
             "message": reply.message,
+            "dryRun": matches.get_flag("dry-run"),
             "revokedGrants": reply.revoked_grants,
             "deduplicated": reply.deduplicated,
             "orphanedJobs": reply.orphaned_jobs,
+            "kvKeys": reply.kv_keys,
+            "purged": reply.purged,
         }));
     } else {
         println!("{}", reply.message);

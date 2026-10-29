@@ -122,6 +122,7 @@ pub(crate) fn lifecycle_report(
         BTreeMap::new();
     let mut adopted: Vec<String> = Vec::new();
     let mut held: Vec<String> = Vec::new();
+    let mut orphaned: BTreeMap<(String, ExtensionPoint), Vec<String>> = BTreeMap::new();
     for job in jobs {
         let entries = job_extension_entries(&job.config, registry);
         for entry in &entries {
@@ -131,6 +132,14 @@ pub(crate) fn lifecycle_report(
             if entry.state == ExtensionState::Pending {
                 // Claimed, but its key needs a permission no submit checked.
                 held.push(entry.label(&job.job_id));
+                continue;
+            }
+            if entry.state == ExtensionState::Orphaned {
+                // Its point is gone from this version: not "passing".
+                orphaned
+                    .entry((entry.key.clone(), entry.point))
+                    .or_default()
+                    .push(entry.label(&job.job_id));
                 continue;
             }
             let installed_key = registry
@@ -169,6 +178,18 @@ pub(crate) fn lifecycle_report(
             lines.extend(failing);
         }
     }
+    for ((key, point), labels) in orphaned {
+        lines.push(format!(
+            "{} value{} of {key} on {} {} orphaned: this version no longer declares the key there. \
+             The values stay stored, flagged orphaned, and each job's next submit fails until the \
+             key is removed:",
+            labels.len(),
+            if labels.len() == 1 { "" } else { "s" },
+            point_plural(point),
+            if labels.len() == 1 { "is" } else { "are" },
+        ));
+        lines.extend(labels.into_iter().map(|label| format!("  {label}")));
+    }
     if installing && !adopted.is_empty() {
         lines.push(format!(
             "Adopts {} pending value{} kept under --allow-unknown-fields: {}",
@@ -185,6 +206,23 @@ pub(crate) fn lifecycle_report(
         ));
     }
     lines
+}
+
+/// The jobs whose values for `app`'s keys `registry` (an upgraded one)
+/// reads as orphaned: the points an upgrade drops.
+pub(crate) fn orphaned_jobs(
+    app: &str,
+    jobs: &[ExtensionJob],
+    registry: &ExtensionRegistry,
+) -> Vec<String> {
+    jobs.iter()
+        .filter(|job| {
+            job_extension_entries(&job.config, registry)
+                .iter()
+                .any(|entry| entry.app == app && entry.state == ExtensionState::Orphaned)
+        })
+        .map(|job| job.job_id.clone())
+        .collect()
 }
 
 impl ManagerDaemonService {

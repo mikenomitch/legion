@@ -452,7 +452,38 @@ pub(crate) enum SubmitOrigin {
     App {
         granted_by: String,
         managed_by: crate::structs::app::ManagedBy,
+        /// The app record's `updated_at` the render came from: the store
+        /// refuses the submit unless the record is still there, enabled, and
+        /// unchanged.
+        record_updated_at: String,
     },
+}
+
+/// What admission made of a submit ([`ManagerDaemonService::admit_rendered_job`]).
+struct AdmittedJob {
+    config: JobConfig,
+    kv_refs: Vec<KvReference>,
+    unknown_fields: UnknownFieldsRecord,
+    namespace: String,
+    artifact_pins: Vec<ArtifactPin>,
+    autoscale_warnings: Vec<String>,
+}
+
+/// The status of a failed artifact admission: `Unavailable` (retry) when a
+/// pin's resolution failed for a reason a retry can fix (the registry or
+/// git remote could not be reached, timed out, or answered 5xx or 429),
+/// `InvalidArgument` (fix the job) for everything else: a reference that
+/// does not exist, credentials that are refused, a rule the job breaks.
+fn artifact_admission_status(e: anyhow::Error) -> Status {
+    if crate::artifacts::fetcher::PinResolveFailure::transient_in(&e) {
+        warn!("Error resolving an artifact pin (transient): {e:#}");
+        return Status::unavailable(format!(
+            "Error normalizing artifacts: {e:#}\nHint: the source could not be reached; the \
+             submit can be retried as it is"
+        ));
+    }
+    error!("Error normalizing artifacts: {:?}", e);
+    Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
 }
 
 struct SubmittedJob {
@@ -2434,42 +2465,25 @@ impl ManagerDaemonService {
         )
     }
 
-    /// Everything RunJob does once it holds a rendered jobspec, shared with
-    /// RunJobTemplate so both submission paths behave identically: KV
-    /// reference resolution, precise ACL enforcement, the template collision
-    /// guard, task validation, artifact admission, persistence (with
-    /// provenance), status clears, KV-ref bookkeeping, keyed-instance
-    /// seeding, and rollout/eval enqueueing.
+    /// The admission half of a submit: everything RunJob checks before it
+    /// writes (KV reference resolution with its `kv:read` checks, precise
+    /// ACL enforcement, the reserved-namespace and app-managed-job rules,
+    /// namespace policies, extension `requires`, the template collision
+    /// guard, task, autoscale, identity, volume and capability validation,
+    /// and artifact admission with pin resolution). Shared by the submit
+    /// and by the app RPCs' dry run of an app's job (install, upgrade,
+    /// config and settings changes), so they refuse what the reconciler's
+    /// submit would.
     #[allow(clippy::too_many_arguments)]
-    fn submit_rendered_job_from(
+    fn admit_rendered_job(
         &self,
         identity: &AclIdentity,
         js: &str,
-        mut subs: Vec<Submission>,
-        // Explicit eval-queue override (`--priority`/`--asap`). `None` lets
-        // the job's priority band set the queue position, which is the
-        // default and the point of having one field mean both things.
-        priority: Option<i64>,
-        force_reschedule: bool,
         template: Option<&JobTemplateProvenance>,
-        // The request's namespace (`-n`); resolved against the jobspec's own.
         namespace: Option<&str>,
-        // Who the stored version is recorded as coming from.
-        origin: SubmitOrigin,
-        // The request's `allow_unknown_fields`.
+        origin: &SubmitOrigin,
         unknown_field_mode: UnknownFieldMode,
-        // Warnings found before the submit: apps' answers to their validate
-        // calls (`ask_apps_to_validate`).
-        app_warnings: Vec<String>,
-    ) -> Result<SubmittedJob, Status> {
-        if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
-            subs.push(Submission {
-                path: "job.rendered.json".into(),
-                content: js.to_string(),
-                is_primary: false,
-            });
-        }
-
+    ) -> Result<AdmittedJob, Status> {
         // The keys installed apps add to the jobspec: the parse resolves
         // extension values against them (docs/apps.md, "Jobspec extensions").
         let registry = self.extension_registry()?;
@@ -2598,13 +2612,69 @@ impl ManagerDaemonService {
         // Artifact admission: desugar/auth/pin. Pin resolution can reach
         // registries, so it runs as blocking work.
         let artifact_pins =
-            run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true)).map_err(
-                |e| {
-                    error!("Error normalizing artifacts: {:?}", e);
-                    Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
-                },
-            )?;
-        let config = config;
+            run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true))
+                .map_err(artifact_admission_status)?;
+        Ok(AdmittedJob {
+            config,
+            kv_refs,
+            unknown_fields,
+            namespace,
+            artifact_pins,
+            autoscale_warnings,
+        })
+    }
+
+    /// Everything RunJob does once it holds a rendered jobspec, shared with
+    /// RunJobTemplate so both submission paths behave identically: KV
+    /// reference resolution, precise ACL enforcement, the template collision
+    /// guard, task validation, artifact admission, persistence (with
+    /// provenance), status clears, KV-ref bookkeeping, keyed-instance
+    /// seeding, and rollout/eval enqueueing.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_rendered_job_from(
+        &self,
+        identity: &AclIdentity,
+        js: &str,
+        mut subs: Vec<Submission>,
+        // Explicit eval-queue override (`--priority`/`--asap`). `None` lets
+        // the job's priority band set the queue position, which is the
+        // default and the point of having one field mean both things.
+        priority: Option<i64>,
+        force_reschedule: bool,
+        template: Option<&JobTemplateProvenance>,
+        // The request's namespace (`-n`); resolved against the jobspec's own.
+        namespace: Option<&str>,
+        // Who the stored version is recorded as coming from.
+        origin: SubmitOrigin,
+        // The request's `allow_unknown_fields`.
+        unknown_field_mode: UnknownFieldMode,
+        // Warnings found before the submit: apps' answers to their validate
+        // calls (`ask_apps_to_validate`).
+        app_warnings: Vec<String>,
+    ) -> Result<SubmittedJob, Status> {
+        if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
+            subs.push(Submission {
+                path: "job.rendered.json".into(),
+                content: js.to_string(),
+                is_primary: false,
+            });
+        }
+
+        let AdmittedJob {
+            config,
+            kv_refs,
+            unknown_fields,
+            namespace,
+            artifact_pins,
+            autoscale_warnings,
+        } = self.admit_rendered_job(
+            identity,
+            js,
+            template,
+            namespace,
+            &origin,
+            unknown_field_mode,
+        )?;
         // The version's grant is recorded in the submitter's name, in the
         // same entry as the version (`enforce_identity_grants` above checked
         // they hold it).
