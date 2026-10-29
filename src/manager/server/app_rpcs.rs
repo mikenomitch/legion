@@ -499,6 +499,7 @@ impl ManagerDaemonService {
                 .iter()
                 .map(super::extension_rpcs::key_proto)
                 .collect(),
+            uid: record.uid,
         })
     }
 
