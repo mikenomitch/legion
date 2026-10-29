@@ -781,10 +781,11 @@ An app presents the assertion back on its own calls to Legion, in the
 API socket attaches). The Rust framework does it for you:
 
 ```rust
+let app = context.clone();
 context.action("pause", move |request: ActionRequest| {
-    let context = context.clone();
+    let app = app.clone();
     async move {
-        let mut legion = request.client_as_viewer(&context).await?;
+        let mut legion = request.client_as_viewer(&app).await?;
         legion
             .pause_scaling(PauseScalingRequest {
                 job: request.context.job_id().unwrap_or_default(),

@@ -33710,7 +33710,11 @@ export class WhoAmIReply extends Message<WhoAmIReply> {
    * How the caller was identified.
    *
    * One of: `disabled` (ACLs off), `token` (Legion ACL token), `jwt`
-   * (external JWT validated by an auth method), `anonymous` (no credential).
+   * (external JWT validated by an auth method), `anonymous` (no credential),
+   * `delegated` (an app's own credential presenting a viewer's assertion in
+   * `legion-on-behalf-of`: `principal` is `<viewer> via app <app>`, and
+   * `rules_json` the one rule the delegation holds, plus any deny rules the
+   * app or the viewer carry).
    *
    * @generated from field: string source = 3;
    */

@@ -439,8 +439,10 @@ export const Manager = {
      * ACL: app-plane. Only the bundled autoscaler's own workload identity (a
      * token whose job grant belongs to an allocation of
      * `legion-system/autoscaler`) or a management token may call it, so a
-     * caller with `scale:write` cannot forge the app's status. With ACLs
-     * disabled every caller is trusted, as everywhere else.
+     * caller with `scale:write` cannot forge the app's status. The app acting
+     * as a viewer (`legion-on-behalf-of`) is PermissionDenied, in audit-only
+     * mode too. With ACLs disabled every caller is trusted, as everywhere
+     * else.
      *
      * @generated from rpc legion.Manager.ReportScalingStatus
      */
@@ -3967,8 +3969,9 @@ export const Manager = {
      * `legion` token, through the API socket or as a bearer token, or an ACL
      * token minted from it with `legion login --method legion`), and it
      * returns only that app's values: `app` must be empty or name the caller.
-     * A management token may name any installed `app`. Re-checks the
-     * caller's credential periodically, like StreamEvents.
+     * A management token may name any installed `app`. An app acting as a
+     * viewer (`legion-on-behalf-of`) is refused. Re-checks the caller's
+     * credential periodically, like StreamEvents.
      *
      * Errors:
      * - Unauthenticated: no credential.
@@ -4099,6 +4102,19 @@ export const Manager = {
      * {...} }` and a viewer assertion that also carries the SHA-256 of the
      * inputs' canonical JSON, so an app acts only on the context and inputs
      * the manager authorized.
+     *
+     * The action's assertion also carries a `delegation`: the declared
+     * resource, the declared action (then `read` on the same resource when
+     * the caller holds it there), and exactly the scope checked (`namespace`
+     * and `name`, plus `template` when the job came from one, for job and
+     * task slots; `pool` for a node slot's `node` permission). The app may
+     * present the assertion back in the `legion-on-behalf-of` metadata, beside
+     * its own credential, to make its calls as `<caller> via app <app>`,
+     * holding only that delegation within its own grant, for the assertion's
+     * 60 seconds; the pause or pin it makes is then recorded by that
+     * principal, not by the app (docs/auth-and-acls.md, "Delegated
+     * identities"). A context whose job, namespace, or pool has a `*` in its
+     * name cannot be delegated: InvalidArgument.
      *
      * The app answers `{ "message": "...", "view": {...} }`; `view`, when
      * present, is a refreshed view, validated like GetAppView's.
