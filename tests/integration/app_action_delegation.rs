@@ -480,7 +480,6 @@ async fn fixture() -> R<Fixture> {
     let mut reconciler = AppReconciler::new(
         fx.svc.clone(),
         ReconcilerSettings {
-            app_user: "nobody".into(),
             seed: BTreeMap::new(),
             own_build: BuildMarker {
                 version: "0.1.0".into(),

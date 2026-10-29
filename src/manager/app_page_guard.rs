@@ -19,6 +19,12 @@
 //! allowlist, that a page still open after an upgrade narrowed its `rpcs`
 //! is held to the new list, and that bridged calls are attributable in the
 //! manager's logs.
+//!
+//! The layer runs before the handler authenticates anyone, so every
+//! refusal reads the same ([`page_call_refused`]): whether the app is
+//! installed or enabled, whether it declares the page, and which RPCs the
+//! page lists are never told to the caller. The reason is in the manager's
+//! log.
 
 use std::task::{Context, Poll};
 
@@ -65,50 +71,77 @@ pub struct AppPageGuard<S> {
     store: Store,
 }
 
+/// The one answer every refused bridged call gets: it names nothing the
+/// caller did not send.
+pub fn page_call_refused() -> Status {
+    Status::permission_denied(
+        "this sandboxed page may not make this call: its app is not installed or enabled, \
+         declares no such page, or does not list the RPC in the page's `rpcs` (the manager's \
+         log says which)",
+    )
+}
+
 /// Check one bridged call (`page_header` is the `legion-app-page` value,
-/// `path` the gRPC route): `Ok` when it may proceed.
+/// `path` the gRPC route): `Ok` when it may proceed, and otherwise
+/// [`page_call_refused`] whatever the reason, which is logged instead.
 pub fn check_page_call(store: &Store, page_header: &str, path: &str) -> Result<(), Status> {
+    match page_call_refusal(store, page_header, path) {
+        Ok(None) => Ok(()),
+        Ok(Some(reason)) => {
+            warn!(
+                page = %page_header,
+                path = %path,
+                reason = %reason,
+                "Refused a sandboxed page's call outside its allowlist"
+            );
+            Err(page_call_refused())
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// Why a bridged call may not proceed, for the log; `None` when it may.
+fn page_call_refusal(
+    store: &Store,
+    page_header: &str,
+    path: &str,
+) -> Result<Option<String>, Status> {
     let Some((app, page)) = page_header.trim().split_once('/') else {
-        return Err(Status::permission_denied(format!(
-            "{APP_PAGE_HEADER} must name `<app>/<page>`"
-        )));
+        return Ok(Some(format!("{APP_PAGE_HEADER} must name `<app>/<page>`")));
     };
     let Some(method) = path.strip_prefix(MANAGER_SERVICE_PREFIX) else {
-        return Err(Status::permission_denied(
-            "a sandboxed page calls Manager RPCs only",
-        ));
+        return Ok(Some("a sandboxed page calls Manager RPCs only".to_string()));
     };
-    let record = store
+    let Some(record) = store
         .get_app(app)
-        .map_err(|err| Status::unavailable(format!("loading app {app}: {err:#}")))?
-        .ok_or_else(|| {
-            Status::permission_denied(format!(
-                "app {app:?} is not installed, so its page {page:?} may call nothing"
-            ))
-        })?;
+        .map_err(|err| Status::unavailable(format!("loading an app: {err:#}")))?
+    else {
+        return Ok(Some(format!(
+            "app {app:?} is not installed, so its page {page:?} may call nothing"
+        )));
+    };
     if !record.enabled {
-        return Err(Status::permission_denied(format!(
+        return Ok(Some(format!(
             "app {app} is disabled, so its page {page:?} may call nothing"
         )));
     }
-    let ui = record.manifest.ui_spec().map_err(|err| {
-        Status::permission_denied(format!("app {app}'s ui block is invalid: {err}"))
-    })?;
+    let ui = match record.manifest.ui_spec() {
+        Ok(ui) => ui,
+        Err(err) => return Ok(Some(format!("app {app}'s ui block is invalid: {err}"))),
+    };
     let Some(declared) = ui.page(page) else {
-        return Err(Status::permission_denied(format!(
-            "app {app} declares no page {page:?}"
-        )));
+        return Ok(Some(format!("app {app} declares no page {page:?}")));
     };
     if declared.allows_rpc(method) {
-        return Ok(());
+        return Ok(None);
     }
     if declared.rpcs.iter().any(|rpc| rpc == method) {
-        return Err(Status::permission_denied(format!(
+        return Ok(Some(format!(
             "page {app}/{page}: {}",
             page_rpc_refusal(method)
         )));
     }
-    Err(Status::permission_denied(format!(
+    Ok(Some(format!(
         "page {app}/{page} may not call {method}: it is not in the page's `rpcs` ({})",
         if declared.rpcs.is_empty() {
             "none".to_string()
@@ -141,15 +174,7 @@ where
                 debug!(page = %header, path = %path, "A sandboxed page's call");
                 Either::Right(self.inner.call(req))
             }
-            Err(status) => {
-                warn!(
-                    page = %header,
-                    path = %path,
-                    reason = %status.message(),
-                    "Refused a sandboxed page's call outside its allowlist"
-                );
-                Either::Left(std::future::ready(Ok(status.into_http())))
-            }
+            Err(status) => Either::Left(std::future::ready(Ok(status.into_http()))),
         }
     }
 }

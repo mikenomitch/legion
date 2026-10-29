@@ -324,7 +324,7 @@ impl CompiledSchema {
     /// Fill defaults, then validate; see [`InstalledKey::check`].
     pub fn check(&self, value: &Value) -> Result<Value, Vec<String>> {
         let mut effective = value.clone();
-        fill_defaults(&self.raw, &self.raw, &mut effective, 0);
+        fill_defaults(&self.raw, &mut effective).map_err(|err| vec![err])?;
         let problems: Vec<String> = match self.compiled.validate(&effective) {
             Ok(()) => Vec::new(),
             Err(errors) => errors
@@ -419,6 +419,12 @@ pub fn compile_schema(schema: &Value, max_bytes: usize) -> Result<jsonschema::JS
             "$ref {remote:?} is not local; only refs into the schema itself (\"#/…\") are allowed"
         ));
     }
+    if let Some(at) = same_value_ref_loop(schema) {
+        return Err(format!(
+            "loops back to {at} without descending into the value (through `$ref`, `allOf`, \
+             `anyOf`, ...); validating against it would never end"
+        ));
+    }
     jsonschema::JSONSchema::options()
         .with_draft(jsonschema::Draft::Draft7)
         .with_resolver(LocalRefsOnly)
@@ -464,51 +470,317 @@ pub fn compiled_extension_schema(schema: &Value) -> Result<Arc<CompiledSchema>, 
     Ok(compiled)
 }
 
-/// Fill `value`'s missing properties from the schema's `default`s, as
-/// Legion reads a value (the validator only validates): every property
-/// absent from an object whose schema has a `default` gets it, and present
-/// objects and array items are filled the same way. Follows local `$ref`s
-/// and `allOf`. Bounded in depth, so a recursive schema cannot loop.
-pub fn fill_defaults(root: &Value, schema: &Value, value: &mut Value, depth: usize) {
-    if depth > 32 {
-        return;
-    }
-    let Some(schema) = resolve_local_ref(root, schema, 0) else {
-        return;
+/// The most values filling defaults may add to one value: past it the fill
+/// fails, naming the schema's recursion as the likely cause.
+pub const MAX_DEFAULT_FILL_VALUES: usize = 10_000;
+/// The most schema applications one fill may make (a schema can apply many
+/// subschemas to one value, `allOf` of `allOf` of ...).
+pub const MAX_DEFAULT_FILL_STEPS: usize = 100_000;
+
+/// Fill `value`'s missing properties from `root`'s `default`s, as Legion
+/// reads a value (the validator only validates): every property absent
+/// from an object whose schema has a `default` gets it, and present objects
+/// and array items are filled the same way. Follows local `$ref`s and
+/// `allOf`.
+///
+/// Bounded, because a schema is an app's data and a value a tenant's: a
+/// `$ref` is not followed back into a schema it is already inside of
+/// without descending into the value first (`allOf: [{ $ref: "#" }]`), nor
+/// at all inside a value a default just supplied, so a recursive schema
+/// fills what the value spells out and one level of defaults; past
+/// [`MAX_DEFAULT_FILL_VALUES`] added values or [`MAX_DEFAULT_FILL_STEPS`]
+/// schema applications the fill fails rather than growing (a schema whose
+/// default recursed into two `$ref`s used to double every level, to 2^33
+/// objects).
+pub fn fill_defaults(root: &Value, value: &mut Value) -> Result<(), String> {
+    let mut fill = DefaultFill {
+        root,
+        added: 0,
+        steps: 0,
+        entered: vec![(root as *const Value, 0)],
     };
-    if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
-        for part in all_of {
-            fill_defaults(root, part, value, depth + 1);
+    fill.fill(root, value, 0, false)
+}
+
+/// One [`fill_defaults`] run's budget and the `$ref`s it is inside of.
+struct DefaultFill<'r> {
+    root: &'r Value,
+    added: usize,
+    steps: usize,
+    /// Each schema a `$ref` led into on the current path, with the value
+    /// depth it was entered at.
+    entered: Vec<(*const Value, usize)>,
+}
+
+impl<'r> DefaultFill<'r> {
+    /// Fill `value` (at `level` in the value) from `schema`; `supplied` when
+    /// the value, or one it is inside of, came from a default.
+    fn fill(
+        &mut self,
+        schema: &'r Value,
+        value: &mut Value,
+        level: usize,
+        supplied: bool,
+    ) -> Result<(), String> {
+        self.steps += 1;
+        if self.steps > MAX_DEFAULT_FILL_STEPS {
+            return Err(format!(
+                "filling the schema's defaults applies more than {MAX_DEFAULT_FILL_STEPS} \
+                 subschemas; the schema refers to itself too often"
+            ));
         }
+        if level > 32 {
+            return Ok(());
+        }
+        let mark = self.entered.len();
+        let outcome = match self.enter(schema, level, supplied) {
+            Some(schema) => self.fill_resolved(schema, value, level, supplied),
+            None => Ok(()),
+        };
+        self.entered.truncate(mark);
+        outcome
     }
-    match value {
-        Value::Object(object) => {
-            let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-                return;
+
+    /// Follow `schema`'s `$ref`s, recording each schema entered; `None` when
+    /// one leads back into a schema already entered at this depth, or, in a
+    /// value a default supplied, at any depth.
+    fn enter(&mut self, mut schema: &'r Value, level: usize, supplied: bool) -> Option<&'r Value> {
+        let mut hops = 0;
+        while let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            hops += 1;
+            if hops > 16 {
+                return None;
+            }
+            let pointer = reference.strip_prefix('#')?;
+            let target = if pointer.is_empty() {
+                self.root
+            } else {
+                self.root.pointer(pointer)?
             };
-            for (name, property) in properties {
-                let Some(property) = resolve_local_ref(root, property, 0) else {
-                    continue;
+            let key = target as *const Value;
+            let looping = self
+                .entered
+                .iter()
+                .any(|(seen, at)| *seen == key && (supplied || *at == level));
+            if looping {
+                return None;
+            }
+            self.entered.push((key, level));
+            schema = target;
+        }
+        Some(schema)
+    }
+
+    fn fill_resolved(
+        &mut self,
+        schema: &'r Value,
+        value: &mut Value,
+        level: usize,
+        supplied: bool,
+    ) -> Result<(), String> {
+        if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
+            for part in all_of {
+                self.fill(part, value, level, supplied)?;
+            }
+        }
+        match value {
+            Value::Object(object) => {
+                let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+                    return Ok(());
                 };
-                if !object.contains_key(name) {
-                    if let Some(default) = property.get("default") {
-                        object.insert(name.clone(), default.clone());
+                for (name, property) in properties {
+                    let mut child_supplied = supplied;
+                    if !object.contains_key(name) {
+                        let default = resolve_local_ref(self.root, property, 0)
+                            .and_then(|resolved| resolved.get("default"));
+                        if let Some(default) = default {
+                            self.added += count_values(default);
+                            if self.added > MAX_DEFAULT_FILL_VALUES {
+                                return Err(format!(
+                                    "filling the schema's defaults adds more than \
+                                     {MAX_DEFAULT_FILL_VALUES} values; a default recurses or \
+                                     nests too deep"
+                                ));
+                            }
+                            object.insert(name.clone(), default.clone());
+                            child_supplied = true;
+                        }
+                    }
+                    if let Some(child) = object.get_mut(name) {
+                        self.fill(property, child, level + 1, child_supplied)?;
                     }
                 }
-                if let Some(child) = object.get_mut(name) {
-                    fill_defaults(root, property, child, depth + 1);
-                }
+                Ok(())
             }
-        }
-        Value::Array(items) => {
-            if let Some(item_schema) = schema.get("items").filter(|items| items.is_object()) {
-                for item in items {
-                    fill_defaults(root, item_schema, item, depth + 1);
+            Value::Array(items) => {
+                if let Some(item_schema) = schema.get("items").filter(|items| items.is_object()) {
+                    for item in items {
+                        self.fill(item_schema, item, level + 1, supplied)?;
+                    }
                 }
+                Ok(())
             }
+            _ => Ok(()),
         }
-        _ => {}
     }
+}
+
+/// How many JSON values `value` holds, itself included.
+fn count_values(value: &Value) -> usize {
+    1 + match value {
+        Value::Object(map) => map.values().map(count_values).sum(),
+        Value::Array(items) => items.iter().map(count_values).sum(),
+        _ => 0,
+    }
+}
+
+/// The first `$ref` loop in `schema` that applies a schema to a value again
+/// without descending into it: `allOf: [{ "$ref": "#" }]`, or two
+/// definitions whose `anyOf`s refer to each other. A validator follows it
+/// forever and overflows its stack, which aborts the process, so a schema
+/// with one is refused before it is compiled. Descending keywords
+/// (`properties`, `items`, ...) consume the value and end any recursion
+/// through them.
+pub fn same_value_ref_loop(schema: &Value) -> Option<String> {
+    let mut finished: std::collections::HashSet<*const Value> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<*const Value> = std::collections::HashSet::new();
+    let mut pending = vec![(schema, "#".to_string())];
+    while let Some((node, at)) = pending.pop() {
+        if !seen.insert(node as *const Value) {
+            continue;
+        }
+        let mut path = Vec::new();
+        if let Some(loop_at) = same_value_walk(schema, node, &at, &mut path, &mut finished) {
+            return Some(loop_at);
+        }
+        // Every schema a keyword holds, and every `$ref` target, starts a
+        // walk of its own: a value can reach each of them.
+        for (child, child_at) in subschemas(node, &at, false) {
+            pending.push((child, child_at));
+        }
+        for (child, child_at) in subschemas(node, &at, true) {
+            pending.push((child, child_at));
+        }
+        if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+            let target = match reference.strip_prefix('#') {
+                Some("") => Some(schema),
+                Some(pointer) => schema.pointer(pointer),
+                None => None,
+            };
+            if let Some(target) = target {
+                pending.push((target, reference.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Depth-first over the schemas `node` applies to the same value; `Some`
+/// with the place the walk came back to when it loops.
+fn same_value_walk<'s>(
+    root: &'s Value,
+    node: &'s Value,
+    at: &str,
+    path: &mut Vec<*const Value>,
+    finished: &mut std::collections::HashSet<*const Value>,
+) -> Option<String> {
+    let key = node as *const Value;
+    if finished.contains(&key) {
+        return None;
+    }
+    if path.contains(&key) {
+        return Some(at.to_string());
+    }
+    if path.len() > 256 {
+        return Some(at.to_string());
+    }
+    path.push(key);
+    let mut next: Vec<(&'s Value, String)> = subschemas(node, at, true);
+    if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+        if let Some(pointer) = reference.strip_prefix('#') {
+            let target = if pointer.is_empty() {
+                Some(root)
+            } else {
+                root.pointer(pointer)
+            };
+            if let Some(target) = target {
+                next.push((target, reference.to_string()));
+            }
+        }
+    }
+    for (child, child_at) in next {
+        if let Some(found) = same_value_walk(root, child, &child_at, path, finished) {
+            return Some(found);
+        }
+    }
+    path.pop();
+    finished.insert(key);
+    None
+}
+
+/// The subschemas `node` holds: those it applies to the same value
+/// (`same_value`: `allOf`, `anyOf`, `oneOf`, `not`, `if`, `then`, `else`,
+/// schema `dependencies`), or those it applies to a part of it
+/// (`properties`, `patternProperties`, `additionalProperties`, `items`,
+/// `additionalItems`, `contains`, `propertyNames`) and the ones it only
+/// defines (`definitions`, `$defs`).
+fn subschemas<'s>(node: &'s Value, at: &str, same_value: bool) -> Vec<(&'s Value, String)> {
+    let Some(map) = node.as_object() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut push = |value: &'s Value, place: String| {
+        if value.is_object() {
+            found.push((value, place));
+        }
+    };
+    if same_value {
+        for keyword in ["allOf", "anyOf", "oneOf"] {
+            if let Some(items) = map.get(keyword).and_then(Value::as_array) {
+                for (index, item) in items.iter().enumerate() {
+                    push(item, format!("{at}/{keyword}/{index}"));
+                }
+            }
+        }
+        for keyword in ["not", "if", "then", "else"] {
+            if let Some(item) = map.get(keyword) {
+                push(item, format!("{at}/{keyword}"));
+            }
+        }
+        if let Some(dependencies) = map.get("dependencies").and_then(Value::as_object) {
+            for (name, item) in dependencies {
+                push(item, format!("{at}/dependencies/{name}"));
+            }
+        }
+    } else {
+        for keyword in ["properties", "patternProperties", "definitions", "$defs"] {
+            if let Some(children) = map.get(keyword).and_then(Value::as_object) {
+                for (name, item) in children {
+                    push(item, format!("{at}/{keyword}/{name}"));
+                }
+            }
+        }
+        for keyword in [
+            "additionalProperties",
+            "additionalItems",
+            "contains",
+            "propertyNames",
+        ] {
+            if let Some(item) = map.get(keyword) {
+                push(item, format!("{at}/{keyword}"));
+            }
+        }
+        match map.get("items") {
+            Some(Value::Array(items)) => {
+                for (index, item) in items.iter().enumerate() {
+                    push(item, format!("{at}/items/{index}"));
+                }
+            }
+            Some(item) => push(item, format!("{at}/items")),
+            None => {}
+        }
+    }
+    found
 }
 
 /// Follow a schema's local `$ref` (`#`, `#/definitions/x`, `#/$defs/x`).
@@ -1467,6 +1739,97 @@ fn rebase_refs(value: &mut Value, base: &str) {
 #[cfg(test)]
 mod extensions_tests {
     use super::*;
+
+    /// A schema whose default recurses into two `$ref`s used to double the
+    /// value at every level, to 2^33 objects: now it fills one level, a
+    /// value the caller spells out is still filled all the way down, and a
+    /// fill that would grow past the budget fails (hardening after the
+    /// adversarial review).
+    #[test]
+    fn filling_defaults_is_bounded_test() {
+        let bomb = json!({
+            "type": "object", "default": {},
+            "properties": { "a": { "$ref": "#" }, "b": { "$ref": "#" } },
+        });
+        let started = std::time::Instant::now();
+        let mut value = json!({});
+        fill_defaults(&bomb, &mut value).expect("fills");
+        assert_eq!(value, json!({ "a": {}, "b": {} }));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Through `allOf` back into itself, on the same value.
+        let looping = json!({ "type": "object", "allOf": [{ "$ref": "#" }, { "$ref": "#" }],
+                              "properties": { "x": { "default": 1 } } });
+        let mut value = json!({});
+        fill_defaults(&looping, &mut value).expect("fills");
+        assert_eq!(value, json!({ "x": 1 }));
+
+        // A recursive schema still fills what the value spells out.
+        let tree = json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "default": "leaf" },
+                "children": { "type": "array", "items": { "$ref": "#" } },
+            },
+        });
+        let mut value = json!({ "children": [{ "children": [{}] }] });
+        fill_defaults(&tree, &mut value).expect("fills");
+        assert_eq!(
+            value,
+            json!({ "name": "leaf", "children": [
+                { "name": "leaf", "children": [{ "name": "leaf" }] },
+            ] })
+        );
+        // And a default's own defaults, through a ref it is not inside of.
+        let nested = json!({
+            "type": "object",
+            "properties": { "tls": { "$ref": "#/definitions/tls" } },
+            "definitions": { "tls": { "type": "object", "default": {},
+                                      "properties": { "enabled": { "default": false } } } },
+        });
+        let mut value = json!({});
+        fill_defaults(&nested, &mut value).expect("fills");
+        assert_eq!(value, json!({ "tls": { "enabled": false } }));
+
+        // A default too big to add is refused, not grown.
+        let wide: serde_json::Map<String, Value> = (0..MAX_DEFAULT_FILL_VALUES + 1)
+            .map(|index| (format!("k{index}"), json!(index)))
+            .collect();
+        let huge = json!({ "type": "object",
+                           "properties": { "big": { "default": Value::Object(wide) } } });
+        let err = fill_defaults(&huge, &mut json!({})).expect_err("too many values");
+        assert!(err.contains("adds more than"), "{err}");
+    }
+
+    /// A schema that applies itself to the same value again (through `$ref`
+    /// and `allOf`, `anyOf`, `not`, ...) overflowed the validator's stack and
+    /// aborted the manager: it is refused before it is compiled. Recursion
+    /// through `properties` or `items` is fine (hardening after the
+    /// adversarial review).
+    #[test]
+    fn schemas_that_loop_on_the_same_value_are_refused_test() {
+        for looping in [
+            json!({ "type": "object", "allOf": [{ "$ref": "#" }] }),
+            json!({ "type": "object", "anyOf": [{ "$ref": "#/definitions/a" }],
+                    "definitions": { "a": { "not": { "$ref": "#/definitions/b" } },
+                                     "b": { "oneOf": [{ "$ref": "#/definitions/a" }] } } }),
+            json!({ "type": "object",
+                    "properties": { "x": { "$ref": "#/definitions/x" } },
+                    "definitions": { "x": { "if": { "$ref": "#/definitions/x" } } } }),
+        ] {
+            let err = compile_schema(&looping, 1 << 16).expect_err("loops");
+            assert!(err.contains("never end"), "{looping}: {err}");
+        }
+        for fine in [
+            json!({ "type": "object",
+                    "properties": { "children": { "type": "array", "items": { "$ref": "#" } } } }),
+            json!({ "type": "object", "properties": { "next": { "$ref": "#" } } }),
+            json!({ "type": "object", "allOf": [{ "$ref": "#/definitions/a" }],
+                    "definitions": { "a": { "properties": { "b": { "$ref": "#" } } } } }),
+        ] {
+            let compiled = compile_schema(&fine, 1 << 16).expect("recursion that descends");
+            assert!(compiled.is_valid(&json!({})), "{fine}");
+        }
+    }
 
     fn backup_decl() -> ExtensionDecl {
         serde_json::from_value(json!({

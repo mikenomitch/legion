@@ -67,6 +67,13 @@ export const Manager = {
      * Depending on current state, this may create a new job config, create a rollout,
      * and enqueue reconciliation work.
      *
+     * KV references (docs/auth-and-acls.md, "KV references in a job"): every
+     * `$path/key` string anywhere in the jobspec (a core field, an extension
+     * value, a pending key) and every key a task's `kvInjections` read needs
+     * `kv:read` on the key, checked before any of them is resolved; a miss is
+     * PERMISSION_DENIED naming the key, and nothing resolved reaches an error
+     * message, an app's validate call, or the stored job.
+     *
      * Jobspec extensions (docs/apps.md, "Jobspec extensions"): a key an
      * installed app declares at an extension point (the job, a group written
      * on one of its tasks, a task, a volume, a port, a service), or written
@@ -207,6 +214,9 @@ export const Manager = {
     },
     /**
      * Computes a placement plan for a jobspec without mutating cluster state.
+     * Requires `job:read` on the job, and `kv:read` on every KV key the
+     * jobspec references, checked before any is resolved, as RunJob does (the
+     * plan shows the rendered values).
      *
      * @generated from rpc legion.Manager.PlanJob
      */
@@ -3779,6 +3789,21 @@ export const Manager = {
      * is recorded on the app record in the installer's name, and the app
      * reconciler then submits the app's job in `legion-system`.
      *
+     * What else installing takes (docs/apps.md, "Trust model"):
+     * - every permission behind each RPC a sandboxed page lists in `rpcs`,
+     *   everywhere the RPC reaches, reserved scopes included (a page runs its
+     *   RPCs as whoever views it, so it can never make a viewer do what its
+     *   installer could not);
+     * - `operator:write`, when the manifest's `placement` is not `managers`
+     *   (where an app runs is where its token lands).
+     *
+     * The app's job, as rendered, may hold nothing host-level besides its
+     * own `exec` tasks, which run as the app's own uid (assigned here, from
+     * 1900000000 up, and never shared): no `exec` health check, `file://`
+     * artifact, `auth.nodeIdentity`, file at an absolute host path, cgroup of
+     * its own, or negative OOM score, whoever installs it. A manifest may not
+     * name an exec task's `user`.
+     *
      * `dry_run` validates the manifest and the installer's coverage and
      * returns the prompt (`prompt`) without installing, which is how the CLI
      * shows what the app runs, where, as whom, and with what grant before it
@@ -3811,16 +3836,22 @@ export const Manager = {
      * Errors:
      * - InvalidArgument: the manifest does not parse or validate (unknown
      *   fields, a bad name, a missing `version`, a config schema that does
-     *   not compile or has a remote `$ref`, a default that fails it, a job
-     *   fragment that does not parse, an extension declaration that breaks a
-     *   rule above, a key that is a core field), `config_json` fails the
-     *   schema, or `keys` names a key the manifest does not declare.
-     * - PermissionDenied: the caller lacks `app:write`, or a permission the
-     *   manifest asks for.
+     *   not compile, has a remote `$ref`, or applies itself to the same
+     *   value again (`allOf: [{ "$ref": "#" }]`), a default that fails it, a
+     *   job fragment that does not parse or names an exec task's `user`, a
+     *   job with something host-level in it, an extension declaration that
+     *   breaks a rule above, a key that is a core field, a page RPC that is
+     *   not page-callable), `config_json` fails the schema, or `keys` names a
+     *   key the manifest does not declare.
+     * - PermissionDenied: the caller lacks `app:write`, a permission the
+     *   manifest asks for, a permission behind a page's `rpcs`, or
+     *   `operator:write` for a placement other than `managers`.
      * - AlreadyExists: an app of that name is installed (use UpgradeApp).
-     * - FailedPrecondition: the name is a bundled app's, one of its jobspec
+     * - FailedPrecondition: the name is a bundled app's, a job
+     *   `legion-system/<name>` exists that is not this app's (no `managedBy`
+     *   stamp for it: install never takes a job over), or one of its jobspec
      *   keys is another installed app's at that point (the message names the
-     *   owner and the `--key` rename), or one of its kinds is another app's.
+     *   owner and the `--key` rename).
      *
      * @generated from rpc legion.Manager.InstallApp
      */
@@ -3834,7 +3865,9 @@ export const Manager = {
      * Replaces an installed app's manifest (`legion app upgrade`). Requires
      * `app:write` and, because a new manifest changes the code the app runs,
      * every permission the new manifest asks for, checked against the caller
-     * as at install.
+     * as at install, and so are the permissions behind its pages' `rpcs`.
+     * The new job is held to the install rules too: nothing host-level
+     * besides the app's own `exec` tasks, and no `user`.
      *
      * The reply carries the permission diff. When the new manifest asks for a
      * permission the recorded grant does not hold, nothing changes unless
@@ -3860,9 +3893,10 @@ export const Manager = {
      *
      * Errors:
      * - NotFound: no app of that name.
-     * - InvalidArgument: the manifest is invalid, names another app, or the
-     *   stored config fails its schema.
-     * - PermissionDenied: the caller lacks `app:write` or a permission.
+     * - InvalidArgument: the manifest is invalid (as at install), names
+     *   another app, or the stored config fails its schema.
+     * - PermissionDenied: the caller lacks `app:write`, a permission, or a
+     *   permission behind a page's `rpcs`.
      * - FailedPrecondition: the app is bundled (bundled apps upgrade with the
      *   binary), it drops a kind that has objects without `force`, or it
      *   changes the scope of a kind that has objects.
@@ -3923,13 +3957,17 @@ export const Manager = {
     /**
      * Changes an app's settings (`legion app set`): replicas, placement, the
      * pool for worker placement, and CPU and memory per task. The reconciler
-     * re-renders the job and rolls it. Requires `app:write`.
+     * re-renders the job and rolls it. Requires `app:write`; a change of
+     * placement or pool also requires `operator:write`, because it decides
+     * which nodes hold the app's token and run its code with its grant.
      *
      * Retry-safe with `idempotency_key`.
      *
      * Errors:
      * - InvalidArgument: replicas outside 1-32, an unknown placement, a pool
      *   with `managers` placement, a zero resource.
+     * - PermissionDenied: the caller lacks `app:write`, or `operator:write`
+     *   for a placement or pool change.
      *
      * @generated from rpc legion.Manager.UpdateAppSettings
      */
@@ -3950,8 +3988,13 @@ export const Manager = {
      *
      * Retry-safe with `idempotency_key`.
      *
+     * The job the new config renders is held to the install rules: a config
+     * that would add something host-level (an artifact code field set to a
+     * `file://` source) is refused, whoever sets it.
+     *
      * Errors:
-     * - InvalidArgument: `config_json` is not JSON or fails the schema.
+     * - InvalidArgument: `config_json` is not JSON, fails the schema, or
+     *   renders a job with something host-level in it.
      * - PermissionDenied: a code field changed and the caller does not hold
      *   the app's grant.
      *
@@ -4491,6 +4534,15 @@ export const Manager = {
      * must be `200` with a `text/html` content type, UTF-8, and at most 1 MiB;
      * the manager does not sanitize it (a page is code, confined by the SPA's
      * sandbox and CSP, not by the manager).
+     *
+     * The SPA stamps every call it makes for the page `legion-app-page:
+     * <app>/<page>`, and the manager refuses (PermissionDenied) a stamped call
+     * whose RPC the page's current manifest does not list, or whose app is
+     * not installed or enabled. That check runs before authentication, so
+     * every such refusal reads the same and names none of the page's `rpcs`.
+     * The RPCs a page may list never include ACL, token, grant, or app
+     * writes, or key rotations, and installing a page takes holding every
+     * permission behind its `rpcs` (InstallApp).
      *
      * Errors:
      * - PermissionDenied: the caller lacks `app:read` or the page's

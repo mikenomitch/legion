@@ -388,7 +388,10 @@ impl ManagerDaemonService {
     ///
     /// Runs before the submit itself, on the async side, and only when an
     /// installed key asks for it. A jobspec that does not parse, or that the
-    /// caller may not submit, asks nobody: the submit reports why.
+    /// caller may not submit, asks nobody: the submit reports why. Nor does
+    /// one that names a KV key the caller may not read: the parse enforces
+    /// `kv:read` on every reference before it resolves any, so an app never
+    /// hears a value its submitter could not read.
     pub(super) async fn ask_apps_to_validate(
         &self,
         identity: &AclIdentity,
@@ -401,7 +404,14 @@ impl ManagerDaemonService {
             return Ok(Vec::new());
         }
         let parsed = run_blocking_admission(|| {
-            resolve_jobspec_kv_references(&self.store, jobspec, mode, &registry)
+            resolve_jobspec_kv_references(
+                &self.store,
+                identity,
+                jobspec,
+                mode,
+                &registry,
+                "Error parsing jobspec",
+            )
         });
         let Ok((mut config, _, _)) = parsed else {
             return Ok(Vec::new());
@@ -596,13 +606,12 @@ impl ManagerDaemonService {
     }
 
     /// The app a caller is: its bearer is this cluster's `legion` token for
-    /// a job in `legion-system`, or it carries a grant reference to an
-    /// allocation of an app's job (an ACL token minted from the identity).
-    pub(super) fn calling_app<T>(
-        &self,
-        request: &Request<T>,
-        identity: &AclIdentity,
-    ) -> Option<String> {
+    /// an allocation of an app's job, or it carries a grant reference to one
+    /// (an ACL token minted from the identity). Either way the allocation
+    /// must run a version the reconciler stamped `managedBy` that app
+    /// ([`crate::storage::store::Store::allocation_app`]): the job's name
+    /// alone is not the app.
+    pub(super) fn calling_app<T>(&self, request: &Request<T>, identity: &AclIdentity) -> Option<String> {
         if identity.source == crate::structs::acl::AclSource::Delegated {
             // An app acting for a viewer is not the app plane.
             return None;
@@ -613,11 +622,12 @@ impl ManagerDaemonService {
         ) {
             if let Ok(claims) = state.verify_control_plane(&bearer) {
                 let namespace = claims.get("legion.io/namespace").and_then(Value::as_str);
-                let job = claims.get("legion.io/job").and_then(Value::as_str);
-                if let (Some(namespace), Some(job)) = (namespace, job) {
-                    if namespace == crate::structs::namespace::SYSTEM_NAMESPACE {
-                        return Some(job.to_string());
-                    }
+                let allocation = claims
+                    .get("legion.io/alloc")
+                    .and_then(Value::as_str)
+                    .and_then(|id| id.parse::<i64>().ok());
+                if namespace == Some(crate::structs::namespace::SYSTEM_NAMESPACE) {
+                    return allocation.and_then(|id| self.store.allocation_app(id).ok().flatten());
                 }
             }
         }

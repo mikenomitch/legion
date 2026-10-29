@@ -106,9 +106,14 @@ pub(crate) fn app_grant_refusal(
 }
 
 /// The identity the reconciler submits an app's job as: the app's recorded
-/// grant (allow rules), plus `job:write` (host-level) on exactly the app's
+/// grant (allow rules), plus `job:read` and `job:write` on exactly the app's
 /// job. The submit's grant check therefore checks the render against the
 /// recorded grant, not against any principal's own rights (apps plan §6.4).
+///
+/// The `job:write` rule has no `host` grant: an app's `exec` task, which
+/// runs as the app's own uid, is not host-level for the reconciler
+/// ([`crate::task_plugins::app_task_host_level_reason`]), and nothing else
+/// host-level may be in an app's job, whoever installed it.
 fn reconciler_identity(record: &AppRecord) -> AclIdentity {
     let mut rules: Vec<AclRule> = record
         .grant
@@ -122,7 +127,6 @@ fn reconciler_identity(record: &AppRecord) -> AclIdentity {
         actions: vec!["read".to_string(), "write".to_string()],
         namespaces: Some(vec![SYSTEM_NAMESPACE.to_string()]),
         names: Some(vec![record.name.clone()]),
-        host: Some(true),
         ..Default::default()
     });
     AclIdentity {
@@ -136,6 +140,51 @@ fn reconciler_identity(record: &AppRecord) -> AclIdentity {
         expires_at: None,
         audit_only: false,
     }
+}
+
+/// Where an app runs is a security decision: its `legion` token lands, and
+/// its code runs with its grant, on the nodes its placement allows. So
+/// moving an app off its default (`managers`, no pool), at install or
+/// later, takes `operator:write` beside `app:write` (docs/apps.md,
+/// "Placement").
+fn enforce_placement_write(identity: &AclIdentity, name: &str, what: &str) -> Result<(), Status> {
+    acl::enforce(
+        identity,
+        AclResource::Operator,
+        AclAction::Write,
+        &AclScope::none(),
+    )
+    .map_err(|status| {
+        if status.code() == tonic::Code::PermissionDenied {
+            Status::permission_denied(format!(
+                "{what} decides which nodes hold app {name}'s token and run its code with its \
+                 grant, so it needs operator:write as well as app:write"
+            ))
+        } else {
+            status
+        }
+    })
+}
+
+/// The first permission behind a page's `rpcs` that `identity` does not hold
+/// everywhere the RPC reaches, worded as the refusal (docs/apps.md, "Which
+/// RPCs a page may call"). A page runs its RPCs as whoever views it, so
+/// installing one takes holding what it can make any viewer do.
+fn page_rpc_refusal(identity: &AclIdentity, manifest: &AppManifest) -> Option<String> {
+    let ui = manifest.ui_spec().ok()?;
+    for page in &ui.pages {
+        for rpc in &page.rpcs {
+            let rules = crate::structs::app_ui::page_rpc_rules(rpc);
+            let who = format!(
+                "page {:?} lists {rpc}, which runs as whoever views the page, so it",
+                page.name
+            );
+            if let Some(refusal) = app_grant_refusal(identity, &who, &rules) {
+                return Some(refusal);
+            }
+        }
+    }
+    None
 }
 
 fn parse_manifest(manifest_json: &str) -> Result<AppManifest, Status> {
@@ -161,9 +210,39 @@ impl ManagerDaemonService {
         let _ = self.app_nudge.set(nudge);
     }
 
-    /// `systemWorker.appUser`, which app exec tasks run as.
-    pub fn app_user(&self) -> &str {
-        &self.app_user
+    /// Render `record`'s job and refuse what an app's job may not hold
+    /// (docs/apps.md, "Trust model"): a task the reserved namespace refuses
+    /// (root, a privileged container, an `exec` health check, a `file://`
+    /// artifact, `auth.nodeIdentity`), or one that is host-level for the
+    /// reconciler, which holds no host grant. Checked at install, upgrade,
+    /// and config changes, so whoever makes the change hears why; the
+    /// reconciler's submit refuses the same render anyway.
+    fn check_app_job(&self, record: &AppRecord) -> Result<(), Status> {
+        // A record not yet inserted has no uid; any app uid renders the
+        // same job shape.
+        let mut record = record.clone();
+        if record.uid == 0 {
+            record.uid = crate::structs::app::APP_UID_BASE;
+        }
+        let rendered = crate::structs::app::render_app_job(
+            &record,
+            crate::structs::app::RenderContext { marker: None },
+        )
+        .map_err(Status::invalid_argument)?;
+        let config: crate::structs::JobConfig = serde_json::from_value(rendered.jobspec)
+            .map_err(|err| Status::invalid_argument(format!("app {}: job: {err}", record.name)))?;
+        for task in &config.tasks {
+            crate::task_plugins::validate_reserved_namespace_task(task, SYSTEM_NAMESPACE)
+                .map_err(|err| Status::invalid_argument(format!("app {}: {err}", record.name)))?;
+            if let Some(reason) = crate::task_plugins::app_task_host_level_reason(task) {
+                return Err(Status::invalid_argument(format!(
+                    "app {}: task {reason}, which would make the app's job host-level, and no \
+                     app's job may be (docs/apps.md, \"Trust model\")",
+                    record.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn nudge_app(&self, name: &str) {
@@ -429,6 +508,7 @@ impl ManagerDaemonService {
                         .collect()
                 })
                 .unwrap_or_default(),
+            uid: record.uid,
         })
     }
 
@@ -530,6 +610,25 @@ impl ManagerDaemonService {
                  upgrades with the binary"
             )));
         }
+        // The app's job is `legion-system/<name>`, which the reconciler
+        // then owns, reverting every other edit: a job by that name that is
+        // not already this app's (an operator's own, or another app's
+        // left behind) is never taken over.
+        let job_id = crate::structs::app::app_job_id(&name);
+        let existing = self
+            .store
+            .app_job_version(&job_id)
+            .map_err(|e| map_store_error("Error loading the app's job", e))?;
+        if let Some(version) = existing {
+            if version.managed_by.as_ref().map(|stamp| stamp.app.as_str()) != Some(name.as_str()) {
+                return Err(Status::failed_precondition(format!(
+                    "job {job_id} already exists and is not app {name}'s (its latest version \
+                     has no managedBy stamp for it), so installing would take it over\nHint: \
+                     install the app under another name, or destroy the job first (`legion job \
+                     destroy {job_id}`)"
+                )));
+            }
+        }
         let source = match inner.source.trim() {
             "" => AppSource::File,
             raw => match AppSource::parse(raw) {
@@ -552,7 +651,10 @@ impl ManagerDaemonService {
             Some(version) => format!("app {name} {version}"),
             None => format!("app {name}"),
         };
-        let uncovered = app_grant_refusal(&identity, &who, &manifest.permissions);
+        // The grant, then what the app's pages can make a viewer do: an
+        // installer holds both or installs nothing.
+        let uncovered = app_grant_refusal(&identity, &who, &manifest.permissions)
+            .or_else(|| page_rpc_refusal(&identity, &manifest));
         // Jobspec keys (docs/apps.md, "Jobspec extensions"): renames, then
         // the collision rules against core fields and other apps' keys.
         let decls = manifest_decls(&manifest).map_err(Status::invalid_argument)?;
@@ -565,10 +667,17 @@ impl ManagerDaemonService {
         if let Some(refusal) = registry.collision(&name, &decls, &keys) {
             return Err(Status::failed_precondition(refusal));
         }
-        let mut prompt = install_prompt(&manifest, &self.app_user);
+        let mut prompt = install_prompt(&manifest);
         let now = now_rfc3339();
         let mut settings = AppSettings::from_manifest(&manifest);
         settings.keys = keys;
+        if settings.placement != Placement::Managers {
+            enforce_placement_write(
+                &identity,
+                &name,
+                &format!("installing with placement {}", settings.placement.as_str()),
+            )?;
+        }
         let record = AppRecord {
             name: name.clone(),
             source,
@@ -587,7 +696,10 @@ impl ManagerDaemonService {
             updated_at: now,
             state: AppReconcileState::default(),
             manifest: manifest.clone(),
+            // Assigned by the store on insert: the lowest free app uid.
+            uid: 0,
         };
+        self.check_app_job(&record)?;
         if !decls.is_empty() {
             // What installing does to values already stored: pending ones
             // it adopts, and how they fare against its schemas.
@@ -753,7 +865,7 @@ impl ManagerDaemonService {
             removed_json: rules_json(&diff.removed),
             unchanged_json: rules_json(&diff.unchanged),
         };
-        let mut prompt = install_prompt(&manifest, &self.app_user);
+        let mut prompt = install_prompt(&manifest);
         let from = record.display_version();
         let to = manifest.version.clone().unwrap_or_default();
         if !decls.is_empty() || !existing.is_empty() {
@@ -826,10 +938,15 @@ impl ManagerDaemonService {
                 dropped.join(", ")
             )));
         }
+        let mut upgraded = record.clone();
+        upgraded.manifest = manifest.clone();
+        upgraded.config = config.clone();
+        self.check_app_job(&upgraded)?;
         let who = format!("app {name} {to}");
         // A new manifest is new code running with the grant: the caller must
         // hold all of it, as at install.
-        let uncovered = app_grant_refusal(&identity, &who, &manifest.permissions);
+        let uncovered = app_grant_refusal(&identity, &who, &manifest.permissions)
+            .or_else(|| page_rpc_refusal(&identity, &manifest));
         if inner.dry_run {
             return Ok(Response::new(UpgradeAppReply {
                 app: Some(self.app_info(&record)?),
@@ -1185,6 +1302,10 @@ impl ManagerDaemonService {
                 (resources.cpu.is_some() || resources.memory.is_some()).then_some(resources);
         }
         settings.validate().map_err(Status::invalid_argument)?;
+        if settings.placement != record.settings.placement || settings.pool != record.settings.pool
+        {
+            enforce_placement_write(&identity, &name, "changing the placement or pool")?;
+        }
         let change = record.settings.describe_change(&settings);
         if settings == record.settings {
             return Ok(Response::new(UpdateAppSettingsReply {
@@ -1245,6 +1366,9 @@ impl ManagerDaemonService {
         validate_app_config(&record.manifest, &config).map_err(|err| {
             Status::invalid_argument(format!("the config does not match {name}'s schema: {err}"))
         })?;
+        let mut changed = record.clone();
+        changed.config = config.clone();
+        self.check_app_job(&changed)?;
         let code_fields = changed_code_fields(&record.manifest, &record.config, &config);
         if !code_fields.is_empty() {
             // Changing what code the app runs needs everything the app's

@@ -18,14 +18,14 @@ use crate::storage::store::Store;
 use crate::storage::Lane;
 use crate::structs::app::{
     AppGrant, AppManifest, AppReconcileState, AppRecord, AppSettings, AppSource, BuildMarker,
-    ManagedBy,
+    ManagedBy, APP_UID_BASE, APP_UID_COUNT,
 };
 use rusqlite::{params, OptionalExtension, Row};
 
 const APP_COLUMNS: &str = "name, source, source_ref, manifest, manifest_digest, enabled, \
      settings, config, grant_rules, granted_by, granted_at, installed_by, installed_at, \
      updated_at, last_digest, last_action, last_error, last_at, build_marker, marker_reason, \
-     pending_change";
+     pending_change, uid";
 
 /// An app job's latest version, as the reconciler compares it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +121,7 @@ impl Store {
                 marker_reason: row.get(19)?,
                 pending_change: row.get(20)?,
             },
+            uid: row.get(21)?,
         })
     }
 
@@ -190,11 +191,12 @@ impl Store {
             Some(marker) => serde_json::to_string(marker)?,
             None => String::new(),
         };
+        let uid = Self::free_app_uid(&conn)?;
         conn.execute(
             &format!(
                 "INSERT INTO app ({APP_COLUMNS}) VALUES \
                  (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-                  ?18, ?19, ?20, ?21);"
+                  ?18, ?19, ?20, ?21, ?22);"
             ),
             params![
                 record.name,
@@ -218,9 +220,34 @@ impl Store {
                 marker,
                 record.state.marker_reason,
                 record.state.pending_change,
+                uid,
             ],
         )?;
         Ok(true)
+    }
+
+    /// The lowest app uid no app holds ([`APP_UID_BASE`] up): the uid an
+    /// app being inserted gets, whatever its record says. Chosen inside the
+    /// replicated write, so two installs can never pick the same one.
+    fn free_app_uid(conn: &rusqlite::Connection) -> R<u32> {
+        let mut stmt = conn.prepare("SELECT uid FROM app WHERE uid >= ?1 ORDER BY uid ASC;")?;
+        let taken = stmt
+            .query_map([APP_UID_BASE], |row| row.get::<_, u32>(0))?
+            .collect::<rusqlite::Result<Vec<u32>>>()?;
+        let mut next = APP_UID_BASE;
+        for uid in taken {
+            if uid > next {
+                break;
+            }
+            next = uid + 1;
+        }
+        if next >= APP_UID_BASE + APP_UID_COUNT {
+            return Err(invalid(format!(
+                "every app uid ({APP_UID_BASE} to {}) is taken; uninstall an app first",
+                APP_UID_BASE + APP_UID_COUNT - 1
+            )));
+        }
+        Ok(next)
     }
 
     /// Replace an app's manifest, settings, config, grant and enabled flag,
@@ -364,6 +391,38 @@ impl Store {
         }))
     }
 
+    /// The app allocation `allocation_id` runs for: its job is
+    /// `legion-system/<app>` **and** the version it runs carries the
+    /// reconciler's `managedBy` stamp for that same app. A version someone
+    /// submitted straight to the job carries none, so its allocations are
+    /// nobody's app. `None` for every other allocation, and for one that does
+    /// not exist.
+    #[instrument(err, skip_all, fields(allocation_id))]
+    pub fn allocation_app(&self, allocation_id: i64) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        let row: Option<(String, Option<Value>)> = conn
+            .prepare_cached(
+                "SELECT tc.job_id, jc.meta FROM allocation a
+                 INNER JOIN task_config tc ON tc.id = a.task_config_id
+                 LEFT JOIN job_config jc ON jc.id = a.job_config_id
+                 WHERE a.id = ?1;",
+            )?
+            .query_row([allocation_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        let Some((job, meta)) = row else {
+            return Ok(None);
+        };
+        let Some(app) = crate::structs::app::app_name_of_job(&job) else {
+            return Ok(None);
+        };
+        let stamp: Option<ManagedBy> = meta
+            .and_then(|meta| meta.get("managedBy").cloned())
+            .and_then(|value| serde_json::from_value(value).ok());
+        Ok(stamp
+            .filter(|stamp| stamp.app == app)
+            .map(|_| app.to_string()))
+    }
+
     /// The `managedBy` stamp on job `job_id`'s latest version.
     pub fn job_managed_by(&self, job_id: &str) -> R<Option<ManagedBy>> {
         Ok(self
@@ -409,6 +468,12 @@ impl Store {
     /// tries them in.
     #[instrument(err, skip_all, fields(job_id))]
     pub fn app_ui_allocations(&self, job_id: &str) -> R<Vec<AppUiAllocation>> {
+        // Only allocations of versions the reconciler stamped for this app
+        // ([`Self::allocation_app`]): a viewer assertion is never sent to a
+        // version someone submitted straight to the job.
+        let Some(app) = crate::structs::app::app_name_of_job(job_id) else {
+            return Ok(Vec::new());
+        };
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
             "SELECT a.id, a.node_id, COALESCE(ah.healthy, 0) FROM allocation a
@@ -416,9 +481,10 @@ impl Store {
              INNER JOIN job j ON j.id = jc.job_id
              LEFT JOIN allocation_health ah ON ah.allocation_id = a.id
              WHERE j.name = ?1 AND a.status NOT IN ('complete', 'failed', 'lost')
+               AND json_extract(jc.meta, '$.managedBy.app') = ?2
              ORDER BY COALESCE(ah.healthy, 0) DESC, a.id DESC;",
         )?;
-        let rows = stmt.query_map([job_id], |row| {
+        let rows = stmt.query_map(params![job_id, app], |row| {
             Ok(AppUiAllocation {
                 id: row.get(0)?,
                 node_id: row.get(1)?,
@@ -485,15 +551,17 @@ mod app_store_tests {
             updated_at: "t0".into(),
             state: AppReconcileState::default(),
             manifest,
+            uid: 0,
         }
     }
 
     #[test]
     fn records_round_trip_and_writes_compare_and_set() -> R<()> {
         let store = store()?;
-        let app = record("demo");
+        let mut app = record("demo");
         check_record(&app)?;
         store.insert_app(app.clone())?;
+        app.uid = APP_UID_BASE;
         assert_eq!(store.get_app("demo")?, Some(app.clone()));
         assert!(store.insert_app(app.clone()).is_err(), "names are unique");
         assert!(!store.seed_app(app.clone())?, "a seed never overwrites");
@@ -536,6 +604,33 @@ mod app_store_tests {
         assert!(store.delete_app("demo")?);
         assert!(store.get_app("demo")?.is_none());
         assert!(store.list_apps()?.is_empty());
+        Ok(())
+    }
+
+    /// Each app gets its own uid, the lowest free one, whatever its record
+    /// says; a freed uid is the next one handed out, and an update never
+    /// moves it (hardening after the adversarial review).
+    #[test]
+    fn every_app_gets_its_own_uid() -> R<()> {
+        let store = store()?;
+        let uid = |name: &str| -> R<u32> { Ok(store.get_app(name)?.context("stored")?.uid) };
+        for name in ["one", "two", "three"] {
+            let mut app = record(name);
+            app.uid = APP_UID_BASE; // what a record says is ignored
+            store.insert_app(app)?;
+        }
+        assert_eq!(
+            (uid("one")?, uid("two")?, uid("three")?),
+            (APP_UID_BASE, APP_UID_BASE + 1, APP_UID_BASE + 2)
+        );
+        assert!(store.delete_app("two")?);
+        store.insert_app(record("four"))?;
+        assert_eq!(uid("four")?, APP_UID_BASE + 1);
+        let mut moved = store.get_app("one")?.context("one")?;
+        moved.uid = APP_UID_BASE + 9;
+        moved.updated_at = "t1".into();
+        store.update_app(moved, "t0")?;
+        assert_eq!(uid("one")?, APP_UID_BASE);
         Ok(())
     }
 }

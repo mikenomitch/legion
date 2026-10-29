@@ -599,6 +599,7 @@ mod tests {
                 updated_at: String::new(),
                 state: Default::default(),
                 manifest: manifest.clone(),
+                uid: crate::structs::app::APP_UID_BASE,
             };
             let marker = crate::structs::app::BuildMarker {
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -608,7 +609,6 @@ mod tests {
                 &record,
                 crate::structs::app::RenderContext {
                     marker: Some(&marker),
-                    app_user: "nobody",
                 },
             )
             .expect("renders");

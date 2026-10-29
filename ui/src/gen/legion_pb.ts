@@ -35919,9 +35919,19 @@ export class App extends Message<App> {
   extensionKeys: AppExtensionKey[] = [];
 
   /**
+   * The uid (and gid) the app's `exec` tasks run as: its own, assigned when
+   * it was installed or seeded, from 1900000000 up, and never shared with
+   * another app (docs/apps.md, "What Legion renders"). 0 in a dry run's
+   * reply, before the store assigns one.
+   *
+   * @generated from field: uint32 uid = 25;
+   */
+  uid = 0;
+
+  /**
    * The object kinds the app declares (docs/app-objects.md).
    *
-   * @generated from field: repeated legion.ObjectKind kinds = 25;
+   * @generated from field: repeated legion.ObjectKind kinds = 26;
    */
   kinds: ObjectKind[] = [];
 
@@ -35957,7 +35967,8 @@ export class App extends Message<App> {
     { no: 22, name: "notes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 23, name: "running_on", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 24, name: "extension_keys", kind: "message", T: AppExtensionKey, repeated: true },
-    { no: 25, name: "kinds", kind: "message", T: ObjectKind, repeated: true },
+    { no: 25, name: "uid", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 26, name: "kinds", kind: "message", T: ObjectKind, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): App {
@@ -40203,8 +40214,10 @@ export class AppPageRpc extends Message<AppPageRpc> {
 
   /**
    * Whether the call changes something. The SPA asks the viewer before
-   * every such call, naming the app, the RPC, and its target; reads run
-   * without asking. Classified by what the call does, not by its ACL action.
+   * every such call, naming the app, the RPC, and the target of the request
+   * as it will be sent (a request that spells a field both ways, `nodeId`
+   * and `node_id`, is refused); reads run without asking. Classified by
+   * what the call does, not by its ACL action.
    *
    * @generated from field: bool mutating = 2;
    */

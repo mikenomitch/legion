@@ -385,165 +385,162 @@ pub enum PageRpcKind {
     Write,
 }
 
-/// The Manager RPCs a sandboxed page may list in `rpcs`, and whether each
-/// one changes anything. Classified by what the call does, not by its ACL
-/// action (`RestoreInstance` needs only `snapshot:read` but creates an
-/// instance). An RPC missing here is refused at install; see
-/// [`page_rpc_refusal`] for why the rest are left out.
-pub const PAGE_RPCS: &[(&str, PageRpcKind)] = {
+/// The Manager RPCs a sandboxed page may list in `rpcs`, whether each one
+/// changes anything, and the permissions behind it.
+///
+/// The kind is what the call does, not its ACL action (`RestoreInstance`
+/// needs only `snapshot:read` but creates an instance). The permissions,
+/// `resource:action`, are what the RPC's own ACL checks can ask of its
+/// caller: a page runs it as whoever views it, so installing (or upgrading
+/// to) a page that lists it takes holding every one of them everywhere the
+/// RPC reaches ([`page_rpc_rules`]): a page can never make a viewer do what
+/// its installer could not. `tests/integration/acl_endpoints.rs` checks the
+/// first against each RPC's gate.
+///
+/// An RPC missing here is refused at install; see [`page_rpc_refusal`] for
+/// why the rest are left out. Nothing that changes who may do what (ACLs,
+/// tokens, grants, apps) or rotates key material is here.
+pub type PageRpc = (&'static str, PageRpcKind, &'static [&'static str]);
+
+pub const PAGE_RPCS: &[PageRpc] = {
     use PageRpcKind::{Read, Write};
     &[
         // Jobs and rollouts.
-        ("RunJob", Write),
-        ("GetJobSpec", Read),
-        ("GetJobSpecByConfig", Read),
-        ("ListJobSpecHistory", Read),
-        ("GetJobInfo", Read),
-        ("ListJobs", Read),
-        ("PlanJob", Read),
-        ("StopJob", Write),
-        ("DestroyJob", Write),
-        ("ListRollouts", Read),
-        ("GetRollout", Read),
-        ("GetRolloutStatus", Read),
-        ("ListRolloutEvents", Read),
-        ("AdvanceRollout", Write),
-        ("StopRollout", Write),
-        ("ListJobActions", Read),
-        ("GetAllocationLogs", Read),
+        ("RunJob", Write, &["job:write"]),
+        ("GetJobSpec", Read, &["job:read"]),
+        ("GetJobSpecByConfig", Read, &["job:read"]),
+        ("ListJobSpecHistory", Read, &["job:read"]),
+        ("GetJobInfo", Read, &["job:read"]),
+        ("ListJobs", Read, &["job:read"]),
+        ("PlanJob", Read, &["job:read"]),
+        ("StopJob", Write, &["job:write"]),
+        ("DestroyJob", Write, &["job:write"]),
+        ("ListRollouts", Read, &["job:read"]),
+        ("GetRollout", Read, &["job:read"]),
+        ("GetRolloutStatus", Read, &["job:read"]),
+        ("ListRolloutEvents", Read, &["job:read"]),
+        ("AdvanceRollout", Write, &["job:write"]),
+        ("StopRollout", Write, &["job:write"]),
+        ("ListJobActions", Read, &["job:read"]),
+        ("GetAllocationLogs", Read, &["job:read"]),
         // Scaling.
-        ("ScaleTask", Write),
-        ("GetJobScaleStatus", Read),
-        ("GetScalingInputs", Read),
-        ("GetScalingDefaults", Read),
-        ("ApplyScalingDefaults", Write),
-        ("GetScalingStatus", Read),
-        ("GetScaleHistory", Read),
-        ("PauseScaling", Write),
-        ("ApplyScalingPolicy", Write),
-        ("DeleteScalingPolicy", Write),
-        ("ListScalingPolicies", Read),
-        ("GetCapacityDemand", Read),
+        ("ScaleTask", Write, &["scale:write"]),
+        ("GetJobScaleStatus", Read, &["scale:read"]),
+        ("GetScalingInputs", Read, &["scale:read"]),
+        ("GetScalingDefaults", Read, &["scale:read"]),
+        ("ApplyScalingDefaults", Write, &["operator:write"]),
+        ("GetScalingStatus", Read, &["scale:read"]),
+        ("GetScaleHistory", Read, &["scale:read"]),
+        ("PauseScaling", Write, &["scale:write", "operator:write"]),
+        (
+            "ApplyScalingPolicy",
+            Write,
+            &["scale:write", "operator:write", "node:write"],
+        ),
+        ("DeleteScalingPolicy", Write, &["scale:write"]),
+        ("ListScalingPolicies", Read, &["scale:read"]),
+        ("GetCapacityDemand", Read, &["node:read"]),
         // Namespaces and templates.
-        ("ListNamespaces", Read),
-        ("GetNamespace", Read),
-        ("ApplyNamespace", Write),
-        ("DeleteNamespace", Write),
-        ("ListNamespacePolicies", Read),
-        ("GetNamespacePolicy", Read),
-        ("ApplyNamespacePolicy", Write),
-        ("DeleteNamespacePolicy", Write),
-        ("ListJobTemplates", Read),
-        ("GetJobTemplate", Read),
-        ("RenderJobTemplate", Read),
-        ("UpsertJobTemplate", Write),
-        ("DeleteJobTemplate", Write),
-        ("RunJobTemplate", Write),
+        ("ListNamespaces", Read, &["namespace:read"]),
+        ("GetNamespace", Read, &["namespace:read"]),
+        ("ApplyNamespace", Write, &["namespace:write"]),
+        ("DeleteNamespace", Write, &["namespace:write"]),
+        ("ListNamespacePolicies", Read, &["acl:read"]),
+        ("GetNamespacePolicy", Read, &["acl:read"]),
+        ("ListJobTemplates", Read, &["template:read"]),
+        ("GetJobTemplate", Read, &["template:read"]),
+        ("RenderJobTemplate", Read, &["job:write"]),
+        ("UpsertJobTemplate", Write, &["template:write"]),
+        ("DeleteJobTemplate", Write, &["template:write"]),
+        ("RunJobTemplate", Write, &["job:write"]),
         // Instances, snapshots, volumes.
-        ("CreateInstance", Write),
-        ("CreateInstances", Write),
-        ("DestroyInstance", Write),
-        ("StopInstance", Write),
-        ("StartInstance", Write),
-        ("SuspendInstance", Write),
-        ("ForkInstance", Write),
-        ("ReplaceInstance", Write),
-        ("PromoteInstance", Write),
-        ("ListInstances", Read),
-        ("GetInstance", Read),
-        ("ListSessionNodes", Read),
-        ("CreateSnapshot", Write),
-        ("ListSnapshots", Read),
-        ("GetSnapshot", Read),
-        ("DeleteSnapshot", Write),
-        ("RestoreInstance", Write),
-        ("SetSnapshotAlias", Write),
-        ("DeleteSnapshotAlias", Write),
-        ("WarmSnapshot", Write),
-        ("ListVolumes", Read),
-        ("GetVolume", Read),
-        ("DeleteVolume", Write),
-        ("ListVolumeDrivers", Read),
+        ("CreateInstance", Write, &["job:write"]),
+        ("CreateInstances", Write, &["job:write"]),
+        ("DestroyInstance", Write, &["job:write"]),
+        ("StopInstance", Write, &["job:write"]),
+        ("StartInstance", Write, &["job:write"]),
+        ("SuspendInstance", Write, &["job:write", "snapshot:write"]),
+        ("ForkInstance", Write, &["job:write", "snapshot:write"]),
+        ("ReplaceInstance", Write, &["job:write"]),
+        ("PromoteInstance", Write, &["job:write"]),
+        ("ListInstances", Read, &["job:read"]),
+        ("GetInstance", Read, &["job:read"]),
+        ("ListSessionNodes", Read, &["job:read"]),
+        ("CreateSnapshot", Write, &["snapshot:write"]),
+        ("ListSnapshots", Read, &["snapshot:read"]),
+        ("GetSnapshot", Read, &["snapshot:read"]),
+        ("DeleteSnapshot", Write, &["snapshot:write"]),
+        ("RestoreInstance", Write, &["snapshot:read", "job:write"]),
+        ("SetSnapshotAlias", Write, &["snapshot:write"]),
+        ("DeleteSnapshotAlias", Write, &["snapshot:write"]),
+        ("WarmSnapshot", Write, &["snapshot:read"]),
+        ("ListVolumes", Read, &["job:read"]),
+        ("GetVolume", Read, &["job:read"]),
+        ("DeleteVolume", Write, &["job:write"]),
+        ("ListVolumeDrivers", Read, &["node:read"]),
         // Nodes.
-        ("GetNodes", Read),
-        ("GetNode", Read),
-        ("GetNodeUsage", Read),
-        ("ListNodeUsage", Read),
-        ("GetNodeContent", Read),
-        ("GetLedger", Read),
-        ("RestartWorker", Write),
-        ("SetNodeAvailability", Write),
-        ("ForgetNode", Write),
-        ("ListJoinTokens", Read),
-        ("DeleteJoinToken", Write),
-        ("ListBootTickets", Read),
+        ("GetNodes", Read, &["node:read"]),
+        ("GetNode", Read, &["node:read"]),
+        ("GetNodeUsage", Read, &["node:read"]),
+        ("ListNodeUsage", Read, &["node:read"]),
+        ("GetNodeContent", Read, &["node:read"]),
+        ("GetLedger", Read, &["node:read"]),
+        ("RestartWorker", Write, &["node:write"]),
+        ("SetNodeAvailability", Write, &["node:write"]),
+        ("ForgetNode", Write, &["node:write"]),
+        ("ListJoinTokens", Read, &["node:read"]),
+        ("ListBootTickets", Read, &["boot:read"]),
         // Services and the network.
-        ("ListServices", Read),
-        ("ListServiceEdges", Read),
-        ("ResolveService", Read),
-        ("UpsertNetPolicy", Write),
-        ("GetNetPolicyObject", Read),
-        ("ListNetPolicies", Read),
-        ("DeleteNetPolicy", Write),
-        ("ShowNetPolicy", Read),
-        ("TestNetPolicy", Read),
-        ("UpsertNetPlugin", Write),
-        ("GetNetPlugin", Read),
-        ("ListNetPlugins", Read),
-        ("DeleteNetPlugin", Write),
-        ("GetNetPluginStatus", Read),
-        ("GetMeshCa", Read),
-        ("RotateMeshCa", Write),
+        ("ListServices", Read, &["job:read"]),
+        ("ListServiceEdges", Read, &["job:read"]),
+        ("ResolveService", Read, &["job:read"]),
+        ("UpsertNetPolicy", Write, &["net:write"]),
+        ("GetNetPolicyObject", Read, &["net:read"]),
+        ("ListNetPolicies", Read, &["net:read"]),
+        ("DeleteNetPolicy", Write, &["net:write"]),
+        ("ShowNetPolicy", Read, &["net:read"]),
+        ("TestNetPolicy", Read, &["net:read"]),
+        ("UpsertNetPlugin", Write, &["net:write"]),
+        ("GetNetPlugin", Read, &["net:read"]),
+        ("ListNetPlugins", Read, &["net:read"]),
+        ("DeleteNetPlugin", Write, &["net:write"]),
+        ("GetNetPluginStatus", Read, &["net:read"]),
+        ("GetMeshCa", Read, &["net:read"]),
         // KV.
-        ("PutKv", Write),
-        ("GetKv", Read),
-        ("ListKv", Read),
-        ("DeleteKv", Write),
-        ("PatchKv", Write),
-        ("AcquireKvLock", Write),
-        ("RenewKvLock", Write),
-        ("ReleaseKvLock", Write),
-        ("GetKvLock", Read),
+        ("PutKv", Write, &["kv:write"]),
+        ("GetKv", Read, &["kv:read"]),
+        ("ListKv", Read, &["kv:read"]),
+        ("DeleteKv", Write, &["kv:write"]),
+        ("PatchKv", Write, &["kv:write"]),
+        ("AcquireKvLock", Write, &["kv:write"]),
+        ("RenewKvLock", Write, &["kv:write"]),
+        ("ReleaseKvLock", Write, &["kv:write"]),
+        ("GetKvLock", Read, &["kv:read"]),
         // Operating the cluster.
-        ("GetManagerConfigs", Read),
-        ("ListManagers", Read),
-        ("GetObservability", Read),
-        ("GetSchedulerConcurrency", Read),
-        ("GetRaftStatus", Read),
-        ("ListRaftHistory", Read),
-        ("GetKeyringStatus", Read),
-        ("RotateDataKey", Write),
-        ("RewrapKv", Write),
-        ("QueryStateStore", Read),
-        ("GetStateStoreSchema", Read),
-        ("ListSavedStateQueries", Read),
-        ("UpsertSavedStateQuery", Write),
-        ("DeleteSavedStateQuery", Write),
-        ("ListEvents", Read),
+        ("GetManagerConfigs", Read, &["operator:read"]),
+        ("ListManagers", Read, &["operator:read"]),
+        ("GetObservability", Read, &["operator:read"]),
+        ("GetSchedulerConcurrency", Read, &["operator:read"]),
+        ("GetRaftStatus", Read, &["operator:read"]),
+        ("ListRaftHistory", Read, &["operator:read"]),
+        ("GetKeyringStatus", Read, &["operator:read"]),
+        ("QueryStateStore", Read, &["state:read"]),
+        ("GetStateStoreSchema", Read, &["state:read"]),
+        ("ListSavedStateQueries", Read, &["state:read"]),
+        ("UpsertSavedStateQuery", Write, &["state:write"]),
+        ("DeleteSavedStateQuery", Write, &["state:write"]),
+        ("ListEvents", Read, &["operator:read"]),
         // Access control and apps.
-        ("WhoAmI", Read),
-        ("GetAuthMethods", Read),
-        ("UpsertAclPolicy", Write),
-        ("GetAclPolicy", Read),
-        ("ListAclPolicies", Read),
-        ("DeleteAclPolicy", Write),
-        ("ListAclTokens", Read),
-        ("DeleteAclToken", Write),
-        ("UpsertAclUser", Write),
-        ("ListAclUsers", Read),
-        ("DeleteAclUser", Write),
-        ("ListExecKeys", Read),
-        ("DeleteExecKey", Write),
-        ("ListGrants", Read),
-        ("RevokeGrant", Write),
-        ("ListApps", Read),
-        ("GetApp", Read),
-        ("InstallApp", Write),
-        ("UpgradeApp", Write),
-        ("UninstallApp", Write),
-        ("SetAppEnabled", Write),
-        ("UpdateAppSettings", Write),
-        ("SetAppConfig", Write),
+        ("WhoAmI", Read, &[]),
+        ("GetAuthMethods", Read, &[]),
+        ("GetAclPolicy", Read, &["acl:read"]),
+        ("ListAclPolicies", Read, &["acl:read"]),
+        ("ListAclTokens", Read, &["acl:read"]),
+        ("ListAclUsers", Read, &["acl:read"]),
+        ("ListExecKeys", Read, &["acl:read"]),
+        ("ListGrants", Read, &["acl:read"]),
+        ("ListApps", Read, &["app:read"]),
+        ("GetApp", Read, &["app:read"]),
     ]
 };
 
@@ -551,8 +548,51 @@ pub const PAGE_RPCS: &[(&str, PageRpcKind)] = {
 pub fn page_rpc_kind(method: &str) -> Option<PageRpcKind> {
     PAGE_RPCS
         .iter()
-        .find(|(name, _)| *name == method)
-        .map(|(_, kind)| *kind)
+        .find(|(name, _, _)| *name == method)
+        .map(|(_, kind, _)| *kind)
+}
+
+/// The permissions behind `method` (`job:read`), for a page-callable one.
+pub fn page_rpc_permissions(method: &str) -> Option<&'static [&'static str]> {
+    PAGE_RPCS
+        .iter()
+        .find(|(name, _, _)| *name == method)
+        .map(|(_, _, needs)| *needs)
+}
+
+/// What listing `method` in a page's `rpcs` asks of its installer, as
+/// requested ACL rules in the shape a grant takes: each permission behind
+/// the RPC, everywhere the RPC can reach as a viewer, reserved scopes
+/// included (`namespaces = ["*", "legion-*"]`, `paths = ["*", "legion/*"]`,
+/// `pools = ["*", "legion-*"]`, and no other selector). Checked with the
+/// grant coverage rules ([`crate::structs::grant::first_uncovered`]) at
+/// install and upgrade, so only someone who could make every call the page
+/// can make, on anything, installs it.
+pub fn page_rpc_rules(method: &str) -> Vec<crate::structs::acl::AclRule> {
+    let everywhere = |reserved: &str| Some(vec!["*".to_string(), reserved.to_string()]);
+    page_rpc_permissions(method)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|permission| {
+            let (resource, action) = permission.split_once(':')?;
+            let mut rule = crate::structs::acl::AclRule {
+                resources: vec![resource.to_string()],
+                actions: vec![action.to_string()],
+                ..Default::default()
+            };
+            if AclResource::namespaced().contains(&resource) {
+                rule.namespaces = everywhere(&format!(
+                    "{}*",
+                    crate::structs::namespace::RESERVED_NAMESPACE_PREFIX
+                ));
+            } else if resource == AclResource::Kv.as_str() {
+                rule.paths = everywhere(&format!("{}*", crate::structs::acl::RESERVED_KV_PREFIX));
+            } else if resource == AclResource::Node.as_str() {
+                rule.pools = everywhere(&format!("{}*", crate::structs::acl::RESERVED_POOL_PREFIX));
+            }
+            Some(rule)
+        })
+        .collect()
 }
 
 /// Why `method` is not available to sandboxed pages.
@@ -564,6 +604,26 @@ pub fn page_rpc_refusal(method: &str) -> String {
         }
         "IssueRaftCommand" | "ResetKeyring" | "RewrapRootKey" => {
             "is a break-glass operator operation; run it from the CLI"
+        }
+        "UpsertAclPolicy"
+        | "DeleteAclPolicy"
+        | "DeleteAclToken"
+        | "UpsertAclUser"
+        | "DeleteAclUser"
+        | "DeleteExecKey"
+        | "RevokeGrant"
+        | "ApplyNamespacePolicy"
+        | "DeleteNamespacePolicy"
+        | "DeleteJoinToken" => {
+            "changes who may do what (ACL policies, users, tokens, keys, grants), which a page \
+             may never do through its viewer; do it from the CLI"
+        }
+        "InstallApp" | "UpgradeApp" | "UninstallApp" | "SetAppEnabled" | "UpdateAppSettings"
+        | "SetAppConfig" => {
+            "changes an app, whose grant and pages reach other people; do it from the CLI"
+        }
+        "RotateDataKey" | "RewrapKv" | "RotateMeshCa" => {
+            "rotates the cluster's key material; do it from the CLI"
         }
         "WatchScalingPolicies" | "StreamEvents" | "ExecAllocation" | "StreamWork" => {
             "streams, and the bridge carries unary calls only"
@@ -2563,6 +2623,69 @@ mod tests {
 
     /// Every RPC pages may call is a unary Manager RPC of this build's
     /// proto, and none is also on the refused list.
+    /// No page RPC changes who may do what, changes an app, or rotates key
+    /// material; every one names the permissions behind it, and listing one
+    /// asks for them everywhere, reserved scopes included (hardening after
+    /// the adversarial review).
+    #[test]
+    fn page_rpcs_are_bounded_by_their_permissions() {
+        for (method, _, needs) in PAGE_RPCS {
+            for permission in *needs {
+                assert!(
+                    !permission.starts_with("acl:write") && !permission.starts_with("app:write"),
+                    "{method} needs {permission}: pages may not change ACLs or apps"
+                );
+                let (resource, action) = permission.split_once(':').expect("resource:action");
+                assert!(
+                    crate::structs::grant::resource_named(resource).is_some(),
+                    "{method}: {resource}"
+                );
+                assert!(matches!(action, "read" | "write"), "{method}: {action}");
+            }
+            if !matches!(*method, "WhoAmI" | "GetAuthMethods") {
+                assert!(!needs.is_empty(), "{method} names no permission");
+            }
+        }
+        for refused in [
+            "UpsertAclPolicy",
+            "DeleteAclToken",
+            "RevokeGrant",
+            "DeleteJoinToken",
+            "ApplyNamespacePolicy",
+            "InstallApp",
+            "UpgradeApp",
+            "UninstallApp",
+            "SetAppEnabled",
+            "UpdateAppSettings",
+            "SetAppConfig",
+            "RotateDataKey",
+            "RewrapKv",
+            "RotateMeshCa",
+        ] {
+            assert!(page_rpc_kind(refused).is_none(), "{refused}");
+            assert!(
+                page_rpc_refusal(refused).contains("from the CLI"),
+                "{refused}: {}",
+                page_rpc_refusal(refused)
+            );
+        }
+        let rules = page_rpc_rules("GetJobInfo");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].namespaces,
+            Some(vec!["*".to_string(), "legion-*".to_string()])
+        );
+        let kv = page_rpc_rules("GetKv");
+        assert_eq!(
+            kv[0].paths,
+            Some(vec!["*".to_string(), "legion/*".to_string()])
+        );
+        let restore = page_rpc_rules("RestoreInstance");
+        assert_eq!(restore.len(), 2, "{restore:?}");
+        assert!(page_rpc_rules("WhoAmI").is_empty());
+        assert!(page_rpc_rules("CreateAclToken").is_empty());
+    }
+
     #[test]
     fn page_rpcs_are_unary_manager_rpcs() {
         let proto = include_str!("../../proto/legion.proto");
@@ -2597,7 +2720,7 @@ mod tests {
             "parsed {} RPCs",
             declarations.len()
         );
-        for (method, _) in PAGE_RPCS {
+        for (method, _, _) in PAGE_RPCS {
             let declaration = declarations
                 .get(*method)
                 .unwrap_or_else(|| panic!("{method} is not a Manager RPC"));

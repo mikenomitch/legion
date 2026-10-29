@@ -21,25 +21,26 @@
 use super::*;
 use crate::manager::delegation::{delegated_identity, presented_assertion, refusal_message};
 use crate::structs::acl::AclSource;
-use crate::structs::app::app_name_of_job;
 use crate::structs::app_ui::{
     assertion_audience, AssertionKind, ViewerAssertion, ASSERTION_CLAIM, ASSERTION_TTL_SECS,
 };
 
 impl ManagerDaemonService {
     /// The app a credential speaks for: the first job-grant reference among
-    /// its policies (`grant:alloc/<id>`) whose allocation runs a job in
-    /// `legion-system`. A bearer `legion` token and an ACL token minted from
-    /// one (`legion login --method legion`) both carry it. `None` for
-    /// everyone else, management tokens and delegated identities included.
+    /// its policies (`grant:alloc/<id>`) whose allocation runs an app's job,
+    /// `legion-system/<app>`, at a version the reconciler stamped
+    /// `managedBy` that app ([`crate::storage::store::Store::allocation_app`]):
+    /// a version someone submitted straight to the job is not the app's. A
+    /// bearer `legion` token and an ACL token minted from one (`legion login
+    /// --method legion`) both carry the reference. `None` for everyone
+    /// else, management tokens and delegated identities included.
     pub(super) fn app_of_identity(&self, identity: &AclIdentity) -> Option<String> {
         if identity.source == AclSource::Delegated {
             return None;
         }
         identity.policies.iter().find_map(|policy| {
             let allocation = crate::structs::grant::parse_grant_policy_ref(policy)?;
-            let job = self.store.allocation_job_id(allocation).ok().flatten()?;
-            app_name_of_job(&job).map(str::to_string)
+            self.store.allocation_app(allocation).ok().flatten()
         })
     }
 

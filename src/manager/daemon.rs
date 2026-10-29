@@ -638,7 +638,6 @@ pub async fn run_manager_with(
     let app_nudge = crate::manager::apps::spawn_reconciler(
         manager_node.clone(),
         crate::manager::apps::ReconcilerSettings {
-            app_user: full_config.system_worker.app_user.clone(),
             seed: full_config.apps.clone(),
             own_build,
         },

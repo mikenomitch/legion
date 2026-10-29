@@ -184,8 +184,6 @@ pub struct AppSeedConfig {
 pub const DEF_SYSTEM_WORKER_CPU: u64 = 1000;
 /// Default `systemWorker.resources.memory`, in MiB.
 pub const DEF_SYSTEM_WORKER_MEMORY: u64 = 1024;
-/// Default `systemWorker.appUser`.
-pub const DEF_SYSTEM_WORKER_APP_USER: &str = "nobody";
 /// Default `systemWorker.port`: beside a standalone worker's 4848, so a
 /// manager and a worker joined on the same host do not collide.
 pub const DEF_SYSTEM_WORKER_PORT: u16 = 4849;
@@ -216,9 +214,6 @@ pub struct SystemWorkerConfig {
     /// 1024 MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<SystemWorkerResourcesConfig>,
-    /// The unprivileged user Legion's bundled apps run as. Default `nobody`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app_user: Option<String>,
     /// The port the system worker's worker plane listens on. Default 4849,
     /// so a standalone worker on the same host keeps 4848. Managers dial it
     /// like any worker's (docs/architecture-managers-workers.md, "Ports").
@@ -245,7 +240,6 @@ pub struct SystemWorkerConfigFull {
     pub enabled: bool,
     pub namespaces: Vec<String>,
     pub resources: SystemWorkerResources,
-    pub app_user: String,
     pub port: u16,
 }
 
@@ -276,10 +270,6 @@ impl SystemWorkerConfig {
                 cpu: resources.cpu.unwrap_or(DEF_SYSTEM_WORKER_CPU),
                 memory: resources.memory.unwrap_or(DEF_SYSTEM_WORKER_MEMORY),
             },
-            app_user: self
-                .app_user
-                .clone()
-                .unwrap_or_else(|| DEF_SYSTEM_WORKER_APP_USER.to_string()),
             port: self.port.unwrap_or(DEF_SYSTEM_WORKER_PORT),
         }
     }
@@ -294,7 +284,6 @@ impl From<SystemWorkerConfigFull> for SystemWorkerConfig {
                 cpu: Some(full.resources.cpu),
                 memory: Some(full.resources.memory),
             }),
-            app_user: Some(full.app_user),
             port: Some(full.port),
         }
     }
@@ -319,14 +308,6 @@ impl SystemWorkerConfigFull {
             bail!(
                 "systemWorker.resources.cpu and .memory must be at least 1 (MHz and MiB); they \
                  are what the manager lends its system worker"
-            );
-        }
-        let user = self.app_user.trim();
-        if user.is_empty() || user == "root" || user == "0" {
-            bail!(
-                "systemWorker.appUser must name an unprivileged user, got {:?}: tasks in \
-                 reserved namespaces may not run as root",
-                self.app_user
             );
         }
         if self.port == 0 {
@@ -3892,7 +3873,6 @@ mod tests {
                 memory: 1024
             }
         );
-        assert_eq!(full.app_user, "nobody");
         assert_eq!(full.port, 4849);
         full.validate()?;
 
@@ -3914,8 +3894,6 @@ mod tests {
                 serde_json::json!({ "resources": { "memory": 0 } }),
                 "resources",
             ),
-            (serde_json::json!({ "appUser": "root" }), "appUser"),
-            (serde_json::json!({ "appUser": "0" }), "appUser"),
             (serde_json::json!({ "port": 0 }), "port"),
         ] {
             let config: SystemWorkerConfig = serde_json::from_value(block.clone())?;

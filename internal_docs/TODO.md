@@ -511,7 +511,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), and app actions as the viewer | All three plans SHIPPED; their items are checked off and in Done |
+| [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after an adversarial security review | All three plans SHIPPED; their items, and the hardening, are checked off and in Done; the review's open and design-level items are under *Ecosystem apps* |
 | branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phase O1 | Builds on #60; O1 is checked off and in Done; O2-O4 and the deferrals are open under Ecosystem apps |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
@@ -4506,6 +4506,53 @@ plan.
           did-you-mean** unless an example uses it; the check only covers
           `configs/jobs`
           ([calls entry 63](calls/legion-apps-plan_calls.md)).
+  - [ ] Left open by the apps hardening after the adversarial security
+        review (the fixed findings are in Done under *Ecosystem apps*;
+        [calls 99-110](calls/legion-apps-plan_calls.md)):
+    - [ ] **Delegations are coarse**: `resource:action` on the pressed
+          context, reusable for 60 s on any RPC that permission gates, so a
+          "Pause" lets the app `ScaleTask(count = 0)` the same job as the
+          viewer. Accepted for now; binding a delegation to RPCs needs a
+          per-RPC permission model
+          ([calls 105](calls/legion-apps-plan_calls.md),
+          [docs](../docs/auth-and-acls.md#delegated-identities)).
+    - [ ] **Views without a permission answer with the app's grant**: a
+          `job`, `task`, or `node` entry may omit `permission`, and then any
+          `app:read` holder can ask for it on any context. Make `job:read`
+          (or `node:read`) on the context the default
+          ([calls 106](calls/legion-apps-plan_calls.md),
+          [docs](../docs/apps.md#who-sees-what)).
+    - [ ] **Viewer-assertion replay is checked by the app only**, in memory
+          per replica; the manager keeps no spent set (see the delegation
+          item above; [docs](../docs/apps.md#the-viewer-assertion)).
+    - [ ] **A grant outlives its granter**: an app's grant, and the bound on
+          its pages' `rpcs`, are checked when someone installs, upgrades,
+          or changes code, never again when that person loses access
+          ([docs](../docs/apps.md#trust-model)).
+    - [ ] **Config `identities` are rendered into every app's job**, and are
+          protected only when the manifest lists `/identities` as a code
+          field (the autoscaler does); make them a code field by rule
+          ([docs](../docs/apps.md#what-legion-renders)).
+    - [ ] **The autoscaler's source settings are not code fields**:
+          `builtin`, `config.url`, `config.headers`, and `namespaces` steer
+          metrics, and so scaling, in every namespace, and make the
+          managers fetch a URL, with only `app:write`
+          ([docs](../docs/autoscaling.md)).
+    - [ ] **The validate call runs before the full submit authorization**:
+          `kv:read` now comes first (calls 99), but the host grant and the
+          band are checked after the app has heard the values
+          ([docs](../docs/apps.md#the-validate-call)).
+    - [ ] **`WatchAppExtensions` and the validate call amplify cost**: every
+          stream polls each second and rescans every value when any job
+          changes, nothing caps streams per app, and each validate call
+          holds a submit up to 2 s. Cap watches per app, share one diff per
+          app, and scan only changed jobs
+          ([calls 90](calls/legion-apps-plan_calls.md)).
+    - [ ] **Schema `pattern`s backtrack** (fancy-regex, capped at 1M steps
+          per match), and values re-validate on every read: refuse
+          lookaround and backreferences at install, or cache validity per
+          schema digest
+          ([docs](../docs/apps.md#values-as-they-read-now)).
   - [ ] Deferred: install apps from a registry (waits on a registry plan
         that doesn't exist yet), tenant-owned apps, and pre-approved
         per-namespace grants, so GitOps needn't hold the union of what its
@@ -6702,6 +6749,36 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         orphaned
   - [x] Extension-only resubmits move allocations in place (same ids, no
         rollout)
+- [x] **Apps hardening after an adversarial security review** (2026-10-29,
+      [#60](https://github.com/mikenomitch/legion/pull/60) ·
+      [calls 99-110](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md#trust-model),
+      [auth-and-acls.md](../docs/auth-and-acls.md#kv-references-in-a-job),
+      [namespaces.md](../docs/namespaces.md#reserved-namespaces))
+  - [x] Every KV reference (core field, extension value, pending key,
+        `kvInjections`) needs `kv:read`, checked before any is resolved, so
+        none reaches a plan, a stored version, an error, or an app's
+        validate call
+  - [x] No host-level construct in an app's job (exec health checks,
+        `file://` artifacts, `auth.nodeIdentity`, and an exec task's files
+        at host paths, own cgroup, or negative OOM score are refused in
+        `legion-system` for everyone, and install, upgrade and config
+        changes check the render); the reconciler holds no `host` grant
+  - [x] Each app runs as its own uid (`1900000000` up, on the record);
+        manifests may not name `user`; `systemWorker.appUser` removed
+  - [x] A page's `rpcs` need the installer to hold their permissions
+        everywhere; ACL, token, grant and app writes and key rotations are
+        no longer page-callable
+  - [x] Default filling is bounded, and schemas that loop on one value
+        (which crashed the validator) are refused
+  - [x] Changing an app's placement or pool, or installing one placed
+        elsewhere than `managers`, needs `operator:write`
+  - [x] The bridge confirms the decoded message, refuses a field spelled
+        both ways, and arms "Run as me" after 500 ms
+  - [x] The page guard answers every refusal alike before authentication
+  - [x] Install takes over no `legion-system` job; an app's identity and
+        its forwarded requests need the reconciler's `managedBy` stamp
+  - [x] Idempotency scopes include how the caller authenticated
 - [x] **Legion apps A1 follow-ups** (2026-10-29,
       [calls 95-97](calls/legion-apps-plan_calls.md))
   - [x] The host guard's `nftables` table and BPF pin directory are named

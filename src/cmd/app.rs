@@ -547,6 +547,9 @@ async fn status(matches: &ArgMatches) -> R<()> {
         "  Installed:  by {} at {}",
         app.installed_by, app.installed_at
     );
+    if app.uid != 0 {
+        println!("  Runs as:    uid {} (its own)", app.uid);
+    }
     if let Some(grant) = &app.grant {
         println!(
             "  Grant:      by {} at {}",

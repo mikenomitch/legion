@@ -920,14 +920,18 @@ impl KindSchema {
         digest_value(&self.raw)
     }
 
-    /// `value` with the schema's defaults filled in fields it lacks.
-    // TODO(apps hardening): `fill_defaults` gains `$ref`-cycle and size caps
-    // on PR #60's branch (security review M5); objects pick them up with the
-    // merge, since they call the same function.
-    pub fn filled(&self, value: &Value) -> Value {
+    /// `value` with the schema's defaults filled in fields it lacks, or an
+    /// error when filling exceeds [`fill_defaults`]'s budget.
+    pub fn try_filled(&self, value: &Value) -> Result<Value, String> {
         let mut filled = value.clone();
-        fill_defaults(&self.raw, &self.raw, &mut filled, 0);
-        filled
+        fill_defaults(&self.raw, &mut filled)?;
+        Ok(filled)
+    }
+
+    /// [`Self::try_filled`] for reads: a value whose defaults exceed the
+    /// budget reads as stored (a write of it was refused by [`Self::check`]).
+    pub fn filled(&self, value: &Value) -> Value {
+        self.try_filled(value).unwrap_or_else(|_| value.clone())
     }
 
     /// Fill defaults, then validate: the filled value, or one message per
@@ -935,7 +939,9 @@ impl KindSchema {
     /// "string"`, `spec.brnach: unknown field (did you mean branch?)`). A
     /// problem at or below a `writeOnly` value never echoes it.
     pub fn check(&self, root: &str, value: &Value) -> Result<Value, Vec<String>> {
-        let effective = self.filled(value);
+        let effective = self
+            .try_filled(value)
+            .map_err(|err| vec![format!("{root}: {err}")])?;
         let problems: Vec<String> = match self.compiled.validate(&effective) {
             Ok(()) => Vec::new(),
             Err(errors) => errors

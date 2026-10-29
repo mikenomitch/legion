@@ -113,11 +113,21 @@ module.exports = async function appPages({ browser, base, check }) {
     window.stopping = window.outcome(legion.call('StopJob', { name: 'web' }))
   })
   await dialog.waitFor({ timeout: 10000 })
+  check(await dialog.locator('[data-testid=bridge-confirm-run]').isDisabled(), '"Run as me" is not armed the moment the dialog appears')
   await dialog.locator('button', { hasText: 'Run as me' }).click()
   const stopped = await frame.evaluate(() => window.stopping)
   check(stopped === 'ok {}', `a confirmed call runs (${stopped})`)
   const stop = seen('StopJob')[0]
   check(stop && stop.headers['legion-app-page'] === 'fake/console' && stop.body.toString('latin1').includes('web'), 'the confirmed call carries its request and the page header')
+
+  // A request that spells a field both ways could be confirmed for one
+  // value and sent with the other: refused, never confirmed or sent.
+  const before = seen('StopJob').length
+  const aliased = await frame.evaluate(() =>
+    window.outcome(legion.call('StopJob', { name: 'web', idempotencyKey: 'shown', idempotency_key: 'sent' })),
+  )
+  check(aliased.startsWith('error invalid_argument'), `a request with both spellings of a field is refused (${aliased})`)
+  check(seen('StopJob').length === before, 'the aliased request is never sent')
 
   // The sandbox: no storage, no SPA DOM, no network, no forms.
   const storage = await frame.evaluate(() => {

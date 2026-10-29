@@ -36,6 +36,13 @@ export const APP_PAGE_HEADER = 'legion-app-page'
 export const MAX_IN_FLIGHT = 16
 export const MAX_PENDING_CONFIRMATIONS = 4
 
+/**
+ * How long a confirmation is shown before "Run as me" can be pressed. Each
+ * confirmation re-arms, so a double-click on one never approves the next,
+ * and a page cannot pop a dialog under a click aimed at something else.
+ */
+export const CONFIRM_ARM_MS = 500
+
 /** JSON with every `<` escaped, safe to inline in a `<script>`. */
 const inlineJson = (value: unknown) => JSON.stringify(value).replace(/</g, '\\u003c')
 
@@ -144,9 +151,44 @@ export function errorCode(error: unknown): string {
 }
 
 /**
+ * The first field a request spells both ways (`nodeId` and `node_id`), as a
+ * dotted path, or undefined. protobuf-es reads either spelling and keeps
+ * whichever comes last, so a request with both could be confirmed naming
+ * one value and sent with the other; the bridge refuses it instead. Walks
+ * nested messages, lists of them, and maps of them.
+ */
+export function aliasedField(type: MessageType<AnyMessage>, value: unknown, path = ''): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  // Well-known types have their own JSON (a Struct is arbitrary data).
+  if (type.typeName.startsWith('google.protobuf.')) return undefined
+  const fields = value as Record<string, unknown>
+  const has = (key: string) => Object.prototype.hasOwnProperty.call(fields, key)
+  for (const field of type.fields.list()) {
+    const here = path ? `${path}.${field.jsonName}` : field.jsonName
+    if (field.name !== field.jsonName && has(field.name) && has(field.jsonName)) return here
+    const nested = has(field.jsonName) ? fields[field.jsonName] : fields[field.name]
+    if (field.kind === 'message') {
+      const items = field.repeated && Array.isArray(nested) ? nested : [nested]
+      for (const item of items) {
+        const found = aliasedField(field.T, item, here)
+        if (found) return found
+      }
+    } else if (field.kind === 'map' && field.V.kind === 'message' && nested && typeof nested === 'object') {
+      for (const item of Object.values(nested as Record<string, unknown>)) {
+        const found = aliasedField(field.V.T, item, here)
+        if (found) return found
+      }
+    }
+  }
+  return undefined
+}
+
+/**
  * What a call is about, for its confirmation: the job, node, key, or
- * object the request names. Best effort from common request fields;
- * the confirmation also shows the whole request.
+ * object the request names. Best effort from common request fields. Pass
+ * the decoded message's JSON (`message.toJson()`), never the page's raw
+ * request: the confirmation must name what will be sent. The confirmation
+ * also shows that whole message.
  */
 export function callTarget(request: unknown): string {
   if (!request || typeof request !== 'object') return 'the cluster'

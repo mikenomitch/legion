@@ -385,7 +385,6 @@ impl Fixture {
         let mut reconciler = AppReconciler::new(
             self.svc.clone(),
             ReconcilerSettings {
-                app_user: "nobody".into(),
                 seed: BTreeMap::new(),
                 own_build: BuildMarker {
                     version: "0.1.0".into(),
@@ -1560,5 +1559,154 @@ async fn install_adopts_pending_upgrade_revalidates_and_uninstall_orphans_test()
         status.message()
     );
     fx.run_as(&job("later", Some(2)), true, &fx.admin).await?;
+    Ok(())
+}
+
+/// A `$path` KV reference needs `kv:read` on its key wherever it sits in a
+/// jobspec, and the check comes before anything resolves it (hardening
+/// after the adversarial review): in a pending key planned with
+/// `--allow-unknown-fields`, in an installed key's value (which the app's
+/// validate call would otherwise see), and in a core field whose parse
+/// error would otherwise echo the value.
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_references_need_kv_read_wherever_they_are_test() -> R<()> {
+    const SECRET: &str = "hunter2";
+    const KEY: &str = "team-b/db/password";
+    let fx = fixture().await?;
+    fx.svc
+        .put_kv(req(
+            PutKvRequest {
+                key: KEY.into(),
+                value: SECRET.into(),
+                value_type: KvValueType::String as i32,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    let tenant = fx
+        .token(
+            "tenant",
+            json!([{ "resources": ["job"], "actions": ["read", "write"], "namespaces": ["*"] }]),
+        )
+        .await?;
+    let refused = |outcome: Result<String, tonic::Status>, what: &str| match outcome {
+        Ok(shown) => panic!("{what} was not refused, and showed: {shown}"),
+        Err(status) => {
+            assert_eq!(status.code(), Code::PermissionDenied, "{what}: {status}");
+            assert!(
+                !status.message().contains(SECRET),
+                "{what} leaked: {status}"
+            );
+            assert!(status.message().contains(KEY), "{what}: {status}");
+        }
+    };
+    let noop = json!({ "name": "t", "runtime": "container",
+                       "config": { "image": "alpine", "command": ["true"] } });
+
+    // A pending key: `job:read` was enough to read any key back.
+    let leak = json!({ "name": "planned", "leak": format!("${KEY}"), "task": noop });
+    let plan = fx
+        .svc
+        .plan_job(req(
+            PlanJobRequest {
+                parsed_jobspec: leak.to_string(),
+                allow_unknown_fields: true,
+                ..Default::default()
+            },
+            &tenant,
+        ))
+        .await
+        .map(|reply| format!("{:?}", reply.into_inner().extensions));
+    refused(plan, "PlanJob with a pending key");
+
+    // An installed key's value: nobody's app hears it, nothing is stored.
+    let before = fx.forwarder.calls.load(Ordering::SeqCst);
+    let stored = json!({ "name": "stored", "uptime": { "url": format!("${KEY}") }, "task": noop });
+    let run = fx
+        .run_as(&stored, false, &tenant)
+        .await
+        .map(|reply| reply.message);
+    refused(run, "RunJob with an installed key");
+    assert_eq!(
+        fx.forwarder.calls.load(Ordering::SeqCst),
+        before,
+        "the validate call heard a value its submitter may not read"
+    );
+    assert!(fx.store.get_job_config_optional("stored")?.is_none());
+
+    // A core field whose type the value does not fit.
+    let echoed = json!({ "name": "echoed", "priority": format!("${KEY}"), "task": noop });
+    let run = fx
+        .run_as(&echoed, false, &tenant)
+        .await
+        .map(|reply| reply.message);
+    refused(run, "RunJob with a mistyped core field");
+
+    // Holding `kv:read` on the key is what it takes.
+    let reader = fx
+        .token(
+            "reader",
+            json!([
+                { "resources": ["job"], "actions": ["read", "write"], "namespaces": ["*"] },
+                { "resources": ["kv"], "actions": ["read"], "paths": ["team-b/*"] },
+            ]),
+        )
+        .await?;
+    fx.run_as(&stored, false, &reader).await?;
+    Ok(())
+}
+
+/// An allocation of `legion-system/<app>` speaks for the app only while the
+/// version it runs carries the reconciler's `managedBy` stamp for that app
+/// (hardening after the adversarial review): a version someone submitted
+/// straight to the job is not the app's.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_stamped_allocation_speaks_for_its_app_test() -> R<()> {
+    let fx = fixture().await?;
+    let job = format!("legion-system/{APP}");
+    let token = fx.app_token(APP)?;
+    fx.svc
+        .watch_app_extensions(req(WatchAppExtensionsRequest::default(), &token))
+        .await?;
+
+    // A direct submit of the app's job, as the admin: no stamp.
+    let mut edited = serde_json::to_value(fx.store.get_job_config(&job)?)?;
+    edited["version"] = Value::Null;
+    edited["tasks"][0]["count"] = json!(2);
+    fx.run(&edited).await?;
+    let config_id = fx.store.get_job_config(&job)?.id();
+    assert!(fx.store.job_managed_by(&job)?.is_none());
+    fx.store
+        .enqueue_eval("job_reschedule", Some(&job), Some(&config_id), None, None)?;
+    fx.drain_evals()?;
+    let allocation = fx
+        .store
+        .allocs_for_job(&job)?
+        .into_iter()
+        .find(|allocation| allocation.job_config_id == config_id)
+        .context("the unstamped version should be placed")?;
+    let task = fx
+        .store
+        .get_task_configs_for_job_config(&allocation.job_config_id)?
+        .into_iter()
+        .find(|(id, _)| *id == allocation.task_config_id)
+        .map(|(_, task)| task)
+        .context("task config")?;
+    let claims = claims_for_allocation(&fx.store, &allocation, &task, "auto")?;
+    let identity = WorkloadIdentity {
+        name: CONTROL_PLANE_IDENTITY_NAME.into(),
+        ..Default::default()
+    };
+    let unstamped = fx
+        .state
+        .issue(&claims, &identity, std::time::SystemTime::now())?
+        .token;
+    let status = fx
+        .svc
+        .watch_app_extensions(req(WatchAppExtensionsRequest::default(), &unstamped))
+        .await
+        .expect_err("an unstamped version's allocation is not the app");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status}");
     Ok(())
 }

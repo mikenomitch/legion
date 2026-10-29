@@ -311,7 +311,6 @@ async fn fixture() -> R<Fixture> {
     let mut reconciler = AppReconciler::new(
         fx.svc.clone(),
         ReconcilerSettings {
-            app_user: "nobody".into(),
             seed: BTreeMap::new(),
             own_build: BuildMarker {
                 version: "0.1.0".into(),
@@ -615,8 +614,11 @@ async fn bridged_calls_are_held_to_the_page_allowlist_test() -> R<()> {
         .list_jobs(list(Some("fake/console")))
         .await
         .unwrap_err();
-    assert!(
-        refused.message().contains("not in the page's `rpcs`"),
+    // The same answer for every refusal, which lists none of the page's
+    // `rpcs` (the guard runs before authentication).
+    assert_eq!(
+        refused.message(),
+        legion::manager::app_page_guard::page_call_refused().message(),
         "{refused}"
     );
     // Unstamped: the SPA's own calls are untouched.
@@ -666,6 +668,119 @@ async fn bridged_calls_are_held_to_the_page_allowlist_test() -> R<()> {
         .await
         .unwrap_err();
     assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
-    assert!(refused.message().contains("disabled"), "{refused}");
+    Ok(())
+}
+
+/// A page's `rpcs` are bounded by its installer's rights (hardening after
+/// the adversarial review): a page reads with whoever views it, so listing
+/// an RPC takes holding its permission everywhere the RPC reaches, reserved
+/// scopes included; and ACL, token, and app writes are not page-callable at
+/// all, whoever installs.
+#[tokio::test(flavor = "multi_thread")]
+async fn page_rpcs_are_bounded_by_the_installers_rights_test() -> R<()> {
+    let fx = fixture().await?;
+    let with_rpcs = |name: &str, rpcs: Value| {
+        json!({
+            "name": name,
+            "version": "1.0.0",
+            "job": { "task": { "name": "main", "runtime": "exec",
+                                "config": { "command": ["sleep", "3600"] },
+                                "network": { "ports": [{ "name": "api" }] } } },
+            "ui": { "pages": [{ "name": "p", "title": "P", "rpcs": rpcs }] },
+        })
+    };
+    let install = |manifest: Value, token: String| {
+        let svc = fx.svc.clone();
+        async move {
+            svc.install_app(req(
+                InstallAppRequest {
+                    manifest_json: manifest.to_string(),
+                    source: "file".into(),
+                    source_ref: "./app.json".into(),
+                    ..Default::default()
+                },
+                &token,
+            ))
+            .await
+            .map(tonic::Response::into_inner)
+        }
+    };
+    let installer = fx
+        .token(
+            "installer",
+            json!([{ "resources": ["app"], "actions": ["read", "write"] }]),
+        )
+        .await?;
+    let refused = install(with_rpcs("snoop", json!(["GetKv", "ListKv"])), installer)
+        .await
+        .expect_err("the installer holds no kv:read");
+    assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+    assert!(refused.message().contains("kv:read"), "{refused}");
+    assert!(fx.store.get_app("snoop")?.is_none());
+
+    for rpc in [
+        "UpsertAclPolicy",
+        "DeleteAclToken",
+        "RevokeGrant",
+        "DeleteJoinToken",
+        "InstallApp",
+        "UpgradeApp",
+        "UninstallApp",
+        "SetAppEnabled",
+        "UpdateAppSettings",
+        "SetAppConfig",
+    ] {
+        let refused = install(with_rpcs("writer", json!([rpc])), fx.admin.clone())
+            .await
+            .expect_err("not page-callable");
+        assert_eq!(refused.code(), Code::InvalidArgument, "{rpc}: {refused}");
+        assert!(refused.message().contains(rpc), "{rpc}: {refused}");
+    }
+
+    // Holding the permission everywhere, reserved keys too, is enough.
+    let reader = fx
+        .token(
+            "kv-reader",
+            json!([
+                { "resources": ["app"], "actions": ["read", "write"] },
+                { "resources": ["kv"], "actions": ["read"], "paths": ["*", "legion/*"] },
+            ]),
+        )
+        .await?;
+    install(with_rpcs("snoop", json!(["GetKv", "ListKv"])), reader).await?;
+    Ok(())
+}
+
+/// The page guard runs before authentication, so it answers every refusal
+/// alike and never lists a page's `rpcs` (hardening after the adversarial
+/// review): an unknown app, a disabled one, an unknown page, and an RPC the
+/// page does not list read the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_page_guard_answers_alike_before_authentication_test() -> R<()> {
+    use legion::manager::app_page_guard::check_page_call;
+    let fx = fixture().await?;
+    let path = "/legion.Manager/ListJobs";
+    let unlisted = check_page_call(&fx.store, "fake/console", path).unwrap_err();
+    let no_page = check_page_call(&fx.store, "fake/nope", path).unwrap_err();
+    let no_app = check_page_call(&fx.store, "nobody/console", path).unwrap_err();
+    fx.svc
+        .set_app_enabled(req(
+            SetAppEnabledRequest {
+                name: APP.into(),
+                enabled: false,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    let disabled = check_page_call(&fx.store, "fake/console", path).unwrap_err();
+    for status in [&unlisted, &no_page, &no_app, &disabled] {
+        assert_eq!(status.code(), Code::PermissionDenied, "{status}");
+        assert!(
+            !status.message().contains("GetJobInfo") && !status.message().contains("StopJob"),
+            "lists the page's rpcs: {status}"
+        );
+        assert_eq!(status.message(), unlisted.message(), "the answers differ");
+    }
     Ok(())
 }

@@ -1725,9 +1725,37 @@ fn tiny_cpu_warning(task: &TaskConfig) -> Option<String> {
 /// | any runtime | an artifact (or `image`) is a `file://` source or a local git repository: the root worker copies node files into the task |
 /// | any runtime | an artifact names `auth.nodeIdentity`: the fetch presents the node's own credential |
 pub fn task_host_level_reason(task: &crate::structs::TaskConfig) -> Option<String> {
+    runtime_host_level_reason(task).or_else(|| node_reaching_reason(task))
+}
+
+/// [`task_host_level_reason`] for a task of an app's job, which the app
+/// reconciler submits (docs/apps.md, "Trust model"). An `exec` task there
+/// runs as the app's own unprivileged uid: the render sets the user, and
+/// [`validate_reserved_namespace_task`] refuses root and everything
+/// [`node_reaching_reason`] names. So the `exec` runtime alone does not make
+/// an app's job host-level, and the reconciler needs no `host` grant for it;
+/// every other reason still does, and the reconciler holds none.
+pub fn app_task_host_level_reason(task: &crate::structs::TaskConfig) -> Option<String> {
+    if task.runtime == "exec" {
+        return node_reaching_reason(task);
+    }
+    task_host_level_reason(task)
+}
+
+/// What makes a task host-level whatever its runtime and user: the worker
+/// itself acts for it on the node, as root or as the node. An `exec` health
+/// check, a `file://` (or local git) artifact or image, or an artifact that
+/// presents `auth.nodeIdentity`; and for an `exec` task, which shares the
+/// host's filesystem, a file the worker writes at an absolute host path
+/// (`config.files`, `kvInjections.files`, an identity's `file`, a
+/// `connect.templates` destination), a `config.cgroup` the worker joins it
+/// to, or an OOM score below 0, which only root may set.
+pub fn node_reaching_reason(task: &crate::structs::TaskConfig) -> Option<String> {
     let name = &task.name;
-    if let Some(reason) = runtime_host_level_reason(task) {
-        return Some(reason);
+    if task.runtime == "exec" {
+        if let Some(reason) = exec_root_assist_reason(task) {
+            return Some(reason);
+        }
     }
     // An `exec` health check is a command the worker runs on the host,
     // whatever the task's runtime, so declaring one is running on the host.
@@ -1774,6 +1802,65 @@ pub fn task_host_level_reason(task: &crate::structs::TaskConfig) -> Option<Strin
             artifact.redacted_source()
         ))
     })
+}
+
+/// What the root worker does for an `exec` task before it drops to the
+/// task's user, beyond its own allocation: writing a file at an absolute
+/// host path, joining a cgroup the task names, or setting a negative OOM
+/// score ([`node_reaching_reason`]).
+fn exec_root_assist_reason(task: &crate::structs::TaskConfig) -> Option<String> {
+    let name = &task.name;
+    let absolute = |path: &str| std::path::Path::new(path.trim()).is_absolute();
+    let config_files = task
+        .config
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|file| file.get("path").and_then(Value::as_str));
+    let injected = task
+        .kv_injections
+        .iter()
+        .flat_map(|injections| injections.files.iter().map(|file| file.path.as_str()));
+    let identities = task
+        .identities
+        .iter()
+        .filter_map(|identity| identity.file.as_ref().map(|file| file.path.as_str()));
+    let templates = task
+        .connect
+        .iter()
+        .flat_map(|connect| connect.templates.iter().map(|t| t.destination.as_str()));
+    if let Some(path) = config_files
+        .chain(injected)
+        .chain(identities)
+        .chain(templates)
+        .find(|path| absolute(path))
+    {
+        return Some(format!(
+            "{name:?} has the worker write {:?} on the host's own filesystem",
+            path.trim()
+        ));
+    }
+    if let Some(cgroup) = task
+        .config
+        .get("cgroup")
+        .and_then(Value::as_str)
+        .filter(|cgroup| !cgroup.trim().is_empty())
+    {
+        return Some(format!(
+            "{name:?} names cgroup {cgroup:?}, which the worker joins it to, outside its \
+             allocation's limits"
+        ));
+    }
+    let oom = ["oom_score_adj", "oom_adj"]
+        .iter()
+        .find_map(|key| task.config.get(*key).and_then(Value::as_i64));
+    if let Some(score) = oom.filter(|score| *score < 0) {
+        return Some(format!(
+            "{name:?} sets an OOM score of {score}, below 0, which only root may"
+        ));
+    }
+    None
 }
 
 /// Whether an artifact source reads the node's filesystem: `file://`, or a
@@ -1856,14 +1943,25 @@ pub fn validate_gated_exec_user(task: &crate::structs::TaskConfig) -> R<()> {
 /// system workers, where root could read the manager's data directory and
 /// raft state, delete the host guard's table, or leave its cgroup: "an app"
 /// would become "the cluster". So an `exec` task must name a non-root
-/// `user`, and a `container` may not opt out of the privilege floor
-/// (`security.userNamespace = false`, `security.seccomp = "unconfined"`).
+/// `user`, a `container` may not opt out of the privilege floor
+/// (`security.userNamespace = false`, `security.seccomp = "unconfined"`),
+/// and no task may have the worker act for it on the node
+/// ([`node_reaching_reason`]: an `exec` health check, a `file://` artifact,
+/// `auth.nodeIdentity`), whoever submits it: the worker there is root on a
+/// manager.
 pub fn validate_reserved_namespace_task(
     task: &crate::structs::TaskConfig,
     namespace: &str,
 ) -> R<()> {
     if !crate::structs::namespace::is_reserved_namespace(namespace) {
         return Ok(());
+    }
+    if let Some(reason) = node_reaching_reason(task) {
+        bail!(
+            "task {reason}, and tasks in namespace {namespace} may not: they run on the \
+             managers' system workers, where the worker that would do it is root.\nHint: use \
+             an `http` or `tcp` health check, and fetch artifacts from a URL"
+        );
     }
     match task.runtime.as_str() {
         "exec" => {
@@ -2271,6 +2369,103 @@ mod tests {
         }
         validate_reserved_namespace_task(&container(serde_json::json!({})), "legion-system")
             .expect("the default floor is fine");
+
+        // Nothing the worker would do for the task on the node, as root or
+        // as the node, whatever the runtime and user.
+        let unprivileged = |extra: serde_json::Value| {
+            let mut value = serde_json::json!({
+                "name": "agent", "runtime": "exec",
+                "config": { "command": ["true"], "user": "nobody" },
+            });
+            for (key, item) in extra.as_object().expect("object") {
+                value[key] = item.clone();
+            }
+            task(value)
+        };
+        for (extra, says) in [
+            (
+                serde_json::json!({ "checks": [{ "type": "health", "kind": "exec",
+                                                 "command": ["/bin/true"] }] }),
+                "exec health check",
+            ),
+            (
+                serde_json::json!({ "artifacts": ["file:///var/lib/legion/"] }),
+                "node's own filesystem",
+            ),
+            (
+                serde_json::json!({ "artifacts": ["git::file:///srv/repo"] }),
+                "node's own filesystem",
+            ),
+            (
+                serde_json::json!({ "artifacts": [{ "source": "https://example.com/x.tgz",
+                                                    "auth": { "nodeIdentity": "pull" } }] }),
+                "auth.nodeIdentity",
+            ),
+            (
+                serde_json::json!({ "config": { "command": ["true"], "user": "nobody",
+                    "files": [{ "path": "/etc/cron.d/x", "content": "* * * * * root id" }] } }),
+                "host's own filesystem",
+            ),
+            (
+                serde_json::json!({ "identities": [{ "name": "cloud", "audience": ["sts"],
+                                                     "file": { "path": "/etc/token" } }] }),
+                "host's own filesystem",
+            ),
+            (
+                serde_json::json!({ "config": { "command": ["true"], "user": "nobody",
+                                                "cgroup": "/" } }),
+                "cgroup",
+            ),
+            (
+                serde_json::json!({ "config": { "command": ["true"], "user": "nobody",
+                                                "oom_score_adj": -1000 } }),
+                "OOM score",
+            ),
+        ] {
+            let err =
+                validate_reserved_namespace_task(&unprivileged(extra.clone()), "legion-system")
+                    .expect_err("the worker would act for it on a manager");
+            assert!(err.to_string().contains(says), "{err}");
+            assert!(err.to_string().contains("legion-system"), "{err}");
+            validate_reserved_namespace_task(&unprivileged(extra), "default")
+                .expect("allowed outside reserved namespaces (with the host grant)");
+        }
+        validate_reserved_namespace_task(
+            &unprivileged(serde_json::json!({
+                "checks": [{ "type": "health", "kind": "http", "path": "/healthz", "port": "api" }],
+                "artifacts": ["https://example.com/x.tgz"],
+                "config": { "command": ["true"], "user": "nobody", "oom_score_adj": 500,
+                            "files": [{ "path": "legion-app-config.json", "content": "{}" }] },
+            })),
+            "legion-system",
+        )
+        .expect("an http check, a URL artifact, a task-dir file and a high OOM score are fine");
+    }
+
+    /// An app's `exec` task is not host-level for the reconciler (it runs as
+    /// the app's uid); anything else host-level still is.
+    #[test]
+    fn app_tasks_are_host_level_only_beyond_their_exec_runtime_test() {
+        let exec = task(serde_json::json!({
+            "name": "e", "runtime": "exec", "config": { "command": ["true"], "user": "1900000000" },
+        }));
+        assert!(task_host_level_reason(&exec).is_some());
+        assert_eq!(app_task_host_level_reason(&exec), None);
+        let mut checked = exec.clone();
+        checked.checks = task(serde_json::json!({
+            "name": "e", "runtime": "exec", "config": {},
+            "checks": [{ "type": "health", "kind": "exec", "command": ["/bin/true"] }],
+        }))
+        .checks;
+        assert!(app_task_host_level_reason(&checked).is_some_and(|why| why.contains("exec health")));
+        let host_network = task(serde_json::json!({
+            "name": "c", "runtime": "container",
+            "config": { "image": "a", "command": ["true"] },
+            "network": { "mode": "host" },
+        }));
+        assert!(app_task_host_level_reason(&host_network).is_some());
+        let plugin = task(serde_json::json!({ "name": "p", "runtime": "custom", "config": {} }));
+        assert!(app_task_host_level_reason(&plugin).is_some());
     }
 
     #[test]

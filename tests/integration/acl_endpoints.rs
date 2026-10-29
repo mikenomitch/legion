@@ -377,6 +377,7 @@ fn app_fixture(name: &str) -> R<legion::structs::app::AppRecord> {
         updated_at: "2026-01-01T00:00:00Z".into(),
         state: AppReconcileState::default(),
         manifest,
+        uid: 0,
     })
 }
 
@@ -2292,6 +2293,30 @@ fn setup_enabled() -> R<(ManagerDaemonService, Fixtures, String)> {
 
 fn is_auth_error(code: Code) -> bool {
     matches!(code, Code::PermissionDenied | Code::Unauthenticated)
+}
+
+/// Guard: a sandboxed page's RPC list is bounded by its installer's rights
+/// through the permissions `PAGE_RPCS` names for each RPC (docs/apps.md,
+/// "Which RPCs a page may call"), so each one's first permission must be the
+/// gate this table records for it, and an open RPC needs none.
+#[test]
+fn page_rpc_permissions_match_the_endpoint_gates_test() {
+    let table: std::collections::HashMap<&str, Plane> = endpoint_table().into_iter().collect();
+    for (method, _, needs) in legion::structs::app_ui::PAGE_RPCS {
+        match table.get(method) {
+            Some(Plane::Protected(gate)) => {
+                let first = needs.first().unwrap_or_else(|| {
+                    panic!("{method} is protected ({gate}) but PAGE_RPCS names no permission")
+                });
+                assert!(
+                    gate.starts_with(first),
+                    "{method}: PAGE_RPCS names {first}, the endpoint table gates it on {gate}"
+                );
+            }
+            Some(Plane::Open) => assert!(needs.is_empty(), "{method} is open: {needs:?}"),
+            other => panic!("{method} is page-callable, but the endpoint table says {other:?}"),
+        }
+    }
 }
 
 /// Guard: every RPC in the Manager proto service must have a row in

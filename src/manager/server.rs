@@ -1541,19 +1541,111 @@ enum MissingKvBehavior {
     KeepExisting,
 }
 
-/// Parse a submitted jobspec: resolve its `$path/key` KV references, then
-/// check its keys the way `mode` (the request's `allow_unknown_fields`)
-/// says (docs/jobs-tasks-and-scheduling.md, "Unknown fields"). Returns the
-/// record of what the flag kept and dropped.
+/// The `$path/key` KV references in a jobspec, without resolving them: each
+/// key and the JSON pointer of the string that names it.
+fn collect_kv_references(value: &Value, pointer: &str, refs: &mut Vec<KvReference>) {
+    match value {
+        Value::String(text) => {
+            if let Some(key) = parse_kv_reference(text) {
+                refs.push(KvReference {
+                    key: key.to_string(),
+                    json_pointer: pointer.to_string(),
+                });
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_kv_references(
+                    item,
+                    &append_json_pointer(pointer, &index.to_string()),
+                    refs,
+                );
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                collect_kv_references(item, &append_json_pointer(pointer, key), refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `kv:read` on every key a job's `kvInjections` read, checked before any
+/// of them is rendered: the `templateKv` pointer first (its value is the
+/// template the other lookups come from), then the `{{ kv "…" }}` lookups.
+fn enforce_kv_injection_read(
+    store: &Store,
+    identity: &AclIdentity,
+    config: &JobConfig,
+) -> Result<(), Status> {
+    for injections in config
+        .tasks
+        .iter()
+        .filter_map(|task| task.kv_injections.as_ref())
+    {
+        let sources = injections
+            .env
+            .iter()
+            .map(|env| &env.value)
+            .chain(injections.files.iter().map(|file| &file.file));
+        for source in sources {
+            if let Some(key) = source.template_kv.as_deref() {
+                enforce_kv_reference_read(
+                    identity,
+                    &[KvReference {
+                        key: key.to_string(),
+                        json_pointer: String::new(),
+                    }],
+                )?;
+            }
+            let deps = template_source_deps(store, source).map_err(|e| {
+                Status::invalid_argument(format!("Error reading a kvInjections template: {e:#}"))
+            })?;
+            let deps: Vec<KvReference> = deps
+                .into_iter()
+                .map(|key| KvReference {
+                    key,
+                    json_pointer: String::new(),
+                })
+                .collect();
+            enforce_kv_reference_read(identity, &deps)?;
+        }
+    }
+    Ok(())
+}
+
+/// Parse a submitted jobspec as `identity`: resolve its `$path/key` KV
+/// references, then check its keys the way `mode` (the request's
+/// `allow_unknown_fields`) says (docs/jobs-tasks-and-scheduling.md,
+/// "Unknown fields"). Returns the references the job keeps as dependency
+/// edges, and the record of what the flag kept and dropped.
+///
+/// **Every reference needs `kv:read` on its key, checked before any is
+/// resolved** (docs/auth-and-acls.md, "KV references in a job"): in a core
+/// field, an extension value, or a pending key alike, and for the keys
+/// `kvInjections` read. Nothing a caller may not read is ever resolved, so
+/// no reply, parse error, schema error, or app validate call can carry one,
+/// and a missing key cannot be told from an unreadable one. A refusal is
+/// `PermissionDenied`; anything else wrong with the spec is
+/// `InvalidArgument`, prefixed with `context`.
 fn resolve_jobspec_kv_references(
     store: &Store,
+    identity: &AclIdentity,
     jobspec: &str,
     mode: UnknownFieldMode,
     registry: &crate::structs::extensions::ExtensionRegistry,
-) -> R<(JobConfig, Vec<KvReference>, UnknownFieldsRecord)> {
-    let mut value: Value = serde_json::from_str(jobspec)?;
+    context: &str,
+) -> Result<(JobConfig, Vec<KvReference>, UnknownFieldsRecord), Status> {
+    // Not logged: the text can hold a resolved value (one the caller may
+    // read, but the log is not the caller's).
+    let invalid = |e: anyhow::Error| Status::invalid_argument(format!("{context}: {e}"));
+    let mut value: Value = serde_json::from_str(jobspec).map_err(|e| invalid(e.into()))?;
+    let mut named = Vec::new();
+    collect_kv_references(&value, "", &mut named);
+    enforce_kv_reference_read(identity, &named)?;
     let mut refs = Vec::new();
-    resolve_kv_references_in_value(store, &mut value, &mut refs, "")?;
+    resolve_kv_references_in_value(store, &mut value, &mut refs, "").map_err(invalid)?;
     let mut refs = refs
         .into_iter()
         .map(|reference| {
@@ -1563,17 +1655,20 @@ fn resolve_jobspec_kv_references(
                 json_pointer,
             })
         })
-        .collect::<R<Vec<_>>>()?;
+        .collect::<R<Vec<_>>>()
+        .map_err(invalid)?;
     let (mut config, unknown_fields) = JobConfig::parse_submitted_with(
         value,
         mode,
         crate::structs::spec_fields::ExtensionCheck::Installed(registry),
-    )?;
+    )
+    .map_err(invalid)?;
     // A `$path` reference inside an extension value or a pending key points
     // where the stored config has nothing (those are stored by app, or under
     // `pendingExtensions`): it is resolved once, here, and not re-rendered,
-    // rather than failing every later KV-driven update of the job.
-    let stored = serde_json::to_value(&config)?;
+    // rather than failing every later KV-driven update of the job. Its read
+    // was checked above with the rest; only the dependency edge is dropped.
+    let stored = serde_json::to_value(&config).map_err(|e| invalid(e.into()))?;
     refs.retain(|reference| {
         let keep = !reference.json_pointer.starts_with('/')
             || stored.pointer(&reference.json_pointer).is_some();
@@ -1585,11 +1680,11 @@ fn resolve_jobspec_kv_references(
         }
         keep
     });
-    refs.extend(apply_job_kv_injections(
-        store,
-        &mut config,
-        MissingKvBehavior::Error,
-    )?);
+    enforce_kv_injection_read(store, identity, &config)?;
+    let injected =
+        apply_job_kv_injections(store, &mut config, MissingKvBehavior::Error).map_err(invalid)?;
+    enforce_kv_reference_read(identity, &injected)?;
+    refs.extend(injected);
     Ok((config, refs, unknown_fields))
 }
 
@@ -2015,9 +2110,6 @@ pub struct ManagerDaemonService {
     /// than a target, and `GetSchedulerConcurrency` reports it as such even
     /// when this manager does not lead the scheduler lane.
     eval_threads: usize,
-    /// `systemWorker.appUser`: the user apps' exec tasks run as when their
-    /// manifest names none (docs/apps.md).
-    app_user: String,
     /// Wakes this manager's app reconciler after an app write; unset in a
     /// service with no reconciler (tests, embedding), where writes simply
     /// wait for whoever reconciles.
@@ -2081,7 +2173,6 @@ impl ManagerDaemonService {
             stream_reauth_interval: acl::STREAM_REAUTH_INTERVAL,
             usage: Arc::new(Mutex::new(crate::manager::usage::UsageTable::default())),
             eval_threads: 1,
-            app_user: crate::structs::config::DEF_SYSTEM_WORKER_APP_USER.to_string(),
             app_nudge: Arc::new(std::sync::OnceLock::new()),
             app_forwarder: Arc::new(crate::manager::app_forward::WorkerPlaneForwarder),
             extension_registry: Arc::new(Mutex::new(None)),
@@ -2408,13 +2499,16 @@ impl ManagerDaemonService {
         // The keys installed apps add to the jobspec: the parse resolves
         // extension values against them (docs/apps.md, "Jobspec extensions").
         let registry = self.extension_registry()?;
-        let (mut config, kv_refs, unknown_fields) =
-            resolve_jobspec_kv_references(&self.store, js, unknown_field_mode, &registry).map_err(
-                |e| {
-                    error!("Error parsing jobspec: {:?}", e);
-                    Status::invalid_argument(format!("Error parsing jobspec: {e}"))
-                },
-            )?;
+        // `kv:read` on every KV reference is enforced inside, before any is
+        // resolved.
+        let (mut config, kv_refs, unknown_fields) = resolve_jobspec_kv_references(
+            &self.store,
+            identity,
+            js,
+            unknown_field_mode,
+            &registry,
+            "Error parsing jobspec",
+        )?;
         // The namespace is resolved before anything is scoped: every check
         // below runs against `config.name`, which is now the canonical id.
         let namespace = self.admit_job_namespace(&mut config, js, namespace)?;
@@ -2431,11 +2525,15 @@ impl ManagerDaemonService {
         // bypassable by rendering.
         // A job with a host-level task (worker-plane-auth plan §6.16) needs a
         // `job:write` rule with `host = true`: "can deploy" must not quietly
-        // mean "is root on every node".
-        let host_level = config
-            .tasks
-            .iter()
-            .find_map(crate::task_plugins::task_host_level_reason);
+        // mean "is root on every node". An app's own `exec` task runs as the
+        // app's uid, so for the app reconciler the runtime alone is not
+        // host-level; anything else that is needs a host grant it never
+        // holds (docs/apps.md, "Trust model").
+        let classify: fn(&crate::structs::TaskConfig) -> Option<String> = match origin {
+            SubmitOrigin::App { .. } => crate::task_plugins::app_task_host_level_reason,
+            SubmitOrigin::Principal => crate::task_plugins::task_host_level_reason,
+        };
+        let host_level = config.tasks.iter().find_map(classify);
         let scope = match template {
             Some(template) => AclScope::job_via_template(&config.name, &template.name),
             None => AclScope::job(&config.name),
@@ -2508,7 +2606,6 @@ impl ManagerDaemonService {
             identity,
             config.tasks.iter().filter_map(|task| task.connect.as_ref()),
         )?;
-        enforce_kv_reference_read(identity, &kv_refs)?;
         enforce_kv_artifact_read(identity, &config)?;
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
@@ -3483,7 +3580,6 @@ impl ManagerDaemonService {
         service.heartbeat = config.heartbeat.clone();
         service.eval_threads = config.eval_threads.max(1);
         service.edge_boot = config.edge_boot.clone();
-        service.app_user = config.system_worker.app_user.clone();
         service
     }
 
@@ -5099,13 +5195,14 @@ impl Manager for ManagerDaemonService {
             .map_err(template_eval_status)?;
 
         let registry = self.extension_registry()?;
-        let (mut config, kv_refs, _) = resolve_jobspec_kv_references(
+        let (mut config, _, _) = resolve_jobspec_kv_references(
             &self.store,
+            &identity,
             &rendered,
             UnknownFieldMode::Reject,
             &registry,
-        )
-        .map_err(|e| Status::invalid_argument(format!("rendered jobspec is invalid: {e}")))?;
+            "rendered jobspec is invalid",
+        )?;
         let namespace =
             self.admit_job_namespace(&mut config, &rendered, inner.namespace.as_deref())?;
         acl::enforce(
@@ -5118,7 +5215,6 @@ impl Manager for ManagerDaemonService {
             &AclScope::job_via_template(&config.name, &template.name).with_band(config.priority),
         )?;
         self.ensure_namespace_exists(&namespace)?;
-        enforce_kv_reference_read(&identity, &kv_refs)?;
         enforce_kv_artifact_read(&identity, &config)?;
         validate_job_config(&config).map_err(|e| {
             Status::invalid_argument(format!("rendered jobspec failed validation: {e}"))
@@ -5954,16 +6050,17 @@ impl Manager for ManagerDaemonService {
         }
 
         let registry = self.extension_registry()?;
-        let (mut config, kv_refs, unknown_fields) = resolve_jobspec_kv_references(
+        // The plan shows the KV-rendered config (`same_content`, extension
+        // values), so it needs the reads a submit would; they are enforced
+        // inside, before any reference is resolved.
+        let (mut config, _, unknown_fields) = resolve_jobspec_kv_references(
             &self.store,
+            &identity,
             &jobspec,
             UnknownFieldMode::from_allow(inner.allow_unknown_fields),
             &registry,
-        )
-        .map_err(|e| {
-            error!("Error parsing jobspec for plan: {:?}", e);
-            Status::invalid_argument(format!("Error parsing jobspec: {e}"))
-        })?;
+            "Error parsing jobspec",
+        )?;
         let namespace =
             self.admit_job_namespace(&mut config, &jobspec, inner.namespace.as_deref())?;
         acl::enforce(
@@ -5973,9 +6070,6 @@ impl Manager for ManagerDaemonService {
             &AclScope::job(&config.name),
         )?;
         self.ensure_namespace_exists(&namespace)?;
-        // The plan compares the KV-rendered config with the stored one
-        // (`same_content`), so it needs the reads a submit would.
-        enforce_kv_reference_read(&identity, &kv_refs)?;
         enforce_kv_artifact_read(&identity, &config)?;
         let mut config = self
             .store
@@ -12989,10 +13083,18 @@ fn scoped_idempotency_key(
     if key.is_empty() {
         return String::new();
     }
-    let caller = identity
-        .accessor_id
-        .as_deref()
-        .unwrap_or(identity.principal.as_str());
+    // Who the caller is, by how it authenticated and then its accessor (a
+    // token) or its principal: a JWT subject spelled like a delegated
+    // identity (`alice via app autoscaler`), or like an accessor, is
+    // another caller and shares no scope with it.
+    let caller = match identity.accessor_id.as_deref() {
+        Some(accessor) => format!("{}:accessor:{accessor}", identity.source.as_str()),
+        None => format!(
+            "{}:principal:{}",
+            identity.source.as_str(),
+            identity.principal
+        ),
+    };
     format!(
         "{operation}/{}:{caller}/{key}#{}",
         caller.len(),
@@ -14781,7 +14883,9 @@ fn enforce_kv_credential_read<'a>(
 /// `templateKv` pointer) is rendered into the task, which can read it, so
 /// naming one needs the same right as reading it: `kv:read` on the path.
 /// Without this, `job:write` on any job was a way to read every KV secret.
-/// Applied to RunJob, template runs and renders, and PlanJob.
+/// Applied by [`resolve_jobspec_kv_references`] to every reference before
+/// any is resolved: RunJob, template runs and renders, PlanJob, and the
+/// apps' validate call.
 fn enforce_kv_reference_read(
     identity: &crate::structs::AclIdentity,
     references: &[KvReference],
@@ -15378,6 +15482,39 @@ mod tests {
     use futures::StreamExt;
     use serde_json::{json, Map, Value};
     use tempfile::Builder;
+
+    /// Two callers never share an idempotency scope, however their names
+    /// are spelled: a JWT subject named like a delegated identity, or like
+    /// a token's accessor, is another caller (hardening after the
+    /// adversarial review).
+    #[test]
+    fn idempotency_scopes_never_collide_across_identity_sources() {
+        use crate::structs::acl::AclSource;
+        let identity = |principal: &str, accessor: Option<&str>, source: AclSource| AclIdentity {
+            principal: principal.to_string(),
+            accessor_id: accessor.map(str::to_string),
+            is_management: false,
+            is_worker: false,
+            policies: Vec::new(),
+            rules: Vec::new(),
+            source,
+            expires_at: None,
+            audit_only: false,
+        };
+        let request = json!({ "name": "web" });
+        let key = |identity: &AclIdentity| {
+            scoped_idempotency_key(identity, "run_job", Some("k1"), &request)
+        };
+        let delegated = identity("alice via app autoscaler", None, AclSource::Delegated);
+        let jwt = identity("alice via app autoscaler", None, AclSource::Jwt);
+        assert_ne!(key(&delegated), key(&jwt));
+        let token = identity("deployer", Some("0f3a"), AclSource::Token);
+        let named_like_it = identity("0f3a", None, AclSource::Jwt);
+        assert_ne!(key(&token), key(&named_like_it));
+        // The same caller, the same request: the same scope.
+        assert_eq!(key(&token), key(&token.clone()));
+        assert!(scoped_idempotency_key(&token, "run_job", None, &request).is_empty());
+    }
 
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
