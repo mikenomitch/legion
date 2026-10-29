@@ -158,11 +158,9 @@ pub struct ObjectWrite {
 /// What an apply did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PutObject {
-    /// Written: created, or a changed spec, labels, or authority.
-    Written {
-        row: AppObjectRow,
-        previous: Option<AppObjectRow>,
-    },
+    /// Written: created (`created`), or a changed spec, labels, or
+    /// authority.
+    Written { row: AppObjectRow, created: bool },
     /// Already stored: nothing written.
     Unchanged { row: AppObjectRow },
     /// The compare-and-set failed; the stored row, if any.
@@ -638,7 +636,7 @@ impl Store {
             tx.commit()?;
             Ok(PutObject::Written {
                 row,
-                previous: current,
+                created: current.is_none(),
             })
         })
     }

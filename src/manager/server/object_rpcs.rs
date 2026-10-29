@@ -1212,7 +1212,7 @@ impl ManagerDaemonService {
             })
             .map_err(|e| map_store_error("Error writing the object", e))?;
         let (row, created, changed) = match outcome {
-            PutObject::Written { row, previous } => (row, previous.is_none(), true),
+            PutObject::Written { row, created } => (row, created, true),
             PutObject::Unchanged { row } => (row, false, false),
             PutObject::Conflict { current } => return Err(conflict(current.as_ref())),
             PutObject::Deleting { .. } => {
@@ -1424,8 +1424,8 @@ impl ManagerDaemonService {
 
     /// Delete one object as `identity`, after `enforce_access`: the managed
     /// check, `requires` against its spec, then the delete (a bounded
-    /// cleanup when the kind has one and `now` is not set). Shared by
-    /// DeleteObject and a namespace cascade.
+    /// cleanup when the kind has one and `now` is not set).
+    #[allow(clippy::too_many_arguments)]
     fn delete_object_checked(
         &self,
         identity: &AclIdentity,
