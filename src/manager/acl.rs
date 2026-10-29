@@ -895,6 +895,19 @@ pub fn enforce(
             action.as_str(),
         )));
     }
+    // An app acting for a viewer holds one target's permission; a reach
+    // hint read off its rule ("this token can write scale in default")
+    // would suggest the whole namespace.
+    if identity.source == AclSource::Delegated {
+        return Err(Status::permission_denied(format!(
+            "permission denied: {}:{} is outside what {} delegates\n\
+             Hint: an app acting for a viewer holds only the action's declared permission on \
+             what the action was pressed for (`WhoAmI` through the same client shows it)",
+            resource.as_str(),
+            action.as_str(),
+            identity.principal,
+        )));
+    }
     // Where the token CAN act, from its own rules: the denial names no
     // target (a scope derived from a lookup would leak it), only the
     // caller's reach.

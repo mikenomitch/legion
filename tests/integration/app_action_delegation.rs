@@ -618,6 +618,12 @@ async fn an_action_runs_as_the_viewer_on_its_context_only_test() -> R<()> {
         .await
         .unwrap_err();
     assert_eq!(elsewhere.code(), Code::PermissionDenied, "{elsewhere}");
+    assert!(
+        elsewhere
+            .message()
+            .contains("scale:write is outside what alice via app deleg delegates"),
+        "{elsewhere}"
+    );
     let stop = fx
         .svc
         .stop_job(on_behalf(
