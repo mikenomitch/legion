@@ -169,6 +169,8 @@ struct LoopbackForwarder {
     addr: std::net::SocketAddr,
     forwarded: Arc<AtomicU64>,
     canned: std::sync::Mutex<Option<(u32, String)>>,
+    /// Hold every delivery this long first (a slow app).
+    delay: std::sync::Mutex<Option<std::time::Duration>>,
 }
 
 #[tonic::async_trait]
@@ -182,6 +184,10 @@ impl AppForwarder for LoopbackForwarder {
         assert_eq!(node_id, NODE);
         legion::worker::app_forward::check_request(&request)?;
         self.forwarded.fetch_add(1, Ordering::SeqCst);
+        let delay = *self.delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if let Some((status, body)) = self.canned.lock().unwrap().clone() {
             return Ok(ForwardAppRequestReply {
                 status,
@@ -397,6 +403,7 @@ async fn fixture() -> R<Fixture> {
         addr: app.addr,
         forwarded: Arc::new(AtomicU64::new(0)),
         canned: std::sync::Mutex::new(None),
+        delay: std::sync::Mutex::new(None),
     });
     let svc = Arc::new(
         ManagerDaemonService::with_acl(store.clone(), auth)
@@ -902,5 +909,38 @@ async fn scenario_c_renders_in_the_terminal_and_over_mcp_test() -> R<()> {
     let data: Value = serde_json::from_str(text)?;
     assert_eq!(data["document"], envelope["data"]["document"]);
     assert_eq!(data["view"], "job");
+    Ok(())
+}
+
+/// Two calls with one idempotency key that overlap (a retry after a client
+/// timeout, a double press) run the action once: the second waits for the
+/// first and gets its reply, deduplicated (hardening after the adversarial
+/// review, H1). Before, both missed the key, which is recorded only after
+/// the app answers, and both ran it.
+#[tokio::test(flavor = "multi_thread")]
+async fn overlapping_calls_with_one_key_run_the_action_once_test() -> R<()> {
+    let fx = fixture().await?;
+    *fx.forwarder.delay.lock().unwrap() = Some(std::time::Duration::from_millis(400));
+    let before = fx.app.actions_run.load(Ordering::SeqCst);
+    let (first, second) = tokio::join!(
+        fx.bump(&fx.admin, "web", json!({ "by": 2 }), Some("overlap-1")),
+        fx.bump(&fx.admin, "web", json!({ "by": 2 }), Some("overlap-1")),
+    );
+    let (first, second) = (first?, second?);
+    assert_eq!(
+        fx.app.actions_run.load(Ordering::SeqCst) - before,
+        1,
+        "the action ran once"
+    );
+    assert_eq!(first.message, second.message);
+    assert_ne!(
+        first.deduplicated, second.deduplicated,
+        "one ran it, the other got its reply"
+    );
+    // Calls without a key are not deduplicated.
+    *fx.forwarder.delay.lock().unwrap() = None;
+    fx.bump(&fx.admin, "web", json!({ "by": 2 }), None).await?;
+    fx.bump(&fx.admin, "web", json!({ "by": 2 }), None).await?;
+    assert_eq!(fx.app.actions_run.load(Ordering::SeqCst) - before, 3);
     Ok(())
 }

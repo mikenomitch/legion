@@ -441,6 +441,13 @@ impl ManagerDaemonService {
         if by_app.is_empty() {
             return Ok(Vec::new());
         }
+        // The submit that follows writes on the Control lane's leader. A
+        // follower refuses before any app is asked, so the leader-forward
+        // layer's replay on the leader asks each app once per submit, not
+        // once here and again there.
+        self.store
+            .require_lane_leader(crate::storage::Lane::Control, "a submit apps validate")
+            .map_err(|e| map_store_error("Error running job", e))?;
         let calls = by_app.into_iter().map(|(app, values)| {
             let config = &config;
             let namespace = namespace.clone();
@@ -473,7 +480,18 @@ impl ManagerDaemonService {
             match outcome {
                 Ok(answer) => {
                     for (index, (value, _)) in values.iter().enumerate() {
-                        let result = answer.results.get(index).cloned().unwrap_or_default();
+                        // A short answer checked nothing past its end: say
+                        // so, as for an app that did not answer.
+                        let Some(result) = answer.results.get(index).cloned() else {
+                            warnings.push(format!(
+                                "{} was not checked by the {app} app (its answer had {} \
+                                 result(s) for {} value(s)); the schema check passed",
+                                place(value),
+                                answer.results.len(),
+                                values.len()
+                            ));
+                            continue;
+                        };
                         for error in result.errors {
                             errors.push(format!("{} ({app} app): {error}", place(value)));
                         }

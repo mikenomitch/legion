@@ -2089,6 +2089,11 @@ pub struct ManagerDaemonService {
     /// How app view and action requests reach an app's allocation: the
     /// worker plane, or (tests) a forwarder that delivers in process.
     app_forwarder: Arc<dyn crate::manager::app_forward::AppForwarder>,
+    /// The idempotency keys of app actions running now on this manager
+    /// (the Control leader, where every keyed action runs): a duplicate
+    /// waits for the first and gets its reply, instead of running the
+    /// action again.
+    app_actions_in_flight: Arc<app_ui_rpcs::InFlightKeys>,
     /// The keys installed apps add to the jobspec, rebuilt when an app
     /// record changes (`extension_rpcs`).
     extension_registry: extension_rpcs::RegistryCache,
@@ -2144,6 +2149,7 @@ impl ManagerDaemonService {
             eval_threads: 1,
             app_nudge: Arc::new(std::sync::OnceLock::new()),
             app_forwarder: Arc::new(crate::manager::app_forward::WorkerPlaneForwarder),
+            app_actions_in_flight: Arc::new(app_ui_rpcs::InFlightKeys::default()),
             extension_registry: Arc::new(Mutex::new(None)),
             simulated_core_fields: Vec::new(),
         }
