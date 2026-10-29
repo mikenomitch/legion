@@ -231,6 +231,12 @@ pub struct AppManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<Vec<crate::structs::extensions::ExtensionDecl>>")]
     pub extensions: Option<Value>,
+    /// Object kinds the app owns (app-object-kinds plan; docs/app-objects.md):
+    /// a list of `crate::structs::app_object::KindDecl`, checked at install
+    /// and kept as JSON so a record round-trips as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Vec<crate::structs::app_object::KindDecl>>")]
+    pub kinds: Option<Value>,
     /// The app's config: its JSON Schema and its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<AppConfigSpec>,
@@ -253,6 +259,7 @@ const MANIFEST_FIELDS: &[&str] = &[
     "permissions",
     "ui",
     "extensions",
+    "kinds",
     "config",
     "codeFields",
 ];
@@ -273,6 +280,8 @@ const ACL_RULE_FIELDS: &[&str] = &[
     "templates",
     "bands",
     "host",
+    "kinds",
+    "via",
 ];
 
 /// Drop the keys of `object` that are not in `known`; returns them, as
@@ -491,6 +500,25 @@ impl AppManifest {
             .map_err(|err| format!("app {}: {err}", self.name))?;
         crate::structs::extensions::validate_decls(&self.name, &decls, &BTreeMap::new())
             .map_err(|err| format!("app {}: {err}", self.name))?;
+        // Object kinds (app-object-kinds plan §6.1): checked on their own
+        // here; against the other installed apps' kinds at install and
+        // upgrade.
+        let kinds = crate::structs::app_object::manifest_kinds(self)
+            .map_err(|err| format!("app {}: {err}", self.name))?;
+        crate::structs::app_object::validate_kind_decls(&kinds)
+            .map_err(|err| format!("app {}: {err}", self.name))?;
+        // A `via = "objects"` rule holds only when the app acts for one of
+        // its objects (docs/app-objects.md, "Acting for an object"): an app
+        // with no kinds could never use it.
+        if kinds.is_empty() {
+            if let Some(index) = self.permissions.iter().position(AclRule::is_via_objects) {
+                return Err(format!(
+                    "app {}: permissions[{index}] says `via = \"objects\"`, but the app declares \
+                     no kinds, so it never acts for an object; declare the kind, or drop `via`",
+                    self.name
+                ));
+            }
+        }
         let schema = self.config_schema();
         let compiled = compile_config_schema(&schema)
             .map_err(|err| format!("app {}: config.schema: {err}", self.name))?;
@@ -991,11 +1019,40 @@ pub fn app_name_of_job(job_id: &str) -> Option<&str> {
 /// The stamp the reconciler puts on the job versions it submits
 /// (`managedBy`, in the version's meta). Kept by KV re-renders, cleared by
 /// any other write that stores a version (apps plan §6.3).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedBy {
     pub app: String,
+    /// The digest of the render the app reconciler submitted (an app's own
+    /// job); empty on a write an app made for one of its objects.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub digest: String,
+    /// The object an app wrote the version for, acting for it
+    /// (`legion-for-object`; docs/app-objects.md, "Acting for an object"):
+    /// `<app>/<Kind>/<namespace>/<name>#<uid>`. Such a stamp never makes a
+    /// job an app's own ([`crate::storage::store::Store::allocation_app`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+}
+
+impl ManagedBy {
+    /// The stamp on a version an app wrote for one of its objects.
+    pub fn for_object(actor: &crate::structs::acl::ActingFor) -> ManagedBy {
+        ManagedBy {
+            app: actor.app.clone(),
+            digest: String::new(),
+            object: Some(actor.object_ref()),
+        }
+    }
+
+    /// `gitops for Repo team-a/storefront`, or the app's name for the
+    /// reconciler's own stamp.
+    pub fn label(&self) -> String {
+        match &self.object {
+            Some(object) => crate::structs::acl::object_stamp_label(object),
+            None => self.app.clone(),
+        }
+    }
 }
 
 /// Compile a config schema (JSON Schema draft 7) with the checks the plan
@@ -1670,6 +1727,7 @@ pub fn describe_rule(rule: &AclRule) -> String {
         ("actions", &rule.action_names),
         ("templates", &rule.templates),
         ("bands", &rule.bands),
+        ("kinds", &rule.kinds),
     ] {
         if let Some(values) = values {
             selectors.push(format!("{label}: {}", values.join(", ")));
@@ -1677,6 +1735,10 @@ pub fn describe_rule(rule: &AclRule) -> String {
     }
     if rule.host == Some(true) {
         selectors.push("host".to_string());
+    }
+    if rule.is_via_objects() {
+        selectors
+            .push("only for its objects (bounded by each object's recorded authority)".to_string());
     }
     let effect = if rule.is_deny() { "deny " } else { "" };
     format!(
@@ -1730,10 +1792,35 @@ pub fn install_prompt(manifest: &AppManifest) -> Vec<String> {
         for rule in &manifest.permissions {
             lines.push(format!("  {}", describe_rule(rule)));
         }
+        // What `via = "objects"` means, with the kinds it is about: the
+        // promise the installer is asked to rely on.
+        if manifest.permissions.iter().any(AclRule::is_via_objects) {
+            let kinds: Vec<String> = crate::structs::app_object::manifest_kinds(manifest)
+                .unwrap_or_default()
+                .iter()
+                .map(|kind| format!("{}/{}", manifest.name, kind.name))
+                .collect();
+            lines.push(format!(
+                "  (rules marked \"only for its objects\" hold only while {} acts for one of its \
+                 {} objects, and only as far as that object's writer was checked for: {} \
+                 writes them only where an object's author could)",
+                manifest.name,
+                kinds.join(", "),
+                manifest.name
+            ));
+        }
     }
     let ui = manifest.ui_summary();
     if !ui.is_empty() {
         lines.push(format!("UI: {}", ui.join(", ")));
+    }
+    // The kinds it owns, and who will be able to write them: a mapping onto
+    // an existing resource is a decision about who may instruct the app.
+    if let Ok(kinds) = crate::structs::app_object::manifest_kinds(manifest) {
+        lines.extend(crate::structs::app_object::kinds_prompt(
+            &manifest.name,
+            &kinds,
+        ));
     }
     if !manifest.code_fields.is_empty() {
         lines.push(format!(
@@ -2339,6 +2426,8 @@ mod app_tests {
             templates: Some(vec![]),
             bands: Some(vec![]),
             host: Some(true),
+            kinds: Some(vec![]),
+            via: Some(crate::structs::acl::VIA_OBJECTS.into()),
         };
         let value = serde_json::to_value(&rule).expect("rule");
         let mut fields: Vec<&str> = value
@@ -2369,6 +2458,61 @@ mod app_tests {
             code.as_object().map(|o| o.len()),
             Some(CODE_FIELD_SPEC_FIELDS.len())
         );
+    }
+
+    /// `via = "objects"`: the prompt says the rule holds only for the app's
+    /// objects, and names them; an app with no kinds may not ask for one.
+    #[test]
+    fn via_objects_permissions_in_the_prompt_test() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/configs/apps/example-app.ncl");
+        let json = crate::config_lang::eval_file(path).expect("evaluates");
+        let example = AppManifest::from_json(&json).expect("parses");
+        let prompt = install_prompt(&example).join("\n");
+        assert!(
+            prompt.contains(
+                "job       write         namespaces: *; only for its objects (bounded by each \
+                 object's recorded authority)"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("while gitops acts for one of its gitops/Repo objects"),
+            "{prompt}"
+        );
+        let without_kinds = manifest(json!({
+            "permissions": [{ "resources": ["job"], "actions": ["write"],
+                              "namespaces": ["*"], "via": "objects" }],
+        }));
+        let refused = without_kinds.validate(false).unwrap_err();
+        assert!(refused.contains("declares no kinds"), "{refused}");
+    }
+
+    /// The reconciler's stamp serializes as it always did; an object's
+    /// stamp carries the object and no digest.
+    #[test]
+    fn managed_by_stamps_test() {
+        let reconciler = ManagedBy {
+            app: "gitops".into(),
+            digest: "abc".into(),
+            object: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&reconciler).expect("json"),
+            json!({ "app": "gitops", "digest": "abc" })
+        );
+        assert_eq!(reconciler.label(), "gitops");
+        let actor = crate::structs::acl::ActingFor::parse("gitops/Repo/team-a/storefront#17@3")
+            .expect("actor");
+        let stamp = ManagedBy::for_object(&actor);
+        assert_eq!(
+            serde_json::to_value(&stamp).expect("json"),
+            json!({ "app": "gitops", "object": "gitops/Repo/team-a/storefront#17" })
+        );
+        assert_eq!(stamp.label(), "gitops for Repo team-a/storefront");
+        let read: ManagedBy =
+            serde_json::from_value(json!({ "app": "gitops", "object": "gitops/Repo/x/y#1" }))
+                .expect("reads");
+        assert_eq!(read.digest, "");
     }
 
     #[test]

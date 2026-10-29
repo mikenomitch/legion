@@ -337,7 +337,8 @@ impl Store {
                  ORDER BY latest.version DESC LIMIT 1
              )
              WHERE j.name LIKE 'legion-system/%'
-               AND json_extract(jc.meta, '$.managedBy.app') IS NOT NULL;",
+               AND json_extract(jc.meta, '$.managedBy.app') IS NOT NULL
+               AND json_extract(jc.meta, '$.managedBy.object') IS NULL;",
         )?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
@@ -677,8 +678,10 @@ impl Store {
         let stamp: Option<ManagedBy> = meta
             .and_then(|meta| meta.get("managedBy").cloned())
             .and_then(|value| serde_json::from_value(value).ok());
+        // Only the reconciler's own stamp: a version an app wrote for one
+        // of its objects (`managedBy.object`) never makes a job the app's.
         Ok(stamp
-            .filter(|stamp| stamp.app == app)
+            .filter(|stamp| stamp.app == app && stamp.object.is_none())
             .map(|_| app.to_string()))
     }
 
@@ -769,6 +772,7 @@ impl Store {
              LEFT JOIN allocation_health ah ON ah.allocation_id = a.id
              WHERE j.name = ?1 AND a.status NOT IN ('complete', 'failed', 'lost')
                AND json_extract(jc.meta, '$.managedBy.app') = ?2
+               AND json_extract(jc.meta, '$.managedBy.object') IS NULL
              ORDER BY COALESCE(ah.healthy, 0) DESC, a.id DESC;",
         )?;
         let rows = stmt.query_map(params![job_id, app], |row| {

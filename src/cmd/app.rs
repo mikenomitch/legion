@@ -286,8 +286,9 @@ pub fn config() -> Command {
                         .long("force")
                         .action(ArgAction::SetTrue)
                         .help(
-                            "Upgrade even though jobs set a jobspec key the new manifest no \
-                             longer declares; their values stay stored, flagged orphaned",
+                            "Upgrade even though jobs set a jobspec key, or objects exist of a \
+                             kind, that the new manifest no longer declares; they stay stored, \
+                             flagged orphaned",
                         ),
                 )
                 .arg(
@@ -308,8 +309,8 @@ pub fn config() -> Command {
                         .long("force")
                         .action(ArgAction::SetTrue)
                         .help(
-                            "Uninstall even though jobs set its jobspec keys; their values stay \
-                             stored, flagged orphaned",
+                            "Uninstall even though jobs set its jobspec keys or objects of its \
+                             kinds exist; they stay stored, flagged orphaned",
                         ),
                 )
                 .arg(

@@ -9,8 +9,9 @@ install from a manifest. It is three things:
 3. **registrations**: the UI it adds (pages, panels, badges, and actions,
    drawn from the app's declarative views, and sandboxed pages for what the
    views cannot draw; see [Views and actions](#views-and-actions) and
-   [Sandboxed pages](#sandboxed-pages)) and the jobspec keys it adds
-   ([Jobspec extensions](#jobspec-extensions)).
+   [Sandboxed pages](#sandboxed-pages)), the jobspec keys it adds
+   ([Jobspec extensions](#jobspec-extensions)), and the object kinds it
+   owns ([Object kinds](#object-kinds)).
 
 A **manifest** declares all three. An **app record**, stored on the
 managers, holds the installed manifest, the operator's settings and config,
@@ -55,7 +56,14 @@ the cluster-wide scaling inputs once per interval, and writes counts through
 `ScaleTask`, reporting each evaluation back to the manager. It also runs
 [node groups](autoscaling.md#node-groups): it asks a provider for nodes,
 mints their join tokens, and drains, terminates, and forgets the nodes it
-scales in. Its grant is `scale:read` and `scale:write` in every namespace,
+scales in. Its manifest declares two [object kinds](app-objects.md):
+`autoscaler/ScalingPolicy` (a policy for a target outside Legion;
+namespaced, governed by `scale` namespace-wide, `target.plugin`
+immutable) and `autoscaler/NodeGroup` (cluster-scoped, governed by
+`node`, requiring `operator:write`, with a 15-minute cleanup window that
+drains and terminates a deleted group's members), written with `legion
+object apply` ([autoscaling.md, "Standalone
+policies"](autoscaling.md#standalone-policies)). Its grant is `scale:read` and `scale:write` in every namespace,
 `job:read` (to read what a drain would move), `node:read` and
 `node:write` (node groups), and `kv` read and write under its reserved
 `legion/apps/autoscaler/` (its replicas' shard leases): it can resize,
@@ -148,9 +156,10 @@ complete example with comments.
 | `placement` | Where the app runs by default ([Placement](#placement)). |
 | `replicas` | Each task's `count` by default. |
 | `job` | A jobspec without `name` or `namespace`, which Legion sets. Must define `task` or `tasks`, and parse as a jobspec. An `exec` task may not set `user`, and nothing in it may be host-level besides the `exec` runtime itself ([Trust model](#trust-model)). |
-| `permissions` | ACL rules in the shape `legion acl policy apply` takes: what the app's `legion` identity asks to be granted. |
+| `permissions` | ACL rules in the shape `legion acl policy apply` takes: what the app's `legion` identity asks to be granted. A rule with `via = "objects"` holds only while the app acts for one of its objects, within that object's recorded authority; its own credential cannot use it, and an app with no `kinds` may not ask for one ([App Objects: Acting for an object](app-objects.md#acting-for-an-object)). The installer must hold every rule, `via` ones included. |
 | `ui` | UI registrations: the slots the app's views appear in, the actions they offer, the port they are served on, and the refresh interval ([Views and actions](#views-and-actions)). Unknown fields are errors. |
 | `extensions` | The keys the app adds to the jobspec, one per extension point, each with a JSON Schema ([Jobspec extensions](#jobspec-extensions)). |
+| `kinds` | The object kinds the app owns, at most 32: each a `name`, a spec `schema`, CEL validation `rules`, what governs and what writing an object requires (`access`, `requires`), `immutable` fields, examples, a `cleanup` window, `maxObjects`, and `columns` ([Object kinds](#object-kinds); every field in [App Objects](app-objects.md#declaring-a-kind)). |
 | `config.schema` | A JSON Schema (draft 7) the config must match. It must describe an object, be at most 64 KiB, and use only local `$ref`s (`"#/…"`); a remote ref is refused before anything is fetched. Default: any object. |
 | `config.default` | The config a fresh install gets. Must match the schema. Default `{}`. |
 | `codeFields` | JSON pointers into the config whose values change the code the app runs. A `*` segment matches every key of an object or element of an array. An entry `{ pointer, artifact = true }` is also fetched as an artifact of the app's job (below). |
@@ -1046,7 +1055,9 @@ manager authenticates every call made with it as **`alice via app
   is `PermissionDenied`, whatever the app's own grant allows;
 - only what the app's own grant also holds there: a delegation never
   widens the app, and an action the grant lacks on the scope is dropped
-  (with nothing left, the call is refused);
+  (with nothing left, the call is refused). That is the app's plain grant:
+  a `via = "objects"` rule plays no part, so an action that should deploy
+  [acts for the object](app-objects.md#acting-for-an-object) instead;
 - nothing the app or the viewer is denied by a deny rule.
 
 It lasts as long as the assertion (60 seconds), covers any number of unary
@@ -1696,6 +1707,44 @@ framework answers that every value passes.
   extension points as not checked.
 - The MCP tools `legion_job_schema` and `legion_job_validate` do the same.
 
+## Object kinds
+
+An app can also own **kinds of object**: `gitops` declares `Repo`, people
+apply Repos with `legion object apply`, and gitops watches them, deploys
+what each names, and reports each one's status. The bundled autoscaler's
+scaling policies and node groups are objects of its kinds
+([App Objects, "A worked example"](app-objects.md#a-worked-example-the-autoscaler)). A manifest declares them in
+`kinds`: a schema, validation rules the manager evaluates on every apply
+(`rules`, in CEL: `self.min <= self.max`), what governs the objects
+(`access`), what writing one also requires of its writer (`requires`), and
+how long a delete waits for the app to clean up. Legion stores and checks the objects; the app only
+reconciles them. [App Objects](app-objects.md) covers the manifest, the
+`legion object` CLI, the ACL model, status, deletion, and the reconcile
+loop apps use.
+
+Objects outlive their app: uninstalling an app with objects, or upgrading
+it to drop a kind that has objects, needs `--force` and leaves the objects
+orphaned (readable and deletable, never written) until the app is
+installed again, which adopts them.
+
+An app that owns kinds can **act for one of its objects**: it names the
+object in `legion-for-object`, and the manager holds the call to what the
+object's writer was checked for, within the app's grant. Permissions marked
+`via = "objects"` in the manifest hold only that way:
+
+```nickel
+permissions = [
+  { resources = ["job"], actions = ["read"], namespaces = ["team-*"] },
+  { resources = ["job"], actions = ["write"], namespaces = ["*"], via = "objects" },
+],
+```
+
+so gitops writes jobs only where a Repo's author could, and the jobs it
+writes are stamped with the Repo. The framework's reconcile handlers get
+that client by default (`request.client()`, with `request.app_client()`
+for the app's own), and `context.client_for(&object)` makes one anywhere
+([App Objects: Acting for an object](app-objects.md#acting-for-an-object)).
+
 ## Inside an app
 
 The app's tasks get, in their environment:
@@ -1711,7 +1760,10 @@ The app's tasks get, in their environment:
 So `legion kv get legion/apps/gitops/state` inside the task just works,
 with the app's grant and no token handling. To act as a viewer from an
 action, the app's calls add the action's assertion in
-`legion-on-behalf-of` ([Acting as the viewer](#acting-as-the-viewer)).
+`legion-on-behalf-of` ([Acting as the viewer](#acting-as-the-viewer)); to
+act for one of its objects, they name it in `legion-for-object`
+([App Objects: Acting for an object](app-objects.md#acting-for-an-object)).
+Never both on one call.
 
 **`legion app run <name>`** is the entrypoint bundled apps run. It reads
 `$LEGION_APP_CONFIG` (validated against the app's schema), serves the app's
@@ -1757,8 +1809,8 @@ manager cannot decode), from the leading manager ([Metrics](metrics.md)).
 | `legion app set <app> [--replicas N] [--placement P] [--pool P] [--cpu MHZ] [--memory MIB] [--dry-run]` | `UpdateAppSettings` |
 | `legion app enable <app>`, `disable <app>` `[--dry-run]` | `SetAppEnabled` |
 | `legion app install <file|url> [--config F] [--yes] [--dry-run] [--key P.K=NEW]` | `InstallApp` |
-| `legion app upgrade <app> <file|url> [--config F] [--yes] [--force] [--dry-run]` | `UpgradeApp` |
-| `legion app uninstall <app> [--force] [--purge] [--dry-run]` | `UninstallApp` |
+| `legion app upgrade <app> <file|url> [--config F] [--yes] [--force] [--dry-run]` (`--force` also to drop a kind that has objects) | `UpgradeApp` |
+| `legion app uninstall <app> [--force] [--purge] [--dry-run]` (`--force` also when objects of its kinds exist) | `UninstallApp` |
 | `legion app extensions [app]` | `ListApps` / `GetApp` (`App.extension_keys`) |
 | `legion job schema` | `GetJobSchema` (the cluster's jobspec schema, installed keys included) |
 | (an app's own values) | `WatchAppExtensions` (app-plane) |
@@ -1767,6 +1819,7 @@ manager cannot decode), from the leading manager ([Metrics](metrics.md)).
 | (the UI's action buttons) | `InvokeAppAction` |
 | (the UI's sandboxed pages) | `GetAppPage` |
 | `legion app run <app> [--listen ADDR] [--config F]` | (the in-task entrypoint) |
+| `legion object kinds\|explain\|apply\|get\|list\|delete` | the object RPCs ([App Objects](app-objects.md#api-cli-and-mcp-reference)) |
 
 Every command but `run` takes `--json`; `legion app view -j` returns the
 validated view document, the actions it offers with whether you may run

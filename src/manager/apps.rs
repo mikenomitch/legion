@@ -59,6 +59,10 @@ use time::OffsetDateTime;
 
 /// The backstop: a full pass this often, in case an event was missed.
 pub const FULL_PASS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the Control-lane leader looks for object cleanups that ran out
+/// (docs/app-objects.md, "Deleting").
+pub const OBJECT_CLEANUP_SWEEP: Duration = Duration::from_secs(5);
 /// The first retry after a failed submit; doubles up to [`MAX_BACKOFF`].
 pub const FIRST_BACKOFF: Duration = Duration::from_secs(5);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(300);
@@ -922,6 +926,7 @@ impl AppReconciler {
         let stamp = ManagedBy {
             app: name.to_string(),
             digest: rendered.digest.clone(),
+            object: None,
         };
         let failed = version.as_ref().is_some_and(AppJobVersion::is_failed);
         let current = version.as_ref().is_some_and(|v| {
@@ -1219,6 +1224,7 @@ pub fn spawn_reconciler(svc: Arc<ManagerDaemonService>, settings: ReconcilerSett
         let mut was_leader = false;
         let mut pending = Pending::default();
         let mut last_full: Option<Instant> = None;
+        let mut last_cleanup_sweep: Option<Instant> = None;
         // The first full pass of a term says what the manager config's
         // `apps` block did not apply; later passes seed quietly.
         let mut first_pass = true;
@@ -1274,11 +1280,40 @@ pub fn spawn_reconciler(svc: Arc<ManagerDaemonService>, settings: ReconcilerSett
                 }
                 reconciler.reconcile_all().await;
                 reconciler.publish_metrics();
+                // Object kinds follow the app records (a bundled app's new
+                // manifest, a write a crash interrupted); app-object-kinds
+                // plan §6.2.
+                if let Err(status) = svc.sync_all_object_kinds() {
+                    warn!("Syncing object kinds failed: {}", status.message());
+                }
+                // The scaling state of the autoscaler's deleted objects
+                // (their `object:<uid>` action rows, pauses, and history),
+                // which the generic object delete leaves (app-object-kinds
+                // plan §8 O2).
+                match svc.store.sweep_object_scaling_state() {
+                    Ok(0) => {}
+                    Ok(swept) => info!(swept, "Swept the scaling state of deleted objects"),
+                    Err(err) => {
+                        warn!(error = ?err, "Sweeping deleted objects' scaling state failed")
+                    }
+                }
             } else if !work.apps.is_empty() {
                 for name in &work.apps {
                     reconciler.reconcile_app(name).await;
+                    if let Err(status) = svc.sync_object_kinds_for(name) {
+                        warn!(app = %name, "Syncing object kinds failed: {}", status.message());
+                    }
                 }
                 reconciler.publish_metrics();
+            }
+            // Bounded object cleanups that ran out (app-object-kinds plan
+            // §6.9): at most every few seconds, and nothing is proposed
+            // unless one is due.
+            if last_cleanup_sweep.is_none_or(|at| at.elapsed() >= OBJECT_CLEANUP_SWEEP) {
+                last_cleanup_sweep = Some(Instant::now());
+                if let Err(status) = svc.expire_object_cleanups() {
+                    warn!("Expiring object cleanups failed: {}", status.message());
+                }
             }
 
             // Wait for the next trigger, the next retry, the backstop, or

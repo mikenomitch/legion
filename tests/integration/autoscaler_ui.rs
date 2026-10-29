@@ -688,7 +688,7 @@ async fn the_sidebar_page_and_the_node_group_panel_test() -> R<()> {
         "jt-general",
         "i-0abc",
         "/nodes/n1",
-        "No node-group policy runs general",
+        "No NodeGroup runs general",
     ] {
         assert!(texts(&panel).contains(needle), "{needle}: {panel}");
     }

@@ -105,6 +105,10 @@ rusqlite_migration = "1.0.2"
 humantime = "2.1.0"
 serde_rusqlite = "0.36.0"
 jsonschema = "0.17.1"
+# CEL validation `rules` on app object kinds (src/structs/object_rules.rs,
+# docs/app-objects.md "Validation rules"). No default features: no regex,
+# chrono, or encoders; `parser_pratt` is the recursion-limited parser.
+cel = { version = "=0.15.0", default-features = false, features = ["parser_pratt"] }
 # Did-you-mean suggestions for unknown jobspec fields (src/structs/spec_fields.rs).
 # Already in the tree through clap and nickel; same version.
 strsim = "0.11.1"

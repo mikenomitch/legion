@@ -36,6 +36,17 @@ pub const VIEWER_HEADER: &str = "legion-viewer";
 /// authenticates the call as `<viewer> via app <app>`, holding only the
 /// assertion's [`Delegation`] within the app's own grant.
 pub const ON_BEHALF_OF_HEADER: &str = "legion-on-behalf-of";
+/// The gRPC metadata key an app names one of its objects in, beside its own
+/// credential, to act for the object (docs/app-objects.md, "Acting for an
+/// object"): the manager then authenticates the call as `<app> for <Kind>
+/// <namespace>/<name>`, holding the object's recorded authority within the
+/// app's own grant (`via = "objects"` rules included). The value is
+/// [`FOR_OBJECT_FORMAT`]; parsed by [`crate::structs::acl::ActingFor`]. A
+/// call carries this header or [`ON_BEHALF_OF_HEADER`], never both.
+pub const FOR_OBJECT_HEADER: &str = "legion-for-object";
+/// The shape of a [`FOR_OBJECT_HEADER`] value. A cluster kind's object has
+/// an empty namespace: `autoscaler/NodeGroup//workers#17@3`.
+pub const FOR_OBJECT_FORMAT: &str = "<app>/<Kind>/<namespace>/<name>#<uid>@<generation>";
 /// Where an app serves view `<name>`: `GET /legion/v1/views/<name>?<context>`.
 pub const VIEW_PATH_PREFIX: &str = "/legion/v1/views/";
 /// Where an app serves action `<name>`: `POST /legion/v1/actions/<name>`
@@ -431,15 +442,34 @@ pub const PAGE_RPCS: &[PageRpc] = {
         ("ApplyScalingDefaults", Write, &["operator:write"]),
         ("GetScalingStatus", Read, &["scale:read"]),
         ("GetScaleHistory", Read, &["scale:read"]),
-        ("PauseScaling", Write, &["scale:write", "operator:write"]),
+        // Pausing an autoscaler object needs what writing it needs: scale
+        // (a ScalingPolicy), node and operator (a NodeGroup).
         (
-            "ApplyScalingPolicy",
+            "PauseScaling",
             Write,
             &["scale:write", "operator:write", "node:write"],
         ),
-        ("DeleteScalingPolicy", Write, &["scale:write"]),
-        ("ListScalingPolicies", Read, &["scale:read"]),
         ("GetCapacityDemand", Read, &["node:read"]),
+        // App objects (docs/app-objects.md): reads only, as the viewer. A
+        // kind's access may be object, job, scale, or node, so a page that
+        // reads objects asks for read on all four. Applying and deleting
+        // objects are left out: what writing one needs is whatever its
+        // kind `requires`, which no fixed list bounds.
+        (
+            "ListObjectKinds",
+            Read,
+            &["object:read", "job:read", "scale:read", "node:read"],
+        ),
+        (
+            "GetObject",
+            Read,
+            &["object:read", "job:read", "scale:read", "node:read"],
+        ),
+        (
+            "ListObjects",
+            Read,
+            &["object:read", "job:read", "scale:read", "node:read"],
+        ),
         // Namespaces and templates.
         ("ListNamespaces", Read, &["namespace:read"]),
         ("GetNamespace", Read, &["namespace:read"]),
@@ -625,8 +655,14 @@ pub fn page_rpc_refusal(method: &str) -> String {
         "RotateDataKey" | "RewrapKv" | "RotateMeshCa" => {
             "rotates the cluster's key material; do it from the CLI"
         }
-        "WatchScalingPolicies" | "StreamEvents" | "ExecAllocation" | "StreamWork" => {
-            "streams, and the bridge carries unary calls only"
+        "WatchScalingPolicies"
+        | "StreamEvents"
+        | "ExecAllocation"
+        | "StreamWork"
+        | "WatchObjects" => "streams, and the bridge carries unary calls only",
+        "ApplyObject" | "DeleteObject" => {
+            "writes an object, which needs whatever its kind `requires` of the writer; no \
+             fixed permission list bounds it, so a page may only read objects"
         }
         "ListUiExtensions" | "GetAppView" | "InvokeAppAction" | "GetAppPage" => {
             "is how the SPA draws apps; a page reaches its own app's views and actions with \
@@ -645,7 +681,9 @@ pub fn page_rpc_refusal(method: &str) -> String {
         | "UpdateNodeDynamic"
         | "GetHeartbeatCadence"
         | "ReportScalingStatus"
-        | "RecordScalingAction" => "is called by workers and apps, not by people",
+        | "RecordScalingAction"
+        | "UpdateObjectStatus"
+        | "ReleaseObject" => "is called by workers and apps, not by people",
         _ => {
             "is not a Manager RPC a page may call (name one like `GetJobInfo`, as \
              proto/legion.proto spells it)"
@@ -2733,26 +2771,22 @@ mod tests {
                 "{method} is both allowed and refused"
             );
         }
-        // Standalone scaling policies (autoscaler Phases 3 and 4) arrived
-        // on a branch that predated the allowlist.
-        assert_eq!(
-            page_rpc_kind("ApplyScalingPolicy"),
-            Some(PageRpcKind::Write)
-        );
-        assert_eq!(
-            page_rpc_kind("DeleteScalingPolicy"),
-            Some(PageRpcKind::Write)
-        );
-        assert_eq!(
-            page_rpc_kind("ListScalingPolicies"),
-            Some(PageRpcKind::Read)
-        );
+        // App objects (which the autoscaler's standalone policies became):
+        // a page reads them; writing one needs what its kind requires,
+        // which no fixed list bounds.
+        for read in ["ListObjectKinds", "GetObject", "ListObjects"] {
+            assert_eq!(page_rpc_kind(read), Some(PageRpcKind::Read), "{read}");
+        }
         for refused in [
             "CreateAclToken",
             "StreamEvents",
             "GetAppView",
             "Heartbeat",
             "ResetKeyring",
+            "ApplyObject",
+            "DeleteObject",
+            "WatchObjects",
+            "UpdateObjectStatus",
         ] {
             assert!(declarations.contains_key(refused), "{refused}");
             assert!(page_rpc_kind(refused).is_none(), "{refused}");

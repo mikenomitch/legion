@@ -1,22 +1,26 @@
 //! Node-group autoscaling: the policy spec and the pure decisions behind it
 //! (autoscaler v2 plan §6.11, calls entries 7 and 16).
 //!
-//! A node group is a pool plus a template. Its policy is a standalone object
-//! (`legion scaling apply nodes.ncl` stores it, from Phase 4 on):
+//! A node group is a pool plus a template. Its policy is the spec of an
+//! `autoscaler/NodeGroup` object (`legion object apply -f nodes.ncl`; the
+//! object's name is the group's, [`crate::autoscaler::policy::parse_node_group`]):
 //!
 //! ```nickel
 //! {
+//!   kind = "autoscaler/NodeGroup",
 //!   name = "workers-general",
-//!   target = { nodes = {
-//!     pool = "default", workerType = "default",
-//!     shape = { cpu = 8000, memory = 16384, attributes = { arch = "amd64" } },
-//!     plugin = "aws-asg", config = { asg = "legion-workers" },
-//!   } },
-//!   min = 1, max = 20,
-//!   up   = { step = { replicas = 5 }, every = "2m", joinTimeout = "10m" },
-//!   down = { when = "empty", for = "10m", step = { percent = 10, replicas = 1 },
-//!            every = "5m", drainDeadline = "10m" },
-//!   expander = "least-waste",
+//!   spec = {
+//!     target = { nodes = {
+//!       pool = "default", workerType = "default",
+//!       shape = { cpu = 8000, memory = 16384, attributes = { arch = "amd64" } },
+//!       plugin = "aws-asg", config = { asg = "legion-workers" },
+//!     } },
+//!     min = 1, max = 20,
+//!     up   = { step = { replicas = 5 }, every = "2m", joinTimeout = "10m" },
+//!     down = { when = "empty", for = "10m", step = { percent = 10, replicas = 1 },
+//!              every = "5m", drainDeadline = "10m" },
+//!     expander = "least-waste",
+//!   },
 //! }
 //! ```
 //!
@@ -418,7 +422,7 @@ impl EffectiveNodeGroup {
 }
 
 /// `field: old -> new` for every field of the effective record that
-/// differs (`legion scaling apply --dry-run`'s diff for a node group).
+/// differs.
 pub fn changed_fields(before: &EffectiveNodeGroup, after: &EffectiveNodeGroup) -> Vec<String> {
     fn flatten(prefix: &str, value: &Value, out: &mut BTreeMap<String, String>) {
         match value {
@@ -666,8 +670,9 @@ impl NodeGroupPolicy {
         })
     }
 
-    /// The JSON schema of a node-group policy, for `scaling apply`,
-    /// editors and agents.
+    /// The JSON schema of a node-group policy, as written in an
+    /// `autoscaler/NodeGroup` object's spec (with `name` taken from the
+    /// object; [`crate::autoscaler::policy::node_group_schema`]).
     pub fn json_schema_value() -> Value {
         serde_json::to_value(schemars::schema_for!(NodeGroupPolicy))
             .expect("node group schema should serialize")
@@ -1090,6 +1095,14 @@ pub struct NodeGroupObservation {
     /// A pause on this group (or on every policy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause: Option<Pause>,
+    /// The group is being deleted (its `autoscaler/NodeGroup` object is in
+    /// its cleanup window): nothing is added, and every member is drained,
+    /// terminated, and forgotten through the scale-in path, whatever
+    /// `down` says (`when`, `for`, the step, `min`). Protected members
+    /// stay. Once no member is left and the provider holds none, the
+    /// decision is [`NodeDecision::retired`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retiring: bool,
 }
 
 // ── The decision ─────────────────────────────────────────────────────────
@@ -1277,6 +1290,11 @@ pub struct NodeDecision {
     pub flags: Vec<NodeFlag>,
     /// The one-line why.
     pub summary: String,
+    /// A retiring group (see [`NodeGroupObservation::retiring`]) has nothing
+    /// left: no member, no drain in flight, and the provider holds no
+    /// instance. Its object can be released.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retired: bool,
 }
 
 impl NodeDecision {
@@ -1722,6 +1740,11 @@ pub fn decide(
             format!(" ({})", obs.expander_note)
         };
         match &obs.demand {
+            _ if obs.retiring => trace.record(
+                NodeStage::Demand,
+                current,
+                "the group is being deleted: nothing is added",
+            ),
             Some(demand) if demand.nodes > 0 && obs.chosen && backing_off.is_none() => {
                 let wanted = current.saturating_add(demand.nodes);
                 trace.record(
@@ -1791,9 +1814,27 @@ pub fn decide(
 
     // ── bounds ───────────────────────────────────────────────────────────
     let mut limited: Option<String> = None;
+    // A retiring group with no member and no drain left holds nothing: the
+    // provider's count goes to 0 (no Legion node can be stranded, since none
+    // is left; an instance that never joined has no work).
+    let emptied = obs.retiring
+        && obs.joined == 0
+        && obs.nodes.is_empty()
+        && state.drains.values().all(Drain::finished);
     {
         let value = trace.value;
-        if value > policy.max && current > policy.max {
+        if obs.retiring {
+            let to = if emptied { 0 } else { current };
+            trace.record(
+                NodeStage::Bounds,
+                to,
+                if emptied && current > 0 {
+                    "being deleted, and no member is left: the provider goes to 0".to_string()
+                } else {
+                    "being deleted: every member drains".to_string()
+                },
+            );
+        } else if value > policy.max && current > policy.max {
             // Lowering the provider's count would let it stop any instance,
             // undrained: a group above max comes down through scale-in.
             trace.record(
@@ -1863,7 +1904,9 @@ pub fn decide(
 
         let value = trace.value;
         let draining = state.drains.len() as u32;
-        let hold = if value > current {
+        let hold = if obs.retiring {
+            None
+        } else if value > current {
             Some("growing this tick".to_string())
         } else if demand_nodes > 0 {
             Some(format!(
@@ -1878,7 +1921,13 @@ pub fn decide(
         let window_used = state.scale_ins.len() as u32;
         let budget = step_budget(policy.down.step, current, false);
         let floor_room = current.saturating_sub(draining).saturating_sub(policy.min);
-        let room = budget.saturating_sub(window_used).min(floor_room);
+        // A retiring group drains every member at once: no budget, no
+        // floor.
+        let room = if obs.retiring {
+            u32::MAX
+        } else {
+            budget.saturating_sub(window_used).min(floor_room)
+        };
         let for_ms = ms(policy.down.for_);
 
         // Candidates: live, not already draining, past `for`.
@@ -1897,6 +1946,7 @@ pub fn decide(
                 .flatten()
                 .filter(|since| now_ms - since >= for_ms);
             let (since, kind) = match (empty, underused) {
+                _ if obs.retiring => (now_ms, "retiring"),
                 (Some(since), _) => (since, "empty"),
                 (None, Some(since)) => (since, "underutilized"),
                 (None, None) => continue,
@@ -1941,7 +1991,9 @@ pub fn decide(
                     skipped_fit += 1;
                     continue;
                 }
-                let reason = if *kind == "empty" {
+                let reason = if *kind == "retiring" {
+                    "the group is being deleted".to_string()
+                } else if *kind == "empty" {
                     format!("empty for {}", format_duration(idle(now_ms - since)))
                 } else {
                     format!(
@@ -2136,6 +2188,11 @@ pub fn decide(
         None => {}
     }
     let summary = summarize(&trace.stages, current, to, &victims);
+    let retired = emptied
+        && obs
+            .provider
+            .as_ref()
+            .is_some_and(|provider| provider.desired == 0);
     NodeDecision {
         at_ms: now_ms,
         from: current,
@@ -2147,6 +2204,7 @@ pub fn decide(
         intents,
         flags,
         summary,
+        retired,
     }
 }
 

@@ -103,6 +103,11 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_app_list` | no | Installed [apps](apps.md) (Legion's add-ons): each app's version, source, status (`running`, `degraded`, `pending`, `stopped`, with `statusDetail` saying why), placement, replicas running against desired (`running`, `desired`), the nodes it runs on, and its UI slots. Needs `app:read`; the list is filtered by the `names` selector. |
 | `legion_app_status` | no | One app (`app`): its record (`manifest`, `settings`, `config`), its grant (`grant.rules`, who approved it), its job's status, the app reconciler's last action and error (`reconcile`), its build marker and what it waits for (`reconcile.markerReason`), and `notes` (no system worker, workload identity off). Changing an app (install, config, settings) is `legion app` on the CLI, not an MCP tool. |
 | `legion_app_view` | no | One of an app's declarative views ([Apps: Views and actions](apps.md#views-and-actions)): what its panel on a job, task, or node page, its sidebar page, or its overview card shows a person, as JSON. Takes `app`, `slot` (`nav`, `overview`, `job`, `task`, `node`), the slot's context (`job` with `namespace`, `task`, `group`, `node`), and optionally `view`. Returns `document` (the validated `legion-view/1` blocks), `actions` (each with `allowed` and `mutating`), and which allocation answered. Checked as the caller: `app:read` and the view's declared permission on the context, before the app is asked. The same data as `legion app view -j`. Actions are not run over MCP. |
+| `legion_object_kinds` | no | The object kinds installed apps declare ([App Objects](app-objects.md)), with each kind's spec and status JSON Schemas (decoded), examples, CEL `rules` (each with its message, path, and whether it is a transition rule), scope, access, `requires`, immutable fields, cleanup window, and state, so an agent can write a valid object. Takes optional `app`. |
+| `legion_object_list` | no | Objects of one kind (`kind`, qualified or a unique short name) or of every kind, in `namespaces` (`["*"]` for all you can read), filtered by `labels`: spec, status (conditions, `observedGeneration`, fields), and `summary` (`Ready`, `Accepted`, `Pending`, `NotReady: <reason>`, `Rejected: <reason>`, `Stale`, `Invalid`, `Deleting`, `Orphaned`). `authorityLapsed: true` (needs `acl:read`) lists only objects whose writer no longer holds what the object records (`authority.check` = `lapsed`, or `unknown` when the writer had no token to re-resolve, with `authority.checkDetail`); the app keeps acting within that authority until someone re-applies the object. |
+| `legion_object_get` | no | One object (`kind`, `name`, optional `namespace`): spec with `writeOnly` values redacted, effective spec, status, summary, `specVersion` (for `expected_version`), `managedBy`, and the authority recorded at its last write. |
+| `legion_object_apply` | **yes** | Create or update an object (`object`: `{ kind: "<app>/<Kind>", name, namespace?, labels?, spec }`). Checks the closed schema (unknown fields fail with a did-you-mean), immutable fields, the kind's CEL `rules` (every failing rule named, with its path), and what the kind `requires` of the writer, then asks the app (advice). `dry_run` returns the field diff; `expected_version` is compare-and-set (`0`: create only); `force` changes an object an app manages; `wait` (with `timeout_seconds`) returns once the app has reported on the new generation, failing on `Rejected`/`NotReady`; `idempotency_key`. |
+| `legion_object_delete` | **yes** | Delete an object; a kind with a cleanup window marks it Deleting until its app releases it (`now` skips the window). Takes `expected_version`, `force`, `idempotency_key`. |
 | `legion_events` | no | List scheduler events. Poll with `after_id` to tail. `instance_id` narrows to one stateful instance (its own events plus its allocations'), `allocation_id` to one allocation. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job, including allocations removed in the last 24 hours (`removed`, `removalCause`). |
 | `legion_state_query` | no | Read-only SQL against the state store. |
@@ -115,11 +120,10 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_job_scale` | **yes** | Change a task's count without a new job version or rollout ([autoscaling.md](autoscaling.md)). On an autoscaled task a count is a time-boxed pin and needs `for` (refused otherwise, with a hint); `min`/`max` with `for` pin a floor or ceiling; `release` ends a pin. Supports `idempotency_key`. |
 | `legion_job_scale_status` | no | Per-task spec vs override vs effective counts. The effective count is the one placement converges to: an override laid over a different spec count does not bind and is not reported. For an autoscaled task, also its policy in one line, its pin and pause, and the autoscaler's state. |
 | `legion_scaling_status` | no | Task autoscaling ([autoscaling.md](autoscaling.md)): every autoscaled task's `now`, `want`, bounds, mode, and `state` (`ok`, `scaled`, `held`, `limited`, `deferred`, `pinned`, `paused`, `dry-run`, `missing-data`, `invalid`, `stale`, `not-evaluated`), its last change, the replica that evaluated it (`instance`), and `app.state` (`running`, `not-running`, `starting`, `disabled`), with `app.replicas` listing every [autoscaler replica](autoscaling.md#replicas), its shards, and its last report. An agent should treat `not-running` as "nothing is scaling", and `stale` as "this target's numbers are old". |
-| `legion_scaling_explain` | no | Why an autoscaled task (or, with `policy`, a standalone policy's target or a node group: each stage, the members chosen for scale-in, the ones protected and why, and the actions taken) is at its count, as data: the last evaluation's checks (reading, desired) and every safeguard stage (`before`, `after`, `note`), and the effective policy with each field's origin (`built-in`, `cluster defaults`, `namespace policy <name>`, `jobspec`). Read this before changing a policy. |
-| `legion_scaling_history` | no | The durable record of a job's (or, with `policy`, a standalone policy's) count changes, newest first: source (`operator`, `autoscaler`), principal, from/to, the one-line why, dry-run rows (`kind = would`, `applied = false`), and failed target calls (`kind = failed`). |
-| `legion_scaling_simulate` | no | Run a policy over up to an hour of recorded history, or a CSV series, and return the count changes it makes ([Simulating a policy](autoscaling.md#simulating-a-policy)). `job` simulates the live policy (`mode = replay`: the decisions the autoscaler made); `spec` takes an edited jobspec or a standalone policy as JSON (`mode = follow`: what it would have done). Writes nothing. Call it before submitting a policy change, and compare its changes with `legion_scaling_history`. |
-| `legion_scaling_apply` | **yes** | Create or update a standalone scaling policy (an external target scaled through a target plugin) or a [node group](autoscaling.md#node-groups) (machines a node target plugin starts, which Legion drains and terminates), from `spec` as JSON ([Standalone policies](autoscaling.md#standalone-policies)). `dry_run = true` validates and returns the field-by-field `diff` against the stored version without writing: use it first. Applying an unchanged spec writes nothing. A node group needs `operator:write` and `node:write`. Supports `idempotency_key`. |
-| `legion_scaling_pause` | **yes** | Pause (or `resume=true`) autoscaling for a job, a task, a standalone `policy`, or the cluster (`all`, needs `operator:write`), optionally `for` a duration. Supports `idempotency_key`. Prefer a pause over fighting the autoscaler with `legion_job_scale`; on an autoscaled task a manual count needs `for` anyway (a pin). |
+| `legion_scaling_explain` | no | Why an autoscaled task (or, with `object = { kind, name, namespace }`, an `autoscaler/ScalingPolicy` or an `autoscaler/NodeGroup`: each stage, the members chosen for scale-in, the ones protected and why, and the actions taken) is at its count, as data: the last evaluation's checks (reading, desired) and every safeguard stage (`before`, `after`, `note`), and the effective policy with each field's origin (`built-in`, `cluster defaults`, `namespace policy <name>`, `jobspec`). Read this before changing a policy. |
+| `legion_scaling_history` | no | The durable record of a job's (or, with `object`, a scaling policy's or node group's; the current object's, keyed by its uid) count changes, newest first: source (`operator`, `autoscaler`), principal, from/to, the one-line why, dry-run rows (`kind = would`, `applied = false`), and failed target calls (`kind = failed`). |
+| `legion_scaling_simulate` | no | Run a policy over up to an hour of recorded history, or a CSV series, and return the count changes it makes ([Simulating a policy](autoscaling.md#simulating-a-policy)). `job` simulates the live policy (`mode = replay`: the decisions the autoscaler made); `spec` takes an edited jobspec or an `autoscaler/ScalingPolicy` object document as JSON (`mode = follow`: what it would have done). Writes nothing. Call it before submitting a policy change, and compare its changes with `legion_scaling_history`. |
+| `legion_scaling_pause` | **yes** | Pause (or `resume=true`) autoscaling for a job, a task, one of the autoscaler's objects (`object`; needs what writing it needs), or the cluster (`all`, needs `operator:write`), optionally `for` a duration. Supports `idempotency_key`. Prefer a pause over fighting the autoscaler with `legion_job_scale`; on an autoscaled task a manual count needs `for` anyway (a pin). |
 | `legion_job_destroy` | **yes** | Destroy a job. |
 | `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key` and `allow_unknown_fields`). |
 | `legion_template_upsert` | **yes** | Store Nickel as the next immutable version of a template. |
@@ -619,6 +623,39 @@ outcome. Both exit non-zero on failure, with the node's reason in the error
 envelope ([suspend-and-resume.md](suspend-and-resume.md)). A suspended
 instance's `checkpointState` (`local` or `published`) in
 `legion_instance_get` tells an agent whether a resume can leave the node.
+
+App objects wait the same way, whatever their kind: `legion object apply
+-f repo.ncl --wait` (or `legion_object_apply` with `wait`) blocks until the
+owning app reports on the applied generation, and exits non-zero with the
+reason when the app rejects the object (`Rejected: <reason>`) or cannot make
+it ready (`NotReady: <reason>`). `legion object delete … --wait` blocks until
+the app has released a deleting object ([App Objects](app-objects.md)). An
+apply of a kind whose app is not installed yet fails with
+`KIND_NOT_INSTALLED`, `retryable: true`.
+
+Scaling policies for targets outside Legion and node groups are such
+objects, of the bundled autoscaler's kinds `autoscaler/ScalingPolicy` and
+`autoscaler/NodeGroup` ([autoscaling.md, "Standalone
+policies"](autoscaling.md#standalone-policies)): an agent writes them with
+`legion_object_apply` (`dry_run` first; `legion_object_kinds` returns their
+schemas), waits on `wait` for the autoscaler's verdict (`Rejected: Invalid`
+names what is wrong, such as `min` above `max` or a plugin closed to the
+namespace), and reads the per-tick numbers with `legion_scaling_status` and
+`legion_scaling_explain` (with `object`). Deleting a node group with `wait`
+blocks until the autoscaler has drained and terminated its members and
+released it, or its 15-minute cleanup window ends.
+
+**Agents that are apps.** An app that owns a kind can act for one of its
+objects by naming it in `legion-for-object:
+<app>/<Kind>/<namespace>/<name>#<uid>@<generation>`: its calls then hold
+only what that object's writer was checked for, within the app's grant,
+and the jobs they submit are stamped with the object (`legion job info -j`
+shows `managedBy.object`). `WhoAmI` through such a client reports `source:
+for-object` and the rules it holds, so an agent can see its bounds before
+it acts ([App Objects: Acting for an
+object](app-objects.md#acting-for-an-object)). To audit what such apps may
+still do, `legion object list -A --authority-lapsed -j` lists the objects
+whose writers have since lost the rights they recorded.
 
 Other signals an agent can use to close the loop:
 

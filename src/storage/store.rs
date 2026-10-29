@@ -55,13 +55,18 @@ mod scaling_ops;
 // Task autoscaling's state: scale writes with compare-and-set, pins,
 // history, pauses, the cluster's scaling defaults, policy snapshots.
 mod autoscale_ops;
-// Standalone scaling policies (`legion scaling apply`).
-mod scaling_policy_ops;
-// Their action intents (`RecordScalingAction`), compare-and-set.
+// The autoscaler's action intents (`RecordScalingAction`), compare-and-set,
+// and the sweep of deleted objects' scaling state.
 mod scaling_action_ops;
 // Jobspec extensions: the jobs holding values, and cheap fingerprints.
 mod extension_ops;
 pub use extension_ops::ExtensionJob;
+// Objects of app-declared kinds (`legion object`), compare-and-set.
+mod app_object_ops;
+pub use app_object_ops::{
+    AppObjectRow, AppObjectStatusRow, DeleteObject, KindWrite, ObjectFilter, ObjectKey,
+    ObjectKindRow, ObjectWrite, PutObject, PutStatus, ReleaseObject, StatusWrite, VersionCas,
+};
 // GetCapacityDemand's pending work, and ForgetNode (autoscaler v2 plan
 // §6.11).
 mod demand_ops;
@@ -90,7 +95,6 @@ pub use reschedule_holds::{
 };
 pub use scaling_action_ops::{ActionHistory, ActionWrite, ScalingActionRow};
 pub use scaling_ops::{ScalingAllocRow, ScalingReplicaRow};
-pub use scaling_policy_ops::{PutScalingPolicy, ScalingPolicyRow};
 pub use session_ops::{PromoteSession, PromotedSession};
 pub use snapshot_ops::{
     DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,
@@ -10466,6 +10470,32 @@ impl Store {
         )
     }
 
+    /// [`Self::handle_job_submit_as`] for an app acting for one of its
+    /// objects (docs/app-objects.md, "Acting for an object"): the grant is
+    /// recorded in `granted_by`'s name (`<app> for <Kind> <ns>/<name>`), and
+    /// the version is stamped `managedBy = { app, object }`. An unchanged
+    /// submit restamps the latest version in place when its stamp differs.
+    pub fn handle_job_submit_for_object(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+        granted_by: &str,
+        managed_by: crate::structs::app::ManagedBy,
+        unknown_fields: Option<&UnknownFieldsRecord>,
+    ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner(
+            config,
+            subs,
+            template,
+            crate::storage::acl_store::GrantSource::Object {
+                granted_by: granted_by.to_string(),
+                managed_by,
+            },
+            unknown_fields,
+        )
+    }
+
     /// Like `handle_job_submit`, stamping the template that rendered this
     /// config into the config's meta for provenance (spec history, the
     /// RunJobTemplate collision guard, and template-scoped ACL reads).
@@ -11059,8 +11089,9 @@ impl Store {
                 // The app reconciler's render equals the stored version but
                 // the version does not carry its stamp (a direct submit left
                 // it identical): stamp it, so the digests compare equal from
-                // here on. Nothing else about the version changes.
-                if let crate::storage::acl_store::GrantSource::App { managed_by, .. } = grant {
+                // here on. Nothing else about the version changes. An app
+                // acting for an object restamps the same way.
+                if let Some(managed_by) = grant.stamp() {
                     Self::stamp_managed_by_tx(tx, &job_config_id, managed_by)?;
                 }
                 return Ok((JobSubmitOutcome::Unchanged { job_config_id }, Vec::new()));
@@ -11132,6 +11163,13 @@ impl Store {
             }
             crate::storage::acl_store::GrantSource::App { managed_by, .. } => {
                 meta["submittedBy"] = json!(crate::structs::app::RECONCILER_PRINCIPAL);
+                meta["managedBy"] = serde_json::to_value(managed_by)?;
+            }
+            crate::storage::acl_store::GrantSource::Object {
+                granted_by,
+                managed_by,
+            } => {
+                meta["submittedBy"] = json!(granted_by);
                 meta["managedBy"] = serde_json::to_value(managed_by)?;
             }
             crate::storage::acl_store::GrantSource::CarryForward => {

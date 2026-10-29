@@ -28,6 +28,7 @@ pub mod namespace_policy;
 pub mod net;
 pub mod net_plugin;
 pub mod node;
+pub mod object;
 pub mod oidc;
 pub mod output;
 pub mod raft;
@@ -35,7 +36,6 @@ pub mod sandbox;
 pub mod scaling;
 pub mod scaling_demand;
 pub mod scaling_plugin;
-pub mod scaling_policy;
 pub mod scaling_simulate;
 pub mod scheduler;
 pub mod service;
@@ -70,6 +70,7 @@ fn base_cli() -> Command {
         .subcommand(scaling::config())
         .subcommand(app::config())
         .subcommand(namespace::config())
+        .subcommand(object::config())
         .subcommand(template::config())
         .subcommand(instance::config())
         .subcommand(node::config())

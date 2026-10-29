@@ -139,13 +139,13 @@ pub struct PauseRow {
 }
 
 impl PauseRow {
-    /// `all`, `job`, `task`, or `policy` (a standalone policy, keyed
-    /// `policy:<id>`).
+    /// `all`, `job`, `task`, or `object` (one of the autoscaler's objects,
+    /// keyed `object:<uid>`).
     pub fn scope(&self) -> &'static str {
         if self.job_id == PAUSE_ANY {
             "all"
-        } else if crate::manager::autoscale::policy_of_target_key(&self.job_id).is_some() {
-            "policy"
+        } else if crate::manager::autoscale::object_uid_of_target_key(&self.job_id).is_some() {
+            "object"
         } else if self.task_group == PAUSE_ANY {
             "job"
         } else {
@@ -162,7 +162,7 @@ impl PauseRow {
     pub fn covers(&self, job_id: &str, task_group: &str, task_name: &str) -> bool {
         match self.scope() {
             "all" => true,
-            "job" | "policy" => self.job_id == job_id,
+            "job" | "object" => self.job_id == job_id,
             _ => {
                 self.job_id == job_id
                     && self.task_group == task_group
@@ -182,7 +182,7 @@ pub fn covering_pause<'a>(
     now_ms: i64,
 ) -> Option<&'a PauseRow> {
     let rank = |pause: &PauseRow| match pause.scope() {
-        "task" | "policy" => 0,
+        "task" | "object" => 0,
         "job" => 1,
         _ => 2,
     };
@@ -715,6 +715,16 @@ impl Store {
             )
             .optional()?;
         Ok(policy)
+    }
+
+    /// A cheap fingerprint of the pauses: their count and newest creation.
+    pub fn scaling_pause_fingerprint(&self) -> R<(i64, i64)> {
+        let conn = self.read_connection()?;
+        Ok(conn.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(created_ms), 0) FROM scaling_pause;",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
     }
 
     /// Every pause, expired ones included (they are inert, and a resume or a

@@ -68,7 +68,16 @@
   # task, `legion ...` reaches the cluster through the allocation's API
   # socket with this grant, when workloadIdentity.enabled is on.
   permissions = [
-    { resources = ["job"], actions = ["read", "write"], namespaces = ["team-*"] },
+    { resources = ["job"], actions = ["read"], namespaces = ["team-*"] },
+    # `via = "objects"`: gitops writes jobs only while it acts for one of its
+    # Repos (`legion-for-object`), and the manager holds each such call to
+    # what that Repo's author was checked for when they applied it (the
+    # Repo's recorded authority; see `requires` below). Its own credential
+    # writes no job anywhere, and the install prompt says so: "only for its
+    # objects". The installer must still hold it, as any permission here.
+    # The jobs it writes this way are stamped `managedBy` the Repo
+    # (docs/app-objects.md, "Acting for an object").
+    { resources = ["job"], actions = ["write"], namespaces = ["*"], via = "objects" },
     { resources = ["template"], actions = ["read"] },
     # Apps keep their state under the reserved `legion/` KV prefix, which a
     # plain `*` path never reaches.
@@ -96,6 +105,9 @@
     # Buttons a view's `actions` block can show. Pressed on a job, task, or
     # node (never in nav or overview), checked as the viewer, audited as
     # `app.action`, and confirmed first when the permission is a write.
+    # gitops answers `sync-now` by acting for the Repo that deploys the job:
+    # acting as the viewer is bounded by its own grant, which (job:write
+    # being `via = "objects"`) writes no job.
     actions = [
       {
         name = "sync-now",
@@ -176,6 +188,93 @@
       # submitter must also hold this permission on the job, checked when
       # the value is new or changed.
       requires = { resource = "template", action = "write" },
+    },
+  ],
+
+  # Object kinds the app owns (docs/app-objects.md): Legion's custom
+  # resources. People apply objects of them with `legion object apply`
+  # (configs/apps/example-repo.ncl); the manager checks each against its
+  # schema and what writing it requires of the writer, and stores it; the
+  # app watches them (WatchObjects), does the work, and reports status. The
+  # kind's name is `gitops/Repo`; `legion object get repo storefront` works
+  # while no other app declares a Repo.
+  kinds = [
+    {
+      # PascalCase, singular. Reserved: Legion's own nouns (job, node, ...).
+      name = "Repo",
+      description = "A git repository gitops deploys jobs from into this namespace.",
+      # `namespaced` (the default) or `cluster`.
+      scope = "namespaced",
+      # The spec's JSON Schema. Closed by default: a field it does not name
+      # is an error (with a did-you-mean). `default`s are stored with the
+      # object at write.
+      schema = {
+        type = "object",
+        required = ["url"],
+        properties = {
+          url = { type = "string", description = "The repository URL." },
+          branch = { type = "string", default = "main", description = "The branch to deploy." },
+          path = { type = "string", default = "jobs/", description = "The directory of jobspecs." },
+          jobs = {
+            type = "array",
+            items = { type = "string" },
+            description = "The jobs it may write; default every job in the namespace.",
+          },
+          # Shown as <redacted> to everyone but the app. A credential is
+          # better kept in KV and named here by path.
+          deployKey = {
+            type = "string",
+            writeOnly = true,
+            description = "A read-only deploy key.",
+          },
+        },
+      },
+      # The schema of the status `fields` the app reports (facts, at most
+      # 16 KiB), beside its Accepted and Ready conditions.
+      status = {
+        schema = {
+          type = "object",
+          properties = {
+            commit = { type = "string" },
+            jobs = { type = "integer" },
+          },
+        },
+      },
+      examples = [{ url = "https://github.com/acme/deploy", path = "jobs/storefront" }],
+      # Also ask the app on each apply (`POST /legion/v1/objects/validate`).
+      # Advice: it fails open when the app does not answer.
+      validate = true,
+      # What governs a Repo itself: `object` (the default) by namespace and
+      # kind; or `job` / `scale` (namespace-wide) or `node` (cluster kinds).
+      access = { resource = "object" },
+      # What writing (or deleting) a Repo also needs of its writer, scoped
+      # from the object: write on the jobs it names (`/spec/jobs`; every job
+      # when it names none) in its namespace. What was checked is recorded
+      # on the Repo as its authority, and bounds what gitops can do for it:
+      # a Repo can never make gitops deploy more than its author could.
+      requires = [
+        { resource = "job", actions = ["write"], name = "/spec/jobs" },
+      ],
+      # Pointers an update may not change.
+      immutable = ["/spec/url"],
+      # CEL rules every apply must pass, checked by the manager whether or
+      # not the app is up (docs/app-objects.md, "Validation rules"): what a
+      # schema cannot say across fields. `self` is the spec with defaults;
+      # a rule that uses `oldSelf` (the stored spec) checks updates only.
+      rules = [
+        {
+          rule = "!has(self.deployKey) || self.url.startsWith('ssh://') || self.url.startsWith('git@')",
+          message = "a deploy key is an SSH key: use an ssh:// or git@ URL with it",
+          path = "/spec/deployKey",
+        },
+      ],
+      # A delete waits up to this long for gitops to clean up (and release
+      # the object); then the object is removed anyway.
+      cleanup = "10m",
+      # At most this many Repos (default 10,000).
+      maxObjects = 500,
+      # The columns `legion object list repos` shows.
+      columns = ["/spec/branch", { name = "COMMIT", pointer = "/status/fields/commit" }],
     },
   ],
 

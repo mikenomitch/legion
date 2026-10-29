@@ -40,6 +40,10 @@
 //!   which can write any policy anyway.
 //! - Management tokens hold everything. A requested deny rule only takes
 //!   access away and is never checked.
+//! - **`via = "objects"`** (an app's rule usable only when it acts for one
+//!   of its objects) is checked like any other: the submitter must hold it.
+//!   A held `via` rule covers only a requested `via` rule, never a plain
+//!   one, since its holder could not use it on its own.
 
 use serde::{Deserialize, Serialize};
 
@@ -202,6 +206,7 @@ pub fn resource_named(name: &str) -> Option<AclResource> {
         AclResource::Snapshot,
         AclResource::Namespace,
         AclResource::App,
+        AclResource::Object,
     ];
     ALL.iter()
         .copied()
@@ -293,8 +298,14 @@ impl Atom<'_> {
         if let Some(bands) = &self.rule.bands {
             text.push_str(&format!(" in bands {}", bands.join(", ")));
         }
+        if let Some(kinds) = &self.rule.kinds {
+            text.push_str(&format!(" on kinds {}", kinds.join(", ")));
+        }
         if self.rule.host == Some(true) {
             text.push_str(" (host = true)");
+        }
+        if self.rule.is_via_objects() {
+            text.push_str(" (via objects)");
         }
         text
     }
@@ -322,7 +333,13 @@ fn pattern_covers(held: &str, requested: &str, prefix: &str) -> bool {
 }
 
 fn held_covers(held: &AclRule, atom: &Atom<'_>) -> bool {
-    if held.is_deny() || !rule_covers_pair(held, atom.resource, atom.action) {
+    // A held `via = "objects"` rule is usable only through an object-scoped
+    // call, so it covers only the same `via` rule (the app reconciler
+    // granting the app's job its recorded grant), never a plain one.
+    if held.is_deny()
+        || (held.is_via_objects() && !atom.rule.is_via_objects())
+        || !rule_covers_pair(held, atom.resource, atom.action)
+    {
         return false;
     }
     let requested = atom.rule;
@@ -336,6 +353,7 @@ fn held_covers(held: &AclRule, atom: &Atom<'_>) -> bool {
         && plain_covered(&held.action_names, &requested.action_names)
         && plain_covered(&held.templates, &requested.templates)
         && plain_covered(&held.bands, &requested.bands)
+        && plain_covered(&held.kinds, &requested.kinds)
 }
 
 fn rule_covers_pair(rule: &AclRule, resource: AclResource, action: AclAction) -> bool {
@@ -472,6 +490,16 @@ mod grant_test {
     use super::*;
     use crate::structs::acl::{parse_rules, AclSource};
 
+    /// Every ACL resource is one a grant can name: a resource missing here
+    /// would drop out of the coverage check, so a grant asking for it would
+    /// pass unchecked.
+    #[test]
+    fn every_acl_resource_is_a_grant_resource_test() {
+        for name in AclResource::all() {
+            assert!(resource_named(name).is_some(), "{name}");
+        }
+    }
+
     fn identity(rules_json: &str) -> AclIdentity {
         AclIdentity {
             principal: "tester".into(),
@@ -483,6 +511,7 @@ mod grant_test {
             source: AclSource::Token,
             expires_at: None,
             audit_only: false,
+            acting_for: None,
         }
     }
 
@@ -717,5 +746,35 @@ mod grant_test {
         assert_eq!(parse_grant_policy_ref("grant:alloc/42"), Some(42));
         assert_eq!(parse_grant_policy_ref("grant:alloc/x"), None);
         assert_eq!(parse_grant_policy_ref("cert-writer"), None);
+    }
+
+    /// A requested `via = "objects"` rule is checked like any other: the
+    /// submitter (the app's installer) must hold it. A held `via` rule
+    /// covers only the same `via` rule, since its holder could not use it
+    /// on its own.
+    #[test]
+    fn via_objects_rules_are_covered_like_any_other_test() {
+        let wanted =
+            r#"[{"resources":["job"],"actions":["write"],"namespaces":["*"],"via":"objects"}]"#;
+        assert!(covers(
+            r#"[{"resources":["job"],"actions":["*"],"namespaces":["*"]}]"#,
+            wanted
+        ));
+        let miss = first_uncovered(
+            &identity(r#"[{"resources":["job"],"actions":["write"],"namespaces":["team-a"]}]"#),
+            &requested(wanted),
+        )
+        .expect("not held");
+        assert_eq!(miss.what, "job:write in * (via objects)");
+        // Holding the `via` rule covers the same `via` rule (the app
+        // reconciler granting the app's job its recorded grant), never the
+        // plain form.
+        let via_holder =
+            r#"[{"resources":["job"],"actions":["write"],"namespaces":["*"],"via":"objects"}]"#;
+        assert!(covers(via_holder, wanted));
+        assert!(!covers(
+            via_holder,
+            r#"[{"resources":["job"],"actions":["write"],"namespaces":["*"]}]"#
+        ));
     }
 }

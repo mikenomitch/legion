@@ -44,11 +44,18 @@ pub struct NamespaceContents {
     pub volumes: Vec<String>,
     /// Snapshot ids of a job in the namespace.
     pub snapshots: Vec<String>,
+    /// Objects of app-declared kinds in the namespace, as `<app>/<Kind>
+    /// <name>` (docs/app-objects.md). Objects whose bounded cleanup is
+    /// running are on their way out and do not count.
+    pub objects: Vec<String>,
 }
 
 impl NamespaceContents {
     pub fn is_empty(&self) -> bool {
-        self.jobs.is_empty() && self.volumes.is_empty() && self.snapshots.is_empty()
+        self.jobs.is_empty()
+            && self.volumes.is_empty()
+            && self.snapshots.is_empty()
+            && self.objects.is_empty()
     }
 
     /// `3 jobs, 1 volume`, for the refusal message.
@@ -58,6 +65,7 @@ impl NamespaceContents {
             (self.jobs.len(), "job", "jobs"),
             (self.volumes.len(), "volume", "volumes"),
             (self.snapshots.len(), "snapshot", "snapshots"),
+            (self.objects.len(), "object", "objects"),
         ] {
             if count > 0 {
                 parts.push(format!("{count} {}", if count == 1 { one } else { many }));
@@ -407,6 +415,14 @@ fn namespace_contents_on(conn: &Connection, name: &str) -> R<NamespaceContents> 
             "job_id",
             "AND state <> 'deleting'",
         )?,
+        objects: {
+            let mut stmt = conn.prepare(
+                "SELECT app || '/' || kind || ' ' || name FROM app_object
+                 WHERE namespace = ?1 AND deleting_since = 0 ORDER BY app, kind, name;",
+            )?;
+            let rows = stmt.query_map([name], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        },
     })
 }
 

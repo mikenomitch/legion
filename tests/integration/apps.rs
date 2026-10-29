@@ -1976,6 +1976,7 @@ async fn a_new_term_retries_and_a_current_job_is_not_parked_test() -> R<()> {
         legion::structs::app::ManagedBy {
             app: "rooted".into(),
             digest: rendered.digest.clone(),
+            object: None,
         },
         &record.updated_at,
     )?;

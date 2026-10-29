@@ -26,6 +26,23 @@ package legion;
 //   app's own identity. Streaming RPCs and app-plane RPCs refuse it
 //   (PermissionDenied). Ignored when ACLs are disabled. See
 //   docs/auth-and-acls.md, "Delegated identities".
+// - `legion-for-object: <app>/<Kind>/<namespace>/<name>#<uid>@<generation>`:
+//   an app acting for one of its objects (an empty namespace for a cluster
+//   kind: `autoscaler/NodeGroup//workers#17@3`). The app's own credential
+//   names the object, and the call is authenticated as `<app> for <Kind>
+//   <namespace>/<name>`: one exact rule per permission of the object's
+//   recorded `authority` (what its writer was checked for when it was last
+//   applied) that the app's own grant covers, its `via = "objects"` rules
+//   included, plus the app's deny rules. The generation is advisory: the
+//   object's current authority applies. A deleting object may be named
+//   (for cleanup). Named by anyone but the owning app's own identity, for a
+//   uid that does not exist or names another object, or for an orphaned
+//   kind, the call is Unauthenticated or PermissionDenied; it never falls
+//   back to the app's own identity. RunJob and RunJobTemplate submits made
+//   this way stamp the version `managedBy = { app, object }`. Streaming RPCs
+//   and app-plane RPCs refuse it (PermissionDenied). A call carrying both
+//   this header and `legion-on-behalf-of` is InvalidArgument. Ignored when
+//   ACLs are disabled. See docs/app-objects.md, "Acting for an object".
 
 // === MANAGER ===
 
@@ -248,21 +265,36 @@ service Manager {
   // counts through ScaleTask (compare-and-set, with the decision attached),
   // and reports what it is doing through ReportScalingStatus. People read
   // that back with GetScalingStatus and GetScaleHistory, and freeze it with
-  // PauseScaling. A target that is not a Legion task has a standalone
-  // policy (ApplyScalingPolicy, DeleteScalingPolicy, ListScalingPolicies),
-  // which the app runs through a target plugin installed in its app config
-  // (docs/autoscaling.md, "Standalone policies"; docs/autoscaling-plugins.md).
+  // PauseScaling. A target that is not a Legion task has an
+  // `autoscaler/ScalingPolicy` object, and a pool of machines an
+  // `autoscaler/NodeGroup` (docs/autoscaling.md, "Standalone policies" and
+  // "Node groups"): kinds the autoscaler app declares, written with
+  // ApplyObject (`legion object apply`), which the app reads over
+  // WatchObjects and runs through target plugins installed in its app
+  // config (docs/autoscaling-plugins.md). Their history, pause, action
+  // intents, and status-board entry are keyed by the object's uid, so a
+  // deleted and recreated object starts fresh.
 
-  // Streams the effective scaling policy of every autoscaled task, and every
-  // standalone policy, the caller may read (`scale:read`), resolved live
-  // against the layered defaults and the plugins installed in the
-  // autoscaler's app config.
+  // Streams the effective scaling policy of every autoscaled task the
+  // caller may read (`scale:read`), resolved live against the layered
+  // defaults and the plugins installed in the autoscaler's app config.
+  // Standalone policies and node groups are not here: they are the
+  // autoscaler's objects (`autoscaler/ScalingPolicy`, `autoscaler/NodeGroup`),
+  // which it reads over WatchObjects.
+  //
+  // To the autoscaler's own identity (or a management token) the stream
+  // also carries what the app needs to run those objects and that only the
+  // manager holds: the layered defaults and the cluster-wide pause
+  // (`context`, on the first message and whenever it changes), so it
+  // resolves a ScalingPolicy exactly as a task's `autoscale` resolves; and
+  // each object target's own pause and action row (`objects`, keyed
+  // `object:<uid>`). Any other caller gets task policies only.
   //
   // The first message is the full set. Another follows whenever any input
-  // changes: a job with `autoscale` is submitted, stopped, or destroyed; a
-  // standalone policy is applied or deleted, or its pause or action row
-  // changes; the cluster's scaling defaults change; a namespace policy's
-  // `autoscale` changes; the autoscaler's plugins change. Without `deltas`
+  // changes: a job with `autoscale` is submitted, stopped, or destroyed; an
+  // object target's pause or action row changes; the cluster's scaling
+  // defaults change; a namespace policy's `autoscale` changes; the
+  // autoscaler's plugins change. Without `deltas`
   // each message is the full set again and replaces the previous one. With
   // `deltas`, every later message carries only what changed (`full =
   // false`): new or changed policies, and the keys of removed ones in
@@ -276,12 +308,12 @@ service Manager {
   // replicated state.
   //
   // With `shard_count` and `shards`, only the policies in those shards are
-  // sent (docs/autoscaling.md, "Replicas"): a policy's shard is FNV-1a
-  // (64-bit) of its key modulo `shard_count`, where the key is
-  // `<job id>/<group>/<task>` for an autoscaled task, `policy:<id>` for an
-  // external-target standalone policy, and `nodegroups` for every node
-  // group. An autoscaler replica watches the shards it holds a lease on, and
-  // starts a new watch when they change.
+  // sent (docs/autoscaling.md, "Replicas"): a task policy's shard is FNV-1a
+  // (64-bit) of `<job id>/<group>/<task>` modulo `shard_count`. An
+  // autoscaler replica watches the shards it holds a lease on, and starts a
+  // new watch when they change. `objects` are not sharded: every replica
+  // gets every object target's pause and action row, and uses those of the
+  // objects it runs.
   //
   // A policy that no longer resolves (a defaults change applied with
   // `force`, two namespace policies that disagree, or a plugin it names
@@ -290,8 +322,9 @@ service Manager {
   // and reports it, rather than dropping it silently.
   //
   // ACL: `scale:read`, gated before anything is read; policies of jobs
-  // outside the caller's grant are left out. Re-checks the caller's
-  // credential periodically, like StreamEvents.
+  // outside the caller's grant are left out, and `context` and `objects` go
+  // only to the autoscaler's own identity (or a management token).
+  // Re-checks the caller's credential periodically, like StreamEvents.
   rpc WatchScalingPolicies (WatchScalingPoliciesRequest) returns (stream ScalingPolicySet);
 
   // Sets the cluster's scaling defaults: the record every autoscaled task
@@ -300,11 +333,13 @@ service Manager {
   // `autoscale` shape without `checks`, and an inherited `min` must be a
   // multiple of `count` of at least "1x".
   //
-  // Every autoscaled task's effective policy is re-resolved first. When the
-  // change would leave any of them invalid (a cluster `min` above a task's
-  // own `max`, say), the apply is refused with FAILED_PRECONDITION listing
-  // them, unless `force` is set; then those policies are held `invalid`
-  // until fixed. `dry_run` returns the same report and writes nothing.
+  // Every autoscaled task's effective policy, and every
+  // `autoscaler/ScalingPolicy` object's (which inherit the same layers), is
+  // re-resolved first. When the change would leave any of them invalid (a
+  // cluster `min` above a task's own `max`, say), the apply is refused with
+  // FAILED_PRECONDITION listing them, unless `force` is set; then those
+  // policies are held `invalid` until fixed. `dry_run` returns the same
+  // report and writes nothing.
   // Inheriting tasks pick the change up live, with no resubmit.
   //
   // ACL: `operator:write`. Retry-safe with `idempotency_key`.
@@ -340,11 +375,14 @@ service Manager {
   // - a `dry-run` policy's "would" decision (`kind = "would"`): a
   //   `scale_history` row with `applied = false`, so `legion scaling
   //   history` shows what the policy would have done;
-  // - an **action intent** on a standalone policy (`kind = "intent"`),
-  //   written before the app acts on a target outside Legion (calls
-  //   `target/scale` or `target/terminate`, drains or forgets a node-group
-  //   member), and its **outcome** (`kind = "outcome"`) once it has. Both are
-  //   compare-and-set on the policy's action version, so when two autoscaler
+  // - an **action intent** on an object target (an
+  //   `autoscaler/ScalingPolicy` or `autoscaler/NodeGroup`, `kind =
+  //   "intent"`), written before the app acts on a target outside Legion
+  //   (calls `target/scale` or `target/terminate`, drains or forgets a
+  //   node-group member), and its **outcome** (`kind = "outcome"`) once it
+  //   has. The object must exist with the uid named, or the call is
+  //   NOT_FOUND. Both are compare-and-set on the object's action version,
+  //   so when two autoscaler
   //   replicas' shard leases overlap, exactly one of them acts on each
   //   decision (docs/autoscaling.md, "No duplicate actions"). The reply says
   //   whether the write won, and carries the policy's action row either
@@ -364,107 +402,59 @@ service Manager {
   // Answered by the status-lane leader, which holds the app's reports (other
   // managers forward). Works with the app down, and says so.
   //
-  // Standalone policies are listed after the tasks; node groups (kind
-  // `nodes`) are listed whatever namespaces are asked for, since they have
-  // none. With several autoscaler replicas (docs/autoscaling.md,
-  // "Replicas"), each target's entry is the newest report of it, from the
-  // replica that owns it.
+  // The autoscaler's objects are listed after the tasks: every
+  // `autoscaler/ScalingPolicy` in the namespaces asked for (kind
+  // `external`), and every `autoscaler/NodeGroup` (kind `nodes`) whatever
+  // namespaces are asked for, since they have none. The manager reads them
+  // from the object store and resolves each as the app does, for its mode,
+  // bounds, and effective policy; their state is the app's last report.
+  // `object` names one instead. With several autoscaler replicas
+  // (docs/autoscaling.md, "Replicas"), each target's entry is the newest
+  // report of it, from the replica that owns it.
   //
   // ACL: `scale:read`, gated before any lookup; targets of jobs outside the
   // caller's grant are left out (a request naming such a job is refused).
-  // Node groups need `node:read`.
+  // An object is read with its kind's access: `scale:read` in its
+  // namespace for a ScalingPolicy, `node:read` for a NodeGroup; a request
+  // naming one is gated before the lookup, so a caller cannot probe for
+  // objects.
   rpc GetScalingStatus (GetScalingStatusRequest) returns (GetScalingStatusReply);
 
   // Lists the durable record of scaling changes for a job, newest first:
   // every count write (by people and by the autoscaler, applied or
   // deferred), pins and releases, and a `dry-run` policy's "would" rows.
-  // History is capped at 200 rows per task. A standalone policy's history
-  // (`policy`) also has its action intents' rows: `scaled`, `failed`, and
-  // for a node group `drain`, `terminate`, `forget`, and `uncordon`.
+  // History is capped at 200 rows per task. An object target's history
+  // (`object`: an `autoscaler/ScalingPolicy` or `autoscaler/NodeGroup`)
+  // also has its action intents' rows: `scaled`, `failed`, and for a node
+  // group `drain`, `terminate`, `forget`, and `uncordon`. It is the current
+  // object's (its uid's): a deleted and recreated object starts a new
+  // history, and a deleted object's history is swept with it.
   //
-  // ACL: `scale:read` on the job, or on the standalone policy; a node
-  // group's with `node:read`.
+  // ACL: `scale:read` on the job; an object's with its kind's read access
+  // (`scale:read` in its namespace, `node:read` for a node group), checked
+  // before the lookup.
   rpc GetScaleHistory (GetScaleHistoryRequest) returns (GetScaleHistoryReply);
 
   // Pauses autoscaling for one task, every autoscaled task of one job, one
-  // standalone policy (`policy`), or the whole cluster (`all`), optionally
-  // for a duration; or resumes it (`resume`). A pause is replicated state, enforced in two places: the
-  // autoscaler skips paused targets, and ScaleTask refuses autoscaler
-  // writes to them, so a pause holds even against a misbehaving app. People
-  // can still scale a paused task by hand.
+  // of the autoscaler's objects (`object`: an `autoscaler/ScalingPolicy` or
+  // `autoscaler/NodeGroup`), or the whole cluster (`all`), optionally for a
+  // duration; or resumes it (`resume`). A pause is replicated state,
+  // enforced in two places: the autoscaler skips paused targets, and
+  // ScaleTask (or, for an object, RecordScalingAction's intent) refuses the
+  // autoscaler's writes to them, so a pause holds even against a
+  // misbehaving app. People can still scale a paused task by hand.
   //
-  // A node group (`policy` naming one) is paused like a standalone policy:
-  // its count holds, no drain starts, and drains that have not reached
-  // terminate are abandoned (their nodes uncordoned).
+  // A node group is paused like a scaling policy: its count holds, no drain
+  // starts, and drains that have not reached terminate are abandoned (their
+  // nodes uncordoned). An object's pause is keyed by its uid: deleting the
+  // object ends it, and a recreated object is not paused.
   //
-  // ACL: `scale:write` on the job (or the standalone policy); a node group
-  // needs `operator:write` and `node:write`; `all` needs `operator:write`.
-  // A standalone policy is gated before its lookup with either grant, so a
-  // caller cannot probe for policies. Retry-safe with `idempotency_key`.
+  // ACL: `scale:write` on the job; an object needs what writing it needs
+  // (its kind's access and `requires`: `scale:write` in its namespace for a
+  // ScalingPolicy, `node:write` and `operator:write` for a NodeGroup),
+  // checked before the lookup, so a caller cannot probe for objects; `all`
+  // needs `operator:write`. Retry-safe with `idempotency_key`.
   rpc PauseScaling (PauseScalingRequest) returns (PauseScalingReply);
-
-  // Creates or replaces a standalone scaling policy (`legion scaling
-  // apply`; docs/autoscaling.md, "Standalone policies"): a policy for a
-  // target that is not a Legion task, stored as its own versioned object on
-  // the Control lane. `spec_json` is the policy as written (the CLI
-  // evaluates a Nickel file to it): `name`, `namespace`, `description`,
-  // `target = { plugin, config }`, and the jobspec `autoscale` record's
-  // fields, with `min`, `max` and `checks` required.
-  //
-  // The policy is resolved exactly as the autoscaler will run it (the
-  // layered defaults, then its own fields) and every plugin it names (its
-  // target, each check's source, each plugin strategy) must be installed in
-  // the autoscaler's app config and open to the policy's namespace; a
-  // policy that fails either is refused with INVALID_ARGUMENT naming the
-  // field or the plugin. What only the plugin knows (that it implements
-  // the kind, and its `policyConfigSchema`) is checked by the autoscaler
-  // when it next evaluates the policy, which reports `invalid` with the
-  // reason (`legion scaling apply --wait` waits for that report).
-  //
-  // A node-group policy (`target = { nodes = … }`; docs/autoscaling.md,
-  // "Node groups") is cluster-scoped: it is stored with no namespace, its id
-  // is its bare name, and it must name a target plugin that is installed
-  // (whether that plugin declares the `nodes` capability is checked by the
-  // autoscaler). Its name may not be the name of a policy in the `default`
-  // namespace, nor the reverse (ALREADY_EXISTS): both are addressed by the
-  // bare name.
-  //
-  // `dry_run` validates and returns the diff against the stored version
-  // without writing. Applying an unchanged policy writes nothing and keeps
-  // its version.
-  //
-  // ACL: `scale:write` on the policy's namespace and name (the scope a job
-  // of that name would have), checked once the body is parsed and before
-  // anything is looked up. A node-group policy needs `operator:write` and
-  // `node:write`, and no `scale` grant. Retry-safe with `idempotency_key`.
-  rpc ApplyScalingPolicy (ApplyScalingPolicyRequest) returns (ApplyScalingPolicyReply);
-
-  // Deletes a standalone scaling policy. The autoscaler stops evaluating it
-  // on its next policy update; its history stays until the history cap
-  // (or the policy's name is reused) ages it out. Deleting a policy that
-  // does not exist is NOT_FOUND.
-  //
-  // `name` is `namespace/name`, or a bare name: the `default` namespace's
-  // policy of that name, else the node group of that name.
-  //
-  // ACL: before the lookup, `scale:write` on the policy's namespace and
-  // name, or `operator:write` and `node:write` (the node-group grant);
-  // after it, the grant the policy's kind needs. Node groups are looked up
-  // only for a caller holding the node-group grant, so a caller cannot tell
-  // an existing policy from a missing one. Retry-safe with
-  // `idempotency_key`: a replayed delete reports `deduplicated`.
-  rpc DeleteScalingPolicy (DeleteScalingPolicyRequest) returns (DeleteScalingPolicyReply);
-
-  // Lists scaling policies in the namespaces asked for (`legion scaling
-  // list`): every autoscaled task (kind `task`, or `group` for a multi-task
-  // group), every standalone policy (kind `external`), and every node group
-  // (kind `nodes`, listed whatever namespaces are asked for: it has none),
-  // with its mode, bounds, and whether it resolves. Any manager answers:
-  // policies are computed from replicated state.
-  //
-  // ACL: `scale:read`, gated with `AclScope::any()`; entries outside the
-  // caller's grant are left out. Node groups need `node:read`.
-  rpc ListScalingPolicies (ListScalingPoliciesRequest) returns (ListScalingPoliciesReply);
 
   // How many nodes of each node-group template the pending work needs
   // (docs/autoscaling.md, "Capacity demand"; the `nodegroup.pending` input
@@ -566,18 +556,21 @@ service Manager {
   rpc ApplyNamespace (ApplyNamespaceRequest) returns (ApplyNamespaceReply);
 
   // Deletes a namespace. Refused with FAILED_PRECONDITION while it holds
-  // anything (jobs in any state, volumes, snapshots), naming what is in the
-  // way by kind. With `cascade`, stops and destroys every job, then deletes
-  // its volumes and snapshots, then the namespace — synchronously, in that
-  // order, reporting each step. There is no `Terminating` state: a cascade
+  // anything (jobs in any state, volumes, snapshots, objects of
+  // app-declared kinds), naming what is in the way by kind. With `cascade`,
+  // deletes its objects (a kind with a bounded `cleanup` starts it; such an
+  // object no longer holds the namespace), stops and destroys every job,
+  // then deletes its volumes and snapshots, then the namespace —
+  // synchronously, in that order, reporting each step. There is no `Terminating` state: a cascade
   // that fails halfway leaves the namespace present and the call re-runnable,
   // and the final delete is one conditional write, so a submit that races in
   // makes it refuse rather than succeed falsely. `default` cannot be deleted.
   //
   // ACL: `namespace:write` on the namespace; a cascade additionally needs
-  // `job:write` there (and `snapshot:write` when it holds snapshots), so the
-  // right to delete an environment is never a back door to destroying
-  // workloads the caller could not otherwise touch.
+  // `job:write` there (and `snapshot:write` when it holds snapshots, and,
+  // for each object, `write` on its kind's access resource and the
+  // object's `requires`), so the right to delete an environment is never a
+  // back door to destroying workloads the caller could not otherwise touch.
   rpc DeleteNamespace (DeleteNamespaceRequest) returns (DeleteNamespaceReply);
 
   // --- Namespace policies (docs/namespaces.md, "Namespace policies") ---
@@ -2707,6 +2700,15 @@ service Manager {
   // values (kept under `allow_unknown_fields`) it adopts, and how they fare
   // against its schemas.
   //
+  // Object kinds (`kinds`; docs/app-objects.md): each declaration is checked
+  // (a PascalCase name that is not a Legion noun, an object schema under
+  // the extension rules, examples that pass it, an `access` resource whose
+  // scope fits the kind's, `writeRequires` that name permissions, columns
+  // that point into an object), and a kind another installed app or a
+  // bundled manifest declares (ignoring case and plurals) is refused. The
+  // prompt shows each kind and who may write it, and reports objects an
+  // earlier install of the same app left orphaned, which it adopts.
+  //
   // Errors:
   // - InvalidArgument: the manifest does not parse or validate (unknown
   //   fields, a bad name, a missing `version`, a config schema that does
@@ -2766,6 +2768,13 @@ service Manager {
   // with a forced reschedule, which is how a failed upgrade is retried.
   // There is no rollback verb: upgrade again with the previous manifest.
   //
+  // Object kinds: the new manifest may add kinds (checked as at install)
+  // and change existing ones. Every stored object of the app's kinds is
+  // checked against the new schemas and reported in the prompt; objects
+  // that fail stay stored and read as `invalid`. Dropping a kind that still
+  // has objects needs `force`, and leaves them `orphaned`. Changing a
+  // kind's scope while it has objects is refused.
+  //
   // Retry-safe with `idempotency_key`.
   //
   // Errors:
@@ -2775,8 +2784,9 @@ service Manager {
   // - PermissionDenied: the caller lacks `app:write`, a permission, or a
   //   permission behind a page's `rpcs`.
   // - FailedPrecondition: the app is bundled (bundled apps upgrade with the
-  //   binary), or the new manifest drops an extension point jobs use and
-  //   `force` is not set (the message lists them).
+  //   binary), the new manifest drops an extension point jobs use or a
+  //   kind that has objects and `force` is not set (the message lists
+  //   them), or it changes the scope of a kind that has objects.
   // - Any code of the admission chain, as at install.
   rpc UpgradeApp (UpgradeAppRequest) returns (UpgradeAppReply);
 
@@ -2792,6 +2802,10 @@ service Manager {
   // the values stay stored, read as `orphaned`, and are listed in
   // `orphaned_jobs`.
   //
+  // Likewise while objects of the app's kinds exist: they stay stored,
+  // read as `orphaned` (readable and deletable, not writable), and are
+  // counted in `orphaned_objects`. Installing the app again adopts them.
+  //
   // The app's KV under `legion/apps/<name>/` stays unless `purge` is set
   // (which also needs `kv:write` there); `kv_keys` says how many keys were
   // left or deleted. `dry_run` reports all of this and changes nothing.
@@ -2803,7 +2817,8 @@ service Manager {
   //
   // Errors:
   // - FailedPrecondition: the app is bundled (disable it instead), or jobs
-  //   set its jobspec keys and `force` is not set (the message lists them).
+  //   set its jobspec keys or objects of its kinds exist, and `force` is
+  //   not set (the message lists them).
   // - PermissionDenied: `purge` without `kv:write` on the app's prefix.
   rpc UninstallApp (UninstallAppRequest) returns (UninstallAppReply);
 
@@ -2904,6 +2919,257 @@ service Manager {
   //   caller that names no app.
   // - NotFound: `app` is not installed.
   rpc WatchAppExtensions (WatchAppExtensionsRequest) returns (stream AppExtensionEvent);
+
+  // Lists object kinds (docs/app-objects.md; `legion object kinds`,
+  // `legion object explain`): the kinds installed apps declare, and the
+  // kinds left `orphaned` by an app uninstalled (or upgraded to drop them)
+  // with `force` while objects of them remained. Each kind is
+  // `<app>/<Kind>` and comes with its scope, the ACL resource that governs
+  // its objects (`access`), what writing one requires (`requires`), its
+  // immutable fields, cleanup window, `maxObjects`, the spec and status
+  // JSON Schemas, examples, and the columns `legion object list` shows.
+  // This is what an agent authors objects against.
+  //
+  // ACL: filtered per kind. A kind is listed when the caller holds `read`
+  // on its access resource somewhere (for the `object` resource, on that
+  // kind). A caller that may read no kind is refused with the
+  // `object:read` denial. Answers from the stored kind declarations alone.
+  //
+  // Errors:
+  // - Unauthenticated / PermissionDenied: the caller may read no kind.
+  rpc ListObjectKinds (ListObjectKindsRequest) returns (ListObjectKindsReply);
+
+  // Creates or updates one object of an app-declared kind (`legion object
+  // apply -f FILE`). `object_json` is the object as a person writes it:
+  // `{ kind, name, namespace?, labels?, spec }`, where `kind` is qualified
+  // with its app (`gitops/Repo`; the app's part exactly, the kind's in any
+  // case, plural optional). `status` is the app's and is refused here.
+  //
+  // In order, the manager:
+  // 1. resolves the kind among active kinds (an unqualified kind is
+  //    refused, naming the qualified one; an orphaned kind cannot be
+  //    written);
+  // 2. works out the scope: a namespaced object's namespace is the one the
+  //    object names, else the request's `namespace`, else `default`; a
+  //    cluster kind's object has none (a namespace in the object is an
+  //    error; the request's default is ignored with a warning);
+  // 3. checks `write` on the kind's access resource on the object's scope
+  //    before reading anything: for `object`, the namespace (`*` for a
+  //    cluster kind), name, and the `kinds` attribute `<app>/<Kind>`; for
+  //    `job` and `scale`, the namespace with name `*` (namespace-wide);
+  //    for `node`, no instance attributes;
+  // 4. checks the name, the labels, that the namespace exists, and the spec
+  //    against the kind's schema, closed by default, with its defaults
+  //    filled (errors name the path: `spec.brnach: unknown field (did you
+  //    mean branch?)`); a spec over 64 KiB after defaults is refused;
+  // 5. resolves the kind's `requires` against the effective spec and
+  //    checks each, as the caller, with the scope the corresponding core
+  //    RPC builds (`job:write in team-b (from spec.targetNamespace)`,
+  //    `kv:read` on a key the spec names, `host` and `band` as a submit
+  //    carries them), fail-closed;
+  // 6. refuses a change to an `immutable` field, an update of an object
+  //    whose bounded cleanup is running, and, without `force`, a person's
+  //    update of an object an app manages (`managed_by`);
+  // 7. for a kind with `validate`, asks the app (`POST
+  //    /legion/v1/objects/validate` to one allocation, with a viewer
+  //    assertion naming the caller, two seconds). Advisory: its errors
+  //    refuse the apply and its warnings come back in `warnings`, but an
+  //    app that is disabled, unreachable, slow, or answers anything but 200
+  //    lets the write through with a warning (fail open). It is never a
+  //    security check;
+  // 8. writes the spec with its defaults, the labels, and the `authority`
+  //    (the permissions step 5 verified, and who and when). Applying what
+  //    is stored writes nothing. A spec change bumps `generation`; every
+  //    write gets a new `spec_version`; a create gets a `uid` and counts
+  //    against the kind's `max_objects` inside the write. A write by an
+  //    app's own identity stamps `managed_by` with the app.
+  //
+  // `dry_run` runs every step but the write (the app is asked too) and
+  // returns the object as it would be, with `diff`: one line per changed
+  // field (`spec.branch: "main" → "release"`; a `writeOnly` field as
+  // `changed (redacted)`). `expected_version` is a compare-and-set on the
+  // stored `spec_version` (`0` means "create only"); status writes never
+  // move it. Emits `object.applied`.
+  //
+  // Retry-safe: a repeated `idempotency_key` returns the first reply with
+  // `deduplicated` set.
+  //
+  // Errors:
+  // - InvalidArgument: the object does not parse (unknown fields, a
+  //   `status`, a missing `spec`), an unqualified or unknown kind (with a
+  //   did-you-mean), a bad name or labels, a namespace on a cluster kind, a
+  //   spec failing the schema or too large, an immutable change, a pointer
+  //   in `requires` naming something other than strings, or the app
+  //   refused it.
+  // - PermissionDenied: the caller lacks the access resource's `write` or a
+  //   resolved `requires` permission.
+  // - NotFound: the namespace does not exist.
+  // - Unavailable, with error code `KIND_NOT_INSTALLED`: no installed app
+  //   declares a kind of that name; retryable (an app and its objects
+  //   applied together converge on retry).
+  // - Aborted: `expected_version` does not match (the object changed since
+  //   it was read; read it again and apply on top).
+  // - FailedPrecondition: the kind is orphaned; the object is being
+  //   deleted; it is managed by an app and `force` is not set.
+  // - ResourceExhausted: the kind already holds `max_objects` objects.
+  rpc ApplyObject (ApplyObjectRequest) returns (ApplyObjectReply);
+
+  // Shows one object (`legion object get KIND NAME`): its spec (stored,
+  // with defaults) and effective spec (plus defaults of fields an upgrade
+  // added), the status its app reported, the derived `summary` (`Ready`,
+  // `NotReady: <reason>`, `Pending`, …), its `uid`, `generation`,
+  // `spec_version`, labels, `authority`, `managed_by`, who wrote it and
+  // when, and its state: `valid`, `invalid` (the spec fails the kind's
+  // current schema), or `orphaned`. `writeOnly` values read as
+  // `<redacted>`. `kind` may be a short name (`repo`, `repos`) when exactly
+  // one kind has it, else qualified.
+  //
+  // ACL: `read` on the kind's access resource on the object's scope,
+  // checked before the object is looked up, so a caller without it gets
+  // PermissionDenied whether or not the object exists. An orphaned kind's
+  // objects keep its recorded access.
+  //
+  // Errors:
+  // - InvalidArgument: an unknown or ambiguous kind (the message lists the
+  //   qualified names).
+  // - PermissionDenied: the caller may not read objects of the kind there.
+  // - NotFound: no such object.
+  rpc GetObject (GetObjectRequest) returns (GetObjectReply);
+
+  // Lists objects (`legion object list [KIND]`): of one kind, or of every
+  // kind when `kind` is empty, in the selected namespaces (names or
+  // `*`-globs; empty means `default`; `*` every namespace). Cluster-scoped
+  // kinds' objects are listed whatever namespaces are asked for. `labels`
+  // keeps only objects carrying every given label value. Each object comes
+  // with its summary; the reply also carries the listed objects' kinds, for
+  // their columns.
+  //
+  // ACL: gated on `read` on the kind's access resource anywhere (any
+  // kind's, or `object`, when no kind is named), then filtered per object
+  // on its scope.
+  //
+  // Errors:
+  // - InvalidArgument: an unknown or ambiguous kind, or a bad namespace
+  //   selector.
+  // - PermissionDenied: the caller may not read the kind anywhere.
+  rpc ListObjects (ListObjectsRequest) returns (ListObjectsReply);
+
+  // Deletes one object (`legion object delete KIND NAME`). Needs what an
+  // apply needs: `write` on the kind's access resource on the object's
+  // scope (checked before the lookup), then the object's `requires`
+  // resolved against its spec, and `force` for a person deleting an object
+  // an app manages. `expected_version` is a compare-and-set on the stored
+  // `spec_version`.
+  //
+  // For a kind with a bounded `cleanup`, the delete marks the object
+  // deleting (`deleted = false`, `deleting = true`): its spec freezes, its
+  // app sees it on its watch and calls ReleaseObject when it has cleaned
+  // up, and at the kind's deadline (or at once if the kind is orphaned) the
+  // manager removes it anyway (`object.cleanup_abandoned`). `now` skips the
+  // cleanup and removes the object at once, with the same rights. The app's
+  // validate call is never asked. Emits `object.deleting` or
+  // `object.deleted`.
+  //
+  // Retry-safe with `idempotency_key`.
+  //
+  // Errors:
+  // - InvalidArgument: an unknown or ambiguous kind.
+  // - PermissionDenied: the caller may not write objects of the kind there,
+  //   or lacks a resolved `requires` permission.
+  // - NotFound: no such object.
+  // - Aborted: `expected_version` does not match.
+  // - FailedPrecondition: the object is managed by an app and `force` is not
+  //   set.
+  rpc DeleteObject (DeleteObjectRequest) returns (DeleteObjectReply);
+
+  // Streams the calling app's objects (docs/app-objects.md, "Inside the
+  // app"): every object of every active kind the app declares, or of
+  // `kinds`, with its uid, spec (with `writeOnly` values: the owning app is
+  // the only reader that sees them), effective spec, generation,
+  // spec version, the stored status at the time it was read, whether it is
+  // being deleted and the cleanup deadline, its state, and its shard.
+  //
+  // The snapshot comes first, in messages of at most 1,000 objects: the
+  // first has `snapshot` set, the last `snapshot_done`. Later messages carry
+  // upserts (any write of an object: spec, labels, authority, the deleting
+  // mark; or a state that changed with its kind) and tombstones (`deletes`,
+  // with each object's uid). Status writes do not wake the watch. Every
+  // message's `sequence` increases by one. `invalid` objects are included,
+  // flagged; orphaned kinds' objects are not. A reconnect starts with a
+  // fresh snapshot; a uid the app held but the snapshot lacks was deleted.
+  // The manager checks a fingerprint of the app's objects and kinds about
+  // once a second; any manager answers.
+  //
+  // `shard_count` and `shards` split the objects across an app's replicas:
+  // an object belongs to shard FNV-1a-64(`<app>/<Kind>:<namespace>/<name>`,
+  // or `<app>/<Kind>:<name>` for a cluster kind) modulo `shard_count`, the
+  // hash the autoscaler's shard leases use; with 64 shards the filter runs
+  // in the query.
+  //
+  // ACL: app-plane. Only an app's own workload identity may call it (its
+  // `legion` token, through the API socket or as a bearer token, or an ACL
+  // token minted from it), and it returns only that app's objects: `app`
+  // must be empty or name the caller. A management token may name any
+  // installed `app`. An app acting as a viewer (`legion-on-behalf-of`) is
+  // refused. Re-checks the caller's credential periodically.
+  //
+  // Errors:
+  // - Unauthenticated: no credential.
+  // - PermissionDenied: the caller is not an app's workload identity, or
+  //   names another app.
+  // - InvalidArgument: a shard outside `shard_count`, a kind the app does
+  //   not declare, or a management caller that names no app.
+  // - NotFound: `app` is not installed.
+  rpc WatchObjects (WatchObjectsRequest) returns (stream ObjectEvent);
+
+  // Reports one object's status: what the app that owns its kind says
+  // about it (docs/app-objects.md, "Status"). The status is
+  // `{ observed_generation, conditions, fields }`: standard conditions are
+  // `Accepted` (the app understood and accepted the spec) and `Ready`
+  // (reconciled and working); `fields` is the app's own payload, checked
+  // against the kind's status schema. Limits: `fields` at most 16 KiB, at
+  // most 16 conditions, a message at most 1 KiB. Each condition's `since` is
+  // kept by the manager.
+  //
+  // Status is stored on the Status lane, keyed by the object's `uid`, apart
+  // from the spec: it never changes `spec_version`, `generation`, or the
+  // spec, and never wakes a watch. The write is refused unless `uid` is the
+  // current object's, `observed_generation` is not ahead of the generation
+  // this manager sees, and not behind the stored one (it never goes
+  // backwards). Because the Status lane may lag the Control lane, readers
+  // compare `observed_generation` with `generation`. An identical report is
+  // dropped without a write (`written = false`). An `Accepted` or `Ready`
+  // transition emits `object.status_changed`. Status is for facts that
+  // change when the world changes, not per-tick telemetry.
+  //
+  // ACL: app-plane. Only the workload identity of the app that owns the
+  // kind (`kind` is the app's kind name, or qualified), or a management
+  // token. Never a delegated identity, and never a person. Retry-safe with
+  // `idempotency_key`.
+  //
+  // Errors:
+  // - Unauthenticated / PermissionDenied: not the owning app.
+  // - InvalidArgument: a bad condition, `fields` failing the status schema
+  //   or too large; an unknown kind.
+  // - NotFound: no object of that name with that `uid`.
+  // - Aborted: `observed_generation` is ahead of the object, or behind the
+  //   stored status.
+  rpc UpdateObjectStatus (UpdateObjectStatusRequest) returns (UpdateObjectStatusReply);
+
+  // Ends a deleting object's bounded cleanup (docs/app-objects.md,
+  // "Deleting"): the app that owns the kind has released what it held for
+  // the object, and the object is removed (`object.deleted`). `uid` must be
+  // the deleting object's, so a release never removes an object recreated
+  // under the same name.
+  //
+  // ACL: app-plane, like UpdateObjectStatus: the owning app's workload
+  // identity, or a management token. Retry-safe with `idempotency_key`.
+  //
+  // Errors:
+  // - Unauthenticated / PermissionDenied: not the owning app.
+  // - NotFound: no object of that name with that `uid`.
+  // - FailedPrecondition: the object is not being deleted.
+  rpc ReleaseObject (ReleaseObjectRequest) returns (ReleaseObjectReply);
 
   // Lists the UI extensions installed apps register (docs/apps.md, "Views
   // and actions"; docs/ui-architecture.md, "App extensions"): the pages,
@@ -3944,9 +4210,12 @@ message GetJobInfoReply {
 
   // Set when the job's latest version was submitted by the app reconciler:
   // the job belongs to an app (docs/apps.md), and direct writes to it are
-  // refused while the app is installed. Unset for every other job, and for
-  // an app's job whose latest version was stored some other way (which the
-  // reconciler reverts).
+  // refused while the app is installed. Also set, with `object`, when an
+  // app acting for one of its objects (`legion-for-object`) wrote the
+  // latest version: a person may still submit over it, and the app will
+  // likely write it back (docs/app-objects.md, "Acting for an object").
+  // Unset for every other job, and for an app's job whose latest version
+  // was stored some other way (which the reconciler reverts).
   optional ManagedByInfo managed_by = 3;
 
   // What `allow_unknown_fields` kept and dropped when the job's latest
@@ -4034,8 +4303,15 @@ message ManagedByInfo {
 
   // The digest of the render the reconciler submitted. The reconciler
   // compares it with the digest of a fresh render of the app record; a
-  // difference resubmits the job.
+  // difference resubmits the job. Empty when `object` is set.
   string digest = 2;
+
+  // The object the app wrote this version for, acting for it
+  // (`legion-for-object`): `<app>/<Kind>/<namespace>/<name>#<uid>`, the
+  // namespace empty for a cluster kind. `legion job status` shows it as
+  // `managed by gitops for Repo team-a/storefront`. Empty for the app
+  // reconciler's own stamp on an app's job.
+  string object = 3;
 }
 
 // One jobspec key Legion did not know, as `allow_unknown_fields` handled it.
@@ -4974,7 +5250,8 @@ message ScalePin {
 // A pause covering a target (`legion scaling pause`).
 message ScalingPauseInfo {
   // What the pause covers: `all` (cluster-wide), `job`, `task`, or
-  // `policy` (one standalone policy).
+  // `object` (one of the autoscaler's objects: a scaling policy or a node
+  // group).
   string scope = 1;
 
   // When the pause ends, unix milliseconds; unset holds until
@@ -5668,8 +5945,9 @@ message WatchScalingPoliciesRequest {
   bool deltas = 4;
 }
 
-// One message of WatchScalingPolicies: the complete set of effective task
-// policies at one moment. Each message replaces the previous one.
+// One message of WatchScalingPolicies: the effective task policies at one
+// moment (all of them, or what changed), and, for the autoscaler's own
+// identity, the layered defaults and its object targets' scaling state.
 message ScalingPolicySet {
   // Every autoscaled task of every running job in scope, sorted by job id,
   // group, task.
@@ -5686,21 +5964,19 @@ message ScalingPolicySet {
   // against (0: none set).
   uint64 defaults_version = 4;
 
-  // Every standalone policy in scope (`legion scaling apply`), sorted by
-  // namespace and name.
-  repeated StandaloneScalingPolicy standalone = 5;
+  reserved 5;
 
   // Whether this message is the full set (always, without `deltas`; the
-  // first message, with them). When false, `policies` and `standalone` hold
-  // only the policies that are new or changed since the previous message,
+  // first message, with them). When false, `policies` and `objects` hold
+  // only the entries that are new or changed since the previous message,
   // and `removed` the ones that are gone.
   bool full = 6;
 
-  // With `deltas`, the keys of policies gone since the previous message
-  // (their job stopped, their task lost `autoscale`, the policy was
-  // deleted, or it left the requested shards): `<job id>/<group>/<task>`
-  // for a task, `policy:<id>` for a standalone policy. Always empty in a
-  // full set.
+  // With `deltas`, the keys of entries gone since the previous message
+  // (their job stopped, their task lost `autoscale`, they left the
+  // requested shards, or an object target's pause and action row are both
+  // gone): `<job id>/<group>/<task>` for a task, `object:<uid>` for an
+  // object target. Always empty in a full set.
   repeated string removed = 7;
 
   // With `deltas`, a change larger than 1,000 policies is split across
@@ -5709,6 +5985,93 @@ message ScalingPolicySet {
   // on any, so a consumer never acts on half a set. Always false without
   // `deltas`, where every message is one whole set.
   bool more = 8;
+
+  // Autoscaler only: what the app needs to run its objects that only the
+  // manager holds (the layered defaults, the cluster-wide pause). Set on a
+  // full set, and on any message after which it changed; unset means
+  // unchanged since the last message that carried it.
+  ScalingAppContext context = 9;
+
+  // Autoscaler only: each object target's scaling state (its pause and its
+  // action row), keyed `object:<uid>`, for the targets that have either.
+  // In a full set, all of them; with `deltas`, the new or changed ones
+  // (gone ones are in `removed`). Not sharded.
+  repeated ScalingObjectState objects = 10;
+}
+
+// What the autoscaler needs to run its `autoscaler/ScalingPolicy` and
+// `autoscaler/NodeGroup` objects that only the manager holds.
+message ScalingAppContext {
+  // The inherited levels of an autoscale policy (docs/autoscaling.md,
+  // "Overriding the defaults"), which a ScalingPolicy resolves against as
+  // a task's `autoscale` does: the cluster's scaling defaults as written
+  // (the `autoscale` record without `checks`, JSON; `{}` when none are
+  // set)...
+  string cluster_json = 1;
+
+  // ...their version (0 when never applied)...
+  uint64 cluster_version = 2;
+
+  // ...and every namespace policy with an `autoscale` record, by name.
+  repeated ScalingLayerPolicy policies = 3;
+
+  // The cluster-wide pause (`legion scaling pause --all`), when one is
+  // active: it covers every object as it covers every task.
+  ScalingPauseInfo paused_all = 4;
+}
+
+// One namespace policy's `autoscale` defaults.
+message ScalingLayerPolicy {
+  // The namespace policy's name.
+  string name = 1;
+
+  // The namespaces it governs: names or `*`-globs.
+  repeated string namespaces = 2;
+
+  // Its `autoscale` record (JSON).
+  string autoscale_json = 3;
+}
+
+// One of the autoscaler's objects, as a scaling surface names it.
+//
+// In a request (GetScalingStatus, GetScaleHistory, PauseScaling), `kind`
+// may be a short name (`scalingpolicy`, `nodegroups`) or qualified
+// (`autoscaler/ScalingPolicy`), `name` may be `namespace/name`, and `uid`
+// is ignored: the manager resolves the object that exists now. From the
+// app (ReportScalingStatus, RecordScalingAction) every field is set, `kind`
+// qualified, and `uid` is checked.
+message ScalingObjectRef {
+  // `autoscaler/ScalingPolicy` or `autoscaler/NodeGroup`.
+  string kind = 1;
+
+  // The namespace; empty for a node group, which the cluster owns.
+  string namespace = 2;
+
+  // The object's name.
+  string name = 3;
+
+  // The object's uid: its scaling state (history, pause, action intents,
+  // status-board entry) is keyed `object:<uid>`, so a recreated object
+  // never inherits a deleted one's.
+  uint64 uid = 4;
+}
+
+// An object target's scaling state, as WatchScalingPolicies delivers it to
+// the autoscaler.
+message ScalingObjectState {
+  // `object:<uid>`.
+  string key = 1;
+
+  // The object's uid.
+  uint64 uid = 2;
+
+  // Its own pause, if any (the cluster-wide one is in `context`).
+  ScalingPauseInfo pause = 3;
+
+  // Its action row (RecordScalingAction): its version, which the next
+  // intent names, and the latest intent with the drains a node group has in
+  // flight. Unset before the first intent.
+  ScalingAction action = 4;
 }
 
 // One autoscaled task's effective policy.
@@ -5803,9 +6166,10 @@ message ApplyScalingDefaultsReply {
   bool deduplicated = 6;
 }
 
-// How one task's effective policy changes under new defaults.
+// How one policy's effective policy changes under new defaults.
 message ScalingPolicyChange {
-  // `job/group/task`.
+  // `job/group/task` for a task, `autoscaler/ScalingPolicy
+  // <namespace>/<name>` for a scaling policy object.
   string target = 1;
 
   // The effective policy's digest before the change (empty if it was
@@ -5855,6 +6219,13 @@ message GetScalingDefaultsReply {
 
   // The namespace policies governing `namespace` that set `autoscale`.
   repeated string policies = 8;
+
+  // The same policies with their `autoscale` records, so a client can
+  // resolve a policy against this namespace's layers exactly as the
+  // manager does (`legion scaling simulate` on an `autoscaler/ScalingPolicy`
+  // file). Visible to the same callers as `effective`, which already shows
+  // their values.
+  repeated ScalingLayerPolicy governing = 9;
 }
 
 // One field of an effective policy or defaults, and where it came from.
@@ -5947,9 +6318,13 @@ message ScalingTargetReport {
   // State changes worth an event, at most one of each kind per episode.
   repeated ScalingEventFlag events = 11;
 
-  // A standalone policy's canonical id, when the report is for one; the
-  // job, group and task fields are then empty.
-  string policy = 12;
+  reserved 12;
+
+  // The object target (an `autoscaler/ScalingPolicy` or
+  // `autoscaler/NodeGroup`, uid included) when the report is for one; the
+  // job, group and task fields are then empty. Its entry on the status
+  // board is keyed `object:<uid>`.
+  ScalingObjectRef object = 13;
 }
 
 // A state change the autoscaler reports for the manager to record as an
@@ -5996,15 +6371,15 @@ message RecordScalingActionRequest {
   // - `would`: a dry-run policy's decision, recorded as a history row with
   //   `applied = false` (`legion scaling history` shows what the policy
   //   would have done). Names a task (`job_id`, `task_group`, `task_name`)
-  //   or a standalone policy (`policy`), with `from`, `to` and `decision`.
-  // - `intent`: open an action intent on a standalone policy before the
-  //   app acts on its target (calls `target/scale`, starts a drain, calls
-  //   `target/terminate`, forgets a node). Needs `policy`, `intent` and
-  //   `expected_action_version`; written only when the policy's action row
+  //   or an object target (`object`), with `from`, `to` and `decision`.
+  // - `intent`: open an action intent on an object target before the app
+  //   acts on it (calls `target/scale`, starts a drain, calls
+  //   `target/terminate`, forgets a node). Needs `object`, `intent` and
+  //   `expected_action_version`; written only when the object's action row
   //   is still at that version (compare-and-set), so of two autoscaler
   //   replicas whose leases overlap exactly one wins and acts (`won`), and
   //   the other reads the winner's intent from `action` instead. Refused
-  //   with FAILED_PRECONDITION while a pause covers the policy, when the
+  //   with FAILED_PRECONDITION while a pause covers the object, when the
   //   intent changes the count (`desired`) or starts a drain (`cordon`):
   //   a pause holds even against a misbehaving app. Drains already past
   //   their drain step (terminate, forget) and aborts (uncordon) go on
@@ -6030,13 +6405,17 @@ message RecordScalingActionRequest {
   // The decision (`would`, and the history rows of an `intent`).
   ScaleDecision decision = 7;
 
-  // A standalone policy's canonical id, instead of a job, group and task.
-  // Required for `intent` and `outcome`.
-  string policy = 8;
+  reserved 8;
 
-  // `intent` and `outcome`: the version of the policy's action row the
-  // app last read (from WatchScalingPolicies, or the last
-  // RecordScalingAction reply); 0 when the policy has none yet.
+  // The object target, uid included, instead of a job, group and task.
+  // Required for `intent` and `outcome`; NOT_FOUND unless an object of that
+  // kind, namespace, name, and uid exists (it may be being deleted: a node
+  // group's cleanup acts through intents too).
+  ScalingObjectRef object = 14;
+
+  // `intent` and `outcome`: the version of the object's action row the
+  // app last read (from WatchScalingPolicies' `objects`, or the last
+  // RecordScalingAction reply); 0 when the object has none yet.
   uint64 expected_action_version = 9;
 
   // `intent`: what the app is about to do.
@@ -6053,8 +6432,8 @@ message RecordScalingActionRequest {
   string instance = 13;
 }
 
-// What the autoscaler is about to do to a standalone policy's target: the
-// payload of an action intent.
+// What the autoscaler is about to do to an object target: the payload of
+// an action intent.
 message ScalingActionIntent {
   // The decision's id (`legion scaling history` shows it).
   string decision_id = 1;
@@ -6095,11 +6474,11 @@ message ScalingActionNode {
   string provider_id = 2;
 }
 
-// A standalone policy's action row: its latest action intent and how it
+// An object target's action row: its latest action intent and how it
 // ended.
 message ScalingAction {
-  // The policy's canonical id.
-  string policy = 1;
+  // The target key: `object:<uid>`.
+  string target = 1;
 
   // The row's version: the compare-and-set token the next intent or
   // outcome names. Never repeats.
@@ -6136,8 +6515,8 @@ message RecordScalingActionReply {
   // nothing was written, and `action` is the row as it is.
   bool won = 2;
 
-  // `intent` and `outcome`: the policy's action row after the call (unset
-  // when the policy has none).
+  // `intent` and `outcome`: the object's action row after the call (unset
+  // when it has none).
   ScalingAction action = 3;
 }
 
@@ -6160,10 +6539,13 @@ message GetScalingStatusRequest {
   // provenance (`legion scaling explain`).
   bool detail = 5;
 
-  // One standalone policy, by canonical id (`namespace/name`, or `name` in
-  // `default`), instead of `job`. Without `job` or `policy`, standalone
-  // policies in `namespaces` are listed after the tasks.
-  string policy = 6;
+  reserved 6;
+
+  // One of the autoscaler's objects instead of `job` (`kind` short or
+  // qualified, `name` or `namespace/name`). Without `job` or `object`, the
+  // objects in `namespaces` (and every node group) are listed after the
+  // tasks.
+  ScalingObjectRef object = 7;
 }
 
 // Reply payload for GetScalingStatus.
@@ -6322,21 +6704,23 @@ message ScalingTargetStatus {
   // The policy in one line (`2..8, cpu 70%, enforce`).
   string policy_summary = 22;
 
-  // A standalone policy's canonical id; the job, group and task fields are
-  // then empty, and `now` is the count its target last reported. (`policy`
-  // is the effective policy's provenance, above.)
-  string policy_id = 23;
+  reserved 23;
 
   // `task`, `group` (a task's whole group moves together), `external`
-  // (a standalone policy's target plugin), or `nodes` (a node group:
-  // `now` is the count its provider holds, and `decision_json` is the node
-  // group's decision, with its victims and protected members).
+  // (an `autoscaler/ScalingPolicy`'s target plugin), or `nodes` (an
+  // `autoscaler/NodeGroup`: `now` is the count its provider holds, and
+  // `decision_json` is the node group's decision, with its victims and
+  // protected members).
   string kind = 24;
 
   // The autoscaler replica whose report this is (`alloc 41`): the one that
   // holds the target's shard (docs/autoscaling.md, "Replicas"). Empty when
   // no replica has reported the target.
   string instance = 25;
+
+  // The object, for `external` and `nodes`: the job, group and task fields
+  // are then empty, and `now` is the count its target last reported.
+  ScalingObjectRef object = 26;
 }
 
 // Request payload for GetScaleHistory.
@@ -6357,8 +6741,11 @@ message GetScaleHistoryRequest {
   // resolves to.
   bool detail = 5;
 
-  // A standalone policy's canonical id, instead of `job`.
-  string policy = 6;
+  reserved 6;
+
+  // One of the autoscaler's objects instead of `job` (`kind` short or
+  // qualified, `name` or `namespace/name`): the current object's history.
+  ScalingObjectRef object = 7;
 }
 
 // Reply payload for GetScaleHistory.
@@ -6404,8 +6791,9 @@ message ScaleHistoryEntry {
   bool applied = 11;
 
   // `scaled`, `deferred` (a scale-in waiting for a rollout), `would` (a
-  // dry-run decision), `pinned`, `released`, `reset`, or `failed` (a
-  // standalone policy's target refused the change recorded just before).
+  // dry-run decision), `pinned`, `released`, `reset`, or `failed` (an
+  // object target's plugin refused the change recorded just before); for a
+  // node group also `drain`, `terminate`, `forget`, and `uncordon`.
   string kind = 12;
 
   // The digest of the effective policy that decided; empty for people.
@@ -6420,9 +6808,11 @@ message ScaleHistoryEntry {
   // The decision's id, if any.
   string decision_id = 16;
 
-  // A standalone policy's canonical id, when the row is one's; the job,
-  // group and task fields are then empty.
-  string policy = 17;
+  reserved 17;
+
+  // The object, when the row is an object target's; the job, group and
+  // task fields are then empty.
+  ScalingObjectRef object = 18;
 }
 
 // Request payload for PauseScaling.
@@ -6451,9 +6841,12 @@ message PauseScalingRequest {
   // Optional idempotency key. See `RunJobRequest.idempotency_key`.
   optional string idempotency_key = 8;
 
-  // A standalone policy's canonical id, instead of `job`. Needs
-  // `scale:write` on the policy.
-  string policy = 9;
+  reserved 9;
+
+  // One of the autoscaler's objects instead of `job` (`kind` short or
+  // qualified, `name` or `namespace/name`). Needs what writing the object
+  // needs.
+  ScalingObjectRef object = 10;
 }
 
 // Reply payload for PauseScaling.
@@ -6469,218 +6862,6 @@ message PauseScalingReply {
   // When the pause ends, unix milliseconds; unset for "until resumed" and
   // for a resume.
   optional int64 until_unix_ms = 3;
-}
-
-// Request payload for ApplyScalingPolicy.
-message ApplyScalingPolicyRequest {
-  // The policy as JSON (the CLI evaluates a Nickel file to it). See the
-  // RPC's comment and docs/autoscaling.md, "Standalone policies".
-  string spec_json = 1;
-
-  // The namespace the policy belongs to when `spec_json` names none: the
-  // CLI's `-n`, else `default`. A `namespace` in the spec wins.
-  string namespace = 2;
-
-  // Validate, resolve, and diff against the stored version; write nothing.
-  bool dry_run = 3;
-
-  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
-  optional string idempotency_key = 4;
-}
-
-// Reply payload for ApplyScalingPolicy.
-message ApplyScalingPolicyReply {
-  // The policy's canonical id: `name` in `default`, `namespace/name`
-  // elsewhere.
-  string id = 1;
-
-  // `external` (a target plugin) or `nodes` (a node group).
-  string kind = 2;
-
-  // The version now stored: unchanged when the policy was (or, with
-  // `dry_run`, would be). Versions come from a Control-lane counter and
-  // never repeat, across deletes too.
-  uint64 version = 3;
-
-  // The policy did not exist before.
-  bool created = 4;
-
-  // The stored policy changed (or would, with `dry_run`).
-  bool changed = 5;
-
-  // Field-by-field differences against the stored version, `field: old ->
-  // new`, in the effective policy's terms (so a change to an inherited
-  // default shows too). Empty when created or unchanged.
-  repeated string diff = 6;
-
-  // For people: `scaling policy media/render-farm: created (v3)`.
-  string message = 7;
-
-  // A replay of an earlier request with the same idempotency key: nothing
-  // was written and only `message` is set.
-  bool deduplicated = 8;
-
-  // The effective policy the autoscaler will run, as canonical JSON (the
-  // same shape `ScalingPolicy.policy_json` carries).
-  string policy_json = 9;
-
-  // Its digest.
-  string digest = 10;
-
-  // Every field of the effective policy with the level it came from
-  // (built-in, cluster defaults, a namespace policy, or `policy` for the
-  // file itself, shown as `jobspec`).
-  repeated ScalingProvenanceRow provenance = 11;
-
-  // The request was a dry run.
-  bool dry_run = 12;
-}
-
-// Request payload for DeleteScalingPolicy.
-message DeleteScalingPolicyRequest {
-  // The policy's name, or its canonical id (`namespace/name`).
-  string name = 1;
-
-  // The namespace, when `name` is bare: the CLI's `-n`, else `default`.
-  string namespace = 2;
-
-  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
-  optional string idempotency_key = 3;
-}
-
-// Reply payload for DeleteScalingPolicy.
-message DeleteScalingPolicyReply {
-  // For people: `scaling policy media/render-farm: deleted (was v3)`.
-  string message = 1;
-
-  // A replay of an earlier request with the same idempotency key.
-  bool deduplicated = 2;
-
-  // The deleted policy's canonical id.
-  string id = 3;
-}
-
-// Request payload for ListScalingPolicies.
-message ListScalingPoliciesRequest {
-  // Namespaces to list, as names or `*`-globs (`["*"]` for every namespace
-  // the caller can read). Empty means `default`.
-  repeated string namespaces = 1;
-
-  // Also return each standalone policy's spec as written (`spec_json`).
-  bool detail = 2;
-}
-
-// Reply payload for ListScalingPolicies.
-message ListScalingPoliciesReply {
-  // Task targets first (by job, group, task), then standalone policies (by
-  // namespace and name).
-  repeated ScalingPolicySummary policies = 1;
-}
-
-// One scaling policy in a listing.
-message ScalingPolicySummary {
-  // The target's label: `job/group/task` for a task, the canonical policy
-  // id (`namespace/name`, or `name` in `default`) for a standalone policy.
-  string id = 1;
-
-  // `task`, `group` (a task's whole group moves together), `external`, or
-  // `nodes` (a node group).
-  string kind = 2;
-
-  // The namespace (empty for a node group).
-  string namespace = 3;
-
-  // The effective mode: `enforce` or `dry-run`. Empty when invalid.
-  string mode = 4;
-
-  // The effective floor. 0 when invalid.
-  uint32 min = 5;
-
-  // The effective ceiling. 0 when invalid.
-  uint32 max = 6;
-
-  // `ok`, or `invalid` when the policy does not resolve against the current
-  // defaults and installed plugins (see `error`).
-  string state = 7;
-
-  // Why the policy is invalid.
-  string error = 8;
-
-  // What it scales: `job web` for a task's (or group's) policy, `plugin
-  // render-exec` for an external target.
-  string target = 9;
-
-  // A standalone policy's version; 0 for a task (its job has versions).
-  uint64 version = 10;
-
-  // The policy in one line: `0..50, queue (per-replica 10), enforce`.
-  string summary = 11;
-
-  // A standalone policy's description.
-  string description = 12;
-
-  // Who last applied a standalone policy, and when (unix ms).
-  string updated_by = 13;
-  int64 updated_at_unix_ms = 14;
-
-  // With `detail`: a standalone policy as written.
-  string spec_json = 15;
-}
-
-// A standalone scaling policy, as WatchScalingPolicies delivers it to the
-// autoscaler.
-message StandaloneScalingPolicy {
-  // The canonical id (`namespace/name`, or `name` in `default`).
-  string id = 1;
-
-  // Its namespace.
-  string namespace = 2;
-
-  // Its name.
-  string name = 3;
-
-  // `external` (a target plugin), or `nodes` (a node group, whose
-  // namespace is empty: it belongs to the cluster).
-  string kind = 4;
-
-  // The stored version.
-  uint64 version = 5;
-
-  // `ok`, or `invalid` (see `error`): the policy no longer resolves against
-  // the defaults, or a plugin it names was removed from the autoscaler's
-  // app config or no longer allows its namespace. An invalid policy is
-  // held and reported, never acted on.
-  string state = 6;
-
-  // Why it is invalid.
-  string error = 7;
-
-  // The effective policy's digest.
-  string digest = 8;
-
-  // The effective policy as canonical JSON: the shape of
-  // `ScalingPolicy.policy_json` for an external target, the node group's
-  // effective record (every default filled) for a node group. Empty when
-  // invalid.
-  string policy_json = 9;
-
-  // The target plugin.
-  string target_plugin = 10;
-
-  // The target plugin's per-policy config, as JSON (`{}` when unset).
-  string target_config_json = 11;
-
-  // The pause that covers this policy (its own, or the cluster-wide one),
-  // if any.
-  ScalingPauseInfo pause = 12;
-
-  // The policy in one line.
-  string summary = 13;
-
-  // The policy's action row (RecordScalingAction): its version, which the
-  // next intent names, and the latest intent with the drains a node group
-  // has in flight. Unset before the first intent.
-  ScalingAction action = 14;
 }
 
 // Request payload for DestroyJob.
@@ -14336,7 +14517,10 @@ message WhoAmIReply {
   // `delegated` (an app's own credential presenting a viewer's assertion in
   // `legion-on-behalf-of`: `principal` is `<viewer> via app <app>`, and
   // `rules_json` the one rule the delegation holds, plus any deny rules the
-  // app or the viewer carry).
+  // app or the viewer carry), `for-object` (an app's own credential naming
+  // one of its objects in `legion-for-object`: `principal` is `<app> for
+  // <Kind> <namespace>/<name>`, and `rules_json` the object's recorded
+  // authority the app's grant covers, plus the app's deny rules).
   string source = 3;
 
   // Human-readable principal: token name, `user:<name>`, JWT subject, or
@@ -14890,6 +15074,9 @@ message App {
   // another app (docs/apps.md, "What Legion renders"). 0 in a dry run's
   // reply, before the store assigns one.
   uint32 uid = 25;
+
+  // The object kinds the app declares (docs/app-objects.md).
+  repeated ObjectKind kinds = 26;
 }
 
 // One jobspec key an installed app adds (App.extension_keys,
@@ -15034,6 +15221,554 @@ message AppExtensionValueRef {
   ExtensionPath path = 3;
 }
 
+// A column `legion object list` shows for a kind.
+message ObjectKindColumn {
+  // The header.
+  string name = 1;
+
+  // A JSON pointer into the object (`/spec/url`, `/status/fields/commit`).
+  string pointer = 2;
+}
+
+// One object kind (ListObjectKinds, App.kinds).
+message ObjectKind {
+  // The kind's name as declared (`Repo`). The kind is `<app>/<name>`.
+  string name = 1;
+
+  // The app that declares it, and that app's version (empty once the kind
+  // is orphaned and the app uninstalled).
+  string app = 2;
+  string app_version = 3;
+
+  // `<app>/<Kind>`: the kind's name in files and the API, and what ACL
+  // `kinds` selectors match.
+  string qualified = 4;
+
+  string description = 5;
+
+  // `namespaced` (each object lives in a namespace) or `cluster`.
+  string scope = 6;
+
+  // The spec's JSON Schema (draft 7) as declared, as JSON. It is checked
+  // closed: a schema with `properties` and neither `additionalProperties`
+  // nor `patternProperties` refuses other fields (composition branches
+  // excepted). Its defaults are filled at write.
+  string schema_json = 7;
+
+  // The JSON Schema of the status `fields`, as JSON; empty when the kind
+  // declares none (any object).
+  string status_schema_json = 8;
+
+  // Example specs, as a JSON array; each passes the schema.
+  string examples_json = 9;
+
+  // Whether every apply that changes the spec also asks the app (`POST
+  // /legion/v1/objects/validate`). Advisory, failing open.
+  bool validate = 10;
+
+  // The ACL resource that governs the kind's objects: `object` (the
+  // default, scoped by namespace, name, and `kinds`), `job` or `scale`
+  // (namespace-wide), or `node`.
+  string access = 11;
+
+  // What writing an object requires, one line per entry (`job:write in the
+  // namespace spec.targetNamespace names`); `requires_json` has the
+  // declarations.
+  repeated string requires = 12;
+  string requires_json = 13;
+
+  // The columns `legion object list` shows.
+  repeated ObjectKindColumn columns = 14;
+
+  // Whether the owning app is installed and enabled. A disabled app's kinds
+  // still take writes (the validate call fails open); nothing acts on them.
+  bool app_enabled = 15;
+
+  // `active`, or `orphaned`: its app was uninstalled, or dropped it, with
+  // `force`; its objects stay readable and deletable with this kind's
+  // access, and cannot be written.
+  string state = 16;
+
+  // JSON pointers into the object an update may not change (`/spec/url`).
+  repeated string immutable = 17;
+
+  // How long a delete waits for the app to release an object (`10m`);
+  // empty deletes at once.
+  string cleanup = 18;
+
+  // The most objects of the kind the cluster holds.
+  uint64 max_objects = 19;
+
+  // JSON pointers below the spec of `writeOnly` values, which every read
+  // but the owning app's watch shows as `<redacted>` (`*` for every key or
+  // item).
+  repeated string write_only = 20;
+
+  // The digest of the manifest the declaration came from.
+  string manifest_digest = 21;
+
+  // The kind's CEL validation rules, in declaration order. Every apply
+  // (dry runs too) evaluates them in the manager after the schema and
+  // `immutable` checks and before `requires`, and is refused, naming every
+  // failing rule's message at its path, when any fails, errors, or runs
+  // past its budget (10 ms per rule, 50 ms per write). Stored objects are
+  // judged against them on read: one that fails reads `invalid`.
+  repeated ObjectKindRule rules = 22;
+}
+
+// One CEL validation rule of a kind (`kinds[].rules[]` in the app manifest;
+// docs/app-objects.md, "Validation rules").
+message ObjectKindRule {
+  // The CEL expression, as declared, that must be true. `self` is the
+  // effective spec (defaults filled); `oldSelf` is the stored spec on an
+  // update.
+  string rule = 1;
+
+  // What a failure says.
+  string message = 2;
+
+  // The JSON pointer into the object (`/spec/min`) a failure is reported
+  // at; empty for the spec as a whole.
+  string path = 3;
+
+  // Whether the rule uses `oldSelf`: a transition rule, checked on updates
+  // only (never on create, and never when a stored object is judged on
+  // read).
+  bool transition = 4;
+}
+
+// Request payload for ListObjectKinds.
+message ListObjectKindsRequest {
+  // Only this app's kinds; empty for every app's.
+  string app = 1;
+}
+
+// Reply payload for ListObjectKinds.
+message ListObjectKindsReply {
+  // The kinds the caller may read, by app and name.
+  repeated ObjectKind kinds = 1;
+}
+
+// One condition of an object's status.
+message ObjectCondition {
+  // PascalCase: `Accepted`, `Ready`, or the app's own.
+  string type = 1;
+
+  // `true`, `false`, or `unknown`.
+  string status = 2;
+
+  // PascalCase, machine-readable (`Synced`, `RepoUnreachable`).
+  string reason = 3;
+
+  // For people, at most 1 KiB.
+  string message = 4;
+
+  // When `status` last changed (RFC 3339), kept by the manager.
+  string since = 5;
+}
+
+// An object's status, as its app reported it.
+message ObjectStatus {
+  // The spec generation the status describes. Lower than the object's
+  // `generation` means the app has not caught up with the spec yet.
+  uint64 observed_generation = 1;
+
+  repeated ObjectCondition conditions = 2;
+
+  // The app's own payload, as JSON, checked against the kind's status
+  // schema.
+  string fields_json = 3;
+
+  // Who reported it (the app's principal), and when (Unix milliseconds).
+  string updated_by = 4;
+  int64 updated_at_unix_ms = 5;
+}
+
+// The permissions an object's writer was checked for, from the kind's
+// `requires`, recorded on the object.
+message ObjectAuthority {
+  // One line per permission: `job:write in team-b (from
+  // spec.targetNamespace)`.
+  repeated string permissions = 1;
+
+  // The same, as JSON.
+  string permissions_json = 2;
+
+  // Who authorized them (principal, and accessor id when the credential has
+  // one), and when (Unix milliseconds).
+  string authorized_by = 3;
+  string accessor = 4;
+  int64 authorized_at_unix_ms = 5;
+
+  // Whether the authorizer still holds the authority, when the request
+  // asked (`ListObjectsRequest.authority_lapsed`): `held`, `lapsed` (the
+  // token was deleted or expired, or no longer holds a permission), or
+  // `unknown` (no accessor to re-resolve: a JWT or SSO login, or an app's
+  // workload identity). Empty when not asked.
+  string check = 6;
+
+  // Why, for `lapsed` and `unknown`: `the token (accessor 0f3a…) was
+  // deleted`, `no longer holds job:write in team-b`.
+  string check_detail = 7;
+}
+
+// One object of an app-declared kind.
+message AppObject {
+  // The app that owns the kind, the kind's name as declared, and
+  // `<app>/<Kind>`.
+  string app = 1;
+  string kind = 2;
+  string qualified_kind = 3;
+
+  // The namespace; empty for a cluster-scoped kind.
+  string namespace = 4;
+
+  // The object's name: a DNS label, unique within its kind and namespace.
+  string name = 5;
+
+  // `namespace/name`, or `name` for a cluster-scoped kind.
+  string id = 6;
+
+  // Never reused, even across a delete and a recreate of the same name.
+  // Status, the watch's tombstones, and an app's own records key on it.
+  uint64 uid = 7;
+
+  // Labels, string to string (ListObjects filters by them).
+  map<string, string> labels = 8;
+
+  // The spec as stored (with the defaults of its write-time schema), and
+  // effective (plus defaults of fields added since), as JSON. `writeOnly`
+  // values read `<redacted>` everywhere but the owning app's watch.
+  string spec_json = 9;
+  string effective_json = 10;
+
+  // Starts at 1 and bumps when the spec changes.
+  uint64 generation = 11;
+
+  // The compare-and-set token: new on every write of the spec, labels,
+  // authority, or the deleting mark; never moved by a status report.
+  uint64 spec_version = 12;
+
+  // What the app reported, if anything.
+  ObjectStatus status = 13;
+
+  // The derived summary, whatever the kind: `Pending`, `Ready`,
+  // `NotReady: <reason>`, `Rejected: <reason>`, `Accepted` (an app that
+  // reports only `Accepted`), `Stale` (the owning app is disabled or not
+  // running), `Invalid`, `Orphaned`, or `Deleting`. `summary_detail` is the
+  // condition's reason and message.
+  string summary = 14;
+  string summary_detail = 15;
+
+  // `valid`, `invalid` (the spec fails the kind's current schema), or
+  // `orphaned` (its kind is); `detail` says why.
+  string state = 16;
+  string detail = 17;
+
+  // What its writer was checked for.
+  ObjectAuthority authority = 18;
+
+  // The app whose own identity last wrote it; empty when a person did.
+  string managed_by = 19;
+
+  // A bounded cleanup is running: when it started and its deadline (Unix
+  // milliseconds).
+  bool deleting = 20;
+  int64 deleting_since_unix_ms = 21;
+  int64 cleanup_deadline_unix_ms = 22;
+
+  // Who created it and last wrote it, and when (Unix milliseconds).
+  string created_by = 23;
+  int64 created_at_unix_ms = 24;
+  string updated_by = 25;
+  int64 updated_at_unix_ms = 26;
+
+  // The digest of the schema its spec was checked against at its last
+  // write.
+  string schema_digest = 27;
+
+  // The watch shard it belongs to (WatchObjects with `shard_count`; 0
+  // otherwise).
+  uint32 shard = 28;
+}
+
+// Request payload for ApplyObject.
+message ApplyObjectRequest {
+  // The object as JSON: `{ kind = "<app>/<Kind>", name, namespace?,
+  // labels?, spec }` (the CLI evaluates a Nickel file first). `status` is
+  // refused.
+  string object_json = 1;
+
+  // The namespace a namespaced object goes in when it names none (the
+  // CLI's `-n`, else `LEGION_NAMESPACE`); empty means `default`. Ignored,
+  // with a warning, for a cluster-scoped kind.
+  string namespace = 2;
+
+  // Validate (the app's validate call included) and diff without writing.
+  bool dry_run = 3;
+
+  // Compare-and-set on the stored `spec_version`: `0` creates only; any
+  // other value must equal it. Unset writes whatever is stored.
+  optional uint64 expected_version = 4;
+
+  // Optional key to dedupe retries; a repeat returns the first reply with
+  // `deduplicated = true`.
+  optional string idempotency_key = 5;
+
+  // Update an object an app manages (`managed_by`).
+  bool force = 6;
+}
+
+// Reply payload for ApplyObject.
+message ApplyObjectReply {
+  // The object as stored (on a dry run, as it would be).
+  AppObject object = 1;
+
+  // It did not exist.
+  bool created = 2;
+
+  // The spec, labels, or authority changed (false: the same object again,
+  // nothing written).
+  bool changed = 3;
+
+  // One line per changed field, against the stored object.
+  repeated string diff = 4;
+
+  // The app's warnings, a validate call that failed open, and an ignored
+  // default namespace.
+  repeated string warnings = 5;
+
+  // Human-readable status message.
+  string message = 6;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 7;
+
+  // Echoes the request: nothing was written.
+  bool dry_run = 8;
+}
+
+// Request payload for GetObject.
+message GetObjectRequest {
+  // The kind: qualified (`gitops/Repo`), or a short name (`repo`, `repos`)
+  // exactly one kind has.
+  string kind = 1;
+
+  // The object's name, or `namespace/name` for a namespaced kind.
+  string name = 2;
+
+  // The namespace, when `name` names none; empty means `default`. Ignored
+  // for a cluster-scoped kind.
+  string namespace = 3;
+}
+
+// Reply payload for GetObject.
+message GetObjectReply {
+  AppObject object = 1;
+
+  // The object's kind.
+  ObjectKind kind = 2;
+}
+
+// Request payload for ListObjects.
+message ListObjectsRequest {
+  // The kind (qualified, or a short name exactly one kind has); empty lists
+  // every kind's objects.
+  string kind = 1;
+
+  // Namespaces to list: names or `*`-globs; empty means `default`, `*`
+  // every namespace the caller can read. Cluster-scoped kinds' objects are
+  // listed whatever is asked for.
+  repeated string namespaces = 2;
+
+  // Only objects carrying every one of these labels with these values.
+  map<string, string> labels = 3;
+
+  // Only objects whose recorded authority may have lapsed: the principal
+  // that last authorized the object (`authority.authorized_by`) no longer
+  // holds every permission it was checked for, or cannot be re-resolved.
+  // Each listed object's `authority.check` says which (`lapsed` or
+  // `unknown`) and `authority.check_detail` why. The authorizer is
+  // re-resolved through its ACL token's accessor, as a request with that
+  // token would authenticate now: a deleted or expired token is `lapsed`;
+  // a writer with no accessor (a JWT or SSO login, or an app's workload
+  // identity) is `unknown`. Authority is never revoked by this: an app
+  // keeps acting within it until someone re-applies the object, which
+  // re-authorizes it as them (docs/app-objects.md, "Acting for an
+  // object"). Needs `acl:read` besides read on the listed objects, since it
+  // reveals what other principals hold. Ignored when ACLs are disabled
+  // (nothing lapses).
+  bool authority_lapsed = 4;
+}
+
+// Reply payload for ListObjects.
+message ListObjectsReply {
+  // The objects the caller may read, by app, kind, namespace, and name.
+  repeated AppObject objects = 1;
+
+  // The kinds among them, for their columns.
+  repeated ObjectKind kinds = 2;
+}
+
+// Request payload for DeleteObject.
+message DeleteObjectRequest {
+  // The kind: qualified, or a short name exactly one kind has.
+  string kind = 1;
+
+  // The object's name, or `namespace/name`.
+  string name = 2;
+
+  // The namespace, when `name` names none; empty means `default`. Ignored
+  // for a cluster-scoped kind.
+  string namespace = 3;
+
+  // Compare-and-set: the stored `spec_version` must be this one.
+  optional uint64 expected_version = 4;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 5;
+
+  // Skip the kind's bounded cleanup: remove the object at once (also ends
+  // a cleanup already running).
+  bool now = 6;
+
+  // Delete an object an app manages (`managed_by`).
+  bool force = 7;
+}
+
+// Reply payload for DeleteObject.
+message DeleteObjectReply {
+  // Human-readable status message.
+  string message = 1;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 2;
+
+  // The object as it was (or, while deleting, as it is).
+  AppObject object = 3;
+
+  // The object is gone.
+  bool deleted = 4;
+
+  // A bounded cleanup started (or was already running): the object stays
+  // until its app releases it or `cleanup_deadline_unix_ms` passes.
+  bool deleting = 5;
+}
+
+// Request payload for WatchObjects.
+message WatchObjectsRequest {
+  // The app whose objects to watch: empty (or the caller's own name) for
+  // an app's identity; required for a management token.
+  string app = 1;
+
+  // Only these of the app's kinds (as declared, or qualified); empty for
+  // every kind it declares.
+  repeated string kinds = 2;
+
+  // How many shards objects split into. 0 (or 1) means one shard: every
+  // object.
+  uint32 shard_count = 3;
+
+  // The shards to watch, each below `shard_count`. Empty watches every
+  // shard.
+  repeated uint32 shards = 4;
+}
+
+// Identifies an object WatchObjects no longer reports: a tombstone.
+message ObjectRef {
+  string app = 1;
+  string kind = 2;
+  // Empty for a cluster-scoped kind.
+  string namespace = 3;
+  string name = 4;
+  uint64 uid = 5;
+}
+
+// One message of WatchObjects.
+message ObjectEvent {
+  // True on the first message of the snapshot: a consumer starts a fresh
+  // set (the snapshot may span several messages).
+  bool snapshot = 1;
+
+  // True on the last message of the snapshot: the set is complete, and a
+  // uid it lacks was deleted.
+  bool snapshot_done = 2;
+
+  // Objects: the snapshot's, then those new or changed since the previous
+  // message.
+  repeated AppObject upserts = 3;
+
+  // Objects that are gone since the previous message (deleted, or no
+  // longer the app's).
+  repeated ObjectRef deletes = 4;
+
+  // Increases by one with every message on this stream.
+  uint64 sequence = 5;
+}
+
+// Request payload for UpdateObjectStatus.
+message UpdateObjectStatusRequest {
+  // The kind: the calling app's kind name, or qualified.
+  string kind = 1;
+
+  // The object's namespace (empty for a cluster-scoped kind), name, and
+  // uid.
+  string namespace = 2;
+  string name = 3;
+  uint64 uid = 4;
+
+  // The spec generation this status describes.
+  uint64 observed_generation = 5;
+
+  // The conditions (`Accepted`, `Ready`, or the app's own).
+  repeated ObjectCondition conditions = 6;
+
+  // The app's own payload, as a JSON object; empty for `{}`.
+  string fields_json = 7;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 8;
+}
+
+// Reply payload for UpdateObjectStatus.
+message UpdateObjectStatusReply {
+  // The object, with the status now stored.
+  AppObject object = 1;
+
+  // Whether a write happened (an identical report is dropped).
+  bool written = 2;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+
+  // Human-readable status message.
+  string message = 4;
+}
+
+// Request payload for ReleaseObject.
+message ReleaseObjectRequest {
+  // The kind: the calling app's kind name, or qualified.
+  string kind = 1;
+
+  // The deleting object's namespace (empty for a cluster-scoped kind),
+  // name, and uid.
+  string namespace = 2;
+  string name = 3;
+  uint64 uid = 4;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 5;
+}
+
+// Reply payload for ReleaseObject.
+message ReleaseObjectReply {
+  // Human-readable status message.
+  string message = 1;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 2;
+}
+
 // Request payload for GetApp.
 message GetAppRequest {
   // The app's name.
@@ -15122,12 +15857,13 @@ message UpgradeAppRequest {
   // stored config, which must then match the new manifest's schema.
   optional string config_json = 7;
 
-  // Upgrade even though jobs set a jobspec key at an extension point the
-  // new manifest no longer declares. Their values stay stored, flagged
-  // `orphaned`, and each such job's next submit fails until the key is
-  // removed (or `--allow-unknown-fields` is passed). Without it, such an
-  // upgrade is refused (`FAILED_PRECONDITION`) naming the jobs, as
-  // `UninstallApp` is.
+  // Upgrade even though the new manifest drops what is still in use:
+  // a jobspec key at an extension point jobs set (their values stay
+  // stored, flagged `orphaned`, and each such job's next submit fails until
+  // the key is removed or `--allow-unknown-fields` is passed), or an object
+  // kind that still has objects (they stay stored, read as `orphaned`:
+  // readable and deletable, not writable). Without it, such an upgrade is
+  // refused (`FAILED_PRECONDITION`) naming them, as `UninstallApp` is.
   bool force = 8;
 }
 
@@ -15184,9 +15920,11 @@ message UninstallAppRequest {
   // Optional key to dedupe retries.
   optional string idempotency_key = 2;
 
-  // Uninstall even though jobs set the app's jobspec keys. Their values
-  // stay stored, flagged `orphaned`; resubmitting such a job fails unless
-  // the key is removed or `--allow-unknown-fields` is passed.
+  // Uninstall even though jobs set the app's jobspec keys, or objects of
+  // its kinds exist. The values stay stored, flagged `orphaned`;
+  // resubmitting such a job fails unless the key is removed or
+  // `--allow-unknown-fields` is passed. The objects stay stored, read as
+  // `orphaned`: readable and deletable, not writable.
   bool force = 3;
 
   // Also delete every KV key under `legion/apps/<name>/`, the app's own
@@ -15222,6 +15960,10 @@ message UninstallAppReply {
 
   // Whether `kv_keys` were deleted (`purge`) or are left behind.
   bool purged = 6;
+
+  // How many objects of the app's kinds are now orphaned (with `force`),
+  // or would be (`dry_run`).
+  uint64 orphaned_objects = 7;
 }
 
 // Request payload for SetAppEnabled.
@@ -17236,6 +17978,10 @@ message NamespaceCounts {
 
   // Snapshots of a job in the namespace.
   uint32 snapshots = 3;
+
+  // Objects of app-declared kinds in the namespace (docs/app-objects.md),
+  // not counting ones whose bounded cleanup is running.
+  uint32 objects = 4;
 }
 
 // What a namespace holds, by id.
@@ -17248,6 +17994,11 @@ message NamespaceContents {
 
   // Snapshot ids.
   repeated string snapshots = 3;
+
+  // Objects of app-declared kinds, as `<app>/<Kind> <name>`. A namespace
+  // holding any is not deleted without `cascade`, which deletes them with
+  // the caller's access to each kind and each object's `requires` checked.
+  repeated string objects = 4;
 }
 
 // One ACL policy rule that reaches a namespace: an allow rule over a
