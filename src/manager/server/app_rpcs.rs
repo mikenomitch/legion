@@ -142,6 +142,27 @@ fn reconciler_identity(record: &AppRecord) -> AclIdentity {
     }
 }
 
+/// The first permission behind a page's `rpcs` that `identity` does not hold
+/// everywhere the RPC reaches, worded as the refusal (docs/apps.md, "Which
+/// RPCs a page may call"). A page runs its RPCs as whoever views it, so
+/// installing one takes holding what it can make any viewer do.
+fn page_rpc_refusal(identity: &AclIdentity, manifest: &AppManifest) -> Option<String> {
+    let ui = manifest.ui_spec().ok()?;
+    for page in &ui.pages {
+        for rpc in &page.rpcs {
+            let rules = crate::structs::app_ui::page_rpc_rules(rpc);
+            let who = format!(
+                "page {:?} lists {rpc}, which runs as whoever views the page, so it",
+                page.name
+            );
+            if let Some(refusal) = app_grant_refusal(identity, &who, &rules) {
+                return Some(refusal);
+            }
+        }
+    }
+    None
+}
+
 fn parse_manifest(manifest_json: &str) -> Result<AppManifest, Status> {
     let manifest = AppManifest::from_json(manifest_json).map_err(Status::invalid_argument)?;
     manifest.validate(false).map_err(Status::invalid_argument)?;
@@ -577,7 +598,10 @@ impl ManagerDaemonService {
             Some(version) => format!("app {name} {version}"),
             None => format!("app {name}"),
         };
-        let uncovered = app_grant_refusal(&identity, &who, &manifest.permissions);
+        // The grant, then what the app's pages can make a viewer do: an
+        // installer holds both or installs nothing.
+        let uncovered = app_grant_refusal(&identity, &who, &manifest.permissions)
+            .or_else(|| page_rpc_refusal(&identity, &manifest));
         // Jobspec keys (docs/apps.md, "Jobspec extensions"): renames, then
         // the collision rules against core fields and other apps' keys.
         let decls = manifest_decls(&manifest).map_err(Status::invalid_argument)?;
@@ -790,7 +814,8 @@ impl ManagerDaemonService {
         let who = format!("app {name} {to}");
         // A new manifest is new code running with the grant: the caller must
         // hold all of it, as at install.
-        let uncovered = app_grant_refusal(&identity, &who, &manifest.permissions);
+        let uncovered = app_grant_refusal(&identity, &who, &manifest.permissions)
+            .or_else(|| page_rpc_refusal(&identity, &manifest));
         if inner.dry_run {
             return Ok(Response::new(UpgradeAppReply {
                 app: Some(self.app_info(&record)?),

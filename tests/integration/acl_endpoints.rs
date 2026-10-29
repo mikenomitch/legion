@@ -2160,6 +2160,30 @@ fn is_auth_error(code: Code) -> bool {
     matches!(code, Code::PermissionDenied | Code::Unauthenticated)
 }
 
+/// Guard: a sandboxed page's RPC list is bounded by its installer's rights
+/// through the permissions `PAGE_RPCS` names for each RPC (docs/apps.md,
+/// "Which RPCs a page may call"), so each one's first permission must be the
+/// gate this table records for it, and an open RPC needs none.
+#[test]
+fn page_rpc_permissions_match_the_endpoint_gates_test() {
+    let table: std::collections::HashMap<&str, Plane> = endpoint_table().into_iter().collect();
+    for (method, _, needs) in legion::structs::app_ui::PAGE_RPCS {
+        match table.get(method) {
+            Some(Plane::Protected(gate)) => {
+                let first = needs.first().unwrap_or_else(|| {
+                    panic!("{method} is protected ({gate}) but PAGE_RPCS names no permission")
+                });
+                assert!(
+                    gate.starts_with(first),
+                    "{method}: PAGE_RPCS names {first}, the endpoint table gates it on {gate}"
+                );
+            }
+            Some(Plane::Open) => assert!(needs.is_empty(), "{method} is open: {needs:?}"),
+            other => panic!("{method} is page-callable, but the endpoint table says {other:?}"),
+        }
+    }
+}
+
 /// Guard: every RPC in the Manager proto service must have a row in
 /// `endpoint_table`, and vice versa. Adding an endpoint without classifying
 /// its ACL behavior fails this test.
