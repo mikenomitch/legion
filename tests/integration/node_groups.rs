@@ -16,6 +16,9 @@
 //!   `legion-system` allocation is never chosen.
 //! - Every step is an action intent in the group's history, and exactly
 //!   one `target/scale` reaches the provider per decision.
+//! - The group is an `autoscaler/NodeGroup` object: its durable verdict is
+//!   in its status, and deleting it drains, terminates, and forgets every
+//!   member, then releases it; at the cleanup deadline it goes anyway.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -24,11 +27,11 @@ use legion::apps::autoscaler::EngineOptions;
 use legion::prelude::{json, Context, Value, R};
 use legion::structs::token::JoinToken;
 use legion::structs::{
-    ApplyScalingPolicyRequest, GetNodesRequest, GetScaleHistoryRequest, GetScalingStatusRequest,
-    StopJobRequest, WorkerRegisterRequest,
+    DeleteObjectRequest, GetNodesRequest, GetObjectRequest, GetScaleHistoryRequest,
+    GetScalingStatusRequest, StopJobRequest, WorkerRegisterRequest,
 };
 
-use crate::autoscaler::{Harness, T0, TICK_MS};
+use crate::autoscaler::{object_ref, Harness, T0, TICK_MS};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -204,9 +207,9 @@ pub(crate) async fn node_ids(h: &mut Harness) -> R<BTreeSet<String>> {
         .collect())
 }
 
-pub(crate) fn group_policy(name: &str, max: u32) -> Value {
+/// A node group's spec (the object's name is the group's).
+pub(crate) fn group_policy(max: u32) -> Value {
     json!({
-        "name": name,
         "target": { "nodes": {
             "pool": "default",
             "shape": { "cpu": 4800, "memory": 8192 },
@@ -233,15 +236,9 @@ async fn a_node_group_grows_from_zero_and_drains_empty_nodes_test() -> R<()> {
     let provider = Provider::new()?;
     h.install_plugins(provider.plugin_config())?;
     let applied = h
-        .client
-        .apply_scaling_policy(ApplyScalingPolicyRequest {
-            spec_json: group_policy("workers", 6).to_string(),
-            ..Default::default()
-        })
-        .await
-        .map_err(|status| anyhow::anyhow!("apply: {}", status.message()))?
-        .into_inner();
-    assert_eq!(applied.kind, "nodes", "{applied:?}");
+        .apply_object("NodeGroup", "", "workers", group_policy(6))
+        .await?;
+    assert!(applied.created, "{applied:?}");
 
     // Six replicas of 2000 MHz: two fit on a 4800 MHz member, so three
     // members. Nothing can host them now.
@@ -375,7 +372,7 @@ async fn a_node_group_grows_from_zero_and_drains_empty_nodes_test() -> R<()> {
     let history = h
         .client
         .get_scale_history(GetScaleHistoryRequest {
-            policy: "workers".into(),
+            object: Some(object_ref("NodeGroup", "", "workers")),
             limit: 200,
             ..Default::default()
         })
@@ -394,7 +391,7 @@ async fn a_node_group_grows_from_zero_and_drains_empty_nodes_test() -> R<()> {
     let status = h
         .client
         .get_scaling_status(GetScalingStatusRequest {
-            policy: "workers".into(),
+            object: Some(object_ref("NodeGroup", "", "workers")),
             detail: true,
             ..Default::default()
         })
@@ -409,5 +406,163 @@ async fn a_node_group_grows_from_zero_and_drains_empty_nodes_test() -> R<()> {
         "the protection is explained: {}",
         target.decision_json
     );
+    // The object's status: accepted, ready, its resolved target, and the
+    // last action (from its action row).
+    // (Its summary reads Stale here: no app job runs in this harness.)
+    let object = get_group(&mut h, "workers").await?.context("the group")?;
+    let status = object.status.context("a status")?;
+    let conditions: Vec<(&str, &str)> = status
+        .conditions
+        .iter()
+        .map(|c| (c.r#type.as_str(), c.status.as_str()))
+        .collect();
+    assert_eq!(
+        conditions,
+        vec![("Accepted", "true"), ("Ready", "true")],
+        "{status:?}"
+    );
+    assert_eq!(status.observed_generation, object.generation);
+    let fields: Value = serde_json::from_str(&status.fields_json)?;
+    assert!(
+        fields["target"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("nodes via provider in pool default")),
+        "{fields}"
+    );
+    assert!(fields["lastAction"]["decision"].is_string(), "{fields}");
     Ok(())
+}
+
+/// The group's object, if it exists.
+async fn get_group(h: &mut Harness, name: &str) -> R<Option<legion::structs::AppObject>> {
+    match h
+        .client
+        .get_object(GetObjectRequest {
+            kind: "autoscaler/NodeGroup".into(),
+            name: name.into(),
+            namespace: String::new(),
+        })
+        .await
+    {
+        Ok(reply) => Ok(reply.into_inner().object),
+        Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+        Err(status) => anyhow::bail!("get {name}: {}", status.message()),
+    }
+}
+
+/// Deleting a group drains, terminates, and forgets every member through
+/// the scale-in path (at once, not one per `down.every`), then releases
+/// the object; a group that cannot finish is removed at its cleanup
+/// deadline anyway.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_node_group_drains_its_members_then_releases_it_test() -> R<()> {
+    if !have_python() {
+        eprintln!("python3 is not installed: skipping the scripted node provider");
+        return Ok(());
+    }
+    let mut h = Harness::start(0).await?;
+    let provider = Provider::new()?;
+    h.install_plugins(provider.plugin_config())?;
+    h.apply_object("NodeGroup", "", "workers", group_policy(6))
+        .await?;
+    h.run(json!({
+        "name": "batch",
+        "task": {
+            "name": "work", "runtime": "exec", "count": 4,
+            "config": { "command": ["sleep", "3600"] },
+            "resources": { "cpu": 2000, "memory": 1024 },
+        }
+    }))
+    .await?;
+    let (mut engine, watch) = h.engine(provider.options("autoscaler")?).await?;
+    let mut at = T0;
+    let report = engine.tick(at).await;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let joined = boot(&mut h, &provider).await?;
+    assert_eq!(joined.len(), 2);
+    h.drain_evals()?;
+    h.client
+        .stop_job(StopJobRequest {
+            name: "batch".into(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|status| anyhow::anyhow!("stop: {}", status.message()))?;
+    h.drain_evals()?;
+
+    // Delete: the object turns Deleting, and the app sees it.
+    let deleted = h
+        .client
+        .delete_object(DeleteObjectRequest {
+            kind: "nodegroup".into(),
+            name: "workers".into(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|status| anyhow::anyhow!("delete: {}", status.message()))?
+        .into_inner();
+    assert!(deleted.deleting && !deleted.deleted, "{deleted:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !is_deleting(&mut h).await? {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "never Deleting");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Both members drain in one tick: no down.every budget, no down.for.
+    let mut drained_together = false;
+    let mut gone = false;
+    for _ in 0..40 {
+        at += TICK_MS;
+        let report = engine.tick(at).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        h.drain_evals()?;
+        let draining = joined
+            .iter()
+            .filter(|name| {
+                h.store
+                    .get_node(name)
+                    .is_ok_and(|node| node.availability != "available")
+            })
+            .count();
+        drained_together |= draining == 2;
+        if get_group(&mut h, "workers").await?.is_none() {
+            gone = true;
+            break;
+        }
+    }
+    watch.abort();
+    assert!(drained_together, "both members drained at once");
+    assert!(gone, "the group was released once its members were gone");
+    let nodes = node_ids(&mut h).await?;
+    assert!(joined.iter().all(|name| !nodes.contains(name)), "{nodes:?}");
+    assert!(provider.instances()?.is_empty());
+
+    // A group whose cleanup cannot finish (no autoscaler running here) is
+    // removed at its deadline anyway.
+    h.apply_object("NodeGroup", "", "stuck", group_policy(2))
+        .await?;
+    h.client
+        .delete_object(DeleteObjectRequest {
+            kind: "nodegroup".into(),
+            name: "stuck".into(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|status| anyhow::anyhow!("delete: {}", status.message()))?;
+    assert_eq!(
+        get_group(&mut h, "stuck").await?.map(|o| o.summary),
+        Some("Deleting".to_string())
+    );
+    let past = chrono::Utc::now().timestamp_millis() + 16 * 60 * 1000;
+    let removed = h.store.expire_app_object_cleanups(past, BTreeSet::new())?;
+    assert_eq!(removed.len(), 1);
+    assert!(get_group(&mut h, "stuck").await?.is_none());
+    Ok(())
+}
+
+/// Whether the group's object reads Deleting.
+async fn is_deleting(h: &mut Harness) -> R<bool> {
+    Ok(get_group(h, "workers")
+        .await?
+        .is_some_and(|object| object.deleting))
 }

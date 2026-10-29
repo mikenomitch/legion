@@ -56,7 +56,6 @@ mod scaling_ops;
 // history, pauses, the cluster's scaling defaults, policy snapshots.
 mod autoscale_ops;
 // Standalone scaling policies (`legion scaling apply`).
-mod scaling_policy_ops;
 // Their action intents (`RecordScalingAction`), compare-and-set.
 mod scaling_action_ops;
 // Jobspec extensions: the jobs holding values, and cheap fingerprints.
@@ -96,7 +95,6 @@ pub use reschedule_holds::{
 };
 pub use scaling_action_ops::{ActionHistory, ActionWrite, ScalingActionRow};
 pub use scaling_ops::{ScalingAllocRow, ScalingReplicaRow};
-pub use scaling_policy_ops::{PutScalingPolicy, ScalingPolicyRow};
 pub use session_ops::{PromoteSession, PromotedSession};
 pub use snapshot_ops::{
     DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,

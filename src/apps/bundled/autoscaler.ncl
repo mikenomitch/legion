@@ -47,6 +47,86 @@
     { resources = ["node"], actions = ["read", "write"] },
     { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/autoscaler/*"] },
   ],
+  # The autoscaler's own objects (docs/app-objects.md; docs/autoscaling.md,
+  # "Standalone policies" and "Node groups"), written with `legion object
+  # apply`. Each kind's `schema` and `status.schema` are generated from the
+  # parser's own types when the manifest loads
+  # (src/apps/autoscaler/objects.rs, `fill_manifest`), so the manager's
+  # schema check and the app's parser cannot drift apart; what a schema
+  # cannot say (min <= max, a plugin closed to the namespace) the app
+  # reports as `Accepted=false`. The app reads both kinds over WatchObjects
+  # and reports their durable verdicts with UpdateObjectStatus, which owning
+  # the kinds allows with no rule.
+  kinds = [
+    {
+      name = "ScalingPolicy",
+      description = "A scaling policy for a target outside Legion, run through a target plugin.",
+      scope = "namespaced",
+      # Governed by `scale`, namespace-wide: whoever may scale in a namespace
+      # writes its policies, as `legion job scale` needs.
+      access = { resource = "scale" },
+      validate = true,
+      # A policy that moves to another target is a new policy.
+      immutable = ["/spec/target/plugin"],
+      examples = [
+        {
+          target = { plugin = "noop" },
+          min = 0,
+          max = 10,
+          checks = [
+            {
+              name = "queue",
+              source = "team-prom",
+              query = "sum(queue_depth)",
+              strategy = { name = "per-replica", value = 10 },
+            },
+          ],
+        },
+      ],
+      columns = [
+        { name = "TARGET", pointer = "/spec/target/plugin" },
+        "/spec/min",
+        "/spec/max",
+        { name = "MODE", pointer = "/spec/mode" },
+      ],
+    },
+    {
+      name = "NodeGroup",
+      description = "A pool of workers a target plugin starts and stops: grown for waiting work, drained and terminated when empty.",
+      scope = "cluster",
+      # Writing (or deleting) one adds or removes machines: node:write, and
+      # operator:write for the cloud spend.
+      access = { resource = "node" },
+      requires = [{ resource = "operator", actions = ["write"] }],
+      validate = true,
+      # Its members belong to the provider that started them.
+      immutable = ["/spec/target/nodes/plugin"],
+      # Deleting a group drains, terminates, and forgets its members through
+      # the scale-in path, then releases the object; at the deadline it goes
+      # anyway, leaving any member the path could not drain.
+      cleanup = "15m",
+      examples = [
+        {
+          target = {
+            nodes = {
+              pool = "default",
+              shape = { cpu = 8000, memory = 16384 },
+              plugin = "aws-asg",
+              config = { asg = "legion-workers" },
+            },
+          },
+          min = 0,
+          max = 20,
+        },
+      ],
+      columns = [
+        { name = "PLUGIN", pointer = "/spec/target/nodes/plugin" },
+        { name = "POOL", pointer = "/spec/target/nodes/pool" },
+        "/spec/min",
+        "/spec/max",
+      ],
+    },
+  ],
   # The autoscaler's UI, as declarative views the SPA, `legion app view`,
   # and `legion_app_view` render (docs/autoscaling.md, "In the UI"). Each
   # entry is shown only to viewers holding its permission: on the job for

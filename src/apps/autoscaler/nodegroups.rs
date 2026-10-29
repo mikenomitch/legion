@@ -25,10 +25,20 @@
 //!    it closes the intent with the outcome. A replica that loses reads the
 //!    winner's intent instead, and an intent a crashed replica left open is
 //!    closed (`reconciled`) once it is older than a target call can take.
+//!
+//! A group is an `autoscaler/NodeGroup` object, and its runtime state is
+//! keyed by the object's uid (`object:<uid>`). **Deleting** one starts its
+//! cleanup window (`cleanup = "15m"`): the group grows no more, and every
+//! member drains, terminates, and is forgotten through the scale-in path
+//! (protected members stay); once none is left and the provider holds no
+//! instance, the app releases the object. At the deadline the manager
+//! removes it anyway. A dry-run group is released at once: it never
+//! started a machine.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::host::{self, Problem};
+use super::objects::ObjectTarget;
 use super::{hash_of, plain_report, Engine, TickReport};
 use crate::autoscaler::nodes::{
     decide, expand, AllocationKind, AllocationView, Drain, DrainObservation, EffectiveNodeGroup,
@@ -41,7 +51,7 @@ use crate::structs::{
     CreateJoinTokenRequest, ForgetNodeRequest, GetCapacityDemandRequest, NodeGroupDemand,
     NodeGroupMember, NodeGroupShape, NodeGroupTemplate, RecordScalingActionRequest, ScaleDecision,
     ScalingAction, ScalingActionIntent, ScalingActionNode, ScalingEventFlag, ScalingTargetReport,
-    SetNodeAvailabilityRequest, StandaloneScalingPolicy,
+    SetNodeAvailabilityRequest,
 };
 
 /// An intent another replica opened is left alone this long, by this
@@ -330,15 +340,16 @@ impl Engine {
     /// group.
     pub(super) async fn evaluate_node_groups(
         &mut self,
-        groups: &[(&StandaloneScalingPolicy, EffectiveNodeGroup)],
+        groups: &[(&ObjectTarget, EffectiveNodeGroup)],
         now_ms: i64,
         report: &mut TickReport,
     ) -> Vec<ScalingTargetReport> {
+        // Keyed by uid: a deleted and recreated group starts afresh.
         let live: BTreeSet<&str> = groups
             .iter()
-            .map(|(policy, _)| policy.id.as_str())
+            .map(|(policy, _)| policy.key.as_str())
             .collect();
-        self.groups.retain(|id, _| live.contains(id.as_str()));
+        self.groups.retain(|key, _| live.contains(key.as_str()));
         let mut out = Vec::new();
         if groups.is_empty() {
             return out;
@@ -348,14 +359,26 @@ impl Engine {
 
         // 1. The provider, and the plugin's fitness for the job.
         struct Prepared<'a> {
-            policy: &'a StandaloneScalingPolicy,
+            policy: &'a ObjectTarget,
             effective: &'a EffectiveNodeGroup,
             status: Option<host::TargetState>,
             status_error: Option<String>,
         }
         let mut prepared: Vec<Prepared<'_>> = Vec::new();
         for (policy, effective) in groups {
-            let runtime = self.groups.entry(policy.id.clone()).or_default();
+            if policy.deleting && effective.mode == crate::autoscaler::Mode::DryRun {
+                // A dry-run group never started a machine: nothing to clean.
+                self.release(policy, report).await;
+                out.push(plain_report(
+                    node_report(policy),
+                    "ok",
+                    0,
+                    "deleted: a dry-run group has nothing to clean up",
+                    now_ms,
+                ));
+                continue;
+            }
+            let runtime = self.groups.entry(policy.key.clone()).or_default();
             if let Some(action) = &policy.action {
                 runtime.adopt(action, &me);
             }
@@ -415,7 +438,7 @@ impl Engine {
         // 2. Demand and members, every group in one read.
         let templates: Vec<NodeGroupTemplate> = prepared
             .iter()
-            .map(|p| template_of(p.effective, &self.groups[&p.policy.id]))
+            .map(|p| template_of(p.effective, &self.groups[&p.policy.key]))
             .collect();
         let demand = match self
             .client
@@ -444,12 +467,14 @@ impl Engine {
             .iter()
             .zip(&demand.groups)
             .map(|(p, group)| {
-                let runtime = &self.groups[&p.policy.id];
+                let runtime = &self.groups[&p.policy.key];
                 let held = p
                     .status
                     .as_ref()
                     .map_or(runtime.joined, |status| status.count);
-                let blocked = if p.policy.pause.is_some() {
+                let blocked = if p.policy.deleting {
+                    Some("being deleted".to_string())
+                } else if p.policy.pause.is_some() {
                     Some("paused".to_string())
                 } else if held >= p.effective.max {
                     Some(format!("at max {}", p.effective.max))
@@ -493,7 +518,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn evaluate_node_group(
         &mut self,
-        policy: &StandaloneScalingPolicy,
+        policy: &ObjectTarget,
         effective: &EffectiveNodeGroup,
         status: Option<&host::TargetState>,
         status_error: Option<&str>,
@@ -532,7 +557,7 @@ impl Engine {
                     .map(|fits| (member.node_id.clone(), fits))
             })
             .collect();
-        let runtime = self.groups.entry(policy.id.clone()).or_default();
+        let runtime = self.groups.entry(policy.key.clone()).or_default();
         runtime.joined = group.members.len() as u32;
         runtime.like_node = group
             .members
@@ -574,7 +599,7 @@ impl Engine {
                 .client
                 .record_scaling_action(RecordScalingActionRequest {
                     kind: "outcome".to_string(),
-                    policy: policy.id.clone(),
+                    object: Some(policy.reference.clone()),
                     expected_action_version: open.version,
                     outcome: "reconciled".to_string(),
                     detail: format!("left open by {}; {seen}", open.owner),
@@ -582,7 +607,7 @@ impl Engine {
                     ..Default::default()
                 })
                 .await;
-            let runtime = self.groups.get_mut(&policy.id).expect("inserted above");
+            let runtime = self.groups.get_mut(&policy.key).expect("inserted above");
             match closed {
                 Ok(reply) => {
                     let reply = reply.into_inner();
@@ -599,7 +624,7 @@ impl Engine {
             }
         }
 
-        let runtime = self.groups.get_mut(&policy.id).expect("inserted above");
+        let runtime = self.groups.get_mut(&policy.key).expect("inserted above");
         let pause = policy.pause.as_ref().map(super::pause_of);
         let obs = NodeGroupObservation {
             joined: runtime.joined,
@@ -610,6 +635,7 @@ impl Engine {
             nodes,
             drains: BTreeMap::new(),
             pause,
+            retiring: policy.deleting,
         };
         let mut effective = effective.clone();
         if let Some(mode) = self.options.force_mode {
@@ -643,7 +669,7 @@ impl Engine {
             now_ms,
             &|node: &NodeView| fits.get(&node.id).copied().unwrap_or(false),
         );
-        let decision_id = super::decision_id(&super::standalone_key(&policy.id), now_ms);
+        let decision_id = super::decision_id(&policy.target_key(), now_ms);
         let mut events: Vec<ScalingEventFlag> = decision.flags.iter().map(flag_event).collect();
         if group.nodes > 0 && !runtime.pending_flagged {
             runtime.pending_flagged = true;
@@ -657,6 +683,29 @@ impl Engine {
             });
         } else if group.nodes == 0 {
             runtime.pending_flagged = false;
+        }
+        if policy.deleting {
+            let draining = runtime.state.drains().filter(|d| !d.finished()).count();
+            let mut note = vec![format!(
+                "{} member(s) left, {draining} draining",
+                runtime.joined
+            )];
+            if !decision.protected.is_empty() {
+                note.push(format!(
+                    "{} protected (they stay: {})",
+                    decision.protected.len(),
+                    decision
+                        .protected
+                        .iter()
+                        .map(|p| format!("{} ({})", p.node, p.protection))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if policy.pause.is_some() {
+                note.push("held by a pause".to_string());
+            }
+            self.cleanups.insert(policy.key.clone(), note.join("; "));
         }
         let scale_decision = ScaleDecision {
             id: decision_id.clone(),
@@ -711,7 +760,7 @@ impl Engine {
                         .collect::<Vec<_>>()
                         .join(",")
                 );
-                let runtime = self.groups.get_mut(&policy.id).expect("inserted above");
+                let runtime = self.groups.get_mut(&policy.key).expect("inserted above");
                 if runtime.last_would.as_deref() != Some(key.as_str()) {
                     let recorded = self
                         .client
@@ -720,14 +769,14 @@ impl Engine {
                             from: decision.from,
                             to: decision.to,
                             decision: Some(scale_decision.clone()),
-                            policy: policy.id.clone(),
+                            object: Some(policy.reference.clone()),
                             instance: me.clone(),
                             ..Default::default()
                         })
                         .await;
                     match recorded {
                         Ok(_) => {
-                            if let Some(runtime) = self.groups.get_mut(&policy.id) {
+                            if let Some(runtime) = self.groups.get_mut(&policy.key) {
                                 runtime.last_would = Some(key);
                             }
                             report.would += 1;
@@ -740,7 +789,7 @@ impl Engine {
                 }
             }
             _ => {
-                if let Some(runtime) = self.groups.get_mut(&policy.id) {
+                if let Some(runtime) = self.groups.get_mut(&policy.key) {
                     if decision.from == decision.to && decision.victims.is_empty() {
                         runtime.last_would = None;
                     }
@@ -753,7 +802,7 @@ impl Engine {
         base.evaluated_at_unix_ms = now_ms;
         base.summary = summary;
         base.events = events;
-        let runtime = self.groups.get_mut(&policy.id).expect("inserted above");
+        let runtime = self.groups.get_mut(&policy.key).expect("inserted above");
         let mut stable = decision.clone();
         stable.at_ms = 0;
         let digest = hash_of(&serde_json::to_string(&stable).unwrap_or_default());
@@ -763,6 +812,13 @@ impl Engine {
             runtime.reported = Some(digest);
             serde_json::to_string(&decision).unwrap_or_default()
         };
+        if policy.deleting && decision.retired {
+            // Every member is gone and the provider holds none: the
+            // cleanup is done.
+            self.release(policy, report).await;
+            self.cleanups
+                .insert(policy.key.clone(), "done: every member is gone".to_string());
+        }
         base
     }
 
@@ -772,7 +828,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn act_node_group(
         &mut self,
-        policy: &StandaloneScalingPolicy,
+        policy: &ObjectTarget,
         effective: &EffectiveNodeGroup,
         decision: &NodeDecision,
         scale_decision: &ScaleDecision,
@@ -781,14 +837,14 @@ impl Engine {
         report: &mut TickReport,
     ) -> Result<Option<String>, (&'static str, String)> {
         let me = self.options.instance.clone();
-        let runtime = self.groups.get_mut(&policy.id).expect("evaluated above");
+        let runtime = self.groups.get_mut(&policy.key).expect("evaluated above");
         let intent = intent_of(decision, &scale_decision.id, &runtime.state);
         let expected = runtime.action_version;
         let opened = self
             .client
             .record_scaling_action(RecordScalingActionRequest {
                 kind: "intent".to_string(),
-                policy: policy.id.clone(),
+                object: Some(policy.reference.clone()),
                 expected_action_version: expected,
                 intent: Some(intent.clone()),
                 decision: Some(scale_decision.clone()),
@@ -796,7 +852,7 @@ impl Engine {
                 ..Default::default()
             })
             .await;
-        let runtime = self.groups.get_mut(&policy.id).expect("evaluated above");
+        let runtime = self.groups.get_mut(&policy.key).expect("evaluated above");
         let won = match opened {
             Err(status) => {
                 // Paused in between, or the manager is unreachable: none of
@@ -863,7 +919,7 @@ impl Engine {
                         .await
                     {
                         Ok(()) => {
-                            if let Some(runtime) = self.groups.get_mut(&policy.id) {
+                            if let Some(runtime) = self.groups.get_mut(&policy.key) {
                                 runtime.state.record_scale(now_ms, decision.from, *count);
                             }
                             scaled = true;
@@ -937,12 +993,12 @@ impl Engine {
                 }
             }
         }
-        let version = self.groups.get(&policy.id).map_or(0, |r| r.action_version);
+        let version = self.groups.get(&policy.key).map_or(0, |r| r.action_version);
         let closed = self
             .client
             .record_scaling_action(RecordScalingActionRequest {
                 kind: "outcome".to_string(),
-                policy: policy.id.clone(),
+                object: Some(policy.reference.clone()),
                 expected_action_version: version,
                 outcome: if failures.is_empty() {
                     "succeeded"
@@ -958,7 +1014,7 @@ impl Engine {
         match closed {
             Ok(reply) => {
                 if let (Some(action), Some(runtime)) =
-                    (reply.into_inner().action, self.groups.get_mut(&policy.id))
+                    (reply.into_inner().action, self.groups.get_mut(&policy.key))
                 {
                     runtime.action_version = action.version;
                 }
@@ -1022,9 +1078,9 @@ fn nodes_occupying(member: &NodeGroupMember) -> u32 {
 }
 
 /// A report naming a node group.
-fn node_report(policy: &StandaloneScalingPolicy) -> ScalingTargetReport {
+fn node_report(policy: &ObjectTarget) -> ScalingTargetReport {
     ScalingTargetReport {
-        policy: policy.id.clone(),
+        object: Some(policy.reference.clone()),
         policy_digest: policy.digest.clone(),
         ..Default::default()
     }

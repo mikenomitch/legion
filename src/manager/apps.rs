@@ -945,6 +945,17 @@ pub fn spawn_reconciler(svc: Arc<ManagerDaemonService>, settings: ReconcilerSett
                 if let Err(status) = svc.sync_all_object_kinds() {
                     warn!("Syncing object kinds failed: {}", status.message());
                 }
+                // The scaling state of the autoscaler's deleted objects
+                // (their `object:<uid>` action rows, pauses, and history),
+                // which the generic object delete leaves (app-object-kinds
+                // plan §8 O2).
+                match svc.store.sweep_object_scaling_state() {
+                    Ok(0) => {}
+                    Ok(swept) => info!(swept, "Swept the scaling state of deleted objects"),
+                    Err(err) => {
+                        warn!(error = ?err, "Sweeping deleted objects' scaling state failed")
+                    }
+                }
             } else if !work.apps.is_empty() {
                 for name in &work.apps {
                     reconciler.reconcile_app(name).await;

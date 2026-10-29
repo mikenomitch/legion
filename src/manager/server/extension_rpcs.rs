@@ -611,7 +611,11 @@ impl ManagerDaemonService {
     /// must run a version the reconciler stamped `managedBy` that app
     /// ([`crate::storage::store::Store::allocation_app`]): the job's name
     /// alone is not the app.
-    pub(super) fn calling_app<T>(&self, request: &Request<T>, identity: &AclIdentity) -> Option<String> {
+    pub(super) fn calling_app<T>(
+        &self,
+        request: &Request<T>,
+        identity: &AclIdentity,
+    ) -> Option<String> {
         if identity.source == crate::structs::acl::AclSource::Delegated {
             // An app acting for a viewer is not the app plane.
             return None;

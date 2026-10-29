@@ -745,15 +745,21 @@ async fn policies_view(ui: &AutoscalerUi, viewer: &Viewer) -> R<AppView> {
     Ok(render_policies(&status, viewer))
 }
 
-/// The policies page's document. Rows are filtered by the namespaces the
-/// viewer holds `scale:read` in (the manager checked it on any scope, and
-/// the assertion says where).
+/// The policies page's document: autoscaled tasks and
+/// `autoscaler/ScalingPolicy` objects. Rows are filtered by the namespaces
+/// the viewer holds `scale:read` in (the manager checked it on any scope,
+/// and the assertion says where), which is what reading a ScalingPolicy
+/// takes. Node groups need `node:read`, which the page's permission does
+/// not establish; they are on the node pages instead.
 fn render_policies(status: &GetScalingStatusReply, viewer: &Viewer) -> AppView {
     let visible: Vec<&ScalingTargetStatus> = status
         .targets
         .iter()
-        .filter(|target| {
-            viewer.sees_namespace(crate::structs::namespace::job_namespace(&target.job_id))
+        .filter(|target| match &target.object {
+            Some(object) => {
+                !object.namespace.is_empty() && viewer.sees_namespace(&object.namespace)
+            }
+            None => viewer.sees_namespace(crate::structs::namespace::job_namespace(&target.job_id)),
         })
         .collect();
     let mut blocks = Vec::new();
@@ -839,14 +845,27 @@ fn render_policies(status: &GetScalingStatusReply, viewer: &Viewer) -> AppView {
         .map(|target| {
             let (namespace, name) = crate::structs::namespace::split_job_id(&target.job_id);
             let mut row = std::collections::BTreeMap::new();
-            row.insert(
-                "target".to_string(),
-                Cell::Rich(RichText {
-                    text: format!(
+            let (text, route) = match &target.object {
+                Some(object) => (
+                    format!(
+                        "ScalingPolicy {}",
+                        crate::autoscaler::policy::object_label(&object.namespace, &object.name)
+                    ),
+                    None,
+                ),
+                None => (
+                    format!(
                         "{}/{}/{}",
                         target.job_id, target.task_group, target.task_name
                     ),
-                    route: Some(format!("/jobs/{}/{}", segment(namespace), segment(name))),
+                    Some(format!("/jobs/{}/{}", segment(namespace), segment(name))),
+                ),
+            };
+            row.insert(
+                "target".to_string(),
+                Cell::Rich(RichText {
+                    text,
+                    route,
                     href: None,
                     tone: None,
                 }),
@@ -897,7 +916,7 @@ fn render_policies(status: &GetScalingStatusReply, viewer: &Viewer) -> AppView {
         ],
         rows,
         empty: Some(
-            "No autoscaled tasks you may see. Put `autoscale = true` on a task to start."
+            "No autoscaled tasks or scaling policies you may see. Put `autoscale = true` on a task to start."
                 .to_string(),
         ),
     }));
@@ -1011,7 +1030,11 @@ async fn node_view(ui: &AutoscalerUi, context: &ViewContext) -> R<AppView> {
     // The group's policy, as the autoscaler last reported it.
     let policy = match client
         .get_scaling_status(GetScalingStatusRequest {
-            policy: group.clone(),
+            object: Some(crate::structs::ScalingObjectRef {
+                kind: crate::autoscaler::policy::NODE_GROUP.to_string(),
+                name: group.clone(),
+                ..Default::default()
+            }),
             detail: true,
             ..Default::default()
         })
@@ -1570,10 +1593,31 @@ mod tests {
     /// `scale:read` in.
     #[test]
     fn the_policies_page_filters_by_the_viewers_namespaces_test() {
+        let object = |kind: &str, namespace: &str, name: &str| ScalingTargetStatus {
+            object: Some(crate::structs::ScalingObjectRef {
+                kind: kind.into(),
+                namespace: namespace.into(),
+                name: name.into(),
+                uid: 9,
+            }),
+            kind: "external".into(),
+            ..Default::default()
+        };
         let reply = status(vec![
             target("web", 2, 2),
             target("team-a/api", 4, 6),
             target("payments/db", 3, 3),
+            object(
+                crate::autoscaler::policy::SCALING_POLICY,
+                "team-b",
+                "render",
+            ),
+            object(
+                crate::autoscaler::policy::SCALING_POLICY,
+                "payments",
+                "render",
+            ),
+            object(crate::autoscaler::policy::NODE_GROUP, "", "workers"),
         ]);
         let viewer = Viewer {
             principal: "alice".into(),
@@ -1593,9 +1637,13 @@ mod tests {
             .find(|block| block["type"] == "table")
             .unwrap();
         let rows = table["rows"].as_array().unwrap();
-        assert_eq!(rows.len(), 1, "{table}");
+        assert_eq!(rows.len(), 2, "{table}");
         assert_eq!(rows[0]["target"]["text"], "team-a/api/web/web");
         assert_eq!(rows[0]["target"]["route"], "/jobs/team-a/api");
+        // A ScalingPolicy in a namespace the viewer reads; never a node
+        // group (it needs node:read, which the page does not establish).
+        assert_eq!(rows[1]["target"]["text"], "ScalingPolicy team-b/render");
+        assert!(!value.to_string().contains("workers"));
         let everyone = Viewer {
             namespaces: vec!["*".into()],
             ..viewer
@@ -1650,7 +1698,12 @@ mod tests {
             "intents": [], "flags": [], "summary": "steady at 3",
         });
         let status = ScalingTargetStatus {
-            policy_id: "general".into(),
+            object: Some(crate::structs::ScalingObjectRef {
+                kind: crate::autoscaler::policy::NODE_GROUP.into(),
+                name: "general".into(),
+                uid: 3,
+                ..Default::default()
+            }),
             kind: "nodes".into(),
             mode: "enforce".into(),
             now: 3,

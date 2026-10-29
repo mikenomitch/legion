@@ -55,7 +55,14 @@ the cluster-wide scaling inputs once per interval, and writes counts through
 `ScaleTask`, reporting each evaluation back to the manager. It also runs
 [node groups](autoscaling.md#node-groups): it asks a provider for nodes,
 mints their join tokens, and drains, terminates, and forgets the nodes it
-scales in. Its grant is `scale:read` and `scale:write` in every namespace,
+scales in. Its manifest declares two [object kinds](app-objects.md):
+`autoscaler/ScalingPolicy` (a policy for a target outside Legion;
+namespaced, governed by `scale` namespace-wide, `target.plugin`
+immutable) and `autoscaler/NodeGroup` (cluster-scoped, governed by
+`node`, requiring `operator:write`, with a 15-minute cleanup window that
+drains and terminates a deleted group's members), written with `legion
+object apply` ([autoscaling.md, "Standalone
+policies"](autoscaling.md#standalone-policies)). Its grant is `scale:read` and `scale:write` in every namespace,
 `job:read` (to read what a drain would move), `node:read` and
 `node:write` (node groups), and `kv` read and write under its reserved
 `legion/apps/autoscaler/` (its replicas' shard leases): it can resize,
@@ -1514,7 +1521,9 @@ framework answers that every value passes.
 
 An app can also own **kinds of object**: `gitops` declares `Repo`, people
 apply Repos with `legion object apply`, and gitops watches them, deploys
-what each names, and reports each one's status. A manifest declares them in
+what each names, and reports each one's status. The bundled autoscaler's
+scaling policies and node groups are objects of its kinds
+([App Objects, "A worked example"](app-objects.md#a-worked-example-the-autoscaler)). A manifest declares them in
 `kinds`: a schema, what governs the objects (`access`), what writing one
 also requires of its writer (`requires`), and how long a delete waits for
 the app to clean up. Legion stores and checks the objects; the app only

@@ -611,7 +611,7 @@ impl ManagerDaemonService {
     }
 
     /// `action` on the kind's access resource on the object's scope.
-    fn enforce_access(
+    pub(super) fn enforce_access(
         &self,
         identity: &AclIdentity,
         kind: &InstalledKind,
@@ -630,7 +630,7 @@ impl ManagerDaemonService {
     /// The kind's `requires` resolved against `doc` and checked as the
     /// writer, fail-closed (app-object-kinds plan §6.4). Returns what was
     /// verified, for the object's `authority`.
-    fn enforce_requirements(
+    pub(super) fn enforce_requirements(
         &self,
         identity: &AclIdentity,
         kind: &InstalledKind,
@@ -673,7 +673,7 @@ impl ManagerDaemonService {
     /// `action` some kind's objects somewhere (or `object` anywhere), so a
     /// caller with no object rights at all learns nothing about which kinds
     /// exist (AGENTS.md, "Check before you fetch").
-    fn gate_objects(
+    pub(super) fn gate_objects(
         &self,
         identity: &AclIdentity,
         registry: &ObjectKindRegistry,
@@ -689,7 +689,7 @@ impl ManagerDaemonService {
         acl::enforce(identity, AclResource::Object, action, &AclScope::any())
     }
 
-    fn lookup_kind(
+    pub(super) fn lookup_kind(
         &self,
         registry: &ObjectKindRegistry,
         typed: &str,
@@ -706,7 +706,7 @@ impl ManagerDaemonService {
     }
 
     /// The namespace and name a get or delete names for `kind`.
-    fn object_ref(
+    pub(super) fn object_ref(
         &self,
         kind: &InstalledKind,
         name: &str,

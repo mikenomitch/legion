@@ -76,6 +76,20 @@ fn s1(autoscale: Value, count: u32) -> Value {
     })
 }
 
+/// One of the autoscaler's objects, as the scaling RPCs name it.
+pub(crate) fn object_ref(
+    kind: &str,
+    namespace: &str,
+    name: &str,
+) -> legion::structs::ScalingObjectRef {
+    legion::structs::ScalingObjectRef {
+        kind: format!("autoscaler/{kind}"),
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        uid: 0,
+    }
+}
+
 pub(crate) struct Harness {
     _dir: tempfile::TempDir,
     pub(crate) store: Store,
@@ -288,7 +302,36 @@ impl Harness {
         let mut record = legion::manager::apps::seed_record(manifest, None);
         record.config = config;
         self.store.seed_app(record)?;
+        // Its kinds, as the app reconciler's pass registers them.
+        ManagerDaemonService::new(self.store.clone())
+            .sync_object_kinds_for("autoscaler")
+            .map_err(|status| anyhow::anyhow!("syncing kinds: {}", status.message()))?;
         Ok(())
+    }
+
+    /// Apply one of the autoscaler's objects (`ScalingPolicy` or
+    /// `NodeGroup`) as the management client.
+    pub(crate) async fn apply_object(
+        &mut self,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        spec: Value,
+    ) -> R<legion::structs::ApplyObjectReply> {
+        let mut object =
+            json!({ "kind": format!("autoscaler/{kind}"), "name": name, "spec": spec });
+        if !namespace.is_empty() {
+            object["namespace"] = json!(namespace);
+        }
+        Ok(self
+            .client
+            .apply_object(legion::structs::ApplyObjectRequest {
+                object_json: object.to_string(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("apply {kind} {name}: {}", status.message()))?
+            .into_inner())
     }
 
     pub(crate) async fn engine(

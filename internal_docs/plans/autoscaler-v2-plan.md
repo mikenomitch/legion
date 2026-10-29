@@ -2,6 +2,14 @@
 
 > **Judgement calls:** [autoscaler-v2-plan_calls.md](../calls/autoscaler-v2-plan_calls.md)
 
+> **Superseded in part (2026-10-29):** standalone policies and node groups
+> are no longer a core `scaling_policy` table behind `legion scaling
+> apply|list|delete`: they are the autoscaler's `autoscaler/ScalingPolicy`
+> and `autoscaler/NodeGroup` object kinds
+> ([app-object-kinds-plan.md](app-object-kinds-plan.md) §8 O2; calls entry
+> 103 here, and app-object-kinds calls entries 32-43). This plan's §6.2 and
+> §6.11 storage, RPCs, CLI, and ids describe what shipped before that.
+
 **Status: SHIPPED** (every phase, 2026-10-28; the deferred items below
 stay open in `internal_docs/TODO.md`). Phase 1 (cluster-wide scaling inputs), the
 engine core (`src/autoscaler/`: spec, layered defaults, strategies,

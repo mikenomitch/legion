@@ -27,7 +27,17 @@
 //! ([`Reconciler::on_cleanup`]) instead, and is released when it returns.
 //!
 //! [`ObjectCache`], [`watch_objects`] and [`write_object_status`] are the
-//! pieces the loop is made of, for an app that wants its own.
+//! pieces the loop is made of, for an app that wants its own;
+//! [`run_object_watch`] keeps a cache current, and [`StatusBook`] writes
+//! status only when it changed.
+//!
+//! **Shards.** A sharded app splits its objects between replicas by the
+//! shard each object carries (FNV-1a of its kind and name, the autoscaler's
+//! hash). A static split is [`Reconciler::shards`]; a split that moves as
+//! replicas come and go (the autoscaler's lease-based shards) is a
+//! [`ShardSelection`] published on a `tokio::sync::watch` channel, which
+//! [`Reconciler::shards_from`] and [`run_object_watch`] follow, opening a
+//! new watch whenever it changes.
 
 use crate::cmd::helpers::AuthedManagerClient;
 use crate::prelude::*;
@@ -43,6 +53,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use tonic::Status;
 
@@ -232,6 +243,123 @@ pub async fn watch_objects(
         .watch_objects(request)
         .await?
         .into_inner())
+}
+
+/// Which of a kind's objects one replica of a sharded app takes, as it
+/// changes (a `tokio::sync::watch` channel carries it).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ShardSelection {
+    /// Every object (one replica, or sharding off).
+    #[default]
+    All,
+    /// The objects in these shards of `count` (each below it).
+    Shards { count: u32, shards: Vec<u32> },
+    /// None: the replica runs none of the kind's objects now.
+    Nothing,
+}
+
+impl ShardSelection {
+    /// The watch request for `app`'s `kinds` under this selection; `None`
+    /// for [`ShardSelection::Nothing`] (and for an empty shard list, which
+    /// the manager would read as every shard).
+    pub fn request(&self, app: &str, kinds: &[String]) -> Option<WatchObjectsRequest> {
+        let (shard_count, shards) = match self {
+            ShardSelection::All => (0, Vec::new()),
+            ShardSelection::Shards { shards, .. } if shards.is_empty() => return None,
+            ShardSelection::Shards { count, shards } => (*count, shards.clone()),
+            ShardSelection::Nothing => return None,
+        };
+        Some(WatchObjectsRequest {
+            app: app.to_string(),
+            kinds: kinds.to_vec(),
+            shard_count,
+            shards,
+        })
+    }
+}
+
+/// An empty, complete snapshot: what a cache holds while its replica takes
+/// none of the objects.
+fn empty_snapshot() -> ObjectEvent {
+    ObjectEvent {
+        snapshot: true,
+        snapshot_done: true,
+        ..Default::default()
+    }
+}
+
+/// Keep `cache` current from `WatchObjects` for `app`'s `kinds`, following
+/// `selection`: a new watch (and a fresh snapshot) whenever it changes,
+/// none while it is [`ShardSelection::Nothing`] (the cache then holds
+/// nothing), and a reconnect with backoff after an error. Runs until the
+/// future is dropped (or `selection`'s sender is).
+pub async fn run_object_watch<P: ObjectPlane>(
+    plane: P,
+    app: String,
+    kinds: Vec<String>,
+    mut selection: tokio::sync::watch::Receiver<ShardSelection>,
+    cache: std::sync::Arc<RwLock<ObjectCache>>,
+) {
+    let mut retry = Duration::from_millis(500);
+    loop {
+        let current = selection.borrow_and_update().clone();
+        let Some(request) = current.request(&app, &kinds) else {
+            if let Ok(mut cache) = cache.write() {
+                cache.reconnecting();
+                cache.apply(empty_snapshot());
+            }
+            if selection.changed().await.is_err() {
+                return;
+            }
+            continue;
+        };
+        let mut stream = match plane.watch(request).await {
+            Ok(stream) => {
+                retry = Duration::from_millis(500);
+                stream
+            }
+            Err(status) => {
+                warn!(app = %app, kinds = ?kinds, "Cannot watch objects: {}", status.message());
+                tokio::select! {
+                    changed = selection.changed() => if changed.is_err() { return },
+                    _ = tokio::time::sleep(retry) => {}
+                }
+                retry = (retry * 2).min(WATCH_RETRY_MAX);
+                continue;
+            }
+        };
+        if let Ok(mut cache) = cache.write() {
+            cache.reconnecting();
+        }
+        loop {
+            tokio::select! {
+                changed = selection.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    debug!(app = %app, kinds = ?kinds, "The shard selection changed: reopening the object watch");
+                    break;
+                }
+                message = stream.next() => match message {
+                    Some(Ok(event)) => {
+                        if let Ok(mut cache) = cache.write() {
+                            cache.apply(event);
+                        }
+                    }
+                    Some(Err(status)) => {
+                        warn!(app = %app, kinds = ?kinds, "The object watch ended: {}", status.message());
+                        tokio::time::sleep(retry).await;
+                        retry = (retry * 2).min(WATCH_RETRY_MAX);
+                        break;
+                    }
+                    None => {
+                        tokio::time::sleep(retry).await;
+                        break;
+                    }
+                },
+            }
+        }
+    }
 }
 
 /// One condition, as a reconcile sets it.
@@ -463,6 +591,48 @@ pub async fn write_object_status<P: ObjectPlane>(
     Ok(reply.written)
 }
 
+/// The status an app last wrote for each of its objects, so it writes one
+/// only when it would change (an app with its own loop; the reconcile loop
+/// keeps the same record itself). It starts from the status the watch
+/// delivers with each object, so a restarted app does not rewrite what is
+/// already stored.
+#[derive(Debug, Default)]
+pub struct StatusBook {
+    written: HashMap<u64, Reported>,
+}
+
+impl StatusBook {
+    /// Whether writing `outcome` for `object` would change its stored
+    /// status (or `observedGeneration`).
+    pub fn differs(&self, object: &AppObject, outcome: &ObjectOutcome) -> bool {
+        let next = Reported::of(object.generation, &outcome.conditions(), &outcome.fields);
+        let stored = self
+            .written
+            .get(&object.uid)
+            .cloned()
+            .or_else(|| Reported::stored(object));
+        stored.as_ref() != Some(&next)
+    }
+
+    /// Record that `outcome` was written for `object`.
+    pub fn record(&mut self, object: &AppObject, outcome: &ObjectOutcome) {
+        self.written.insert(
+            object.uid,
+            Reported::of(object.generation, &outcome.conditions(), &outcome.fields),
+        );
+    }
+
+    /// Forget every object but `live` (uids): deleted objects' records go.
+    pub fn retain(&mut self, live: &std::collections::HashSet<u64>) {
+        self.written.retain(|uid, _| live.contains(uid));
+    }
+
+    /// Forget one object's record (a write that failed: try again).
+    pub fn forget(&mut self, uid: u64) {
+        self.written.remove(&uid);
+    }
+}
+
 /// One object handed to a reconcile or cleanup handler.
 #[derive(Debug, Clone)]
 pub struct ObjectRequest {
@@ -508,6 +678,7 @@ pub struct Reconciler {
     resync: Duration,
     shard_count: u32,
     shards: Vec<u32>,
+    dynamic_shards: Option<tokio::sync::watch::Receiver<ShardSelection>>,
     concurrency: usize,
     cleanup: Option<CleanupHandler>,
 }
@@ -520,6 +691,7 @@ impl std::fmt::Debug for Reconciler {
             .field("resync", &self.resync)
             .field("shard_count", &self.shard_count)
             .field("shards", &self.shards)
+            .field("dynamic_shards", &self.dynamic_shards.is_some())
             .field("concurrency", &self.concurrency)
             .field("cleanup", &self.cleanup.is_some())
             .finish()
@@ -536,6 +708,7 @@ impl Reconciler {
             resync: DEFAULT_RESYNC,
             shard_count: 0,
             shards: Vec::new(),
+            dynamic_shards: None,
             concurrency: DEFAULT_CONCURRENCY,
             cleanup: None,
         }
@@ -553,6 +726,19 @@ impl Reconciler {
     pub fn shards(mut self, count: u32, mine: Vec<u32>) -> Reconciler {
         self.shard_count = count;
         self.shards = mine;
+        self
+    }
+
+    /// Reconcile the objects of the shards `selection` names as it changes:
+    /// the hook for a split that moves (lease-based shards, as the
+    /// autoscaler's replicas hold). Each change opens a new watch; objects
+    /// that left the selection drop out of the loop as the new snapshot
+    /// lands. Overrides [`Self::shards`].
+    pub fn shards_from(
+        mut self,
+        selection: tokio::sync::watch::Receiver<ShardSelection>,
+    ) -> Reconciler {
+        self.dynamic_shards = Some(selection);
         self
     }
 
@@ -737,12 +923,19 @@ async fn reconcile_loop<P: ObjectPlane>(
     mut stop: tokio::sync::watch::Receiver<bool>,
     handler: ReconcileHandler,
 ) {
-    let request = WatchObjectsRequest {
-        app: config.app.clone(),
-        kinds: vec![config.kind.clone()],
-        shard_count: config.shard_count,
-        shards: config.shards.clone(),
+    let kinds = vec![config.kind.clone()];
+    let static_selection = if config.shard_count > 1 {
+        ShardSelection::Shards {
+            count: config.shard_count,
+            shards: config.shards.clone(),
+        }
+    } else {
+        ShardSelection::All
     };
+    // A static split never changes: a channel whose sender lives as long as
+    // the loop.
+    let (_static_tx, static_rx) = tokio::sync::watch::channel(static_selection);
+    let mut selection = config.dynamic_shards.clone().unwrap_or(static_rx);
     let mut cache = ObjectCache::default();
     let mut work: HashMap<u64, Work> = HashMap::new();
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Done>();
@@ -753,7 +946,25 @@ async fn reconcile_loop<P: ObjectPlane>(
         if *stop.borrow() {
             return;
         }
-        let mut stream = match plane.watch(request.clone()).await {
+        let Some(request) = selection.borrow_and_update().request(&config.app, &kinds) else {
+            // This replica takes none of the objects now: drop them all, and
+            // wait for a share.
+            for change in cache.apply(empty_snapshot()) {
+                if let CacheChange::Deleted(uid) = change {
+                    if !work.get(&uid).is_some_and(|entry| entry.running) {
+                        work.remove(&uid);
+                    }
+                }
+            }
+            tokio::select! {
+                _ = stopped(&mut stop) => return,
+                changed = selection.changed() => if changed.is_err() {
+                    std::future::pending::<()>().await;
+                },
+            }
+            continue;
+        };
+        let mut stream = match plane.watch(request).await {
             Ok(stream) => {
                 watch_retry = Duration::from_millis(500);
                 stream
@@ -772,9 +983,17 @@ async fn reconcile_loop<P: ObjectPlane>(
         let mut resync = tokio::time::interval(config.resync);
         resync.tick().await;
         let mut tick = tokio::time::interval(DISPATCH_TICK);
+        let mut reselect = false;
         loop {
             tokio::select! {
                 _ = stopped(&mut stop) => return,
+                changed = selection.changed(), if config.dynamic_shards.is_some() => {
+                    if changed.is_ok() {
+                        debug!(kind = %config.kind, "The shard selection changed: reopening the object watch");
+                        reselect = true;
+                        break;
+                    }
+                },
                 message = stream.next() => match message {
                     Some(Ok(event)) => {
                         for change in cache.apply(event) {
@@ -895,6 +1114,9 @@ async fn reconcile_loop<P: ObjectPlane>(
                     }
                 },
             }
+        }
+        if reselect {
+            continue;
         }
         tokio::select! {
             _ = stopped(&mut stop) => return,

@@ -141,7 +141,7 @@ mod node_content_rpcs;
 mod node_group_rpcs;
 mod object_rpcs;
 mod plugin_rpcs;
-mod scaling_policy_rpcs;
+mod scaling_objects;
 mod scaling_rpcs;
 mod session_rpcs;
 mod snapshot_rpcs;
@@ -6793,30 +6793,6 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::PauseScalingRequest>,
     ) -> Result<Response<crate::structs::PauseScalingReply>, Status> {
         self.pause_scaling_rpc(request).await
-    }
-
-    // ACL: scale:write, coarse then on the policy (in the handler).
-    async fn apply_scaling_policy(
-        &self,
-        request: Request<crate::structs::ApplyScalingPolicyRequest>,
-    ) -> Result<Response<crate::structs::ApplyScalingPolicyReply>, Status> {
-        self.apply_scaling_policy_rpc(request).await
-    }
-
-    // ACL: scale:write, coarse then on the policy (in the handler).
-    async fn delete_scaling_policy(
-        &self,
-        request: Request<crate::structs::DeleteScalingPolicyRequest>,
-    ) -> Result<Response<crate::structs::DeleteScalingPolicyReply>, Status> {
-        self.delete_scaling_policy_rpc(request).await
-    }
-
-    // ACL: scale:read, filtered (in the handler).
-    async fn list_scaling_policies(
-        &self,
-        request: Request<crate::structs::ListScalingPoliciesRequest>,
-    ) -> Result<Response<crate::structs::ListScalingPoliciesReply>, Status> {
-        self.list_scaling_policies_rpc(request).await
     }
 
     async fn get_capacity_demand(

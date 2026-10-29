@@ -157,6 +157,26 @@ impl Store {
     }
 }
 
+/// One of the autoscaler's objects, as scaling events name it: its
+/// qualified kind, `namespace/name` (or `name` for a node group), and uid.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectTarget<'a> {
+    pub kind: &'a str,
+    pub id: &'a str,
+    pub uid: u64,
+}
+
+impl ObjectTarget<'_> {
+    /// `ScalingPolicy media/render-farm`.
+    pub fn label(&self) -> String {
+        let bare = self
+            .kind
+            .split_once('/')
+            .map_or(self.kind, |(_, bare)| bare);
+        format!("{bare} {}", self.id)
+    }
+}
+
 /// Pure constructors for every scheduler event kind Legion emits.
 ///
 /// This module is the authoritative catalog of the stream's kinds — the
@@ -1215,7 +1235,7 @@ pub mod drafts {
             ("scale.resumed", "resumed")
         };
         let draft = EventDraft::info(kind, format!("Autoscaling {verb} for {target} by {by}"));
-        let draft = if scope == "all" || scope == "policy" {
+        let draft = if scope == "all" || scope == "object" {
             draft
         } else {
             draft.job(target.split_once('/').map_or(target, |(job, _)| job))
@@ -1262,21 +1282,27 @@ pub mod drafts {
     /// `scale.limited`, `scale.flapping`, `scale.check_failed` for a
     /// standalone scaling policy (`legion scaling apply`): the same state
     /// changes, named by the policy instead of a job.
-    pub fn scale_policy_flag(kind: &str, policy: &str, message: &str) -> Option<EventDraft> {
+    pub fn scale_policy_flag(
+        kind: &str,
+        object: &ObjectTarget<'_>,
+        message: &str,
+    ) -> Option<EventDraft> {
         let (kind, level) = match kind {
             "limited" => ("scale.limited", "info"),
             "flapping" => ("scale.flapping", "warn"),
             "check_failed" => ("scale.check_failed", "warn"),
             _ => return None,
         };
-        let text = format!("Scaling policy {policy}: {message}");
+        let text = format!("{}: {message}", object.label());
         let draft = if level == "warn" {
             EventDraft::warn(kind, text)
         } else {
             EventDraft::info(kind, text)
         };
         Some(draft.meta(json!({
-            "policy": policy,
+            "kind": object.kind,
+            "object": object.id,
+            "uid": object.uid,
             "message": message,
             "source": "autoscaler",
         })))
@@ -1287,10 +1313,11 @@ pub mod drafts {
     /// `completed` or `aborted`, for a scale-in).
     pub fn nodegroup_flag(
         kind: &str,
-        group: &str,
+        object: &ObjectTarget<'_>,
         message: &str,
         outcome: &str,
     ) -> Option<EventDraft> {
+        let group = object.id;
         let (kind, warn, text) = match kind {
             "pending" => (
                 "nodegroup.pending",
@@ -1316,7 +1343,9 @@ pub mod drafts {
         };
         let mut meta = json!({
             "group": group,
-            "policy": group,
+            "kind": object.kind,
+            "object": object.id,
+            "uid": object.uid,
             "message": message,
             "source": "autoscaler",
         });
@@ -1329,17 +1358,19 @@ pub mod drafts {
     /// `scale.applied` for a standalone scaling policy: the autoscaler is
     /// about to move its target from `previous` to `count`.
     pub fn scale_policy_applied(
-        policy: &str,
+        object: &ObjectTarget<'_>,
         previous: u32,
         count: u32,
         reason: &str,
     ) -> EventDraft {
         EventDraft::info(
             "scale.applied",
-            format!("Scaling policy {policy} scaled {previous} -> {count}"),
+            format!("{} scaled {previous} -> {count}", object.label()),
         )
         .meta(json!({
-            "policy": policy,
+            "kind": object.kind,
+            "object": object.id,
+            "uid": object.uid,
             "previous": previous,
             "count": count,
             "source": "autoscaler",
@@ -3026,21 +3057,33 @@ impl EventRecorder<'_> {
         }
     }
 
-    pub fn scale_policy_flag(self, kind: &str, policy: &str, message: &str) {
-        if let Some(draft) = drafts::scale_policy_flag(kind, policy, message) {
+    pub fn scale_policy_flag(self, kind: &str, object: &ObjectTarget<'_>, message: &str) {
+        if let Some(draft) = drafts::scale_policy_flag(kind, object, message) {
             self.emit(draft);
         }
     }
 
-    pub fn nodegroup_flag(self, kind: &str, group: &str, message: &str, outcome: &str) {
-        if let Some(draft) = drafts::nodegroup_flag(kind, group, message, outcome) {
+    pub fn nodegroup_flag(
+        self,
+        kind: &str,
+        object: &ObjectTarget<'_>,
+        message: &str,
+        outcome: &str,
+    ) {
+        if let Some(draft) = drafts::nodegroup_flag(kind, object, message, outcome) {
             self.emit(draft);
         }
     }
 
-    pub fn scale_policy_applied(self, policy: &str, previous: u32, count: u32, reason: &str) {
+    pub fn scale_policy_applied(
+        self,
+        object: &ObjectTarget<'_>,
+        previous: u32,
+        count: u32,
+        reason: &str,
+    ) {
         self.emit(drafts::scale_policy_applied(
-            policy, previous, count, reason,
+            object, previous, count, reason,
         ));
     }
 

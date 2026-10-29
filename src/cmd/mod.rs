@@ -36,7 +36,6 @@ pub mod sandbox;
 pub mod scaling;
 pub mod scaling_demand;
 pub mod scaling_plugin;
-pub mod scaling_policy;
 pub mod scaling_simulate;
 pub mod scheduler;
 pub mod service;

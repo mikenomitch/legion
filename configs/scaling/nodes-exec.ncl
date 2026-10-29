@@ -1,6 +1,7 @@
-# A node group on a scripted provider (docs/autoscaling.md, "Node groups").
+# A node group on a scripted provider: an `autoscaler/NodeGroup` object
+# (docs/autoscaling.md, "Node groups").
 #
-#   legion scaling apply configs/scaling/nodes-exec.ncl
+#   legion object apply -f configs/scaling/nodes-exec.ncl
 #
 # `scripted` names a target plugin the operator installs in the autoscaler's
 # app config, here the `exec` builtin, which declares the `nodes` capability:
@@ -20,18 +21,21 @@
 # data. tests/integration/node_groups.rs drives a group like this one with a
 # scripted provider.
 {
+  kind = "autoscaler/NodeGroup",
   name = "workers-scripted",
-  target = {
-    nodes = {
-      pool = "default",
-      workerType = "default",
-      shape = { cpu = 4000, memory = 8192 },
-      plugin = "scripted",
-      config = { image = "legion-worker-2026-10" },
+  spec = {
+    target = {
+      nodes = {
+        pool = "default",
+        workerType = "default",
+        shape = { cpu = 4000, memory = 8192 },
+        plugin = "scripted",
+        config = { image = "legion-worker-2026-10" },
+      },
     },
+    min = 0,
+    max = 10,
+    up = { step = { replicas = 2 }, every = "2m", joinTimeout = "10m" },
+    down = { when = "empty", for = "10m", step = { replicas = 1 }, every = "5m" },
   },
-  min = 0,
-  max = 10,
-  up = { step = { replicas = 2 }, every = "2m", joinTimeout = "10m" },
-  down = { when = "empty", for = "10m", step = { replicas = 1 }, every = "5m" },
 }

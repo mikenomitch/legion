@@ -7,8 +7,8 @@ number is its rank.**
 
 **Revised after adversarial review (2026-10-29).** Three reviews (of this
 plan, and of the apps substrate's security and correctness) changed O1
-before it shipped. Entries 1-31 are the decisions as they stand (28-31 were made while
-building O1); entries 32-38 are the original entries they supersede, kept as written at the end
+before it shipped. Entries 1-43 are the decisions as they stand (28-31 were made while
+building O1); entries 44-50 are the original entries they supersede, kept as written at the end
 so the reasoning that lost is not silently dropped. The guiding principle
 the review added: **an object can never make its app do more than its
 writer could do directly, and the write path never depends on the app being
@@ -38,7 +38,7 @@ Error: writing gitops/Repo team-a/storefront needs job:write in team-b (from spe
 ```
 
 **Alternatives.** (a) The original `writeRequires`, checked on the object's
-own namespace and name (entry 32): a team lead with `job:write` on
+own namespace and name (entry 44): a team lead with `job:write` on
 `names = ["storefront"]` could write a Repo named `storefront` that deploys
 `billing`, or into `team-b`; a tenant without `host = true` could have the
 app deploy host-level jobs; a `credentials.kv` field could make the app read
@@ -71,7 +71,7 @@ the replica sees. Only the owning app writes it (app-plane), and a person's
 apply refuses a file that sets `status`. Status is for facts that change
 when the world changes; per-tick numbers stay in memory.
 
-**Alternatives.** The original plan (entry 34): status in the spec row on
+**Alternatives.** The original plan (entry 46): status in the spec row on
 the Control lane, every write a new `version`. Or Kubernetes' status
 subresource with RBAC (anyone granted it writes).
 
@@ -103,7 +103,7 @@ Error: "repo" names 2 kinds: gitops/Repo, reposync/Repo
 Hint: name one: legion object get gitops/Repo storefront
 ```
 
-**Alternatives.** The original (entry 35): flat names unique cluster-wide,
+**Alternatives.** The original (entry 47): flat names unique cluster-wide,
 refused at install. A `--kind Repo=SyncRepo` rename at install, mirroring
 `--key`.
 
@@ -172,7 +172,7 @@ namespaces, as `*` reaches everything else.
 { resources = ["scale"], actions = ["write"], namespaces = ["media"], names = ["web-*"] }  # does not: it is about jobs
 ```
 
-**Alternatives.** The original (entry 32): any resource, scoped as "a job
+**Alternatives.** The original (entry 44): any resource, scoped as "a job
 named like the object", which let `names = ["web-*"]` grant writes to a
 policy named `web-proxy`, failed band-scoped rules silently, and could map
 onto `acl` or `state`. Kubernetes' choice: no mapping, every kind its own
@@ -222,7 +222,7 @@ derived from the app records by an idempotent sync after every app write
 and on the reconciler's full pass; an orphaned row with no objects left is
 dropped.
 
-**Alternatives.** The original (entry 33): orphans fall back to the `object`
+**Alternatives.** The original (entry 45): orphans fall back to the `object`
 resource, which locked `scale:write` holders out of the ScalingPolicies
 they wrote. Storing the access resource on every object row.
 
@@ -271,7 +271,7 @@ and `--cascade` deletes them with the caller's per-kind access and
 `requires` checked for each.
 
 **Alternatives.** Kubernetes finalizers (an object stays until its
-controller removes the finalizer). The original plan (entry 37): deleting a
+controller removes the finalizer). The original plan (entry 49): deleting a
 namespace leaves its objects.
 
 **Trade-off.** An app that needs longer than an hour to release external
@@ -432,7 +432,7 @@ calling app's rows and kinds only, so other apps' writes and every status
 write leave it asleep; the 64-shard value is a stored column the query
 filters on. There is no `since_version` resume: a reconnect relists.
 
-**Alternatives.** The original (entry 36): one snapshot message and a
+**Alternatives.** The original (entry 48): one snapshot message and a
 table-wide fingerprint. A change log with tombstone retention and resume.
 
 **Trade-off.** Every reconnect is a full relist, fine to about 50,000
@@ -691,11 +691,286 @@ enough for 1,000 maximal objects (about 150 MiB).
 worst case of every object at its 64 KiB spec, twice (stored and
 effective), which no client should have to buffer.
 
+## 32. The autoscaler keys its objects' scaling state by uid, `object:<uid>`
+
+*Implementation, Phase O2 (`object_target_key`,
+`Store::sweep_object_scaling_state`).* **Call.** A scaling policy's or
+node group's history, pause, action row, and status-board entry live in
+core's scaling tables under `object:<uid>`, never under its name. The API
+names the object (`ScalingObjectRef { kind, namespace, name, uid }`); a
+person's reference (`legion scaling history workers --kind nodegroup`) is
+resolved to the current object's uid. The scaling state of deleted objects
+is swept on the app reconciler's full pass.
+
+```console
+$ legion scaling pause workers --kind nodegroup --for 1h     # the node group's pause
+$ legion scaling explain workers --kind scalingpolicy         # ScalingPolicy default/workers: not paused
+```
+
+**Alternatives.** (a) Key by kind and reference (`autoscaler/NodeGroup:workers`),
+so history outlives a delete and a recreate, and sweep the pause and the
+action row on delete (or stamp them with the uid). (b) Keep today's
+`policy:<id>` with a `nodes/` prefix for node groups (the plan review's
+suggestion).
+
+**Trade-off.** An object's history goes with it: a policy deleted and
+created again under the same name starts with no history (the events stay
+in the journal). Ids break once: `policy:<id>` keys, `--standalone`, and the
+bare-name lookup are gone (no installed base; the PR says so).
+
+**Why (correctness, simplicity).** A uid cannot collide (`NodeGroup
+workers` and `ScalingPolicy default/workers` are two objects) and cannot be
+inherited: a recreated object is never paused by a pause meant for the old
+one, and never resumes a drain the old one's intent recorded. The sweep
+only tidies; nothing depends on it for correctness, so object deletes stay
+generic and know nothing of scaling.
+
+## 33. Cross-field checks move to the app: a fail-open regression until O4
+
+*Implementation, Phase O2.* **Call.** The manager checks a ScalingPolicy
+or NodeGroup against its kind's schema at apply; what a schema cannot
+express (`min` above `max`, a check's strategy settings, a plugin the
+namespace may not use) is refused at apply only by the autoscaler's
+validate call, and otherwise by the autoscaler at evaluation, which holds
+the object `Accepted=false`:
+
+```text
+$ legion object apply -f inverted.ncl     # the autoscaler is down
+autoscaler/ScalingPolicy media/render: created (generation 1, spec version 52)
+warning: autoscaler/ScalingPolicy media/render was not checked by the autoscaler app (...)
+$ legion object get scalingpolicy render -n media
+autoscaler/ScalingPolicy media/render (valid)  Rejected: Invalid (render: min = 9 is above max = 3)
+```
+
+**Alternatives.** (a) Run the policy parser in `ApplyObject` for the
+autoscaler's kinds (an autoscaler-specific hook in the generic write
+path). (b) Wait for O4's CEL `rules` before moving the policies.
+
+**Trade-off.** Today's `legion scaling apply` refused such a policy
+fail-closed, in the manager. Now, with the app down, it is stored and
+reads `Rejected` once the app runs. It is never acted on, so the
+regression is in feedback, not in safety.
+
+**Why (extensibility).** The generic write path stays generic (§1: it
+never depends on the app), and O4's `rules` restore the fail-closed check
+for every kind, not just this one. Recorded as a known limitation in
+docs/autoscaling.md.
+
+## 34. `WatchScalingPolicies` keeps serving the autoscaler what only core holds; the app resolves its objects itself
+
+*Implementation, Phase O2.* **Call.** `WatchScalingPolicies` streams task
+policies only. To the autoscaler's own identity (or a management token) it
+also carries `context` (the cluster's scaling defaults, every namespace
+policy's `autoscale`, the cluster-wide pause) and `objects` (each object
+target's own pause and action row, keyed `object:<uid>`, unsharded). The
+app reads the objects over `WatchObjects` and resolves each ScalingPolicy
+against `context` with the same code core uses.
+
+**Alternatives.** (a) Keep the manager resolving standalone policies and
+streaming them (`StandaloneScalingPolicy`), reading `app_object` instead of
+`scaling_policy`. (b) The app polls `GetScalingDefaults` per namespace and
+the pauses through `GetScalingInputs`. (c) A new app-plane RPC.
+
+**Trade-off.** The layered resolution runs in two places (the app, to
+evaluate; the manager, for status and the defaults check), from one
+function in one binary. Object targets' pauses and action rows go to every
+replica, not just the one that owns the object.
+
+**Why (simplicity).** The app reads its objects through the generic
+system, as any app would (the point of O2), and core serves only what core
+owns. (a) would keep a second, autoscaler-shaped object feed in core; (b)
+replaces a push with polling and loses change notification for the
+defaults; the existing stream already wakes on defaults, namespace-policy,
+pause, and action-row changes.
+
+## 35. The policy parser stays linked into the manager
+
+*Implementation, Phase O2 (`manager/server/scaling_objects.rs`).*
+**Call.** Core reads the autoscaler's objects, through the generic
+`Store::app_objects` by kind, in four places, and parses them with the
+autoscaler's parser: `ApplyScalingDefaults`' impact check (ScalingPolicies
+inherit the same layers as tasks), `GetScalingStatus` (mode, bounds, and
+the effective policy with provenance), `RecordScalingAction`'s existence
+check (by uid), and history and pause lookups (name to uid). No storage and
+no ACL in core are autoscaler-specific.
+
+**Alternatives.** `GetScalingStatus` shows only what the app reported, and
+the defaults check ignores ScalingPolicies.
+
+**Trade-off.** Core still knows the ScalingPolicy spec format; a change to
+it must keep both readers in step (they share the code, so a build does).
+
+**Why (correctness).** A defaults change that would invalidate a
+ScalingPolicy must be refused as it is for a task (fail-closed, before the
+write), and `legion scaling status` must say what a policy is, and why it
+is invalid, while the app is down.
+
+## 36. A deleted node group retires through the scale-in path
+
+*Implementation, Phase O2 (`NodeGroupObservation::retiring`,
+`NodeDecision::retired`).* **Call.** A NodeGroup has `cleanup = "15m"`.
+While it is Deleting, the engine adds nothing, makes every member a victim
+at once (ignoring `down.when`, `down.for`, the step budget, and `min`),
+keeps the never-victim protections, scales the provider to 0 once no member
+is left (an instance that never joined strands nothing), and the app
+releases the object when no member, drain, or provider instance is left. A
+pause holds the cleanup; a dry-run group is released at once.
+
+```text
+autoscaler/NodeGroup workers-general (valid)  Deleting
+  fields: {"cleanup":"1 member(s) left, 0 draining; 1 protected (they stay: w-3 (runs legion-system job ...))"}
+```
+
+**Alternatives.** (a) `target/scale` to 0 at once (the provider stops
+instances undrained). (b) Keep `down`'s budget (a 10-node group at one
+drain per 5 minutes cannot finish in 15). (c) Drain protected members too.
+
+**Trade-off.** A protected member, or work that cannot move within the
+drain deadline, outlives the window: the manager removes the object at the
+deadline and the machine is left to the operator, still labeled with the
+group's name.
+
+**Why (correctness).** The scale-in path is the one that never strands work
+or stops the wrong machine (provider-id checks, drains before terminate,
+forget after); deletion reuses it rather than inventing a second way to
+remove machines.
+
+## 37. The autoscaler runs its own loop over the object cache; the dynamic shard hook goes in both
+
+*Implementation, Phase O2 (`run_object_watch`, `ShardSelection`,
+`Reconciler::shards_from`, `StatusBook`).* **Call.** The autoscaler keeps
+two `ObjectCache`s current with `run_object_watch` (ScalingPolicies of the
+shards it holds; every NodeGroup on the replica holding the `nodegroups`
+shard), evaluates them on its tick, and writes status through a
+`StatusBook`. The selection a replica watches is a `tokio::sync::watch`
+channel the lease controller's ownership feeds; `Reconciler::shards_from`
+gives the reconcile loop the same hook.
+
+**Alternatives.** The framework's reconcile loop, one handler per object.
+
+**Trade-off.** The bundled app does not exercise the reconcile loop; the
+framework has two ways to own objects.
+
+**Why (performance).** An evaluation tick reads every target's inputs in
+one batched call and runs the expander across all node groups at once; a
+per-object handler would split both. The shard hook belongs in the
+framework, so any sharded app gets it.
+
+## 38. Object status holds verdicts, written on change; the last action comes from the action row
+
+*Implementation, Phase O2 (`objects::verdict`).* **Call.** Status says
+`Accepted` (the spec parses, resolves, and its plugins are open to it),
+`Ready` (the last evaluation worked; reason `Paused` while paused,
+`TargetError`, `MissingData`, `Deleting`), and fields `target`, `policy`,
+`digest`, `error`, `lastAction` (the last closed action intent, from the
+replicated action row), `cleanup`. The current and wanted counts stay on
+the scaling status board.
+
+**Alternatives.** Report every evaluation in status; keep the last action
+in the replica's memory.
+
+**Trade-off.** `legion object get` does not show the current count; that
+is `legion scaling status`.
+
+**Why (performance, correctness).** Ten thousand policies reporting every
+15 seconds is the Status-lane churn entry 2 exists to avoid. The action row
+is replicated, so a replica that restarts or takes a shard over reports
+the same last action instead of dropping it.
+
+## 39. The kinds' schemas are generated from the parser's types and filled in when the bundled manifest loads
+
+*Implementation, Phase O2 (`BundledApp::generated`,
+`policy::scaling_policy_schema`).* **Call.** `autoscaler.ncl` declares the
+kinds without `schema`; the app's Rust types (schemars over
+`AutoscaleRecord` and `NodeGroupPolicy`, with every `$ref` inlined and
+`null` alternatives dropped) fill `schema` and `status.schema` before the
+manifest is parsed.
+
+**Alternatives.** Hand-write the schemas in Nickel, with a test that they
+match the types.
+
+**Trade-off.** The manifest file alone does not show the schemas
+(`legion object explain` and `legion object kinds -j` do).
+
+**Why (simplicity).** One source of truth: a field added to the policy
+record reaches the kind's schema, its `explain` text (the doc comments),
+and the parser at once.
+
+## 40. Pausing and naming an object follow its kind; a node group and a policy may share a name
+
+*Implementation, Phase O2.* **Call.** Reading an object's status or
+history needs its kind's read access; pausing one needs what writing it
+needs (its access and `requires`), checked before the lookup. The scaling
+verbs name an object with `--kind` (`legion scaling explain workers --kind
+nodegroup`). The manager-side node-group special case
+(`enforce_policy_write`, `gate_policy_ref`, the shared bare-name space) is
+gone.
+
+**Alternatives.** Keep `scale:write` for any pause, and `operator:write`
+plus `node:write` for a node group's, hard-coded.
+
+**Trade-off.** A `scale:write` holder who could pause a policy by its job-
+like name before now needs `scale:write` namespace-wide in its namespace.
+
+**Why (simplicity).** One rule: the kind's declaration decides. A third-
+party app's kinds get the same treatment with no core change.
+
+## 41. Both kinds' target plugin is immutable
+
+*Implementation, Phase O2.* **Call.** `immutable = ["/spec/target/plugin"]`
+on ScalingPolicy, as the plan says, and `["/spec/target/nodes/plugin"]` on
+NodeGroup, which the plan did not ask for.
+
+**Alternatives.** Let a node group change provider in place.
+
+**Trade-off.** Moving a group to another provider is a delete (which
+drains it) and a create.
+
+**Why (correctness).** A group's members belong to the provider that
+started them; a new provider would not list them, so every member would
+read "the provider does not list its instance" and could never be scaled
+in.
+
+## 42. Pages read objects, never write them; the Autoscaling page lists policies, not node groups
+
+*Implementation, Phase O2 (`PAGE_RPCS`, `render_policies`).* **Call.**
+`ListObjectKinds`, `GetObject`, and `ListObjects` are page-callable reads
+(installing a page that lists one needs `object`, `job`, `scale`, and
+`node` read everywhere). `ApplyObject` and `DeleteObject` are refused for
+pages. The removed scaling-policy RPCs leave the list; `PauseScaling` now
+names `node:write` too. The Autoscaling page shows ScalingPolicies in the
+viewer's namespaces, and no node groups.
+
+**Alternatives.** Classify object writes with a permission list.
+
+**Trade-off.** A page cannot write objects; an app that needs it uses an
+action.
+
+**Why (security).** What writing an object needs is whatever its kind
+`requires`, which no fixed list bounds, so no installer check could bound a
+page that writes them. The page's `scale:read` says nothing about the
+viewer's `node:read`, which a node group needs.
+
+## 43. `legion scaling simulate` resolves a ScalingPolicy file on the client
+
+*Implementation, Phase O2.* **Call.** `GetScalingDefaultsReply` gains
+`governing` (the namespace's governing policies' `autoscale` records), and
+`simulate` resolves an `autoscaler/ScalingPolicy` object file against it
+and the cluster record locally.
+
+**Alternatives.** An RPC that resolves a spec without storing it (today's
+`ApplyScalingPolicy --dry-run`).
+
+**Trade-off.** Plugins are not checked in a simulation (it runs none).
+
+**Why (simplicity).** `GetScalingDefaults` already shows the same values
+with provenance to the same callers; no new RPC.
+
 # Superseded entries
 
 Kept as written when they were superseded; they no longer describe the design.
 
-## 32. *Superseded.* A kind's ACL is one resource: the generic `object`, or an existing one of the same scope
+## 44. *Superseded.* A kind's ACL is one resource: the generic `object`, or an existing one of the same scope
 
 **Superseded by entries 1 (`requires`) and 5 (the access mapping)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -730,7 +1005,7 @@ With (a), O2 would have needed every `scale:write` holder to also be given
 default stays K8s-like (`object` with `kinds`), so a kind that maps onto
 nothing is still governed separately.
 
-## 33. *Superseded.* An orphaned object is governed by the `object` resource
+## 45. *Superseded.* An orphaned object is governed by the `object` resource
 
 **Superseded by entry 7 (orphans keep their kind's mapping)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -749,7 +1024,7 @@ upgrade changes it, and then two rows of one kind answer to different
 resources. Orphans are an operator's clean-up after a forced removal, and
 the rule fits in one sentence.
 
-## 34. *Superseded.* Status is the owning app's alone, with CAS on version or generation
+## 46. *Superseded.* Status is the owning app's alone, with CAS on version or generation
 
 **Superseded by entry 2 (status on the Status lane, `specVersion` CAS)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -768,7 +1043,7 @@ delegate status writes to a helper with another identity.
 it makes it a claim nobody can trust at 3am. App identity is already the
 app plane's key (`WatchAppExtensions`, `ReportScalingStatus`).
 
-## 35. *Superseded.* Kind names are flat, unique cluster-wide case-insensitively, with `<app>/<Kind>` as the qualified spelling
+## 47. *Superseded.* Kind names are flat, unique cluster-wide case-insensitively, with `<app>/<Kind>` as the qualified spelling
 
 **Superseded by entry 3 (`<app>/<Kind>` is the name)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -791,7 +1066,7 @@ its kind. Install says so, naming the owner.
 rule already established "the short name may collide, the qualified one
 never does" (apps calls on `apps.<app>`), so it is one idea, not two.
 
-## 36. *Superseded.* `WatchObjects` polls a fingerprint each second
+## 48. *Superseded.* `WatchObjects` polls a fingerprint each second
 
 **Superseded by entry 17 (chunked, per-app watch)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -808,7 +1083,7 @@ per second.
 90), whose cost was measured acceptable; both move to events together when
 it is not.
 
-## 37. *Superseded.* Deleting a namespace leaves its objects
+## 49. *Superseded.* Deleting a namespace leaves its objects
 
 **Superseded by entry 9 (objects are namespace contents)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -828,7 +1103,7 @@ and a proto change to the namespace contents reply; the standalone scaling
 policies O2 replaces behave the same way today. Recorded as a TODO with the
 plan's lean (refuse, and cascade).
 
-## 38. *Superseded.* Defaults filled on read (the defaults half of the original entry 1)
+## 50. *Superseded.* Defaults filled on read (the defaults half of the original entry 1)
 
 **Superseded by entry 6** (adversarial review, 2026-10-29). The original
 argued that deriving defaults on read lets an upgrade that adds or changes

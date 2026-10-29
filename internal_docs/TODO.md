@@ -512,7 +512,7 @@ How to use it:
 | PR | What it lands | Notes |
 | --- | --- | --- |
 | [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after an adversarial security review | All three plans SHIPPED; their items, and the hardening, are checked off and in Done; the review's open and design-level items are under *Ecosystem apps* |
-| branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phase O1 | Builds on #60; O1 is checked off and in Done; O2-O4 and the deferrals are open under Ecosystem apps |
+| branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phases O1 and O2 | Builds on #60; O1 and O2 are checked off and in Done; O3, O4, and the deferrals and follow-ups are open under Ecosystem apps |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -4562,21 +4562,39 @@ plan.
         kinds** below.
 
 - [ ] **App-owned object kinds** (Legion's CRDs):
-      [plan](plans/app-object-kinds-plan.md) (IN EXECUTION; O1 in Done) ·
+      [plan](plans/app-object-kinds-plan.md) (IN EXECUTION; O1 and O2 in Done) ·
       [calls](calls/app-object-kinds-plan_calls.md) · docs:
       [app-objects.md](../docs/app-objects.md)
-  - [ ] **O2: the autoscaler's policies become its objects** (plan §8):
-        `ScalingPolicy` (`access = scale`, `immutable` target plugin) and
-        `NodeGroup` (cluster, `access = node`, `requires` operator:write,
-        `cleanup = "15m"`), autoscaler state keyed by kind and uid, durable
-        verdicts in object status, the namespace plugin allowlist enforced
-        by the app fail-closed, every core reader of standalone policies
-        reworked (`ApplyScalingDefaults` invalidation, `GetScalingStatus`,
-        `RecordScalingAction`, pauses and history), `PAGE_RPCS`, and the
-        lease-based shards lifted into the framework's `Reconciler`
-        ([calls 23](calls/app-object-kinds-plan_calls.md)). Cross-field
-        checks (`min <= max`) move to the app until O4: a regression from
-        today's fail-closed apply, to record when it lands.
+  - [ ] Follow-ups from O2 ([calls 32-43](calls/app-object-kinds-plan_calls.md)):
+    - [ ] **A deleted scaling object's history goes with it**: state is keyed
+          `object:<uid>`, so a policy deleted and created again under the
+          same name starts with no `legion scaling history` (the events stay
+          in the journal) ([calls 32](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **`min <= max` and plugin allowlists are checked fail-open**: with
+          the autoscaler down, an inverted ScalingPolicy or NodeGroup is
+          stored and reads `Rejected` once the app runs (never acted on).
+          O4's `rules` restore the fail-closed check
+          ([calls 33](calls/app-object-kinds-plan_calls.md);
+          [docs](../docs/autoscaling.md)).
+    - [ ] **Node groups have no SPA list**: the Autoscaling page shows
+          ScalingPolicies only (a page's `scale:read` says nothing about
+          `node:read`); node groups show on the node panel and in `legion
+          object list nodegroup`. Waits on the object browser below
+          ([calls 42](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **A NodeGroup's protected members outlive its cleanup window**:
+          at the 15-minute deadline the object goes and the machines stay,
+          labeled with the group's name, for the operator
+          ([calls 36](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **Object targets' pauses and action rows go to every replica**
+          on `WatchScalingPolicies`, not just the owning one; fine at
+          10,000 objects, a sharded `objects` feed beyond that
+          ([calls 34](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **The bundled autoscaler runs its own loop**, not the framework's
+          `Reconciler` (it batches inputs per tick); nothing bundled
+          exercises the reconcile loop end to end beyond its tests
+          ([calls 37](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **`legion scaling simulate` checks no plugins** when it resolves
+          a ScalingPolicy file ([calls 43](calls/app-object-kinds-plan_calls.md)).
   - [ ] **O3: objects carry their authority** (plan §8): the
         `legion-for-object` header, the app's grant intersected with the
         object's recorded `authority`, `managedBy = { app, object uid }`,
@@ -4584,6 +4602,9 @@ plan.
         --authority-lapsed` ([calls 1, 26](calls/app-object-kinds-plan_calls.md)).
   - [ ] **O4: CEL `rules`** on kinds, evaluated in the manager; `rules` is
         refused until then ([calls 10](calls/app-object-kinds-plan_calls.md)).
+        Restores the fail-closed `min <= max` check on the autoscaler's
+        ScalingPolicy and NodeGroup, which O2 moved to the app
+        ([calls 33](calls/app-object-kinds-plan_calls.md)).
   - [ ] Deferred from O1:
     - [ ] **Per-namespace object quotas** in namespace policies; today
           only a kind's cluster-wide `maxObjects` caps objects
@@ -6383,6 +6404,54 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
 
 ## Ecosystem apps
 
+- [x] **App-owned object kinds, Phase O2: the autoscaler's policies become
+      its objects** (2026-10-29, branch `claude/app-objects`;
+      [plan](plans/app-object-kinds-plan.md) §8 ·
+      [calls 32-43](calls/app-object-kinds-plan_calls.md) · docs:
+      [autoscaling.md](../docs/autoscaling.md),
+      [app-objects.md](../docs/app-objects.md),
+      [autoscaling-plugins.md](../docs/autoscaling-plugins.md),
+      [apps.md](../docs/apps.md),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] The bundled manifest's kinds: `autoscaler/ScalingPolicy`
+        (namespaced, `access = scale`, immutable target plugin) and
+        `autoscaler/NodeGroup` (cluster, `access = node`, `requires`
+        operator:write, immutable provider, `cleanup = "15m"`), both
+        `validate = true`, with schemas and status schemas generated from
+        the parser's types when the manifest loads.
+  - [x] Removed with no aliases: the `scaling_policy` table (a migration
+        drops it and its `policy:` scaling state), `ApplyScalingPolicy`,
+        `DeleteScalingPolicy`, `ListScalingPolicies`, `legion scaling
+        apply|list|delete`, `--standalone`, MCP `legion_scaling_apply`,
+        their capability entries and ACL rows, and the manager's node-group
+        ACL special case.
+  - [x] Core readers on `Store::app_objects`: `ApplyScalingDefaults`'
+        impact check, `GetScalingStatus`, `RecordScalingAction`'s existence
+        check (by uid), history and pause lookups (`ScalingObjectRef`,
+        `--kind`); `WatchScalingPolicies` streams task policies plus the
+        app's `context` and object pauses/action rows.
+  - [x] Scaling state keyed `object:<uid>`, swept for deleted objects on
+        the app reconciler's full pass; a recreated object inherits no pause
+        or intent.
+  - [x] The autoscaler reads both kinds over `WatchObjects` (policies by
+        object shard; node groups on the `nodegroups` shard's holder),
+        writes durable verdicts (`Accepted`, `Ready`, target, policy,
+        digest, error, last action, cleanup) on change, enforces the plugin
+        allowlist fail-closed, answers the validate call, and retires a
+        deleted NodeGroup through the scale-in path before releasing it.
+        The framework gains `ShardSelection`, `run_object_watch`,
+        `StatusBook`, and `Reconciler::shards_from`.
+  - [x] `PAGE_RPCS` (object reads page-callable, writes refused); the
+        Autoscaling page lists ScalingPolicies from objects;
+        `configs/scaling/*.ncl` in the object format, each applied in a
+        test; `legion scaling simulate` resolves a ScalingPolicy file.
+  - [x] Tests: the standalone and node-group integration tests ported;
+        ACL by kind (`scale:write` namespace-wide vs job selectors,
+        `node:write` + `operator:write`); NodeGroup delete cleanup and
+        forced removal at the deadline; no collision between a NodeGroup
+        and a ScalingPolicy of one name; recreate inherits no pause; objects
+        follow the replicas' shards.
+
 - [x] **App-owned object kinds, Phase O1: the generic system**
       (2026-10-29, branch `claude/app-objects`;
       [plan](plans/app-object-kinds-plan.md) §6-§8 ·
@@ -6570,7 +6639,9 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         `WatchScalingPolicies`; status, history, pause and events by
         `policy`; CLI `legion scaling apply [--dry-run] [--wait]|list|
         delete` and `--standalone` on `explain|history|pause|resume`;
-        MCP `legion_scaling_apply`; capability entries; ACL rows
+        MCP `legion_scaling_apply`; capability entries; ACL rows. (Replaced
+        in app-object-kinds O2 by the `autoscaler/ScalingPolicy` kind; the
+        table, RPCs, and verbs are gone.)
   - [x] `legion scaling plugin test`, the conformance suite
   - [x] The Rust SDK crate `legion-scaling-plugin` and example plugins
         (Python strategy, Go source and target, Rust strategy) in

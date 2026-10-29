@@ -1223,12 +1223,12 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_scaling_explain",
-            description: "Why an autoscaled task (or a standalone policy or node group, with `policy`) is at its count, as structured data: the last evaluation's checks (reading, desired) and every safeguard stage (before, after, note), the effective policy with the level each field came from (built-in, cluster defaults, namespace policy, jobspec), pins, and pauses. Read-only.",
+            description: "Why an autoscaled task (or, with `object`, an autoscaler/ScalingPolicy or autoscaler/NodeGroup) is at its count, as structured data: the last evaluation's checks (reading, desired) and every safeguard stage (before, after, note), the effective policy with the level each field came from (built-in, cluster defaults, namespace policy, jobspec), pins, and pauses. Read-only.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "job": { "type": "string", "description": "Job name." },
-                    "policy": { "type": "string", "description": "A standalone policy (`namespace/name`) instead of a job." },
+                    "object": { "type": "object", "description": "One of the autoscaler's objects instead of a job: { kind = \"scalingpolicy\" | \"nodegroup\" (or qualified, autoscaler/ScalingPolicy), name, namespace? }.", "properties": { "kind": { "type": "string" }, "name": { "type": "string" }, "namespace": { "type": "string" } }, "required": ["kind", "name"], "additionalProperties": false },
                     "group": { "type": "string", "description": "Task group, when the job has several autoscaled tasks." },
                     "task": { "type": "string", "description": "Task name, when the job has several autoscaled tasks." }
                 },
@@ -1238,12 +1238,12 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_scaling_history",
-            description: "The durable record of a job's (or, with `policy`, a standalone policy's) count changes, newest first: who (operator or autoscaler), from and to, the one-line why, the policy digest, dry-run \"would\" rows (`applied = false`), and a standalone target's `failed` rows. Read-only.",
+            description: "The durable record of a job's (or, with `object`, a scaling policy's or node group's) count changes, newest first: who (operator or autoscaler), from and to, the one-line why, the policy digest, dry-run \"would\" rows (`applied = false`), and an object target's `failed` rows (and a node group's drain, terminate, forget, and uncordon steps). An object's history is the current object's: a deleted and recreated one starts over. Read-only.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "job": { "type": "string", "description": "Job name." },
-                    "policy": { "type": "string", "description": "A standalone policy (`namespace/name`) instead of a job." },
+                    "object": { "type": "object", "description": "One of the autoscaler's objects instead of a job: { kind = \"scalingpolicy\" | \"nodegroup\" (or qualified, autoscaler/ScalingPolicy), name, namespace? }.", "properties": { "kind": { "type": "string" }, "name": { "type": "string" }, "namespace": { "type": "string" } }, "required": ["kind", "name"], "additionalProperties": false },
                     "group": { "type": "string" },
                     "task": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Rows (default 50)." }
@@ -1254,12 +1254,12 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_scaling_pause",
-            description: "Pause (or with resume=true, resume) autoscaling for a job, one of its tasks, a standalone policy (`policy`), or the whole cluster (all=true, needs operator:write), optionally for a duration. While paused the server refuses the autoscaler's writes; people can still scale by hand. Mutating.",
+            description: "Pause (or with resume=true, resume) autoscaling for a job, one of its tasks, one of the autoscaler's objects (`object`: a scaling policy or node group; needs what writing it needs), or the whole cluster (all=true, needs operator:write), optionally for a duration. While paused the server refuses the autoscaler's writes; people can still scale by hand. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
-                    "job": { "type": "string", "description": "Job name; omit with all=true or policy." },
-                    "policy": { "type": "string", "description": "A standalone policy (`namespace/name`) instead of a job." },
+                    "job": { "type": "string", "description": "Job name; omit with all=true or object." },
+                    "object": { "type": "object", "description": "One of the autoscaler's objects instead of a job: { kind = \"scalingpolicy\" | \"nodegroup\" (or qualified, autoscaler/ScalingPolicy), name, namespace? }.", "properties": { "kind": { "type": "string" }, "name": { "type": "string" }, "namespace": { "type": "string" } }, "required": ["kind", "name"], "additionalProperties": false },
                     "group": { "type": "string" },
                     "task": { "type": "string" },
                     "all": { "type": "boolean", "description": "Every autoscaled task in the cluster." },
@@ -1274,12 +1274,12 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_scaling_simulate",
-            description: "Run a scaling policy over the last hour of history (or a CSV series) and return the decisions it makes, without writing anything (docs/autoscaling.md, \"Simulating a policy\"). Give `job` for its live policy (replayed against the real count by default: it reproduces the live autoscaler's decisions), or `spec` (a jobspec, or a standalone policy, as JSON) for an edited policy (followed by default: what it would have done, with utilizations rescaled to its own count). `series_csv` (header `time,ready,total,<check>...`) replaces history; it is required for a standalone policy, whose sources have no history in Legion. Returns the changes, how many evaluations ran, and the checks the input had no readings for. Read-only.",
+            description: "Run a scaling policy over the last hour of history (or a CSV series) and return the decisions it makes, without writing anything (docs/autoscaling.md, \"Simulating a policy\"). Give `job` for its live policy (replayed against the real count by default: it reproduces the live autoscaler's decisions), or `spec` (a jobspec, or an autoscaler/ScalingPolicy object document `{ kind, name, namespace, spec }`, as JSON) for an edited policy (followed by default: what it would have done, with utilizations rescaled to its own count). `series_csv` (header `time,ready,total,<check>...`) replaces history; it is required for a scaling policy, whose sources have no history in Legion. Returns the changes, how many evaluations ran, and the checks the input had no readings for. Read-only.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "job": { "type": "string", "description": "A running job: simulate its live policy." },
-                    "spec": { "type": "object", "description": "A jobspec or a standalone policy (as JSON) to simulate instead." },
+                    "spec": { "type": "object", "description": "A jobspec, or an autoscaler/ScalingPolicy object document (as JSON), to simulate instead." },
                     "namespace": { "type": "string", "description": "Namespace for a bare job name or a spec that names none." },
                     "group": { "type": "string" },
                     "task": { "type": "string" },
@@ -1292,22 +1292,6 @@ fn tool_defs() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
             mutates: false,
-        },
-        ToolDef {
-            name: "legion_scaling_apply",
-            description: "Create or update a standalone scaling policy (docs/autoscaling.md, \"Standalone policies\"): a policy for a target that is not a Legion task, through a target plugin installed in the autoscaler's app config (or the built-in `noop`). `spec` is the jobspec `autoscale` record plus name, namespace, description and target = { plugin, config }, with min, max and checks required; or a node group (docs/autoscaling.md, \"Node groups\"): name, target = { nodes = { pool, workerType, shape, plugin, config } }, min, max, up, down, which is cluster-scoped. dry_run=true validates and returns the diff without writing. Needs scale:write on the policy's namespace; a node group needs operator:write and node:write. Mutating.",
-            input_schema: || json!({
-                "type": "object",
-                "properties": {
-                    "spec": { "type": "object", "description": "The policy, as JSON." },
-                    "namespace": { "type": "string", "description": "Namespace when the spec names none (default `default`)." },
-                    "dry_run": { "type": "boolean", "description": "Validate and diff; write nothing." },
-                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
-                },
-                "required": ["spec"],
-                "additionalProperties": false
-            }),
-            mutates: true,
         },
         ToolDef {
             name: "legion_job_destroy",
@@ -3108,8 +3092,8 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_scaling_explain" => {
-            let policy = opt_str_arg(&args, "policy").unwrap_or_default();
-            let job = if policy.is_empty() {
+            let object = object_arg(&args)?;
+            let job = if object.is_none() {
                 job_arg(&args, "job")?
             } else {
                 String::new()
@@ -3121,7 +3105,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     task_group: opt_str_arg(&args, "group"),
                     task_name: opt_str_arg(&args, "task"),
                     detail: true,
-                    policy,
+                    object,
                     ..Default::default()
                 },
             ))
@@ -3150,8 +3134,8 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             Ok(value)
         }
         "legion_scaling_history" => {
-            let policy = opt_str_arg(&args, "policy").unwrap_or_default();
-            let job = if policy.is_empty() {
+            let object = object_arg(&args)?;
+            let job = if object.is_none() {
                 job_arg(&args, "job")?
             } else {
                 String::new()
@@ -3164,7 +3148,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     task_name: opt_str_arg(&args, "task"),
                     limit: args.get("limit").and_then(Value::as_u64).unwrap_or(0) as u32,
                     detail: false,
-                    policy,
+                    object,
                 }),
             )
             .await
@@ -3212,29 +3196,10 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             }
             serde_json::to_value(&report).map_err(|err| err.to_string())
         }
-        "legion_scaling_apply" => {
-            let spec = args
-                .get("spec")
-                .filter(|spec| spec.is_object())
-                .ok_or_else(|| "spec (the policy, as a JSON object) is required".to_string())?;
-            let mut client = connect().await?;
-            grpc(
-                client.apply_scaling_policy(crate::structs::ApplyScalingPolicyRequest {
-                    spec_json: spec.to_string(),
-                    namespace: opt_str_arg(&args, "namespace").unwrap_or_default(),
-                    dry_run: args
-                        .get("dry_run")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
-                }),
-            )
-            .await
-        }
         "legion_scaling_pause" => {
             let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-            let policy = opt_str_arg(&args, "policy").unwrap_or_default();
-            let job = if all || !policy.is_empty() {
+            let object = object_arg(&args)?;
+            let job = if all || object.is_some() {
                 String::new()
             } else {
                 job_arg(&args, "job")?
@@ -3258,7 +3223,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 reason: opt_str_arg(&args, "reason").unwrap_or_default(),
                 resume: args.get("resume").and_then(Value::as_bool).unwrap_or(false),
                 idempotency_key: opt_str_arg(&args, "idempotency_key"),
-                policy,
+                object,
             }))
             .await
         }
@@ -3625,6 +3590,32 @@ fn str_arg(args: &Value, key: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| format!("missing string argument: {key}"))
+}
+
+/// The `object` argument of the scaling tools: one of the autoscaler's
+/// objects (`{ kind, name, namespace? }`).
+fn object_arg(args: &Value) -> Result<Option<crate::structs::ScalingObjectRef>, String> {
+    let Some(object) = args.get("object").filter(|object| !object.is_null()) else {
+        return Ok(None);
+    };
+    let field = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (kind, name) = (field("kind"), field("name"));
+    if kind.is_empty() || name.is_empty() {
+        return Err("object takes kind (scalingpolicy or nodegroup) and name".to_string());
+    }
+    Ok(Some(crate::structs::ScalingObjectRef {
+        kind,
+        name,
+        namespace: field("namespace"),
+        uid: 0,
+    }))
 }
 
 fn opt_str_arg(args: &Value, key: &str) -> Option<String> {

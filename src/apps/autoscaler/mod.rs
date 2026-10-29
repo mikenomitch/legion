@@ -5,12 +5,15 @@
 //! Every call it makes is a public RPC, as its own `legion` identity through
 //! the allocation's API socket:
 //!
-//! 1. **Policies** arrive on `WatchScalingPolicies`: the effective policy of
-//!    every autoscaled task, and every standalone policy (`legion scaling
-//!    apply`), re-sent whenever a job, a standalone policy, the cluster's
-//!    scaling defaults, a namespace policy, a pause of a standalone policy,
-//!    or the plugins installed in this app's config change. Nothing is
-//!    polled.
+//! 1. **Policies** arrive on two streams. `WatchScalingPolicies` sends the
+//!    effective policy of every autoscaled task, re-sent whenever a job, the
+//!    cluster's scaling defaults, a namespace policy, or the plugins
+//!    installed in this app's config change, and, for this app alone, the
+//!    layered defaults, the cluster-wide pause, and each of its objects'
+//!    pause and action row. `WatchObjects` sends the app's own objects
+//!    ([`objects`]): `autoscaler/ScalingPolicy` (a target outside Legion) and
+//!    `autoscaler/NodeGroup`, which this app resolves against those layers
+//!    itself, enforcing the plugin allowlist. Nothing is polled.
 //! 2. **Every interval** (`interval` in the app's config, default 15s), one
 //!    `GetScalingInputs` call (per 1000 targets) reads every task target's
 //!    replicas, measured usage, pins, pauses, rollouts, and override
@@ -24,8 +27,8 @@
 //!    its desired count first.
 //! 4. A task's change is written with `ScaleTask` (`source = "autoscaler"`,
 //!    compare-and-set on the version it read, the decision attached). A
-//!    standalone policy's change is an **action intent** first
-//!    (`RecordScalingAction` `intent`, compare-and-set on the policy's
+//!    scaling policy's change is an **action intent** first
+//!    (`RecordScalingAction` `intent`, compare-and-set on the object's
 //!    action version, which a pause refuses on the server), then made with
 //!    `target/scale`, then closed with its outcome. A dry-run change is
 //!    recorded with `RecordScalingAction` `would`, and every evaluation is
@@ -33,7 +36,12 @@
 //!    heartbeat.
 //! 5. Node groups ([`nodegroups`]) run after the task and external
 //!    policies: one `GetCapacityDemand` for every group, the expander, the
-//!    node-group engine, and one action intent per acting group.
+//!    node-group engine, and one action intent per acting group. A deleted
+//!    group (its object in its cleanup window) drains and terminates every
+//!    member, then is released.
+//! 6. Each object's durable verdict (accepted, ready, its resolved target,
+//!    its last action) is written to its status with `UpdateObjectStatus`,
+//!    only when it changed; the per-tick numbers stay in the report.
 //!
 //! **Replicas** ([`shards`]; docs/autoscaling.md, "Replicas"). Policies
 //! hash to 64 shards; each replica holds KV leases on the shards it
@@ -45,12 +53,14 @@
 //! Module map: [`rpc`] (the JSON-RPC transports), [`host`] (every installed
 //! plugin, ready to call), [`builtins`] (`prometheus`, `http`, `exec`,
 //! `noop`), [`conformance`] (`legion scaling plugin test`), [`nodegroups`]
-//! (node groups), [`shards`] (the shard leases).
+//! (node groups), [`objects`] (the app's object kinds, their status, and the
+//! validate call), [`shards`] (the shard leases).
 
 pub mod builtins;
 pub mod conformance;
 pub mod host;
 pub mod nodegroups;
+pub mod objects;
 pub mod rpc;
 pub mod shards;
 
@@ -60,6 +70,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::apps::objects::{run_object_watch, ObjectCache, ShardSelection, StatusBook};
 use crate::apps::{AppContext, AppFuture};
 use crate::autoscaler::defaults::EffectiveCheck;
 use crate::autoscaler::plugins::PluginCatalog;
@@ -73,12 +84,13 @@ use crate::autoscaler::{
 use crate::cmd::helpers::AuthedManagerClient;
 use crate::prelude::*;
 use crate::structs::{
-    GetScalingInputsRequest, RecordScalingActionRequest, ReportScalingStatusRequest, ScaleDecision,
-    ScaleTaskRequest, ScalingActionIntent, ScalingEventFlag, ScalingInputs, ScalingPauseInfo,
-    ScalingPolicy, ScalingPolicySet, ScalingTargetReport, ScalingTargetSelector,
-    StandaloneScalingPolicy, WatchScalingPoliciesRequest,
+    GetScalingInputsRequest, RecordScalingActionRequest, ReleaseObjectRequest,
+    ReportScalingStatusRequest, ScaleDecision, ScaleTaskRequest, ScalingActionIntent,
+    ScalingAppContext, ScalingEventFlag, ScalingInputs, ScalingPauseInfo, ScalingPolicy,
+    ScalingPolicySet, ScalingTargetReport, ScalingTargetSelector, WatchScalingPoliciesRequest,
 };
 use host::{PluginHost, RecommendCall, SourceCall, SourceReading};
+use objects::{ObjectTarget, Plan};
 use shards::{LeaseTiming, Ownership, Shards};
 
 /// The default evaluation interval (plan §6.9).
@@ -188,6 +200,9 @@ async fn run_body(mut context: AppContext) -> R<()> {
     // as the app; the actions write as the viewer, over the same connection
     // (docs/autoscaling.md, "In the UI").
     ui.connect(connection, engine.evaluations());
+    // The validate call for the app's kinds, from the layers the policy
+    // watch keeps (advice; the engine's own checks are the control).
+    objects::register_validate(context.ui(), engine.validator());
     // Shard leases first, so the first watch and tick know what this
     // replica owns (everything, when it is alone).
     let mut leases = engine.shards(LeaseTiming::default());
@@ -223,18 +238,9 @@ pub fn now_ms() -> i64 {
 }
 
 /// One target: `job/group/task` for a task, where `task` carries
-/// `autoscale`; `(policy key, "", "")` for a standalone policy.
+/// `autoscale`; `(object:<uid>, "", "")` for one of the app's objects
+/// ([`ObjectTarget::target_key`]).
 type TargetKey = (String, String, String);
-
-/// The key a standalone policy's history, pauses and status live under:
-/// `policy:<id>` (see `crate::manager::autoscale::policy_target_key`).
-fn standalone_key(id: &str) -> TargetKey {
-    (
-        crate::manager::autoscale::policy_target_key(id),
-        String::new(),
-        String::new(),
-    )
-}
 
 /// What the engine keeps per target between ticks.
 #[derive(Debug)]
@@ -261,8 +267,8 @@ struct TargetState {
     /// Why the policy was invalid at the last evaluation (for one
     /// `scale.check_failed` per episode).
     invalid: Option<String>,
-    /// A standalone policy's action version, as last seen (the
-    /// compare-and-set token of its next intent).
+    /// A scaling policy's action version, as last seen (the compare-and-set
+    /// token of its next intent).
     action_version: u64,
 }
 
@@ -293,11 +299,14 @@ impl TargetState {
 }
 
 /// Everything `WatchScalingPolicies` sent, by the key a delta names an
-/// entry with (`job/group/task`, or `policy:<id>`).
+/// entry with (`job/group/task`, or `object:<uid>`).
 #[derive(Debug, Clone, Default)]
 struct PolicyCache {
     tasks: BTreeMap<String, ScalingPolicy>,
-    standalone: BTreeMap<String, StandaloneScalingPolicy>,
+    /// The app's objects' pauses and action rows.
+    objects: objects::ObjectStates,
+    /// The layered defaults and the cluster-wide pause.
+    context: Option<ScalingAppContext>,
 }
 
 impl PolicyCache {
@@ -305,11 +314,11 @@ impl PolicyCache {
     fn apply(&mut self, set: ScalingPolicySet) {
         if set.full {
             self.tasks.clear();
-            self.standalone.clear();
+            self.objects.clear();
         }
         for key in &set.removed {
             self.tasks.remove(key);
-            self.standalone.remove(key);
+            self.objects.remove(key);
         }
         for policy in set.policies {
             self.tasks.insert(
@@ -317,12 +326,34 @@ impl PolicyCache {
                 policy,
             );
         }
-        for policy in set.standalone {
-            self.standalone.insert(
-                crate::manager::autoscale::policy_target_key(&policy.id),
-                policy,
-            );
+        for state in set.objects {
+            self.objects.insert(state.key.clone(), state);
         }
+        if set.context.is_some() {
+            self.context = set.context;
+        }
+    }
+}
+
+/// Which ScalingPolicies a replica watches: those of the shards it holds.
+fn policy_selection(owned: &Ownership) -> ShardSelection {
+    match &owned.shards {
+        None => ShardSelection::All,
+        Some(shards) => ShardSelection::Shards {
+            count: SHARDS,
+            shards: shards.iter().copied().collect(),
+        },
+    }
+}
+
+/// Which NodeGroups a replica watches: every one, on the replica that holds
+/// the `nodegroups` shard (the expander must see every group); none
+/// elsewhere.
+fn group_selection(owned: &Ownership) -> ShardSelection {
+    if owned.owns(shard::shard_of(shard::NODE_GROUPS_KEY, SHARDS)) {
+        ShardSelection::All
+    } else {
+        ShardSelection::Nothing
     }
 }
 
@@ -345,6 +376,18 @@ pub struct Engine {
     options: EngineOptions,
     started_ms: i64,
     policies: Arc<RwLock<Option<PolicyCache>>>,
+    /// The layered defaults the policy watch last sent, which the validate
+    /// call reads too.
+    context: Arc<RwLock<Option<ScalingAppContext>>>,
+    /// The app's ScalingPolicies of this replica's shards, and (on the
+    /// replica holding the `nodegroups` shard) every NodeGroup, from
+    /// `WatchObjects`.
+    policy_objects: Arc<RwLock<ObjectCache>>,
+    group_objects: Arc<RwLock<ObjectCache>>,
+    /// The status each object last had written, so only a change writes.
+    statuses: StatusBook,
+    /// A deleting node group's cleanup progress this tick, by key.
+    cleanups: HashMap<String, String>,
     targets: HashMap<TargetKey, TargetState>,
     host: Arc<PluginHost>,
     /// The manager that took the last report. Reports leave out unchanged
@@ -609,6 +652,11 @@ impl Engine {
             options,
             started_ms,
             policies: Arc::new(RwLock::new(None)),
+            context: Arc::new(RwLock::new(None)),
+            policy_objects: Arc::new(RwLock::new(ObjectCache::default())),
+            group_objects: Arc::new(RwLock::new(ObjectCache::default())),
+            statuses: StatusBook::default(),
+            cleanups: HashMap::new(),
             targets: HashMap::new(),
             host: Arc::new(host),
             served_by: None,
@@ -659,15 +707,77 @@ impl Engine {
         &self.host
     }
 
-    /// Keep the policy cache current from `WatchScalingPolicies` (deltas,
-    /// filtered to the shards this replica owns), reconnecting with backoff,
-    /// and starting over whenever the owned shards change, until the
-    /// returned task is aborted.
+    /// What the validate call for the app's kinds reads.
+    pub fn validator(&self) -> objects::Validator {
+        objects::Validator {
+            context: self.context.clone(),
+            plugins: self.options.plugins.clone(),
+        }
+    }
+
+    /// Keep the policy cache and the object caches current until the
+    /// returned task is aborted: `WatchScalingPolicies` (deltas, filtered to
+    /// the shards this replica owns), and `WatchObjects` for the app's
+    /// ScalingPolicies (the same shards) and NodeGroups (all of them, on the
+    /// replica holding the `nodegroups` shard), each reconnecting with
+    /// backoff and starting over whenever the owned shards change.
     pub fn spawn_watch(&self) -> tokio::task::JoinHandle<()> {
+        let policy_watch = self.policy_watch();
+        let owned = self.ownership();
+        let (policy_tx, policy_rx) = tokio::sync::watch::channel(policy_selection(&owned));
+        let (group_tx, group_rx) = tokio::sync::watch::channel(group_selection(&owned));
+        let ownership = self.ownership.clone();
+        // The lease controller publishes ownership in place; follow it into
+        // the object watches' selections.
+        let follow = async move {
+            let mut every = tokio::time::interval(Duration::from_millis(250));
+            loop {
+                every.tick().await;
+                let owned = ownership
+                    .read()
+                    .map(|ownership| ownership.clone())
+                    .unwrap_or_default();
+                policy_tx.send_if_modified(|current| {
+                    let next = policy_selection(&owned);
+                    let changed = *current != next;
+                    *current = next;
+                    changed
+                });
+                group_tx.send_if_modified(|current| {
+                    let next = group_selection(&owned);
+                    let changed = *current != next;
+                    *current = next;
+                    changed
+                });
+            }
+        };
+        let app = crate::autoscaler::policy::APP.to_string();
+        let policies = run_object_watch(
+            self.client.clone(),
+            app.clone(),
+            vec![crate::autoscaler::policy::SCALING_POLICY_KIND.to_string()],
+            policy_rx,
+            self.policy_objects.clone(),
+        );
+        let groups = run_object_watch(
+            self.client.clone(),
+            app,
+            vec![crate::autoscaler::policy::NODE_GROUP_KIND.to_string()],
+            group_rx,
+            self.group_objects.clone(),
+        );
+        tokio::spawn(async move {
+            tokio::join!(policy_watch, follow, policies, groups);
+        })
+    }
+
+    /// The `WatchScalingPolicies` loop (see [`Self::spawn_watch`]).
+    fn policy_watch(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let mut client = self.client.clone();
         let policies = self.policies.clone();
+        let context = self.context.clone();
         let ownership = self.ownership.clone();
-        tokio::spawn(async move {
+        async move {
             let mut backoff = Duration::from_millis(500);
             loop {
                 let owned = ownership
@@ -704,13 +814,18 @@ impl Engine {
                                 Ok(Some(set)) => {
                                     debug!(
                                         policies = set.policies.len(),
-                                        standalone = set.standalone.len(),
+                                        objects = set.objects.len(),
                                         removed = set.removed.len(),
                                         full = set.full,
                                         more = set.more,
                                         generation = set.generation,
                                         "Scaling policies updated"
                                     );
+                                    if let Some(sent) = &set.context {
+                                        if let Ok(mut context) = context.write() {
+                                            *context = Some(sent.clone());
+                                        }
+                                    }
                                     let more = set.more;
                                     if staging.is_none() && !set.full && !more {
                                         // A whole delta: apply it in place.
@@ -757,26 +872,36 @@ impl Engine {
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(WATCH_BACKOFF_MAX);
             }
-        })
+        }
     }
 
-    /// How many policies the cache holds, task and standalone (`None`
-    /// before the first set).
+    /// How many policies the caches hold: task policies, and the app's
+    /// ScalingPolicies and NodeGroups (`None` before the first policy set,
+    /// or while an object watch has not completed its first snapshot).
     pub fn policy_count(&self) -> Option<usize> {
-        self.policies.read().ok().and_then(|cache| {
-            cache
-                .as_ref()
-                .map(|cache| cache.tasks.len() + cache.standalone.len())
-        })
+        let tasks = self
+            .policies
+            .read()
+            .ok()
+            .and_then(|cache| cache.as_ref().map(|cache| cache.tasks.len()))?;
+        let mut count = tasks;
+        for cache in [&self.policy_objects, &self.group_objects] {
+            let cache = cache.read().ok()?;
+            if !cache.synced() {
+                return None;
+            }
+            count += cache.len();
+        }
+        Some(count)
     }
 
     /// Replace the policy cache's task policies (tests, or a caller with
     /// its own source).
     pub fn set_policies(&self, policies: Vec<ScalingPolicy>) {
         if let Ok(mut cache) = self.policies.write() {
-            let standalone = cache
+            let (objects, context) = cache
                 .as_ref()
-                .map(|cache| cache.standalone.clone())
+                .map(|cache| (cache.objects.clone(), cache.context.clone()))
                 .unwrap_or_default();
             *cache = Some(PolicyCache {
                 tasks: policies
@@ -788,9 +913,60 @@ impl Engine {
                         )
                     })
                     .collect(),
-                standalone,
+                objects,
+                context,
             });
         }
+    }
+
+    /// The app's objects this replica runs this tick, resolved: its
+    /// ScalingPolicies (of the shards it holds) and, when it holds the
+    /// `nodegroups` shard, every NodeGroup. Empty before the policy watch
+    /// has sent the layered defaults.
+    fn object_targets(&self, cache: &PolicyCache, owned: &Ownership) -> Vec<ObjectTarget> {
+        let Some(layers) = objects::layers_of(cache.context.as_ref(), &self.options.plugins) else {
+            return Vec::new();
+        };
+        let paused_all = cache
+            .context
+            .as_ref()
+            .and_then(|context| context.paused_all.as_ref());
+        let force_dry_run = self.options.force_mode == Some(Mode::DryRun);
+        let mut out = Vec::new();
+        let groups_here = owned.owns(shard::shard_of(shard::NODE_GROUPS_KEY, SHARDS));
+        for (cache_lock, groups) in [(&self.policy_objects, false), (&self.group_objects, true)] {
+            if groups && !groups_here {
+                continue;
+            }
+            let Ok(objects) = cache_lock.read() else {
+                continue;
+            };
+            for object in objects.objects() {
+                // The watch is filtered to the shards held, but lags a
+                // rebalance by a moment.
+                if !groups
+                    && !owned.owns(crate::structs::app_object::object_shard(
+                        &object.app,
+                        &object.kind,
+                        &object.namespace,
+                        &object.name,
+                        SHARDS,
+                    ))
+                {
+                    continue;
+                }
+                let state = cache
+                    .objects
+                    .get(&crate::manager::autoscale::object_target_key(object.uid));
+                if let Some(target) =
+                    objects::resolve_target(object, &layers, state, paused_all, force_dry_run)
+                {
+                    out.push(target);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        out
     }
 
     /// One evaluation of every policy at `now_ms`: read, decide, write,
@@ -814,24 +990,16 @@ impl Engine {
             .filter(|(key, _)| owned.owns(shard::shard_of(key, SHARDS)))
             .map(|(_, policy)| policy)
             .collect();
-        let standalone_policies: Vec<&StandaloneScalingPolicy> = cache
-            .standalone
-            .values()
-            .filter(|policy| {
-                owned.owns(shard::shard_of(
-                    &shard::standalone_key(&policy.kind, &policy.id),
-                    SHARDS,
-                ))
-            })
-            .collect();
-        let mut reports = Vec::with_capacity(tasks.len() + standalone_policies.len());
+        let object_targets = self.object_targets(&cache, &owned);
+        let mut reports = Vec::with_capacity(tasks.len() + object_targets.len());
         let live: BTreeSet<TargetKey> = tasks
             .iter()
             .map(|p| (p.job_id.clone(), p.task_group.clone(), p.task_name.clone()))
-            .chain(standalone_policies.iter().map(|p| standalone_key(&p.id)))
+            .chain(object_targets.iter().map(ObjectTarget::target_key))
             .collect();
         self.targets.retain(|key, _| live.contains(key));
         self.log.retain(&live);
+        self.cleanups.clear();
 
         // Parse the valid policies; report the invalid ones as held.
         let mut valid: Vec<(&ScalingPolicy, EffectivePolicy)> = Vec::new();
@@ -862,46 +1030,24 @@ impl Engine {
                 )),
             }
         }
-        let mut standalone: Vec<(&StandaloneScalingPolicy, EffectivePolicy)> = Vec::new();
-        let mut node_groups: Vec<(&StandaloneScalingPolicy, EffectiveNodeGroup)> = Vec::new();
-        for policy in standalone_policies.iter().copied() {
-            if policy.state != "ok" {
-                reports.push(plain_report(
-                    standalone_report(policy),
+        // The app's objects: one that does not resolve (its spec, the
+        // layered defaults, a plugin closed to its namespace) is held
+        // `invalid`, never run.
+        let mut standalone: Vec<(&ObjectTarget, EffectivePolicy)> = Vec::new();
+        let mut node_groups: Vec<(&ObjectTarget, EffectiveNodeGroup)> = Vec::new();
+        for target in &object_targets {
+            match &target.plan {
+                Err(err) => reports.push(plain_report(
+                    object_report(target),
                     "invalid",
                     0,
-                    &policy.error,
-                    now_ms,
-                ));
-                continue;
-            }
-            if policy.kind == "nodes" {
-                match serde_json::from_str::<EffectiveNodeGroup>(&policy.policy_json) {
-                    Ok(group) => node_groups.push((policy, group)),
-                    Err(err) => reports.push(plain_report(
-                        standalone_report(policy),
-                        "error",
-                        0,
-                        &format!("the node group does not parse in this build: {err}"),
-                        now_ms,
-                    )),
-                }
-                continue;
-            }
-            match serde_json::from_str::<EffectivePolicy>(&policy.policy_json) {
-                Ok(mut effective) => {
-                    if let Some(mode) = self.options.force_mode {
-                        effective.mode = mode;
-                    }
-                    standalone.push((policy, effective));
-                }
-                Err(err) => reports.push(plain_report(
-                    standalone_report(policy),
-                    "error",
-                    0,
-                    &format!("the policy does not parse in this build: {err}"),
+                    err,
                     now_ms,
                 )),
+                Ok(Plan::External(effective)) => {
+                    standalone.push((target, effective.as_ref().clone()))
+                }
+                Ok(Plan::Nodes(group)) => node_groups.push((target, group.as_ref().clone())),
             }
         }
 
@@ -923,7 +1069,7 @@ impl Engine {
                     .chain(
                         standalone
                             .iter()
-                            .map(|(policy, effective)| (policy.id.clone(), effective)),
+                            .map(|(target, effective)| (target.id.clone(), effective)),
                     ),
                 now_ms,
             )
@@ -1092,19 +1238,20 @@ impl Engine {
         reports.extend(group_reports);
 
         for target in &reports {
-            let label = if target.policy.is_empty() {
-                format!(
+            let label = match &target.object {
+                None => format!(
                     "{}/{}/{}",
                     target.job_id, target.task_group, target.task_name
-                )
-            } else {
-                target.policy.clone()
+                ),
+                Some(object) => object_label(object),
             };
             report.states.insert(label.clone(), target.state.clone());
             report.summaries.insert(label, target.summary.clone());
         }
         let decided_at = Instant::now();
         report.timings.decide = decided_at - read_at;
+        // Each object's durable verdict, written only when it changed.
+        self.write_statuses(&object_targets, &reports).await;
         let request = ReportScalingStatusRequest {
             instance: self.options.instance.clone(),
             interval_seconds: self.options.interval.as_secs().max(1) as u32,
@@ -1507,16 +1654,15 @@ impl Engine {
     /// scale the target.
     async fn evaluate_standalone(
         &mut self,
-        policy: &StandaloneScalingPolicy,
+        policy: &ObjectTarget,
         effective: &EffectivePolicy,
         external: &HashMap<QueryKey, Result<SourceReading, String>>,
         now_ms: i64,
         report: &mut TickReport,
     ) -> ScalingTargetReport {
-        let key = standalone_key(&policy.id);
-        let base = standalone_report(policy);
-        let config: Value =
-            serde_json::from_str(&policy.target_config_json).unwrap_or_else(|_| json!({}));
+        let key = policy.target_key();
+        let base = object_report(policy);
+        let config = policy.target_config.clone();
         let host = self.host.clone();
         if let Err(problem) = host
             .check(
@@ -1592,7 +1738,7 @@ impl Engine {
                     .client
                     .record_scaling_action(RecordScalingActionRequest {
                         kind: "intent".to_string(),
-                        policy: policy.id.clone(),
+                        object: Some(policy.reference.clone()),
                         expected_action_version: expected,
                         intent: Some(ScalingActionIntent {
                             decision_id: scale_decision.id.clone(),
@@ -1659,7 +1805,7 @@ impl Engine {
                         .client
                         .record_scaling_action(RecordScalingActionRequest {
                             kind: "outcome".to_string(),
-                            policy: policy.id.clone(),
+                            object: Some(policy.reference.clone()),
                             expected_action_version: version,
                             outcome: outcome.to_string(),
                             detail,
@@ -1708,7 +1854,7 @@ impl Engine {
                             from: decision.from,
                             to: decision.to,
                             decision: Some(scale_decision),
-                            policy: policy.id.clone(),
+                            object: Some(policy.reference.clone()),
                             ..Default::default()
                         })
                         .await;
@@ -1735,6 +1881,95 @@ impl Engine {
         }
         self.finish_report(&key, &decision, &mut target_report);
         target_report
+    }
+}
+
+impl Engine {
+    /// Write each object's durable verdict ([`objects::verdict`]) to its
+    /// status when it differs from what is stored: a handful of writes
+    /// when the world changes, none on a quiet tick. A write that fails is
+    /// tried again next tick.
+    async fn write_statuses(&mut self, targets: &[ObjectTarget], reports: &[ScalingTargetReport]) {
+        let live: std::collections::HashSet<u64> =
+            targets.iter().map(|target| target.object.uid).collect();
+        self.statuses.retain(&live);
+        let by_uid: HashMap<u64, &ScalingTargetReport> = reports
+            .iter()
+            .filter_map(|tick| tick.object.as_ref().map(|object| (object.uid, tick)))
+            .collect();
+        let mut writes = Vec::new();
+        for target in targets {
+            let Some(tick) = by_uid.get(&target.object.uid) else {
+                continue;
+            };
+            let outcome = objects::verdict(
+                target,
+                &tick.state,
+                &tick.summary,
+                self.cleanups.get(&target.key).cloned(),
+            );
+            if self.statuses.differs(&target.object, &outcome) {
+                writes.push((target.object.clone(), outcome));
+            }
+        }
+        if writes.is_empty() {
+            return;
+        }
+        use futures::StreamExt;
+        let client = self.client.clone();
+        let results: Vec<_> = futures::stream::iter(writes.into_iter().map(|(object, outcome)| {
+            let client = client.clone();
+            async move {
+                let written =
+                    crate::apps::objects::write_object_status(&client, &object, &outcome).await;
+                (object, outcome, written)
+            }
+        }))
+        .buffer_unordered(8)
+        .collect()
+        .await;
+        for (object, outcome, written) in results {
+            match written {
+                Ok(_) => self.statuses.record(&object, &outcome),
+                Err(status) => {
+                    // A deleted object, or one whose generation this manager
+                    // has not seen yet: the next tick tries again.
+                    debug!(
+                        kind = %object.qualified_kind,
+                        object = %object.id,
+                        uid = object.uid,
+                        "Writing the object's status: {}",
+                        status.message()
+                    );
+                    self.statuses.forget(object.uid);
+                }
+            }
+        }
+    }
+
+    /// Release a deleting object whose cleanup is done.
+    async fn release(&mut self, target: &ObjectTarget, report: &mut TickReport) {
+        match self
+            .client
+            .release_object(ReleaseObjectRequest {
+                kind: target.reference.kind.clone(),
+                namespace: target.reference.namespace.clone(),
+                name: target.reference.name.clone(),
+                uid: target.reference.uid,
+                idempotency_key: None,
+            })
+            .await
+        {
+            Ok(_) => {
+                info!(object = %target.label, uid = target.reference.uid, "Released a deleted object: its cleanup is done")
+            }
+            Err(status) if status.code() == tonic::Code::NotFound => {}
+            Err(status) => report.errors.push(format!(
+                "{}: releasing it: {}",
+                target.label,
+                status.message()
+            )),
+        }
     }
 }
 
@@ -1765,13 +2000,25 @@ fn task_report(policy: &ScalingPolicy) -> ScalingTargetReport {
     }
 }
 
-/// A report naming a standalone policy.
-fn standalone_report(policy: &StandaloneScalingPolicy) -> ScalingTargetReport {
+/// A report naming one of the app's objects.
+fn object_report(target: &ObjectTarget) -> ScalingTargetReport {
     ScalingTargetReport {
-        policy: policy.id.clone(),
-        policy_digest: policy.digest.clone(),
+        object: Some(target.reference.clone()),
+        policy_digest: target.digest.clone(),
         ..Default::default()
     }
+}
+
+/// `ScalingPolicy media/render-farm`: how a tick report names an object.
+fn object_label(object: &crate::structs::ScalingObjectRef) -> String {
+    let bare = object
+        .kind
+        .split_once('/')
+        .map_or(object.kind.as_str(), |(_, bare)| bare);
+    format!(
+        "{bare} {}",
+        crate::autoscaler::policy::object_label(&object.namespace, &object.name)
+    )
 }
 
 #[cfg(test)]

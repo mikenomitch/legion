@@ -232,7 +232,6 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("scale_history", Owner::Lane(Lane::Control)),
     ("scaling_pause", Owner::Lane(Lane::Control)),
     ("scaling_policy_snapshot", Owner::Lane(Lane::Control)),
-    ("scaling_policy", Owner::Lane(Lane::Control)),
     // A standalone policy's action intent: compare-and-set writes beside
     // the policy they act for.
     ("scaling_action", Owner::Lane(Lane::Control)),

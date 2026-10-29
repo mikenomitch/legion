@@ -6,10 +6,17 @@
 (the generic system) is built (2026-10-29, branch `claude/app-objects`;
 public page [docs/app-objects.md](../../docs/app-objects.md)); what the
 build decided beyond this plan is calls entries 28-31 and the note under
-entry 11 (the `Accepted` summary). **Phases O2-O4** are
-planned here and not started: O2 moves the autoscaler's standalone scaling
-policies and node groups onto kinds it owns, O3 lets an app act for an
-object with the authority its writer recorded, O4 adds CEL `rules`.
+entry 11 (the `Accepted` summary). **Phase O2** is built (2026-10-29, same
+branch): the autoscaler's standalone policies and node groups are its
+`autoscaler/ScalingPolicy` and `autoscaler/NodeGroup` kinds, the core
+`scaling_policy` table, its three RPCs, `legion scaling apply|list|delete`,
+and `legion_scaling_apply` are gone (public pages
+[docs/autoscaling.md](../../docs/autoscaling.md#standalone-policies) and
+[docs/app-objects.md](../../docs/app-objects.md#a-worked-example-the-autoscaler));
+what the build decided is calls entries 32-43. **Phases O3-O4** are
+planned here and not started: O3 lets an app act for an object with the
+authority its writer recorded, O4 adds CEL `rules` (and with them restores
+the fail-closed `min <= max` check O2 moved to the app, calls entry 33).
 Deliberately deferred: schema versions and conversion, owner references and
 core garbage collection (bounded `cleanup` replaces finalizers), a generic
 object browser in the SPA, `since_version` watch resume, per-namespace
@@ -18,8 +25,8 @@ yet.
 
 **Revised after adversarial review (2026-10-29).** Three reviews of this
 plan and of the apps substrate changed O1 before it shipped; calls entries
-1-31 are the decisions as they stand (28-31 from the build), and the superseded originals are kept
-at the end of the calls doc. What changed:
+1-43 are the decisions as they stand (28-31 from O1's build, 32-43 from
+O2's), and the superseded originals are kept at the end of the calls doc. What changed:
 - a guiding principle (§1): an object can never make its app do more than
   its writer could, and the write path never depends on the app being up;
 - **kind identity** is `<app>/<Kind>`; files and the API require it, short
@@ -849,8 +856,15 @@ every third-party app can have objects). It may ship as two commit series:
 core (§6.1-§6.7, §6.9-§6.11), then the framework (§6.8's reconcile loop),
 the example, and the docs.
 
-**O2: the autoscaler's policies become its objects** (a later change;
+**O2: the autoscaler's policies become its objects** (built 2026-10-29;
 valuable alone: it deletes a core subsystem and proves the generic one).
+As built, beyond what follows: state is keyed by uid (`object:<uid>`,
+calls entry 32), the app reads its objects with `run_object_watch` and
+writes status through a `StatusBook` rather than the reconcile loop (entry
+37), `WatchScalingPolicies` carries the layered defaults and object
+targets' pauses and action rows to the app alone (entry 34), deleting a
+node group retires it through the scale-in path (entry 36), and the
+schemas are generated from the parser's types (entry 39).
 
 - The bundled manifest declares `autoscaler/ScalingPolicy` (namespaced,
   `access = scale`, namespace-wide; `immutable` on the target plugin) and

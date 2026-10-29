@@ -2466,6 +2466,21 @@ fn migration_list() -> Vec<M<'static>> {
         DROP TABLE IF EXISTS app_object;
         DROP TABLE IF EXISTS object_kind;",
         ),
+        // The autoscaler's standalone policies and node groups became its
+        // object kinds (`autoscaler/ScalingPolicy`, `autoscaler/NodeGroup`
+        // in `app_object`; app-object-kinds plan §8 O2): `scaling_policy`
+        // goes, its rows not converted (no installed base). The scaling
+        // state they kept under `policy:<id>` keys goes too: object targets
+        // key it `object:<uid>`, and `scaling_action.policy` now holds that
+        // key.
+        M::up(
+            "DROP TABLE IF EXISTS scaling_policy;
+        DELETE FROM scaling_action;
+        DELETE FROM scaling_pause WHERE job_id LIKE 'policy:%';
+        DELETE FROM scale_history WHERE job_id LIKE 'policy:%';
+        DELETE FROM scaling_counter WHERE name = 'scaling_policy';",
+        )
+        .down(""),
     ]
 }
 

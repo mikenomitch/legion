@@ -10,8 +10,10 @@
 //! - A Python strategy installed through the autoscaler's app config and
 //!   used by a task's policy (acceptance P4); a policy in a namespace
 //!   outside its allowlist is refused at apply.
-//! - A standalone policy on the `exec` target, scaled by an `http` source,
-//!   paused, and deleted.
+//! - A standalone policy (an `autoscaler/ScalingPolicy` object) on the
+//!   `exec` target, scaled by an `http` source: applied (and diffed), run,
+//!   reported in its status, paused, deleted, and recreated without the
+//!   pause.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -24,12 +26,12 @@ use legion::apps::autoscaler::EngineOptions;
 use legion::autoscaler::plugins::PluginCatalog;
 use legion::prelude::{json, Value, R};
 use legion::structs::{
-    ApplyScalingPolicyRequest, DeleteScalingPolicyRequest, GetScaleHistoryRequest,
-    GetScalingStatusRequest, ListScalingPoliciesRequest, PauseScalingRequest,
+    ApplyObjectRequest, DeleteObjectRequest, GetObjectRequest, GetScaleHistoryRequest,
+    GetScalingStatusRequest, ListObjectsRequest, PauseScalingRequest,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::autoscaler::{Harness, T0, TICK_MS};
+use crate::autoscaler::{object_ref, Harness, T0, TICK_MS};
 
 fn examples() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/scaling-plugins")
@@ -629,9 +631,11 @@ async fn a_python_strategy_installed_in_app_config_drives_a_policy_test() -> R<(
     Ok(())
 }
 
-/// A standalone policy on the `exec` target, scaled by the `http` source:
-/// applied (and diffed), evaluated, recorded in history, paused, and
-/// deleted.
+/// A standalone policy on the `exec` target, scaled by the `http` source,
+/// as an `autoscaler/ScalingPolicy` object: applied (a dry run, an
+/// unchanged re-apply, a diff), evaluated, recorded in history and in its
+/// status, paused, deleted, and recreated under the same name without the
+/// old pause or history (state is keyed by the object's uid).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_standalone_policy_scales_an_exec_target_test() -> R<()> {
     let depth = Arc::new(Mutex::new(25.0));
@@ -655,66 +659,66 @@ async fn a_standalone_policy_scales_an_exec_target_test() -> R<()> {
     let mut h = Harness::start(1).await?;
     h.install_plugins(config.clone())?;
     let policy = json!({
-        "name": "render-farm",
         "description": "GPU render workers",
         "target": { "plugin": "render", "config": { "pool": "gpu" } },
         "min": 1, "max": 10,
         "checks": [{ "name": "queue", "source": "queue", "query": "/depth",
                      "strategy": { "name": "per-replica", "value": 5 } }],
     });
-    let apply = |spec: &Value, dry_run: bool| ApplyScalingPolicyRequest {
-        spec_json: spec.to_string(),
-        namespace: String::new(),
+    let apply = |spec: &Value, dry_run: bool| ApplyObjectRequest {
+        object_json: json!({
+            "kind": "autoscaler/ScalingPolicy", "name": "render-farm", "spec": spec,
+        })
+        .to_string(),
         dry_run,
-        idempotency_key: None,
+        ..Default::default()
     };
     let dry = h
         .client
-        .apply_scaling_policy(apply(&policy, true))
+        .apply_object(apply(&policy, true))
         .await?
         .into_inner();
     assert!(dry.created && dry.dry_run, "{dry:?}");
-    assert!(h.store.scaling_policy("default", "render-farm")?.is_none());
     let created = h
         .client
-        .apply_scaling_policy(apply(&policy, false))
+        .apply_object(apply(&policy, false))
         .await?
         .into_inner();
-    assert_eq!(created.id, "render-farm");
     assert!(created.created, "{created:?}");
+    let first = created.object.clone().expect("the object");
     let again = h
         .client
-        .apply_scaling_policy(apply(&policy, false))
+        .apply_object(apply(&policy, false))
         .await?
         .into_inner();
-    assert!(
-        !again.changed && again.version == created.version,
-        "{again:?}"
-    );
+    assert!(!again.changed, "{again:?}");
     let mut wider = policy.clone();
     wider["max"] = json!(20);
     let diff = h
         .client
-        .apply_scaling_policy(apply(&wider, true))
+        .apply_object(apply(&wider, true))
         .await?
         .into_inner();
-    assert_eq!(diff.diff, vec!["max: 10 -> 20".to_string()], "{diff:?}");
+    assert_eq!(diff.diff, vec!["spec.max: 10 → 20".to_string()], "{diff:?}");
+    // The target plugin is immutable.
+    let mut moved = policy.clone();
+    moved["target"]["plugin"] = json!("queue");
+    let refused = h
+        .client
+        .apply_object(apply(&moved, true))
+        .await
+        .expect_err("target.plugin is immutable");
+    assert!(refused.message().contains("immutable"), "{refused:?}");
 
     let listed = h
         .client
-        .list_scaling_policies(ListScalingPoliciesRequest::default())
+        .list_objects(ListObjectsRequest {
+            kind: "scalingpolicies".into(),
+            ..Default::default()
+        })
         .await?
         .into_inner();
-    let entry = listed
-        .policies
-        .iter()
-        .find(|policy| policy.id == "render-farm")
-        .expect("listed");
-    assert_eq!(
-        (entry.kind.as_str(), entry.min, entry.max),
-        ("external", 1, 10)
-    );
-    assert_eq!(entry.target, "plugin render");
+    assert_eq!(listed.objects.len(), 1);
 
     let options = EngineOptions {
         plugins: PluginCatalog::from_app_config(&config).map_err(|err| anyhow::anyhow!(err))?,
@@ -725,23 +729,61 @@ async fn a_standalone_policy_scales_an_exec_target_test() -> R<()> {
     let report = engine.tick(T0).await;
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(std::fs::read_to_string(&state)?.trim(), "5");
+    let target = object_ref("ScalingPolicy", "default", "render-farm");
     let history = h
         .client
         .get_scale_history(GetScaleHistoryRequest {
-            policy: "render-farm".into(),
+            object: Some(target.clone()),
             limit: 10,
             ..Default::default()
         })
         .await?
         .into_inner();
     assert_eq!((history.entries[0].from, history.entries[0].to), (1, 5));
-    assert_eq!(history.entries[0].policy, "render-farm");
+    assert_eq!(
+        history.entries[0].object.as_ref().map(|o| o.uid),
+        Some(first.uid)
+    );
     assert_eq!(history.entries[0].kind, "scaled");
+
+    // The durable verdict, in the object's status: accepted, ready, its
+    // resolved target, and the last action once its intent closed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let fields = loop {
+        engine.tick(T0 + TICK_MS).await;
+        let object = h
+            .client
+            .get_object(GetObjectRequest {
+                kind: "scalingpolicy".into(),
+                name: "render-farm".into(),
+                namespace: String::new(),
+            })
+            .await?
+            .into_inner()
+            .object
+            .expect("the object");
+        let status = object.status.unwrap_or_default();
+        let fields: Value = serde_json::from_str(&status.fields_json).unwrap_or_default();
+        if fields["lastAction"]["to"] == 5 {
+            assert_eq!(status.observed_generation, object.generation);
+            let ready = status
+                .conditions
+                .iter()
+                .find(|c| c.r#type == "Ready")
+                .map(|c| c.status.as_str());
+            assert_eq!(ready, Some("true"), "{status:?}");
+            break fields;
+        }
+        assert!(std::time::Instant::now() < deadline, "{fields}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(fields["target"], "plugin render", "{fields}");
+    assert_eq!(fields["lastAction"]["outcome"], "succeeded", "{fields}");
 
     // Paused: the server refuses the scale, nothing moves.
     h.client
         .pause_scaling(PauseScalingRequest {
-            policy: "render-farm".into(),
+            object: Some(target.clone()),
             reason: "maintenance".into(),
             ..Default::default()
         })
@@ -749,8 +791,13 @@ async fn a_standalone_policy_scales_an_exec_target_test() -> R<()> {
     *depth.lock().unwrap() = 50.0;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let report = engine.tick(T0 + TICK_MS).await;
-        if report.states.get("render-farm").map(String::as_str) == Some("paused") {
+        let report = engine.tick(T0 + 2 * TICK_MS).await;
+        if report
+            .states
+            .get("ScalingPolicy default/render-farm")
+            .map(String::as_str)
+            == Some("paused")
+        {
             break;
         }
         assert!(std::time::Instant::now() < deadline, "{report:?}");
@@ -760,7 +807,7 @@ async fn a_standalone_policy_scales_an_exec_target_test() -> R<()> {
     let status = h
         .client
         .get_scaling_status(GetScalingStatusRequest {
-            policy: "render-farm".into(),
+            object: Some(target.clone()),
             detail: true,
             ..Default::default()
         })
@@ -768,17 +815,48 @@ async fn a_standalone_policy_scales_an_exec_target_test() -> R<()> {
         .into_inner();
     assert_eq!(status.targets[0].state, "paused");
     assert_eq!(status.targets[0].kind, "external");
-    watch.abort();
+    assert!(status.targets[0].pause.is_some());
 
+    // Deleted (no cleanup window for a policy: at once), then created
+    // again under the same name: a new uid, so no pause and no history.
     let deleted = h
         .client
-        .delete_scaling_policy(DeleteScalingPolicyRequest {
+        .delete_object(DeleteObjectRequest {
+            kind: "scalingpolicy".into(),
             name: "render-farm".into(),
             ..Default::default()
         })
         .await?
         .into_inner();
-    assert!(deleted.message.contains("deleted"), "{deleted:?}");
-    assert!(h.store.scaling_policy("default", "render-farm")?.is_none());
+    assert!(deleted.deleted, "{deleted:?}");
+    let recreated = h
+        .client
+        .apply_object(apply(&policy, false))
+        .await?
+        .into_inner();
+    let second = recreated.object.expect("the object");
+    assert_ne!(second.uid, first.uid);
+    let status = h
+        .client
+        .get_scaling_status(GetScalingStatusRequest {
+            object: Some(target.clone()),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    assert!(status.targets[0].pause.is_none(), "{:?}", status.targets[0]);
+    let history = h
+        .client
+        .get_scale_history(GetScaleHistoryRequest {
+            object: Some(target),
+            limit: 10,
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    assert!(history.entries.is_empty(), "{:?}", history.entries);
+    // The old object's state is swept on the managers' next pass.
+    assert!(h.store.sweep_object_scaling_state()? > 0);
+    watch.abort();
     Ok(())
 }

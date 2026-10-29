@@ -120,11 +120,10 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_job_scale` | **yes** | Change a task's count without a new job version or rollout ([autoscaling.md](autoscaling.md)). On an autoscaled task a count is a time-boxed pin and needs `for` (refused otherwise, with a hint); `min`/`max` with `for` pin a floor or ceiling; `release` ends a pin. Supports `idempotency_key`. |
 | `legion_job_scale_status` | no | Per-task spec vs override vs effective counts. The effective count is the one placement converges to: an override laid over a different spec count does not bind and is not reported. For an autoscaled task, also its policy in one line, its pin and pause, and the autoscaler's state. |
 | `legion_scaling_status` | no | Task autoscaling ([autoscaling.md](autoscaling.md)): every autoscaled task's `now`, `want`, bounds, mode, and `state` (`ok`, `scaled`, `held`, `limited`, `deferred`, `pinned`, `paused`, `dry-run`, `missing-data`, `invalid`, `stale`, `not-evaluated`), its last change, the replica that evaluated it (`instance`), and `app.state` (`running`, `not-running`, `starting`, `disabled`), with `app.replicas` listing every [autoscaler replica](autoscaling.md#replicas), its shards, and its last report. An agent should treat `not-running` as "nothing is scaling", and `stale` as "this target's numbers are old". |
-| `legion_scaling_explain` | no | Why an autoscaled task (or, with `policy`, a standalone policy's target or a node group: each stage, the members chosen for scale-in, the ones protected and why, and the actions taken) is at its count, as data: the last evaluation's checks (reading, desired) and every safeguard stage (`before`, `after`, `note`), and the effective policy with each field's origin (`built-in`, `cluster defaults`, `namespace policy <name>`, `jobspec`). Read this before changing a policy. |
-| `legion_scaling_history` | no | The durable record of a job's (or, with `policy`, a standalone policy's) count changes, newest first: source (`operator`, `autoscaler`), principal, from/to, the one-line why, dry-run rows (`kind = would`, `applied = false`), and failed target calls (`kind = failed`). |
-| `legion_scaling_simulate` | no | Run a policy over up to an hour of recorded history, or a CSV series, and return the count changes it makes ([Simulating a policy](autoscaling.md#simulating-a-policy)). `job` simulates the live policy (`mode = replay`: the decisions the autoscaler made); `spec` takes an edited jobspec or a standalone policy as JSON (`mode = follow`: what it would have done). Writes nothing. Call it before submitting a policy change, and compare its changes with `legion_scaling_history`. |
-| `legion_scaling_apply` | **yes** | Create or update a standalone scaling policy (an external target scaled through a target plugin) or a [node group](autoscaling.md#node-groups) (machines a node target plugin starts, which Legion drains and terminates), from `spec` as JSON ([Standalone policies](autoscaling.md#standalone-policies)). `dry_run = true` validates and returns the field-by-field `diff` against the stored version without writing: use it first. Applying an unchanged spec writes nothing. A node group needs `operator:write` and `node:write`. Supports `idempotency_key`. |
-| `legion_scaling_pause` | **yes** | Pause (or `resume=true`) autoscaling for a job, a task, a standalone `policy`, or the cluster (`all`, needs `operator:write`), optionally `for` a duration. Supports `idempotency_key`. Prefer a pause over fighting the autoscaler with `legion_job_scale`; on an autoscaled task a manual count needs `for` anyway (a pin). |
+| `legion_scaling_explain` | no | Why an autoscaled task (or, with `object = { kind, name, namespace }`, an `autoscaler/ScalingPolicy` or an `autoscaler/NodeGroup`: each stage, the members chosen for scale-in, the ones protected and why, and the actions taken) is at its count, as data: the last evaluation's checks (reading, desired) and every safeguard stage (`before`, `after`, `note`), and the effective policy with each field's origin (`built-in`, `cluster defaults`, `namespace policy <name>`, `jobspec`). Read this before changing a policy. |
+| `legion_scaling_history` | no | The durable record of a job's (or, with `object`, a scaling policy's or node group's; the current object's, keyed by its uid) count changes, newest first: source (`operator`, `autoscaler`), principal, from/to, the one-line why, dry-run rows (`kind = would`, `applied = false`), and failed target calls (`kind = failed`). |
+| `legion_scaling_simulate` | no | Run a policy over up to an hour of recorded history, or a CSV series, and return the count changes it makes ([Simulating a policy](autoscaling.md#simulating-a-policy)). `job` simulates the live policy (`mode = replay`: the decisions the autoscaler made); `spec` takes an edited jobspec or an `autoscaler/ScalingPolicy` object document as JSON (`mode = follow`: what it would have done). Writes nothing. Call it before submitting a policy change, and compare its changes with `legion_scaling_history`. |
+| `legion_scaling_pause` | **yes** | Pause (or `resume=true`) autoscaling for a job, a task, one of the autoscaler's objects (`object`; needs what writing it needs), or the cluster (`all`, needs `operator:write`), optionally `for` a duration. Supports `idempotency_key`. Prefer a pause over fighting the autoscaler with `legion_job_scale`; on an autoscaled task a manual count needs `for` anyway (a pin). |
 | `legion_job_destroy` | **yes** | Destroy a job. |
 | `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key` and `allow_unknown_fields`). |
 | `legion_template_upsert` | **yes** | Store Nickel as the next immutable version of a template. |
@@ -633,6 +632,18 @@ it ready (`NotReady: <reason>`). `legion object delete … --wait` blocks until
 the app has released a deleting object ([App Objects](app-objects.md)). An
 apply of a kind whose app is not installed yet fails with
 `KIND_NOT_INSTALLED`, `retryable: true`.
+
+Scaling policies for targets outside Legion and node groups are such
+objects, of the bundled autoscaler's kinds `autoscaler/ScalingPolicy` and
+`autoscaler/NodeGroup` ([autoscaling.md, "Standalone
+policies"](autoscaling.md#standalone-policies)): an agent writes them with
+`legion_object_apply` (`dry_run` first; `legion_object_kinds` returns their
+schemas), waits on `wait` for the autoscaler's verdict (`Rejected: Invalid`
+names what is wrong, such as `min` above `max` or a plugin closed to the
+namespace), and reads the per-tick numbers with `legion_scaling_status` and
+`legion_scaling_explain` (with `object`). Deleting a node group with `wait`
+blocks until the autoscaler has drained and terminated its members and
+released it, or its 15-minute cleanup window ends.
 
 Other signals an agent can use to close the loop:
 

@@ -500,14 +500,72 @@ context.start_reconciler(
   is stored.
 - A **deleting** object goes to the `on_cleanup` handler instead, and is
   released when it returns `Ok`; without a handler it is released at once.
-- `shards(count, mine)` reconciles a static subset of the objects.
+- `shards(count, mine)` reconciles a static subset of the objects;
+  `shards_from(selection)` follows a subset that moves (a
+  `tokio::sync::watch` channel of `ShardSelection`, as lease-based shards
+  publish it), opening a new watch whenever it changes.
 
-`ObjectCache`, `watch_objects`, and `write_object_status` are there for an
-app that wants its own loop; `UiRegistry::object_validate(kind, handler)`
+`ObjectCache`, `watch_objects`, `run_object_watch` (a cache kept current,
+following a `ShardSelection`), `write_object_status`, and `StatusBook`
+(write a status only when it changed) are there for an app that wants its
+own loop, as the autoscaler does; `UiRegistry::object_validate(kind, handler)`
 answers the validate call (without a handler, every object passes). An app
 not written in Rust calls the three RPCs and serves
 `POST /legion/v1/objects/validate` itself; `proto/legion.proto` documents
 them.
+
+## A worked example: the autoscaler
+
+The bundled [autoscaler](autoscaling.md) owns two kinds, and is the
+model for an app that owns objects:
+
+```console
+$ legion object kinds --app autoscaler
+KIND                      SCOPE       ACCESS                                            STATE   DESCRIPTION
+autoscaler/NodeGroup      cluster     node:write, and operator:write                    active  A pool of workers a target plugin starts and stops: ...
+autoscaler/ScalingPolicy  namespaced  scale:write in the object's namespace             active  A scaling policy for a target outside Legion, run through a target plugin.
+```
+
+- **`autoscaler/ScalingPolicy`** ([Standalone
+  policies](autoscaling.md#standalone-policies)) is namespaced and mapped
+  onto `scale`, so it is written by whoever may scale in its namespace,
+  namespace-wide: the grant that governs scaling governs scaling policies,
+  with no second grant to keep in step. `target.plugin` is `immutable`.
+- **`autoscaler/NodeGroup`** ([Node groups](autoscaling.md#node-groups)) is
+  cluster-scoped, mapped onto `node`, and `requires` `operator:write`:
+  creating one buys machines. Its `cleanup = "15m"` turns a delete into
+  "drain, terminate, and forget every member, then release": the app's
+  cleanup runs through the same scale-in path a quiet group shrinks by,
+  and at the deadline the manager removes the object anyway.
+- **Schemas from the app's types.** The manifest leaves both kinds'
+  `schema` and `status.schema` to the app's Rust types, filled in when the
+  bundled manifest loads, so the manager's check and the app's parser
+  cannot drift. What a schema cannot say (`min <= max`, a strategy's
+  settings) the validate call reports at apply, as advice, and the app
+  reports as `Accepted=false` when it evaluates the object.
+- **A security control lives in the app, fail-closed.** Which namespaces
+  may use a scaling plugin is the app's config (`namespaces` on a plugin).
+  The app checks it on every evaluation and holds a policy that names a
+  closed plugin `Rejected`; the validate call only mirrors it.
+- **Its own loop, not the reconcile loop.** The autoscaler evaluates every
+  policy together each interval (one batched read of the cluster's
+  inputs, one expander across node groups), so it keeps two
+  `ObjectCache`s current with `run_object_watch` and writes status itself
+  through a `StatusBook`, which writes only what changed: `Accepted`,
+  `Ready`, the resolved target, the last action. The per-tick numbers stay
+  in its own status report, never in object status.
+- **Lease-based shards.** Its replicas split policies by the shard each
+  object carries; the share each replica holds moves as replicas come and
+  go, published as a `ShardSelection` the watch follows (a new watch, and
+  a fresh snapshot, on every change). Every node group goes to the one
+  replica holding the `nodegroups` shard, since the expander must see all
+  of them. `Reconciler::shards_from` gives the reconcile loop the same
+  hook.
+- **State keyed by uid.** Its history, pauses, and action intents live in
+  core's scaling tables under `object:<uid>`, so a `NodeGroup workers` and
+  a `ScalingPolicy default/workers` never share state, and a deleted and
+  recreated object never inherits a pause or a half-done drain. The
+  managers sweep the scaling state of deleted objects.
 
 ## Events and metrics
 

@@ -122,20 +122,64 @@ fn the_plans_example_policy_parses_and_resolves_test() {
     );
 }
 
-/// `configs/scaling/nodes-aws.ncl` evaluates, validates, and writes out
-/// exactly the defaults it says it does.
+/// `configs/scaling/nodes-aws.ncl` (an `autoscaler/NodeGroup` object)
+/// evaluates, validates, and writes out exactly the defaults it says it
+/// does.
 #[test]
 fn the_example_config_is_a_valid_policy_of_defaults_test() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/configs/scaling/nodes-aws.ncl");
     let rendered = crate::config_lang::eval_file(path).expect("the example evaluates");
-    let policy: NodeGroupPolicy = serde_json::from_str(&rendered).expect("a policy");
+    let object: Value = serde_json::from_str(&rendered).expect("JSON");
+    assert_eq!(object["kind"], "autoscaler/NodeGroup");
+    let name = object["name"].as_str().expect("a name");
+    let spec = object["spec"].clone();
+    let policy = crate::autoscaler::policy::parse_node_group(name, &spec).expect("a policy");
     let effective = policy.resolve().expect("valid");
-    let mut bare: Value = serde_json::from_str(&rendered).unwrap();
+    let mut bare = spec;
     for field in ["min", "up", "down", "expander", "mode"] {
         bare.as_object_mut().unwrap().remove(field);
     }
-    let defaults: NodeGroupPolicy = serde_json::from_value(bare).unwrap();
+    let defaults = crate::autoscaler::policy::parse_node_group(name, &bare).unwrap();
     assert_eq!(defaults.resolve().unwrap(), effective);
+}
+
+/// A retiring group (its object deleted) adds nothing, drains every
+/// member at once whatever `down` says, keeps a protected one, and is
+/// retired once no member is left and the provider holds none.
+#[test]
+fn a_retiring_group_drains_everything_and_retires_test() {
+    let policy = group();
+    let mut state = NodeGroupState::default();
+    let mut o = scale_in_obs(vec![busy("a"), node("b"), busy("c")]);
+    o.demand = Some(demand(3));
+    o.chosen = true;
+    o.retiring = true;
+    // Busy, just seen, a budget of one: every member is a victim anyway.
+    let decision = decide(&policy, &mut state, &o, min(0), &no_fit);
+    let victims: Vec<&str> = decision.victims.iter().map(|v| v.node.as_str()).collect();
+    assert_eq!(victims, vec!["a", "b", "c"], "{}", decision.summary);
+    assert_eq!(decision.to, decision.from, "nothing is added");
+    assert!(!decision.retired);
+    assert!(decision
+        .victims
+        .iter()
+        .all(|v| v.reason == "the group is being deleted"));
+
+    // No member left, and the provider still holds two (never joined): it
+    // goes to 0; once it reports 0 the group is retired.
+    let mut state = NodeGroupState::default();
+    let mut empty = obs(0, 2);
+    empty.retiring = true;
+    let decision = decide(&policy, &mut state, &empty, min(0), &no_fit);
+    assert_eq!(decision.to, 0);
+    assert!(decision
+        .intents
+        .contains(&NodeIntent::SetDesired { count: 0 }));
+    assert!(!decision.retired);
+    let mut gone = obs(0, 0);
+    gone.retiring = true;
+    let decision = decide(&policy, &mut state, &gone, min(1), &no_fit);
+    assert!(decision.retired, "{}", decision.summary);
 }
 
 #[test]

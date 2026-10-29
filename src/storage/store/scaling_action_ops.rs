@@ -1,7 +1,9 @@
 //! Action intents for targets outside Legion (`RecordScalingAction`;
 //! docs/autoscaling.md, "No duplicate actions"; autoscaler-v2 plan §6.9,
-//! calls entry 12): one `scaling_action` row per standalone policy, on the
-//! Control lane with the rest of the scaling state.
+//! calls entry 12): one `scaling_action` row per object target (an
+//! `autoscaler/ScalingPolicy` or `autoscaler/NodeGroup`), keyed by its
+//! target key `object:<uid>` (in the `policy` column), on the Control lane
+//! with the rest of the scaling state.
 //!
 //! Before the autoscaler calls a target plugin (`target/scale`,
 //! `target/terminate`) or starts a drain, it **opens an intent**: a
@@ -14,8 +16,10 @@
 //! status.
 //!
 //! - **Versions** are values of the `scaling_action` counter in
-//!   `scaling_counter`: they never repeat, across a policy's delete and
-//!   recreate (calls entry 41's rule).
+//!   `scaling_counter`: they never repeat (calls entry 41's rule).
+//! - **Keyed by uid**, so a deleted and recreated object starts with no
+//!   row; [`Store::sweep_object_scaling_state`] removes the rows (and the
+//!   pauses and history) of objects that are gone.
 //! - **History** rows ride the same transaction: the intent's `scaled` /
 //!   `drain` / `terminate` / `forget` / `uncordon` rows, and a `failed`
 //!   row when it closes failed.
@@ -30,8 +34,8 @@ const SCALING_ACTION_COUNTER: &str = "scaling_action";
 /// One `scaling_action` row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScalingActionRow {
-    /// The standalone policy's canonical id.
-    pub policy: String,
+    /// The object target's key, `object:<uid>`.
+    pub target: String,
     pub version: u64,
     /// `open`, `succeeded`, `failed`, or `reconciled`.
     pub state: String,
@@ -70,7 +74,7 @@ const COLUMNS: &str =
 
 fn from_row(row: &Row<'_>) -> Result<ScalingActionRow, rusqlite::Error> {
     Ok(ScalingActionRow {
-        policy: row.get(0)?,
+        target: row.get(0)?,
         version: row.get::<_, i64>(1)?.max(0) as u64,
         state: row.get(2)?,
         intent: row.get(3)?,
@@ -83,19 +87,19 @@ fn from_row(row: &Row<'_>) -> Result<ScalingActionRow, rusqlite::Error> {
 }
 
 impl Store {
-    fn scaling_action_tx(conn: &Connection, policy: &str) -> R<Option<ScalingActionRow>> {
+    fn scaling_action_tx(conn: &Connection, target: &str) -> R<Option<ScalingActionRow>> {
         Ok(conn
             .prepare_cached(&format!(
                 "SELECT {COLUMNS} FROM scaling_action WHERE policy = ?1;"
             ))?
-            .query_row([policy], from_row)
+            .query_row([target], from_row)
             .optional()?)
     }
 
-    /// One policy's action row.
-    pub fn scaling_action(&self, policy: &str) -> R<Option<ScalingActionRow>> {
+    /// One object target's action row.
+    pub fn scaling_action(&self, target: &str) -> R<Option<ScalingActionRow>> {
         let conn = self.read_connection()?;
-        Self::scaling_action_tx(&conn, policy)
+        Self::scaling_action_tx(&conn, target)
     }
 
     /// Every action row.
@@ -145,14 +149,14 @@ impl Store {
         Ok(())
     }
 
-    /// Open an intent on `policy` if its row is still at
+    /// Open an intent on `target` (`object:<uid>`) if its row is still at
     /// `expected_version` (0: no row yet), with its history rows, in one
     /// write.
     #[allow(clippy::too_many_arguments)]
     #[instrument(err, skip(self, intent, history))]
     pub fn open_scaling_action(
         &self,
-        policy: &str,
+        target: &str,
         expected_version: u64,
         intent: &str,
         owner: &str,
@@ -160,8 +164,8 @@ impl Store {
         now_ms: i64,
         history: Vec<ActionHistory>,
     ) -> R<ActionWrite> {
-        let (policy, intent, owner, principal) = (
-            policy.to_owned(),
+        let (target, intent, owner, principal) = (
+            target.to_owned(),
             intent.to_owned(),
             owner.to_owned(),
             principal.to_owned(),
@@ -169,7 +173,7 @@ impl Store {
         self.replicated(Lane::Control, "open_scaling_action", move |s| {
             let mut conn = s.write_connection()?;
             let tx = Self::write_tx(&mut conn)?;
-            let current = Self::scaling_action_tx(&tx, &policy)?;
+            let current = Self::scaling_action_tx(&tx, &target)?;
             if current.as_ref().map_or(0, |row| row.version) != expected_version {
                 return Ok(ActionWrite::Lost(current));
             }
@@ -179,11 +183,10 @@ impl Store {
                  opened_ms, closed_ms, detail) VALUES (?1, ?2, 'open', ?3, ?4, ?5, ?6, NULL, '') \
                  ON CONFLICT(policy) DO UPDATE SET version = ?2, state = 'open', intent = ?3, \
                  owner = ?4, principal = ?5, opened_ms = ?6, closed_ms = NULL, detail = '';",
-                params![policy, version as i64, intent, owner, principal, now_ms],
+                params![target, version as i64, intent, owner, principal, now_ms],
             )?;
-            let key = crate::manager::autoscale::policy_target_key(&policy);
-            Self::write_history_rows_tx(&tx, &key, &principal, now_ms, &history)?;
-            let row = Self::scaling_action_tx(&tx, &policy)?
+            Self::write_history_rows_tx(&tx, &target, &principal, now_ms, &history)?;
+            let row = Self::scaling_action_tx(&tx, &target)?
                 .ok_or_else(|| anyhow::anyhow!("scaling_action row vanished in its own write"))?;
             tx.commit()?;
             Ok(ActionWrite::Won(row))
@@ -196,7 +199,7 @@ impl Store {
     #[instrument(err, skip(self, detail, history))]
     pub fn close_scaling_action(
         &self,
-        policy: &str,
+        target: &str,
         version: u64,
         state: &str,
         detail: &str,
@@ -204,8 +207,8 @@ impl Store {
         now_ms: i64,
         history: Vec<ActionHistory>,
     ) -> R<ActionWrite> {
-        let (policy, state, detail, principal) = (
-            policy.to_owned(),
+        let (target, state, detail, principal) = (
+            target.to_owned(),
             state.to_owned(),
             detail.to_owned(),
             principal.to_owned(),
@@ -213,7 +216,7 @@ impl Store {
         self.replicated(Lane::Control, "close_scaling_action", move |s| {
             let mut conn = s.write_connection()?;
             let tx = Self::write_tx(&mut conn)?;
-            let current = Self::scaling_action_tx(&tx, &policy)?;
+            let current = Self::scaling_action_tx(&tx, &target)?;
             if current.as_ref().map(|row| row.version) != Some(version) {
                 return Ok(ActionWrite::Lost(current));
             }
@@ -221,14 +224,64 @@ impl Store {
             tx.execute(
                 "UPDATE scaling_action SET version = ?2, state = ?3, closed_ms = ?4, detail = ?5 \
                  WHERE policy = ?1;",
-                params![policy, next as i64, state, now_ms, detail],
+                params![target, next as i64, state, now_ms, detail],
             )?;
-            let key = crate::manager::autoscale::policy_target_key(&policy);
-            Self::write_history_rows_tx(&tx, &key, &principal, now_ms, &history)?;
-            let row = Self::scaling_action_tx(&tx, &policy)?
+            Self::write_history_rows_tx(&tx, &target, &principal, now_ms, &history)?;
+            let row = Self::scaling_action_tx(&tx, &target)?
                 .ok_or_else(|| anyhow::anyhow!("scaling_action row vanished in its own write"))?;
             tx.commit()?;
             Ok(ActionWrite::Won(row))
+        })
+    }
+}
+
+/// The scaling rows keyed by an object target whose object is gone: `WHERE`
+/// clauses over `scaling_action.policy` and `job_id` columns.
+const GONE_OBJECT: &str = "LIKE 'object:%' AND CAST(substr({col}, 8) AS INTEGER) NOT IN \
+                           (SELECT uid FROM app_object)";
+
+impl Store {
+    /// Remove the scaling state of object targets whose object is gone:
+    /// their action rows, pauses, and history (`object:<uid>` keys whose uid
+    /// no object has any more). Object deletes are generic and know nothing
+    /// of scaling, so this sweep runs on the Control-lane leader instead
+    /// (the app reconciler's full pass), as `DestroyJob`'s purge removes a
+    /// job's. Nothing is proposed when there is nothing to remove. Returns
+    /// the rows removed.
+    #[instrument(err, skip(self))]
+    pub fn sweep_object_scaling_state(&self) -> R<usize> {
+        let tables = [
+            ("scaling_action", "policy"),
+            ("scaling_pause", "job_id"),
+            ("scale_history", "job_id"),
+        ];
+        let count = |conn: &Connection| -> R<usize> {
+            let mut total = 0usize;
+            for (table, column) in tables {
+                let clause = GONE_OBJECT.replace("{col}", column);
+                let n: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} {clause};"),
+                    [],
+                    |row| row.get(0),
+                )?;
+                total += n.max(0) as usize;
+            }
+            Ok(total)
+        };
+        if count(&*self.read_connection()?)? == 0 {
+            return Ok(0);
+        }
+        self.replicated(Lane::Control, "sweep_object_scaling_state", move |s| {
+            let mut conn = s.write_connection()?;
+            let tx = Self::write_tx(&mut conn)?;
+            let mut removed = 0usize;
+            for (table, column) in tables {
+                let clause = GONE_OBJECT.replace("{col}", column);
+                removed +=
+                    tx.execute(&format!("DELETE FROM {table} WHERE {column} {clause};"), [])?;
+            }
+            tx.commit()?;
+            Ok(removed)
         })
     }
 }
@@ -263,12 +316,14 @@ mod tests {
 
     /// Two writers holding the same version: exactly one intent lands, the
     /// other reads the winner's row; closing is compare-and-set too, and
-    /// versions never repeat across a policy's delete.
+    /// versions never repeat.
     #[test]
     fn intents_are_compare_and_set_test() -> R<()> {
         let (_dir, store) = store()?;
+        let workers = crate::manager::autoscale::object_target_key(7);
+        let workers = workers.as_str();
         let ActionWrite::Won(first) = store.open_scaling_action(
-            "workers",
+            workers,
             0,
             "{}",
             "alloc-1",
@@ -285,7 +340,7 @@ mod tests {
         );
         // The second replica read version 0 too: it loses, and sees the row.
         let lost = store.open_scaling_action(
-            "workers",
+            workers,
             0,
             "{}",
             "alloc-2",
@@ -295,15 +350,14 @@ mod tests {
         )?;
         assert_eq!(lost, ActionWrite::Lost(Some(first.clone())));
         // One history row: the winner's.
-        let key = crate::manager::autoscale::policy_target_key("workers");
-        let rows = store.scale_history(&key, Some(""), Some(""), 10)?;
+        let rows = store.scale_history(workers, Some(""), Some(""), 10)?;
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].kind.as_str(), rows[0].to), ("scaled", 3));
 
         // Closing names the version; a stale close loses.
         assert!(matches!(
             store.close_scaling_action(
-                "workers",
+                workers,
                 first.version + 100,
                 "succeeded",
                 "",
@@ -314,7 +368,7 @@ mod tests {
             ActionWrite::Lost(Some(_))
         ));
         let ActionWrite::Won(closed) = store.close_scaling_action(
-            "workers",
+            workers,
             first.version,
             "succeeded",
             "",
@@ -335,12 +389,20 @@ mod tests {
             (1, closed.version as i64)
         );
 
-        // The policy's delete takes its action row with it.
-        store.put_scaling_policy("", "workers", "nodes", "{}", "", "op", 13)?;
-        store.delete_scaling_policy("", "workers")?;
-        assert!(store.scaling_action("workers")?.is_none());
+        // The object is gone (uid 7 has no object row): the sweep takes its
+        // action row, pause, and history; a recreated object (a new uid)
+        // starts from nothing.
+        store.set_scaling_pause(workers, "", "", None, "maintenance", "alice", 13)?;
+        assert_eq!(store.sweep_object_scaling_state()?, 3);
+        assert!(store.scaling_action(workers)?.is_none());
+        assert!(store.scaling_pauses()?.is_empty());
+        assert!(store
+            .scale_history(workers, Some(""), Some(""), 10)?
+            .is_empty());
+        assert_eq!(store.sweep_object_scaling_state()?, 0, "nothing left");
+        let fresh = crate::manager::autoscale::object_target_key(8);
         let ActionWrite::Won(again) =
-            store.open_scaling_action("workers", 0, "{}", "alloc-1", "app", 14, vec![])?
+            store.open_scaling_action(&fresh, 0, "{}", "alloc-1", "app", 14, vec![])?
         else {
             panic!("a fresh row starts at 0");
         };
