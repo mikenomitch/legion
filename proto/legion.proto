@@ -15276,6 +15276,35 @@ message ObjectKind {
 
   // The digest of the manifest the declaration came from.
   string manifest_digest = 21;
+
+  // The kind's CEL validation rules, in declaration order. Every apply
+  // (dry runs too) evaluates them in the manager after the schema and
+  // `immutable` checks and before `requires`, and is refused, naming every
+  // failing rule's message at its path, when any fails, errors, or runs
+  // past its budget (10 ms per rule, 50 ms per write). Stored objects are
+  // judged against them on read: one that fails reads `invalid`.
+  repeated ObjectKindRule rules = 22;
+}
+
+// One CEL validation rule of a kind (`kinds[].rules[]` in the app manifest;
+// docs/app-objects.md, "Validation rules").
+message ObjectKindRule {
+  // The CEL expression, as declared, that must be true. `self` is the
+  // effective spec (defaults filled); `oldSelf` is the stored spec on an
+  // update.
+  string rule = 1;
+
+  // What a failure says.
+  string message = 2;
+
+  // The JSON pointer into the object (`/spec/min`) a failure is reported
+  // at; empty for the spec as a whole.
+  string path = 3;
+
+  // Whether the rule uses `oldSelf`: a transition rule, checked on updates
+  // only (never on create, and never when a stored object is judged on
+  // read).
+  bool transition = 4;
 }
 
 // Request payload for ListObjectKinds.

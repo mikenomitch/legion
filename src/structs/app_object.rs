@@ -8,20 +8,22 @@
 //! (`namespaced` or `cluster`), the ACL resource that governs its objects
 //! (`access`: `object`, `job`, `scale`, or `node`), the permissions writing
 //! an object needs, resolved from its contents (`requires`), fields an
-//! update may not change (`immutable`), a bounded `cleanup` window,
-//! `maxObjects`, and the columns `legion object list` shows.
+//! update may not change (`immutable`), CEL validation `rules` (compiled
+//! and evaluated in [`crate::structs::object_rules`]), a bounded `cleanup`
+//! window, `maxObjects`, and the columns `legion object list` shows.
 //!
 //! Everything here is pure: declarations and their install checks, the
 //! registry of kinds and how a typed kind resolves against it, parsing an
 //! object as a person writes it, schemas (closing, defaults, errors with
 //! paths, `writeOnly` redaction), `requires` resolution into concrete ACL
-//! checks, `immutable`, the status envelope and the summary every object
+//! checks, `immutable`, rules, the status envelope and the summary every object
 //! reads as, the spec diff, and the watch's shard key.
 
 use crate::structs::acl::{AclAction, AclResource, AclScope};
 use crate::structs::app::{digest_value, AppManifest};
 use crate::structs::app_ui::ViewContext;
 use crate::structs::extensions::{compile_schema, fill_defaults};
+use crate::structs::object_rules::{compile_rules, CompiledRules, KindRule};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -313,10 +315,11 @@ pub struct KindDecl {
     /// The columns `legion object list` shows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<KindColumn>,
-    /// Reserved for CEL validation rules (Phase O4): refused until then.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<Vec<serde_json::Map<String, Value>>>")]
-    pub rules: Option<Value>,
+    /// CEL validation rules every write's spec must pass, beyond the
+    /// schema (`self.min <= self.max`); a rule that uses `oldSelf` checks
+    /// updates only. At most 32, each at most 1 KiB.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<KindRule>,
 }
 
 impl KindDecl {
@@ -597,8 +600,9 @@ fn validate_requirement(scope: KindScope, requirement: &KindRequirement) -> Resu
 /// the same noun as each other (two apps may share one: the kind is
 /// `<app>/<Kind>`); schemas that compile, closed; examples that pass; an
 /// `access` resource from the pinned set whose scope fits; `requires`,
-/// `immutable`, and `columns` pointers into the object; `cleanup` at most an
-/// hour; `maxObjects` in range; no `rules` (CEL, Phase O4).
+/// `immutable`, and `columns` pointers into the object; `rules` that compile
+/// within their cost bounds, which every example passes; `cleanup` at most
+/// an hour; `maxObjects` in range.
 pub fn validate_kind_decls(decls: &[KindDecl]) -> Result<(), String> {
     if decls.len() > MAX_KINDS_PER_APP {
         return Err(format!(
@@ -619,18 +623,20 @@ pub fn validate_kind_decls(decls: &[KindDecl]) -> Result<(), String> {
                 other.name
             ));
         }
-        if decl.rules.is_some() {
-            return Err(format!(
-                "{at}: `rules` (CEL validation rules) are not supported yet; use JSON Schema \
-                 (draft-7 conditionals included), `immutable`, and the app's Accepted condition"
-            ));
-        }
         let schema =
             KindSchema::compile(&decl.schema).map_err(|err| format!("{at}: schema {err}"))?;
+        let rules = compile_rules(&decl.rules).map_err(|err| format!("{at}: {err}"))?;
         for (n, example) in decl.examples.iter().enumerate() {
-            schema.check("spec", example).map_err(|errors| {
+            let effective = schema.check("spec", example).map_err(|errors| {
                 format!(
                     "{at}: examples[{n}] does not match the kind's schema: {}",
+                    errors.join("; ")
+                )
+            })?;
+            // An example is a create: transition rules do not apply.
+            rules.evaluate(&effective, None).map_err(|errors| {
+                format!(
+                    "{at}: examples[{n}] fails the kind's rules: {}",
                     errors.join("; ")
                 )
             })?;
@@ -1088,6 +1094,8 @@ pub struct InstalledKind {
     pub decl: KindDecl,
     pub schema: Arc<KindSchema>,
     pub status_schema: Option<Arc<KindSchema>>,
+    /// The kind's `rules`, compiled.
+    pub rules: Arc<CompiledRules>,
     pub access: AclResource,
     pub cleanup: Option<std::time::Duration>,
 }
@@ -1111,6 +1119,8 @@ impl InstalledKind {
                     .map_err(|err| format!("kind {app}/{}: status.schema {err}", decl.name))?,
             ),
         };
+        let rules =
+            compile_rules(&decl.rules).map_err(|err| format!("kind {app}/{}: {err}", decl.name))?;
         let access = decl
             .access_resource()
             .map_err(|err| format!("kind {app}/{}: {err}", decl.name))?;
@@ -1126,6 +1136,7 @@ impl InstalledKind {
             decl,
             schema,
             status_schema,
+            rules,
             access,
             cleanup,
         })
@@ -1148,6 +1159,15 @@ impl InstalledKind {
     /// path below `spec`.
     pub fn check_spec(&self, spec: &Value) -> Result<Value, Vec<String>> {
         self.schema.check("spec", spec)
+    }
+
+    /// [`Self::check_spec`], then the kind's rules on the effective spec,
+    /// as a create (no `oldSelf`), on the calling thread: how a stored
+    /// object is judged against its kind now (an upgrade's report, reads).
+    pub fn check_stored_spec(&self, spec: &Value) -> Result<Value, Vec<String>> {
+        let effective = self.check_spec(spec)?;
+        self.rules.evaluate(&effective, None)?;
+        Ok(effective)
     }
 
     /// Status `fields` checked against the status schema (any object
@@ -1981,9 +2001,11 @@ pub fn condition_transitions(
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ObjectState {
-    /// Its kind is active, and the spec passes the current schema.
+    /// Its kind is active, and the spec passes the current schema and
+    /// rules.
     Valid,
-    /// The spec fails the kind's current schema (an upgrade tightened it).
+    /// The spec fails the kind's current schema or rules (an upgrade
+    /// tightened them).
     Invalid,
     /// Its kind is orphaned (its app uninstalled or dropped it).
     Orphaned,
@@ -2015,7 +2037,7 @@ pub fn judge(kind: Option<&InstalledKind>, spec: &Value) -> (Value, ObjectState,
             } else {
                 ObjectState::Orphaned
             };
-            match kind.check_spec(spec) {
+            match kind.check_stored_spec(spec) {
                 Ok(effective) => (
                     effective,
                     state_if_valid,
@@ -2234,6 +2256,13 @@ pub fn kinds_prompt(app: &str, decls: &[KindDecl]) -> Vec<String> {
             decl.scope.as_str(),
             decl.access_label(app)
         );
+        if !decl.rules.is_empty() {
+            line.push_str(&format!(
+                "; {} validation rule{}",
+                decl.rules.len(),
+                if decl.rules.len() == 1 { "" } else { "s" }
+            ));
+        }
         if decl.validate {
             line.push_str("; checked by the app (advisory)");
         }
@@ -2330,7 +2359,7 @@ mod app_object_tests {
             cleanup: None,
             max_objects: None,
             columns: Vec::new(),
-            rules: None,
+            rules: Vec::new(),
         }
     }
 
@@ -2447,11 +2476,30 @@ mod app_object_tests {
         let mut max = decl("Repo");
         max.max_objects = Some(MAX_MAX_OBJECTS + 1);
         assert!(validate_kind_decls(&[max]).is_err());
+        // Rules compile at install, and every example passes them.
         let mut rules = decl("Repo");
-        rules.rules = Some(json!([{ "rule": "self.a" }]));
+        rules.rules = serde_json::from_value(json!([
+            { "rule": "self.url.startsWith('https://')", "message": "url must be https",
+              "path": "/spec/url" },
+            { "rule": "self.url == oldSelf.url", "message": "url cannot change" },
+        ]))
+        .expect("rules");
+        assert!(validate_kind_decls(&[rules.clone()]).is_ok());
+        rules.examples = vec![json!({ "url": "http://x" })];
+        assert!(validate_kind_decls(&[rules.clone()])
+            .expect_err("example")
+            .contains("examples[0] fails the kind's rules: spec.url: url must be https"));
+        rules.rules[0].rule = "self.url.startsWith(".into();
+        assert!(validate_kind_decls(&[rules.clone()])
+            .expect_err("parse")
+            .contains("rules[0]"));
+        rules.rules[0].rule = "self.nope".into();
+        rules.examples = Vec::new();
+        assert!(validate_kind_decls(&[rules.clone()]).is_ok());
+        rules.rules[0].rule = "other.nope".into();
         assert!(validate_kind_decls(&[rules])
-            .expect_err("rules")
-            .contains("not supported yet"));
+            .expect_err("unknown variable")
+            .contains("uses `other`"));
 
         let mut columns = decl("Repo");
         columns.columns = vec![
@@ -2954,6 +3002,19 @@ mod app_object_tests {
         assert_eq!(input.kind, "gitops/Repo");
         let effective = kind.check_spec(&input.spec).expect("the spec passes");
         assert_eq!(effective["branch"], "main");
+        // Its rule: a deploy key needs an SSH URL.
+        assert_eq!(kind.rules.evaluate(&effective, None), Ok(()));
+        let mut keyed = effective.clone();
+        keyed["deployKey"] = json!("ssh-ed25519 AAAA");
+        assert_eq!(
+            kind.rules.evaluate(&keyed, None),
+            Err(vec![
+                "spec.deployKey: a deploy key is an SSH key: use an ssh:// or git@ URL with it"
+                    .to_string()
+            ])
+        );
+        keyed["url"] = json!("git@github.com:acme/deploy.git");
+        assert_eq!(kind.rules.evaluate(&keyed, None), Ok(()));
         let doc = object_document(
             &input.name,
             "team-a",

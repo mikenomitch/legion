@@ -13,20 +13,30 @@ branch): the autoscaler's standalone policies and node groups are its
 and `legion_scaling_apply` are gone (public pages
 [docs/autoscaling.md](../../docs/autoscaling.md#standalone-policies) and
 [docs/app-objects.md](../../docs/app-objects.md#a-worked-example-the-autoscaler));
-what the build decided is calls entries 32-43. **Phases O3-O4** are
-planned here and not started: O3 lets an app act for an object with the
-authority its writer recorded, O4 adds CEL `rules` (and with them restores
-the fail-closed `min <= max` check O2 moved to the app, calls entry 33).
+what the build decided is calls entries 32-43. **Phase O4** is built
+(2026-10-29, branch `claude/app-objects-o4`): kinds declare CEL `rules`
+(`src/structs/object_rules.rs`, on the `cel` crate 0.15.0), evaluated in
+the manager on every apply after the schema and `immutable` and before
+`requires`, fail-closed and cost-bounded, re-checked against stored objects
+on upgrade and read; the autoscaler's two kinds declare their parser's
+cross-field checks as rules, which restores the fail-closed `min <= max`
+check O2 moved to the app (calls entry 33). Public page
+[docs/app-objects.md, "Validation rules"](../../docs/app-objects.md#validation-rules);
+what the build decided is calls entries 44-50. **Phase O3** is planned
+here (an app acts for an object with the authority its writer recorded).
 Deliberately deferred: schema versions and conversion, owner references and
-core garbage collection (bounded `cleanup` replaces finalizers), a generic
+core garbage collection (bounded `cleanup` replaces finalizers), rules on a
+subschema (`x-legion-validations`) and `messageExpression` (calls entry
+49), a static cost estimate for rules (entry 45), a generic
 object browser in the SPA, `since_version` watch resume, per-namespace
 object quotas, and `--allow-pending` for objects of a kind not installed
 yet.
 
 **Revised after adversarial review (2026-10-29).** Three reviews of this
 plan and of the apps substrate changed O1 before it shipped; calls entries
-1-43 are the decisions as they stand (28-31 from O1's build, 32-43 from
-O2's), and the superseded originals are kept at the end of the calls doc. What changed:
+1-50 are the decisions as they stand (28-31 from O1's build, 32-43 from
+O2's, 44-50 from O4's), and the superseded originals (51-57) are kept at
+the end of the calls doc. What changed:
 - a guiding principle (§1): an object can never make its app do more than
   its writer could, and the write path never depends on the app being up;
 - **kind identity** is `<app>/<Kind>`; files and the API require it, short
@@ -413,7 +423,7 @@ kinds = [
 | `cleanup` | How long a delete waits for the app to release the object (§6.9): a duration, at most `1h`; default none (deletes at once). |
 | `maxObjects` | At most this many objects of the kind, cluster-wide. Default 10,000, at most 100,000. |
 | `columns` | At most 8 JSON pointers into `{ name, namespace, labels, spec, status }` for `legion object list`. A string's header is its last segment upper-cased; a record names it. |
-| `rules` | Reserved for CEL validation rules (O4); setting it is refused in O1. |
+| `rules` | Reserved for CEL validation rules (O4); setting it is refused in O1. *O4: `[{ rule, message, path? }]`, at most 32, evaluated on every apply (docs/app-objects.md, "Validation rules").* |
 
 Every pointer in a kind's declaration points into the same document, the
 object as `legion object get -j` shows it, so `/spec/url` means one thing
@@ -928,6 +938,21 @@ manager: `rules = [{ rule = "self.min <= self.max", message = "min must not
 exceed max" }]` (the `cel-interpreter` crate, MIT). Until then a manifest
 that sets `rules` is refused.
 
+*Built (2026-10-29).* As planned, with these differences (calls entries
+44-50): the engine is the renamed `cel` crate 0.15.0 with its
+recursion-limited Pratt parser, not `cel-interpreter` 0.10, whose ANTLR
+parser crashed on a deeply nested rule (entry 46); a rule is
+`{ rule, message, path? }`, where `path` points into the object
+(`/spec/min`, entry 50), and a rule that uses `oldSelf` is a transition
+rule, checked on update only; cost is bounded by source size, raw-text
+nesting, parsed depth, comprehension nesting with a deadline check injected
+into every comprehension, and a 10 ms per rule / 50 ms per write clock, on
+a blocking thread at apply (entry 45); the apply order is now schema,
+`immutable`, rules, `requires` (entry 47); stored objects are re-judged on
+upgrade and read; the autoscaler's kinds declare 11 and 5 rules (entry
+48). Deferred: rules on a subschema, `messageExpression`, a static cost
+estimate (entries 45, 49).
+
 ## 9. Testing plan
 
 - **Unit** (`src/structs/app_object.rs`, `acl.rs`): kind declaration rules
@@ -1030,4 +1055,6 @@ the PR says so.
   exists.
 - **O3.** A Repo authored by someone holding `job:write` only in `team-a`
   cannot make GitOps write a job in `team-b`, whatever the app's grant.
-- **O4.** A `ScalingPolicy` with `min > max` is refused at apply.
+- **O4.** A `ScalingPolicy` with `min > max` is refused at apply. *Met:
+  `tests/integration/app_objects.rs`, `rules_fail_closed_test`, with the
+  autoscaler stopped.*

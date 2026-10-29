@@ -159,6 +159,7 @@ complete example with comments.
 | `permissions` | ACL rules in the shape `legion acl policy apply` takes: what the app's `legion` identity asks to be granted. |
 | `ui` | UI registrations: the slots the app's views appear in, the actions they offer, the port they are served on, and the refresh interval ([Views and actions](#views-and-actions)). Unknown fields are errors. |
 | `extensions` | The keys the app adds to the jobspec, one per extension point, each with a JSON Schema ([Jobspec extensions](#jobspec-extensions)). |
+| `kinds` | The object kinds the app owns, at most 32: each a `name`, a spec `schema`, CEL validation `rules`, what governs and what writing an object requires (`access`, `requires`), `immutable` fields, examples, a `cleanup` window, `maxObjects`, and `columns` ([Object kinds](#object-kinds); every field in [App Objects](app-objects.md#declaring-a-kind)). |
 | `config.schema` | A JSON Schema (draft 7) the config must match. It must describe an object, be at most 64 KiB, and use only local `$ref`s (`"#/…"`); a remote ref is refused before anything is fetched. Default: any object. |
 | `config.default` | The config a fresh install gets. Must match the schema. Default `{}`. |
 | `codeFields` | JSON pointers into the config whose values change the code the app runs. A `*` segment matches every key of an object or element of an array. An entry `{ pointer, artifact = true }` is also fetched as an artifact of the app's job (below). |
@@ -1711,9 +1712,10 @@ apply Repos with `legion object apply`, and gitops watches them, deploys
 what each names, and reports each one's status. The bundled autoscaler's
 scaling policies and node groups are objects of its kinds
 ([App Objects, "A worked example"](app-objects.md#a-worked-example-the-autoscaler)). A manifest declares them in
-`kinds`: a schema, what governs the objects (`access`), what writing one
-also requires of its writer (`requires`), and how long a delete waits for
-the app to clean up. Legion stores and checks the objects; the app only
+`kinds`: a schema, validation rules the manager evaluates on every apply
+(`rules`, in CEL: `self.min <= self.max`), what governs the objects
+(`access`), what writing one also requires of its writer (`requires`), and
+how long a delete waits for the app to clean up. Legion stores and checks the objects; the app only
 reconciles them. [App Objects](app-objects.md) covers the manifest, the
 `legion object` CLI, the ACL model, status, deletion, and the reconcile
 loop apps use.
