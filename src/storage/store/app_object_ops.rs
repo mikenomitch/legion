@@ -354,7 +354,14 @@ impl Store {
                      created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?6) \
                      ON CONFLICT(app, kind) DO UPDATE SET decl = ?3, digest = ?4, \
                      state = 'active', revision = ?5, updated_ms = ?6;",
-                    params![app, kind.kind, kind.decl, kind.digest, revision as i64, now_ms],
+                    params![
+                        app,
+                        kind.kind,
+                        kind.decl,
+                        kind.digest,
+                        revision as i64,
+                        now_ms
+                    ],
                 )?;
                 wrote = true;
             }
@@ -726,29 +733,16 @@ impl Store {
         now_ms: i64,
         orphaned: BTreeSet<(String, String)>,
     ) -> R<Vec<AppObjectRow>> {
-        let due = |conn: &Connection| -> R<Vec<AppObjectRow>> {
-            let mut stmt = conn.prepare_cached(&format!(
-                "SELECT {COLUMNS} FROM app_object WHERE deleting_since > 0;"
-            ))?;
-            let rows = Self::collect_rows(stmt.query_map([], from_row)?)?;
-            Ok(rows
-                .into_iter()
-                .filter(|row| {
-                    row.cleanup_deadline <= now_ms
-                        || orphaned.contains(&(row.key.app.clone(), row.key.kind.clone()))
-                })
-                .collect())
-        };
         {
             let conn = self.read_connection()?;
-            if due(&conn)?.is_empty() {
+            if Self::due_cleanups(&conn, now_ms, &orphaned)?.is_empty() {
                 return Ok(Vec::new());
             }
         }
         self.replicated(Lane::Control, "expire_app_object_cleanups", move |s| {
             let mut conn = s.write_connection()?;
             let tx = Self::write_tx(&mut conn)?;
-            let rows = due(&tx)?;
+            let rows = Self::due_cleanups(&tx, now_ms, &orphaned)?;
             for row in &rows {
                 tx.execute(
                     "DELETE FROM app_object WHERE uid = ?1 AND deleting_since > 0;",
@@ -758,6 +752,25 @@ impl Store {
             tx.commit()?;
             Ok(rows)
         })
+    }
+
+    /// Deleting objects past their deadline, or of an orphaned kind.
+    fn due_cleanups(
+        conn: &Connection,
+        now_ms: i64,
+        orphaned: &BTreeSet<(String, String)>,
+    ) -> R<Vec<AppObjectRow>> {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM app_object WHERE deleting_since > 0;"
+        ))?;
+        let rows = Self::collect_rows(stmt.query_map([], from_row)?)?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                row.cleanup_deadline <= now_ms
+                    || orphaned.contains(&(row.key.app.clone(), row.key.kind.clone()))
+            })
+            .collect())
     }
 
     // ── status (Status lane) ──────────────────────────────────────────────
@@ -785,12 +798,14 @@ impl Store {
                 let mut stmt = conn.prepare_cached(&format!(
                     "SELECT {STATUS_COLUMNS} FROM app_object_status WHERE app = ?1;"
                 ))?;
-                Self::collect_rows(stmt.query_map([app], status_from_row)?)?
+                let rows = Self::collect_rows(stmt.query_map([app], status_from_row)?)?;
+                rows
             }
             None => {
                 let mut stmt = conn
                     .prepare_cached(&format!("SELECT {STATUS_COLUMNS} FROM app_object_status;"))?;
-                Self::collect_rows(stmt.query_map([], status_from_row)?)?
+                let rows = Self::collect_rows(stmt.query_map([], status_from_row)?)?;
+                rows
             }
         };
         Ok(rows.into_iter().map(|row| (row.uid, row)).collect())
@@ -803,7 +818,8 @@ impl Store {
         conn: &Connection,
         write: &StatusWrite,
     ) -> R<Result<Option<AppObjectStatusRow>, PutStatus>> {
-        let Some(object) = Self::app_object_tx(conn, &write.key)?.filter(|row| row.uid == write.uid)
+        let Some(object) =
+            Self::app_object_tx(conn, &write.key)?.filter(|row| row.uid == write.uid)
         else {
             return Ok(Err(PutStatus::Missing));
         };
@@ -974,7 +990,11 @@ mod tests {
             PutObject::Unchanged { .. }
         ));
         assert!(matches!(
-            store.put_app_object(write("web", "{\"a\":2}", VersionCas::Version(first.spec_version + 99)))?,
+            store.put_app_object(write(
+                "web",
+                "{\"a\":2}",
+                VersionCas::Version(first.spec_version + 99)
+            ))?,
             PutObject::Conflict { .. }
         ));
         let PutObject::Written { row: second, .. } = store.put_app_object(write(
@@ -1006,7 +1026,10 @@ mod tests {
         assert!(previous.is_none());
         assert_eq!(row.observed_generation, 2);
         assert_eq!(
-            store.app_object(&key("web"))?.context("stored")?.spec_version,
+            store
+                .app_object(&key("web"))?
+                .context("stored")?
+                .spec_version,
             third.spec_version
         );
         // Identical: dropped. Ahead, behind, another uid: refused.
@@ -1084,8 +1107,13 @@ mod tests {
             store.delete_app_object(&key("web"), None, Some(100), 11)?,
             DeleteObject::AlreadyDeleting(_)
         ));
-        assert_eq!(store.release_app_object(&key("web"), row.uid + 1)?, ReleaseObject::Missing);
-        assert!(store.expire_app_object_cleanups(50, BTreeSet::new())?.is_empty());
+        assert_eq!(
+            store.release_app_object(&key("web"), row.uid + 1)?,
+            ReleaseObject::Missing
+        );
+        assert!(store
+            .expire_app_object_cleanups(50, BTreeSet::new())?
+            .is_empty());
         assert!(matches!(
             store.release_app_object(&key("web"), row.uid)?,
             ReleaseObject::Released(_)
@@ -1100,7 +1128,8 @@ mod tests {
         let expired = store.expire_app_object_cleanups(200, BTreeSet::new())?;
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].key.name, "a");
-        let orphaned: BTreeSet<(String, String)> = [("gitops".to_string(), "Repo".to_string())].into();
+        let orphaned: BTreeSet<(String, String)> =
+            [("gitops".to_string(), "Repo".to_string())].into();
         assert_eq!(store.expire_app_object_cleanups(200, orphaned)?.len(), 1);
         Ok(())
     }
@@ -1113,15 +1142,26 @@ mod tests {
             decl: decl.into(),
             digest: "d1".into(),
         };
-        assert!(store.sync_object_kinds("gitops", vec![kind("Repo", "{}"), kind("Hook", "{}")], 1)?);
-        assert!(!store.sync_object_kinds("gitops", vec![kind("Repo", "{}"), kind("Hook", "{}")], 2)?);
+        assert!(store.sync_object_kinds(
+            "gitops",
+            vec![kind("Repo", "{}"), kind("Hook", "{}")],
+            1
+        )?);
+        assert!(!store.sync_object_kinds(
+            "gitops",
+            vec![kind("Repo", "{}"), kind("Hook", "{}")],
+            2
+        )?);
         let (_, revision) = store.object_kind_fingerprint()?;
         store.put_app_object(write("web", "{}", VersionCas::Any))?;
         // Dropping Repo (which has an object) orphans it; Hook (none) goes.
         assert!(store.sync_object_kinds("gitops", Vec::new(), 3)?);
         let kinds = store.object_kinds()?;
         assert_eq!(kinds.len(), 1);
-        assert_eq!((kinds[0].kind.as_str(), kinds[0].state.as_str()), ("Repo", "orphaned"));
+        assert_eq!(
+            (kinds[0].kind.as_str(), kinds[0].state.as_str()),
+            ("Repo", "orphaned")
+        );
         assert!(store.object_kind_fingerprint()?.1 > revision);
         assert!(!store.sync_object_kinds("gitops", Vec::new(), 4)?);
         // Reinstalling adopts it.

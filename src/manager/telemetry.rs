@@ -2058,7 +2058,7 @@ impl Metrics {
             evals_blocked,
             apps,
             gang_blocked_jobs,
-gang_outcomes_total,
+            gang_outcomes_total,
             object_status_writes_total,
             evals_unblocked_total,
             blocked_wait_seconds,

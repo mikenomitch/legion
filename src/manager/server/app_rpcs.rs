@@ -420,7 +420,15 @@ impl ManagerDaemonService {
                 .iter()
                 .map(super::extension_rpcs::key_proto)
                 .collect(),
-            kinds: self.record_kinds(record),
+            kinds: self
+                .object_registry()
+                .map(|registry| {
+                    registry
+                        .of_app(&record.name)
+                        .map(super::object_rpcs::kind_proto)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -593,6 +601,21 @@ impl ManagerDaemonService {
                 true,
             ));
         }
+        // Object kinds (docs/app-objects.md): what installing does to objects
+        // an earlier install of the app left orphaned (adopted again, checked
+        // against the new schemas).
+        {
+            let registry = self.object_registry()?;
+            let before: Vec<_> = registry.of_app(&name).cloned().collect();
+            let next = self.record_kinds(&record);
+            prompt.extend(super::object_rpcs::objects_report(
+                &name,
+                &self.app_object_rows(&name)?,
+                &before,
+                &next,
+                true,
+            ));
+        }
         if inner.dry_run {
             return Ok(Response::new(InstallAppReply {
                 app: Some(self.app_info(&record)?),
@@ -634,6 +657,9 @@ impl ManagerDaemonService {
         self.store
             .insert_app(record.clone())
             .map_err(|e| map_store_error("Error installing the app", e))?;
+        // Register its kinds now rather than at the reconciler's next pass,
+        // so objects can be applied as soon as this returns.
+        self.sync_object_kinds_for(&name)?;
         let version = manifest.version.clone().unwrap_or_default();
         self.store
             .events()
@@ -747,6 +773,57 @@ impl ManagerDaemonService {
                 false,
             ));
         }
+        // Object kinds (docs/app-objects.md, "Upgrading"): every stored object
+        // checked against the new schemas, changed defaults, changed
+        // requirements; a kind with objects may not change scope, and is
+        // dropped only with `force` (its objects are left orphaned).
+        let mut upgraded_record = record.clone();
+        upgraded_record.manifest = manifest.clone();
+        upgraded_record.manifest_digest = manifest.digest();
+        let kinds_before: Vec<_> = self
+            .object_registry()?
+            .of_app(&name)
+            .filter(|kind| kind.is_active())
+            .cloned()
+            .collect();
+        let kinds_next = self.record_kinds(&upgraded_record);
+        let object_counts = self.app_object_counts(&name)?;
+        for kind in &kinds_next {
+            let count = object_counts.get(&kind.decl.name).copied().unwrap_or(0);
+            let rescoped = kinds_before
+                .iter()
+                .any(|old| old.decl.name == kind.decl.name && old.decl.scope != kind.decl.scope);
+            if rescoped && count > 0 {
+                return Err(Status::failed_precondition(format!(
+                    "{name} {to} changes the scope of {} to {} while {count} object(s) of it                      exist; an object cannot change scope
+Hint: delete them first, or give the                      kind a new name",
+                    kind.qualified(),
+                    kind.decl.scope.as_str()
+                )));
+            }
+        }
+        let dropped: Vec<String> = kinds_before
+            .iter()
+            .filter(|old| !kinds_next.iter().any(|new| new.decl.name == old.decl.name))
+            .filter_map(|old| {
+                let count = object_counts.get(&old.decl.name).copied().unwrap_or(0);
+                (count > 0).then(|| format!("{} ({count})", old.qualified()))
+            })
+            .collect();
+        prompt.extend(super::object_rpcs::objects_report(
+            &name,
+            &self.app_object_rows(&name)?,
+            &kinds_before,
+            &kinds_next,
+            false,
+        ));
+        if !dropped.is_empty() && !inner.force && !inner.dry_run {
+            return Err(Status::failed_precondition(format!(
+                "{name} {to} no longer declares kinds that have objects: {}. Upgrading leaves                  them stored, orphaned: readable and deletable, not writable
+Hint: pass --force                  to upgrade anyway",
+                dropped.join(", ")
+            )));
+        }
         let who = format!("app {name} {to}");
         // A new manifest is new code running with the grant: the caller must
         // hold all of it, as at install.
@@ -823,6 +900,7 @@ impl ManagerDaemonService {
         };
         next.state.pending_change = format!("upgraded {from} → {to}");
         let next = self.write_app(&record, next)?;
+        self.sync_object_kinds_for(&name)?;
         self.store.events().app_upgraded(
             &name,
             &from,
@@ -888,6 +966,29 @@ impl ManagerDaemonService {
         // only with `force` (apps plan §6.6, "Lifecycle").
         let registry = self.extension_registry()?;
         let using = self.jobs_using_app(&name, &registry)?;
+        // Objects of its kinds stay, orphaned: only with `force`
+        // (docs/app-objects.md, "Uninstalling").
+        let object_counts = self.app_object_counts(&name)?;
+        let objects: u64 = object_counts.values().sum();
+        if objects > 0 && !inner.force {
+            let kinds: Vec<String> = object_counts
+                .iter()
+                .map(|(kind, count)| format!("{name}/{kind}: {count}"))
+                .collect();
+            return Err(Status::failed_precondition(format!(
+                "{objects} object(s) of {name}'s kinds exist ({}). Uninstalling leaves them                  stored, orphaned: readable and deletable with their kind's access, not                  writable{}
+Hint: pass --force to uninstall anyway",
+                kinds.join(", "),
+                if using.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; and {} job(s) set its jobspec keys, whose values are left orphaned too",
+                        using.len()
+                    )
+                }
+            )));
+        }
         if !using.is_empty() && !inner.force {
             let shown: Vec<&str> = using.iter().map(String::as_str).take(10).collect();
             let more = if using.len() > shown.len() {
@@ -933,6 +1034,8 @@ impl ManagerDaemonService {
         self.store
             .delete_app(&name)
             .map_err(|e| map_store_error("Error uninstalling the app", e))?;
+        // Its kinds stay as orphaned while they have objects.
+        self.sync_object_kinds_for(&name)?;
         self.store
             .events()
             .app_uninstalled(&name, &identity.principal, revoked);
@@ -948,6 +1051,11 @@ impl ManagerDaemonService {
                 using.join(", ")
             ));
         }
+        if objects > 0 {
+            message.push_str(&format!(
+                "; {objects} object(s) of its kinds are left orphaned (`legion object list` shows                  them; installing {name} again adopts them)"
+            ));
+        }
         self.store
             .idempotency_record(&idempotency_key, "uninstall_app", &message)
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
@@ -956,7 +1064,7 @@ impl ManagerDaemonService {
             revoked_grants: u32::try_from(revoked).unwrap_or(u32::MAX),
             deduplicated: false,
             orphaned_jobs: using,
-            orphaned_objects: 0,
+            orphaned_objects: objects,
         }))
     }
 

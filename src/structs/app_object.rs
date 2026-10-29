@@ -379,7 +379,7 @@ impl KindDecl {
 }
 
 /// `job:write in the namespace spec.targetNamespace names`.
-fn requirement_label(requirement: &KindRequirement) -> String {
+pub fn requirement_label(requirement: &KindRequirement) -> String {
     let mut text = format!("{}:{}", requirement.resource, requirement.actions.join("+"));
     if let Some(pointer) = &requirement.namespace {
         text.push_str(&format!(
@@ -388,16 +388,25 @@ fn requirement_label(requirement: &KindRequirement) -> String {
         ));
     }
     if let Some(pointer) = &requirement.path {
-        text.push_str(&format!(" on the key {} names", dotted(pointer.trim_start_matches('/'))));
+        text.push_str(&format!(
+            " on the key {} names",
+            dotted(pointer.trim_start_matches('/'))
+        ));
     }
     if let Some(pointer) = &requirement.pool {
-        text.push_str(&format!(" in the pool {} names", dotted(pointer.trim_start_matches('/'))));
+        text.push_str(&format!(
+            " in the pool {} names",
+            dotted(pointer.trim_start_matches('/'))
+        ));
     }
     if requirement.host {
         text.push_str(" (host-level)");
     }
     if let Some(pointer) = &requirement.when {
-        text.push_str(&format!(" when {} is set", dotted(pointer.trim_start_matches('/'))));
+        text.push_str(&format!(
+            " when {} is set",
+            dotted(pointer.trim_start_matches('/'))
+        ));
     }
     text
 }
@@ -500,7 +509,10 @@ fn validate_requirement(scope: KindScope, requirement: &KindRequirement) -> Resu
         )
     })?;
     if requirement.actions.is_empty() {
-        return Err(format!("{}: `actions` must not be empty", resource.as_str()));
+        return Err(format!(
+            "{}: `actions` must not be empty",
+            resource.as_str()
+        ));
     }
     for action in &requirement.actions {
         AclAction::parse(action.trim()).ok_or_else(|| {
@@ -737,7 +749,12 @@ fn close_into(schema: &mut Value, close_here: bool, depth: usize) {
             }
         }
     }
-    for key in ["items", "additionalProperties", "additionalItems", "contains"] {
+    for key in [
+        "items",
+        "additionalProperties",
+        "additionalItems",
+        "contains",
+    ] {
         match map.get_mut(key) {
             Some(Value::Array(items)) => {
                 for item in items {
@@ -766,7 +783,13 @@ fn close_into(schema: &mut Value, close_here: bool, depth: usize) {
 
 /// Every `writeOnly: true` property's pointer below the schema's root, with
 /// `*` for each key of an open map or item of a list.
-fn collect_write_only(root: &Value, schema: &Value, at: &mut Vec<String>, out: &mut Vec<Vec<String>>, depth: usize) {
+fn collect_write_only(
+    root: &Value,
+    schema: &Value,
+    at: &mut Vec<String>,
+    out: &mut Vec<Vec<String>>,
+    depth: usize,
+) {
     if depth > 32 {
         return;
     }
@@ -1193,7 +1216,10 @@ impl KindLookup {
                 "{typed:?} names {} kinds: {}\nHint: name one: legion object get {} <name>",
                 candidates.len(),
                 candidates.join(", "),
-                candidates.first().map(String::as_str).unwrap_or("<app>/<Kind>")
+                candidates
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("<app>/<Kind>")
             ),
             KindLookup::Unqualified { candidate } => match candidate {
                 Some(qualified) => format!(
@@ -1283,8 +1309,11 @@ impl ObjectKindRegistry {
             1 => Ok(matches.remove(0)),
             _ => {
                 // An active kind wins over orphaned ones of the same name.
-                let active: Vec<&InstalledKind> =
-                    matches.iter().copied().filter(|kind| kind.is_active()).collect();
+                let active: Vec<&InstalledKind> = matches
+                    .iter()
+                    .copied()
+                    .filter(|kind| kind.is_active())
+                    .collect();
                 if active.len() == 1 {
                     return Ok(active[0]);
                 }
@@ -1306,7 +1335,11 @@ impl ObjectKindRegistry {
     pub fn suggest(&self, typed: &str) -> Option<String> {
         let names: Vec<String> = self.kinds.iter().map(InstalledKind::qualified).collect();
         let bare = typed.rsplit('/').next().unwrap_or(typed);
-        let short: Vec<&str> = self.kinds.iter().map(|kind| kind.decl.name.as_str()).collect();
+        let short: Vec<&str> = self
+            .kinds
+            .iter()
+            .map(|kind| kind.decl.name.as_str())
+            .collect();
         crate::structs::spec_fields::suggest_owned(bare, &short).map(|index| names[index].clone())
     }
 }
@@ -1336,8 +1369,7 @@ pub fn parse_object_input(value: &Value) -> Result<ObjectInput, String> {
     };
     if map.contains_key("status") {
         return Err(
-            "`status` is written by the app that owns the kind, never applied; leave it out"
-                .into(),
+            "`status` is written by the app that owns the kind, never applied; leave it out".into(),
         );
     }
     let input: ObjectInput =
@@ -2301,7 +2333,9 @@ mod app_object_tests {
         for bad in ["repo", "Repo-x", "", "9Lives", "Re po"] {
             assert!(validate_kind_name(bad).is_err(), "{bad}");
         }
-        for reserved in ["Job", "Jobs", "Policy", "Policies", "Token", "Node", "Events", "Status"] {
+        for reserved in [
+            "Job", "Jobs", "Policy", "Policies", "Token", "Node", "Events", "Status",
+        ] {
             let err = validate_kind_name(reserved).expect_err(reserved);
             assert!(err.contains("reserved"), "{err}");
         }
@@ -2329,7 +2363,8 @@ mod app_object_tests {
     #[test]
     fn declarations_are_checked_test() {
         assert!(validate_kind_decls(&[decl("Repo")]).is_ok());
-        let err = validate_kind_decls(&[decl("Repo"), decl("Repos")]).expect_err("plural duplicate");
+        let err =
+            validate_kind_decls(&[decl("Repo"), decl("Repos")]).expect_err("plural duplicate");
         assert!(err.contains("already declares Repo"), "{err}");
 
         let mut bad_example = decl("Repo");
@@ -2339,24 +2374,37 @@ mod app_object_tests {
             .contains("examples[0]"));
         let mut typo = decl("Repo");
         typo.examples = vec![json!({ "url": "x", "brnach": "y" })];
-        assert!(validate_kind_decls(&[typo]).expect_err("closed").contains("unknown field"));
+        assert!(validate_kind_decls(&[typo])
+            .expect_err("closed")
+            .contains("unknown field"));
 
         let mut remote = decl("Repo");
-        remote.schema = json!({ "type": "object", "properties": { "a": { "$ref": "https://x/s.json" } } });
-        assert!(validate_kind_decls(&[remote]).expect_err("remote").contains("not local"));
+        remote.schema =
+            json!({ "type": "object", "properties": { "a": { "$ref": "https://x/s.json" } } });
+        assert!(validate_kind_decls(&[remote])
+            .expect_err("remote")
+            .contains("not local"));
 
         // The access mapping is pinned, and must fit the scope.
         let mut scale = decl("Policyish");
-        scale.access = Some(KindAccess { resource: "scale".into() });
+        scale.access = Some(KindAccess {
+            resource: "scale".into(),
+        });
         assert!(validate_kind_decls(&[scale.clone()]).is_ok());
         scale.scope = KindScope::Cluster;
         assert!(validate_kind_decls(&[scale]).is_err());
         let mut acl = decl("Repo");
-        acl.access = Some(KindAccess { resource: "acl".into() });
-        assert!(validate_kind_decls(&[acl]).expect_err("pinned").contains("object (the default), job, scale, or node"));
+        acl.access = Some(KindAccess {
+            resource: "acl".into(),
+        });
+        assert!(validate_kind_decls(&[acl])
+            .expect_err("pinned")
+            .contains("object (the default), job, scale, or node"));
         let mut node = decl("NodeGroup");
         node.scope = KindScope::Cluster;
-        node.access = Some(KindAccess { resource: "node".into() });
+        node.access = Some(KindAccess {
+            resource: "node".into(),
+        });
         node.requires = vec![KindRequirement {
             resource: "operator".into(),
             actions: vec!["write".into()],
@@ -2364,11 +2412,19 @@ mod app_object_tests {
         }];
         assert!(validate_kind_decls(&[node.clone()]).is_ok());
         node.requires[0].namespace = Some("/spec/x".into());
-        assert!(validate_kind_decls(&[node]).expect_err("namespace on operator").contains("namespaced"));
+        assert!(validate_kind_decls(&[node])
+            .expect_err("namespace on operator")
+            .contains("namespaced"));
 
         let mut kv = decl("Repo");
-        kv.requires = vec![KindRequirement { resource: "kv".into(), actions: vec!["read".into()], ..Default::default() }];
-        assert!(validate_kind_decls(&[kv]).expect_err("kv path").contains("path"));
+        kv.requires = vec![KindRequirement {
+            resource: "kv".into(),
+            actions: vec!["read".into()],
+            ..Default::default()
+        }];
+        assert!(validate_kind_decls(&[kv])
+            .expect_err("kv path")
+            .contains("path"));
 
         let mut immutable = decl("Repo");
         immutable.immutable = vec!["/url".into()];
@@ -2381,12 +2437,17 @@ mod app_object_tests {
         assert!(validate_kind_decls(&[max]).is_err());
         let mut rules = decl("Repo");
         rules.rules = Some(json!([{ "rule": "self.a" }]));
-        assert!(validate_kind_decls(&[rules]).expect_err("rules").contains("not supported yet"));
+        assert!(validate_kind_decls(&[rules])
+            .expect_err("rules")
+            .contains("not supported yet"));
 
         let mut columns = decl("Repo");
         columns.columns = vec![
             KindColumn::Pointer("/spec/url".into()),
-            KindColumn::Named { name: "COMMIT".into(), pointer: "/status/fields/commit".into() },
+            KindColumn::Named {
+                name: "COMMIT".into(),
+                pointer: "/status/fields/commit".into(),
+            },
         ];
         assert!(validate_kind_decls(&[columns.clone()]).is_ok());
         assert_eq!(columns.columns[0].header(), "URL");
@@ -2406,18 +2467,26 @@ mod app_object_tests {
         assert_eq!(closed["properties"]["a"]["additionalProperties"], false);
         assert!(closed["allOf"][0].get("additionalProperties").is_none());
         assert_eq!(closed["definitions"]["d"]["additionalProperties"], false);
-        let open = close_schema(&json!({ "type": "object", "properties": {}, "additionalProperties": true }));
+        let open = close_schema(
+            &json!({ "type": "object", "properties": {}, "additionalProperties": true }),
+        );
         assert_eq!(open["additionalProperties"], true);
 
         let schema = KindSchema::compile(&decl("Repo").schema).expect("compiles");
         let err = schema
             .check("spec", &json!({ "url": "x", "brnach": "dev" }))
             .expect_err("unknown");
-        assert_eq!(err, vec!["spec.brnach: unknown field (did you mean branch?)".to_string()]);
+        assert_eq!(
+            err,
+            vec!["spec.brnach: unknown field (did you mean branch?)".to_string()]
+        );
         let err = schema
             .check("spec", &json!({ "url": "x", "token": 5 }))
             .expect_err("write-only type");
-        assert_eq!(err, vec!["spec.token: invalid value (write-only, not shown)".to_string()]);
+        assert_eq!(
+            err,
+            vec!["spec.token: invalid value (write-only, not shown)".to_string()]
+        );
         let effective = schema.check("spec", &json!({ "url": "x" })).expect("valid");
         assert_eq!(effective["branch"], "main");
         assert_eq!(
@@ -2434,28 +2503,46 @@ mod app_object_tests {
             kind("certs", decl("Certificate")),
         ]);
         for typed in ["gitops/Repo", "gitops/repos", "gitops/REPO"] {
-            assert_eq!(registry.resolve_qualified(typed).expect(typed).qualified(), "gitops/Repo");
+            assert_eq!(
+                registry.resolve_qualified(typed).expect(typed).qualified(),
+                "gitops/Repo"
+            );
         }
         assert_eq!(
             registry.resolve_qualified("Certificate"),
-            Err(KindLookup::Unqualified { candidate: Some("certs/Certificate".into()) })
+            Err(KindLookup::Unqualified {
+                candidate: Some("certs/Certificate".into())
+            })
         );
-        assert_eq!(registry.resolve("certificates").expect("short").qualified(), "certs/Certificate");
+        assert_eq!(
+            registry.resolve("certificates").expect("short").qualified(),
+            "certs/Certificate"
+        );
         let ambiguous = registry.resolve("repo").expect_err("ambiguous");
         assert_eq!(
             ambiguous,
-            KindLookup::Ambiguous { candidates: vec!["gitops/Repo".into(), "reposync/Repo".into()] }
+            KindLookup::Ambiguous {
+                candidates: vec!["gitops/Repo".into(), "reposync/Repo".into()]
+            }
         );
-        assert!(ambiguous.message("repo").contains("names 2 kinds: gitops/Repo, reposync/Repo"));
+        assert!(ambiguous
+            .message("repo")
+            .contains("names 2 kinds: gitops/Repo, reposync/Repo"));
         assert_eq!(
             registry.resolve("Certifcate"),
-            Err(KindLookup::Unknown { suggestion: Some("certs/Certificate".into()) })
+            Err(KindLookup::Unknown {
+                suggestion: Some("certs/Certificate".into())
+            })
         );
         // An orphaned kind yields to an active one of the same short name.
         let mut orphan = kind("old", decl("Certificate"));
         orphan.state = KindState::Orphaned;
-        let registry = ObjectKindRegistry::from_kinds(vec![orphan, kind("certs", decl("Certificate"))]);
-        assert_eq!(registry.resolve("certificate").expect("active wins").app, "certs");
+        let registry =
+            ObjectKindRegistry::from_kinds(vec![orphan, kind("certs", decl("Certificate"))]);
+        assert_eq!(
+            registry.resolve("certificate").expect("active wins").app,
+            "certs"
+        );
     }
 
     #[test]
@@ -2471,7 +2558,10 @@ mod app_object_tests {
         }))
         .expect_err("status")
         .contains("written by the app"));
-        assert!(parse_object_input(&json!({ "kind": "gitops/Repo", "name": "web", "spek": {} })).is_err());
+        assert!(
+            parse_object_input(&json!({ "kind": "gitops/Repo", "name": "web", "spek": {} }))
+                .is_err()
+        );
         assert!(validate_object_name("web-1").is_ok());
         assert!(validate_object_name("Web").is_err());
 
@@ -2480,14 +2570,20 @@ mod app_object_tests {
         assert_eq!(state, ObjectState::Valid);
         assert_eq!(effective["branch"], "main");
         // A stored default is kept: only missing fields are filled.
-        let (effective, _, _) = judge(Some(&repo), &json!({ "url": "https://x", "branch": "trunk" }));
+        let (effective, _, _) = judge(
+            Some(&repo),
+            &json!({ "url": "https://x", "branch": "trunk" }),
+        );
         assert_eq!(effective["branch"], "trunk");
         let (_, state, detail) = judge(Some(&repo), &json!({ "branch": "x" }));
         assert_eq!(state, ObjectState::Invalid);
         assert!(detail.contains("spec"), "{detail}");
         let mut orphan = repo.clone();
         orphan.state = KindState::Orphaned;
-        assert_eq!(judge(Some(&orphan), &json!({ "url": "x" })).1, ObjectState::Orphaned);
+        assert_eq!(
+            judge(Some(&orphan), &json!({ "url": "x" })).1,
+            ObjectState::Orphaned
+        );
         assert_eq!(judge(None, &json!({})).1, ObjectState::Orphaned);
     }
 
@@ -2495,20 +2591,49 @@ mod app_object_tests {
     fn requirements_resolve_from_the_object_test() {
         let mut repo = decl("Repo");
         repo.requires = vec![
-            KindRequirement { resource: "job".into(), actions: vec!["write".into()], namespace: Some("/spec/targetNamespace".into()), ..Default::default() },
-            KindRequirement { resource: "kv".into(), actions: vec!["read".into()], path: Some("/spec/credentials/kv".into()), ..Default::default() },
-            KindRequirement { resource: "job".into(), actions: vec!["write".into()], host: true, when: Some("/spec/allowHost".into()), ..Default::default() },
-            KindRequirement { resource: "operator".into(), actions: vec!["read".into()], ..Default::default() },
+            KindRequirement {
+                resource: "job".into(),
+                actions: vec!["write".into()],
+                namespace: Some("/spec/targetNamespace".into()),
+                ..Default::default()
+            },
+            KindRequirement {
+                resource: "kv".into(),
+                actions: vec!["read".into()],
+                path: Some("/spec/credentials/kv".into()),
+                ..Default::default()
+            },
+            KindRequirement {
+                resource: "job".into(),
+                actions: vec!["write".into()],
+                host: true,
+                when: Some("/spec/allowHost".into()),
+                ..Default::default()
+            },
+            KindRequirement {
+                resource: "operator".into(),
+                actions: vec!["read".into()],
+                ..Default::default()
+            },
         ];
         let repo = kind("gitops", repo);
-        let doc = |spec: Value| object_document("web", "team-a", &BTreeMap::new(), &spec, &Value::Null);
-        let resolved = resolve_requirements(&repo, &doc(json!({ "url": "x", "targetNamespace": "team-b" })), "team-a").expect("resolves");
+        let doc =
+            |spec: Value| object_document("web", "team-a", &BTreeMap::new(), &spec, &Value::Null);
+        let resolved = resolve_requirements(
+            &repo,
+            &doc(json!({ "url": "x", "targetNamespace": "team-b" })),
+            "team-a",
+        )
+        .expect("resolves");
         // The KV entry names no key, and the host entry is off: two checks.
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].namespace.as_deref(), Some("team-b"));
         assert_eq!(resolved[0].name.as_deref(), Some("*"));
         assert_eq!(resolved[0].band.as_deref(), Some("normal"));
-        assert_eq!(resolved[0].label(), "job:write in team-b (from spec.targetNamespace)");
+        assert_eq!(
+            resolved[0].label(),
+            "job:write in team-b (from spec.targetNamespace)"
+        );
         assert_eq!(resolved[1].resource, "operator");
         assert!(resolved[1].scope().namespace.is_none());
 
@@ -2525,12 +2650,24 @@ mod app_object_tests {
         assert!(resolved[2].host && resolved[2].scope().host);
 
         // A list names several; a number is refused.
-        let listed = resolve_requirements(&repo, &doc(json!({ "url": "x", "targetNamespace": ["a", "b"] })), "team-a").expect("list");
+        let listed = resolve_requirements(
+            &repo,
+            &doc(json!({ "url": "x", "targetNamespace": ["a", "b"] })),
+            "team-a",
+        )
+        .expect("list");
         assert_eq!(listed.len(), 3);
-        assert!(resolve_requirements(&repo, &doc(json!({ "url": "x", "targetNamespace": 5 })), "team-a").is_err());
+        assert!(resolve_requirements(
+            &repo,
+            &doc(json!({ "url": "x", "targetNamespace": 5 })),
+            "team-a"
+        )
+        .is_err());
         // A cluster kind's object: every namespace.
         assert_eq!(
-            resolve_requirements(&repo, &doc(json!({ "url": "x" })), "").expect("cluster")[0].namespace.as_deref(),
+            resolve_requirements(&repo, &doc(json!({ "url": "x" })), "").expect("cluster")[0]
+                .namespace
+                .as_deref(),
             Some("*")
         );
     }
@@ -2540,13 +2677,20 @@ mod app_object_tests {
         let mut repo = decl("Repo");
         repo.immutable = vec!["/spec/url".into(), "/spec/token".into()];
         let repo = kind("gitops", repo);
-        let doc = |spec: Value| object_document("web", "team-a", &BTreeMap::new(), &spec, &Value::Null);
+        let doc =
+            |spec: Value| object_document("web", "team-a", &BTreeMap::new(), &spec, &Value::Null);
         let changes = immutable_changes(
             &repo,
             &doc(json!({ "url": "a", "token": "x" })),
             &doc(json!({ "url": "b", "token": "y" })),
         );
-        assert_eq!(changes, vec!["spec.url is immutable (was \"a\")".to_string(), "spec.token is immutable".to_string()]);
+        assert_eq!(
+            changes,
+            vec![
+                "spec.url is immutable (was \"a\")".to_string(),
+                "spec.token is immutable".to_string()
+            ]
+        );
         let secret = |path: &[String]| repo.schema.is_write_only(path);
         let lines = spec_diff(
             "spec",
@@ -2581,35 +2725,94 @@ mod app_object_tests {
             fields: json!({}),
         };
         let summary = |state, deleting, running, status: Option<&ObjectStatus>| {
-            summarize(&SummaryInputs { state, deleting, app_running: running, generation: 4, status }).0
+            summarize(&SummaryInputs {
+                state,
+                deleting,
+                app_running: running,
+                generation: 4,
+                status,
+            })
+            .0
         };
         let ready = status(vec![("Ready", "true", "Synced")], 4);
-        assert_eq!(summary(ObjectState::Valid, false, true, Some(&ready)), "Ready");
-        assert_eq!(summary(ObjectState::Valid, false, true, Some(&status(vec![("Ready", "true", "")], 3))), "Pending");
+        assert_eq!(
+            summary(ObjectState::Valid, false, true, Some(&ready)),
+            "Ready"
+        );
+        assert_eq!(
+            summary(
+                ObjectState::Valid,
+                false,
+                true,
+                Some(&status(vec![("Ready", "true", "")], 3))
+            ),
+            "Pending"
+        );
         assert_eq!(summary(ObjectState::Valid, false, true, None), "Pending");
         assert_eq!(
-            summary(ObjectState::Valid, false, true, Some(&status(vec![("Ready", "false", "RepoUnreachable")], 4))),
+            summary(
+                ObjectState::Valid,
+                false,
+                true,
+                Some(&status(vec![("Ready", "false", "RepoUnreachable")], 4))
+            ),
             "NotReady: RepoUnreachable"
         );
         assert_eq!(
-            summary(ObjectState::Valid, false, true, Some(&status(vec![("Accepted", "false", "BadUrl"), ("Ready", "true", "")], 4))),
+            summary(
+                ObjectState::Valid,
+                false,
+                true,
+                Some(&status(
+                    vec![("Accepted", "false", "BadUrl"), ("Ready", "true", "")],
+                    4
+                ))
+            ),
             "Rejected: BadUrl"
         );
-        assert_eq!(summary(ObjectState::Valid, false, true, Some(&status(vec![("Accepted", "true", "")], 4))), "Accepted");
-        assert_eq!(summary(ObjectState::Valid, false, false, Some(&ready)), "Stale");
-        assert_eq!(summary(ObjectState::Invalid, false, true, Some(&ready)), "Invalid");
-        assert_eq!(summary(ObjectState::Valid, true, true, Some(&ready)), "Deleting");
-        assert_eq!(summary(ObjectState::Orphaned, true, true, Some(&ready)), "Orphaned");
+        assert_eq!(
+            summary(
+                ObjectState::Valid,
+                false,
+                true,
+                Some(&status(vec![("Accepted", "true", "")], 4))
+            ),
+            "Accepted"
+        );
+        assert_eq!(
+            summary(ObjectState::Valid, false, false, Some(&ready)),
+            "Stale"
+        );
+        assert_eq!(
+            summary(ObjectState::Invalid, false, true, Some(&ready)),
+            "Invalid"
+        );
+        assert_eq!(
+            summary(ObjectState::Valid, true, true, Some(&ready)),
+            "Deleting"
+        );
+        assert_eq!(
+            summary(ObjectState::Orphaned, true, true, Some(&ready)),
+            "Orphaned"
+        );
         assert_eq!(summary_settled("Ready"), Some(true));
         assert_eq!(summary_settled("NotReady: X"), Some(false));
         assert_eq!(summary_settled("Pending"), None);
 
-        let mut conditions = vec![ObjectCondition { kind: "Ready".into(), status: "TRUE".into(), ..Default::default() }];
+        let mut conditions = vec![ObjectCondition {
+            kind: "Ready".into(),
+            status: "TRUE".into(),
+            ..Default::default()
+        }];
         validate_conditions(&mut conditions).expect("valid");
         assert_eq!(conditions[0].status, "true");
         stamp_condition_times(&mut conditions, Some(&ready), "now");
         assert_eq!(conditions[0].since, "");
-        let mut bad = vec![ObjectCondition { kind: "ready".into(), status: "true".into(), ..Default::default() }];
+        let mut bad = vec![ObjectCondition {
+            kind: "ready".into(),
+            status: "true".into(),
+            ..Default::default()
+        }];
         assert!(validate_conditions(&mut bad).is_err());
         let after = status(vec![("Ready", "false", "X")], 4);
         assert_eq!(
@@ -2622,10 +2825,30 @@ mod app_object_tests {
     #[test]
     fn scopes_follow_the_access_mapping_test() {
         let object = access_scope(AclResource::Object, "gitops/Repo", "team-a", "web");
-        assert_eq!((object.namespace.as_deref(), object.name.as_deref()), (Some("team-a"), Some("web")));
-        assert_eq!(access_scope(AclResource::Object, "a/K", "", "x").namespace.as_deref(), Some("*"));
-        let scale = access_scope(AclResource::Scale, "autoscaler/ScalingPolicy", "media", "render");
-        assert_eq!((scale.namespace.as_deref(), scale.name.as_deref(), scale.band.as_deref()), (Some("media"), Some("*"), None));
+        assert_eq!(
+            (object.namespace.as_deref(), object.name.as_deref()),
+            (Some("team-a"), Some("web"))
+        );
+        assert_eq!(
+            access_scope(AclResource::Object, "a/K", "", "x")
+                .namespace
+                .as_deref(),
+            Some("*")
+        );
+        let scale = access_scope(
+            AclResource::Scale,
+            "autoscaler/ScalingPolicy",
+            "media",
+            "render",
+        );
+        assert_eq!(
+            (
+                scale.namespace.as_deref(),
+                scale.name.as_deref(),
+                scale.band.as_deref()
+            ),
+            (Some("media"), Some("*"), None)
+        );
         let job = access_scope(AclResource::Job, "gitops/Deploy", "team-a", "web");
         assert_eq!(job.band.as_deref(), Some("normal"));
         let node = access_scope(AclResource::Node, "autoscaler/NodeGroup", "", "workers");
@@ -2648,7 +2871,10 @@ mod app_object_tests {
     fn shards_use_the_autoscalers_hash_test() {
         let key = shard_key("autoscaler", "ScalingPolicy", "media", "render");
         assert_eq!(key, "autoscaler/ScalingPolicy:media/render");
-        assert_eq!(shard_key("a", "NodeGroup", "", "workers"), "a/NodeGroup:workers");
+        assert_eq!(
+            shard_key("a", "NodeGroup", "", "workers"),
+            "a/NodeGroup:workers"
+        );
         assert_eq!(
             object_shard("autoscaler", "ScalingPolicy", "media", "render", 64),
             crate::autoscaler::shard::shard_of(&key, 64)
@@ -2663,7 +2889,12 @@ mod app_object_tests {
         assert!(validate_labels(&labels).is_ok());
         labels.insert("9bad".to_string(), "x".to_string());
         assert!(validate_labels(&labels).is_err());
-        assert_eq!(parse_label_filter(&["team=a,tier=web".into(), "x=y".into()]).expect("filter").len(), 3);
+        assert_eq!(
+            parse_label_filter(&["team=a,tier=web".into(), "x=y".into()])
+                .expect("filter")
+                .len(),
+            3
+        );
         let document = object_document(
             "web",
             "team-a",

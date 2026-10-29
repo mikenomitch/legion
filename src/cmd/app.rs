@@ -269,6 +269,14 @@ pub fn config() -> Command {
                         .action(ArgAction::SetTrue)
                         .help("Show the permission diff; upgrade nothing"),
                 )
+                .arg(
+                    Arg::new("force")
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Upgrade even though the new manifest drops object kinds that have                              objects; they stay stored, orphaned",
+                        ),
+                )
                 .arg(idempotency_arg())
                 .arg(json_flag()),
         )
@@ -281,8 +289,8 @@ pub fn config() -> Command {
                         .long("force")
                         .action(ArgAction::SetTrue)
                         .help(
-                            "Uninstall even though jobs set its jobspec keys; their values stay \
-                             stored, flagged orphaned",
+                            "Uninstall even though jobs set its jobspec keys or objects of its \
+                             kinds exist; they stay stored, flagged orphaned",
                         ),
                 )
                 .arg(idempotency_arg())
@@ -973,9 +981,7 @@ async fn upgrade(matches: &ArgMatches) -> R<()> {
         dry_run,
         idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
         config_json: config_json.clone(),
-        // Not yet a flag: removing an object kind that has objects
-        // (app-object-kinds plan §6.8) is wired with the lifecycle.
-        force: false,
+        force: matches.get_flag("force"),
     };
     let preview = output::resolve(
         format,

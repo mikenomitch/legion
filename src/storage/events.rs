@@ -1840,7 +1840,9 @@ pub mod drafts {
         meta["cleanupDeadlineUnixMs"] = json!(deadline_ms);
         EventDraft::info(
             "object.deleting",
-            format!("{label} deleted by {by}; its app has until the cleanup deadline to release it"),
+            format!(
+                "{label} deleted by {by}; its app has until the cleanup deadline to release it"
+            ),
         )
         .meta(meta)
     }

@@ -12310,6 +12310,14 @@ impl Manager for ManagerDaemonService {
         self.update_object_status_rpc(request).await
     }
 
+    // ACL: app-plane (in the handler).
+    async fn release_object(
+        &self,
+        request: Request<crate::structs::ReleaseObjectRequest>,
+    ) -> Result<Response<crate::structs::ReleaseObjectReply>, Status> {
+        self.release_object_rpc(request).await
+    }
+
     #[instrument(skip_all, fields(job))]
     async fn revoke_grant(
         &self,
