@@ -585,7 +585,8 @@ header is ignored, like every credential, and nothing is stamped.
 The **generation is advisory.** The object's current authority applies,
 whatever generation the app read: authority changes only when someone
 applies the object, so a stale generation can do no more than the current
-one. The app sends it so the audit log can say what it acted on.
+one. The manager logs a mismatch (at debug level) and acts with the
+current authority.
 
 ### `via = "objects"`
 
