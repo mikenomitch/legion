@@ -28,9 +28,11 @@
 
   # A jobspec without `name` and `namespace`, which Legion sets. Legion also
   # renders: count (replicas), the permit and placement constraints, the
-  # `legion` identity carrying the grant, `user = systemWorker.appUser` for
-  # an exec task that names none (tasks in legion-system may not run as
-  # root), and the config as a file named by $LEGION_APP_CONFIG.
+  # `legion` identity carrying the grant, the app's own uid as every exec
+  # task's `user` (so leave `user` out; no two apps share one), and the
+  # config as a file named by $LEGION_APP_CONFIG. An app's job may not hold
+  # anything host-level besides that: no exec health check, no `file://`
+  # artifact, no `auth.nodeIdentity`.
   job = {
     task = {
       name = "sync",

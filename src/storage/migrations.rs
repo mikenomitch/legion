@@ -2381,6 +2381,19 @@ fn migration_list() -> Vec<M<'static>> {
         // 10,000 policies").
         M::up("CREATE INDEX IF NOT EXISTS idx_task_config_job_id ON task_config(job_id);")
             .down("DROP INDEX IF EXISTS idx_task_config_job_id;"),
+        // Each app's own uid (docs/apps.md, "Trust model"): the uid and gid
+        // its exec tasks run as, so no two apps share a user. Assigned on
+        // insert, the lowest free one from `APP_UID_BASE` (1900000000);
+        // apps installed before this get one each, in name order. Unique
+        // among assigned ones. Appended at the end, since raft changesets
+        // bind columns by position.
+        M::up(
+            "ALTER TABLE app ADD COLUMN uid INTEGER NOT NULL DEFAULT 0;
+        UPDATE app SET uid = 1900000000
+            + (SELECT COUNT(*) FROM app AS earlier WHERE earlier.name < app.name);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_app_uid ON app(uid) WHERE uid > 0;",
+        )
+        .down("DROP INDEX IF EXISTS idx_app_uid;"),
     ]
 }
 

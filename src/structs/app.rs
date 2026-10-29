@@ -53,6 +53,16 @@ pub const BUILD_ID_ATTR: &str = "buildId";
 pub const MAX_APP_NAME_LEN: usize = 40;
 /// Most replicas an app may run.
 pub const MAX_APP_REPLICAS: u32 = 32;
+/// The first uid (and gid) an app runs its `exec` tasks as. Each app gets
+/// its own, the lowest free one at or above this, recorded on its record
+/// when it is installed or seeded, so no two apps share a user and one
+/// cannot read another's `secrets/` (docs/apps.md, "Trust model"). In the
+/// range systemd leaves unused (1879048192-2147352575), above every user,
+/// container (`/etc/subuid`, Legion's own user-namespace pool), and
+/// dynamic-user range a distribution hands out. A uid needs no passwd entry.
+pub const APP_UID_BASE: u32 = 1_900_000_000;
+/// How many app uids there are: `APP_UID_BASE` to `APP_UID_BASE + 65535`.
+pub const APP_UID_COUNT: u32 = 65_536;
 /// Largest config schema a manifest may carry.
 pub const MAX_CONFIG_SCHEMA_BYTES: usize = 64 * 1024;
 /// Largest config an app may hold (it is rendered into the job).
@@ -382,6 +392,31 @@ impl AppManifest {
         if !job.contains_key("task") && !job.contains_key("tasks") {
             return Err(format!(
                 "app {}: `job` must define `task` or `tasks`",
+                self.name
+            ));
+        }
+        let mut named_user = None;
+        let mut tasks = Value::Object(job.clone());
+        for_each_task(&mut tasks, |task| {
+            let exec = task.get("runtime").and_then(Value::as_str) == Some("exec");
+            if exec
+                && task
+                    .get("config")
+                    .and_then(|config| config.get("user"))
+                    .is_some()
+            {
+                named_user.get_or_insert_with(|| {
+                    task.get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unnamed")
+                        .to_string()
+                });
+            }
+        });
+        if let Some(task) = named_user {
+            return Err(format!(
+                "app {}: task {task:?} sets config.user; an app's exec tasks run as the app's \
+                 own uid, which Legion assigns at install, so leave it out",
                 self.name
             ));
         }
@@ -777,6 +812,11 @@ pub struct AppRecord {
     pub installed_at: String,
     pub updated_at: String,
     pub state: AppReconcileState,
+    /// The uid and gid the app's `exec` tasks run as: its own, assigned by
+    /// the store when the record is inserted ([`APP_UID_BASE`]), and never
+    /// shared with another app. 0 until then.
+    #[serde(default)]
+    pub uid: u32,
 }
 
 impl AppRecord {
@@ -1126,9 +1166,6 @@ pub struct RenderContext<'a> {
     /// constraint; the reconciler does not submit a bundled app without
     /// one).
     pub marker: Option<&'a BuildMarker>,
-    /// `systemWorker.appUser`: the user exec tasks run as when the manifest
-    /// names none.
-    pub app_user: &'a str,
 }
 
 /// An app's job as the reconciler submits it, and its digest.
@@ -1147,7 +1184,7 @@ pub struct RenderedApp {
 /// - `replicas` becomes every task's `count`;
 /// - placement becomes the permit and the constraints or affinity (§6.2);
 /// - `settings.resources` overrides each task's CPU and memory;
-/// - exec tasks with no `user` run as `systemWorker.appUser`;
+/// - exec tasks run as the app's own uid and gid ([`AppRecord::uid`]);
 /// - the `legion` identity carries the recorded grant, and the config's
 ///   `identities` (when its schema has them) join it;
 /// - the config is a file in the task directory, named by
@@ -1157,6 +1194,13 @@ pub struct RenderedApp {
 ///   environment, so a new marker is a new job version.
 pub fn render_app_job(record: &AppRecord, ctx: RenderContext<'_>) -> Result<RenderedApp, String> {
     let manifest = &record.manifest;
+    if record.uid == 0 {
+        return Err(format!(
+            "app {} has no uid yet; the store assigns one when the app is installed",
+            record.name
+        ));
+    }
+    let user = record.uid.to_string();
     let mut job = manifest.job.clone();
     let Some(object) = job.as_object_mut() else {
         return Err(format!(
@@ -1216,8 +1260,10 @@ pub fn render_app_job(record: &AppRecord, ctx: RenderContext<'_>) -> Result<Rend
             *config = json!({});
         }
         let config = config.as_object_mut().expect("made an object above");
-        if runtime == "exec" && !config.contains_key("user") {
-            config.insert("user".into(), json!(ctx.app_user));
+        if runtime == "exec" {
+            // Always the app's own uid: a manifest may not name a user
+            // (`validate_job`), and the record's wins over anything here.
+            config.insert("user".into(), json!(user));
         }
         let env = config.entry("env").or_insert_with(|| json!({}));
         if !env.is_object() {
@@ -1491,7 +1537,7 @@ pub fn describe_rule(rule: &AclRule) -> String {
 
 /// What `legion app install` shows before it asks (apps plan §3, scenario
 /// C): what runs where, as whom, the grant, and the UI.
-pub fn install_prompt(manifest: &AppManifest, app_user: &str) -> Vec<String> {
+pub fn install_prompt(manifest: &AppManifest) -> Vec<String> {
     let label = match &manifest.version {
         Some(version) => format!("{} {version}", manifest.name),
         None => manifest.name.clone(),
@@ -1510,14 +1556,9 @@ pub fn install_prompt(manifest: &AppManifest, app_user: &str) -> Vec<String> {
     let mut job = manifest.job.clone();
     for_each_task(&mut job, |task| {
         let runtime = task.get("runtime").and_then(Value::as_str).unwrap_or("");
-        let user = task
-            .get("config")
-            .and_then(|config| config.get("user"))
-            .and_then(Value::as_str);
-        match (runtime, user) {
-            ("exec", Some(user)) => users.insert(format!("user {user}")),
-            ("exec", None) => users.insert(format!("user {app_user}")),
-            (runtime, _) => users.insert(format!("a {runtime} task")),
+        match runtime {
+            "exec" => users.insert("its own unprivileged user".to_string()),
+            runtime => users.insert(format!("a {runtime} task")),
         };
     });
     let users: Vec<String> = users.into_iter().collect();
@@ -1625,13 +1666,11 @@ mod app_tests {
             updated_at: "2026-10-28T00:00:00Z".into(),
             state: AppReconcileState::default(),
             manifest,
+            uid: APP_UID_BASE,
         }
     }
 
-    const NO_MARKER: RenderContext<'static> = RenderContext {
-        marker: None,
-        app_user: "nobody",
-    };
+    const NO_MARKER: RenderContext<'static> = RenderContext { marker: None };
 
     #[test]
     fn a_complete_manifest_validates_and_unknown_fields_fail() {
@@ -1698,6 +1737,36 @@ mod app_tests {
         assert!(text.contains("codeFields"), "{text}");
     }
 
+    /// Every app runs its exec tasks as its own uid: the render sets it
+    /// over anything in the manifest, a manifest may not name a user, and a
+    /// record without a uid does not render (hardening after the adversarial
+    /// review).
+    #[test]
+    fn each_app_runs_as_its_own_uid() {
+        let mut one = record(manifest(json!({})));
+        let mut two = record(manifest(json!({ "name": "other" })));
+        one.uid = APP_UID_BASE;
+        two.uid = APP_UID_BASE + 1;
+        let user = |record: &AppRecord| {
+            render_app_job(record, NO_MARKER).expect("renders").jobspec["task"]["config"]["user"]
+                .clone()
+        };
+        assert_eq!(user(&one), json!(APP_UID_BASE.to_string()));
+        assert_eq!(user(&two), json!((APP_UID_BASE + 1).to_string()));
+        // Even a record whose manifest slipped a user in renders its own.
+        let mut sneaky = one.clone();
+        sneaky.manifest.job["task"]["config"]["user"] = json!(two.uid.to_string());
+        assert_eq!(user(&sneaky), json!(APP_UID_BASE.to_string()));
+        let err = sneaky
+            .manifest
+            .validate(false)
+            .expect_err("a manifest names no user");
+        assert!(err.contains("sets config.user"), "{err}");
+        one.uid = 0;
+        let err = render_app_job(&one, NO_MARKER).expect_err("no uid yet");
+        assert!(err.contains("no uid"), "{err}");
+    }
+
     #[test]
     fn render_forces_identity_placement_user_config_and_count() {
         let mut record = record(manifest(json!({})));
@@ -1711,7 +1780,7 @@ mod app_tests {
         assert_eq!(task["count"], 3);
         assert_eq!(task["permit"][0]["operator"], "matches");
         assert_eq!(task["constraints"][0]["key"], "legion.role");
-        assert_eq!(task["config"]["user"], "nobody");
+        assert_eq!(task["config"]["user"], APP_UID_BASE.to_string());
         assert_eq!(task["config"]["env"][APP_CONFIG_ENV], APP_CONFIG_FILE);
         assert_eq!(task["config"]["files"][0]["path"], APP_CONFIG_FILE);
         let content: Value = serde_json::from_str(
@@ -1819,7 +1888,6 @@ mod app_tests {
         };
         let ctx = RenderContext {
             marker: Some(&marker),
-            app_user: "nobody",
         };
         let mut record = record(manifest(json!({})));
         let third_party = render_app_job(&record, ctx).unwrap();
@@ -1843,7 +1911,6 @@ mod app_tests {
             &record,
             RenderContext {
                 marker: Some(&rebuilt),
-                app_user: "nobody",
             },
         )
         .unwrap();
@@ -2025,10 +2092,11 @@ mod app_tests {
                               "permission": { "resource": "job", "action": "write" } }],
             },
         }));
-        let prompt = install_prompt(&with_ui, "nobody").join("\n");
+        let prompt = install_prompt(&with_ui).join("\n");
         assert!(
             prompt.starts_with(
-                "gitops 0.2.0 runs its own code (1 artifact) on your managers, as user nobody,"
+                "gitops 0.2.0 runs its own code (1 artifact) on your managers, as its own \
+                 unprivileged user,"
             ),
             "{prompt}"
         );

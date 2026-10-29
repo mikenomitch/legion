@@ -951,7 +951,7 @@ async fn a_silent_app_reads_not_running_after_three_intervals_test() -> R<()> {
 fn the_app_runs_on_a_fresh_cluster_and_reads_not_running_when_frozen_test() {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
-        eprintln!("skipped: an exec task in legion-system runs as `nobody`, which needs root");
+        eprintln!("skipped: an app's exec task runs as its own uid, which needs root");
         return;
     }
     let _serial = crate::system_worker::SERIAL

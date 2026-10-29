@@ -44,8 +44,6 @@
     # whole capacity as the scheduler sees it and, on Linux with cgroup v2,
     # the cpu.max / memory.max of its `legion-system` cgroup parent.
     resources = { cpu = 1000, memory = 1024 },
-    # The unprivileged user Legion's bundled apps run as.
-    appUser = "nobody",
     # Its worker plane port. A standalone worker on this host keeps 4848.
     port = 4849,
   },

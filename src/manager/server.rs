@@ -2081,9 +2081,6 @@ pub struct ManagerDaemonService {
     /// than a target, and `GetSchedulerConcurrency` reports it as such even
     /// when this manager does not lead the scheduler lane.
     eval_threads: usize,
-    /// `systemWorker.appUser`: the user apps' exec tasks run as when their
-    /// manifest names none (docs/apps.md).
-    app_user: String,
     /// Wakes this manager's app reconciler after an app write; unset in a
     /// service with no reconciler (tests, embedding), where writes simply
     /// wait for whoever reconciles.
@@ -2144,7 +2141,6 @@ impl ManagerDaemonService {
             stream_reauth_interval: acl::STREAM_REAUTH_INTERVAL,
             usage: Arc::new(Mutex::new(crate::manager::usage::UsageTable::default())),
             eval_threads: 1,
-            app_user: crate::structs::config::DEF_SYSTEM_WORKER_APP_USER.to_string(),
             app_nudge: Arc::new(std::sync::OnceLock::new()),
             app_forwarder: Arc::new(crate::manager::app_forward::WorkerPlaneForwarder),
             extension_registry: Arc::new(Mutex::new(None)),
@@ -2496,11 +2492,15 @@ impl ManagerDaemonService {
         // bypassable by rendering.
         // A job with a host-level task (worker-plane-auth plan §6.16) needs a
         // `job:write` rule with `host = true`: "can deploy" must not quietly
-        // mean "is root on every node".
-        let host_level = config
-            .tasks
-            .iter()
-            .find_map(crate::task_plugins::task_host_level_reason);
+        // mean "is root on every node". An app's own `exec` task runs as the
+        // app's uid, so for the app reconciler the runtime alone is not
+        // host-level; anything else that is needs a host grant it never
+        // holds (docs/apps.md, "Trust model").
+        let classify: fn(&crate::structs::TaskConfig) -> Option<String> = match origin {
+            SubmitOrigin::App { .. } => crate::task_plugins::app_task_host_level_reason,
+            SubmitOrigin::Principal => crate::task_plugins::task_host_level_reason,
+        };
+        let host_level = config.tasks.iter().find_map(classify);
         let scope = match template {
             Some(template) => AclScope::job_via_template(&config.name, &template.name),
             None => AclScope::job(&config.name),
@@ -3547,7 +3547,6 @@ impl ManagerDaemonService {
         service.heartbeat = config.heartbeat.clone();
         service.eval_threads = config.eval_threads.max(1);
         service.edge_boot = config.edge_boot.clone();
-        service.app_user = config.system_worker.app_user.clone();
         service
     }
 

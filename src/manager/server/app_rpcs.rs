@@ -106,9 +106,14 @@ pub(crate) fn app_grant_refusal(
 }
 
 /// The identity the reconciler submits an app's job as: the app's recorded
-/// grant (allow rules), plus `job:write` (host-level) on exactly the app's
+/// grant (allow rules), plus `job:read` and `job:write` on exactly the app's
 /// job. The submit's grant check therefore checks the render against the
 /// recorded grant, not against any principal's own rights (apps plan §6.4).
+///
+/// The `job:write` rule has no `host` grant: an app's `exec` task, which
+/// runs as the app's own uid, is not host-level for the reconciler
+/// ([`crate::task_plugins::app_task_host_level_reason`]), and nothing else
+/// host-level may be in an app's job, whoever installed it.
 fn reconciler_identity(record: &AppRecord) -> AclIdentity {
     let mut rules: Vec<AclRule> = record
         .grant
@@ -122,7 +127,6 @@ fn reconciler_identity(record: &AppRecord) -> AclIdentity {
         actions: vec!["read".to_string(), "write".to_string()],
         namespaces: Some(vec![SYSTEM_NAMESPACE.to_string()]),
         names: Some(vec![record.name.clone()]),
-        host: Some(true),
         ..Default::default()
     });
     AclIdentity {
@@ -161,9 +165,39 @@ impl ManagerDaemonService {
         let _ = self.app_nudge.set(nudge);
     }
 
-    /// `systemWorker.appUser`, which app exec tasks run as.
-    pub fn app_user(&self) -> &str {
-        &self.app_user
+    /// Render `record`'s job and refuse what an app's job may not hold
+    /// (docs/apps.md, "Trust model"): a task the reserved namespace refuses
+    /// (root, a privileged container, an `exec` health check, a `file://`
+    /// artifact, `auth.nodeIdentity`), or one that is host-level for the
+    /// reconciler, which holds no host grant. Checked at install, upgrade,
+    /// and config changes, so whoever makes the change hears why; the
+    /// reconciler's submit refuses the same render anyway.
+    fn check_app_job(&self, record: &AppRecord) -> Result<(), Status> {
+        // A record not yet inserted has no uid; any app uid renders the
+        // same job shape.
+        let mut record = record.clone();
+        if record.uid == 0 {
+            record.uid = crate::structs::app::APP_UID_BASE;
+        }
+        let rendered = crate::structs::app::render_app_job(
+            &record,
+            crate::structs::app::RenderContext { marker: None },
+        )
+        .map_err(Status::invalid_argument)?;
+        let config: crate::structs::JobConfig = serde_json::from_value(rendered.jobspec)
+            .map_err(|err| Status::invalid_argument(format!("app {}: job: {err}", record.name)))?;
+        for task in &config.tasks {
+            crate::task_plugins::validate_reserved_namespace_task(task, SYSTEM_NAMESPACE)
+                .map_err(|err| Status::invalid_argument(format!("app {}: {err}", record.name)))?;
+            if let Some(reason) = crate::task_plugins::app_task_host_level_reason(task) {
+                return Err(Status::invalid_argument(format!(
+                    "app {}: task {reason}, which would make the app's job host-level, and no \
+                     app's job may be (docs/apps.md, \"Trust model\")",
+                    record.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn nudge_app(&self, name: &str) {
@@ -556,7 +590,7 @@ impl ManagerDaemonService {
         if let Some(refusal) = registry.collision(&name, &decls, &keys) {
             return Err(Status::failed_precondition(refusal));
         }
-        let mut prompt = install_prompt(&manifest, &self.app_user);
+        let mut prompt = install_prompt(&manifest);
         let now = now_rfc3339();
         let mut settings = AppSettings::from_manifest(&manifest);
         settings.keys = keys;
@@ -578,7 +612,10 @@ impl ManagerDaemonService {
             updated_at: now,
             state: AppReconcileState::default(),
             manifest: manifest.clone(),
+            // Assigned by the store on insert: the lowest free app uid.
+            uid: 0,
         };
+        self.check_app_job(&record)?;
         if !decls.is_empty() {
             // What installing does to values already stored: pending ones
             // it adopts, and how they fare against its schemas.
@@ -726,7 +763,7 @@ impl ManagerDaemonService {
             removed_json: rules_json(&diff.removed),
             unchanged_json: rules_json(&diff.unchanged),
         };
-        let mut prompt = install_prompt(&manifest, &self.app_user);
+        let mut prompt = install_prompt(&manifest);
         let from = record.display_version();
         let to = manifest.version.clone().unwrap_or_default();
         if !decls.is_empty() || !existing.is_empty() {
@@ -746,6 +783,10 @@ impl ManagerDaemonService {
                 false,
             ));
         }
+        let mut upgraded = record.clone();
+        upgraded.manifest = manifest.clone();
+        upgraded.config = config.clone();
+        self.check_app_job(&upgraded)?;
         let who = format!("app {name} {to}");
         // A new manifest is new code running with the grant: the caller must
         // hold all of it, as at install.
@@ -1130,6 +1171,9 @@ impl ManagerDaemonService {
         validate_app_config(&record.manifest, &config).map_err(|err| {
             Status::invalid_argument(format!("the config does not match {name}'s schema: {err}"))
         })?;
+        let mut changed = record.clone();
+        changed.config = config.clone();
+        self.check_app_job(&changed)?;
         let code_fields = changed_code_fields(&record.manifest, &record.config, &config);
         if !code_fields.is_empty() {
             // Changing what code the app runs needs everything the app's

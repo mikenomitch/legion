@@ -83,8 +83,6 @@ impl AppNudge {
 /// What the reconciler needs besides the service.
 #[derive(Debug, Clone)]
 pub struct ReconcilerSettings {
-    /// `systemWorker.appUser`.
-    pub app_user: String,
     /// The manager config's `apps` block, read only when seeding.
     pub seed: BTreeMap<String, AppSeedConfig>,
     /// The build this manager runs: a new bundled manifest is adopted only
@@ -311,6 +309,8 @@ pub fn seed_record(
         updated_at: now,
         state: AppReconcileState::default(),
         manifest: manifest.clone(),
+        // The store assigns it when the record is inserted.
+        uid: 0,
     }
 }
 
@@ -444,14 +444,8 @@ impl AppReconciler {
     /// The nodes an app's placement allows, with their builds: what its
     /// build marker is decided from.
     fn eligible_builds(&self, record: &AppRecord) -> R<Vec<NodeBuild>> {
-        let rendered = render_app_job(
-            record,
-            RenderContext {
-                marker: None,
-                app_user: &self.settings.app_user,
-            },
-        )
-        .map_err(|err| anyhow!(err))?;
+        let rendered =
+            render_app_job(record, RenderContext { marker: None }).map_err(|err| anyhow!(err))?;
         let mut job = rendered.jobspec;
         let mut rules: Option<(Value, Value)> = None;
         crate::structs::app::for_each_task(&mut job, |task| {
@@ -661,7 +655,6 @@ impl AppReconciler {
             &record,
             RenderContext {
                 marker: marker.as_ref(),
-                app_user: &self.settings.app_user,
             },
         ) {
             Ok(rendered) => rendered,
@@ -1015,12 +1008,8 @@ pub fn submit_rendered(
 
 /// The rendered job of `record` as the reconciler would submit it now
 /// (`marker` for bundled apps), for tests and `legion app status`.
-pub fn render_for(
-    record: &AppRecord,
-    marker: Option<&BuildMarker>,
-    app_user: &str,
-) -> Result<RenderedApp, String> {
-    render_app_job(record, RenderContext { marker, app_user })
+pub fn render_for(record: &AppRecord, marker: Option<&BuildMarker>) -> Result<RenderedApp, String> {
+    render_app_job(record, RenderContext { marker })
 }
 
 #[cfg(test)]
@@ -1039,7 +1028,6 @@ mod tests {
         let reconciler = AppReconciler::new(
             svc,
             ReconcilerSettings {
-                app_user: "nobody".into(),
                 seed: BTreeMap::new(),
                 own_build: BuildMarker {
                     version: "0.1.0".into(),

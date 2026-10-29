@@ -340,6 +340,7 @@ fn app_fixture(name: &str) -> R<legion::structs::app::AppRecord> {
         updated_at: "2026-01-01T00:00:00Z".into(),
         state: AppReconcileState::default(),
         manifest,
+        uid: 0,
     })
 }
 
