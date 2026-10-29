@@ -12984,10 +12984,18 @@ fn scoped_idempotency_key(
     if key.is_empty() {
         return String::new();
     }
-    let caller = identity
-        .accessor_id
-        .as_deref()
-        .unwrap_or(identity.principal.as_str());
+    // Who the caller is, by how it authenticated and then its accessor (a
+    // token) or its principal: a JWT subject spelled like a delegated
+    // identity (`alice via app autoscaler`), or like an accessor, is
+    // another caller and shares no scope with it.
+    let caller = match identity.accessor_id.as_deref() {
+        Some(accessor) => format!("{}:accessor:{accessor}", identity.source.as_str()),
+        None => format!(
+            "{}:principal:{}",
+            identity.source.as_str(),
+            identity.principal
+        ),
+    };
     format!(
         "{operation}/{}:{caller}/{key}#{}",
         caller.len(),
@@ -15375,6 +15383,39 @@ mod tests {
     use futures::StreamExt;
     use serde_json::{json, Map, Value};
     use tempfile::Builder;
+
+    /// Two callers never share an idempotency scope, however their names
+    /// are spelled: a JWT subject named like a delegated identity, or like
+    /// a token's accessor, is another caller (hardening after the
+    /// adversarial review).
+    #[test]
+    fn idempotency_scopes_never_collide_across_identity_sources() {
+        use crate::structs::acl::AclSource;
+        let identity = |principal: &str, accessor: Option<&str>, source: AclSource| AclIdentity {
+            principal: principal.to_string(),
+            accessor_id: accessor.map(str::to_string),
+            is_management: false,
+            is_worker: false,
+            policies: Vec::new(),
+            rules: Vec::new(),
+            source,
+            expires_at: None,
+            audit_only: false,
+        };
+        let request = json!({ "name": "web" });
+        let key = |identity: &AclIdentity| {
+            scoped_idempotency_key(identity, "run_job", Some("k1"), &request)
+        };
+        let delegated = identity("alice via app autoscaler", None, AclSource::Delegated);
+        let jwt = identity("alice via app autoscaler", None, AclSource::Jwt);
+        assert_ne!(key(&delegated), key(&jwt));
+        let token = identity("deployer", Some("0f3a"), AclSource::Token);
+        let named_like_it = identity("0f3a", None, AclSource::Jwt);
+        assert_ne!(key(&token), key(&named_like_it));
+        // The same caller, the same request: the same scope.
+        assert_eq!(key(&token), key(&token.clone()));
+        assert!(scoped_idempotency_key(&token, "run_job", None, &request).is_empty());
+    }
 
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
