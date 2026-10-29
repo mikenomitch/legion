@@ -811,10 +811,10 @@ manager authenticates every call made with it as **`alice via app
   (with nothing left, the call is refused);
 - nothing the app or the viewer is denied by a deny rule.
 
-It lasts as long as the assertion (60 seconds) and covers any number of
-unary calls in that time; while the viewer's ACL token exists and still
-holds the permission. Revoking the token, or the policy, ends it at the
-next call. The pause, pin, or job change the app makes is recorded by
+It lasts as long as the assertion (60 seconds), covers any number of unary
+calls in that time, and holds only while the viewer's ACL token exists and
+still grants the permission: revoking the token, or changing the policy,
+ends it at the next call. The pause, pin, or job change the app makes is recorded by
 `alice via app <app>`, so `legion scaling status`, `legion scaling
 history`, and the event stream name the person and the app, while the
 `app.action` event names who pressed. `WhoAmI` through a viewer client
