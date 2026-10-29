@@ -84,7 +84,7 @@ use crate::autoscaler::{
 use crate::cmd::helpers::AuthedManagerClient;
 use crate::prelude::*;
 use crate::structs::{
-    GetScalingInputsRequest, RecordScalingActionRequest, ReleaseObjectRequest,
+    AppObject, GetScalingInputsRequest, RecordScalingActionRequest, ReleaseObjectRequest,
     ReportScalingStatusRequest, ScaleDecision, ScaleTaskRequest, ScalingActionIntent,
     ScalingAppContext, ScalingEventFlag, ScalingInputs, ScalingPauseInfo, ScalingPolicy,
     ScalingPolicySet, ScalingTargetReport, ScalingTargetSelector, WatchScalingPoliciesRequest,
@@ -888,6 +888,19 @@ impl Engine {
             .filter_map(|cache| cache.read().ok().map(|cache| cache.len()))
             .sum();
         Some(tasks + objects)
+    }
+
+    /// The objects the watches hold now: the ScalingPolicies of this
+    /// replica's shards, and every NodeGroup when it holds the `nodegroups`
+    /// shard.
+    pub fn watched_objects(&self) -> Vec<AppObject> {
+        let mut out = Vec::new();
+        for cache in [&self.policy_objects, &self.group_objects] {
+            if let Ok(cache) = cache.read() {
+                out.extend(cache.objects().cloned());
+            }
+        }
+        out
     }
 
     /// Whether both object watches (ScalingPolicies, NodeGroups) have

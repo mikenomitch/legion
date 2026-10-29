@@ -255,6 +255,14 @@ fn last_action(action: Option<&ScalingAction>) -> Option<Value> {
     }))
 }
 
+/// The `lastAction` the object's stored status already says: kept while
+/// a newer intent is open, so the field never drops out mid-action.
+fn stored_last_action(object: &AppObject) -> Option<Value> {
+    let status = object.status.as_ref()?;
+    let fields: Value = serde_json::from_str(&status.fields_json).ok()?;
+    fields.get("lastAction").filter(|action| action.is_object()).cloned()
+}
+
 /// One object's durable verdict from its tick: what its status says. Only
 /// facts that change when the world changes, so an unchanged verdict writes
 /// nothing: whether the spec is accepted, whether the last evaluation
@@ -272,7 +280,9 @@ pub(crate) fn verdict(
         fields.insert("policy".to_string(), json!(target.summary));
         fields.insert("digest".to_string(), json!(target.digest));
     }
-    if let Some(action) = last_action(target.action.as_ref()) {
+    if let Some(action) = last_action(target.action.as_ref())
+        .or_else(|| stored_last_action(&target.object))
+    {
         fields.insert("lastAction".to_string(), action);
     }
     let outcome = match (&target.plan, state) {

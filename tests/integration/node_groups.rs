@@ -348,7 +348,6 @@ async fn a_node_group_grows_from_zero_and_drains_empty_nodes_test() -> R<()> {
             break;
         }
     }
-    watch.abort();
     assert_eq!(gone_at.len(), 2, "{gone_at:?}");
     assert!(
         !gone_at.contains_key(&protected),
@@ -407,9 +406,31 @@ async fn a_node_group_grows_from_zero_and_drains_empty_nodes_test() -> R<()> {
         target.decision_json
     );
     // The object's status: accepted, ready, its resolved target, and the
-    // last action (from its action row).
+    // last action (from its action row, once the policy watch has
+    // delivered the closed one: tick until it has).
     // (Its summary reads Stale here: no app job runs in this harness.)
-    let object = get_group(&mut h, "workers").await?.context("the group")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let object = loop {
+        let object = get_group(&mut h, "workers").await?.context("the group")?;
+        let last_action = object
+            .status
+            .as_ref()
+            .and_then(|status| serde_json::from_str::<Value>(&status.fields_json).ok())
+            .is_some_and(|fields| fields["lastAction"]["decision"].is_string());
+        if last_action {
+            break object;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "no lastAction in {:?}",
+            object.status
+        );
+        at += TICK_MS;
+        let report = engine.tick(at).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+    watch.abort();
     let status = object.status.context("a status")?;
     let conditions: Vec<(&str, &str)> = status
         .conditions
@@ -507,31 +528,47 @@ async fn deleting_a_node_group_drains_its_members_then_releases_it_test() -> R<(
         anyhow::ensure!(std::time::Instant::now() < deadline, "never Deleting");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    // The engine's own watch has it too, before it ticks again (or the
+    // ordinary scale-in, `down.for = 1m`, would start a drain first).
+    while !engine
+        .watched_objects()
+        .iter()
+        .any(|object| object.name == "workers" && object.deleting)
+    {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the engine never saw the delete"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
-    // Both members drain in one tick: no down.every budget, no down.for.
-    let mut drained_together = false;
+    // Both members leave in one tick: no down.every budget, no down.for.
+    // (A member has left once it is not available, or is forgotten.)
+    let mut first_left: Option<usize> = None;
     let mut gone = false;
     for _ in 0..40 {
         at += TICK_MS;
         let report = engine.tick(at).await;
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         h.drain_evals()?;
-        let draining = joined
+        let left = joined
             .iter()
             .filter(|name| {
                 h.store
                     .get_node(name)
-                    .is_ok_and(|node| node.availability != "available")
+                    .map_or(true, |node| node.availability != "available")
             })
             .count();
-        drained_together |= draining == 2;
+        if left > 0 && first_left.is_none() {
+            first_left = Some(left);
+        }
         if get_group(&mut h, "workers").await?.is_none() {
             gone = true;
             break;
         }
     }
     watch.abort();
-    assert!(drained_together, "both members drained at once");
+    assert_eq!(first_left, Some(2), "both members drained at once");
     assert!(gone, "the group was released once its members were gone");
     let nodes = node_ids(&mut h).await?;
     assert!(joined.iter().all(|name| !nodes.contains(name)), "{nodes:?}");
