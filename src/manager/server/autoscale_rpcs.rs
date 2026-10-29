@@ -521,6 +521,9 @@ impl ManagerDaemonService {
                 ..Default::default()
             }));
         }
+        // An installed app's count is its `replicas` (`legion app set
+        // --replicas`): a scale override would outlive every resubmit.
+        self.refuse_direct_app_job_write(&inner.name, "scaling it directly")?;
 
         let pinning = inner.pin_for_seconds.is_some();
         let bounds = inner.min.is_some() || inner.max.is_some();

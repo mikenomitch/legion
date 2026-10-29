@@ -1670,11 +1670,26 @@ async fn only_a_stamped_allocation_speaks_for_its_app_test() -> R<()> {
         .watch_app_extensions(req(WatchAppExtensionsRequest::default(), &token))
         .await?;
 
-    // A direct submit of the app's job, as the admin: no stamp.
+    // A version of the app's job stored without the stamp. RunJob refuses
+    // a direct submit of an installed app's job, so this is what an older
+    // release could have left.
     let mut edited = serde_json::to_value(fx.store.get_job_config(&job)?)?;
     edited["version"] = Value::Null;
     edited["tasks"][0]["count"] = json!(2);
-    fx.run(&edited).await?;
+    let refused = fx.run(&edited).await.expect_err("an app's job");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    let edited: JobConfig = serde_json::from_value(edited)?;
+    fx.store.handle_job_submit_as(
+        &edited,
+        &[Submission {
+            path: "job.json".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }],
+        None,
+        "admin",
+        None,
+    )?;
     let config_id = fx.store.get_job_config(&job)?.id();
     assert!(fx.store.job_managed_by(&job)?.is_none());
     fx.store
@@ -1708,5 +1723,85 @@ async fn only_a_stamped_allocation_speaks_for_its_app_test() -> R<()> {
         .await
         .expect_err("an unstamped version's allocation is not the app");
     assert_eq!(status.code(), Code::PermissionDenied, "{status}");
+    Ok(())
+}
+
+/// An upgrade that drops an extension point jobs set a key at is refused
+/// without `force`, naming the jobs, as uninstall is; the dry run lists the
+/// jobs and reports their values as orphaned, not as passing (hardening
+/// after the adversarial review, M7).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upgrade_that_drops_a_used_point_needs_force_test() -> R<()> {
+    let fx = fixture().await?;
+    let two = small_manifest(
+        "pair",
+        "0.1.0",
+        json!([
+            { "point": "task", "key": "slaTier",
+              "schema": object_schema(json!({ "level": { "type": "string" } }), &[]) },
+            { "point": "job", "key": "costCenter",
+              "schema": object_schema(json!({ "team": { "type": "string" } }), &[]) },
+        ]),
+    );
+    let one = small_manifest(
+        "pair",
+        "0.2.0",
+        json!([
+            { "point": "job", "key": "costCenter",
+              "schema": object_schema(json!({ "team": { "type": "string" } }), &[]) },
+        ]),
+    );
+    fx.install(&two, &[]).await?;
+    fx.run(&json!({
+        "name": "tiered",
+        "costCenter": { "team": "a" },
+        "task": { "name": "main", "runtime": "exec", "config": { "command": ["true"] },
+                  "slaTier": { "level": "gold" } },
+    }))
+    .await?;
+    let upgrade = |dry_run: bool, force: bool| {
+        fx.svc.upgrade_app(req(
+            UpgradeAppRequest {
+                name: "pair".into(),
+                manifest_json: one.to_string(),
+                dry_run,
+                force,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+    };
+    let dry = upgrade(true, false).await?.into_inner();
+    assert_eq!(dry.orphaned_jobs, vec!["tiered".to_string()]);
+    assert!(dry.uncovered.is_empty());
+    assert!(dry.message.contains("--force"), "{}", dry.message);
+    assert!(
+        dry.prompt
+            .iter()
+            .any(|line| line.starts_with("1 value of slaTier on tasks is orphaned")),
+        "{:?}",
+        dry.prompt
+    );
+    assert!(
+        !dry.prompt
+            .iter()
+            .any(|line| line.contains("slaTier") && line.contains("every value passes")),
+        "an orphaned value is not passing: {:?}",
+        dry.prompt
+    );
+    let refused = upgrade(false, false)
+        .await
+        .expect_err("jobs use the dropped point");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert!(
+        refused.message().contains("tiered") && refused.message().contains("--force"),
+        "{}",
+        refused.message()
+    );
+    let reply = upgrade(false, true).await?.into_inner();
+    assert!(reply.upgraded, "{}", reply.message);
+    assert_eq!(reply.orphaned_jobs, vec!["tiered".to_string()]);
+    let info = fx.info("tiered").await?;
+    assert_eq!(find(&info.extensions, "task", "slaTier")?.state, "orphaned");
     Ok(())
 }

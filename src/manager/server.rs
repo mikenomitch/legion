@@ -230,6 +230,7 @@ fn store_error_status(action: &str, err: &anyhow::Error) -> Status {
         StorageError::Conflict { .. } => Status::already_exists(message),
         StorageError::InvalidInput { .. } => Status::invalid_argument(message),
         StorageError::FailedPrecondition { .. } => Status::failed_precondition(message),
+        StorageError::Aborted { .. } => Status::aborted(message),
         StorageError::ForeignKey { .. } => Status::failed_precondition(message),
         StorageError::DatabaseBusy | StorageError::DatabaseLocked => Status::unavailable(message),
         StorageError::DatabaseReadOnly => Status::failed_precondition(message),
@@ -452,7 +453,38 @@ pub(crate) enum SubmitOrigin {
     App {
         granted_by: String,
         managed_by: crate::structs::app::ManagedBy,
+        /// The app record's `updated_at` the render came from: the store
+        /// refuses the submit unless the record is still there, enabled, and
+        /// unchanged.
+        record_updated_at: String,
     },
+}
+
+/// What admission made of a submit ([`ManagerDaemonService::admit_rendered_job`]).
+struct AdmittedJob {
+    config: JobConfig,
+    kv_refs: Vec<KvReference>,
+    unknown_fields: UnknownFieldsRecord,
+    namespace: String,
+    artifact_pins: Vec<ArtifactPin>,
+    autoscale_warnings: Vec<String>,
+}
+
+/// The status of a failed artifact admission: `Unavailable` (retry) when a
+/// pin's resolution failed for a reason a retry can fix (the registry or
+/// git remote could not be reached, timed out, or answered 5xx or 429),
+/// `InvalidArgument` (fix the job) for everything else: a reference that
+/// does not exist, credentials that are refused, a rule the job breaks.
+fn artifact_admission_status(e: anyhow::Error) -> Status {
+    if crate::artifacts::fetcher::PinResolveFailure::transient_in(&e) {
+        warn!("Error resolving an artifact pin (transient): {e:#}");
+        return Status::unavailable(format!(
+            "Error normalizing artifacts: {e:#}\nHint: the source could not be reached; the \
+             submit can be retried as it is"
+        ));
+    }
+    error!("Error normalizing artifacts: {:?}", e);
+    Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
 }
 
 struct SubmittedJob {
@@ -2117,6 +2149,11 @@ pub struct ManagerDaemonService {
     /// How app view and action requests reach an app's allocation: the
     /// worker plane, or (tests) a forwarder that delivers in process.
     app_forwarder: Arc<dyn crate::manager::app_forward::AppForwarder>,
+    /// The idempotency keys of app actions running now on this manager
+    /// (the Control leader, where every keyed action runs): a duplicate
+    /// waits for the first and gets its reply, instead of running the
+    /// action again.
+    app_actions_in_flight: Arc<app_ui_rpcs::InFlightKeys>,
     /// The keys installed apps add to the jobspec, rebuilt when an app
     /// record changes (`extension_rpcs`).
     extension_registry: extension_rpcs::RegistryCache,
@@ -2175,6 +2212,7 @@ impl ManagerDaemonService {
             eval_threads: 1,
             app_nudge: Arc::new(std::sync::OnceLock::new()),
             app_forwarder: Arc::new(crate::manager::app_forward::WorkerPlaneForwarder),
+            app_actions_in_flight: Arc::new(app_ui_rpcs::InFlightKeys::default()),
             extension_registry: Arc::new(Mutex::new(None)),
             object_registry: Arc::new(Mutex::new(None)),
             simulated_core_fields: Vec::new(),
@@ -2460,42 +2498,25 @@ impl ManagerDaemonService {
         )
     }
 
-    /// Everything RunJob does once it holds a rendered jobspec, shared with
-    /// RunJobTemplate so both submission paths behave identically: KV
-    /// reference resolution, precise ACL enforcement, the template collision
-    /// guard, task validation, artifact admission, persistence (with
-    /// provenance), status clears, KV-ref bookkeeping, keyed-instance
-    /// seeding, and rollout/eval enqueueing.
+    /// The admission half of a submit: everything RunJob checks before it
+    /// writes (KV reference resolution with its `kv:read` checks, precise
+    /// ACL enforcement, the reserved-namespace and app-managed-job rules,
+    /// namespace policies, extension `requires`, the template collision
+    /// guard, task, autoscale, identity, volume and capability validation,
+    /// and artifact admission with pin resolution). Shared by the submit
+    /// and by the app RPCs' dry run of an app's job (install, upgrade,
+    /// config and settings changes), so they refuse what the reconciler's
+    /// submit would.
     #[allow(clippy::too_many_arguments)]
-    fn submit_rendered_job_from(
+    fn admit_rendered_job(
         &self,
         identity: &AclIdentity,
         js: &str,
-        mut subs: Vec<Submission>,
-        // Explicit eval-queue override (`--priority`/`--asap`). `None` lets
-        // the job's priority band set the queue position, which is the
-        // default and the point of having one field mean both things.
-        priority: Option<i64>,
-        force_reschedule: bool,
         template: Option<&JobTemplateProvenance>,
-        // The request's namespace (`-n`); resolved against the jobspec's own.
         namespace: Option<&str>,
-        // Who the stored version is recorded as coming from.
-        origin: SubmitOrigin,
-        // The request's `allow_unknown_fields`.
+        origin: &SubmitOrigin,
         unknown_field_mode: UnknownFieldMode,
-        // Warnings found before the submit: apps' answers to their validate
-        // calls (`ask_apps_to_validate`).
-        app_warnings: Vec<String>,
-    ) -> Result<SubmittedJob, Status> {
-        if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
-            subs.push(Submission {
-                path: "job.rendered.json".into(),
-                content: js.to_string(),
-                is_primary: false,
-            });
-        }
-
+    ) -> Result<AdmittedJob, Status> {
         // The keys installed apps add to the jobspec: the parse resolves
         // extension values against them (docs/apps.md, "Jobspec extensions").
         let registry = self.extension_registry()?;
@@ -2564,6 +2585,12 @@ impl ManagerDaemonService {
             }
         })?;
 
+        // An installed app's job is the app reconciler's alone (docs/apps.md,
+        // "Editing an app's job"): a direct submit is refused, not reverted.
+        if matches!(origin, SubmitOrigin::Principal) {
+            self.refuse_direct_app_job_write(&config.name, "submitting it directly")?;
+        }
+
         // After authorization, so a caller with no grant in the namespace
         // cannot learn whether it exists.
         self.ensure_namespace_exists(&namespace)?;
@@ -2618,13 +2645,69 @@ impl ManagerDaemonService {
         // Artifact admission: desugar/auth/pin. Pin resolution can reach
         // registries, so it runs as blocking work.
         let artifact_pins =
-            run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true)).map_err(
-                |e| {
-                    error!("Error normalizing artifacts: {:?}", e);
-                    Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
-                },
-            )?;
-        let config = config;
+            run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true))
+                .map_err(artifact_admission_status)?;
+        Ok(AdmittedJob {
+            config,
+            kv_refs,
+            unknown_fields,
+            namespace,
+            artifact_pins,
+            autoscale_warnings,
+        })
+    }
+
+    /// Everything RunJob does once it holds a rendered jobspec, shared with
+    /// RunJobTemplate so both submission paths behave identically: KV
+    /// reference resolution, precise ACL enforcement, the template collision
+    /// guard, task validation, artifact admission, persistence (with
+    /// provenance), status clears, KV-ref bookkeeping, keyed-instance
+    /// seeding, and rollout/eval enqueueing.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_rendered_job_from(
+        &self,
+        identity: &AclIdentity,
+        js: &str,
+        mut subs: Vec<Submission>,
+        // Explicit eval-queue override (`--priority`/`--asap`). `None` lets
+        // the job's priority band set the queue position, which is the
+        // default and the point of having one field mean both things.
+        priority: Option<i64>,
+        force_reschedule: bool,
+        template: Option<&JobTemplateProvenance>,
+        // The request's namespace (`-n`); resolved against the jobspec's own.
+        namespace: Option<&str>,
+        // Who the stored version is recorded as coming from.
+        origin: SubmitOrigin,
+        // The request's `allow_unknown_fields`.
+        unknown_field_mode: UnknownFieldMode,
+        // Warnings found before the submit: apps' answers to their validate
+        // calls (`ask_apps_to_validate`).
+        app_warnings: Vec<String>,
+    ) -> Result<SubmittedJob, Status> {
+        if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
+            subs.push(Submission {
+                path: "job.rendered.json".into(),
+                content: js.to_string(),
+                is_primary: false,
+            });
+        }
+
+        let AdmittedJob {
+            config,
+            kv_refs,
+            unknown_fields,
+            namespace,
+            artifact_pins,
+            autoscale_warnings,
+        } = self.admit_rendered_job(
+            identity,
+            js,
+            template,
+            namespace,
+            &origin,
+            unknown_field_mode,
+        )?;
         // The version's grant is recorded in the submitter's name, in the
         // same entry as the version (`enforce_identity_grants` above checked
         // they hold it).
@@ -2639,9 +2722,14 @@ impl ManagerDaemonService {
             SubmitOrigin::App {
                 granted_by,
                 managed_by,
-            } => self
-                .store
-                .handle_job_submit_managed(&config, &subs, &granted_by, managed_by),
+                record_updated_at,
+            } => self.store.handle_job_submit_managed(
+                &config,
+                &subs,
+                &granted_by,
+                managed_by,
+                &record_updated_at,
+            ),
         }
         .map_err(|e| map_store_error("Error running job", e))?;
         if !unknown_fields.is_empty() {
@@ -3831,13 +3919,16 @@ impl ManagerDaemonService {
                 {
                     continue;
                 }
-                let resolved = self.resolve_pin(spec).with_context(|| {
-                    format!(
-                        "resolve artifact {} at submit failed; fix the reference or set \
-                         resolve: \"always\" to re-resolve at staging instead",
-                        spec.redacted_source()
-                    )
-                })?;
+                let resolved = self
+                    .resolve_pin(spec)
+                    .map_err(crate::artifacts::fetcher::PinResolveFailure::classify)
+                    .with_context(|| {
+                        format!(
+                            "resolve artifact {} at submit failed; fix the reference or set \
+                             resolve: \"always\" to re-resolve at staging instead",
+                            spec.redacted_source()
+                        )
+                    })?;
                 notes.push(ArtifactPin {
                     task: task.name.clone(),
                     from: spec.redacted_source(),
@@ -6020,6 +6111,15 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
         self.enforce_rollout_job(&identity, AclAction::Write, request.id)?;
+        // Stopping (or reverting) an app's rollout fights the reconciler;
+        // advancing one moves toward what it submitted, and is allowed.
+        if let Some(rollout) = self
+            .store
+            .get_rollout(request.id)
+            .map_err(|e| map_store_error("Error loading rollout", e))?
+        {
+            self.refuse_direct_app_job_write(&rollout.job_id, "stopping its rollout")?;
+        }
         let priority = request.priority.unwrap_or(self.store.default_eval_priority);
         let rollout = stop_rollout_state(&self.store, request.id, request.revert, priority)
             .map_err(|e| Status::invalid_argument(format!("Error stopping rollout: {e}")))?;
@@ -6069,6 +6169,9 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             &AclScope::job(&config.name),
         )?;
+        // A plan predicts the run: a direct submit to an installed app's
+        // job would be refused.
+        self.refuse_direct_app_job_write(&config.name, "submitting it directly")?;
         self.ensure_namespace_exists(&namespace)?;
         enforce_kv_artifact_read(&identity, &config)?;
         let mut config = self
@@ -6098,10 +6201,7 @@ impl Manager for ManagerDaemonService {
         // Artifact admission for plan mirrors run: pins resolve here too so
         // the plan shows the digests a submit would ship.
         let pin_notes = run_blocking_admission(|| self.normalize_job_artifacts(&mut config, true))
-            .map_err(|e| {
-                error!("Error normalizing artifacts: {:?}", e);
-                Status::invalid_argument(format!("Error normalizing artifacts: {e:#}"))
-            })?;
+            .map_err(artifact_admission_status)?;
         let config = config;
 
         let scheduler = Scheduler::new(&self.store).map_err(|e| {
@@ -6648,6 +6748,8 @@ impl Manager for ManagerDaemonService {
                 deduplicated: true,
             }));
         }
+        // An installed app's job stops with `legion app disable`.
+        self.refuse_direct_app_job_write(&name, "stopping it directly")?;
 
         let job_config_id = self
             .store
@@ -6840,6 +6942,9 @@ impl Manager for ManagerDaemonService {
                 deduplicated: true,
             }));
         }
+        // An installed app's job is destroyed only once the app is
+        // uninstalled.
+        self.refuse_direct_app_job_write(&name, "destroying it")?;
 
         let _ = self.store.destroy_job(&name).map_err(|e| {
             self.job_lookup_error(&identity, &name, map_store_error("Error deleting job", e))

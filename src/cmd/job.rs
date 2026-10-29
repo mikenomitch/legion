@@ -2976,7 +2976,7 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
         if let Some(managed_by) = &reply.managed_by {
             let digest: String = managed_by.digest.chars().take(8).collect();
             println!(
-                "managed by app {} (digest {digest}…); direct edits are reverted. Use `legion app`.",
+                "managed by app {} (digest {digest}…); direct edits are refused. Use `legion app`.",
                 managed_by.app
             );
         }

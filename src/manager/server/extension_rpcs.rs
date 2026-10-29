@@ -122,6 +122,7 @@ pub(crate) fn lifecycle_report(
         BTreeMap::new();
     let mut adopted: Vec<String> = Vec::new();
     let mut held: Vec<String> = Vec::new();
+    let mut orphaned: BTreeMap<(String, ExtensionPoint), Vec<String>> = BTreeMap::new();
     for job in jobs {
         let entries = job_extension_entries(&job.config, registry);
         for entry in &entries {
@@ -131,6 +132,14 @@ pub(crate) fn lifecycle_report(
             if entry.state == ExtensionState::Pending {
                 // Claimed, but its key needs a permission no submit checked.
                 held.push(entry.label(&job.job_id));
+                continue;
+            }
+            if entry.state == ExtensionState::Orphaned {
+                // Its point is gone from this version: not "passing".
+                orphaned
+                    .entry((entry.key.clone(), entry.point))
+                    .or_default()
+                    .push(entry.label(&job.job_id));
                 continue;
             }
             let installed_key = registry
@@ -169,6 +178,18 @@ pub(crate) fn lifecycle_report(
             lines.extend(failing);
         }
     }
+    for ((key, point), labels) in orphaned {
+        lines.push(format!(
+            "{} value{} of {key} on {} {} orphaned: this version no longer declares the key there. \
+             The values stay stored, flagged orphaned, and each job's next submit fails until the \
+             key is removed:",
+            labels.len(),
+            if labels.len() == 1 { "" } else { "s" },
+            point_plural(point),
+            if labels.len() == 1 { "is" } else { "are" },
+        ));
+        lines.extend(labels.into_iter().map(|label| format!("  {label}")));
+    }
     if installing && !adopted.is_empty() {
         lines.push(format!(
             "Adopts {} pending value{} kept under --allow-unknown-fields: {}",
@@ -185,6 +206,23 @@ pub(crate) fn lifecycle_report(
         ));
     }
     lines
+}
+
+/// The jobs whose values for `app`'s keys `registry` (an upgraded one)
+/// reads as orphaned: the points an upgrade drops.
+pub(crate) fn orphaned_jobs(
+    app: &str,
+    jobs: &[ExtensionJob],
+    registry: &ExtensionRegistry,
+) -> Vec<String> {
+    jobs.iter()
+        .filter(|job| {
+            job_extension_entries(&job.config, registry)
+                .iter()
+                .any(|entry| entry.app == app && entry.state == ExtensionState::Orphaned)
+        })
+        .map(|job| job.job_id.clone())
+        .collect()
 }
 
 impl ManagerDaemonService {
@@ -441,6 +479,13 @@ impl ManagerDaemonService {
         if by_app.is_empty() {
             return Ok(Vec::new());
         }
+        // The submit that follows writes on the Control lane's leader. A
+        // follower refuses before any app is asked, so the leader-forward
+        // layer's replay on the leader asks each app once per submit, not
+        // once here and again there.
+        self.store
+            .require_lane_leader(crate::storage::Lane::Control, "a submit apps validate")
+            .map_err(|e| map_store_error("Error running job", e))?;
         let calls = by_app.into_iter().map(|(app, values)| {
             let config = &config;
             let namespace = namespace.clone();
@@ -473,7 +518,18 @@ impl ManagerDaemonService {
             match outcome {
                 Ok(answer) => {
                     for (index, (value, _)) in values.iter().enumerate() {
-                        let result = answer.results.get(index).cloned().unwrap_or_default();
+                        // A short answer checked nothing past its end: say
+                        // so, as for an app that did not answer.
+                        let Some(result) = answer.results.get(index).cloned() else {
+                            warnings.push(format!(
+                                "{} was not checked by the {app} app (its answer had {} \
+                                 result(s) for {} value(s)); the schema check passed",
+                                place(value),
+                                answer.results.len(),
+                                values.len()
+                            ));
+                            continue;
+                        };
                         for error in result.errors {
                             errors.push(format!("{} ({app} app): {error}", place(value)));
                         }

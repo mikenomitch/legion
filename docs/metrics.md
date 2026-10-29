@@ -398,11 +398,13 @@ while admitted work is still placing.
 ### Apps
 
 - **`legion_apps{status}`** (gauge): installed [apps](apps.md) by status,
-  `running`, `degraded`, `pending`, or `stopped`, as `legion app list`
-  derives it. Set by the control-lane leader's app reconciler after each
-  pass (at least once a minute); zero on other managers. A `stopped` or
-  `degraded` count is worth an alert: a bundled app (the autoscaler) that is
-  not running is a cluster-health finding, not a silent absence.
+  `running`, `upgrading`, `degraded`, `pending`, `stopped`, or `corrupt`, as
+  `legion app list` derives it. Set by the control-lane leader's app
+  reconciler after each pass (at least once a minute); zero on other
+  managers. A `stopped` or `degraded` count is worth an alert: a bundled app
+  (the autoscaler) that is not running is a cluster-health finding, not a
+  silent absence. A `corrupt` count is a record this manager cannot decode
+  (logged once, with the reason): `legion app uninstall <app>` removes it.
 
 ### Node usage
 

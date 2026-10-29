@@ -171,6 +171,98 @@ pub struct FetchRequest<'a> {
     pub limits: &'a FetchLimits,
 }
 
+/// Context a manager puts on a failed pin resolution at submit: whether a
+/// retry can fix it. Transient failures (the registry or git remote could
+/// not be reached, timed out, or answered 5xx or 429) make the submit
+/// `Unavailable`; the rest (a tag that does not exist, refused credentials,
+/// a malformed reference) stay `InvalidArgument`. The app reconciler backs
+/// off and retries the first kind, and parks on the second
+/// (docs/apps.md, "How an app stays running").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinResolveFailure {
+    pub transient: bool,
+}
+
+impl fmt::Display for PinResolveFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.transient {
+            write!(f, "the source could not be reached (a retry may succeed)")
+        } else {
+            write!(f, "the source refused the reference")
+        }
+    }
+}
+
+impl PinResolveFailure {
+    /// `err` with this context on it, classified.
+    pub fn classify(err: anyhow::Error) -> anyhow::Error {
+        let transient = is_transient_fetch_error(&err);
+        err.context(PinResolveFailure { transient })
+    }
+
+    /// Whether `err` carries a transient pin-resolution failure.
+    pub fn transient_in(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<PinResolveFailure>()
+            .is_some_and(|failure| failure.transient)
+    }
+}
+
+/// Whether a fetch or resolve error is one a retry can fix: the network,
+/// not the reference.
+pub fn is_transient_fetch_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(oci) = cause.downcast_ref::<oci_client::errors::OciDistributionError>() {
+            use oci_client::errors::OciDistributionError as Oci;
+            return match oci {
+                Oci::RequestError(request) => !request.is_builder() && !request.is_decode(),
+                Oci::IoError(_) => true,
+                Oci::ServerError { code, .. } => *code >= 500 || *code == 429,
+                _ => false,
+            };
+        }
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
+            return request.is_connect()
+                || request.is_timeout()
+                || request
+                    .status()
+                    .is_some_and(|status| status.is_server_error() || status.as_u16() == 429);
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind;
+            if matches!(
+                io.kind(),
+                ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::NotConnected
+                    | ErrorKind::TimedOut
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+    }
+    // git reports through the last line of its stderr.
+    let text = format!("{err:#}").to_ascii_lowercase();
+    [
+        "could not resolve host",
+        "temporary failure in name resolution",
+        "connection refused",
+        "connection reset",
+        "connection timed out",
+        "operation timed out",
+        "network is unreachable",
+        "no route to host",
+        "the requested url returned error: 5",
+        "the requested url returned error: 429",
+        "early eof",
+        "rpc failed",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 /// A mutable reference resolved to a stable identity without downloading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedIdentity {
@@ -346,6 +438,49 @@ impl FetcherRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry that cannot be reached is a failure a retry can fix; a
+    /// tag that does not exist, or refused credentials, are not (hardening
+    /// after the adversarial review, M4). The classification survives the
+    /// context the submit puts on top.
+    #[test]
+    fn pin_failures_are_classified_by_whether_a_retry_can_fix_them() {
+        let refused = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ))
+        .context("resolve manifest digest for oci://registry.example/app:1");
+        let classified = PinResolveFailure::classify(refused).context("resolve artifact failed");
+        assert!(PinResolveFailure::transient_in(&classified));
+
+        let server = anyhow::Error::new(oci_client::errors::OciDistributionError::ServerError {
+            code: 503,
+            url: "https://registry.example/v2/".into(),
+            message: "unavailable".into(),
+        });
+        assert!(is_transient_fetch_error(&server));
+        let missing = anyhow::Error::new(oci_client::errors::OciDistributionError::ServerError {
+            code: 404,
+            url: "https://registry.example/v2/".into(),
+            message: "manifest unknown".into(),
+        });
+        assert!(!is_transient_fetch_error(&missing));
+        let auth = anyhow::Error::new(
+            oci_client::errors::OciDistributionError::AuthenticationFailure("denied".into()),
+        );
+        let classified = PinResolveFailure::classify(auth).context("resolve artifact failed");
+        assert!(!PinResolveFailure::transient_in(&classified));
+
+        let git = anyhow!(
+            "git ls-remote failed for git::https://git.example/app: fatal: unable to access \
+             'https://git.example/app/': Could not resolve host: git.example"
+        );
+        assert!(is_transient_fetch_error(&git));
+        let no_ref = anyhow!("git ls-remote found no ref \"v9\" at git::https://git.example/app");
+        assert!(!is_transient_fetch_error(&no_ref));
+        // An error with no classification is not transient.
+        assert!(!PinResolveFailure::transient_in(&anyhow!("bad reference")));
+    }
 
     #[test]
     fn credential_json_shapes_parse() -> R<()> {

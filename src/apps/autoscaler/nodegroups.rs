@@ -59,6 +59,54 @@ use crate::structs::{
 /// take, plus a tick), before it counts as abandoned and is reconciled.
 pub const RECONCILE_AFTER_MS: i64 = 150_000;
 
+/// How long the replica that won an intent may act on it: well under
+/// [`RECONCILE_AFTER_MS`], so it is done (or has stopped) before any other
+/// replica can count the intent abandoned, reconcile it, and act on the
+/// group again. A step not started by then is left to a later tick, which
+/// decides again from what happened; one still running is abandoned.
+pub const ACT_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis((RECONCILE_AFTER_MS - 30_000) as u64);
+
+/// The deadline an intent's steps run against ([`ACT_BUDGET`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActBudget {
+    deadline: tokio::time::Instant,
+    budget: std::time::Duration,
+}
+
+impl ActBudget {
+    pub(crate) fn new(budget: std::time::Duration) -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + budget,
+            budget,
+        }
+    }
+
+    /// Run one step: `Err` when the budget was spent before it started, or
+    /// ran out while it ran.
+    pub(crate) async fn step<F: std::future::Future>(
+        &self,
+        what: &str,
+        step: F,
+    ) -> Result<F::Output, String> {
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err(format!(
+                "{what}: not started, the {}s act budget was spent (the next tick decides again)",
+                self.budget.as_secs()
+            ));
+        }
+        tokio::time::timeout_at(self.deadline, step)
+            .await
+            .map_err(|_| {
+                format!(
+                    "{what}: did not finish within the {}s act budget (abandoned; the next tick \
+                     reads what happened)",
+                    self.budget.as_secs()
+                )
+            })
+    }
+}
+
 /// Provider member states that mean the instance is gone or going.
 const GONE: [&str; 5] = [
     "terminated",
@@ -889,16 +937,25 @@ impl Engine {
         let host = self.host.clone();
         let mut failures: Vec<String> = Vec::new();
         let mut scaled = false;
+        // Every step runs against one deadline from winning the intent, well
+        // inside the window after which another replica may take it over
+        // (legion-apps-plan calls entry 124): sequential target calls of up to 120 seconds
+        // each, behind a plugin's one turn, could otherwise outlast it, and
+        // two replicas would act on one group.
+        let budget = ActBudget::new(ACT_BUDGET);
         for action in &decision.intents {
             match action {
                 NodeIntent::SetDesired { count } => {
                     let new_nodes = count.saturating_sub(decision.from).max(1);
-                    let token = match self
-                        .mint_join_token(effective, new_nodes, &scale_decision.id)
+                    let token = match budget
+                        .step(
+                            "minting the join token",
+                            self.mint_join_token(effective, new_nodes, &scale_decision.id),
+                        )
                         .await
                     {
-                        Ok(token) => token,
-                        Err(err) => {
+                        Ok(Ok(token)) => token,
+                        Ok(Err(err)) | Err(err) => {
                             failures.push(err);
                             continue;
                         }
@@ -907,55 +964,71 @@ impl Engine {
                         "token": token,
                         "attributes": effective.member_attributes(),
                     });
-                    match host
-                        .scale_nodes(
-                            &effective.plugin,
-                            &policy.id,
-                            &effective.config,
-                            *count,
-                            &scale_decision.id,
-                            join,
+                    let what = format!("target/scale to {count}");
+                    match budget
+                        .step(
+                            &what,
+                            host.scale_nodes(
+                                &effective.plugin,
+                                &policy.id,
+                                &effective.config,
+                                *count,
+                                &scale_decision.id,
+                                join,
+                            ),
                         )
                         .await
                     {
-                        Ok(()) => {
+                        Ok(Ok(())) => {
                             if let Some(runtime) = self.groups.get_mut(&policy.key) {
                                 runtime.state.record_scale(now_ms, decision.from, *count);
                             }
                             scaled = true;
                             report.scaled += 1;
                         }
-                        Err(err) => failures.push(format!("target/scale to {count}: {err}")),
+                        Ok(Err(err)) => failures.push(format!("{what}: {err}")),
+                        Err(over) => failures.push(over),
                     }
                 }
                 NodeIntent::Cordon { node } => {
-                    if let Err(status) = self
-                        .client
-                        .set_node_availability(SetNodeAvailabilityRequest {
-                            node_id: node.clone(),
-                            availability: "drained".to_string(),
-                            evict: true,
-                            idempotency_key: None,
-                        })
+                    let what = format!("draining {node}");
+                    match budget
+                        .step(
+                            &what,
+                            self.client
+                                .set_node_availability(SetNodeAvailabilityRequest {
+                                    node_id: node.clone(),
+                                    availability: "drained".to_string(),
+                                    evict: true,
+                                    idempotency_key: None,
+                                }),
+                        )
                         .await
                     {
-                        failures.push(format!("draining {node}: {}", status.message()));
+                        Ok(Ok(_)) => {}
+                        Ok(Err(status)) => failures.push(format!("{what}: {}", status.message())),
+                        Err(over) => failures.push(over),
                     }
                 }
                 NodeIntent::Uncordon { node } => {
-                    if let Err(status) = self
-                        .client
-                        .set_node_availability(SetNodeAvailabilityRequest {
-                            node_id: node.clone(),
-                            availability: "available".to_string(),
-                            evict: false,
-                            idempotency_key: None,
-                        })
+                    let what = format!("uncordoning {node}");
+                    match budget
+                        .step(
+                            &what,
+                            self.client
+                                .set_node_availability(SetNodeAvailabilityRequest {
+                                    node_id: node.clone(),
+                                    availability: "available".to_string(),
+                                    evict: false,
+                                    idempotency_key: None,
+                                }),
+                        )
                         .await
                     {
-                        if status.code() != tonic::Code::NotFound {
-                            failures.push(format!("uncordoning {node}: {}", status.message()));
-                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(status)) if status.code() == tonic::Code::NotFound => {}
+                        Ok(Err(status)) => failures.push(format!("{what}: {}", status.message())),
+                        Err(over) => failures.push(over),
                     }
                 }
                 NodeIntent::Terminate { node, provider_id } => {
@@ -963,32 +1036,45 @@ impl Engine {
                         failures.push(format!("{node} has no legion.provider-id to terminate"));
                         continue;
                     };
-                    if let Err(err) = host
-                        .terminate(
-                            &effective.plugin,
-                            &policy.id,
-                            &effective.config,
-                            std::slice::from_ref(id),
-                            &scale_decision.id,
+                    let what = format!("target/terminate {id} ({node})");
+                    match budget
+                        .step(
+                            &what,
+                            host.terminate(
+                                &effective.plugin,
+                                &policy.id,
+                                &effective.config,
+                                std::slice::from_ref(id),
+                                &scale_decision.id,
+                            ),
                         )
                         .await
                     {
-                        failures.push(format!("target/terminate {id} ({node}): {err}"));
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => failures.push(format!("{what}: {err}")),
+                        Err(over) => failures.push(over),
                     }
                 }
                 NodeIntent::Forget { node } => {
-                    if let Err(status) = self
-                        .client
-                        .forget_node(ForgetNodeRequest {
-                            node_id: node.clone(),
-                            force: false,
-                            idempotency_key: Some(format!("{}-forget-{node}", scale_decision.id)),
-                        })
+                    let what = format!("forgetting {node}");
+                    match budget
+                        .step(
+                            &what,
+                            self.client.forget_node(ForgetNodeRequest {
+                                node_id: node.clone(),
+                                force: false,
+                                idempotency_key: Some(format!(
+                                    "{}-forget-{node}",
+                                    scale_decision.id
+                                )),
+                            }),
+                        )
                         .await
                     {
-                        if status.code() != tonic::Code::NotFound {
-                            failures.push(format!("forgetting {node}: {}", status.message()));
-                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(status)) if status.code() == tonic::Code::NotFound => {}
+                        Ok(Err(status)) => failures.push(format!("{what}: {}", status.message())),
+                        Err(over) => failures.push(over),
                     }
                 }
             }
@@ -1090,6 +1176,43 @@ fn node_report(policy: &ObjectTarget) -> ScalingTargetReport {
 mod tests {
     use super::*;
     use crate::structs::NodeGroupAllocation;
+
+    /// The act budget ends well before another replica may take an intent
+    /// over, and an intent's steps stop at it: a slow step is abandoned at
+    /// the deadline, and the steps after it never start (hardening after
+    /// the adversarial review, L6).
+    #[tokio::test]
+    async fn an_intents_steps_stop_at_the_act_budget() {
+        assert!(
+            ACT_BUDGET.as_millis() as i64 + 20_000 <= RECONCILE_AFTER_MS,
+            "the budget leaves room before the takeover window"
+        );
+        let budget = ActBudget::new(std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let fast = budget.step("fast", async { 1 }).await;
+        assert_eq!(fast, Ok(1));
+        let slow = budget
+            .step(
+                "target/terminate i-1",
+                tokio::time::sleep(std::time::Duration::from_secs(5)),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "abandoned at the deadline, not after the step: {elapsed:?}"
+        );
+        assert!(
+            slow.as_ref()
+                .is_err_and(|err| err.contains("did not finish within")),
+            "{slow:?}"
+        );
+        let next = budget.step("target/terminate i-2", async { 2 }).await;
+        assert!(
+            next.as_ref().is_err_and(|err| err.contains("not started")),
+            "{next:?}"
+        );
+    }
 
     fn status(count: u32, members: Value) -> host::TargetState {
         host::TargetState {

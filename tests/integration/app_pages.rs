@@ -575,13 +575,7 @@ async fn bridged_calls_are_held_to_the_page_allowlist_test() -> R<()> {
     });
     let mut client = ManagerClient::connect(addr).await?;
     let stamped = |page: Option<&str>, job: &str| {
-        let mut request = req(
-            GetJobInfoRequest {
-                name: job.into(),
-                ..Default::default()
-            },
-            &fx.admin,
-        );
+        let mut request = req(GetJobInfoRequest { name: job.into() }, &fx.admin);
         if let Some(page) = page {
             request
                 .metadata_mut()

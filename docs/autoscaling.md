@@ -743,6 +743,16 @@ seconds, and evaluates only the shards it holds:
 - `shards/<n>`: with several replicas, each holds up to `ceil(64 / live)`,
   gives up what it holds above that, and takes free shards up to it.
 
+**What several replicas cost.** Every lease renewal is a Control-lane raft
+write. One replica renews two leases every 5 seconds (0.4 writes a second).
+With several, the replicas renew all 64 shard leases between them plus one
+membership lease each, every 5 seconds: about `(64 + replicas) / 5` writes
+a second, so 13 to 14 for two or three replicas, for as long as they run,
+whether or not any policy changes. That is small next to a busy cluster's
+heartbeats, but it is a steady cost on the lane that also carries job
+submits; run more than one replica for availability, not for throughput,
+unless you have hundreds of policies.
+
 When a replica joins, the others shed shards and it takes them on its next
 round; when one dies, its leases expire after one TTL and the others take
 its shards. Its policy watch (`WatchScalingPolicies`) is filtered to the
@@ -1157,9 +1167,15 @@ matches acts; two autoscaler replicas whose leases overlap cannot both
 resize the group or drain different victims. When the calls return, the
 intent is closed with its outcome. An intent left open by a replica that
 died is closed as `reconciled` by the next owner once it is older than any
-target call can take, after checking the provider's status, and the drains
-it recorded are resumed. `legion scaling history workers-general --kind
-nodegroup` shows each step: `scaled`, `drain`, `terminate`, `forget`,
+target call can take (150 seconds), after checking the provider's status,
+and the drains it recorded are resumed. The replica that opened an intent
+acts on it for at most 120 seconds: a step not started by then (a second
+`target/terminate` behind a slow first one, say) is left for a later tick,
+which decides again from what happened, and one still running at the
+deadline is abandoned and recorded as failed. So the owner is done before
+anyone else may take the intent over, and two replicas never act on one
+group at once. `legion scaling history workers-general
+--kind nodegroup` shows each step: `scaled`, `drain`, `terminate`, `forget`,
 `uncordon`, and `failed`.
 
 ## Scaling by hand

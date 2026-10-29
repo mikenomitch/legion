@@ -48,6 +48,86 @@ const FORWARD_ATTEMPTS: usize = 3;
 /// The longest app message an error or event repeats.
 const MAX_APP_MESSAGE: usize = 500;
 
+/// How long a keyed action waits for one with the same key to finish
+/// before it answers `Aborted` (the first one's forward is bounded well
+/// under this).
+const ACTION_KEY_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// The idempotency keys of the app actions running on this manager. A
+/// keyed action holds its key while it runs, so a duplicate (a retry after a
+/// client timeout, a double press) waits for it and then finds its recorded
+/// reply, instead of running the action a second time.
+#[derive(Debug, Default)]
+pub(crate) struct InFlightKeys {
+    keys: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// One held key; released when dropped.
+pub(crate) struct InFlightGuard<'a> {
+    owner: &'a InFlightKeys,
+    key: String,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl InFlightKeys {
+    /// Hold `key`, waiting at most `wait` for whoever holds it; `None` when
+    /// it is still held then.
+    pub(crate) async fn hold(
+        &self,
+        key: &str,
+        wait: std::time::Duration,
+    ) -> Option<InFlightGuard<'_>> {
+        let lock = self
+            .keys
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(key.to_string())
+            .or_default()
+            .clone();
+        match tokio::time::timeout(wait, lock.lock_owned()).await {
+            Ok(held) => Some(InFlightGuard {
+                owner: self,
+                key: key.to_string(),
+                held: Some(held),
+            }),
+            Err(_) => {
+                self.release(key);
+                None
+            }
+        }
+    }
+
+    /// Drop `key`'s entry once nobody holds or waits for it.
+    fn release(&self, key: &str) {
+        let mut keys = self
+            .keys
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if keys
+            .get(key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            keys.remove(key);
+        }
+    }
+
+    /// How many keys are held or waited for (tests).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.keys
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.held.take());
+        self.owner.release(&self.key);
+    }
+}
+
 fn context_from_proto(context: Option<AppViewContext>) -> Result<ViewContext, Status> {
     let Some(context) = context else {
         return Err(Status::invalid_argument(
@@ -709,6 +789,13 @@ impl ManagerDaemonService {
             AclAction::Read,
             AclScope::app(&name),
         )?;
+        // Actions run on the Control leader. A follower refuses here, before
+        // anything reaches the app, so the leader-forward layer's replay on
+        // the leader is the only time the action runs: refusing after the
+        // forward (when the idempotency write found no leader) ran it twice.
+        self.store
+            .require_lane_leader(crate::storage::Lane::Control, "an app action")
+            .map_err(|e| map_store_error("Error running the app action", e))?;
         let inner = request.into_inner();
         let action_name = inner.action.trim().to_string();
         let context = context_from_proto(inner.context.clone())?;
@@ -754,6 +841,23 @@ impl ManagerDaemonService {
             inner.idempotency_key.as_deref(),
             &inner,
         );
+        // A keyed action holds its key until its reply is recorded: a
+        // duplicate waits, then finds that reply below.
+        let _in_flight = if idempotency_key.is_empty() {
+            None
+        } else {
+            Some(
+                self.app_actions_in_flight
+                    .hold(&idempotency_key, ACTION_KEY_WAIT)
+                    .await
+                    .ok_or_else(|| {
+                        Status::aborted(format!(
+                            "action {action_name:?} with this idempotency key is still running; \
+                             retry with the same key for its result"
+                        ))
+                    })?,
+            )
+        };
         if let Some(stored) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -895,13 +999,23 @@ impl ManagerDaemonService {
             inputs_json: inputs.to_string(),
         };
         if !idempotency_key.is_empty() {
-            self.store
-                .idempotency_record(
-                    &idempotency_key,
-                    "invoke_app_action",
-                    &serde_json::to_string(&reply).unwrap_or_default(),
-                )
-                .map_err(|e| map_store_error("Error recording idempotency", e))?;
+            // The action ran: a failure to record its key is logged, never
+            // returned. Returning it (a not-the-leader answer after a
+            // leadership change, say) would have the leader-forward layer
+            // run the action again on the new leader.
+            if let Err(err) = self.store.idempotency_record(
+                &idempotency_key,
+                "invoke_app_action",
+                &serde_json::to_string(&reply).unwrap_or_default(),
+            ) {
+                warn!(
+                    app = %name,
+                    action = %action_name,
+                    error = %format!("{err:#}"),
+                    "The app action ran, but its idempotency key was not recorded; a retry with \
+                     the same key runs it again"
+                );
+            }
         }
         Ok(Response::new(reply))
     }
@@ -1007,5 +1121,47 @@ impl ManagerDaemonService {
             allocation_id: allocation.id,
             node_id: allocation.node_id,
         }))
+    }
+}
+
+#[cfg(test)]
+mod in_flight_tests {
+    use super::*;
+
+    /// A second holder of a key waits for the first; a key held past the
+    /// wait answers `None`; the map forgets a key nobody holds (hardening
+    /// after the adversarial review, H1).
+    #[tokio::test]
+    async fn a_held_key_makes_its_duplicate_wait() {
+        let keys = Arc::new(InFlightKeys::default());
+        let first = keys
+            .hold("k", std::time::Duration::from_secs(1))
+            .await
+            .expect("free");
+        assert!(
+            keys.hold("k", std::time::Duration::from_millis(50))
+                .await
+                .is_none(),
+            "held by the first"
+        );
+        assert_eq!(keys.len(), 1);
+        let waiter = {
+            let keys = keys.clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let held = keys.hold("k", std::time::Duration::from_secs(5)).await;
+                (held.is_some(), started.elapsed())
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(first);
+        let (held, waited) = waiter.await.expect("waiter");
+        assert!(held, "the duplicate holds the key once the first is done");
+        assert!(waited >= std::time::Duration::from_millis(90), "{waited:?}");
+        assert_eq!(keys.len(), 0, "nobody holds it any more");
+        let other = keys
+            .hold("other", std::time::Duration::from_millis(10))
+            .await;
+        assert!(other.is_some(), "keys are independent");
     }
 }

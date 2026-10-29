@@ -89,7 +89,20 @@ export const Manager = {
      * an app that cannot answer lets the submit through with a warning. A
      * resubmit whose only differences are extension values (or pending keys)
      * creates a version but no rollout: the running allocations move to it in
-     * place.
+     * place. Apps are asked on the Control lane's leader: a follower refuses
+     * such a submit before asking any app, and the leader-forward layer
+     * replays it there, so each app is asked once per submit.
+     *
+     * Artifact pins (`resolve: "pin"`) resolve at submit: a source that could
+     * not be reached (connection refused, a timeout, a 5xx or 429 answer) is
+     * UNAVAILABLE, retryable as is; a reference that does not resolve (a tag
+     * that does not exist, refused credentials) is INVALID_ARGUMENT.
+     *
+     * An installed app's job (`legion-system/<app>` while the app is
+     * installed) is the app reconciler's: a direct submit of it is refused
+     * (FAILED_PRECONDITION naming `legion app set|config set|disable|
+     * uninstall`), for every caller, management tokens included
+     * (docs/apps.md, "Editing an app's job").
      *
      * @generated from rpc legion.Manager.RunJob
      */
@@ -203,6 +216,9 @@ export const Manager = {
     },
     /**
      * Stops an in-flight rollout and optionally reverts to the previous config.
+     * Refused (FAILED_PRECONDITION) for a rollout of an installed app's job,
+     * which the app reconciler owns; AdvanceRollout, which moves toward the
+     * version the reconciler submitted, is allowed.
      *
      * @generated from rpc legion.Manager.StopRollout
      */
@@ -216,7 +232,8 @@ export const Manager = {
      * Computes a placement plan for a jobspec without mutating cluster state.
      * Requires `job:read` on the job, and `kv:read` on every KV key the
      * jobspec references, checked before any is resolved, as RunJob does (the
-     * plan shows the rendered values).
+     * plan shows the rendered values). A plan of an installed app's job is
+     * refused as RunJob would refuse the submit (FAILED_PRECONDITION).
      *
      * @generated from rpc legion.Manager.PlanJob
      */
@@ -255,7 +272,9 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Marks a job as stopped and enqueues stop reconciliation.
+     * Marks a job as stopped and enqueues stop reconciliation. Refused
+     * (FAILED_PRECONDITION) for an installed app's job: `legion app disable`
+     * stops it (docs/apps.md, "Editing an app's job").
      *
      * @generated from rpc legion.Manager.StopJob
      */
@@ -289,6 +308,10 @@ export const Manager = {
      * refused. When the autoscaled task shares its group with other tasks,
      * every task of the group moves to the count in one write. Every applied
      * or deferred write is recorded in the task's scale history.
+     *
+     * Refused (FAILED_PRECONDITION) for an installed app's job: its count is
+     * the app's `replicas` (`legion app set --replicas`), and an override
+     * would outlive every resubmit the reconciler makes.
      *
      * @generated from rpc legion.Manager.ScaleTask
      */
@@ -655,7 +678,9 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Permanently removes a stopped job and related records.
+     * Permanently removes a stopped job and related records. Refused
+     * (FAILED_PRECONDITION) for an installed app's job; once the app is
+     * uninstalled, its stopped job is an ordinary job and can be destroyed.
      *
      * @generated from rpc legion.Manager.DestroyJob
      */
@@ -903,6 +928,9 @@ export const Manager = {
      * fails with FAILED_PRECONDITION unless the caller also holds plain
      * `job:write` on that job name (this stops a template-only identity from
      * hijacking unrelated jobs when the rendered name is user-influenced).
+     *
+     * A render that names an installed app's job is refused, as RunJob's
+     * submit is (FAILED_PRECONDITION).
      *
      * @generated from rpc legion.Manager.RunJobTemplate
      */
@@ -3748,11 +3776,23 @@ export const Manager = {
      * its own, or negative OOM score, whoever installs it. A manifest may not
      * name an exec task's `user`.
      *
+     * The rendered job then goes through the submit's admission chain as the
+     * reconciler would submit it (its recorded grant, the namespace's
+     * policies and quota, `kv:read` on every KV key it references, artifacts
+     * and pins, volumes, capabilities), writing nothing: an app whose job the
+     * reconciler would be refused is refused here, with the reason, instead
+     * of installing and sitting in `reconcile refused`.
+     *
+     * KV keys under `legion/apps/<name>/` left by an earlier app of the same
+     * name (uninstalled without `purge`) are reported in the prompt: the new
+     * app's grant may reach them.
+     *
      * `dry_run` validates the manifest and the installer's coverage and
      * returns the prompt (`prompt`) without installing, which is how the CLI
      * shows what the app runs, where, as whom, and with what grant before it
      * asks. A dry run that the grant check would refuse still answers, with
-     * the refusal in `uncovered`.
+     * the refusal in `uncovered`; one the admission chain refuses is that
+     * error.
      *
      * Retry-safe: a repeated `idempotency_key` returns the first reply with
      * `deduplicated` set.
@@ -3791,6 +3831,11 @@ export const Manager = {
      *   manifest asks for, a permission behind a page's `rpcs`, or
      *   `operator:write` for a placement other than `managers`.
      * - AlreadyExists: an app of that name is installed (use UpgradeApp).
+     * - Any code of the admission chain (`app <name>'s job would be refused
+     *   when the reconciler submits it: …`): INVALID_ARGUMENT,
+     *   PERMISSION_DENIED (a KV key the grant does not cover),
+     *   RESOURCE_EXHAUSTED (a quota), UNAVAILABLE (a pin's source could not be
+     *   reached; retry).
      * - FailedPrecondition: the name is a bundled app's, a job
      *   `legion-system/<name>` exists that is not this app's (no `managedBy`
      *   stamp for it: install never takes a job over), or one of its jobspec
@@ -3824,7 +3869,20 @@ export const Manager = {
      * install-time checks (a key the installed version already declared may
      * stay even if a newer Legion made it a core field). The prompt reports
      * every stored value of the app's keys checked against the new schemas;
-     * values that fail stay stored and read as `invalid`.
+     * values that fail stay stored and read as `invalid`. A point the new
+     * manifest no longer declares orphans the values jobs set there: the
+     * upgrade is then refused unless `force` is set, and `orphaned_jobs`
+     * lists them (on a dry run too).
+     *
+     * The new job goes through the submit's admission chain, as at install.
+     * The operator's settings (replicas, placement, pool, resources) are kept;
+     * the prompt says so where the new manifest's defaults differ.
+     *
+     * Upgrading to the manifest that is already installed is still a write:
+     * when the app's job does not run healthy at the version the record
+     * renders (its rollout failed or rolled back), the reconciler resubmits it
+     * with a forced reschedule, which is how a failed upgrade is retried.
+     * There is no rollback verb: upgrade again with the previous manifest.
      *
      * Object kinds: the new manifest may add kinds (checked as at install)
      * and change existing ones. Every stored object of the app's kinds is
@@ -3842,8 +3900,10 @@ export const Manager = {
      * - PermissionDenied: the caller lacks `app:write`, a permission, or a
      *   permission behind a page's `rpcs`.
      * - FailedPrecondition: the app is bundled (bundled apps upgrade with the
-     *   binary), it drops a kind that has objects without `force`, or it
-     *   changes the scope of a kind that has objects.
+     *   binary), the new manifest drops an extension point jobs use or a
+     *   kind that has objects and `force` is not set (the message lists
+     *   them), or it changes the scope of a kind that has objects.
+     * - Any code of the admission chain, as at install.
      *
      * @generated from rpc legion.Manager.UpgradeApp
      */
@@ -3854,9 +3914,13 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Uninstalls an app (`legion app uninstall`): stops its job, revokes the
-     * job's grants, and deletes the record. The stopped job stays in
-     * `legion-system` until someone destroys it. Requires `app:write`.
+     * Uninstalls an app (`legion app uninstall`): disables the record (so a
+     * reconciler submit already in flight loses its compare-and-set), stops
+     * its job, revokes the job's grants, and deletes the record. The stopped
+     * job stays in `legion-system`, an ordinary job now, until someone
+     * destroys it. Requires `app:write`. A record this manager cannot decode
+     * (`status = corrupt`) is removed by name the same way, a bundled app's
+     * included (the reconciler seeds it again from this build).
      *
      * While any job sets the app's jobspec keys, uninstalling needs `force`;
      * the values stay stored, read as `orphaned`, and are listed in
@@ -3866,13 +3930,20 @@ export const Manager = {
      * read as `orphaned` (readable and deletable, not writable), and are
      * counted in `orphaned_objects`. Installing the app again adopts them.
      *
-     * Retry-safe with `idempotency_key`; uninstalling an app that is not
-     * installed is NotFound.
+     * The app's KV under `legion/apps/<name>/` stays unless `purge` is set
+     * (which also needs `kv:write` there); `kv_keys` says how many keys were
+     * left or deleted. `dry_run` reports all of this and changes nothing.
+     *
+     * Retry-safe with `idempotency_key`: the record's deletion, the purge, and
+     * the key are one replicated entry, and a retry gets the first reply back
+     * whole, with `deduplicated`. Uninstalling an app that is not installed is
+     * NotFound.
      *
      * Errors:
      * - FailedPrecondition: the app is bundled (disable it instead), or jobs
      *   set its jobspec keys or objects of its kinds exist, and `force` is
      *   not set (the message lists them).
+     * - PermissionDenied: `purge` without `kv:write` on the app's prefix.
      *
      * @generated from rpc legion.Manager.UninstallApp
      */
@@ -3886,7 +3957,9 @@ export const Manager = {
      * Enables or disables an app (`legion app enable|disable`). Disabling
      * stops the app's job and keeps its record, config, and grant; enabling
      * runs it again. Requires `app:write`. Setting the state an app already
-     * has is a write too: it retries a reconcile the last failure parked.
+     * has is a write too: it retries a reconcile the last failure parked, and
+     * resubmits (with a forced reschedule) a job that does not run healthy at
+     * the version the record renders. `dry_run` says what would change.
      *
      * Retry-safe with `idempotency_key`.
      *
@@ -3903,7 +3976,9 @@ export const Manager = {
      * pool for worker placement, and CPU and memory per task. The reconciler
      * re-renders the job and rolls it. Requires `app:write`; a change of
      * placement or pool also requires `operator:write`, because it decides
-     * which nodes hold the app's token and run its code with its grant.
+     * which nodes hold the app's token and run its code with its grant. The
+     * re-rendered job goes through the submit's admission chain first (a
+     * quota, a pool policy). `dry_run` validates and says what would change.
      *
      * Retry-safe with `idempotency_key`.
      *
@@ -3934,7 +4009,14 @@ export const Manager = {
      *
      * The job the new config renders is held to the install rules: a config
      * that would add something host-level (an artifact code field set to a
-     * `file://` source) is refused, whoever sets it.
+     * `file://` source) is refused, whoever sets it; and it goes through the
+     * submit's admission chain. `dry_run` validates and says what would
+     * change.
+     *
+     * A bundled app whose new build is held because the stored config does
+     * not match that build's config schema (`upgrade held: …`) accepts a
+     * config that matches the new schema even where the stored manifest's
+     * refuses it: that config is what lets the upgrade through.
      *
      * Errors:
      * - InvalidArgument: `config_json` is not JSON, fails the schema, or
@@ -4446,9 +4528,23 @@ export const Manager = {
      * The app answers `{ "message": "...", "view": {...} }`; `view`, when
      * present, is a refreshed view, validated like GetAppView's.
      *
+     * Actions run on the Control lane's leader. A follower refuses an action
+     * before anything reaches the app (the typed not-the-leader rejection),
+     * and the leader-forward layer replays it on the leader, so a press that
+     * lands on a follower runs once. With `idempotency_key`, the reply is
+     * recorded when the app answers; a call with the same key that arrives
+     * while the first still runs (a retry after a client timeout, a double
+     * press) waits for it, up to 45 seconds, and returns its reply with
+     * `deduplicated` (ABORTED, retryable with the same key, if it is still
+     * running then). A failure to record the key after the app ran the action
+     * is logged, never returned: returning it would run the action again.
+     * A leadership change while an action runs can still let a retry with the
+     * same key run it again on the new leader.
+     *
      * Errors: as GetAppView, plus InvalidArgument for inputs that fail their
-     * declaration, and FailedPrecondition carrying the app's own message when
-     * the app reports the action failed (HTTP 4xx other than 401, 403, 404).
+     * declaration, FailedPrecondition carrying the app's own message when the
+     * app reports the action failed (HTTP 4xx other than 401, 403, 404), and
+     * Aborted when a call with the same key is still running.
      *
      * @generated from rpc legion.Manager.InvokeAppAction
      */

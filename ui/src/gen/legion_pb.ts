@@ -2290,10 +2290,10 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
 
   /**
    * Set when the job's latest version was submitted by the app reconciler:
-   * the job belongs to an app (docs/apps.md), and the reconciler reverts
-   * any direct edit to it within seconds. Unset for every other job, and
-   * for an app's job whose latest version someone else submitted (the edit
-   * the reconciler is about to revert).
+   * the job belongs to an app (docs/apps.md), and direct writes to it are
+   * refused while the app is installed. Unset for every other job, and for
+   * an app's job whose latest version was stored some other way (which the
+   * reconciler reverts).
    *
    * @generated from field: optional legion.ManagedByInfo managed_by = 3;
    */
@@ -35387,7 +35387,14 @@ export class App extends Message<App> {
   settings?: AppSettingsInfo;
 
   /**
-   * `running`, `degraded`, `pending`, or `stopped`.
+   * `running`, `upgrading`, `degraded`, `pending`, `stopped`, or
+   * `corrupt`. Derived from the app's job as it runs now: `running` counts
+   * only healthy allocations of the job version the record renders, so an
+   * upgrade that has not taken shows `upgrading` (the previous version still
+   * serves) or `degraded` with `upgrade failing: …` (its rollout failed or
+   * rolled back), never `running` on the old version. `corrupt` is a record
+   * this manager cannot decode (`status_detail` says why); only `legion app
+   * uninstall` acts on it.
    *
    * @generated from field: string status = 8;
    */
@@ -35395,7 +35402,8 @@ export class App extends Message<App> {
 
   /**
    * Why, when the status needs one: `2/3 running`, `reconcile failing:
-   * ...`, `waiting for an eligible node to report its build`.
+   * ...`, `waiting for an eligible node to report its build`, `its job
+   * failed; restarting it in 20s (restart 2)`, `upgrade held: …`.
    *
    * @generated from field: string status_detail = 9;
    */
@@ -38291,9 +38299,13 @@ export class UpgradeAppRequest extends Message<UpgradeAppRequest> {
   configJson?: string;
 
   /**
-   * Upgrade even though the new manifest drops object kinds that still
-   * have objects. Those objects stay stored, read as `orphaned`: readable
-   * and deletable, not writable.
+   * Upgrade even though the new manifest drops what is still in use:
+   * a jobspec key at an extension point jobs set (their values stay
+   * stored, flagged `orphaned`, and each such job's next submit fails until
+   * the key is removed or `--allow-unknown-fields` is passed), or an object
+   * kind that still has objects (they stay stored, read as `orphaned`:
+   * readable and deletable, not writable). Without it, such an upgrade is
+   * refused (`FAILED_PRECONDITION`) naming them, as `UninstallApp` is.
    *
    * @generated from field: bool force = 8;
    */
@@ -38433,11 +38445,31 @@ export class UpgradeAppReply extends Message<UpgradeAppReply> {
   /**
    * The new manifest's install prompt, then, for an app with jobspec keys,
    * every stored value of its keys checked against the new schemas (`14
-   * jobs set backup on volumes; 2 fail this version's schema: …`).
+   * jobs set backup on volumes; 2 fail this version's schema: …`), the
+   * values a dropped extension point orphans, and the operator settings
+   * the upgrade keeps where the new manifest's defaults differ.
    *
    * @generated from field: repeated string prompt = 6;
    */
   prompt: string[] = [];
+
+  /**
+   * The first permission the caller does not hold, worded as the refusal
+   * would be; empty when the caller holds them all. Set on a dry run, so an
+   * agent can tell "would be refused" from the field rather than the
+   * message.
+   *
+   * @generated from field: string uncovered = 7;
+   */
+  uncovered = "";
+
+  /**
+   * The jobs whose values the upgrade leaves orphaned, because the new
+   * manifest drops the extension point their key is declared at.
+   *
+   * @generated from field: repeated string orphaned_jobs = 8;
+   */
+  orphanedJobs: string[] = [];
 
   constructor(data?: PartialMessage<UpgradeAppReply>) {
     super();
@@ -38453,6 +38485,8 @@ export class UpgradeAppReply extends Message<UpgradeAppReply> {
     { no: 4, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 6, name: "prompt", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "uncovered", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "orphaned_jobs", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpgradeAppReply {
@@ -38501,6 +38535,25 @@ export class UninstallAppRequest extends Message<UninstallAppRequest> {
    */
   force = false;
 
+  /**
+   * Also delete every KV key under `legion/apps/<name>/`, the app's own
+   * state. Needs `kv:write` on that prefix besides `app:write`. Without
+   * it, the keys stay, and a later install of an app with the same name
+   * is told about them in its prompt (its grant may reach them).
+   *
+   * @generated from field: bool purge = 4;
+   */
+  purge = false;
+
+  /**
+   * Check what the uninstall would do (the jobs it would orphan, the
+   * grants it would revoke, the keys `purge` would delete) without doing
+   * it.
+   *
+   * @generated from field: bool dry_run = 5;
+   */
+  dryRun = false;
+
   constructor(data?: PartialMessage<UninstallAppRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -38512,6 +38565,8 @@ export class UninstallAppRequest extends Message<UninstallAppRequest> {
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 3, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "purge", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UninstallAppRequest {
@@ -38567,9 +38622,25 @@ export class UninstallAppReply extends Message<UninstallAppReply> {
   orphanedJobs: string[] = [];
 
   /**
-   * How many objects of the app's kinds are now orphaned (with `force`).
+   * How many KV keys under `legion/apps/<name>/` were deleted (`purge`),
+   * or, without it, are left behind.
    *
-   * @generated from field: uint64 orphaned_objects = 5;
+   * @generated from field: uint32 kv_keys = 5;
+   */
+  kvKeys = 0;
+
+  /**
+   * Whether `kv_keys` were deleted (`purge`) or are left behind.
+   *
+   * @generated from field: bool purged = 6;
+   */
+  purged = false;
+
+  /**
+   * How many objects of the app's kinds are now orphaned (with `force`),
+   * or would be (`dry_run`).
+   *
+   * @generated from field: uint64 orphaned_objects = 7;
    */
   orphanedObjects = protoInt64.zero;
 
@@ -38585,7 +38656,9 @@ export class UninstallAppReply extends Message<UninstallAppReply> {
     { no: 2, name: "revoked_grants", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 4, name: "orphaned_jobs", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
-    { no: 5, name: "orphaned_objects", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 5, name: "kv_keys", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "purged", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "orphaned_objects", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UninstallAppReply {
@@ -38618,6 +38691,9 @@ export class SetAppEnabledRequest extends Message<SetAppEnabledRequest> {
 
   /**
    * True runs the app; false stops its job and keeps everything else.
+   * Enabling an app that is already enabled reconciles it again, and
+   * resubmits its job when the job is not running healthy at the version
+   * the record renders (a failed upgrade, a failed job).
    *
    * @generated from field: bool enabled = 2;
    */
@@ -38630,6 +38706,13 @@ export class SetAppEnabledRequest extends Message<SetAppEnabledRequest> {
    */
   idempotencyKey?: string;
 
+  /**
+   * Say what would change without changing it.
+   *
+   * @generated from field: bool dry_run = 4;
+   */
+  dryRun = false;
+
   constructor(data?: PartialMessage<SetAppEnabledRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -38641,6 +38724,7 @@ export class SetAppEnabledRequest extends Message<SetAppEnabledRequest> {
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetAppEnabledRequest {
@@ -38766,6 +38850,14 @@ export class UpdateAppSettingsRequest extends Message<UpdateAppSettingsRequest> 
    */
   idempotencyKey?: string;
 
+  /**
+   * Validate the change (and its `operator:write` check) and say what would
+   * change, without changing it.
+   *
+   * @generated from field: bool dry_run = 8;
+   */
+  dryRun = false;
+
   constructor(data?: PartialMessage<UpdateAppSettingsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -38781,6 +38873,7 @@ export class UpdateAppSettingsRequest extends Message<UpdateAppSettingsRequest> 
     { no: 5, name: "memory", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
     { no: 6, name: "pool", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 7, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 8, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpdateAppSettingsRequest {
@@ -38880,6 +38973,14 @@ export class SetAppConfigRequest extends Message<SetAppConfigRequest> {
    */
   idempotencyKey?: string;
 
+  /**
+   * Validate the config (its schema, the job it renders, the code-field
+   * grant check) and say what would change, without changing it.
+   *
+   * @generated from field: bool dry_run = 4;
+   */
+  dryRun = false;
+
   constructor(data?: PartialMessage<SetAppConfigRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -38891,6 +38992,7 @@ export class SetAppConfigRequest extends Message<SetAppConfigRequest> {
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "config_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetAppConfigRequest {

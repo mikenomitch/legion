@@ -193,6 +193,11 @@ pub enum GrantSource {
     App {
         granted_by: String,
         managed_by: crate::structs::app::ManagedBy,
+        /// The app record's `updated_at` the render was made from: the
+        /// submit is refused (`Aborted`) unless the record still exists, is
+        /// enabled, and has not changed since (compare-and-set, in the same
+        /// entry as the version).
+        record_updated_at: String,
     },
 }
 

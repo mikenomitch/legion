@@ -1098,7 +1098,7 @@ impl Metrics {
         let apps = Arc::new(GaugeVec {
             meta: FamilyMeta {
                 name: "legion_apps",
-                help: "Installed apps by status: `running`, `degraded`, `pending`, `stopped` (docs/apps.md). Set by the control-lane leader's app reconciler after each pass; zero elsewhere. A `stopped` bundled app is worth a look: Legion's own add-ons are not running.",
+                help: "Installed apps by status: `running`, `upgrading`, `degraded`, `pending`, `stopped`, `corrupt` (a record the manager cannot decode) (docs/apps.md). Set by the control-lane leader's app reconciler after each pass; zero elsewhere. A `stopped` bundled app is worth a look: Legion's own add-ons are not running.",
                 labels: &["status"],
             },
             series: Series::new(),

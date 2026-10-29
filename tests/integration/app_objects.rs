@@ -1289,6 +1289,8 @@ async fn kinds_follow_their_app_test() -> R<()> {
                 name: APP.into(),
                 idempotency_key: None,
                 force,
+                purge: false,
+                dry_run: false,
             },
             &fx.admin,
         ))

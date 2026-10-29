@@ -1854,6 +1854,7 @@ async fn call_endpoint(
                     name: DELETABLE_APP.into(),
                     idempotency_key: None,
                     force: false,
+                    ..Default::default()
                 },
                 token,
             ))
@@ -1865,6 +1866,7 @@ async fn call_endpoint(
                     name: FIXTURE_APP.into(),
                     enabled: true,
                     idempotency_key: None,
+                    ..Default::default()
                 },
                 token,
             ))
@@ -1887,6 +1889,7 @@ async fn call_endpoint(
                     name: FIXTURE_APP.into(),
                     config_json: "{}".into(),
                     idempotency_key: None,
+                    ..Default::default()
                 },
                 token,
             ))
