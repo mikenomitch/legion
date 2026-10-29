@@ -199,6 +199,7 @@ fn sandbox_job() -> JobConfig {
         rollout_by_group: Default::default(),
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

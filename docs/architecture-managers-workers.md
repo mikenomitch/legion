@@ -411,7 +411,8 @@ What the manager registers:
   the node, so no job from another namespace lands there whatever its
   permit says. The pool keeps away every job that does not permit it, too.
   A job in `legion-system` whose permit names no pool goes there through
-  the `legion-system` namespace policy (`pools.default = "legion-system"`,
+  the `legion-system` namespace policy (`pools.default = ["legion-system",
+  "default"]`, so it also places on a `--run-worker` manager's worker;
   [Reserved namespaces](namespaces.md#reserved-namespaces)).
 - **Attribute `legion.role = "manager"`**, so a job can be constrained to
   managers' workers (`constraints = { "legion.role" = "manager" }`).
@@ -466,12 +467,16 @@ worker for that run, and runs even with `systemWorker.enabled = false`.
 
 Known limitations:
 
-- **One host guard table per host.** On Linux the kernel host guard is one
-  `nftables` table, and the eBPF classifier one pin directory, per host. A
-  manager's system worker and a standalone worker on the same Linux host
-  each rewrite them with their own allocations; run a standalone worker on
-  a manager's host only where that does not matter (a development box), or
-  turn the system worker off there.
+- **Two workers on one host each guard only their own allocations.** On
+  Linux the kernel host guard (`nftables` table) and the eBPF classifier's
+  pin directory are named after the worker's cgroup parent
+  (`legion_host_guard_legion-system` and `/sys/fs/bpf/legion_legion-system`
+  for the system worker; `legion_host_guard` and `/sys/fs/bpf/legion` for a
+  worker with the default parent), so a manager's system worker and a
+  standalone worker on one host keep separate guards instead of overwriting
+  each other's. Each guard covers the sockets of its own worker's
+  allocations; give two workers on one host different cgroup parents (the
+  system worker always uses `legion-system`).
 - **The lend is fixed**, not a share of the host.
 - **Bundled apps are not built yet.** The system worker runs whatever is
   submitted to `legion-system`; nothing is submitted there automatically.

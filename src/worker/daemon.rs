@@ -1542,7 +1542,9 @@ fn open_kernel_classifier(
     match KernelNet::open(KernelSettings {
         cgroup_root: root.to_path_buf(),
         cgroup_parent: cgroup_parent.to_string(),
-        pin_dir: bpffs.then(|| std::path::PathBuf::from("/sys/fs/bpf/legion")),
+        // Named after the cgroup parent, so a manager's system worker and a
+        // standalone worker on one host keep separate pins.
+        pin_dir: bpffs.then(|| crate::worker::netd::kernel_guard::bpf_pin_dir(cgroup_parent)),
     }) {
         Ok(net) => {
             info!("Kernel classifier active: host-mode egress chains are enforced at connect()");
@@ -4422,6 +4424,7 @@ mod tests {
             ],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,

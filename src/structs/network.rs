@@ -2549,7 +2549,10 @@ spec_block!(
     ["mode", "ports", "labels", "egress", "ingress"],
     |this, walk| {
         for port in this.ports.iter_mut() {
-            walk.scoped(format!("port {}", port.name), port);
+            walk.scoped(
+                crate::structs::spec_fields::Scope::Port(port.name.clone()),
+                port,
+            );
         }
     }
 );

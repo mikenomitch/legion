@@ -20,9 +20,17 @@
 //! as `net.denied` rows with source `host-guard`.
 //!
 //! The worker owns the table: it is replaced atomically on every change
-//! (`nft -f -` with an add-delete-add transaction) and deleted at clean
-//! shutdown. It shells out to `nft`, as the container runtime shells out to
-//! its binaries, so there is no new dependency.
+//! (`nft -f -` with an add-delete-add transaction). It shells out to `nft`,
+//! as the container runtime shells out to its binaries, so there is no new
+//! dependency.
+//!
+//! **One per worker, not per host.** The table, and the kernel
+//! classifier's bpffs pin directory, are named after the worker's cgroup
+//! parent ([`table_name`], [`bpf_pin_dir`]), so a manager's system worker
+//! (`legion-system`) and a standalone worker (`legion`) on one host each
+//! keep their own instead of overwriting each other's with only their own
+//! allocations. A worker with the default parent keeps the historical names
+//! (`legion_host_guard`, `/sys/fs/bpf/legion`).
 //!
 //! What it does not cover is stated in the public doc: a root `exec` task
 //! (it holds `CAP_NET_ADMIN` and can delete the table), other daemons on the
@@ -32,8 +40,60 @@ use crate::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-/// The table's name in the `inet` family.
+/// The table's name in the `inet` family, for a worker with the default
+/// cgroup parent; other workers append their parent ([`table_name`]).
 pub const TABLE: &str = "legion_host_guard";
+
+/// The cgroup parent whose worker keeps the historical, unsuffixed names.
+pub const DEFAULT_CGROUP_PARENT: &str = "legion";
+
+/// Where workers pin the kernel classifier, under bpffs.
+pub const BPF_PIN_ROOT: &str = "/sys/fs/bpf";
+
+/// What sets a worker's kernel objects apart from another worker's on the
+/// same host: nothing for the default cgroup parent (`legion`), so a lone
+/// worker keeps the names it always had, and the parent otherwise, with
+/// `/` and anything but letters, digits, `_`, `-`, and `.` turned into `_`
+/// (a name `nft` and bpffs both take).
+pub fn instance_suffix(cgroup_parent: &str) -> Option<String> {
+    let parent = cgroup_parent.trim_matches('/');
+    if parent.is_empty() || parent == DEFAULT_CGROUP_PARENT {
+        return None;
+    }
+    Some(
+        parent
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The `inet` table the host guard of a worker with `cgroup_parent` loads:
+/// `legion_host_guard`, or `legion_host_guard_<parent>`
+/// (`legion_host_guard_legion-system` for a manager's system worker).
+pub fn table_name(cgroup_parent: &str) -> String {
+    match instance_suffix(cgroup_parent) {
+        None => TABLE.to_string(),
+        Some(suffix) => format!("{TABLE}_{suffix}"),
+    }
+}
+
+/// The bpffs directory the kernel classifier of a worker with
+/// `cgroup_parent` pins under: `/sys/fs/bpf/legion`, or
+/// `/sys/fs/bpf/legion_<parent>`.
+pub fn bpf_pin_dir(cgroup_parent: &str) -> std::path::PathBuf {
+    let root = std::path::Path::new(BPF_PIN_ROOT);
+    match instance_suffix(cgroup_parent) {
+        None => root.join(DEFAULT_CGROUP_PARENT),
+        Some(suffix) => root.join(format!("{DEFAULT_CGROUP_PARENT}_{suffix}")),
+    }
+}
 
 /// The `hostGuard` node attribute: `active (nftables)` or
 /// `unavailable (<reason>)`.
@@ -90,6 +150,11 @@ pub const DROP_CONTROL: &str = "a Legion control port";
 pub const DROP_DATAPATH: &str = "another allocation's datapath";
 
 impl GuardTable {
+    /// The `inet` table this one loads as ([`table_name`]).
+    pub fn name(&self) -> String {
+        table_name(&self.cgroup_parent)
+    }
+
     /// The cgroup v2 `level` of a path: its number of components.
     fn level(path: &str) -> usize {
         path.split('/').filter(|part| !part.is_empty()).count()
@@ -154,11 +219,12 @@ impl GuardTable {
     /// The `nft -f` script that replaces the table in one transaction.
     pub fn render(&self) -> String {
         let mut out = String::new();
+        let table = self.name();
         // Add-delete-add: `delete` fails on a table that does not exist, so
         // the first `add` makes it exist; all three apply atomically.
-        let _ = writeln!(out, "table inet {TABLE}");
-        let _ = writeln!(out, "delete table inet {TABLE}");
-        let _ = writeln!(out, "table inet {TABLE} {{");
+        let _ = writeln!(out, "table inet {table}");
+        let _ = writeln!(out, "delete table inet {table}");
+        let _ = writeln!(out, "table inet {table} {{");
         let set = |out: &mut String, name: &str, kind: &str, interval: bool, items: &[String]| {
             if items.is_empty() {
                 return;
@@ -333,20 +399,20 @@ pub fn apply(table: &GuardTable) -> R<()> {
     Ok(())
 }
 
-/// Deletes the table (clean shutdown). Missing is fine.
-pub fn remove() {
+/// Deletes the table named `table` ([`table_name`]). Missing is fine.
+pub fn remove(table: &str) {
     let _ = std::process::Command::new(nft_binary())
-        .args(["delete", "table", "inet", TABLE])
+        .args(["delete", "table", "inet", table])
         .stderr(std::process::Stdio::null())
         .status();
 }
 
-/// Packets dropped per (allocation, reason) since the table loaded, read
-/// from `nft -j list table`. Drops in the `unattributed` chain are keyed by
-/// allocation 0.
-pub fn read_counters() -> R<BTreeMap<(i64, String), u64>> {
+/// Packets dropped per (allocation, reason) since the table named `table`
+/// loaded, read from `nft -j list table`. Drops in the `unattributed` chain
+/// are keyed by allocation 0.
+pub fn read_counters(table: &str) -> R<BTreeMap<(i64, String), u64>> {
     let output = std::process::Command::new(nft_binary())
-        .args(["-j", "list", "table", "inet", TABLE])
+        .args(["-j", "list", "table", "inet", table])
         .output()
         .context("run nft -j list")?;
     if !output.status.success() {
@@ -492,6 +558,43 @@ mod kernel_guard_test {
         }
     }
 
+    /// A manager's system worker and a standalone worker on one host load
+    /// different tables and pin under different directories; the default
+    /// parent keeps the historical names.
+    #[test]
+    fn kernel_objects_are_named_after_the_cgroup_parent_test() {
+        assert_eq!(table_name("legion"), "legion_host_guard");
+        assert_eq!(table_name("/legion/"), "legion_host_guard");
+        assert_eq!(table_name(""), "legion_host_guard");
+        assert_eq!(
+            bpf_pin_dir("legion"),
+            std::path::PathBuf::from("/sys/fs/bpf/legion")
+        );
+        assert_eq!(
+            table_name("legion-system"),
+            "legion_host_guard_legion-system"
+        );
+        assert_eq!(
+            bpf_pin_dir("legion-system"),
+            std::path::PathBuf::from("/sys/fs/bpf/legion_legion-system")
+        );
+        assert_ne!(table_name("legion-system"), table_name("legion"));
+        assert_ne!(bpf_pin_dir("legion-system"), bpf_pin_dir("legion"));
+        // Nested and odd parents become one safe name.
+        assert_eq!(table_name("ci/workers"), "legion_host_guard_ci_workers");
+        assert_eq!(instance_suffix("a b$c"), Some("a_b_c".to_string()));
+
+        // The rendered transaction loads, deletes, and reloads its own table.
+        let mut system = table();
+        system.cgroup_parent = "legion-system".into();
+        let script = system.render();
+        assert!(script.starts_with(
+            "table inet legion_host_guard_legion-system\ndelete table inet \
+             legion_host_guard_legion-system\ntable inet legion_host_guard_legion-system {"
+        ));
+        assert!(!script.contains("table inet legion_host_guard\n"));
+    }
+
     #[test]
     fn the_table_matches_the_golden_rendering_test() {
         let expected = r#"table inet legion_host_guard
@@ -626,7 +729,7 @@ table inet legion_host_guard {
             allocation.cgroup = parent.to_string();
         }
         let script = table.render();
-        let script = script.replace(TABLE, "legion_host_guard_check");
+        let script = script.replace(&table.name(), "legion_host_guard_check");
         let mut child = std::process::Command::new(nft_binary())
             .args(["-c", "-f", "-"])
             .stdin(std::process::Stdio::piped())
@@ -690,8 +793,9 @@ table inet legion_host_guard {
             ))
             .output()?;
         let said = String::from_utf8_lossy(&status.stdout).to_string();
-        let drops = guard.new_drops(read_counters()?);
-        remove();
+        let name = table_name(&parent);
+        let drops = guard.new_drops(read_counters(&name)?);
+        remove(&name);
         let _ = std::fs::remove_dir(root.join(&leaf));
         let _ = std::fs::remove_dir(root.join(&parent).join("share"));
         let _ = std::fs::remove_dir(root.join(&parent));

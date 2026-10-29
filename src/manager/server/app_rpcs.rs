@@ -22,6 +22,7 @@ use crate::structs::app::{
     RenderedApp, RECONCILER_PRINCIPAL,
 };
 use crate::structs::config::{MANAGER_ROLE_ATTR, MANAGER_ROLE_VALUE};
+use crate::structs::extensions::{core_collision, key_overrides, manifest_decls, validate_decls};
 use crate::structs::namespace::SYSTEM_NAMESPACE;
 use crate::structs::{
     App, AppGrantInfo, AppReconcileInfo, AppSettingsInfo, GetAppReply, GetAppRequest,
@@ -30,6 +31,7 @@ use crate::structs::{
     UninstallAppReply, UninstallAppRequest, UpdateAppSettingsReply, UpdateAppSettingsRequest,
     UpgradeAppReply, UpgradeAppRequest,
 };
+use std::collections::BTreeMap;
 use time::format_description::well_known::Rfc3339;
 
 const GRANT_HINT: &str =
@@ -232,6 +234,7 @@ impl ManagerDaemonService {
             // The render is Legion's own output: an unknown key in it is a
             // manifest bug, so the reconciler submits strictly.
             crate::structs::spec_fields::UnknownFieldMode::Reject,
+            Vec::new(),
         )?;
         let message = submitted.message_with_warnings();
         self.store
@@ -334,7 +337,8 @@ impl ManagerDaemonService {
             crate::manager::apps::task_count(record),
             blocked.as_deref(),
         );
-        let mut notes = Vec::new();
+        let keys = self.record_registry(record);
+        let mut notes = keys.shadowed_notes(Some(&record.name));
         if self.workload_identity.is_none() {
             notes.push(
                 "workload identity is off on this manager (workloadIdentity.enabled = false): the \
@@ -411,6 +415,11 @@ impl ManagerDaemonService {
             ui_slots: record.manifest.ui_slots(),
             notes,
             running_on: allocations.nodes,
+            extension_keys: keys
+                .keys()
+                .iter()
+                .map(super::extension_rpcs::key_proto)
+                .collect(),
         })
     }
 
@@ -535,15 +544,29 @@ impl ManagerDaemonService {
             None => format!("app {name}"),
         };
         let uncovered = app_grant_refusal(&identity, &who, &manifest.permissions);
-        let prompt = install_prompt(&manifest, &self.app_user);
+        // Jobspec keys (docs/apps.md, "Jobspec extensions"): renames, then
+        // the collision rules against core fields and other apps' keys.
+        let decls = manifest_decls(&manifest).map_err(Status::invalid_argument)?;
+        let keys = key_overrides(&name, &decls, &inner.keys).map_err(Status::invalid_argument)?;
+        validate_decls(&name, &decls, &keys).map_err(Status::invalid_argument)?;
+        if let Some(refusal) = core_collision(&name, &decls, &keys, &[]) {
+            return Err(Status::invalid_argument(refusal));
+        }
+        let registry = self.extension_registry()?;
+        if let Some(refusal) = registry.collision(&name, &decls, &keys) {
+            return Err(Status::failed_precondition(refusal));
+        }
+        let mut prompt = install_prompt(&manifest, &self.app_user);
         let now = now_rfc3339();
+        let mut settings = AppSettings::from_manifest(&manifest);
+        settings.keys = keys;
         let record = AppRecord {
             name: name.clone(),
             source,
             source_ref: inner.source_ref.trim().to_string(),
             manifest_digest: manifest.digest(),
             enabled: true,
-            settings: AppSettings::from_manifest(&manifest),
+            settings,
             config,
             grant: AppGrant {
                 rules: manifest.permissions.clone(),
@@ -556,6 +579,19 @@ impl ManagerDaemonService {
             state: AppReconcileState::default(),
             manifest: manifest.clone(),
         };
+        if !decls.is_empty() {
+            // What installing does to values already stored: pending ones
+            // it adopts, and how they fare against its schemas.
+            let next = registry
+                .with_record(&record)
+                .map_err(Status::invalid_argument)?;
+            prompt.extend(super::extension_rpcs::lifecycle_report(
+                &name,
+                &self.extension_jobs()?,
+                &next,
+                true,
+            ));
+        }
         if inner.dry_run {
             return Ok(Response::new(InstallAppReply {
                 app: Some(self.app_info(&record)?),
@@ -655,15 +691,61 @@ impl ManagerDaemonService {
                  that does with `legion app upgrade {name} <manifest> --config <file>`"
             ))
         })?;
+        // Jobspec keys: the installed renames carry over for the points the
+        // new manifest still declares; a key the installed version did not
+        // declare is checked against core fields and other apps' keys.
+        let decls = manifest_decls(&manifest).map_err(Status::invalid_argument)?;
+        let keys: BTreeMap<String, String> = record
+            .settings
+            .keys
+            .iter()
+            .filter(|(point, _)| {
+                decls
+                    .iter()
+                    .any(|decl| decl.point.as_str() == point.as_str())
+            })
+            .map(|(point, key)| (point.clone(), key.clone()))
+            .collect();
+        validate_decls(&name, &decls, &keys).map_err(Status::invalid_argument)?;
+        let registry = self.extension_registry()?;
+        let existing: Vec<(crate::structs::spec_fields::ExtensionPoint, String)> = registry
+            .keys()
+            .iter()
+            .filter(|installed| installed.app == name)
+            .map(|installed| (installed.decl.point, installed.key.clone()))
+            .collect();
+        if let Some(refusal) = core_collision(&name, &decls, &keys, &existing) {
+            return Err(Status::invalid_argument(refusal));
+        }
+        if let Some(refusal) = registry.collision(&name, &decls, &keys) {
+            return Err(Status::failed_precondition(refusal));
+        }
         let diff = permission_diff(&record.grant.rules, &manifest.permissions);
         let diff_message = PermissionDiff {
             added_json: rules_json(&diff.added),
             removed_json: rules_json(&diff.removed),
             unchanged_json: rules_json(&diff.unchanged),
         };
-        let prompt = install_prompt(&manifest, &self.app_user);
+        let mut prompt = install_prompt(&manifest, &self.app_user);
         let from = record.display_version();
         let to = manifest.version.clone().unwrap_or_default();
+        if !decls.is_empty() || !existing.is_empty() {
+            // Every stored value for the app, checked against the new
+            // schemas (apps plan §6.6, "Lifecycle").
+            let mut upgraded = record.clone();
+            upgraded.manifest = manifest.clone();
+            upgraded.manifest_digest = manifest.digest();
+            upgraded.settings.keys = keys.clone();
+            let next = registry
+                .with_record(&upgraded)
+                .map_err(Status::invalid_argument)?;
+            prompt.extend(super::extension_rpcs::lifecycle_report(
+                &name,
+                &self.extension_jobs()?,
+                &next,
+                false,
+            ));
+        }
         let who = format!("app {name} {to}");
         // A new manifest is new code running with the grant: the caller must
         // hold all of it, as at install.
@@ -724,6 +806,7 @@ impl ManagerDaemonService {
         next.manifest_digest = manifest.digest();
         next.manifest = manifest;
         next.config = config;
+        next.settings.keys = keys;
         if !inner.source_ref.trim().is_empty() {
             next.source_ref = inner.source_ref.trim().to_string();
             if next.source_ref.starts_with("http://") || next.source_ref.starts_with("https://") {
@@ -789,6 +872,7 @@ impl ManagerDaemonService {
                 message,
                 revoked_grants: 0,
                 deduplicated: true,
+                orphaned_jobs: Vec::new(),
             }));
         }
         let record = self.load_app(&name)?;
@@ -796,6 +880,28 @@ impl ManagerDaemonService {
             return Err(Status::failed_precondition(format!(
                 "{name} is bundled with Legion and cannot be uninstalled; `legion app disable \
                  {name}` stops it and keeps its settings"
+            )));
+        }
+        // Jobs that set the app's jobspec keys keep their values, orphaned:
+        // only with `force` (apps plan §6.6, "Lifecycle").
+        let registry = self.extension_registry()?;
+        let using = self.jobs_using_app(&name, &registry)?;
+        if !using.is_empty() && !inner.force {
+            let shown: Vec<&str> = using.iter().map(String::as_str).take(10).collect();
+            let more = if using.len() > shown.len() {
+                format!(", and {} more", using.len() - shown.len())
+            } else {
+                String::new()
+            };
+            return Err(Status::failed_precondition(format!(
+                "{} job{} set{} {name}'s jobspec keys: {}{more}. Uninstalling leaves their values \
+                 stored, flagged orphaned, and each job's next submit fails until the key is \
+                 removed (or --allow-unknown-fields is passed)\nHint: pass --force to uninstall \
+                 anyway",
+                using.len(),
+                if using.len() == 1 { "" } else { "s" },
+                if using.len() == 1 { "s" } else { "" },
+                shown.join(", ")
             )));
         }
         // Disable first, so a reconcile pass that runs in the middle stops
@@ -829,10 +935,17 @@ impl ManagerDaemonService {
             .events()
             .app_uninstalled(&name, &identity.principal, revoked);
         info!(app = %name, by = %identity.principal, revoked, "Uninstalled app");
-        let message = format!(
+        let mut message = format!(
             "uninstalled {name}; job {job_id} stopped and {revoked} grant(s) revoked (`legion job \
              destroy {job_id}` removes the job)"
         );
+        if !using.is_empty() {
+            message.push_str(&format!(
+                "; {} job(s) keep orphaned values for its keys: {}",
+                using.len(),
+                using.join(", ")
+            ));
+        }
         self.store
             .idempotency_record(&idempotency_key, "uninstall_app", &message)
             .map_err(|e| map_store_error("Error recording idempotency", e))?;
@@ -840,6 +953,7 @@ impl ManagerDaemonService {
             message,
             revoked_grants: u32::try_from(revoked).unwrap_or(u32::MAX),
             deduplicated: false,
+            orphaned_jobs: using,
         }))
     }
 

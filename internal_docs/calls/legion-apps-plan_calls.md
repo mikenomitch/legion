@@ -6,8 +6,9 @@ ordered by project impact, highest first, and an entry's number is its
 rank.** Entries 1-17 are design-time calls. Implementation calls start at
 18 (phase A1, entries 18-28) and continue at 29 (phase A2, entries 29-41),
 42 (phase A3, entries 42-57), 58 (phase A6a, strict fields, entries
-58-67), 68 (phase A4, UI tier 1, entries 68-79), and 80 (phase A5,
-sandboxed pages, entries 80-84), appended after the design calls, since none outranks them; each
+58-67), 68 (phase A4, UI tier 1, entries 68-79), 80 (phase A5, sandboxed
+pages, entries 80-84), 85 (phase A6b, jobspec extensions, entries 85-94),
+and 95 (A1 follow-ups, entries 95-97), appended after the design calls, since none outranks them; each
 phase's entries are ranked among themselves.
 Autoscaler-specific calls are in
 [autoscaler-v2-plan_calls.md](autoscaler-v2-plan_calls.md).
@@ -2055,3 +2056,205 @@ CI, and Playwright is not a UI dependency.
 **Trade-off.** UI regressions are caught only when someone runs them.
 
 **Why (cost).** CI has no browser, and an agent can't run HTML anyway.
+
+## 85. Extension values are one job-level list, and their state and defaults are worked out on read (A6b)
+
+**Call.** A job version's extension values are stored as written in one
+list in `job_config.meta.extensions`, each with its point and path (task,
+volume, port, ...). Nothing derived is stored: whether a value is valid,
+invalid, orphaned (its app uninstalled) or pending, and its defaults, are
+computed against the current registry on every read, with compiled
+schemas cached by digest. `legion job info` lists them under
+`jobspec extensions:` with their state now.
+
+**Alternatives.** Fields on each block's config (`task_config`, volume,
+port, service JSON); persisting the state and the filled-in value.
+
+**Trade-off.** Readers map a value's path back to its block, and every
+read pays a (cached) schema check.
+
+**Why (simplicity).** No `task_config` migration, one place for `job info`
+and `WatchAppExtensions` to read, and install, upgrade and uninstall need
+no rewrite pass over every job.
+
+## 86. Pending values are adopted on read, except for keys with `requires` (A6b)
+
+**Call.** A value kept as `pending` by `--allow-unknown-fields` reads as
+adopted once an app declaring that key is installed. It is not rewritten
+into the stored list until the job's next submit, and a key whose
+declaration has `requires` is not adopted at all: someone holding the
+permission has to submit it.
+
+**Alternatives.** Rewrite every pending value into an adopted one at
+install.
+
+**Trade-off.** Adoption is not persisted until the next submit.
+
+**Why (security, simplicity).** No bulk write at install, and a `requires`
+key must be set by a submitter who holds what it requires.
+
+## 87. The validate call fails open, per app, on run only (A6b)
+
+**Call.** For apps declaring `validate = true`, `RunJob` and
+`RunJobTemplate` send one POST per app to `/legion/v1/extensions/validate`
+over the A4 forward, with a 2-second timeout and a viewer assertion of
+kind `validate`, after checking `job:write`. A rejection fails the submit
+(`InvalidArgument`); an unreachable, disabled, non-200 or slow app is
+skipped with a warning. Plans, `job validate`, and idempotent replays don't
+call it.
+
+**Alternatives.** Fail closed; also call it from `job plan` and
+`job validate`.
+
+**Trade-off.** A down app's check is skipped, and a plan can pass what the
+run then refuses.
+
+**Why (availability).** A down app must not block deploys, and the submit
+path stays synchronous.
+
+## 88. `requires` is checked as the submitter, on the job or cluster-wide (A6b)
+
+**Call.** A key's `requires` permission is enforced on the submitter for
+new or changed values only: on the job for a namespaced resource, and
+cluster-wide for a cluster-scoped one (`net`, `node`).
+
+**Alternatives.** Always scope it to the job.
+
+**Trade-off.** Some asks need a cluster grant.
+
+**Why (consistency).** It matches how those resources are scoped
+everywhere else.
+
+## 89. One owner per key; renames happen at install (A6b)
+
+**Call.** A key colliding with a core field is refused at install (an
+upgrade keeps keys the app already declares); a key another app owns is
+refused with a hint to install it under another key
+(`--key <point>.<key>=<new key>`). Renames live in the app's settings, survive upgrades, and can only be set
+at install. A key a newer core field now shadows is detected (a raw JSON
+check), logged at manager start, and its users get the qualified-spelling
+error.
+
+**Alternatives.** Allow overlap and pick a winner; renames after install.
+
+**Trade-off.** No `app set --key` to rename later.
+
+**Why (simplicity).** One owner per key keeps the jobspec unambiguous.
+
+## 90. `WatchAppExtensions` polls the store and diffs (A6b)
+
+**Call.** The stream sends a snapshot, then upserts and deletes with a
+generation, found by a 1-second fingerprint check and a 30-second full
+read, sharded by SHA-256 of the job (first 8 bytes, mod the shard count).
+Only the calling app's own values are returned, identified by its workload
+identity or grant reference; a management token must name the app.
+
+**Alternatives.** Feed it from the event stream.
+
+**Trade-off.** Up to a second of latency and a periodic read per stream.
+
+**Why (simplicity).** No new event plumbing, and it covers every job
+status.
+
+## 91. Extension-only resubmits move in place through the autoscaler's predicate (A6b)
+
+**Call.** `classify_in_place` extends Phase 2's predicate: it strips
+extension values and every `pendingExtensions` map, plus autoscale-owned
+counts, and compares the rest. When only extension values differ,
+allocations move to the new version with the same ids and no rollout:
+
+```console
+Job updated in place: only jobspec extension values changed, so nothing restarts (the apps that own them see the new values)
+```
+
+A value's `validated_by` is ignored when comparing.
+
+**Alternatives.** A second predicate for extensions.
+
+**Trade-off.** One predicate carries two features' rules.
+
+**Why (simplicity).** One place decides what restarts.
+
+## 92. `GetJobSchema` needs `job:read`, and installed schemas are rebased into `$defs` (A6b)
+
+**Call.** The schema behind `legion job schema` and `job validate` is the
+core schema plus every installed key at its point under
+`$defs/ext.<app>.<point>`, readable with `job:read` anywhere. Offline,
+`job validate` checks core fields and reports installed keys `unchecked`.
+
+**Alternatives.** Open to every caller.
+
+**Trade-off.** Callers without `job:read` get no schema.
+
+**Why (security).** It reveals which apps are installed.
+
+## 93. KV references in extension values resolve once, at submit (A6b)
+
+**Call.** A `{ kv = … }` reference inside an extension value is resolved
+when the job is submitted, like the rest of the spec; a reference whose
+pointer does not resolve in the stored config is dropped.
+
+**Alternatives.** Live re-resolution.
+
+**Trade-off.** A KV change reaches an app's value only on the next submit
+or KV re-render.
+
+**Why (consistency).** The same rule as every other jobspec value.
+
+## 94. `maximal.ncl` shows extension keys as comments, and `job plan` shows values (A6b)
+
+**Call.** The maximal example shows each point's key (and the
+`apps.<app>` spelling) commented out, since no app is installed when its
+test parses it. `PlanJobReply` gains `extensions`, so `job plan` prints
+the values a submit would store.
+
+**Alternatives.** Real keys under `pendingExtensions`.
+
+**Trade-off.** The examples are not parsed.
+
+**Why (simplicity).** No fake install in the examples test.
+
+## 95. The host guard's nftables table and BPF pins are named after the worker's cgroup parent (A1 follow-up)
+
+**Call.** The default parent keeps `legion_host_guard` and
+`/sys/fs/bpf/legion`; any other parent gets a sanitized suffix (the system
+worker uses `legion_host_guard_legion-system`), so a manager's system
+worker and a standalone worker on one host stop overwriting each other.
+
+**Alternatives.** Name them after the worker id.
+
+**Trade-off.** Two workers sharing one cgroup parent still collide
+(documented).
+
+**Why (operability).** A name stable across restarts lets a worker clean
+up its own objects, and the default is unchanged.
+
+## 96. `*` pool globs don't reach reserved `legion-` pools (A1 follow-up)
+
+**Call.** An allow rule's `pools` glob reaches a `legion-*` pool only when
+the pattern itself starts with `legion-`, for every node action including
+read; a rule with no `pools` selector reaches what `*` reaches. Deny rules
+keep plain globs, and grant coverage follows the same rule.
+
+**Alternatives.** Protect only writes.
+
+**Trade-off.** A tenant with `node:read` on `*` no longer lists the
+managers' system workers.
+
+**Why (consistency).** The same reserved-name model as namespaces and KV
+paths (entry 18).
+
+## 97. `pools.default` can be a list, and `legion-system` defaults to both pools (A1 follow-up)
+
+**Call.** A namespace policy's `pools.default` takes one pool or a list;
+the bootstrap `legion-system` policy defaults to
+`["legion-system", "default"]`, so a hand-written `legion-system` job also
+places on a `--run-worker` manager's worker.
+
+**Alternatives.** Put `--run-worker` nodes in the `legion-system` pool.
+
+**Trade-off.** A new policy shape; clusters bootstrapped earlier keep the
+single-pool policy.
+
+**Why (ease).** Ordinary workers still refuse `legion-system` through
+their `namespaces`, and the list form is reusable.

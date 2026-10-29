@@ -247,7 +247,7 @@ impl ManagerDaemonService {
     }
 
     /// Sign a viewer assertion with the cluster's workload-identity key.
-    fn sign_viewer_assertion(
+    pub(super) fn sign_viewer_assertion(
         &self,
         identity: &AclIdentity,
         assertion: &ViewerAssertion,
@@ -322,7 +322,7 @@ impl ManagerDaemonService {
     /// [`FORWARD_ATTEMPTS`] in all; one that reached the app is never sent
     /// twice.
     #[allow(clippy::too_many_arguments)]
-    async fn forward_to_app(
+    pub(super) async fn forward_to_app(
         &self,
         record: &AppRecord,
         ui: &UiSpec,

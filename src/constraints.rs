@@ -379,6 +379,28 @@ pub fn with_permit_pool(permit: &Value, pool: &str) -> Value {
     }
 }
 
+/// `permit` with a rule admitting any of `pools` added (`pool matches
+/// ^(a|b)$`). An object-shaped permit becomes the equivalent list, since the
+/// object shorthand only states equality.
+pub fn with_permit_pools(permit: &Value, pools: &[&str]) -> Value {
+    let alternatives: Vec<String> = pools.iter().map(|pool| regex::escape(pool)).collect();
+    let rule = serde_json::json!({
+        "key": "pool",
+        "operator": "matches",
+        "value": format!("^({})$", alternatives.join("|")),
+    });
+    let mut items = match permit {
+        Value::Array(items) => items.clone(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+            .collect(),
+        _ => Vec::new(),
+    };
+    items.push(rule);
+    Value::Array(items)
+}
+
 fn parse_rules(value: &Value, allow_multiplier: bool) -> R<Vec<Rule>> {
     match value {
         Value::Null => Ok(Vec::new()),

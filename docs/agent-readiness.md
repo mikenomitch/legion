@@ -62,8 +62,8 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_namespace_policy_apply` / `_delete` | yes | Write a namespace policy (needs `acl:write`). Run `dry_run` first: it lists what the policy would have refused among existing jobs. |
 | `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). For a [gang](gang-scheduling.md), `blocked.gang` says how many replicas fit (`placeable`, `running`) against the quorum it must place together (`min`), and, when it sets `placementTimeout`, when it gives up (`deadline`, Unix seconds): wait until then, or add capacity. A gang job past its deadline, or one whose `onMemberLoss` failed it, reports `status: failed` and places nothing until `legion job run`. With `scale:read`, `scalingInputs` adds request vs usage per task, cluster-wide: replicas (ready, placed, desired, unplaced), measured CPU and memory against the reservation, requests into a service the task backs (internal callers only), and `freshness.state`. Act on usage only when the state is `current`; `missing` and `resyncing` mean no data, not zero load ([Scaling inputs](autoscaling.md#scaling-inputs)). |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
-| `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
-| `legion_job_validate` | no | Validate a rendered jobspec (JSON). An unknown key is an error naming its path and the closest known key; `allow_unknown_fields` shows what a submit with the flag would keep and drop (`warnings`, `unknownFields`). |
+| `legion_job_schema` | no | This cluster's jobspec JSON Schema (`GetJobSchema`): the core fields and task runtimes, plus each key installed apps add at its point and in its qualified spelling `apps.<app>`. Without a reachable manager, the compiled-in schema, and `$comment` says installed keys are not included. |
+| `legion_job_validate` | no | Validate a rendered jobspec (JSON). An unknown key is an error naming its path and the closest known key (installed apps' keys included); values for installed apps' keys are checked against their schemas when a manager answers (`installedKeys: checked`; offline, `unchecked`, and keys at extension points are reported as not checked); `allow_unknown_fields` shows what a submit with the flag would keep and drop (`warnings`, `unknownFields`). |
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
 | `legion_instance_list` | no | List a job's stateful instances (slot + keyed), then its running [sessions](session-mode.md) (`mode: "session"`, `durable: false`) from the session index. The reply is `{ instances, nextIdlePageToken, complete, asOf }`: `complete: false` means some node that runs the job's sessions has not reported yet, so sessions may be missing. `include_idle: true` also lists instances [archived](suspend-and-resume.md#archiving-idle-instances) with `manifestOnly`, which have no row, from the bucket a page at a time (`idle_page_token`, `idle_page_size`); page until the token is empty, since a page can come back short. |
@@ -255,17 +255,34 @@ Agents write jobspecs far more reliably against a schema than against free-form
 Nickel.
 
 ```bash
-# Get the jobspec JSON Schema, including the live per-runtime task config schemas:
+# Get this cluster's jobspec JSON Schema, including the live per-runtime task
+# config schemas and the keys installed apps add:
 legion job schema --json
 
 # Render and deeply validate a jobspec WITHOUT submitting it:
 legion job validate ./configs/jobs/demo.ncl --json
+
+# The keys installed apps add, with their schemas and examples:
+legion app extensions --json
 ```
 
 `job validate` runs the same validation the manager applies on submit
 (`validate_job_config`), so an agent can fix mistakes before touching the
 cluster. The schema includes the built-in task-runtime config schemas (`exec`,
 `container`, …) under `taskRuntimes`, derived from the typed Rust structs.
+
+**The schema is the cluster's.** With a manager reachable, `job schema`,
+`job validate`, and the `legion_job_schema` and `legion_job_validate` MCP
+tools use `GetJobSchema` (`job:read`): the core schema plus every key an
+installed [app](apps.md#jobspec-extensions) adds, as a property at its
+extension point (`backup` on volume entries, `dns` on ports, …) described as
+"From the backup app, 0.3.1: …", and under that point's `apps` record in
+its qualified spelling. `job validate` checks values for those keys against
+their schemas and lists what only a submit checks (a key's `requires`, an
+app's own validate call). Offline, both fall back to the compiled-in schema
+and say so: `job schema` in `$comment`, `job validate` with
+`"installedKeys": "unchecked"` and one warning per key at an extension point
+it could not resolve.
 
 **Write the spec as `.json`, not `.ncl`.** The JSON path exists for
 machine-generated specs like these. `legion job schema` describes the JSON, an
@@ -305,6 +322,11 @@ anyway:
   "hint": "fix or remove each field above. To submit anyway, pass --allow-unknown-fields …",
   "retryable": false } }
 ```
+
+An installed app's key is a suggestion too (`did you mean `backup`, the
+backup app's key?`), and a value that fails an installed key's schema is an
+error naming its full path (`orders-db: task postgres: volume data:
+backup.keep: 0 is less than the minimum of 1`) that no flag excuses.
 
 Fix the spec: the suggestion is usually the whole fix. `--allow-unknown-fields`
 (`allow_unknown_fields` on the RPCs and MCP tools) is for a key Legion cannot

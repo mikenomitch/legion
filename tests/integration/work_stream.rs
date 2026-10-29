@@ -140,6 +140,7 @@ fn submit_keyed(store: &Store) -> R<()> {
             rollout_by_group: Default::default(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         },
         &[Submission {
             path: format!("{JOB}.json"),
@@ -926,6 +927,7 @@ fn a_job_volume_change_reaches_a_streaming_worker_under_raft() -> R<()> {
         rollout_by_group: Default::default(),
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let submission = [Submission {
         path: format!("{VOLUME_JOB}.json"),
@@ -1131,6 +1133,7 @@ fn checkpoint_work_reaches_a_streaming_worker_without_a_heartbeat() -> R<()> {
             rollout_by_group: Default::default(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         },
         &[Submission {
             path: format!("{JOB}.json"),

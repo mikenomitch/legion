@@ -525,6 +525,18 @@ pub fn kv_path_glob_match(pattern: &str, path: &str) -> bool {
     reserved_glob_match(pattern, path, RESERVED_KV_PREFIX)
 }
 
+/// The node-pool prefix reserved for Legion's own workers: a manager's
+/// system worker runs in pool `legion-system`. The same prefix as reserved
+/// namespaces.
+pub const RESERVED_POOL_PREFIX: &str = RESERVED_NAMESPACE_PREFIX;
+
+/// [`reserved_glob_match`] for node pools: `legion-*` is reserved, so a
+/// `pools = ["*"]` rule (or a `node` rule with no `pools`) does not reach
+/// the managers' system workers; `pools = ["legion-*"]` does.
+pub fn pool_glob_match(pattern: &str, pool: &str) -> bool {
+    reserved_glob_match(pattern, pool, RESERVED_POOL_PREFIX)
+}
+
 fn any_glob_matches(patterns: &[String], value: &str) -> bool {
     patterns.iter().any(|p| glob_match(p, value))
 }
@@ -585,7 +597,7 @@ fn rule_matches(
             namespace_selector_matches(rule, namespace)
         })
         && selector_matches(&rule.names, &scope.name)
-        && selector_matches(&rule.pools, &scope.pool)
+        && pools_selector_matches(rule, &scope.pool)
         && paths_selector_matches(rule, &scope.path)
         && selector_matches(&rule.action_names, &scope.action_name)
         && selector_matches(&rule.templates, &scope.template)
@@ -680,6 +692,23 @@ fn paths_selector_matches(rule: &AclRule, path: &Option<String>) -> bool {
         (Some(patterns), Some(path)) => patterns
             .iter()
             .any(|pattern| kv_path_glob_match(pattern, path)),
+    }
+}
+
+/// Whether a rule's `pools` selector accepts a node pool. Allow rules follow
+/// the reserved-prefix rule ([`pool_glob_match`]): a `legion-*` pool (the
+/// managers' system workers) is reached only by a pattern starting
+/// `legion-`, and an allow rule with no `pools` reaches what `*` reaches.
+/// Deny rules are plain globs, for the reason [`namespace_selector_matches`]
+/// gives. A scope without a pool is decided by the generic selector rule.
+fn pools_selector_matches(rule: &AclRule, pool: &Option<String>) -> bool {
+    match (&rule.pools, pool.as_deref()) {
+        (_, None) => selector_matches(&rule.pools, pool),
+        _ if rule.is_deny() => selector_matches(&rule.pools, pool),
+        (None, Some(pool)) => pool_glob_match("*", pool),
+        (Some(patterns), Some(pool)) => patterns
+            .iter()
+            .any(|pattern| pool_glob_match(pattern, pool)),
     }
 }
 
@@ -1132,6 +1161,90 @@ mod acl_rules_test {
             AclResource::Kv,
             AclAction::Write,
             &AclScope::path("legion/apps/autoscaler/lease")
+        ));
+    }
+
+    /// `node:write` with `pools = ["*"]`, or with no `pools`, cannot cordon,
+    /// drain, or mint a join token for the managers' system workers (pool
+    /// `legion-system`); a pattern naming the prefix can, a deny on `*`
+    /// still denies there, and management tokens bypass rules as always.
+    #[test]
+    fn star_pool_rules_do_not_reach_reserved_pools() {
+        assert!(pool_glob_match("*", "default"));
+        assert!(pool_glob_match("gpu-*", "gpu-a100"));
+        assert!(!pool_glob_match("*", "legion-system"));
+        assert!(!pool_glob_match("legion*", "legion-system"));
+        assert!(pool_glob_match("legion-*", "legion-system"));
+        assert!(pool_glob_match("legion-system", "legion-system"));
+        // Only the prefix is reserved.
+        assert!(pool_glob_match("*", "legionnaire"));
+
+        for broad in [
+            r#"[{"resources": ["node"], "actions": ["read", "write"], "pools": ["*"]}]"#,
+            r#"[{"resources": ["node"], "actions": ["read", "write"]}]"#,
+            r#"[{"resources": ["*"], "actions": ["*"]}]"#,
+        ] {
+            let r = rules(broad);
+            assert!(evaluate(
+                &r,
+                AclResource::Node,
+                AclAction::Write,
+                &AclScope::pool("default")
+            ));
+            for action in [AclAction::Read, AclAction::Write] {
+                assert!(
+                    !evaluate(
+                        &r,
+                        AclResource::Node,
+                        action,
+                        &AclScope::pool("legion-system")
+                    ),
+                    "{broad} {action:?}"
+                );
+            }
+            // The list gate still passes; system workers filter out.
+            assert!(evaluate(
+                &r,
+                AclResource::Node,
+                AclAction::Read,
+                &AclScope::any()
+            ));
+            // A scope with no pool is unaffected: a rule without the
+            // selector matches it, as before.
+            if !broad.contains("pools") {
+                assert!(evaluate(
+                    &r,
+                    AclResource::Node,
+                    AclAction::Write,
+                    &AclScope::none()
+                ));
+            }
+        }
+        let named =
+            rules(r#"[{"resources": ["node"], "actions": ["write"], "pools": ["*", "legion-*"]}]"#);
+        assert!(evaluate(
+            &named,
+            AclResource::Node,
+            AclAction::Write,
+            &AclScope::pool("legion-system")
+        ));
+        let denied = rules(
+            r#"[
+                {"resources": ["node"], "actions": ["write"], "pools": ["legion-*"]},
+                {"resources": ["node"], "actions": ["write"], "pools": ["*"], "effect": "deny"}
+            ]"#,
+        );
+        assert!(!evaluate(
+            &denied,
+            AclResource::Node,
+            AclAction::Write,
+            &AclScope::pool("legion-system")
+        ));
+        let management = AclIdentity::acl_disabled();
+        assert!(management.allows(
+            AclResource::Node,
+            AclAction::Write,
+            &AclScope::pool("legion-system")
         ));
     }
 

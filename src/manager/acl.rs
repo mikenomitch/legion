@@ -818,7 +818,7 @@ impl StreamCredential {
 }
 
 /// Pulls a bearer credential from `authorization` or `x-legion-token`.
-fn extract_bearer(metadata: &MetadataMap) -> Option<String> {
+pub(crate) fn extract_bearer(metadata: &MetadataMap) -> Option<String> {
     if let Some(value) = metadata.get("authorization").and_then(|v| v.to_str().ok()) {
         let value = value.trim();
         if let Some(rest) = value

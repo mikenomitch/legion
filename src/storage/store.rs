@@ -59,6 +59,9 @@ mod autoscale_ops;
 mod scaling_policy_ops;
 // Their action intents (`RecordScalingAction`), compare-and-set.
 mod scaling_action_ops;
+// Jobspec extensions: the jobs holding values, and cheap fingerprints.
+mod extension_ops;
+pub use extension_ops::ExtensionJob;
 // GetCapacityDemand's pending work, and ForgetNode (autoscaler v2 plan
 // §6.11).
 mod demand_ops;
@@ -9936,6 +9939,7 @@ impl Store {
                 let job_config_id: String = row.get(0)?;
                 let meta: Value = row.get(3)?;
                 let pending_extensions = Self::pending_extensions_from_meta(&meta);
+                let extensions = Self::extensions_from_meta(&meta);
                 let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
                 Ok((
                     JobConfig {
@@ -9946,6 +9950,7 @@ impl Store {
                         rollout_by_group,
                         version: Some(row.get(4)?),
                         pending_extensions,
+                        extensions,
                     },
                     job_config_id,
                 ))
@@ -9972,6 +9977,7 @@ impl Store {
                 let job_config_id = row.get(0)?;
                 let meta: Value = row.get(3)?;
                 let pending_extensions = Self::pending_extensions_from_meta(&meta);
+                let extensions = Self::extensions_from_meta(&meta);
                 let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
                 let jc = JobConfig {
                     name: row.get(1)?,
@@ -9981,6 +9987,7 @@ impl Store {
                     rollout_by_group,
                     version: Some(row.get(4)?),
                     pending_extensions,
+                    extensions,
                 };
 
                 Ok((jc, job_config_id))
@@ -10011,6 +10018,7 @@ impl Store {
                 let job_config_id = row.get(0)?;
                 let meta: Value = row.get(3)?;
                 let pending_extensions = Self::pending_extensions_from_meta(&meta);
+                let extensions = Self::extensions_from_meta(&meta);
                 let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
                 let jc = JobConfig {
                     name: row.get(1)?,
@@ -10020,6 +10028,7 @@ impl Store {
                     rollout_by_group,
                     version: Some(row.get(4)?),
                     pending_extensions,
+                    extensions,
                 };
 
                 Ok((jc, job_config_id))
@@ -10081,6 +10090,7 @@ impl Store {
                 };
                 let meta: Value = row.get(3)?;
                 let pending_extensions = Self::pending_extensions_from_meta(&meta);
+                let extensions = Self::extensions_from_meta(&meta);
                 let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
                 let config = JobConfig {
                     name: row.get(2)?,
@@ -10090,6 +10100,7 @@ impl Store {
                     rollout_by_group,
                     version: Some(row.get(4)?),
                     pending_extensions,
+                    extensions,
                 };
                 Ok((status, Some((config_id, config))))
             })
@@ -10247,6 +10258,19 @@ impl Store {
         meta.get(PENDING_EXTENSIONS_KEY)
             .and_then(|value| serde_json::from_value(value.clone()).ok())
             .unwrap_or_default()
+    }
+
+    /// The installed apps' extension values a version stores
+    /// (`job_config.meta.extensions`). A value this build cannot read is
+    /// dropped with a warning rather than failing the read.
+    fn extensions_from_meta(meta: &Value) -> Vec<crate::structs::extensions::ExtensionValue> {
+        match meta.get(crate::structs::extensions::EXTENSIONS_KEY) {
+            None | Some(Value::Null) => Vec::new(),
+            Some(value) => serde_json::from_value(value.clone()).unwrap_or_else(|err| {
+                warn!(error = %err, "Unreadable stored extension values; reading none");
+                Vec::new()
+            }),
+        }
     }
 
     /// What `allow_unknown_fields` kept and dropped when a version was
@@ -11084,6 +11108,12 @@ impl Store {
         if !config.pending_extensions.is_empty() {
             meta[PENDING_EXTENSIONS_KEY] = serde_json::to_value(&config.pending_extensions)?;
         }
+        // Installed apps' extension values, at every point, live in meta
+        // too: one list, by app (apps plan §6.6).
+        if !config.extensions.is_empty() {
+            meta[crate::structs::extensions::EXTENSIONS_KEY] =
+                serde_json::to_value(&config.extensions)?;
+        }
         if let Some(record) = unknown_fields.filter(|record| !record.is_empty()) {
             meta[UNKNOWN_FIELDS_META_KEY] = serde_json::to_value(record)?;
         }
@@ -11110,6 +11140,7 @@ impl Store {
                         version: Some(row.get(4)?),
                         tasks,
                         pending_extensions: config.pending_extensions.clone(),
+                        extensions: config.extensions.clone(),
                     },
                     row.get(0)?,
                 ))
@@ -22057,6 +22088,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let mut v2 = v1.clone();
         v2.tasks[0].count = TaskCount::new(2);
@@ -22122,6 +22154,7 @@ mod tests {
                 }],
                 version: None,
                 pending_extensions: Default::default(),
+                extensions: Default::default(),
             },
             subs: vec![sub("other")],
             template: None,
@@ -22939,6 +22972,7 @@ mod tests {
             rollout_by_group: Default::default(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let submission = Submission {
             path: "pool-prop.ncl".into(),
@@ -23107,6 +23141,7 @@ mod tests {
             tasks: vec![task],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -23158,6 +23193,7 @@ mod tests {
             tasks: vec![t.clone()],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -23184,6 +23220,7 @@ mod tests {
             tasks: vec![task("worker")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -23212,6 +23249,7 @@ mod tests {
             tasks: vec![task("worker")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -23260,6 +23298,7 @@ mod tests {
             tasks: vec![task("alpha")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -23292,6 +23331,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -23461,6 +23501,7 @@ mod tests {
             tasks: vec![task("worker")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -23944,6 +23985,7 @@ mod tests {
             tasks: task_configs.clone(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let store = setup_store()?;
 
@@ -24013,6 +24055,7 @@ mod tests {
             tasks: vec![task_one],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let store = setup_store()?;
@@ -24061,6 +24104,7 @@ mod tests {
             tasks: orig_task_configs.clone(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let store = setup_store()?;
@@ -24177,6 +24221,7 @@ mod tests {
             tasks: orig_task_configs.clone(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let store = setup_store()?;
@@ -24223,6 +24268,7 @@ mod tests {
             tasks: vec![task_one.clone(), task_two.clone()],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let job_one_subs = vec![Submission {
             path: "job-one-sub.ncl".into(),
@@ -24249,6 +24295,7 @@ mod tests {
             tasks: vec![task_three.clone()],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let job_two_subs = vec![Submission {
             path: "job-two-sub.ncl".into(),
@@ -24349,6 +24396,7 @@ mod tests {
             tasks,
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(&job_config, &submissions)?;
@@ -24409,6 +24457,7 @@ mod tests {
             tasks: tasks.clone(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let job_two_config = JobConfig {
@@ -24419,6 +24468,7 @@ mod tests {
             tasks,
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let job_one_subs = vec![shared_submission.clone()];
@@ -25176,6 +25226,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task-one", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let job_two = JobConfig {
             priority: Default::default(),
@@ -25185,6 +25236,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task-two", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let submission = [Submission {
@@ -25256,6 +25308,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -25289,6 +25342,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job_v1,
@@ -25313,6 +25367,7 @@ mod tests {
             tasks: vec![v2_task],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job_v2,
@@ -25354,6 +25409,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -25425,6 +25481,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -25469,6 +25526,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -25513,6 +25571,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -26018,6 +26077,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -26079,6 +26139,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -26151,6 +26212,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -26207,6 +26269,7 @@ mod tests {
                 tasks: vec![TaskConfig::new(task_name, "noop")],
                 version: None,
                 pending_extensions: Default::default(),
+                extensions: Default::default(),
             };
 
             let submissions = [Submission {
@@ -26291,6 +26354,7 @@ mod tests {
             tasks: vec![constrained_task],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -27382,6 +27446,7 @@ mod tests {
             priority: Band::default(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -27871,6 +27936,7 @@ mod tests {
             ],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         store.handle_job_submit(
@@ -27924,6 +27990,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -28005,6 +28072,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -28077,6 +28145,7 @@ mod tests {
                 }],
                 version: None,
                 pending_extensions: Default::default(),
+                extensions: Default::default(),
             };
             store.handle_job_submit(
                 &job,
@@ -28136,6 +28205,7 @@ mod tests {
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -28216,6 +28286,7 @@ mod tests {
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -28249,6 +28320,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -28438,6 +28510,7 @@ mod tests {
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -28584,6 +28657,7 @@ mod tests {
             tasks: vec![TaskConfig::new("box", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[])?;
         let job_config_id = store.get_job_config("inst")?.id();
@@ -28825,6 +28899,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[])?;
         store.enqueue_eval("job_submit", Some(&job.name), None, None, None)?;
@@ -28864,6 +28939,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -28883,6 +28959,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -28955,6 +29032,7 @@ mod tests {
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &v1,
@@ -28977,6 +29055,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &v2,
@@ -29030,6 +29109,7 @@ mod tests {
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &v1,
@@ -29052,6 +29132,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &v2,
@@ -29124,6 +29205,7 @@ mod tests {
             tasks,
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &config,
@@ -30868,6 +30950,7 @@ mod tests {
             tasks: vec![task],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -31057,6 +31140,7 @@ mod tests {
             tasks,
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -31377,6 +31461,7 @@ mod tests {
             tasks: vec![TaskConfig::new("main", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let submission = Submission {
             path: "template://tpl/1".into(),
@@ -31980,6 +32065,7 @@ mod tests {
                 tasks: vec![task("web")],
                 version: None,
                 pending_extensions: Default::default(),
+                extensions: Default::default(),
             };
             store.handle_job_submit(
                 &job,
@@ -32406,6 +32492,7 @@ mod tests {
             tasks: vec![task("web")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let subs = [Submission {
             path: "job.ncl".into(),

@@ -604,6 +604,7 @@ fn submit_and_place(store: &Store, name: &str) -> R<usize> {
         }],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let submissions = vec![Submission {
         path: format!("{name}.json"),

@@ -64,6 +64,7 @@ fn job(name: &str, count: u32, gang: Option<GangConfig>) -> JobConfig {
         rollout_by_group: Default::default(),
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

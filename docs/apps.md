@@ -10,8 +10,7 @@ install from a manifest. It is three things:
    drawn from the app's declarative views, and sandboxed pages for what the
    views cannot draw; see [Views and actions](#views-and-actions) and
    [Sandboxed pages](#sandboxed-pages)) and the jobspec keys it adds
-   (stored now, resolved by a later release; see
-   [Limitations](#limitations)).
+   ([Jobspec extensions](#jobspec-extensions)).
 
 A **manifest** declares all three. An **app record**, stored on the
 managers, holds the installed manifest, the operator's settings and config,
@@ -125,7 +124,7 @@ A manifest is Nickel or JSON. Unknown fields are errors.
     { resources = ["kv"], actions = ["read"], paths = ["legion/apps/gitops/*"] },
   ],
   ui = { ... },                          # pages, panels, badges, actions, sandboxed pages (Views and actions)
-  extensions = [ ... ],                  # jobspec keys (stored; see Limitations)
+  extensions = [ ... ],                  # jobspec keys (Jobspec extensions)
   config = {
     schema = { type = "object", properties = { repos = { type = "array" } } },
     default = { repos = [] },
@@ -150,7 +149,7 @@ complete example with comments.
 | `job` | A jobspec without `name` or `namespace`, which Legion sets. Must define `task` or `tasks`, and parse as a jobspec. |
 | `permissions` | ACL rules in the shape `legion acl policy apply` takes: what the app's `legion` identity asks to be granted. |
 | `ui` | UI registrations: the slots the app's views appear in, the actions they offer, the port they are served on, and the refresh interval ([Views and actions](#views-and-actions)). Unknown fields are errors. |
-| `extensions` | Jobspec key declarations. Validated as a list and stored. |
+| `extensions` | The keys the app adds to the jobspec, one per extension point, each with a JSON Schema ([Jobspec extensions](#jobspec-extensions)). |
 | `config.schema` | A JSON Schema (draft 7) the config must match. It must describe an object, be at most 64 KiB, and use only local `$ref`s (`"#/…"`); a remote ref is refused before anything is fetched. Default: any object. |
 | `config.default` | The config a fresh install gets. Must match the schema. Default `{}`. |
 | `codeFields` | JSON pointers into the config whose values change the code the app runs. A `*` segment matches every key of an object or element of an array. An entry `{ pointer, artifact = true }` is also fetched as an artifact of the app's job (below). |
@@ -220,8 +219,11 @@ fetched by the CLI (at most 1 MiB); a Nickel manifest from a URL must be
 self-contained, because imports are refused. The CLI asks the manager for a
 dry run first (`InstallApp` with `dry_run`), prints the prompt, and asks
 before installing; `--yes` skips the question (and is required with
-`--json`), `--dry-run` stops after the prompt, and `--config <file>` sets
-the initial config.
+`--json`), `--dry-run` stops after the prompt, `--config <file>` sets
+the initial config, and `--key <point>.<key>=<new>` installs a jobspec key
+under another name ([Keys cannot collide](#keys-cannot-collide)). An app
+that declares jobspec keys adds what installing does to stored values to the
+prompt: the pending values it adopts, and how they fare against its schemas.
 
 **You can grant only what you hold.** Installing needs `app:write` on the
 app's name, and every permission the manifest asks for, checked exactly as a
@@ -256,7 +258,9 @@ upgrade needs approval (`--yes`, or the question); one that only keeps or
 drops permissions upgrades without asking. The stored config must match the
 new schema; `--config <file>` replaces it in the same step. `--dry-run`
 shows the diff and changes nothing. Bundled apps cannot be upgraded this
-way.
+way. The prompt reports every stored jobspec value of the app's keys checked
+against the new schemas ([Installing, upgrading,
+uninstalling](#installing-upgrading-uninstalling)).
 
 ### Config
 
@@ -309,6 +313,14 @@ Uninstall disables the app, stops its job, revokes the job's grants (its
 workload tokens lose them at their next request), and deletes the record. The
 stopped job stays until someone destroys it. Bundled apps cannot be
 uninstalled; disable them.
+
+While jobs set the app's jobspec keys, uninstall needs `--force`, and the
+values stay stored, flagged `orphaned`:
+
+```text
+Error: 2 jobs set backup's jobspec keys: orders-db, cache. Uninstalling leaves their values stored, flagged orphaned, and each job's next submit fails until the key is removed (or --allow-unknown-fields is passed)
+Hint: pass --force to uninstall anyway
+```
 
 ## How an app stays running
 
@@ -497,6 +509,9 @@ with a `names` selector, matched against app names:
 | `GetAppView` | `app:read` on the app, and the entry's permission on the context |
 | `InvokeAppAction` | `app:read` on the app, and the action's permission on the context |
 | `GetAppPage` | `app:read` on the app, and the page's permission on any scope |
+| `GetJobSchema` | `job:read` on any scope (the schema describes jobspecs, not jobs) |
+| `WatchAppExtensions` | app-plane: the app's own workload identity (its values only), or a management token naming the app |
+| `RunJob`, `RunJobTemplate` setting a key with `requires` | the key's permission on the job, for a new or changed value ([At submit](#at-submit)) |
 
 Every mutating RPC takes `idempotency_key`, and a repeat returns the first
 reply with `deduplicated` set (`--idempotency-key` on the CLI).
@@ -966,6 +981,313 @@ narrowed by its `rpcs`, while its viewer has it open.
 | `permission_denied` in the page | the viewer lacks the RPC's permission, or the manager refused an RPC the current manifest does not list | |
 | `The page left the bundle ...; its bridge to Legion is closed` | the page navigated its frame | reload |
 
+## Jobspec extensions
+
+An app that acts on jobs usually needs settings per job: what to back up and
+how often, which hostname to route, which repository a job came from. Apps
+declare **keys** at fixed **extension points** of the jobspec, and job
+authors write them next to what they configure, like any other field:
+
+```nickel
+{
+  name = "orders-db",
+  uptime = { url = "https://orders.acme.dev/healthz" },        # job: the uptime app
+  task = {
+    name = "postgres",
+    runtime = "container",
+    config = { image = "postgres:17" },
+    volumes = [
+      { name = "data", path = "/var/lib/postgresql",
+        backup = { schedule = "0 3 * * *", keep = 14 } },       # volume: the backup app
+    ],
+    network = { ports = [{ name = "http", dns = { hostname = "orders.acme.dev" } }] },   # port: the dns app
+  },
+}
+```
+
+Values are Nickel like the rest of the jobspec (`let`, functions, imports,
+and merging all work): the CLI evaluates the spec to JSON, and the manager
+checks the evaluated value. `legion job spec` shows the Nickel as written.
+
+### Extension points
+
+| Point | Where the key is written | What the app gets as context |
+| --- | --- | --- |
+| `job` | the top level of the jobspec | the job |
+| `group` | on **one** task of the group; it applies to the whole group (the jobspec has no group objects) | the job, the group, and the task it is written on |
+| `task` | a task | the job, group, and task |
+| `volume` | an entry of a task's `volumes` | the job, task, and volume name |
+| `port` | an entry of a task's `network.ports` | the job, task, and port name |
+| `service` | a task's `service` block | the job, task, and service name |
+
+A `group` key written on two tasks of one group is a submit error. Points
+are Legion's: an app cannot add one, and core keeps its own new fields from
+colliding at these points (below).
+
+### Declaring keys
+
+```nickel
+extensions = [
+  {
+    point = "volume",
+    key = "backup",               # what job authors write; defaults to the app's name
+    description = "Back up this volume on a schedule.",
+    schema = {                    # JSON Schema, draft 7
+      type = "object",
+      additionalProperties = false,
+      required = ["schedule"],
+      properties = {
+        schedule = { type = "string", description = "Cron expression, in UTC." },
+        keep     = { type = "integer", minimum = 1, default = 7 },
+      },
+    },
+    examples = [{ schedule = "0 3 * * *", keep = 14 }],
+    validate = true,              # also ask the app at submit (optional)
+    requires = { resource = "net", action = "write" },   # extra permission to set it (optional)
+  },
+],
+```
+
+Install refuses a declaration that breaks any of these:
+
+- At most one key per point; `task` and `group` count as one point (both
+  are written on a task), so an app declares at most one of the two. An app
+  with several settings nests them in that key's record.
+- The key is a letter, then letters, digits, `_` or `-`, at most 64. `apps`,
+  `pendingExtensions`, and `extensions` are reserved everywhere.
+- The schema describes an object (`type = "object"`), is at most 64 KiB, and
+  uses only local `$ref`s (`"#/definitions/…"`). It is compiled at install
+  with a resolver that refuses every other ref, so installing an app never
+  makes the manager fetch a URL.
+- Every example passes the schema (with its defaults filled), so the
+  examples an app ships cannot drift from it.
+- `requires` names an ACL resource and `read` or `write`.
+
+A schema can declare `default`s. Legion fills them when a value is read, not
+when it is stored ([Values as they read now](#values-as-they-read-now)).
+
+### Keys cannot collide
+
+1. **Not a core field.** Installing an app whose key is a field of the block
+   at that point (`readOnly` on a volume, `config` on a task) fails.
+2. **Not another app's key.** Installing an app whose key another installed
+   app already declares at that point (`task` and `group` as one) fails,
+   naming the owner. Install it under another key instead:
+
+   ```console
+   $ legion app install ./pgbackup.ncl
+   Error: pgbackup declares `backup` on volumes, which the backup app already owns on volumes
+   Hint: install it under another key: --key volume.backup=pgbackup
+   $ legion app install ./pgbackup.ncl --key volume.backup=pgbackup
+   ```
+
+   Job authors then write `pgbackup = { … }`. The rename is part of the
+   app's settings and survives upgrades.
+3. **The qualified spelling never collides.** Every key can also be written
+   `apps.<app>` at the same point, which no core field can take:
+
+   ```nickel
+   volumes = [{ name = "data", apps = { backup = { schedule = "0 3 * * *" } } }]
+   ```
+
+   If a later Legion release adds a core field named like an installed key,
+   the core field wins at that point: the manager logs the conflict when it
+   starts, `legion app status` and `legion app extensions` say so, and job
+   authors write the app's values as `apps.<app>`. A submit cannot tell
+   which one an author means, so it refuses, pointing at the qualified
+   spelling, only when the job's previous version stored that app's value
+   under the short key; any other submit takes the key as the core field.
+   Stored values are untouched: they are stored by app, not by key.
+
+### At submit
+
+For each extension value in a `RunJob`, `RunJobTemplate`, or `PlanJob`, the
+manager:
+
+1. **finds its owner**: the installed app that declares the key, or the app
+   named by `apps.<app>`, at that point. With no owner the key is unknown:
+   an error, with a suggestion drawn from core fields and installed keys,
+   or, with `--allow-unknown-fields`, kept as pending
+   ([Unknown fields](jobs-tasks-and-scheduling.md#unknown-fields));
+2. **checks it against the schema**, with the schema's defaults filled in.
+   An invalid value is an error whatever the flag says;
+3. **checks `requires`** (`RunJob`, `RunJobTemplate`), as the submitter,
+   for a value that is new or changed since the job's previous version: on
+   the job for a namespaced resource (`job`, `kv`, …), cluster-wide for a
+   cluster-scoped one (`net`, `node`, …);
+4. **asks the app** (`RunJob`, `RunJobTemplate`), when the key says
+   `validate = true` ([The validate call](#the-validate-call));
+5. **stores it as written**, by app, stamped `validated_by =
+   <app>@<manifest digest>`.
+
+```text
+Error: orders-db: task postgres: volume data: backup.keep: 0 is less than the minimum of 1
+Hint: fix each value above against its app's schema (`legion app extensions` shows them, `legion job schema` has them at their points)
+
+Error: orders-db: task postgres: volume data: unknown field `bakup` (did you mean `backup`, the backup app's key?)
+
+Error: orders-db: task postgres: port http: dns (dns app) requires net:write to set, which your token does not hold
+```
+
+A disabled app's keys are still checked at submit; nothing acts on the
+values while it is off. Values are visible to anyone with `job:read`, so
+they must never hold secrets: a schema should take a KV path, not the
+secret. A KV reference (`$path/key`) inside a value is resolved once, at
+submit, and not re-rendered when the key changes.
+
+### Values as they read now
+
+A job version stores each value as written. When it is read (`legion job
+info`, `GetJobInfo`, the app's watch, and `legion job plan` for a spec not
+yet submitted), Legion fills the defaults from the app's **current** schema
+and judges the value against it, so an upgrade that changes a default
+reaches every value that did not set it:
+
+```console
+$ legion job info orders-db
+...
+jobspec extensions:
+  job: uptime = {"alert":"#oncall","url":"https://orders.acme.dev/healthz"} (uptime app; valid)
+  task postgres: volume data: backup = {"keep":7,"schedule":"0 3 * * *"} (backup app; valid)
+  task postgres: port http: dns = {"hostname":"orders.acme.dev"} (dns app; valid)
+```
+
+| State | Meaning |
+| --- | --- |
+| `valid` | the app is installed and the value passes its current schema |
+| `invalid` | the value fails the current schema (an upgrade tightened it). It stays stored, the app's watch flags it, and the job's next submit must conform |
+| `pending` | kept under `--allow-unknown-fields`, and no installed app claims it (or the app that does declares `requires`; below) |
+| `orphaned` | its app was uninstalled, or no longer declares a key at that point. Resubmitting the job fails until the key is removed or `--allow-unknown-fields` is passed |
+
+`detail` says why, `app disabled` while the app is off, or `adopted from
+pending`. `legion job info -j` carries them under `extensions`.
+
+### Changing only extension values restarts nothing
+
+A resubmit whose only differences are extension values (or pending keys)
+still makes a new job version, but no rollout: the running allocations move
+to the new version in place, as KV re-renders and `autoscale` edits do, and
+the apps see the new values through their watch.
+
+```console
+$ legion job run orders-db.ncl          # backup.keep 14 → 30
+Job updated in place: only jobspec extension values changed, so nothing restarts (the apps that own them see the new values)
+```
+
+A rollout in flight, or allocations still on an older version, falls back
+to a rollout, as for `autoscale`.
+
+### How values reach the app
+
+An app reads its values with **`WatchAppExtensions`**, a stream that only
+an app's own workload identity may open (its `legion` token, which the
+allocation's API socket attaches). It returns that app's values and no
+other app's:
+
+- the first message has `snapshot` set and carries every current value;
+- later messages carry upserts (new, changed, a new job version, a
+  validity that changed with an upgrade) and deletes (a value a resubmit
+  removed, a destroyed job);
+- each value has its job, namespace, version and status, its point and
+  path (group, task, volume, port, service), the key as written, the value
+  as written and with defaults filled, its state, and whether it was
+  adopted from pending.
+
+`shard_count` and `shards` split the values across replicas by the job id's
+hash (the first eight bytes of SHA-256 of the canonical job id, modulo the
+count): the same key hash the autoscaler shards by. A management token may
+watch any app by naming it in `app`.
+
+The app acts only on what carries the value: the job, task, volume, port,
+or service in its context. A schema cannot name a different job.
+
+### The validate call
+
+A key with `validate = true` asks its app at submit, for checks a schema
+cannot express (is this volume one that can be snapshotted? is this
+hostname ours?). The manager sends `POST /legion/v1/extensions/validate` to
+one allocation of the app's job, through the same worker-plane forward and
+viewer assertion as views ([The viewer assertion](#the-viewer-assertion)),
+with the submitter as the viewer, the job as the context (`job` slot), the
+assertion's `kind` set to `validate`, and its inputs digest the body's:
+
+```json
+{ "job": "orders-db", "namespace": "default",
+  "values": [ { "point": "volume",
+                "path": { "group": "db", "task": "postgres", "volume": "data" },
+                "key": "backup",
+                "value": { "schedule": "0 3 * * *" },
+                "effective": { "schedule": "0 3 * * *", "keep": 7 } } ] }
+```
+
+The app answers one result per value, in order:
+
+```json
+{ "results": [ { "errors": ["this volume is node-local, and backups need one that can be snapshotted"],
+                 "warnings": [] } ] }
+```
+
+Errors refuse the submit; warnings pass through to the reply's `warnings`.
+Each app gets one call per submit, with all its values, and two seconds.
+**An app that cannot be reached, is disabled, answers anything but `200`,
+or does not answer in time passes the values with a warning**: a broken
+add-on must not block deploys. The app checks values again when they reach
+it through its watch, and reports problems on its own status and views.
+
+```text
+warning: orders-db: task postgres: volume data: backup was not checked by the backup app (did not answer within 2s); the schema check passed
+```
+
+On the app framework, `UiRegistry::validate(|request: ValidateRequest| …)`
+answers it, with the assertion already verified; without a handler the
+framework answers that every value passes.
+
+### Installing, upgrading, uninstalling
+
+- **Install** registers the app's keys after the collision checks, and
+  **adopts pending values**: a value kept under `--allow-unknown-fields`
+  before the app existed now belongs to it, checked against its schema. The
+  prompt says which:
+
+  ```text
+  1 job sets backup on volumes; every value passes this version's schema.
+  Adopts 1 pending value kept under --allow-unknown-fields: orders-db/postgres/data: backup
+  ```
+
+  A pending value for a key that declares `requires` is not adopted: no
+  submit checked its author for the permission. It stays pending until the
+  job is resubmitted by someone who holds it.
+- **Upgrade** replaces the keys and schemas and reports how every stored
+  value fares against the new schema. Failing values stay stored, flagged
+  `invalid`:
+
+  ```text
+  14 jobs set backup on volumes; 2 fail this version's schema (flagged invalid; each job's next submit must conform):
+    orders-db/postgres/data: backup: "schedule" is a required property
+  ```
+
+- **Disable** keeps the keys registered, so submits are still checked;
+  nothing acts on the values, and `job info` says `app disabled`.
+- **Uninstall** needs `--force` while any job sets the app's keys, and
+  lists them. The values stay stored, flagged `orphaned`; adopted pending
+  values go back to pending.
+
+### Discovering keys
+
+- `legion app extensions [app]` lists every installed key: its point,
+  owner, description, examples, and whether setting it needs a permission
+  or asks the app. `-j` adds each key's schema.
+- `legion job schema` (`GetJobSchema`, `job:read`) prints this cluster's
+  jobspec schema: the core fields plus each installed key at its point,
+  described as "From the backup app, 0.3.1: …", and each app under its
+  point's `apps` record. Offline it prints the compiled-in schema and says
+  that installed keys are not included.
+- `legion job validate` checks values against the cluster's keys when a
+  manager answers, and says what only a submit checks (`requires`, the
+  validate call). Offline it checks core fields only and reports keys at
+  extension points as not checked.
+- The MCP tools `legion_job_schema` and `legion_job_validate` do the same.
+
 ## Inside an app
 
 The app's tasks get, in their environment:
@@ -1023,9 +1345,12 @@ manager ([Metrics](metrics.md)).
 | `legion app config set <app> -f <file>` | `SetAppConfig` |
 | `legion app set <app> [--replicas N] [--placement P] [--pool P] [--cpu MHZ] [--memory MIB]` | `UpdateAppSettings` |
 | `legion app enable <app>`, `disable <app>` | `SetAppEnabled` |
-| `legion app install <file|url> [--config F] [--yes] [--dry-run]` | `InstallApp` |
+| `legion app install <file|url> [--config F] [--yes] [--dry-run] [--key P.K=NEW]` | `InstallApp` |
 | `legion app upgrade <app> <file|url> [--config F] [--yes] [--dry-run]` | `UpgradeApp` |
-| `legion app uninstall <app>` | `UninstallApp` |
+| `legion app uninstall <app> [--force]` | `UninstallApp` |
+| `legion app extensions [app]` | `ListApps` / `GetApp` (`App.extension_keys`) |
+| `legion job schema` | `GetJobSchema` (the cluster's jobspec schema, installed keys included) |
+| (an app's own values) | `WatchAppExtensions` (app-plane) |
 | `legion app view <app>` | `ListUiExtensions` (what the app shows you, and where) |
 | `legion app view <app> <slot> [ctx…] [--view V] [--group G]` | `GetAppView` (`job <job>`, `task <job> <task>`, `node <node>`, `nav`, `overview`) |
 | (the UI's action buttons) | `InvokeAppAction` |
@@ -1041,9 +1366,27 @@ them, and which allocation answered. The MCP server exposes
 
 ## Limitations
 
-- **Jobspec extensions are stored, not used.** The manifest's `extensions`
-  are validated for shape and kept on the record; resolving jobspec keys
-  comes in a later release.
+- **Extension values are checked against JSON Schema, plus an optional,
+  fail-open call to the app.** Cross-field and cluster-aware checks are the
+  app's to make, and a submit that cannot reach the app goes through with a
+  warning.
+- **Validity depends on the cluster.** The same jobspec can be valid on a
+  cluster with an app installed and invalid on one without it
+  (`--allow-unknown-fields` keeps the values pending), and two clusters
+  with different apps owning one key read it differently; `apps.<app>`
+  pins the owner.
+- **Values share their job's lifecycle and visibility**: they are part of
+  the version, visible with `job:read`, and never a place for secrets.
+- **`legion job plan` and `legion job validate` do not run `requires` or
+  the validate call**; only a submit does. Nickel evaluation does not know
+  installed keys either (there is no importable jobspec contract yet), so a
+  wrong value is caught at submit or by `legion job validate`.
+- **A KV reference inside an extension value is resolved once**, at submit,
+  and not re-rendered when the key changes.
+- **Adoption is read-side.** A pending value an installed app claims is
+  reported as that app's (`adopted`), but stays stored as pending until the
+  job is resubmitted; uninstalling the app makes it pending again rather
+  than orphaned.
 - **Views and actions need workload identity**, which is on by default.
   The viewer assertion is signed with the workload-identity key, and an
   app fetches the keys that verify it through its API socket; on a manager

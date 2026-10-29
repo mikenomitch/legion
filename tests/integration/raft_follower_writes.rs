@@ -316,6 +316,7 @@ fn a_follower_forwards_a_batch_completion_in_single_topology() -> R<()> {
         tasks: vec![fetch],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let outcome = store.handle_job_submit(
         &job,

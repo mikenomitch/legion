@@ -2,7 +2,7 @@
 
 > **Judgement calls:** [legion-apps-plan_calls.md](../calls/legion-apps-plan_calls.md)
 
-**Status: IN EXECUTION** (written 2026-10-19; reconciler and upgrade
+**Status: SHIPPED** (every phase, A1-A6, by 2026-10-29; written 2026-10-19; reconciler and upgrade
 details, jobspec extensions, and strict unknown fields added 2026-10-27).
 **A1 shipped 2026-10-28** (the `legion-system` namespace, the reserved-glob
 rule, node-side `namespaces`, and the system worker; docs:
@@ -49,7 +49,18 @@ worker-plane RPC; `legion app view`; and sandboxed single-file pages behind a
 where they differ: running an action needs `app:read` plus the action's
 declared permission rather than `app:write` (entry 68), the forward is its
 own RPC until the reverse proxy lands (entry 70), and pages live only in the
-sidebar (entry 82). A6b is not built. It has six phases (§8),
+sidebar (entry 82). **A6b shipped 2026-10-29** (app-declared jobspec
+extension keys at the job, group, task, volume, port, and service points,
+the `apps.<app>` spelling, install-time collision checks and `--key`
+renames, schema validation with defaults, `requires`, the fail-open validate
+call, `GetJobSchema`, `WatchAppExtensions`, pending adoption, and in-place
+moves for extension-only changes; docs:
+[apps.md](../../docs/apps.md#jobspec-extensions)), with the A1 follow-ups
+(per-worker host-guard names, reserved `legion-` pools, a list
+`pools.default`). Calls entries 85-97 record where they differ: values live
+in one job-level list with state worked out on read (entry 85), pending
+values are adopted on read (entry 86), and the validate call fails open
+(entry 87). It has six phases (§8),
 and each ships alone. The first consumer is the autoscaler
 ([autoscaler-v2-plan.md](autoscaler-v2-plan.md)). GitOps is the second, and
 this plan checks the substrate against it (§6.8). Deliberately deferred:

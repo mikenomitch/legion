@@ -507,6 +507,7 @@ mod tests {
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -620,6 +621,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,

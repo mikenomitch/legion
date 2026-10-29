@@ -17,8 +17,9 @@
 //! - [`describe`] and [`summary_line`]: the words `legion job plan` and
 //!   `legion scaling status` print for a policy.
 //! - [`in_place_change`]: whether a resubmit differs only in `autoscale`
-//!   and the `count` of autoscaled tasks, so `RunJob` can move allocations
-//!   to the new version instead of rolling out.
+//!   and the `count` of autoscaled tasks, or in installed apps' jobspec
+//!   extension values (apps plan §6.6), so `RunJob` can move allocations to
+//!   the new version instead of rolling out.
 
 use rusqlite::Connection;
 
@@ -770,37 +771,96 @@ pub fn describe(resolved: &ResolvedPolicy, task: &TaskConfig) -> Vec<String> {
     lines
 }
 
-/// Whether `next` differs from `previous` only in `autoscale`, and in the
-/// `count` of tasks that are autoscaled in `next` (plan §6.3, "Editing the
-/// policy restarts nothing"). Such a resubmit moves the running
-/// allocations to the new version instead of rolling out.
+/// What an in-place resubmit changed: the parts of a job version that can
+/// move to a new version without restarting anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InPlaceChange {
+    /// `autoscale`, or the `count` of tasks the new version autoscales
+    /// (autoscaler-v2 plan §6.3, "Editing the policy restarts nothing").
+    pub autoscale: bool,
+    /// Installed apps' jobspec extension values, or pending keys, at any
+    /// point (apps plan §6.6, "Changing only extension values restarts
+    /// nothing"): no runtime reads them, the apps see them through their
+    /// watch.
+    pub extensions: bool,
+}
+
+/// Whether `next` differs from `previous` only in what [`InPlaceChange`]
+/// names. Such a resubmit moves the running allocations to the new version
+/// instead of rolling out.
 pub fn in_place_change(previous: &JobConfig, next: &JobConfig) -> bool {
+    classify_in_place(previous, next).is_some()
+}
+
+/// [`in_place_change`], saying what changed. `None` when anything else
+/// changed, or nothing did.
+pub fn classify_in_place(previous: &JobConfig, next: &JobConfig) -> Option<InPlaceChange> {
     if previous.tasks.len() != next.tasks.len() {
-        return false;
+        return None;
     }
-    if !next.tasks.iter().any(is_autoscaled) && !previous.tasks.iter().any(is_autoscaled) {
-        return false;
-    }
-    let normalize = |config: &JobConfig, scaled: &dyn Fn(&TaskConfig) -> bool| {
-        let mut config = config.clone();
-        config.version = None;
-        for task in config.tasks.iter_mut() {
-            if scaled(task) {
-                task.count.num = 0;
-            }
-            task.autoscale = None;
-        }
-        config
-    };
+    let autoscaled =
+        next.tasks.iter().any(is_autoscaled) || previous.tasks.iter().any(is_autoscaled);
     // A task's count may differ only when the new version autoscales it.
     let autoscaled_next = |task: &TaskConfig| {
         next.tasks
             .iter()
             .any(|n| n.group == task.group && n.name == task.name && is_autoscaled(n))
     };
-    let before = normalize(previous, &autoscaled_next);
-    let after = normalize(next, &autoscaled_next);
-    before == after
+    let strip_autoscale = |config: &mut JobConfig| {
+        if !autoscaled {
+            return;
+        }
+        for task in config.tasks.iter_mut() {
+            if autoscaled_next(task) {
+                task.count.num = 0;
+            }
+            task.autoscale = None;
+        }
+    };
+    let strip_extensions = |config: &mut JobConfig| {
+        config.extensions.clear();
+        config.pending_extensions.clear();
+        for task in config.tasks.iter_mut() {
+            task.pending_extensions.clear();
+            for volume in task.volumes.iter_mut() {
+                volume.pending_extensions.clear();
+            }
+            if let Some(network) = task.network.as_mut() {
+                for port in network.ports.iter_mut() {
+                    port.pending_extensions.clear();
+                }
+            }
+            if let Some(service) = task.service.as_mut() {
+                service.pending_extensions.clear();
+            }
+        }
+    };
+    let mut before = previous.clone();
+    let mut after = next.clone();
+    before.version = None;
+    after.version = None;
+    strip_extensions(&mut before);
+    strip_extensions(&mut after);
+    // Everything but the extensions equal: autoscale did not change.
+    let same_but_extensions = before == after;
+    strip_autoscale(&mut before);
+    strip_autoscale(&mut after);
+    if before != after {
+        return None;
+    }
+    let change = InPlaceChange {
+        autoscale: !same_but_extensions,
+        extensions: {
+            let mut a = previous.clone();
+            let mut b = next.clone();
+            a.version = None;
+            b.version = None;
+            strip_autoscale(&mut a);
+            strip_autoscale(&mut b);
+            a != b
+        },
+    };
+    (change.autoscale || change.extensions).then_some(change)
 }
 
 #[cfg(test)]
@@ -820,6 +880,7 @@ mod tests {
                 .collect(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 
@@ -1102,9 +1163,67 @@ mod tests {
             &base,
             &with(json!({ "resources": { "cpu": 600, "memory": 512 } }))
         ));
-        // No autoscale on either side: never in place.
+        // No autoscale on either side: a count change is never in place.
         let plain = job(vec![web(json!({ "autoscale": false }))]);
         let plain_more = job(vec![web(json!({ "autoscale": false, "count": 4 }))]);
         assert!(!in_place_change(&plain, &plain_more));
+    }
+
+    #[test]
+    fn extension_only_changes_are_in_place_test() {
+        use crate::structs::extensions::{ExtensionPath, ExtensionValue};
+        use crate::structs::spec_fields::ExtensionPoint;
+        let plain = job(vec![web(json!({ "autoscale": false }))]);
+        let value = |keep: u32| ExtensionValue {
+            app: "backup".into(),
+            point: ExtensionPoint::Task,
+            path: ExtensionPath {
+                group: "web".into(),
+                task: "web".into(),
+                ..Default::default()
+            },
+            key: "backup".into(),
+            value: json!({ "keep": keep }),
+            validated_by: "backup@1".into(),
+        };
+        let mut set = plain.clone();
+        set.extensions = vec![value(3)];
+        let mut changed = plain.clone();
+        changed.extensions = vec![value(4)];
+        assert_eq!(
+            classify_in_place(&plain, &set),
+            Some(InPlaceChange {
+                autoscale: false,
+                extensions: true
+            })
+        );
+        assert!(in_place_change(&set, &changed));
+        // Removing the value is in place too.
+        assert!(in_place_change(&changed, &plain));
+        // A pending key alone (calls entry 62's restart, now in place).
+        let mut pending = plain.clone();
+        pending.tasks[0]
+            .pending_extensions
+            .insert("uptime".into(), json!(true));
+        assert!(in_place_change(&plain, &pending));
+        // `validated_by` alone is no change at all.
+        let mut stamped = set.clone();
+        stamped.extensions[0].validated_by = "backup@2".into();
+        assert_eq!(classify_in_place(&set, &stamped), None);
+        // An extension change with any other change rolls out.
+        let mut both = changed.clone();
+        both.tasks[0].resources = json!({ "cpu": 600, "memory": 512 });
+        assert!(!in_place_change(&set, &both));
+        // Autoscale and extensions together are in place, and say so.
+        let base = job(vec![web(json!({}))]);
+        let mut scaled = job(vec![web(json!({ "autoscale": { "max": 20 } }))]);
+        scaled.extensions = vec![value(3)];
+        assert_eq!(
+            classify_in_place(&base, &scaled),
+            Some(InPlaceChange {
+                autoscale: true,
+                extensions: true
+            })
+        );
     }
 }

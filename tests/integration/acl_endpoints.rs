@@ -295,6 +295,12 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetAppView", Plane::Protected("app:read")),
         ("InvokeAppAction", Plane::Protected("app:read")),
         ("GetAppPage", Plane::Protected("app:read")),
+        // Jobspec extensions (docs/apps.md, "Jobspec extensions"): the
+        // cluster's jobspec schema describes jobspecs, not jobs (`job:read`
+        // on any scope); an app's own values are app-plane (its workload
+        // identity, or management naming the app).
+        ("GetJobSchema", Plane::Protected("job:read")),
+        ("WatchAppExtensions", Plane::App),
     ]
 }
 
@@ -1853,6 +1859,7 @@ async fn call_endpoint(
                 UninstallAppRequest {
                     name: DELETABLE_APP.into(),
                     idempotency_key: None,
+                    force: false,
                 },
                 token,
             ))
@@ -1932,6 +1939,20 @@ async fn call_endpoint(
                 GetAppPageRequest {
                     app: FIXTURE_APP.into(),
                     page: "console".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetJobSchema" => svc
+            .get_job_schema(req(GetJobSchemaRequest {}, token))
+            .await
+            .map(|_| ()),
+        "WatchAppExtensions" => svc
+            .watch_app_extensions(req(
+                WatchAppExtensionsRequest {
+                    app: FIXTURE_APP.into(),
+                    ..Default::default()
                 },
                 token,
             ))

@@ -425,8 +425,11 @@ Under skew:
   always did, and ignores `allow_unknown_fields`. Nothing records what it
   dropped. Upgrade the managers before relying on the error.
 - **The CLI's `legion job validate` checks locally**, with the parser
-  compiled into the CLI binary. An older CLI does not catch unknown keys; a
-  newer CLI catches them even against an older manager.
+  compiled into the CLI binary, and asks the manager (`GetJobSchema`) which
+  keys installed apps add. An older CLI does not catch unknown keys; a
+  newer CLI catches them even against an older manager, but against a
+  manager that predates `GetJobSchema` it reports keys at extension points
+  as not checked.
 - **A newer CLI's `--allow-unknown-fields` against an older manager** is
   harmless: the manager ignores the field and drops the keys, as before.
 - **Downgrading a manager** past this release ignores the task- and
@@ -434,6 +437,15 @@ Under skew:
   on them anyway), but an older manager cannot read a version whose volumes
   carry pending keys: its volume parser refuses unknown keys. Resubmit those
   jobs without `--allow-unknown-fields` before downgrading.
+- **Jobspec extension values** ([Apps: Jobspec
+  extensions](apps.md#jobspec-extensions)) live in the version's
+  `job_config.meta.extensions`. A manager from before they existed does not
+  read them: to it the version has no extension values, and in a
+  mixed-version cluster an older manager cannot apply a replicated submit
+  that carries them (its parser refuses the `extensions` key). Upgrade every
+  manager before installing an app that declares jobspec keys. Values an
+  earlier release kept as pending are adopted by the app that declares them
+  when it is installed, with no resubmit.
 
 ## Task-plugin ABI
 

@@ -207,6 +207,7 @@ mod group_commit_test {
                 tasks: vec![task],
                 version: None,
                 pending_extensions: Default::default(),
+                extensions: Default::default(),
             },
             &[Submission {
                 path: "agents.json".into(),

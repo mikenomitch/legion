@@ -88,6 +88,7 @@ fn job_named(name: &str, tasks: Vec<TaskConfig>) -> JobConfig {
         rollout_by_group: Default::default(),
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

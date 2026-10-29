@@ -130,6 +130,7 @@ mod app_rpcs;
 mod app_ui_rpcs;
 mod autoscale_rpcs;
 mod checkpoint_support;
+mod extension_rpcs;
 mod fork_rpcs;
 mod make_room;
 mod material_rpcs;
@@ -1518,6 +1519,7 @@ fn resolve_jobspec_kv_references(
     store: &Store,
     jobspec: &str,
     mode: UnknownFieldMode,
+    registry: &crate::structs::extensions::ExtensionRegistry,
 ) -> R<(JobConfig, Vec<KvReference>, UnknownFieldsRecord)> {
     let mut value: Value = serde_json::from_str(jobspec)?;
     let mut refs = Vec::new();
@@ -1532,7 +1534,27 @@ fn resolve_jobspec_kv_references(
             })
         })
         .collect::<R<Vec<_>>>()?;
-    let (mut config, unknown_fields) = JobConfig::parse_submitted(value, mode)?;
+    let (mut config, unknown_fields) = JobConfig::parse_submitted_with(
+        value,
+        mode,
+        crate::structs::spec_fields::ExtensionCheck::Installed(registry),
+    )?;
+    // A `$path` reference inside an extension value or a pending key points
+    // where the stored config has nothing (those are stored by app, or under
+    // `pendingExtensions`): it is resolved once, here, and not re-rendered,
+    // rather than failing every later KV-driven update of the job.
+    let stored = serde_json::to_value(&config)?;
+    refs.retain(|reference| {
+        let keep = !reference.json_pointer.starts_with('/')
+            || stored.pointer(&reference.json_pointer).is_some();
+        if !keep {
+            debug!(
+                key = %reference.key,
+                "KV reference inside an extension value is resolved once at submit"
+            );
+        }
+        keep
+    });
     refs.extend(apply_job_kv_injections(
         store,
         &mut config,
@@ -1973,6 +1995,12 @@ pub struct ManagerDaemonService {
     /// How app view and action requests reach an app's allocation: the
     /// worker plane, or (tests) a forwarder that delivers in process.
     app_forwarder: Arc<dyn crate::manager::app_forward::AppForwarder>,
+    /// The keys installed apps add to the jobspec, rebuilt when an app
+    /// record changes (`extension_rpcs`).
+    extension_registry: extension_rpcs::RegistryCache,
+    /// Field names treated as core although this build has none (tests: a
+    /// simulated release that adds a core field named like an app's key).
+    simulated_core_fields: Vec<(crate::structs::spec_fields::ExtensionPoint, String)>,
 }
 
 /// Distinct merged policy bodies kept in memory.
@@ -2023,6 +2051,8 @@ impl ManagerDaemonService {
             app_user: crate::structs::config::DEF_SYSTEM_WORKER_APP_USER.to_string(),
             app_nudge: Arc::new(std::sync::OnceLock::new()),
             app_forwarder: Arc::new(crate::manager::app_forward::WorkerPlaneForwarder),
+            extension_registry: Arc::new(Mutex::new(None)),
+            simulated_core_fields: Vec::new(),
         }
     }
 
@@ -2289,6 +2319,7 @@ impl ManagerDaemonService {
         template: Option<&JobTemplateProvenance>,
         namespace: Option<&str>,
         unknown_field_mode: UnknownFieldMode,
+        app_warnings: Vec<String>,
     ) -> Result<SubmittedJob, Status> {
         self.submit_rendered_job_from(
             identity,
@@ -2300,6 +2331,7 @@ impl ManagerDaemonService {
             namespace,
             SubmitOrigin::Principal,
             unknown_field_mode,
+            app_warnings,
         )
     }
 
@@ -2327,6 +2359,9 @@ impl ManagerDaemonService {
         origin: SubmitOrigin,
         // The request's `allow_unknown_fields`.
         unknown_field_mode: UnknownFieldMode,
+        // Warnings found before the submit: apps' answers to their validate
+        // calls (`ask_apps_to_validate`).
+        app_warnings: Vec<String>,
     ) -> Result<SubmittedJob, Status> {
         if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
             subs.push(Submission {
@@ -2336,11 +2371,16 @@ impl ManagerDaemonService {
             });
         }
 
+        // The keys installed apps add to the jobspec: the parse resolves
+        // extension values against them (docs/apps.md, "Jobspec extensions").
+        let registry = self.extension_registry()?;
         let (mut config, kv_refs, unknown_fields) =
-            resolve_jobspec_kv_references(&self.store, js, unknown_field_mode).map_err(|e| {
-                error!("Error parsing jobspec: {:?}", e);
-                Status::invalid_argument(format!("Error parsing jobspec: {e}"))
-            })?;
+            resolve_jobspec_kv_references(&self.store, js, unknown_field_mode, &registry).map_err(
+                |e| {
+                    error!("Error parsing jobspec: {:?}", e);
+                    Status::invalid_argument(format!("Error parsing jobspec: {e}"))
+                },
+            )?;
         // The namespace is resolved before anything is scoped: every check
         // below runs against `config.name`, which is now the canonical id.
         let namespace = self.admit_job_namespace(&mut config, js, namespace)?;
@@ -2399,6 +2439,17 @@ impl ManagerDaemonService {
         // policy's default pool lands in the stored config); quota and
         // `maxJobs` inside the store's submit entry.
         self.admit_namespace_policies(&mut config)?;
+        // Extension values, beyond their schemas: a key that a core field
+        // now shadows, and each new or changed value's `requires`, checked
+        // as the submitter against the job's previous version.
+        if !config.extensions.is_empty() || registry.keys().iter().any(|key| key.shadowed) {
+            let previous = self
+                .store
+                .get_job_config_optional(&config.name)
+                .map_err(|e| map_store_error("Error loading the job's previous version", e))?;
+            self.check_shadowed_keys(&config, previous.as_ref(), js, &registry)?;
+            self.enforce_extension_requires(identity, &config, previous.as_ref(), &registry)?;
+        }
 
         if let Some(template) = template {
             self.enforce_template_collision_guard(identity, &config.name, template)?;
@@ -2539,6 +2590,11 @@ impl ManagerDaemonService {
                 .len();
         }
 
+        let in_place = if matches!(submit_outcome, JobSubmitOutcome::Updated { .. }) {
+            self.update_in_place(&config, &job_config_id)?
+        } else {
+            None
+        };
         let (eval_kind, message) = match submit_outcome {
             JobSubmitOutcome::Unchanged { .. } => {
                 if force_reschedule {
@@ -2580,17 +2636,30 @@ impl ManagerDaemonService {
                 }
             }
             JobSubmitOutcome::Created { .. } => (Some("job_submit"), "Job submit success"),
-            JobSubmitOutcome::Updated { .. }
-                if self.update_autoscale_in_place(&config, &job_config_id)? =>
-            {
-                // Only `autoscale` and autoscaled tasks' `count` changed: the
-                // running allocations moved to the new version, and a
-                // `job_scale` eval converges the count (docs/autoscaling.md,
-                // "Editing the policy restarts nothing").
+            JobSubmitOutcome::Updated { .. } if in_place.is_some() => {
+                let change = in_place.expect("checked by the guard");
+                // Only `autoscale` and autoscaled tasks' `count`, or only
+                // installed apps' extension values, changed: the running
+                // allocations moved to the new version, and a `job_scale`
+                // eval converges the count, or starts a job that was not
+                // running (docs/autoscaling.md, "Editing the policy restarts
+                // nothing"; docs/apps.md, "Jobspec extensions").
                 (
                     Some("job_scale"),
-                    "Job updated in place: only autoscale (and autoscaled counts) changed, so \
-                     nothing restarts",
+                    match (change.autoscale, change.extensions) {
+                        (true, false) => {
+                            "Job updated in place: only autoscale (and autoscaled counts) \
+                             changed, so nothing restarts"
+                        }
+                        (false, _) => {
+                            "Job updated in place: only jobspec extension values changed, so \
+                             nothing restarts (the apps that own them see the new values)"
+                        }
+                        (true, true) => {
+                            "Job updated in place: only autoscale and jobspec extension values \
+                             changed, so nothing restarts"
+                        }
+                    },
                 )
             }
             JobSubmitOutcome::Updated { .. } => {
@@ -2697,6 +2766,7 @@ impl ManagerDaemonService {
             warnings: unknown_fields
                 .warnings()
                 .into_iter()
+                .chain(app_warnings)
                 .chain(self.band_submit_warnings(&config))
                 .chain(autoscale_warnings)
                 .chain(crate::task_plugins::resource_submit_warnings(&config))
@@ -2797,6 +2867,7 @@ impl ManagerDaemonService {
         &self,
         identity: &AclIdentity,
         inner: RunJobRequest,
+        app_warnings: Vec<String>,
     ) -> Result<Response<RunJobReply>, Status> {
         let idempotency_key = scoped_idempotency_key(
             identity,
@@ -2829,6 +2900,7 @@ impl ManagerDaemonService {
             None,
             inner.namespace.as_deref(),
             UnknownFieldMode::from_allow(inner.allow_unknown_fields),
+            app_warnings,
         )?;
 
         let message = submitted.message_with_warnings();
@@ -4747,6 +4819,29 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
+        // Apps whose jobspec keys ask to check their values are asked first,
+        // on the runtime (a retried request already recorded asks nobody).
+        let replay = self
+            .store
+            .idempotency_lookup(&scoped_idempotency_key(
+                &identity,
+                "run_job",
+                inner.idempotency_key.as_deref(),
+                &inner,
+            ))
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+            .is_some();
+        let app_warnings = if replay {
+            Vec::new()
+        } else {
+            self.ask_apps_to_validate(
+                &identity,
+                &inner.parsed_jobspec,
+                inner.namespace.as_deref(),
+                UnknownFieldMode::from_allow(inner.allow_unknown_fields),
+            )
+            .await?
+        };
         // Off the runtime, like `heartbeat`. `run_job_blocking` is
         // synchronous and a submit is a chain of quorum writes (the job
         // config, its status clears, KV references, the eval enqueue, the
@@ -4756,7 +4851,7 @@ impl Manager for ManagerDaemonService {
         // `spawn_blocking` await waits behind them for a thread to resume
         // on: measured on the AWS rig as 14-78ms per eval outside every
         // instrumented phase, about as long again as the plan itself.
-        run_blocking_admission(|| self.run_job_blocking(&identity, inner))
+        run_blocking_admission(|| self.run_job_blocking(&identity, inner, app_warnings))
     }
 
     #[instrument(skip_all)]
@@ -4969,11 +5064,14 @@ impl Manager for ManagerDaemonService {
             .await
             .map_err(template_eval_status)?;
 
-        let (mut config, kv_refs, _) =
-            resolve_jobspec_kv_references(&self.store, &rendered, UnknownFieldMode::Reject)
-                .map_err(|e| {
-                    Status::invalid_argument(format!("rendered jobspec is invalid: {e}"))
-                })?;
+        let registry = self.extension_registry()?;
+        let (mut config, kv_refs, _) = resolve_jobspec_kv_references(
+            &self.store,
+            &rendered,
+            UnknownFieldMode::Reject,
+            &registry,
+        )
+        .map_err(|e| Status::invalid_argument(format!("rendered jobspec is invalid: {e}")))?;
         let namespace =
             self.admit_job_namespace(&mut config, &rendered, inner.namespace.as_deref())?;
         acl::enforce(
@@ -5070,6 +5168,16 @@ impl Manager for ManagerDaemonService {
             version: template.version,
         };
 
+        // Apps whose jobspec keys ask to check their values, asked before
+        // the submit (docs/apps.md, "Jobspec extensions").
+        let app_warnings = self
+            .ask_apps_to_validate(
+                &identity,
+                &rendered,
+                inner.namespace.as_deref(),
+                UnknownFieldMode::from_allow(inner.allow_unknown_fields),
+            )
+            .await?;
         // Off the runtime for the same reason as `run_job`: the submit and
         // the idempotency record are blocking quorum writes.
         let submitted = run_blocking_admission(|| {
@@ -5082,6 +5190,7 @@ impl Manager for ManagerDaemonService {
                 Some(&provenance),
                 inner.namespace.as_deref(),
                 UnknownFieldMode::from_allow(inner.allow_unknown_fields),
+                app_warnings,
             )?;
             info!(
                 template = %template.name,
@@ -5159,11 +5268,19 @@ impl Manager for ManagerDaemonService {
             .job_unknown_fields_record(&name)
             .map_err(|e| map_store_error("Error loading job provenance", e))?
             .map(crate::structs::UnknownFieldsRecord::from);
+        // Installed apps' values, as they read now against the apps
+        // installed now (docs/apps.md, "Jobspec extensions").
+        // (The read model's cached task configs: no JSON parse per call.)
+        let extensions = match self.store.job_status_and_latest_config(&name) {
+            Ok((_, config)) => self.job_extension_values(&config),
+            Err(_) => Vec::new(),
+        };
         let reply = GetJobInfoReply {
             job: Some(job),
             template,
             managed_by,
             unknown_fields,
+            extensions,
         };
 
         Ok(Response::new(reply))
@@ -5802,10 +5919,12 @@ impl Manager for ManagerDaemonService {
             return Err(Status::invalid_argument("Plan request missing jobspec"));
         }
 
+        let registry = self.extension_registry()?;
         let (mut config, kv_refs, unknown_fields) = resolve_jobspec_kv_references(
             &self.store,
             &jobspec,
             UnknownFieldMode::from_allow(inner.allow_unknown_fields),
+            &registry,
         )
         .map_err(|e| {
             error!("Error parsing jobspec for plan: {:?}", e);
@@ -6077,6 +6196,7 @@ impl Manager for ManagerDaemonService {
                     policy_json: task.resolved.policy.canonical_json(),
                 })
                 .collect(),
+            extensions: self.job_extension_values(&config),
         };
 
         Ok(Response::new(reply))
@@ -12079,6 +12199,25 @@ impl Manager for ManagerDaemonService {
         self.get_app_page_rpc(request).await
     }
 
+    // ACL: job:read (in the handler).
+    async fn get_job_schema(
+        &self,
+        request: Request<crate::structs::GetJobSchemaRequest>,
+    ) -> Result<Response<crate::structs::GetJobSchemaReply>, Status> {
+        self.get_job_schema_rpc(request).await
+    }
+
+    type WatchAppExtensionsStream =
+        ReceiverStream<Result<crate::structs::AppExtensionEvent, Status>>;
+
+    // ACL: app-plane (in the handler).
+    async fn watch_app_extensions(
+        &self,
+        request: Request<crate::structs::WatchAppExtensionsRequest>,
+    ) -> Result<Response<Self::WatchAppExtensionsStream>, Status> {
+        self.watch_app_extensions_rpc(request).await
+    }
+
     #[instrument(skip_all, fields(job))]
     async fn revoke_grant(
         &self,
@@ -15483,6 +15622,7 @@ mod tests {
             rollout_by_group: Default::default(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(job_name)?.id();
@@ -15560,6 +15700,7 @@ mod tests {
             rollout_by_group: Default::default(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         Ok(())
@@ -15643,6 +15784,7 @@ mod tests {
                 rollout_by_group: Default::default(),
                 version: None,
                 pending_extensions: Default::default(),
+                extensions: Default::default(),
             })
         };
         store.handle_job_submit(
@@ -15711,6 +15853,7 @@ mod tests {
                 rollout_by_group: Default::default(),
                 version: None,
                 pending_extensions: Default::default(),
+                extensions: Default::default(),
             },
             &[submission()],
         )?;
@@ -16131,6 +16274,7 @@ mod tests {
             rollout_by_group: Default::default(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(job_name)?.id();
@@ -16343,6 +16487,7 @@ mod tests {
             rollout_by_group: Default::default(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let launch = build_rollout_launch_config(&config)?;
         assert_eq!(launch.strategy.as_deref(), Some("default"));
@@ -16369,6 +16514,7 @@ mod tests {
             rollout_by_group: Default::default(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let launch = build_rollout_launch_config(&config)?;
         assert_eq!(launch.progression.as_deref(), Some("manual"));
@@ -18441,6 +18587,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -18459,6 +18606,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -18537,6 +18685,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -18555,6 +18704,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -18636,6 +18786,7 @@ mod tests {
             tasks: vec![task],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job_name)?.id();
@@ -18711,6 +18862,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -18808,6 +18960,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -18875,6 +19028,7 @@ mod tests {
             tasks: vec![TaskConfig::new("store", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19218,6 +19372,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19317,6 +19472,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19387,6 +19543,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19426,6 +19583,7 @@ mod tests {
             tasks: vec![TaskConfig::new("task", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19498,6 +19656,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -19516,6 +19675,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -19594,6 +19754,7 @@ mod tests {
             ],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -19630,6 +19791,7 @@ mod tests {
             ],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -19762,6 +19924,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -19778,6 +19941,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -19947,6 +20111,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -19981,6 +20146,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -20060,6 +20226,7 @@ mod tests {
             ],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -20226,6 +20393,7 @@ mod tests {
             tasks: vec![TaskConfig::new("api", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         async fn status_of(manager: &ManagerDaemonService) -> R<String> {
@@ -20286,6 +20454,7 @@ mod tests {
             tasks: vec![task],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -20543,6 +20712,7 @@ mod tests {
             tasks,
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(name)?.id();

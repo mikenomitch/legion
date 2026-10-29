@@ -323,6 +323,7 @@ fn job(archive: &str, on_restore_failure: Option<&str>) -> JobConfig {
         rollout_by_group: Default::default(),
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

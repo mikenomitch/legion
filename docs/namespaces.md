@@ -204,13 +204,18 @@ managers' [system workers](architecture-managers-workers.md#the-system-worker).
 
   ```nickel
   { name = "legion-system", namespaces = ["legion-system"],
-    pools = { default = "legion-system" } }
+    pools = { default = ["legion-system", "default"] } }
   ```
 
-  A job in `legion-system` whose permit names no pool therefore runs in the
-  `legion-system` pool, which is where the managers' system workers are. The
-  policy is an ordinary one: an operator may edit or delete it, and Legion
-  never writes it again.
+  A job in `legion-system` whose permit names no pool therefore may run in
+  the `legion-system` pool, which is where the managers' system workers are,
+  or in `default`, where a `--run-worker` manager's worker is (a dev
+  cluster). It does not reach ordinary workers in `default`: their
+  `namespaces` (by default `["*"]`) refuse `legion-system`, and that, not
+  the pool, is the boundary ([Nodes that accept only some namespaces](#nodes-that-accept-only-some-namespaces)).
+  The policy is an ordinary one: an operator may edit or delete it, and
+  Legion never writes it again. A cluster created before this release keeps
+  the single-pool default it was created with.
 - **Nobody can create, rename, or delete one.** `legion namespace create
   legion-x` is refused, and so is deleting `legion-system`:
 
@@ -569,7 +574,7 @@ purpose:
 | `maxJobs` | Jobs (any state) across every matching namespace |
 | `maxNamespaces` | Namespaces matching the policy |
 | `pools.allowed` | Pool names or globs every task must run in |
-| `pools.default` | The pool a task whose permit names none lands in (must be within `allowed`) |
+| `pools.default` | The pool a task whose permit names none lands in, or a list of pools it may land in (`["legion-system", "default"]`, rendered as a `pool matches ^(…)$` permit). Each must be within `allowed`, and a pool name, not a glob |
 | `runtimes` | Allowed task runtimes, names or globs |
 | `hostVolumes` | Allowed host volumes (`driver = "host"`, by `params.name`), names or globs |
 | `autoscale` | Autoscaling defaults for every task in the matching namespaces: the jobspec `autoscale` record without `checks`, overriding the cluster's scaling defaults field by field, and live ([autoscaling.md](autoscaling.md#overriding-the-defaults)). Its `min` must be a multiple of `count` of at least `"1x"` |

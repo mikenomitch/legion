@@ -419,4 +419,14 @@ fn run_worker_keeps_running_every_namespace_on_the_manager_test() {
     let run = cluster.cli_json(&["job", "run", &agent]);
     assert_eq!(run["ok"], true, "{run}");
     cluster.wait_placed("legion-system/agent", &id);
+
+    // A hand-written legion-system job that names no pool places too: the
+    // legion-system namespace policy defaults to both pools.
+    let plain = cluster.write_job(
+        "plain",
+        job("plain", serde_json::json!({ "namespace": "legion-system" })),
+    );
+    let run = cluster.cli_json(&["job", "run", &plain]);
+    assert_eq!(run["ok"], true, "{run}");
+    cluster.wait_placed("legion-system/plain", &id);
 }

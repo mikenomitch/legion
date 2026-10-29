@@ -905,6 +905,7 @@ mod tests {
             tasks: vec![serde_json::from_value(task)?],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &config,

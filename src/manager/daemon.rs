@@ -644,6 +644,15 @@ pub async fn run_manager_with(
         },
     );
     manager_node.set_app_nudge(app_nudge);
+    // Load the jobspec keys installed apps add, now rather than at the first
+    // submit, so a key a core field of this release shadows is logged at
+    // start (docs/apps.md, "Keys cannot collide").
+    if let Err(status) = manager_node.extension_registry() {
+        warn!(
+            "Could not read installed apps' jobspec keys: {}",
+            status.message()
+        );
+    }
 
     let addr: std::net::SocketAddr =
         format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
@@ -1582,6 +1591,7 @@ fn seed_ui_test_data(store: &Store) -> R<()> {
         rollout_by_group: Default::default(),
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
 
     let submit_outcome = store.handle_job_submit(
@@ -3930,7 +3940,7 @@ fn ensure_system_namespace(store: &Store) -> R<()> {
         info!(
             namespace = crate::structs::namespace::SYSTEM_NAMESPACE,
             "Created the legion-system namespace and its namespace policy (pools.default = \
-             \"legion-system\")"
+             [\"legion-system\", \"default\"])"
         );
     }
     Ok(())
@@ -4820,6 +4830,7 @@ mod tests {
             tasks: vec![TaskConfig::new("svc", "noop")],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,

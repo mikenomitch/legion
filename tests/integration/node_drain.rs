@@ -204,6 +204,7 @@ fn stateless_job(name: &str, count: u32, constraints: serde_json::Value) -> JobC
         }],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

@@ -214,9 +214,12 @@ pub struct AppManifest {
     /// written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<Value>,
-    /// Jobspec extension keys (apps plan §6.6). Stored as written; resolved
-    /// from phase A6 on.
+    /// Jobspec extension keys (apps plan §6.6; docs/apps.md, "Jobspec
+    /// extensions"): a list of `crate::structs::extensions::ExtensionDecl`,
+    /// checked at install and kept as JSON so a record round-trips as
+    /// written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Vec<crate::structs::extensions::ExtensionDecl>>")]
     pub extensions: Option<Value>,
     /// The app's config: its JSON Schema and its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -341,14 +344,12 @@ impl AppManifest {
             spec.validate(&self.port_labels())
                 .map_err(|err| format!("app {}: {err}", self.name))?;
         }
-        if let Some(extensions) = &self.extensions {
-            if !extensions.is_array() && !extensions.is_object() {
-                return Err(format!(
-                    "app {}: `extensions` must be a list of key declarations",
-                    self.name
-                ));
-            }
-        }
+        // Jobspec keys (apps plan §6.6): checked on their own here; against
+        // the other installed apps' keys at install and upgrade.
+        let decls = crate::structs::extensions::manifest_decls(self)
+            .map_err(|err| format!("app {}: {err}", self.name))?;
+        crate::structs::extensions::validate_decls(&self.name, &decls, &BTreeMap::new())
+            .map_err(|err| format!("app {}: {err}", self.name))?;
         let schema = self.config_schema();
         let compiled = compile_config_schema(&schema)
             .map_err(|err| format!("app {}: config.schema: {err}", self.name))?;
@@ -619,6 +620,11 @@ pub struct AppSettings {
     /// The worker pool for `workers` and `any` placement. Default `default`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
+    /// Jobspec keys installed under another name (`legion app install
+    /// --key volume.backup=pgbackup`): extension point → the key job
+    /// authors write there instead of the declared one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: BTreeMap<String, String>,
 }
 
 impl AppSettings {
@@ -629,6 +635,7 @@ impl AppSettings {
             placement: manifest.placement,
             resources: None,
             pool: None,
+            keys: BTreeMap::new(),
         }
     }
 
@@ -819,39 +826,7 @@ pub struct ManagedBy {
 /// [`MAX_CONFIG_SCHEMA_BYTES`], and only local `$ref`s, because the
 /// validator resolves remote refs over HTTP by default.
 pub fn compile_config_schema(schema: &Value) -> Result<jsonschema::JSONSchema, String> {
-    if !schema.is_object() {
-        return Err("must be a JSON Schema object".into());
-    }
-    let size = schema.to_string().len();
-    if size > MAX_CONFIG_SCHEMA_BYTES {
-        return Err(format!(
-            "is {size} bytes; the limit is {MAX_CONFIG_SCHEMA_BYTES}"
-        ));
-    }
-    if let Some(remote) = first_remote_ref(schema) {
-        return Err(format!(
-            "$ref {remote:?} is not local; only refs into the schema itself (\"#/…\") are allowed"
-        ));
-    }
-    jsonschema::JSONSchema::options()
-        .with_draft(jsonschema::Draft::Draft7)
-        .compile(schema)
-        .map_err(|err| format!("is not a valid JSON Schema: {err}"))
-}
-
-fn first_remote_ref(value: &Value) -> Option<String> {
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::String(reference)) = map.get("$ref") {
-                if !reference.starts_with('#') {
-                    return Some(reference.clone());
-                }
-            }
-            map.values().find_map(first_remote_ref)
-        }
-        Value::Array(items) => items.iter().find_map(first_remote_ref),
-        _ => None,
-    }
+    crate::structs::extensions::compile_schema(schema, MAX_CONFIG_SCHEMA_BYTES)
 }
 
 /// Check a config against a compiled schema; every error, with its path.
@@ -2100,8 +2075,43 @@ mod app_tests {
             ui.action("sync-now").map(|action| action.mutating()),
             Some(true)
         );
-        let rendered = render_app_job(&record(manifest), NO_MARKER).expect("renders");
+        let rendered = render_app_job(&record(manifest.clone()), NO_MARKER).expect("renders");
         serde_json::from_value::<crate::structs::JobConfig>(rendered.jobspec).expect("a jobspec");
+
+        // The example job sets the app's keys, and parses against them.
+        let (registry, problems) =
+            crate::structs::extensions::ExtensionRegistry::from_records(&[record(manifest)]);
+        assert!(problems.is_empty(), "{problems:?}");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/configs/apps/example-app-job.ncl"
+        );
+        let job = crate::config_lang::eval_file(path).expect("evaluates");
+        let (config, _) = crate::structs::JobConfig::parse_submitted_str(
+            &job,
+            crate::structs::spec_fields::UnknownFieldMode::Reject,
+            crate::structs::spec_fields::ExtensionCheck::Installed(&registry),
+        )
+        .expect("the example job parses against the example app's keys");
+        let keys: Vec<(&str, &str, &str)> = config
+            .extensions
+            .iter()
+            .map(|value| {
+                (
+                    value.point.as_str(),
+                    value.key.as_str(),
+                    value.path.group.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("job", "gitops", ""),
+                ("group", "apps.gitops", "background"),
+                ("group", "syncWave", "frontend"),
+            ]
+        );
     }
 
     #[test]

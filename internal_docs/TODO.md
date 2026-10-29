@@ -4360,32 +4360,18 @@ replicas is one command on day N. The shared substrate is
 [legion-apps-plan.md](plans/legion-apps-plan.md); each app still needs its own
 plan.
 
-- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (IN EXECUTION; A1, A2,
-      A3, A4, A5 and A6a shipped, in Done) · [calls](calls/legion-apps-plan_calls.md)
+- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (SHIPPED; every
+      phase, A1-A6, is in Done; what follows are follow-ups and deferrals) · [calls](calls/legion-apps-plan_calls.md)
   - [ ] A1 follow-ups, found while building it:
-    - [ ] **A manager's system worker and a standalone worker on one Linux
-          host overwrite each other's host guard.** The kernel host guard is
-          one `nftables` table (`legion_host_guard`) and the eBPF classifier
-          one pin directory (`/sys/fs/bpf/legion`) per host, and each worker
-          rewrites them with only its own allocations. Name both after the
-          worker's cgroup parent. Documented as a limitation in
-          [architecture-managers-workers.md](../docs/architecture-managers-workers.md#the-system-worker).
-    - [ ] **A hand-written `legion-system` job with no permit does not place
-          on a `--run-worker` dev cluster.** The `legion-system` namespace
-          policy sends it to pool `legion-system` (`pools.default`), and a
-          `--run-worker` manager's worker is in `default`, so plan §6.2's
-          "lands on managers too" holds only with a system worker. A3's
-          rendered permits (both pools, `legion.role = "manager"`) place
-          fine (`tests/integration/system_worker.rs`). Decide whether the
-          policy should allow both pools by default.
+    - [ ] **Run the per-worker host-guard naming as root**: the system
+          worker's table (`legion_host_guard_legion-system`) and pin
+          directory are unit-tested, not exercised by the root-only kernel
+          tests; two workers sharing one cgroup parent still collide
+          ([calls 95](calls/legion-apps-plan_calls.md)).
     - [ ] **Verify the system worker's `cpu.max` ceiling on a cgroup v2
           host** with a busy loop (plan §9 A1). It is unit-tested on a
           scratch tree (`parent_limits_cap_the_whole_hierarchy_test`); CI and
           the dev container have no cgroup v2.
-    - [ ] **The `pools` ACL selector does not reserve `legion-system`**:
-          `node:write` with `pools = ["*"]` can cordon or drain the managers'
-          system workers. Apply the reserved rule to pool selectors too, or
-          decide it is fine.
   - [ ] A2 follow-ups, found while building it:
     - [ ] **Sandboxes have no API socket.** They get the `legion` token file
           (`/legion/identity/secrets/legion.token`) but no `LEGION_ADDR`, so
@@ -4456,19 +4442,19 @@ plan.
           `ProxyTunnel`** when that plan ships, and list it in the
           worker-plane-auth plan §6.1
           ([calls 70](calls/legion-apps-plan_calls.md)).
-  - [ ] A6b: jobspec extensions. Natural extension keys that apps declare
-        at fixed points (job, group via a task, task, volume, port,
-        service), validated against the app's JSON Schema (the task-runtime
-        schema pattern). Collisions are refused at install, `--key`
-        renames, and `apps.<app>` is a qualified spelling that never
-        collides. Plus an optional validate call that fails open,
-        `WatchAppExtensions`, a new `GetJobSchema` RPC (today
-        `job schema`/`job validate` are CLI-local), live schema defaults,
-        did-you-mean over installed app keys, adoption of `pendingExtensions`
-        when an app declaring the key is installed, and in-place version
-        moves for extension-only changes (a new check in `run_job`'s
-        `Updated` branch, which today always rolls out; a pending-only
-        change rolls out too, [calls entry 62](calls/legion-apps-plan_calls.md)).
+  - [ ] A6b follow-ups, found while building it:
+    - [ ] **No `legion app set --key`**: an extension key can be renamed
+          only at install ([calls 89](calls/legion-apps-plan_calls.md)).
+    - [ ] **Adopted pending values are not persisted** until the job's next
+          submit ([calls 86](calls/legion-apps-plan_calls.md)).
+    - [ ] **`job plan` and `job validate` skip `requires` and the validate
+          call**, so a plan can pass what the run refuses
+          ([calls 87](calls/legion-apps-plan_calls.md)).
+    - [ ] **`WatchAppExtensions` polls the store per stream** (1s
+          fingerprint, 30s full read); event-driven delivery would cut the
+          cost ([calls 90](calls/legion-apps-plan_calls.md)).
+    - [ ] **No Nickel contract library for app keys**: authors get JSON
+          Schema errors at submit, not Nickel contract errors at eval.
   - [ ] A6a follow-ups:
     - [ ] **Free-form maps are not checked**: `resources = { memroy = 512 }`
           is accepted and blocks the job on a dimension no node offers,
@@ -6557,6 +6543,37 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         with the `PAGE_RPCS` allowlist re-checked by the manager and an
         SPA-owned confirmation for every write
   - [x] Playwright smoke tests (`npm run test:smoke` in `ui/`)
+- [x] **Legion apps A6b: jobspec extensions** (2026-10-29,
+      [plan](plans/legion-apps-plan.md) §6.6, §8 ·
+      [calls 85-94](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md#jobspec-extensions),
+      [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#extension-keys),
+      [agent-readiness.md](../docs/agent-readiness.md),
+      [upgrades.md](../docs/upgrades.md))
+  - [x] Manifest `extensions[]` (point, key, schema, examples, `validate`,
+        `requires`) at the job, group, task, volume, port and service
+        points; keys resolved at submit with the `apps.<app>` spelling and
+        did-you-mean over installed keys; JSON Schema draft 7 with local
+        `$ref`s only and defaults filled on read
+  - [x] Collisions refused at install (core fields, other apps), `--key`
+        renames, shadowed-key detection; `requires` as the submitter; the
+        fail-open validate call over the app forward
+  - [x] `GetJobSchema` (`legion job schema`, `job validate`,
+        `legion_job_schema`), `WatchAppExtensions`, values in `job info`
+        and `job plan`, `legion app extensions`; pending values adopted on
+        install; upgrade re-validation; `uninstall --force` leaving values
+        orphaned
+  - [x] Extension-only resubmits move allocations in place (same ids, no
+        rollout)
+- [x] **Legion apps A1 follow-ups** (2026-10-29,
+      [calls 95-97](calls/legion-apps-plan_calls.md))
+  - [x] The host guard's `nftables` table and BPF pin directory are named
+        after the worker's cgroup parent, so a system worker and a
+        standalone worker on one host stop overwriting each other
+  - [x] `*` pool globs no longer reach reserved `legion-` pools
+  - [x] `pools.default` takes a list; `legion-system` defaults to
+        `["legion-system", "default"]`, so its jobs place on a
+        `--run-worker` dev cluster
 - [x] **Legion apps A6a: strict jobspec fields** (2026-10-28,
       [plan](plans/legion-apps-plan.md) §6.6, §8 ·
       [calls 58-67](calls/legion-apps-plan_calls.md) · docs:

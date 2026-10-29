@@ -42,7 +42,8 @@ pub const RESERVED_NAMESPACE_PREFIX: &str = "legion-";
 /// The namespace Legion's own operational jobs live in. The first manager to
 /// lead the control lane of an empty store creates it, together with the
 /// namespace policy of the same name that sends its jobs to the managers'
-/// system workers (`pools.default = "legion-system"`).
+/// system workers, or a `--run-worker` manager's worker (`pools.default =
+/// ["legion-system", "default"]`).
 pub const SYSTEM_NAMESPACE: &str = "legion-system";
 
 /// Whether `name` is in the reserved `legion-` space.

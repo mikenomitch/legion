@@ -189,6 +189,7 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
         rollout_by_group: Default::default(),
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let submission = Submission {
         path: "sim-it.ncl".into(),

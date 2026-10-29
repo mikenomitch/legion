@@ -199,6 +199,7 @@ fn stateful_job(name: &str, count: u32, driver: &str, params: Option<Value>) -> 
         rollout_by_group: Default::default(),
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -334,6 +335,7 @@ fn a_dry_run_plan_never_reads_another_jobs_volume_pins() -> R<()> {
         rollout_by_group: Default::default(),
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let scheduler = Scheduler::new(&cluster.store)?;
     let preview = scheduler.plan_for_config(&web, PlanMode::Fresh, None)?;
@@ -620,6 +622,7 @@ fn stateless_jobs_create_no_volumes() -> R<()> {
         rollout_by_group: Default::default(),
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     })?;
     assert!(
         cluster.volumes()?.is_empty(),

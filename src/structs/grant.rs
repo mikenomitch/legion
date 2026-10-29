@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::structs::acl::{
     glob_match, AclAction, AclIdentity, AclResource, AclRule, AclScope, RESERVED_KV_PREFIX,
+    RESERVED_POOL_PREFIX,
 };
 use crate::structs::namespace::RESERVED_NAMESPACE_PREFIX;
 use crate::structs::workload_identity::CONTROL_PLANE_IDENTITY_NAME;
@@ -331,7 +332,7 @@ fn held_covers(held: &AclRule, atom: &Atom<'_>) -> bool {
     namespace_covered(held, requested, &atom.namespace)
         && path_covered(held, &atom.path)
         && plain_covered(&held.names, &requested.names)
-        && plain_covered(&held.pools, &requested.pools)
+        && pools_covered(&held.pools, &requested.pools)
         && plain_covered(&held.action_names, &requested.action_names)
         && plain_covered(&held.templates, &requested.templates)
         && plain_covered(&held.bands, &requested.bands)
@@ -380,9 +381,30 @@ fn path_covered(held: &AclRule, atom: &Pattern) -> bool {
     }
 }
 
-/// A plain selector (`names`, `pools`, `actionNames`, `templates`,
-/// `bands`): a held rule without it covers anything; one with it covers
-/// only requested patterns it matches, and never a request without it.
+/// A requested `pools` selector against a held one, under the reserved-
+/// prefix rule for `legion-*` pools (the managers' system workers): a held
+/// rule without the selector reaches what `*` reaches, so it covers a
+/// request without one and every requested pattern that reaches no
+/// reserved pool; one with it covers a requested pattern only through a
+/// held pattern that covers it under the rule, and never a request without
+/// it.
+fn pools_covered(held: &Option<Vec<String>>, requested: &Option<Vec<String>>) -> bool {
+    match (held, requested) {
+        (None, None) => true,
+        (None, Some(requested)) => requested
+            .iter()
+            .all(|pattern| !pattern.starts_with(RESERVED_POOL_PREFIX)),
+        (Some(_), None) => false,
+        (Some(held), Some(requested)) => requested.iter().all(|pattern| {
+            held.iter()
+                .any(|glob| pattern_covers(glob, pattern, RESERVED_POOL_PREFIX))
+        }),
+    }
+}
+
+/// A plain selector (`names`, `actionNames`, `templates`, `bands`): a held
+/// rule without it covers anything; one with it covers only requested
+/// patterns it matches, and never a request without it.
 fn plain_covered(held: &Option<Vec<String>>, requested: &Option<Vec<String>>) -> bool {
     match (held, requested) {
         (None, _) => true,
@@ -410,9 +432,23 @@ fn reserved_is_why(rules: &[AclRule], atom: &Atom<'_>) -> bool {
     let reserved_namespace =
         matches!(&atom.namespace, Pattern::Glob(p) if p.starts_with(RESERVED_NAMESPACE_PREFIX));
     let reserved_path = matches!(&atom.path, Pattern::Glob(p) if p.starts_with(RESERVED_KV_PREFIX));
-    if !reserved_namespace && !reserved_path {
+    let reserved_pool = atom.rule.pools.as_ref().is_some_and(|pools| {
+        pools
+            .iter()
+            .any(|pool| pool.starts_with(RESERVED_POOL_PREFIX))
+    });
+    if !reserved_namespace && !reserved_path && !reserved_pool {
         return false;
     }
+    let unreserved_rule = AclRule {
+        pools: atom.rule.pools.as_ref().map(|pools| {
+            pools
+                .iter()
+                .map(|pool| pool.trim_start_matches(RESERVED_POOL_PREFIX).to_string())
+                .collect()
+        }),
+        ..atom.rule.clone()
+    };
     let plain = |pattern: &Pattern| match pattern {
         Pattern::Glob(p) => Pattern::Glob(
             p.trim_start_matches(RESERVED_NAMESPACE_PREFIX)
@@ -422,7 +458,7 @@ fn reserved_is_why(rules: &[AclRule], atom: &Atom<'_>) -> bool {
         Pattern::Unset => Pattern::Unset,
     };
     let unreserved = Atom {
-        rule: atom.rule,
+        rule: &unreserved_rule,
         resource: atom.resource,
         action: atom.action,
         namespace: plain(&atom.namespace),

@@ -41,6 +41,7 @@ fn make_job_config(name: &str, count: u32) -> JobConfig {
         tasks: vec![task],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -395,6 +396,7 @@ fn dag_job(name: &str) -> JobConfig {
         ],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -680,6 +682,7 @@ fn job_of(name: &str, tasks: Vec<TaskConfig>) -> JobConfig {
         tasks,
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

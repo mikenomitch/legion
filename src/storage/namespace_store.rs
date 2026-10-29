@@ -313,12 +313,19 @@ impl Store {
         let mut policy = crate::structs::namespace_policy::NamespacePolicy {
             name: SYSTEM_NAMESPACE.to_string(),
             description: "Jobs in legion-system that name no pool run on the managers' system \
-                          workers"
+                          workers, or on a --run-worker manager's worker"
                 .to_string(),
             namespaces: vec![SYSTEM_NAMESPACE.to_string()],
+            // Both pools: the system workers' (`legion-system`) and the one a
+            // `--run-worker` manager's worker joins (`default`). The pool is
+            // not what keeps legion-system off ordinary workers; their
+            // `namespaces` is (a node with the default `["*"]` refuses it).
             pools: Some(crate::structs::namespace_policy::PoolRule {
                 allowed: None,
-                default: Some(SYSTEM_NAMESPACE.to_string()),
+                default: Some(crate::structs::namespace_policy::PoolDefault::Many(vec![
+                    SYSTEM_NAMESPACE.to_string(),
+                    "default".to_string(),
+                ])),
             }),
             ..Default::default()
         };
@@ -522,6 +529,7 @@ mod namespace_store_test {
             rollout_by_group: Default::default(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 
@@ -603,8 +611,11 @@ mod namespace_store_test {
             .policy;
         assert_eq!(policy.namespaces, vec![SYSTEM_NAMESPACE.to_string()]);
         assert_eq!(
-            policy.pools.and_then(|pools| pools.default).as_deref(),
-            Some(SYSTEM_NAMESPACE)
+            policy
+                .pools
+                .and_then(|pools| pools.default)
+                .map(|default| default.label()),
+            Some(format!("{SYSTEM_NAMESPACE}, default"))
         );
 
         let err = store

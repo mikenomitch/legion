@@ -38,6 +38,9 @@ use crate::structs::app_ui::{
     AssertionKind, AssertionScope, ViewContext, ViewerAssertion, ACTION_PATH_PREFIX,
     ASSERTION_CLAIM, ASSERTION_TTL_SECS, MAX_PAGE_BYTES, PAGE_PATH_PREFIX, VIEW_PATH_PREFIX,
 };
+use crate::structs::extensions::{
+    validate_context, ValidateAnswer, ValidateCall, ValidateResult, VALIDATE_PATH,
+};
 use futures::future::BoxFuture;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use std::future::Future;
@@ -118,6 +121,18 @@ pub struct ActionRequest {
     pub viewer: Viewer,
 }
 
+/// A submit's request to check this app's jobspec extension values
+/// (`POST /legion/v1/extensions/validate`; docs/apps.md, "Jobspec
+/// extensions"), verified: the job, its values for the app's keys with
+/// their context, and the submitter as the viewer. The handler answers one
+/// [`ValidateResult`] per value, in order: errors reject the submit,
+/// warnings pass through to its reply.
+#[derive(Debug, Clone)]
+pub struct ValidateRequest {
+    pub call: ValidateCall,
+    pub viewer: Viewer,
+}
+
 /// A page request, verified: the page's bundle, for this viewer.
 #[derive(Debug, Clone)]
 pub struct PageRequest {
@@ -166,6 +181,8 @@ type ViewHandler = Arc<dyn Fn(ViewRequest) -> BoxFuture<'static, R<AppView>> + S
 type ActionHandler =
     Arc<dyn Fn(ActionRequest) -> BoxFuture<'static, R<ActionOutcome>> + Send + Sync>;
 type PageHandler = Arc<dyn Fn(PageRequest) -> BoxFuture<'static, R<String>> + Send + Sync>;
+type ValidateHandler =
+    Arc<dyn Fn(ValidateRequest) -> BoxFuture<'static, R<Vec<ValidateResult>>> + Send + Sync>;
 
 /// The views and actions an app serves. Registrations may happen at any
 /// time, also after the port is up.
@@ -174,6 +191,7 @@ pub struct UiRegistry {
     views: std::sync::RwLock<HashMap<String, ViewHandler>>,
     actions: std::sync::RwLock<HashMap<String, ActionHandler>>,
     pages: std::sync::RwLock<HashMap<String, PageHandler>>,
+    validate: std::sync::RwLock<Option<ValidateHandler>>,
 }
 
 impl UiRegistry {
@@ -216,6 +234,24 @@ impl UiRegistry {
         if let Ok(mut pages) = self.pages.write() {
             pages.insert(name.to_string(), handler);
         }
+    }
+
+    /// Answer the app's validate call (the keys its manifest declares with
+    /// `validate = true`) from `handler`. Without one, the framework answers
+    /// that every value passes.
+    pub fn validate<F, Fut>(&self, handler: F)
+    where
+        F: Fn(ValidateRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R<Vec<ValidateResult>>> + Send + 'static,
+    {
+        let handler: ValidateHandler = Arc::new(move |request| Box::pin(handler(request)));
+        if let Ok(mut validate) = self.validate.write() {
+            *validate = Some(handler);
+        }
+    }
+
+    fn validate_handler(&self) -> Option<ValidateHandler> {
+        self.validate.read().ok()?.clone()
     }
 
     fn page_handler(&self, name: &str) -> Option<PageHandler> {
@@ -682,6 +718,11 @@ impl UiServer {
                 return UiAnswer::error(405, "pages are fetched with GET");
             }
             (AssertionKind::Page, name)
+        } else if path == VALIDATE_PATH {
+            if method != "POST" {
+                return UiAnswer::error(405, "extension values are validated with POST");
+            }
+            (AssertionKind::Validate, "validate")
         } else {
             return UiAnswer::error(404, "not found");
         };
@@ -703,7 +744,29 @@ impl UiServer {
             Ok(verified) => verified,
             Err(refusal) => return UiAnswer::error(refusal.status(), refusal.message()),
         };
+        let mut validate_call = None;
         let (context, inputs) = match kind {
+            AssertionKind::Validate => {
+                if body.len() > MAX_ACTION_BODY {
+                    return UiAnswer::error(413, "the validate request is too large");
+                }
+                let raw: Value = match serde_json::from_slice(body) {
+                    Ok(raw) => raw,
+                    Err(err) => {
+                        return UiAnswer::error(400, format!("the validate request: {err}"))
+                    }
+                };
+                match serde_json::from_value::<ValidateCall>(raw.clone()) {
+                    Ok(call) => {
+                        let context = validate_context(&call.job);
+                        validate_call = Some(call);
+                        (context, Some(raw))
+                    }
+                    Err(err) => {
+                        return UiAnswer::error(400, format!("the validate request: {err}"))
+                    }
+                }
+            }
             AssertionKind::View => match ViewContext::from_query(query) {
                 Ok(context) => (context, None),
                 Err(err) => return UiAnswer::error(400, err),
@@ -748,6 +811,30 @@ impl UiServer {
         let viewer = Viewer::from_assertion(&claimed);
         let slot = context.slot().ok();
         match kind {
+            AssertionKind::Validate => {
+                let call = validate_call.expect("parsed above");
+                let count = call.values.len();
+                let Some(handler) = self.registry.validate_handler() else {
+                    return UiAnswer::json(
+                        serde_json::to_value(ValidateAnswer {
+                            results: vec![ValidateResult::default(); count],
+                        })
+                        .unwrap_or_default(),
+                    );
+                };
+                match handler(ValidateRequest { call, viewer }).await {
+                    Ok(mut results) => {
+                        results.resize(count, ValidateResult::default());
+                        UiAnswer::json(
+                            serde_json::to_value(ValidateAnswer { results }).unwrap_or_default(),
+                        )
+                    }
+                    Err(err) => {
+                        warn!(error = %format!("{err:#}"), "Validating extension values failed");
+                        UiAnswer::error(500, format!("{err:#}"))
+                    }
+                }
+            }
             AssertionKind::View => {
                 let Some(handler) = self.registry.view_handler(name) else {
                     return UiAnswer::error(404, format!("this app serves no view {name:?}"));

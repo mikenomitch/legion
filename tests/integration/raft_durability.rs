@@ -360,6 +360,7 @@ fn test_job(name: &str) -> JobConfig {
         tasks: vec![TaskConfig::new("svc", "noop")],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
