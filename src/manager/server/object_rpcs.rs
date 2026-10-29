@@ -27,11 +27,12 @@ use crate::structs::app_object::{
 use crate::structs::app_ui::{inputs_digest, AssertionKind, AssertionScope, ViewerAssertion};
 use crate::structs::extensions::VALIDATE_TIMEOUT;
 use crate::structs::namespace::DEFAULT_NAMESPACE;
+use crate::structs::object_rules::evaluate_bounded;
 use crate::structs::{
     AppObject, ApplyObjectReply, ApplyObjectRequest, DeleteObjectReply, DeleteObjectRequest,
     GetObjectReply, GetObjectRequest, ListObjectKindsReply, ListObjectKindsRequest,
     ListObjectsReply, ListObjectsRequest, ObjectAuthority, ObjectCondition, ObjectEvent,
-    ObjectKind, ObjectKindColumn, ObjectRef, ObjectStatus, ReleaseObjectReply,
+    ObjectKind, ObjectKindColumn, ObjectKindRule, ObjectRef, ObjectStatus, ReleaseObjectReply,
     ReleaseObjectRequest, UpdateObjectStatusReply, UpdateObjectStatusRequest, WatchObjectsRequest,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -156,6 +157,17 @@ pub(crate) fn kind_proto(kind: &InstalledKind) -> ObjectKind {
             .map(|path| format!("/spec/{}", path.join("/")))
             .collect(),
         manifest_digest: kind.digest.clone(),
+        rules: kind
+            .rules
+            .rules
+            .iter()
+            .map(|rule| ObjectKindRule {
+                rule: rule.rule.clone(),
+                message: rule.message.clone(),
+                path: rule.path.clone().unwrap_or_default(),
+                transition: rule.transition,
+            })
+            .collect(),
     }
 }
 
@@ -368,7 +380,7 @@ pub(crate) fn objects_report(
             .iter()
             .filter_map(|row| {
                 let spec: Value = serde_json::from_str(&row.spec).unwrap_or(Value::Null);
-                kind.check_spec(&spec).err().map(|errors| {
+                kind.check_stored_spec(&spec).err().map(|errors| {
                     format!(
                         "  {}: {}",
                         object_id(&row.key.namespace, &row.key.name),
@@ -391,12 +403,17 @@ pub(crate) fn objects_report(
                 ""
             }
         );
+        let checks = if kind.rules.is_empty() {
+            "schema"
+        } else {
+            "schema and rules"
+        };
         if failing.is_empty() {
-            lines.push(format!("{lead}; every one passes this version's schema."));
+            lines.push(format!("{lead}; every one passes this version's {checks}."));
         } else {
             lines.push(format!(
-                "{lead}; {} fail{} this version's schema (flagged invalid; each must conform at \
-                 its next apply):",
+                "{lead}; {} fail{} this version's {checks} (flagged invalid; each must conform \
+                 at its next apply):",
                 failing.len(),
                 if failing.len() == 1 { "s" } else { "" }
             ));
@@ -852,8 +869,9 @@ impl ManagerDaemonService {
 
     // ACL: two-step: the kind (public metadata) is resolved from the body,
     // then `write` on its access resource on the object's scope, before the
-    // object is read; then the kind's `requires`, resolved from the spec,
-    // as the caller, fail-closed.
+    // object is read; then (after the schema, `immutable`, and the kind's
+    // rules) its `requires`, resolved from the spec, as the caller,
+    // fail-closed.
     #[instrument(skip_all, fields(kind, object))]
     pub(super) async fn apply_object_rpc(
         &self,
@@ -945,6 +963,65 @@ impl ManagerDaemonService {
             )));
         }
         let doc = object_document(&name, &namespace, &input.labels, &effective, &Value::Null);
+
+        // The stored object, read once the caller may write the kind here:
+        // an update may not change an `immutable` field, and the kind's
+        // transition rules see its spec as `oldSelf`. Both run before
+        // `requires`, which resolves from the new spec the writer chose, so
+        // reading first tells a writer nothing it could not learn anyway
+        // (app-object-kinds calls, "The apply order is schema, immutable,
+        // rules, requires").
+        let key = ObjectKey {
+            app: kind.app.clone(),
+            kind: kind.decl.name.clone(),
+            namespace: namespace.clone(),
+            name: name.clone(),
+        };
+        let current = self
+            .store
+            .app_object(&key)
+            .map_err(|e| map_store_error("Error reading the object", e))?;
+        let previous_spec: Value = current
+            .as_ref()
+            .and_then(|row| serde_json::from_str(&row.spec).ok())
+            .unwrap_or(Value::Null);
+        let previous_labels: BTreeMap<String, String> = current
+            .as_ref()
+            .map(|row| row.labels.clone())
+            .unwrap_or_default();
+        let previous_effective = current.as_ref().map(|_| kind.schema.filled(&previous_spec));
+        if let Some(previous_effective) = &previous_effective {
+            let before = object_document(
+                &name,
+                &namespace,
+                &previous_labels,
+                previous_effective,
+                &Value::Null,
+            );
+            let changes = immutable_changes(&kind, &before, &doc);
+            if !changes.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "{qualified} {id}: {}\nHint: delete and recreate the object to change an \
+                     immutable field",
+                    changes.join("; ")
+                )));
+            }
+        }
+        // The kind's CEL rules, fail-closed: on a blocking thread, within a
+        // time budget; every failing rule is named.
+        evaluate_bounded(
+            kind.rules.clone(),
+            effective.clone(),
+            previous_effective.clone(),
+        )
+        .await
+        .map_err(|failures| {
+            Status::invalid_argument(format!(
+                "{qualified} {id}: {}\nHint: `legion object explain {qualified}` lists the \
+                 kind's rules",
+                failures.join("; ")
+            ))
+        })?;
         let permissions = self.enforce_requirements(&identity, &kind, &doc, &namespace, &id)?;
 
         let idempotency_key = if inner.dry_run {
@@ -957,25 +1034,15 @@ impl ManagerDaemonService {
                 &inner,
             )
         };
-        let key = ObjectKey {
-            app: kind.app.clone(),
-            kind: kind.decl.name.clone(),
-            namespace: namespace.clone(),
-            name: name.clone(),
-        };
         let mut seen = BTreeMap::new();
         if let Some(message) = self
             .store
             .idempotency_lookup(&idempotency_key)
             .map_err(|e| map_store_error("Error checking idempotency", e))?
         {
-            let current = self
-                .store
-                .app_object(&key)
-                .map_err(|e| map_store_error("Error reading the object", e))?;
             return Ok(Response::new(ApplyObjectReply {
-                object: match current {
-                    Some(row) => Some(self.read_proto(&row, Some(&kind), &mut seen)?),
+                object: match &current {
+                    Some(row) => Some(self.read_proto(row, Some(&kind), &mut seen)?),
                     None => None,
                 },
                 message,
@@ -983,10 +1050,6 @@ impl ManagerDaemonService {
                 ..Default::default()
             }));
         }
-        let current = self
-            .store
-            .app_object(&key)
-            .map_err(|e| map_store_error("Error reading the object", e))?;
         if let Some(row) = current.as_ref().filter(|row| row.is_deleting()) {
             return Err(Status::failed_precondition(format!(
                 "{qualified} {id} is being deleted (its cleanup runs until {}); its spec is \
@@ -1029,31 +1092,6 @@ impl ManagerDaemonService {
         };
         if !cas.holds(current.as_ref()) {
             return Err(conflict(current.as_ref()));
-        }
-        let previous_spec: Value = current
-            .as_ref()
-            .and_then(|row| serde_json::from_str(&row.spec).ok())
-            .unwrap_or(Value::Null);
-        let previous_labels: BTreeMap<String, String> = current
-            .as_ref()
-            .map(|row| row.labels.clone())
-            .unwrap_or_default();
-        if current.is_some() {
-            let before = object_document(
-                &name,
-                &namespace,
-                &previous_labels,
-                &kind.schema.filled(&previous_spec),
-                &Value::Null,
-            );
-            let changes = immutable_changes(&kind, &before, &doc);
-            if !changes.is_empty() {
-                return Err(Status::invalid_argument(format!(
-                    "{qualified} {id}: {}\nHint: delete and recreate the object to change an \
-                     immutable field",
-                    changes.join("; ")
-                )));
-            }
         }
         let spec_changed = current.as_ref().is_none_or(|row| row.spec != spec_text);
         let mut diff = Vec::new();

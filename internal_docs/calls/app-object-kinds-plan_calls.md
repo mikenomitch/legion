@@ -7,8 +7,9 @@ number is its rank.**
 
 **Revised after adversarial review (2026-10-29).** Three reviews (of this
 plan, and of the apps substrate's security and correctness) changed O1
-before it shipped. Entries 1-52 are the decisions as they stand (28-31 were made while
-building O1, 32-43 building O2, 44-52 building O3); entries 53-59 are the original entries they supersede, kept as written at the end
+before it shipped. Entries 1-59 are the decisions as they stand (28-31 were made while
+building O1, 32-43 building O2, 44-52 building O3, 53-59 building O4); entries 60-66 are the
+original entries they supersede, kept as written at the end
 so the reasoning that lost is not silently dropped. The guiding principle
 the review added: **an object can never make its app do more than its
 writer could do directly, and the write path never depends on the app being
@@ -38,7 +39,7 @@ Error: writing gitops/Repo team-a/storefront needs job:write in team-b (from spe
 ```
 
 **Alternatives.** (a) The original `writeRequires`, checked on the object's
-own namespace and name (entry 53): a team lead with `job:write` on
+own namespace and name (entry 60): a team lead with `job:write` on
 `names = ["storefront"]` could write a Repo named `storefront` that deploys
 `billing`, or into `team-b`; a tenant without `host = true` could have the
 app deploy host-level jobs; a `credentials.kv` field could make the app read
@@ -71,7 +72,7 @@ the replica sees. Only the owning app writes it (app-plane), and a person's
 apply refuses a file that sets `status`. Status is for facts that change
 when the world changes; per-tick numbers stay in memory.
 
-**Alternatives.** The original plan (entry 55): status in the spec row on
+**Alternatives.** The original plan (entry 62): status in the spec row on
 the Control lane, every write a new `version`. Or Kubernetes' status
 subresource with RBAC (anyone granted it writes).
 
@@ -103,7 +104,7 @@ Error: "repo" names 2 kinds: gitops/Repo, reposync/Repo
 Hint: name one: legion object get gitops/Repo storefront
 ```
 
-**Alternatives.** The original (entry 56): flat names unique cluster-wide,
+**Alternatives.** The original (entry 63): flat names unique cluster-wide,
 refused at install. A `--kind Repo=SyncRepo` rename at install, mirroring
 `--key`.
 
@@ -172,7 +173,7 @@ namespaces, as `*` reaches everything else.
 { resources = ["scale"], actions = ["write"], namespaces = ["media"], names = ["web-*"] }  # does not: it is about jobs
 ```
 
-**Alternatives.** The original (entry 53): any resource, scoped as "a job
+**Alternatives.** The original (entry 60): any resource, scoped as "a job
 named like the object", which let `names = ["web-*"]` grant writes to a
 policy named `web-proxy`, failed band-scoped rules silently, and could map
 onto `acl` or `state`. Kubernetes' choice: no mapping, every kind its own
@@ -222,7 +223,7 @@ derived from the app records by an idempotent sync after every app write
 and on the reconciler's full pass; an orphaned row with no objects left is
 dropped.
 
-**Alternatives.** The original (entry 54): orphans fall back to the `object`
+**Alternatives.** The original (entry 61): orphans fall back to the `object`
 resource, which locked `scale:write` holders out of the ScalingPolicies
 they wrote. Storing the access resource on every object row.
 
@@ -271,7 +272,7 @@ and `--cascade` deletes them with the caller's per-kind access and
 `requires` checked for each.
 
 **Alternatives.** Kubernetes finalizers (an object stays until its
-controller removes the finalizer). The original plan (entry 58): deleting a
+controller removes the finalizer). The original plan (entry 65): deleting a
 namespace leaves its objects.
 
 **Trade-off.** An app that needs longer than an hour to release external
@@ -310,6 +311,8 @@ app's `Accepted` condition meanwhile, which is the regression O2 records.
 author asked for, and Legion already made jobspecs strict for it. CEL is a
 new language and dependency whose cost bounds need their own design; draft-7
 conditionals, `immutable`, and `Accepted` cover the interim.
+
+*Phase O4 shipped `rules` (entries 53-59).*
 
 ## 11. Status has a standard envelope, and the manager derives a summary anyone can wait on
 
@@ -432,7 +435,7 @@ calling app's rows and kinds only, so other apps' writes and every status
 write leave it asleep; the 64-shard value is a stored column the query
 filters on. There is no `since_version` resume: a reconnect relists.
 
-**Alternatives.** The original (entry 57): one snapshot message and a
+**Alternatives.** The original (entry 64): one snapshot message and a
 table-wide fingerprint. A change log with tombstone retention and resume.
 
 **Trade-off.** Every reconnect is a full relist, fine to about 50,000
@@ -758,6 +761,19 @@ regression is in feedback, not in safety.
 never depends on the app), and O4's `rules` restore the fail-closed check
 for every kind, not just this one. Recorded as a known limitation in
 docs/autoscaling.md.
+
+**Fixed by O4** (entries 53 and 57). Both kinds declare the parser's
+cross-field checks as CEL `rules`, so the manager refuses the inverted
+policy at apply, autoscaler up or down:
+
+```text
+$ legion object apply -f inverted.ncl     # the autoscaler is down
+Error: autoscaler/ScalingPolicy media/render: spec.min: min must not exceed max
+```
+
+What needs the cluster (a strategy's settings, durations, the plugin
+allowlist) is still the validate call's and the engine's; docs/autoscaling.md
+says so in place of the old limitation.
 
 ## 34. `WatchScalingPolicies` keeps serving the autoscaler what only core holds; the app resolves its objects itself
 
@@ -1226,11 +1242,258 @@ and will likely overwrite a change (cert-manager's children). A cleanup
 that cannot act for the object it is cleaning up could not undeploy what
 the object deployed; an orphaned kind has no app reconciling it.
 
+## 53. Kinds validate across fields with CEL `rules`, evaluated in the manager and failing closed
+
+*Implementation, Phase O4 (`src/structs/object_rules.rs`).* **Call.** A
+kind declares `rules`: CEL expressions over `self` (the effective spec,
+defaults filled) and `oldSelf` (the stored spec, on update), each with a
+fixed `message` and an optional `path`. The manager compiles them at
+install and upgrade, refusing a rule that does not parse, names any other
+variable, is known not to evaluate to a bool, breaks a cost bound (entry
+54), or that an example fails. It evaluates every rule on every apply, dry
+runs included, and refuses the write naming every failing rule; a rule
+that errors, returns something other than a bool, or runs out of time
+fails too. A rule that uses `oldSelf` is a transition rule, skipped on
+create. Stored objects are judged against the current rules wherever they
+are judged against the schema (reads, the upgrade and install reports),
+inline and without `oldSelf`: one that fails reads `invalid`.
+
+```nickel
+rules = [
+  { rule = "self.min <= self.max", message = "min must not exceed max", path = "/spec/min" },
+  { rule = "self.replicas >= oldSelf.replicas", message = "replicas may only grow" },
+]
+```
+
+```text
+Error: autoscaler/ScalingPolicy media/render: spec.min: min must not exceed max; spec.checks: every check needs its own name
+Hint: `legion object explain autoscaler/ScalingPolicy` lists the kind's rules
+```
+
+**Alternatives.** (a) **Nickel contracts.** Legion already embeds Nickel
+for jobspecs, so a kind could ship a contract the manager applies to each
+spec. (b) **A homegrown rule set**: a few declarative checks
+(`{ lessOrEqual = ["/spec/min", "/spec/max"] }`, `{ unique =
+"/spec/checks/*/name" }`). (c) Leave cross-field checks to the app's
+validate call, O2's state (entry 33).
+
+**Trade-off.** A new language on the write path, and a dependency (entry
+55) whose evaluator has no cost model of its own (entry 54). There is no
+type checker: a rule that compiles can fail at evaluation (`no such key:
+max` when a field it reads is absent and unguarded by `has()`), and that
+refuses the write, so kind authors test with `--dry-run`. Judging on read
+evaluates every rule for every object a list returns, about 10-20 µs per
+rule.
+
+**Why (simplicity, extensibility).** CEL is what Kubernetes moved CRD
+validation to for the same reason (no webhook in the write path, entry 8),
+so kind authors arrive knowing it, and it is built to be embedded: no side
+effects, no recursion, termination by construction, only cost left to
+bound. Nickel contracts are a general language with recursion and imports,
+no cost bound the manager could enforce, and the evaluator jobspec loading
+already pays dearly for, now on every apply; (b) grows a field per check
+until it is a worse CEL; (c) fails open, which is the regression this
+fixes. Judging stored objects by the same rules keeps `invalid` meaning one
+thing: the object would be refused if written today.
+
+## 54. A rule's cost is bounded by construction and a clock, failing closed; a blocking thread under a timeout covers what cannot be interrupted
+
+*Implementation, Phase O4 (`compile_rule`, `CompiledRules::evaluate`,
+`evaluate_bounded`).* **Call.** No Rust CEL crate estimates or interrupts
+cost, so the manager bounds it:
+
+- a rule's source is at most 1 KiB, and its bracket nesting and
+  conditionals at most 32 each, **counted on the raw text before any
+  parser runs**;
+- once parsed, the expression is at most 24 levels deep (evaluation
+  recurses once per level), and comprehensions nest at most 2 deep;
+- every comprehension is **rewritten at compile time to call a budget
+  check on each iteration**: the loop condition of `all` and `exists`, the
+  step's guard of `exists_one`, `map`, and `filter` (an always-true guard
+  for `map`), which keeps the evaluator's in-place append. In cel 0.15
+  these are parse-time macros, not functions that could be replaced, and
+  rewriting their expansion does the same job, so nesting 2 is allowed
+  rather than the fallback of 1;
+- each rule has 10 ms and all of a kind's rules 50 ms. The clock is checked
+  after each rule whatever it returned, since a rule can absorb the budget
+  check's error (`... || true`);
+- at apply the rules run in `spawn_blocking`, and the RPC waits at most
+  100 ms (the 50 ms budget plus 50 ms of grace) before refusing the write;
+- a failure or overrun is `InvalidArgument`, never a retryable code.
+
+```text
+Error: gitops/Repo team-a/web: spec.jobs: jobs are unique (not checked: rules[0] ran past its 10 ms budget, so the write is refused)
+```
+
+**Alternatives.** (a) A static cost estimate, as Kubernetes computes from
+the CEL type checker and the schema's `maxItems` and `maxLength`:
+cel-rust has no checker to hang one on, and a schema without `maxItems`
+would need a pessimistic bound that refuses ordinary rules. (b)
+Comprehension nesting capped at 1 with the clock alone. (c) Evaluating on
+the async runtime with only the in-loop checks. (d) A thread per apply
+with a large stack, instead of the depth cap.
+
+**Trade-off.** **The thread finishes, but the write is refused.** Work
+between two budget checks cannot be stopped: a 1 KiB rule of 100 list
+concatenations over a 32,000-item list runs about 0.9 s (release build;
+the deepest left-to-right chain the depth cap allows, 22 terms, about
+0.35 s) on its blocking thread after the write is refused at 100 ms.
+Reads and the install and upgrade reports evaluate inline, bounded by the
+same clocks but on the caller's thread. A wall-clock budget lets a rule
+near its limit pass on an idle manager and fail on a busy one. The depth
+cap of 24 refuses a few legitimate rules (a sum of 25 fields).
+
+**Why (performance, simplicity).** The writer controls the data; the rule
+is the app's, approved at install with its grant. Everything data can make
+expensive goes through a comprehension, and those stop on time (a nested
+`all` over 30,000 items returns at about 12 ms); what is left takes a
+pathological rule, which the source and depth caps hold to about a
+second, off the write's latency. The raw-text count exists because of a
+measured crash: a 500-deep nested rule (about 1 KiB) overflowed a 2 MiB
+stack inside cel-interpreter 0.10's ANTLR parser and aborted the process;
+it is now refused before any parser sees it. The depth cap is set by the
+evaluator's stack: at `-O0` (tests) one level takes 30-40 KiB, and 64 levels
+overflowed a 2 MiB thread. A typical rule costs 10-20 µs including the
+spec's conversion, and compiles in 1-50 µs.
+
+## 55. The engine is the `cel` crate 0.15.0 with its Pratt parser, not cel-interpreter 0.10 or 0.9, or our own
+
+*Implementation, Phase O4 (`Cargo.toml`).* **Call.** `cel = "=0.15.0"`
+(cel-rust, MIT, 2026-10-06), with no default features (no `regex`,
+`chrono`, or encoders) and `parser_pratt`. Rules parse with its
+`PrattParser` (recursion limit 96, at most 4,096 nodes) and evaluate on one
+shared `Env::stdlib()`. New crates: `cel`, `antlr4rust` 0.6.0 (BSD-3, built
+though nothing calls it), `bit-set` 0.11 and `bit-vec` 0.10, `murmur3`, and
+`pastey`; `uuid` moved from 1.23 to 1.26.1, and `borsh` 1.8 and `syn` 3
+entered the lock without being built for any target Legion uses.
+
+**Alternatives.**
+
+- **`cel-interpreter` 0.10.0**, the brief's choice: its parser is ANTLR on
+  a pre-release runtime (`antlr4rust ^0.3.0-beta2`, resolving to
+  0.3.0-rc2), and a 500-deep nested rule overflowed a 2 MiB stack inside
+  it, aborting the process (release build). The line ended there: the
+  crate was renamed `cel`.
+- **`cel-interpreter` 0.9.1**: an lalrpop parser and two new crates only
+  (its `lalrpop-util` and `regex` are already in the tree), at comparable
+  speed (parse 0.3-0.75 ms, evaluate about 10 µs). But it is a dead line,
+  `--1` and `!!x` do not lex, and its evaluator overflowed a 2 MiB stack at
+  510 nested lists in a debug build.
+- **A homegrown CEL subset**: no dependency, but a parser and evaluator to
+  own, against a spec people know from Kubernetes.
+
+**Trade-off.** About five new crates, among them an ANTLR runtime nothing
+calls. The Pratt parser is `#[doc(hidden)]` in 0.15, which the exact pin
+covers: an upgrade is a reviewed change. The 0.15 evaluator concatenates
+lists slower than 0.10's (4.0 s against 0.17 s for 70 terms over 30,000
+items), the cost entry 54's trade-off measures.
+
+**Why (simplicity, performance).** A validation engine in the control
+plane should stand on a maintained line, a stable runtime, and a parser
+that bounds its own recursion behind the raw-text cap. 0.15 also parses a
+rule 10 to 100 times faster than 0.9 (1-50 µs) and evaluates a typical one
+in 10-20 µs.
+
+## 56. The apply order is schema, `immutable`, rules, `requires`
+
+*Implementation, Phase O4 (`apply_object_rpc`).* **Call.** `ApplyObject`
+reads the stored object right after the schema check (the caller already
+holds `write` on the kind's access resource on its scope), checks
+`immutable` and the rules (a transition rule needs the stored spec as
+`oldSelf`), and only then resolves and checks `requires`. Before, the code
+checked `requires` first and read the stored object after, which
+contradicted docs/app-objects.md (schema, `immutable`, `requires`).
+
+**Alternatives.** (a) Keep `requires` first and split the rules: plain
+rules before it, transition rules after. (b) Keep the code's order and fix
+the doc.
+
+**Trade-off.** A writer lacking a `requires` permission now learns an
+immutable field's stored value (`spec.url is immutable (was "...")`) and
+which rules the spec breaks before the refusal. For a requirement without
+a pointer (NodeGroup's `operator:write`), that writer still holds `write`
+on the kind's access resource there (`node:write`).
+
+**Why (simplicity).** It leaks nothing a writer could not learn anyway:
+`requires` resolves from the spec the writer submits, so naming nothing
+they lack passes it and reaches the `immutable` check. One order, written
+once: validity before authority, as a jobspec is validated before the
+resolved spec is authorized.
+
+## 57. The autoscaler declares its parser's cross-field checks as rules; `immutable` and the validate call stay
+
+*Implementation, Phase O4 (`src/apps/bundled/autoscaler.ncl`).* **Call.**
+ScalingPolicy declares 11 rules: `min <= max`, `max >= 1`, unique check
+names, no `query` on the `legion` source, `activation >= 0`, `tolerance`
+in [0, 1), a schedule window sets a bound and orders its bounds when both
+are counts, each `step` names `percent` or `replicas`, and
+`down.step.percent <= 100`. NodeGroup declares 5: `min <= max` (`min`
+defaulting to 0), `max >= 1`, no `legion.nodegroup` in
+`shape.attributes`, and the two `step` rules. A test runs every failing
+spec through both the rules and the parser. `target.plugin` stays
+`immutable`; the validate call stays for what needs the cluster: strategy
+settings, durations, plugin configs, and the plugin allowlist, which the
+app enforces fail-closed at evaluation.
+
+**Alternatives.** (a) `min <= max` alone, the regression entry 33 named.
+(b) Transition rules in place of `immutable`
+(`self.target.plugin == oldSelf.target.plugin`). (c) Rules generated from
+the parser.
+
+**Trade-off.** The checks now live in Rust and in CEL and can drift; the
+test pins the listed cases. Where they differ (a `query` of only spaces),
+the parser decides, and the object reads `Rejected`. A duration of `0s`
+and a strategy's settings stay fail-open at apply.
+
+**Why (correctness).** Every check that can refuse a policy without the
+cluster now refuses it in the manager, whether or not the app is up, which
+is what `legion scaling apply` did before O2. `immutable` says "cannot
+change" more simply, with the stored value in the error.
+
+## 58. Rules are per kind only; per-field `x-legion-validations` and `messageExpression` are deferred
+
+*Implementation, Phase O4.* **Call.** `rules` is one list on the kind,
+and every rule sees the whole spec. No rules on a subschema, no
+`messageExpression` (refused with a hint), no `reason` or
+`optionalOldSelf`.
+
+**Alternatives.** Kubernetes' `x-kubernetes-validations` on any schema
+node, where `self` is that node (a rule on a list's `items` runs per item),
+with `messageExpression`, `reason`, and `optionalOldSelf`.
+
+**Trade-off.** A per-item check is a comprehension
+(`self.checks.all(c, ...)`): it counts toward the nesting limit of 2, and
+reports at the list, not the item's index. A message cannot include the
+offending value.
+
+**Why (simplicity).** One place to declare rules, one `self`, and a cost
+bound per rule rather than per rule times items; a message that evaluates
+is a second program per failure and a path for a `writeOnly` value into an
+error. Per-node rules can come later without changing these: a kind-level
+rule is a rule on the root.
+
+## 59. A rule's `path` points into the object document (`/spec/min`), not into the spec
+
+*Implementation, Phase O4.* **Call.** `path` is `/spec` or starts with
+`/spec/`, and a failure reads `spec.min: ...`. The brief's sketch wrote
+`path = "/min"`, relative to `self`.
+
+**Alternatives.** Spec-relative pointers that mirror `self` (`/min` for
+`self.min`).
+
+**Trade-off.** Five more characters, and a pointer that does not mirror
+the rule's own `self.min`.
+
+**Why (simplicity).** Entry 27: every pointer in a declaration points into
+one document, so `/spec/min` means the same in `immutable`, `columns`,
+`requires`, and a rule, and a rule's error path reads like the schema's
+(`spec.min: ...`).
+
 # Superseded entries
 
 Kept as written when they were superseded; they no longer describe the design.
 
-## 53. *Superseded.* A kind's ACL is one resource: the generic `object`, or an existing one of the same scope
+## 60. *Superseded.* A kind's ACL is one resource: the generic `object`, or an existing one of the same scope
 
 **Superseded by entries 1 (`requires`) and 5 (the access mapping)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -1265,7 +1528,7 @@ With (a), O2 would have needed every `scale:write` holder to also be given
 default stays K8s-like (`object` with `kinds`), so a kind that maps onto
 nothing is still governed separately.
 
-## 54. *Superseded.* An orphaned object is governed by the `object` resource
+## 61. *Superseded.* An orphaned object is governed by the `object` resource
 
 **Superseded by entry 7 (orphans keep their kind's mapping)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -1284,7 +1547,7 @@ upgrade changes it, and then two rows of one kind answer to different
 resources. Orphans are an operator's clean-up after a forced removal, and
 the rule fits in one sentence.
 
-## 55. *Superseded.* Status is the owning app's alone, with CAS on version or generation
+## 62. *Superseded.* Status is the owning app's alone, with CAS on version or generation
 
 **Superseded by entry 2 (status on the Status lane, `specVersion` CAS)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -1303,7 +1566,7 @@ delegate status writes to a helper with another identity.
 it makes it a claim nobody can trust at 3am. App identity is already the
 app plane's key (`WatchAppExtensions`, `ReportScalingStatus`).
 
-## 56. *Superseded.* Kind names are flat, unique cluster-wide case-insensitively, with `<app>/<Kind>` as the qualified spelling
+## 63. *Superseded.* Kind names are flat, unique cluster-wide case-insensitively, with `<app>/<Kind>` as the qualified spelling
 
 **Superseded by entry 3 (`<app>/<Kind>` is the name)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -1326,7 +1589,7 @@ its kind. Install says so, naming the owner.
 rule already established "the short name may collide, the qualified one
 never does" (apps calls on `apps.<app>`), so it is one idea, not two.
 
-## 57. *Superseded.* `WatchObjects` polls a fingerprint each second
+## 64. *Superseded.* `WatchObjects` polls a fingerprint each second
 
 **Superseded by entry 17 (chunked, per-app watch)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -1343,7 +1606,7 @@ per second.
 90), whose cost was measured acceptable; both move to events together when
 it is not.
 
-## 58. *Superseded.* Deleting a namespace leaves its objects
+## 65. *Superseded.* Deleting a namespace leaves its objects
 
 **Superseded by entry 9 (objects are namespace contents)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -1363,7 +1626,7 @@ and a proto change to the namespace contents reply; the standalone scaling
 policies O2 replaces behave the same way today. Recorded as a TODO with the
 plan's lean (refuse, and cascade).
 
-## 59. *Superseded.* Defaults filled on read (the defaults half of the original entry 1)
+## 66. *Superseded.* Defaults filled on read (the defaults half of the original entry 1)
 
 **Superseded by entry 6** (adversarial review, 2026-10-29). The original
 argued that deriving defaults on read lets an upgrade that adds or changes

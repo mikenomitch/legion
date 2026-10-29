@@ -446,6 +446,132 @@ mod tests {
         assert_eq!(group.cleanup.as_deref(), Some("15m"));
         assert_eq!(group.schema, standalone::node_group_schema());
         assert!(group.status.is_some() && policy.status.is_some());
+        assert!(!policy.rules.is_empty() && !group.rules.is_empty());
+    }
+
+    /// Both kinds' CEL rules refuse, in the manager, what the parser's
+    /// cross-field checks refuse (app-object-kinds calls entry 33, fixed by
+    /// O4), and pass what it accepts.
+    #[test]
+    fn the_kinds_rules_refuse_what_the_parser_refuses_test() {
+        use crate::structs::app_object::{manifest_kinds, InstalledKind, KindState};
+        let manifest = crate::apps::bundled_manifest("autoscaler").expect("bundled");
+        let kinds = manifest_kinds(manifest).expect("kinds");
+        let installed = |name: &str| {
+            let decl = kinds.iter().find(|k| k.name == name).expect("kind").clone();
+            InstalledKind::new("autoscaler", decl, "d", KindState::Active, "1", true)
+                .expect("the kind compiles")
+        };
+        let check = |kind: &InstalledKind, spec: &Value| -> Result<(), Vec<String>> {
+            let effective = kind.check_spec(spec).expect("the schema passes it");
+            kind.rules.evaluate(&effective, None)
+        };
+        let patched = |base: Value, patch: Value| {
+            let mut spec = base;
+            for (key, value) in patch.as_object().expect("a record") {
+                spec[key] = value.clone();
+            }
+            spec
+        };
+
+        let policy = installed(SCALING_POLICY_KIND);
+        assert_eq!(check(&policy, &policy_spec()), Ok(()));
+        let check_named = |name: &str, source: &str, query: &str| {
+            json!({ "name": name, "source": source, "query": query,
+                    "strategy": { "name": "per-replica", "value": 10 } })
+        };
+        for (patch, needle) in [
+            (
+                json!({ "min": 9, "max": 3 }),
+                "spec.min: min must not exceed max",
+            ),
+            (
+                json!({ "min": 0, "max": 0 }),
+                "spec.max: max must be at least 1",
+            ),
+            (
+                json!({ "checks": [check_named("q", "prom", "a"), check_named("q", "prom", "b")] }),
+                "every check needs its own name",
+            ),
+            (
+                json!({ "checks": [check_named("l", "legion", "sum(x)")] }),
+                "legion source",
+            ),
+            (
+                json!({ "checks": [{ "name": "q", "source": "prom", "query": "a", "activation": -1,
+                                     "strategy": { "name": "per-replica", "value": 10 } }] }),
+                "activation is 0 or more",
+            ),
+            (json!({ "tolerance": 1.5 }), "spec.tolerance"),
+            (
+                json!({ "schedule": [{ "cron": "0 8 * * *", "for": "1h" }] }),
+                "sets min, max, or both",
+            ),
+            (
+                json!({ "schedule": [{ "cron": "0 8 * * *", "for": "1h", "min": 5, "max": 2 }] }),
+                "min must not exceed its max",
+            ),
+            (json!({ "up": { "step": {} } }), "up.step names percent"),
+            (
+                json!({ "down": { "step": { "percent": 150 } } }),
+                "spec.down.step.percent",
+            ),
+        ] {
+            let spec = patched(policy_spec(), patch);
+            let failures = check(&policy, &spec).expect_err(needle);
+            assert!(
+                failures.iter().any(|failure| failure.contains(needle)),
+                "{needle}: {failures:?}"
+            );
+            assert!(
+                standalone::parse_object(SCALING_POLICY_KIND, "media", "p", &spec).is_err(),
+                "the parser refuses it too: {needle}"
+            );
+        }
+        // A schedule bounded by a multiple is the parser's to judge.
+        let multiple = patched(
+            policy_spec(),
+            json!({ "schedule": [{ "cron": "0 8 * * *", "for": "1h", "min": 5, "max": "2x" }] }),
+        );
+        assert_eq!(check(&policy, &multiple), Ok(()));
+
+        let group = installed(NODE_GROUP_KIND);
+        let group_spec = || {
+            json!({ "target": { "nodes": { "pool": "default", "plugin": "aws-asg",
+                                           "shape": { "cpu": 8000, "memory": 16384 } } },
+                    "min": 0, "max": 20 })
+        };
+        assert_eq!(check(&group, &group_spec()), Ok(()));
+        assert_eq!(
+            check(
+                &group,
+                &json!({ "target": { "nodes": { "plugin": "x" } }, "max": 2 })
+            ),
+            Ok(()),
+            "min defaults to 0"
+        );
+        for (patch, needle) in [
+            (json!({ "min": 30 }), "spec.min: min must not exceed max"),
+            (json!({ "max": 0 }), "spec.max: max must be at least 1"),
+            (
+                json!({ "target": { "nodes": { "plugin": "aws-asg",
+                                               "shape": { "attributes": { "legion.nodegroup": "x" } } } } }),
+                "legion.nodegroup",
+            ),
+            (json!({ "up": { "step": {} } }), "up.step names percent"),
+            (json!({ "down": { "step": {} } }), "down.step names percent"),
+        ] {
+            let spec = patched(group_spec(), patch);
+            let failures = check(&group, &spec).expect_err(needle);
+            assert!(
+                failures.iter().any(|failure| failure.contains(needle)),
+                "{needle}: {failures:?}"
+            );
+            assert!(
+                standalone::parse_object(NODE_GROUP_KIND, "", "g", &spec).is_err(),
+                "the parser refuses it too: {needle}"
+            );
+        }
     }
 
     /// A policy resolves against the context's layers; a plugin closed to

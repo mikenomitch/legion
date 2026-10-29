@@ -52,9 +52,13 @@
   # apply`. Each kind's `schema` and `status.schema` are generated from the
   # parser's own types when the manifest loads
   # (src/apps/autoscaler/objects.rs, `fill_manifest`), so the manager's
-  # schema check and the app's parser cannot drift apart; what a schema
-  # cannot say (min <= max, a plugin closed to the namespace) the app
-  # reports as `Accepted=false`. The app reads both kinds over WatchObjects
+  # schema check and the app's parser cannot drift apart. What a schema
+  # cannot say across fields (min <= max, unique check names) is each
+  # kind's `rules`, CEL the manager evaluates on every apply, fail-closed,
+  # whether or not the app is up. What needs the cluster (a plugin closed to
+  # the namespace, a strategy's settings, durations) stays with the app: its
+  # validate call reports it at apply, as advice, and the engine holds such
+  # an object `Accepted=false`. The app reads both kinds over WatchObjects
   # and reports their durable verdicts with UpdateObjectStatus, which owning
   # the kinds allows with no rule.
   kinds = [
@@ -68,6 +72,57 @@
       validate = true,
       # A policy that moves to another target is a new policy.
       immutable = ["/spec/target/plugin"],
+      # The parser's cross-field checks, enforced by the manager at apply
+      # (the parser repeats them; the validate call reports the rest).
+      rules = [
+        { rule = "self.min <= self.max", message = "min must not exceed max", path = "/spec/min" },
+        { rule = "self.max >= 1", message = "max must be at least 1", path = "/spec/max" },
+        {
+          rule = "self.checks.all(c, self.checks.exists_one(d, d.name == c.name))",
+          message = "every check needs its own name",
+          path = "/spec/checks",
+        },
+        {
+          rule = "self.checks.all(c, c.source != 'legion' || !has(c.query) || c.query == '')",
+          message = "a check on the legion source reads a Legion task, and a policy has none: leave its query out",
+          path = "/spec/checks",
+        },
+        {
+          rule = "self.checks.all(c, !has(c.activation) || c.activation >= 0)",
+          message = "a check's activation is 0 or more",
+          path = "/spec/checks",
+        },
+        {
+          rule = "!has(self.tolerance) || (self.tolerance >= 0 && self.tolerance < 1)",
+          message = "tolerance is at least 0 and below 1 (a fraction of the target: 0.1 is ±10%)",
+          path = "/spec/tolerance",
+        },
+        {
+          rule = "!has(self.schedule) || self.schedule.all(s, has(s.min) || has(s.max))",
+          message = "a schedule window sets min, max, or both",
+          path = "/spec/schedule",
+        },
+        {
+          rule = "!has(self.schedule) || self.schedule.all(s, !has(s.min) || !has(s.max) || type(s.min) != int || type(s.max) != int || s.min <= s.max)",
+          message = "a schedule window's min must not exceed its max",
+          path = "/spec/schedule",
+        },
+        {
+          rule = "!has(self.up) || !has(self.up.step) || has(self.up.step.percent) || has(self.up.step.replicas)",
+          message = "up.step names percent, replicas, or both",
+          path = "/spec/up/step",
+        },
+        {
+          rule = "!has(self.down) || !has(self.down.step) || has(self.down.step.percent) || has(self.down.step.replicas)",
+          message = "down.step names percent, replicas, or both",
+          path = "/spec/down/step",
+        },
+        {
+          rule = "!has(self.down) || !has(self.down.step) || !has(self.down.step.percent) || self.down.step.percent <= 100",
+          message = "down.step.percent is at most 100: scale-in removes at most every replica",
+          path = "/spec/down/step/percent",
+        },
+      ],
       examples = [
         {
           target = { plugin = "noop" },
@@ -101,6 +156,29 @@
       validate = true,
       # Its members belong to the provider that started them.
       immutable = ["/spec/target/nodes/plugin"],
+      rules = [
+        { rule = "!has(self.min) || self.min <= self.max", message = "min must not exceed max", path = "/spec/min" },
+        {
+          rule = "self.max >= 1",
+          message = "max must be at least 1: a group that should never run a node does not need a policy",
+          path = "/spec/max",
+        },
+        {
+          rule = "!has(self.target.nodes.shape) || !has(self.target.nodes.shape.attributes) || !('legion.nodegroup' in self.target.nodes.shape.attributes)",
+          message = "shape.attributes may not set legion.nodegroup: every member gets it from the group's name",
+          path = "/spec/target/nodes/shape/attributes",
+        },
+        {
+          rule = "!has(self.up) || !has(self.up.step) || has(self.up.step.percent) || has(self.up.step.replicas)",
+          message = "up.step names percent, replicas, or both",
+          path = "/spec/up/step",
+        },
+        {
+          rule = "!has(self.down) || !has(self.down.step) || has(self.down.step.percent) || has(self.down.step.replicas)",
+          message = "down.step names percent, replicas, or both",
+          path = "/spec/down/step",
+        },
+      ],
       # Deleting a group drains, terminates, and forgets its members through
       # the scale-in path, then releases the object; at the deadline it goes
       # anyway, leaving any member the path could not drain.

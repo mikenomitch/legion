@@ -257,6 +257,17 @@
       ],
       # Pointers an update may not change.
       immutable = ["/spec/url"],
+      # CEL rules every apply must pass, checked by the manager whether or
+      # not the app is up (docs/app-objects.md, "Validation rules"): what a
+      # schema cannot say across fields. `self` is the spec with defaults;
+      # a rule that uses `oldSelf` (the stored spec) checks updates only.
+      rules = [
+        {
+          rule = "!has(self.deployKey) || self.url.startsWith('ssh://') || self.url.startsWith('git@')",
+          message = "a deploy key is an SSH key: use an ssh:// or git@ URL with it",
+          path = "/spec/deployKey",
+        },
+      ],
       # A delete waits up to this long for gitops to clean up (and release
       # the object); then the object is removed anyway.
       cleanup = "10m",

@@ -512,7 +512,7 @@ How to use it:
 | PR | What it lands | Notes |
 | --- | --- | --- |
 | [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after adversarial security and correctness reviews | All three plans SHIPPED; their items, and both hardening passes, are checked off and in Done; the reviews' open and design-level items are under *Ecosystem apps* |
-| branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phases O1, O2, and O3 | Builds on #60; O1, O2, and O3 are checked off and in Done; O4, and the deferrals and follow-ups are open under Ecosystem apps |
+| branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phases O1-O4 | Builds on #60; O1-O4 are checked off and in Done; the deferrals and follow-ups are open under Ecosystem apps |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -4598,7 +4598,7 @@ plan.
         kinds** below.
 
 - [ ] **App-owned object kinds** (Legion's CRDs):
-      [plan](plans/app-object-kinds-plan.md) (IN EXECUTION; O1, O2, and O3 in Done) ·
+      [plan](plans/app-object-kinds-plan.md) (SHIPPED; O1-O4 in Done) ·
       [calls](calls/app-object-kinds-plan_calls.md) · docs:
       [app-objects.md](../docs/app-objects.md)
   - [ ] Follow-ups from O2 ([calls 32-43](calls/app-object-kinds-plan_calls.md)):
@@ -4606,12 +4606,15 @@ plan.
           `object:<uid>`, so a policy deleted and created again under the
           same name starts with no `legion scaling history` (the events stay
           in the journal) ([calls 32](calls/app-object-kinds-plan_calls.md)).
-    - [ ] **`min <= max` and plugin allowlists are checked fail-open**: with
-          the autoscaler down, an inverted ScalingPolicy or NodeGroup is
-          stored and reads `Rejected` once the app runs (never acted on).
-          O4's `rules` restore the fail-closed check
-          ([calls 33](calls/app-object-kinds-plan_calls.md);
-          [docs](../docs/autoscaling.md)).
+    - [ ] **What needs the cluster is checked fail-open at apply**: a
+          strategy's settings, a duration of `0s`, a plugin's config, and
+          the plugin allowlist are refused at apply only by the
+          autoscaler's validate call; with the autoscaler down such an
+          object is stored and reads `Rejected` once the app runs (never
+          acted on). The cross-field half of this item (`min <= max`) is
+          fixed by O4's rules
+          ([calls 33, 48](calls/app-object-kinds-plan_calls.md);
+          [docs](../docs/autoscaling.md#the-policy-rules)).
     - [ ] **Node groups have no SPA list**: the Autoscaling page shows
           ScalingPolicies only (a page's `scale:read` says nothing about
           `node:read`); node groups show on the node panel and in `legion
@@ -4652,11 +4655,34 @@ plan.
           ([calls 51](calls/app-object-kinds-plan_calls.md)).
     - [ ] **No SPA surface** shows a job's object stamp or the lapsed
           list; the CLI, API, and MCP do.
-  - [ ] **O4: CEL `rules`** on kinds, evaluated in the manager; `rules` is
-        refused until then ([calls 10](calls/app-object-kinds-plan_calls.md)).
-        Restores the fail-closed `min <= max` check on the autoscaler's
-        ScalingPolicy and NodeGroup, which O2 moved to the app
-        ([calls 33](calls/app-object-kinds-plan_calls.md)).
+  - [ ] Deferred from O4 ([calls 53-59](calls/app-object-kinds-plan_calls.md)):
+    - [ ] **Rules on a subschema** (`x-legion-validations`, where `self` is
+          the node, so a rule on a list's items runs per item),
+          `messageExpression`, `reason`, and `optionalOldSelf`; rules are
+          per kind only ([calls 58](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **A static cost estimate for rules**: the budget is wall-clock
+          (10 ms per rule, 50 ms per write), so a rule near its limit can
+          pass idle and fail busy, and work between two comprehension
+          deadline checks cannot be interrupted: a pathological 1 KiB rule
+          of list concatenations over a 64 KiB spec runs about 0.9 s on its
+          blocking thread after the write is refused at 100 ms
+          ([calls 54](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **Rules are not type-checked** against the schema (cel-rust has
+          no checker): a rule reading an absent, unguarded field fails at
+          apply rather than at install. The CEL `regex` (`matches`) and
+          `chrono` (durations, timestamps) features and the strings, lists,
+          and math extensions are off
+          ([docs](../docs/app-objects.md#validation-rules)).
+    - [ ] **Rules are re-evaluated on every read** that judges an object
+          (`get`, `list`, the watch), about 10-20 µs per rule per object;
+          no cache keyed by spec version and kind digest yet.
+    - [ ] **The autoscaler's rules duplicate its parser's checks** in CEL;
+          a test pins the listed cases, and the parser stays the authority
+          where they differ ([calls 57](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **`antlr4rust` is built but never called**: the `cel` crate
+          depends on it unconditionally although rules parse with its Pratt
+          parser; a `cel` release that makes the ANTLR parser optional
+          would drop it ([calls 55](calls/app-object-kinds-plan_calls.md)).
   - [ ] Deferred from O1:
     - [ ] **Per-namespace object quotas** in namespace policies; today
           only a kind's cluster-wide `maxObjects` caps objects
@@ -6455,6 +6481,45 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       Federation still needs an explicit public `issuer`.
 
 ## Ecosystem apps
+
+- [x] **App-owned object kinds, Phase O4: CEL validation `rules`**
+      (2026-10-29, merged into branch `claude/app-objects`;
+      [plan](plans/app-object-kinds-plan.md) §8 ·
+      [calls 53-59](calls/app-object-kinds-plan_calls.md) · docs:
+      [app-objects.md](../docs/app-objects.md#validation-rules),
+      [autoscaling.md](../docs/autoscaling.md#the-policy-rules),
+      [apps.md](../docs/apps.md#object-kinds),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] `kinds[].rules = [{ rule, message, path? }]`, at most 32: CEL over
+        `self` (the effective spec) and `oldSelf` (transition rules, on
+        update only), on the `cel` crate 0.15.0 (Pratt parser, no default
+        features) in `src/structs/object_rules.rs`; compiled and cached by
+        digest at install and upgrade, refusing a rule that does not parse,
+        names another variable, is known not to be a bool, or that an
+        example fails; `messageExpression` refused.
+  - [x] Cost bounds: 1 KiB source, bracket nesting and conditionals at
+        most 32 counted on the raw text before parsing, parsed depth 24,
+        comprehension nesting 2 with a deadline check injected into every
+        comprehension, 10 ms per rule and 50 ms per write, evaluated in
+        `spawn_blocking` under a 100 ms timeout at apply, failing closed.
+  - [x] Apply order schema, `immutable`, rules, `requires` (the stored
+        object is read before `requires`); every failing rule reported at
+        its path; dry runs too. Stored objects are judged against the rules
+        on read and in the install and upgrade reports (`invalid`).
+  - [x] `ObjectKind.rules` (`ObjectKindRule`) on `ListObjectKinds`; `legion
+        object explain` prints them; MCP descriptions and the capability
+        summary mention them; `ui/src/gen` regenerated.
+  - [x] The autoscaler's ScalingPolicy (11 rules) and NodeGroup (5 rules)
+        declare the parser's cross-field checks, restoring the fail-closed
+        `min <= max` at apply (calls 33, fixed); the gitops example Repo
+        has one illustrative rule.
+  - [x] Tests: compile refusals, evaluation, transition rules, the CEL
+        subset, a 500-deep nested rule refused before the parser, a deeply
+        nested spec, budget overruns (and `|| true` still failing closed),
+        the autoscaler's rules against its parser, and
+        `app_objects::rules_fail_closed_test` (upgrade re-check, dry run,
+        rules before `requires`, a transition rule, an inverted
+        ScalingPolicy refused with the autoscaler not running).
 
 - [x] **App-owned object kinds, Phase O3: objects carry their authority**
       (2026-10-29, branch `claude/app-objects`;

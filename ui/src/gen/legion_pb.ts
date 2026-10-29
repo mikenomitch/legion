@@ -36356,6 +36356,18 @@ export class ObjectKind extends Message<ObjectKind> {
    */
   manifestDigest = "";
 
+  /**
+   * The kind's CEL validation rules, in declaration order. Every apply
+   * (dry runs too) evaluates them in the manager after the schema and
+   * `immutable` checks and before `requires`, and is refused, naming every
+   * failing rule's message at its path, when any fails, errors, or runs
+   * past its budget (10 ms per rule, 50 ms per write). Stored objects are
+   * judged against them on read: one that fails reads `invalid`.
+   *
+   * @generated from field: repeated legion.ObjectKindRule rules = 22;
+   */
+  rules: ObjectKindRule[] = [];
+
   constructor(data?: PartialMessage<ObjectKind>) {
     super();
     proto3.util.initPartial(data, this);
@@ -36385,6 +36397,7 @@ export class ObjectKind extends Message<ObjectKind> {
     { no: 19, name: "max_objects", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 20, name: "write_only", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 21, name: "manifest_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 22, name: "rules", kind: "message", T: ObjectKindRule, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ObjectKind {
@@ -36401,6 +36414,77 @@ export class ObjectKind extends Message<ObjectKind> {
 
   static equals(a: ObjectKind | PlainMessage<ObjectKind> | undefined, b: ObjectKind | PlainMessage<ObjectKind> | undefined): boolean {
     return proto3.util.equals(ObjectKind, a, b);
+  }
+}
+
+/**
+ * One CEL validation rule of a kind (`kinds[].rules[]` in the app manifest;
+ * docs/app-objects.md, "Validation rules").
+ *
+ * @generated from message legion.ObjectKindRule
+ */
+export class ObjectKindRule extends Message<ObjectKindRule> {
+  /**
+   * The CEL expression, as declared, that must be true. `self` is the
+   * effective spec (defaults filled); `oldSelf` is the stored spec on an
+   * update.
+   *
+   * @generated from field: string rule = 1;
+   */
+  rule = "";
+
+  /**
+   * What a failure says.
+   *
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  /**
+   * The JSON pointer into the object (`/spec/min`) a failure is reported
+   * at; empty for the spec as a whole.
+   *
+   * @generated from field: string path = 3;
+   */
+  path = "";
+
+  /**
+   * Whether the rule uses `oldSelf`: a transition rule, checked on updates
+   * only (never on create, and never when a stored object is judged on
+   * read).
+   *
+   * @generated from field: bool transition = 4;
+   */
+  transition = false;
+
+  constructor(data?: PartialMessage<ObjectKindRule>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ObjectKindRule";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "rule", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "transition", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ObjectKindRule {
+    return new ObjectKindRule().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ObjectKindRule {
+    return new ObjectKindRule().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ObjectKindRule {
+    return new ObjectKindRule().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ObjectKindRule | PlainMessage<ObjectKindRule> | undefined, b: ObjectKindRule | PlainMessage<ObjectKindRule> | undefined): boolean {
+    return proto3.util.equals(ObjectKindRule, a, b);
   }
 }
 

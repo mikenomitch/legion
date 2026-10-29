@@ -865,7 +865,8 @@ missing data (a source, a strategy) or its target `error`.
 A policy whose target is not a Legion task is an **object**: an
 `autoscaler/ScalingPolicy`, a kind the bundled autoscaler app declares
 ([App Objects](app-objects.md)). `legion object apply` stores it, the
-manager checks it against the kind's schema and your rights, and the
+manager checks it against the kind's schema, its validation rules, and your
+rights, and the
 autoscaler runs it next to the task policies and reports on it in the
 object's status.
 
@@ -923,15 +924,25 @@ $ legion object delete scalingpolicy render-farm -n media
   policies, so a selector written about jobs never decides who aims the
   autoscaler at an external target ([Access control](#access-control)).
   Reading one needs `scale:read` there.
-- **Checked at apply, in the manager**: the schema (closed: an unknown
-  field is an error with its path, `spec.stabilise: unknown field (did you
-  mean ...)`), and `target.plugin` is **immutable** (a policy that moves to
-  another target is a new policy: delete and recreate it). The autoscaler
-  is also asked (the validate call): it refuses what the schema cannot
-  express, such as `min` above `max`, a check's strategy settings, or a
-  plugin the namespace may not use. That call is advice and fails open:
-  when the app is down or slow, the write goes through with a warning, and
-  the app rejects the policy when it evaluates it (below).
+- **Checked at apply, in the manager, fail-closed**, whether or not the
+  autoscaler is running: the schema (closed: an unknown field is an error
+  with its path, `spec.stabilise: unknown field (did you mean ...)`);
+  `target.plugin` is **immutable** (a policy that moves to another target
+  is a new policy: delete and recreate it); and the kind's
+  [validation rules](#the-policy-rules), what a schema cannot say across
+  fields, such as `min` above `max`:
+
+  ```text
+  $ legion object apply -f inverted.ncl
+  Error: autoscaler/ScalingPolicy media/render: spec.min: min must not exceed max
+  Hint: `legion object explain autoscaler/ScalingPolicy` lists the kind's rules
+  ```
+
+  The autoscaler is also asked (the validate call) about what needs the
+  cluster: a check's strategy settings, durations, or a plugin the
+  namespace may not use. That call is advice and fails open: when the app
+  is down or slow, the write goes through with a warning, and the app
+  rejects the policy when it evaluates it (below).
 - **The target** is a target plugin: `noop` (built in: it records
   decisions and events and changes nothing), an `exec` builtin, or an
   installed plugin. `target.config` is passed to it as data. Each
@@ -956,6 +967,32 @@ $ legion object delete scalingpolicy render-farm -n media
   policy created again under the same name starts fresh, unpaused, with no
   history.
 
+### The policy rules
+
+Both kinds declare [validation rules](app-objects.md#validation-rules):
+the policy parser's cross-field checks, written in CEL, which the manager
+evaluates on every apply (dry runs too), fail-closed, whether or not the
+autoscaler is running. Every failing rule is reported at once, at its
+field; `legion object explain scalingpolicy` (or `nodegroup`) prints them.
+
+| Kind | Rule |
+| --- | --- |
+| ScalingPolicy | `min` is at most `max`, and `max` is at least 1 |
+| ScalingPolicy | every check has its own `name` |
+| ScalingPolicy | a check on the `legion` source has no `query` (a policy has no Legion task to measure) |
+| ScalingPolicy | a check's `activation` is 0 or more; `tolerance` is at least 0 and below 1 |
+| ScalingPolicy | a `schedule` window sets `min`, `max`, or both, and its `min` is at most its `max` when both are replica counts |
+| ScalingPolicy | `up.step` and `down.step` name `percent`, `replicas`, or both; `down.step.percent` is at most 100 |
+| NodeGroup | `min` is at most `max`, and `max` is at least 1 |
+| NodeGroup | `target.nodes.shape.attributes` does not set `legion.nodegroup` (every member gets it from the group's name) |
+| NodeGroup | `up.step` and `down.step` name `percent`, `replicas`, or both |
+
+The rules are a subset of what the parser checks; the parser runs again
+when the autoscaler evaluates an object, and holds anything else it
+refuses `Accepted=false`. `target.plugin` (and a node group's
+`target.nodes.plugin`) stays `immutable` rather than a transition rule: it
+says the same thing more simply.
+
 ### Status and conditions
 
 The autoscaler reports each object's durable verdict in its status, and
@@ -966,7 +1003,7 @@ scaling status` and `explain` read.
 | Condition | Means |
 | --- | --- |
 | `Accepted=true` | the spec parses, resolves against the layered defaults, and every plugin it names is installed and open to its namespace |
-| `Accepted=false` (`Invalid`) | it does not: the message says why (`min = 9 is above max = 3`, `check 'queue' uses source 'team-prom', which is not available to namespace payments`). The policy is held, never run. |
+| `Accepted=false` (`Invalid`) | it does not: the message says why (`check 'queue' uses source 'team-prom', which is not available to namespace payments`). The policy is held, never run. The kind's rules keep the cross-field mistakes (`min` above `max`) from being stored at all. |
 | `Ready=true` | its last evaluation worked (reason `Paused` while a pause holds it) |
 | `Ready=false` (`TargetError`, `MissingData`) | its target's `target/status` or `target/scale` failed, or its checks have no data |
 
@@ -1043,7 +1080,11 @@ owner with broad `scale:write` cannot add machines). Reading one, its
 status, and its history needs `node:read`. Its name is its own: a node
 group and a scaling policy may share a name, since their kinds tell them
 apart and each keeps its own history and pause. `target.nodes.plugin` is
-immutable: a group's members belong to the provider that started them.
+immutable: a group's members belong to the provider that started them. The
+manager refuses, at apply, a group whose `min` is above its `max`, whose
+`max` is 0, whose `shape.attributes` set `legion.nodegroup`, or whose
+`up.step` or `down.step` names neither `percent` nor `replicas` (the
+kind's [rules](#the-policy-rules)).
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -1709,8 +1750,8 @@ caller is trusted, as everywhere else, and a UI press is recorded by
   `failed` row in `legion scaling history NAME --kind scalingpolicy`; the
   next evaluation asks the target again.
 - **A scaling policy or node group reads `Rejected: Invalid`**: it does
-  not resolve (the object's status says why: `min` above `max`, a plugin
-  that is not installed or not open to its namespace, a node group's
+  not resolve (the object's status says why: a plugin that is not
+  installed or not open to its namespace, a node group's
   plugin that is `noop`, a source, or does not declare
   `capabilities.nodes`, or a config that does not match the plugin's
   schema). It is held, never run, until fixed and applied again.
@@ -1805,13 +1846,15 @@ caller is trusted, as everywhere else, and a UI press is recorded by
   empty and shows `starting`, then fills on the app's next report.
 - **Group targets share one count.** A group's tasks cannot be autoscaled
   separately.
-- **Cross-field rules are the autoscaler's, not the manager's.** The
-  manager checks a ScalingPolicy's or NodeGroup's schema at apply; a rule a
-  schema cannot express (`min` above `max`, a strategy's settings, a plugin
-  closed to the namespace) is refused at apply only by the autoscaler's
-  validate call, which fails open. When the autoscaler is down, such an
-  object is stored, and reads `Rejected: Invalid` once it runs. It is never
-  acted on.
+- **What needs the cluster is the autoscaler's to check.** The manager
+  refuses, at apply, what a ScalingPolicy's or NodeGroup's schema and
+  rules can say (`min` above `max`, duplicate check names). A strategy's
+  settings, a duration, and a plugin closed to the namespace are refused at
+  apply only by the autoscaler's validate call, which fails open: when the
+  autoscaler is down, such an object is stored, and reads `Rejected:
+  Invalid` once it runs. It is never acted on. A rule's checks are a
+  subset of the parser's: where they differ (a `query` of only spaces on
+  the `legion` source), the parser decides, as `Rejected`.
 - **An object's scaling state goes with it.** A scaling policy's or node
   group's history, pause, and action intents are keyed by its uid: they are
   swept once it is deleted, and an object created again under the same

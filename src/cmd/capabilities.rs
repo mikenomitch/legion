@@ -166,7 +166,7 @@ pub fn catalog() -> Vec<Capability> {
             name: "object.explain",
             cli: "legion object explain <KIND>[.<FIELD>]",
             grpc: Some("Manager/ListObjectKinds"),
-            summary: "Describe a kind or one field: type, default, required, immutable, write-only, examples.",
+            summary: "Describe a kind or one field: type, default, required, immutable, write-only, rules, examples.",
             mutates: false,
             read_only_safe: true,
         },

@@ -20,7 +20,8 @@ storefront  Ready   2m   main    3f9a1c2
 ```
 
 Legion keeps the objects: it checks each one against its kind's schema and
-against what writing it requires of the writer, stores it on the managers
+validation rules and against what writing it requires of the writer,
+stores it on the managers
 (replicated with the rest of the control state), versions it, and serves it
 to the CLI, the API, the MCP server, and the app. The app only reconciles.
 
@@ -66,6 +67,13 @@ kinds = [
     access = { resource = "object" },
     requires = [{ resource = "job", actions = ["write"], name = "/spec/jobs" }],
     immutable = ["/spec/url"],
+    rules = [
+      {
+        rule = "!has(self.deployKey) || self.url.startsWith('ssh://') || self.url.startsWith('git@')",
+        message = "a deploy key is an SSH key: use an ssh:// or git@ URL with it",
+        path = "/spec/deployKey",
+      },
+    ],
     cleanup = "10m",
     maxObjects = 500,
     columns = ["/spec/branch", { name = "COMMIT", pointer = "/status/fields/commit" }],
@@ -85,27 +93,27 @@ kinds = [
 | `access.resource` | What governs the kind's objects: `object` (the default), `job` or `scale` for a namespaced kind, `node` for a cluster kind ([Access](#access)). |
 | `requires` | What writing or deleting an object also needs of its writer, scoped from the object ([Requires](#requires)). |
 | `immutable` | JSON pointers (`/spec/url`) an update may not change. |
+| `rules` | CEL expressions every apply's spec must pass, each with a `message` and an optional `path` ([Validation rules](#validation-rules)). At most 32. |
 | `writeOnly: true` | On any property: the value is a secret, shown as `"<redacted>"` on every read but the owning app's watch. |
 | `cleanup` | How long a delete waits for the app to release the object: a duration, at most `1h`. Default: none, deletes are immediate ([Deleting](#deleting)). |
 | `maxObjects` | At most this many objects of the kind, cluster-wide. Default 10,000, at most 100,000. |
 | `columns` | Up to 8 extra columns for `legion object list`: a pointer (its last segment, upper-cased, is the header) or `{ name, pointer }`. |
-| `rules` | Reserved for cross-field validation rules; refused today. |
 
-Every pointer in a declaration (`requires`, `immutable`, `columns`) points
-into the same document, the object as `legion object get -j` shows it:
+Every pointer in a declaration (`requires`, `immutable`, a rule's `path`,
+`columns`) points into the same document, the object as `legion object get -j` shows it:
 `{ name, namespace, labels, spec, status }`.
 
 Install refuses a kind name that is one of Legion's own nouns (`Job`,
 `Node`, `Namespace`, `Policy`, `Object`, `Kind`, every top-level CLI command,
 every ACL resource, in any case, singular or plural), two kinds of one app
 that differ only by case or plural, a schema that does not compile, an
-example that fails its schema, an access mapping that does not fit the
-scope, and `rules`. The install prompt lists each kind with what writing it
-takes:
+example that fails its schema or rules, a rule that does not compile or
+breaks a cost bound, and an access mapping that does not fit the scope. The
+install prompt lists each kind with what writing it takes:
 
 ```text
 Kinds:
-  gitops/Repo            namespaced; written with object:write on gitops/Repo, and job:write on what spec.jobs names; checked by the app (advisory); deletes wait up to 10m for the app
+  gitops/Repo            namespaced; written with object:write on gitops/Repo, and job:write on what spec.jobs names; 1 validation rule; checked by the app (advisory); deletes wait up to 10m for the app
 ```
 
 Two apps may both declare `Repo`: they are different kinds, `gitops/Repo`
@@ -150,9 +158,9 @@ Each stored object has:
   (what its last write was checked against, [Requires](#requires));
 - **managed by**: the app whose own identity wrote it, if one did;
 - a **state**: `valid`; `invalid` when the stored spec fails the kind's
-  current schema (an upgrade tightened it; the object stays readable and
-  deletable, and the next apply must conform); `orphaned` when no installed
-  app declares the kind any more.
+  current schema or rules (an upgrade tightened them; the object stays
+  readable and deletable, and the next apply must conform); `orphaned`
+  when no installed app declares the kind any more.
 
 Limits: a spec is at most 64 KiB with its defaults; at most 32 labels, keys
 at most 63 characters, values at most 256; the kind's `maxObjects`, counted
@@ -174,8 +182,9 @@ Hint: read it again (legion object get gitops/Repo team-a/storefront) and apply 
 An apply runs, in order: the kind lookup; `write` on the kind's access
 resource ([Access](#access)); the schema (unknown fields fail with a
 did-you-mean: `spec.brnch: unknown field (did you mean branch?)`);
-`immutable`; `requires` ([Requires](#requires)); the app's validate call
-when the kind asks for one; then the write. `--dry-run` runs all of it and
+`immutable`; the kind's rules ([Validation rules](#validation-rules));
+`requires` ([Requires](#requires)); the app's validate call when the kind
+asks for one; then the write. `--dry-run` runs all of it and
 prints the field diff instead of writing. `--expected-version N` writes only
 if the object is at spec version `N` (`0`: only if it does not exist yet).
 `--idempotency-key` makes a retry safe. Applying an unchanged spec and
@@ -318,6 +327,109 @@ The app's own writes are checked the same way, against its grant: an app
 writes objects (its own kind's or another's) only as far as its manifest's
 `permissions` reach.
 
+## Validation rules
+
+A schema checks each field on its own. A kind's **`rules`** check what a
+schema cannot say, usually across fields: [CEL](https://cel.dev)
+expressions that must be true, evaluated by the manager on every apply,
+fail-closed, whether or not the app is up. They are Legion's answer to
+validating webhooks, as `x-kubernetes-validations` is Kubernetes':
+
+```nickel
+rules = [
+  { rule = "self.min <= self.max", message = "min must not exceed max", path = "/spec/min" },
+  {
+    rule = "self.checks.all(c, self.checks.exists_one(d, d.name == c.name))",
+    message = "every check needs its own name",
+    path = "/spec/checks",
+  },
+  # A transition rule: it uses oldSelf, so it checks updates only.
+  { rule = "self.replicas >= oldSelf.replicas", message = "replicas may only grow" },
+],
+```
+
+| Key | Meaning |
+| --- | --- |
+| `rule` | A CEL expression that must evaluate to `true`. At most 1 KiB. |
+| `message` | What a failure says. Required, at most 512 bytes, fixed text (`messageExpression` is not supported). |
+| `path` | A JSON pointer into the spec (`/spec/min`), like every pointer in the declaration: where the failure is reported. Default: the spec as a whole. |
+
+What a rule sees:
+
+- **`self`** is the spec as it will be stored: the writer's spec with the
+  schema's defaults filled. A JSON object is a CEL map: `self.min` reads a
+  field (and fails, `no such key`, when it is absent), `has(self.min)`
+  tests for one, `'team' in self.labels` for a key. Integers are `int`,
+  other numbers `double`, and the two compare (`self.ratio < 1`). Lists
+  are lists.
+- **`oldSelf`** is the stored spec, defaults filled, when an apply updates
+  an object. A rule that uses it is a **transition rule**: checked on
+  updates only, never on create, and never when a stored object is judged
+  on read. `immutable` is still the plain way to freeze a field; a
+  transition rule says how one may change.
+- Nothing else: a rule that names another variable is refused at install.
+
+**When they run.** An apply evaluates every rule after the schema and
+`immutable` and before `requires` ([Applying](#applying)); dry runs too.
+Every failing rule is reported, each at its path:
+
+```text
+$ legion object apply -f inverted.ncl
+Error: autoscaler/ScalingPolicy media/render: spec.min: min must not exceed max; spec.checks: every check needs its own name
+Hint: `legion object explain autoscaler/ScalingPolicy` lists the kind's rules
+```
+
+A rule also fails, and refuses the write, when it errors (it read a field
+the spec lacks: guard optional fields with `has()`), evaluates to something
+other than a bool, or runs past its budget (below); the message says which,
+without the values involved. Install and upgrade compile every rule and
+check every example against the non-transition ones (an example is a
+create). An upgrade that adds or tightens rules re-checks the stored
+objects: its prompt lists those that fail, and they read `invalid`
+(summary `Invalid`) until their next apply conforms. `legion object
+explain` prints a kind's rules, and `ListObjectKinds` (`legion object kinds
+-j`, the MCP `legion_object_kinds`) returns them.
+
+**Cost.** A rule over a large list can be expensive, so the manager bounds
+every rule, by construction:
+
+| Bound | Limit |
+| --- | --- |
+| Rules per kind | 32 |
+| A rule's source | 1 KiB |
+| Bracket nesting (`(`, `[`, `{`, counted on the raw text before any parsing) and conditionals (`? :`) | 32 each |
+| Expression depth, once parsed (evaluation recurses once per level) | 24 |
+| Comprehensions (`all`, `exists`, `exists_one`, `map`, `filter`) nested in one another | 2 |
+| Time | 10 ms per rule, 50 ms for all of a kind's rules on one write |
+| The spec | 64 KiB with its defaults; 128 levels deep |
+
+Every comprehension checks its rule's deadline on each iteration, so even a
+nested `all` over a 20,000-item list stops after 10 ms. A rule that runs
+past its budget fails and refuses the write (`... (not checked: rules[2]
+ran past its 10 ms budget, so the write is refused)`), whatever it would
+have returned. An apply evaluates its rules on a separate thread and waits
+at most 100 ms for them: work between two deadline checks (a long chain of
+list concatenations over a large list) cannot be interrupted, so it
+finishes on that thread, but the write is refused at the timeout either
+way.
+
+Typical rules are cheap: one comparison like `self.min <= self.max` costs
+about 10 to 20 microseconds, including turning a policy-sized spec into CEL
+values, and compiling one at install about 1 to 50 microseconds (release
+build). The 64 KiB spec limit bounds the conversion: about 3 ms for a
+30,000-item list.
+
+**The CEL subset.** Rules run on the [`cel`](https://crates.io/crates/cel)
+crate (cel-rust) 0.15.0 with its standard library and none of its optional
+features: the operators, `size`, `has`, `in`, `startsWith`, `endsWith`,
+`contains`, `type`, the conversions (`int`, `uint`, `double`, `string`),
+and the macros `all`, `exists`, `exists_one`, `map`, and `filter`. Not
+available: `matches` (regular expressions), durations and timestamps, the
+string, list, and math extensions, optional syntax (`self.?x`), and
+message construction. There is no type checker: a rule that compiles can
+still fail at evaluation, which refuses the write, so try a new kind's
+rules against a few objects with `--dry-run`.
+
 ## The validate call
 
 A kind with `validate = true` is also checked by its app, after every core
@@ -345,7 +457,7 @@ seconds, or answers anything but `200` lets the write through with a
 warning (`gitops/Repo team-a/storefront was not checked by the gitops app
 (...)`). It is a convenience, never a control: a writer can make it time
 out. Anything that must refuse a write belongs in the schema, `immutable`,
-or `requires`. Apps answer it with `UiRegistry::object_validate`
+`rules`, or `requires`. Apps answer it with `UiRegistry::object_validate`
 ([Writing an app that owns a kind](#writing-an-app-that-owns-a-kind)).
 
 ## Status
@@ -387,7 +499,7 @@ precedence:
 | --- | --- |
 | `Orphaned` | no installed app declares the kind |
 | `Deleting` | a delete is waiting for the app's cleanup |
-| `Invalid` | the stored spec fails the kind's current schema |
+| `Invalid` | the stored spec fails the kind's current schema or rules |
 | `Stale` | the app is disabled or has no healthy allocation; the status shown is as old as it says |
 | `Pending` | no status yet, or `observedGeneration` is below the generation |
 | `Rejected: <reason>` | `Accepted` is `false` |
@@ -424,11 +536,13 @@ object is gone.
 
 - **Install** registers the app's kinds. Objects an earlier install of the
   same app left orphaned are adopted: the prompt says how many, they are
-  checked against the new schema (failures read `Invalid`), and they keep
+  checked against the new schema and rules (failures read `Invalid`), and
+  they keep
   their recorded authority.
-- **Upgrade** may add kinds and change schemas, access, `requires`,
+- **Upgrade** may add kinds and change schemas, rules, access, `requires`,
   `immutable`, `cleanup`, columns, and limits. The prompt reports existing
-  objects that fail the new schema, defaults that changed (and how many
+  objects that fail the new schema or rules (they read `Invalid`), defaults
+  that changed (and how many
   objects keep the old value), and objects authorized under different
   `requires`. Dropping a kind that still has objects needs `--force` and
   orphans them. Changing a kind's `scope` while it has objects is refused.
@@ -737,8 +851,13 @@ autoscaler/ScalingPolicy  namespaced  scale:write in the object's namespace     
 - **Schemas from the app's types.** The manifest leaves both kinds'
   `schema` and `status.schema` to the app's Rust types, filled in when the
   bundled manifest loads, so the manager's check and the app's parser
-  cannot drift. What a schema cannot say (`min <= max`, a strategy's
-  settings) the validate call reports at apply, as advice, and the app
+  cannot drift.
+- **Cross-field checks as rules.** Both kinds declare the parser's
+  cross-field checks as CEL `rules` (`self.min <= self.max`, unique check
+  names, [The policy rules](autoscaling.md#the-policy-rules)), so the
+  manager refuses an inverted policy at apply even with the autoscaler
+  stopped. What needs the cluster (a strategy's settings, a plugin's
+  config) the validate call reports at apply, as advice, and the app
   reports as `Accepted=false` when it evaluates the object.
 - **A security control lives in the app, fail-closed.** Which namespaces
   may use a scaling plugin is the app's config (`namespaces` on a plugin).
@@ -822,6 +941,9 @@ objects in one pass converges on retry.
 | `"repo" names 2 kinds` | a short name more than one app declares | name the kind in full |
 | `spec.x: unknown field` | the schema is closed | fix the field; `legion object explain` lists them |
 | `spec.url is immutable` | an update changed an `immutable` pointer | delete and recreate |
+| `spec.min: min must not exceed max` | the spec fails one of the kind's rules (the message is the kind's; every failing rule is listed) | fix the spec; `legion object explain` lists the rules |
+| `... (rules[2] could not be evaluated: no such key: max)` | a rule read a field the spec does not have | set the field, or ask the app's author to guard it with `has()` |
+| `... ran past its 10 ms budget, so the write is refused` | a rule is too expensive for this spec (usually nested comprehensions over a large list) | make the list shorter, or ask the app's author for a cheaper rule |
 | `PermissionDenied ... needs job:write ...` | the kind's `requires` | have someone who holds it write the object |
 | `... is managed by the gitops app` | the app wrote it | `--force` to change it anyway |
 | `... is being deleted` | its cleanup window is running | wait (`delete --wait`), then apply |
@@ -839,9 +961,21 @@ objects in one pass converges on retry.
 
 - **No per-namespace quotas for objects.** `maxObjects` caps a kind
   cluster-wide; namespace policies do not count objects yet.
-- **No cross-field validation in the manager.** Rules such as `min <= max`
-  are the app's (`Rejected`) until CEL `rules` land; `rules` is refused
-  today.
+- **Rules are per kind, not per field.** A kind's `rules` see the whole
+  spec; there are no rules attached to a subschema (Kubernetes'
+  `x-kubernetes-validations` on any property), and a rule over every item
+  of a list is written with `all`.
+- **No message expressions or type checking.** A rule's `message` is fixed
+  text (`messageExpression` is refused). Rules are not type-checked against
+  the schema: a rule that reads a field the spec lacks fails at apply, so
+  try a new kind's rules with `--dry-run`.
+- **A rule's cost is bounded by a clock, not estimated.** There is no
+  static cost estimate as Kubernetes has; the budget is wall-clock time,
+  so a rule close to its 10 ms can pass on an idle manager and fail on a
+  busy one, and work the budget check cannot interrupt (between two
+  comprehension iterations) runs to its end on the manager's thread after
+  the write is refused. The source, depth, and nesting limits keep that
+  work small.
 - **The validate call is advice**, and a dry run does not prove the app
   would accept the object later.
 - **No resume for the watch.** A reconnect relists the app's objects; that

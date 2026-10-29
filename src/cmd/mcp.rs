@@ -326,7 +326,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_object_kinds",
-            description: "List the object kinds installed apps declare (Legion's custom resources): each kind's qualified name (<app>/<Kind>), scope (namespaced or cluster), access (the permission that governs its objects), requires (what writing one also needs of the writer), JSON schema of spec and status fields, examples, columns, cleanup window and state (active, or orphaned when its app no longer declares it) (docs/app-objects.md).",
+            description: "List the object kinds installed apps declare (Legion's custom resources): each kind's qualified name (<app>/<Kind>), scope (namespaced or cluster), access (the permission that governs its objects), requires (what writing one also needs of the writer), JSON schema of spec and status fields, rules (CEL validation rules every apply must pass, each with its message and path), examples, columns, cleanup window and state (active, or orphaned when its app no longer declares it) (docs/app-objects.md).",
             input_schema: object_kinds_schema,
             mutates: false,
         },
@@ -344,7 +344,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_object_apply",
-            description: "Create or update an object of an installed kind. The manager checks the spec against the kind's closed schema (unknown fields fail with a did-you-mean), checks what writing it requires of you (fail-closed), and asks the app's validator (advice only). Run with dry_run first to see the diff. wait returns once the app has reconciled the new generation.",
+            description: "Create or update an object of an installed kind. The manager checks the spec against the kind's closed schema (unknown fields fail with a did-you-mean), its immutable fields and CEL rules (every failing rule named), checks what writing it requires of you (fail-closed), and asks the app's validator (advice only). Run with dry_run first to see the diff. wait returns once the app has reconciled the new generation.",
             input_schema: object_apply_schema,
             mutates: true,
         },

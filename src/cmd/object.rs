@@ -93,7 +93,7 @@ pub fn config() -> Command {
         )
         .subcommand(
             Command::new("explain")
-                .about("Describe a kind, or one of its fields: type, default, required, immutable, write-only, examples")
+                .about("Describe a kind, or one of its fields: type, default, required, immutable, write-only, rules, examples")
                 .arg(
                     Arg::new("target")
                         .required(true)
@@ -632,6 +632,25 @@ async fn explain(matches: &ArgMatches) -> R<()> {
             if !status_schema.is_null() {
                 lines.push("Status fields (reported by the app):".to_string());
                 describe_properties("status.fields", &status_schema, &[], &mut lines);
+            }
+            if !kind.rules.is_empty() {
+                lines.push(
+                    "Rules (CEL, checked by the manager on every apply; `self` is the spec, \
+                     `oldSelf` the stored spec):"
+                        .to_string(),
+                );
+                for rule in &kind.rules {
+                    let at = match rule.path.trim_start_matches('/') {
+                        "" => "spec".to_string(),
+                        path => path.replace('/', "."),
+                    };
+                    lines.push(format!(
+                        "  {at}: {}{}",
+                        rule.message,
+                        if rule.transition { " (on update)" } else { "" }
+                    ));
+                    lines.push(format!("    {}", rule.rule));
+                }
             }
             let examples: Vec<Value> =
                 serde_json::from_str(&kind.examples_json).unwrap_or_default();

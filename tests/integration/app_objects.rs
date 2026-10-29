@@ -1321,3 +1321,202 @@ async fn kinds_follow_their_app_test() -> R<()> {
     );
     Ok(())
 }
+
+/// CEL validation rules (Phase O4; docs/app-objects.md, "Validation
+/// rules"): an upgrade that adds them re-checks stored objects, which read
+/// `Invalid`; every apply evaluates them, dry runs too, naming every
+/// failing rule at its path, before `requires`; a transition rule checks
+/// updates only; and the autoscaler's ScalingPolicy refuses `min > max` at
+/// apply while the autoscaler is not running.
+#[tokio::test(flavor = "multi_thread")]
+async fn rules_fail_closed_test() -> R<()> {
+    let fx = fixture().await?;
+    // Stored before the kind has rules.
+    fx.apply(
+        repo("web", "team-a", json!({ "url": "http://git/web" })),
+        &fx.admin,
+    )
+    .await?;
+
+    let mut next = manifest("2.0.0", true);
+    next["kinds"][0]["rules"] = json!([
+        { "rule": "self.url.startsWith('https://')", "message": "url must be https",
+          "path": "/spec/url" },
+        { "rule": "self.branch != 'tmp'", "message": "no tmp branches", "path": "/spec/branch" },
+        { "rule": "!has(oldSelf.jobs) || (has(self.jobs) && size(self.jobs) >= size(oldSelf.jobs))",
+          "message": "jobs may only be added", "path": "/spec/jobs" },
+    ]);
+    let upgraded = fx
+        .svc
+        .upgrade_app(req(
+            UpgradeAppRequest {
+                name: APP.into(),
+                manifest_json: next.to_string(),
+                source_ref: "./app.json".into(),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?
+        .into_inner();
+    assert!(
+        upgraded
+            .prompt
+            .iter()
+            .any(|line| line.contains("1 fails this version's schema and rules")),
+        "{:?}",
+        upgraded.prompt
+    );
+    assert!(
+        upgraded
+            .prompt
+            .iter()
+            .any(|line| line.contains("team-a/web: spec.url: url must be https")),
+        "{:?}",
+        upgraded.prompt
+    );
+    let stored = fx.get(KIND, "team-a/web", &fx.admin).await?;
+    assert_eq!(stored.state, "invalid");
+    assert_eq!(stored.summary, "Invalid");
+    assert!(
+        stored.detail.contains("url must be https"),
+        "{}",
+        stored.detail
+    );
+    let kinds = fx
+        .svc
+        .list_object_kinds(req(ListObjectKindsRequest { app: APP.into() }, &fx.admin))
+        .await?
+        .into_inner()
+        .kinds;
+    assert_eq!(kinds[0].rules.len(), 3);
+    assert!(!kinds[0].rules[0].transition && kinds[0].rules[2].transition);
+    assert_eq!(kinds[0].rules[0].path, "/spec/url");
+
+    // Every failing rule, at its path; a dry run is refused the same way.
+    let both = repo(
+        "api",
+        "team-a",
+        json!({ "url": "http://git/api", "branch": "tmp" }),
+    );
+    for dry_run in [true, false] {
+        assert_code(
+            fx.apply_with(both.clone(), &fx.admin, |request| request.dry_run = dry_run)
+                .await,
+            Code::InvalidArgument,
+            "gitops/Repo team-a/api: spec.url: url must be https; spec.branch: no tmp branches",
+        );
+    }
+    assert_code(
+        fx.get(KIND, "team-a/api", &fx.admin).await,
+        Code::NotFound,
+        "",
+    );
+
+    // Rules run before `requires`: a writer without job:write is told what
+    // is wrong with the spec first.
+    let writer = fx
+        .token(
+            "rules-writer",
+            json!([
+                { "resources": ["object"], "namespaces": ["team-a"], "kinds": [KIND],
+                  "actions": ["read", "write"] },
+            ]),
+        )
+        .await?;
+    assert_code(
+        fx.apply(
+            repo(
+                "w",
+                "team-a",
+                json!({ "url": "http://git/w", "jobs": ["w"] }),
+            ),
+            &writer,
+        )
+        .await,
+        Code::InvalidArgument,
+        "url must be https",
+    );
+    assert_code(
+        fx.apply(
+            repo(
+                "w",
+                "team-a",
+                json!({ "url": "https://git/w", "jobs": ["w"] }),
+            ),
+            &writer,
+        )
+        .await,
+        Code::PermissionDenied,
+        "job:write",
+    );
+
+    // A transition rule is skipped on create and checked on update.
+    fx.apply(
+        repo(
+            "api",
+            "team-a",
+            json!({ "url": "https://git/api", "jobs": ["a", "b"] }),
+        ),
+        &fx.admin,
+    )
+    .await?;
+    assert_code(
+        fx.apply(
+            repo(
+                "api",
+                "team-a",
+                json!({ "url": "https://git/api", "jobs": ["a"] }),
+            ),
+            &fx.admin,
+        )
+        .await,
+        Code::InvalidArgument,
+        "spec.jobs: jobs may only be added",
+    );
+    fx.apply(
+        repo(
+            "api",
+            "team-a",
+            json!({ "url": "https://git/api", "jobs": ["a", "b", "c"] }),
+        ),
+        &fx.admin,
+    )
+    .await?;
+
+    // The autoscaler's kinds, its app installed and not running: the
+    // manager refuses an inverted policy on its own (calls entry 33).
+    let autoscaler =
+        legion::apps::bundled_manifest("autoscaler").context("the bundled autoscaler")?;
+    fx.store
+        .seed_app(legion::manager::apps::seed_record(autoscaler, None))?;
+    fx.svc
+        .sync_object_kinds_for("autoscaler")
+        .map_err(|status| anyhow!(status.message().to_string()))?;
+    let policy = |min: u32, max: u32| {
+        json!({
+            "kind": "autoscaler/ScalingPolicy", "name": "render", "namespace": "team-a",
+            "spec": {
+                "target": { "plugin": "noop" }, "min": min, "max": max,
+                "checks": [{ "name": "floor", "source": "legion",
+                             "strategy": { "name": "fixed", "value": 1 } }],
+            },
+        })
+    };
+    assert_code(
+        fx.apply(policy(9, 3), &fx.admin).await,
+        Code::InvalidArgument,
+        "autoscaler/ScalingPolicy team-a/render: spec.min: min must not exceed max",
+    );
+    let created = fx.apply(policy(1, 3), &fx.admin).await?;
+    assert!(created.created, "{created:?}");
+    assert!(
+        created
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not checked by the autoscaler app")),
+        "the autoscaler is not running: {:?}",
+        created.warnings
+    );
+    Ok(())
+}
