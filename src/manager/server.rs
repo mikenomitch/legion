@@ -1269,6 +1269,13 @@ impl EventAudience {
     fn sees(&self, event: &SchedulerEventRecord) -> bool {
         match self {
             EventAudience::Operator => true,
+            // An object's events reach only a caller who may read that kind
+            // on that object's scope: reaching its namespace is not enough,
+            // or the feed would undo check-before-fetch (docs/app-objects.md,
+            // "Events").
+            EventAudience::Tenant(identity) if event.kind.starts_with("object.") => {
+                object_event_visible(identity, event)
+            }
             EventAudience::Tenant(identity) => match event.job_id.as_deref() {
                 Some(job_id) if !job_id.is_empty() => {
                     identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(job_id))
@@ -1297,6 +1304,25 @@ impl EventAudience {
             ),
         }
     }
+}
+
+/// Whether a tenant may see an `object.*` event: `read` on the kind's
+/// access resource (recorded in the event) on the object's scope.
+fn object_event_visible(identity: &AclIdentity, event: &SchedulerEventRecord) -> bool {
+    let Ok(meta) = serde_json::from_str::<Value>(&event.metadata_json) else {
+        return false;
+    };
+    let text = |key: &str| meta.get(key).and_then(Value::as_str).unwrap_or_default();
+    let Some(access) = AclResource::parse(text("access")) else {
+        return false;
+    };
+    let scope = crate::structs::app_object::access_scope(
+        access,
+        text("qualifiedKind"),
+        text("namespace"),
+        text("name"),
+    );
+    identity.allows(access, AclAction::Read, &scope)
 }
 
 fn map_scheduler_event(event: SchedulerEventRecord) -> SchedulerEvent {

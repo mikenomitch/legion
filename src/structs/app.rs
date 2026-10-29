@@ -361,7 +361,7 @@ impl AppManifest {
         // upgrade.
         let kinds = crate::structs::app_object::manifest_kinds(self)
             .map_err(|err| format!("app {}: {err}", self.name))?;
-        crate::structs::app_object::validate_kind_decls(&self.name, &kinds)
+        crate::structs::app_object::validate_kind_decls(&kinds)
             .map_err(|err| format!("app {}: {err}", self.name))?;
         let schema = self.config_schema();
         let compiled = compile_config_schema(&schema)

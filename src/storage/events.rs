@@ -1772,81 +1772,124 @@ pub mod drafts {
             }))
     }
 
-    /// What every object event's metadata carries, and the object's label
-    /// (`Repo team-a/storefront`).
-    fn object_meta(app: &str, kind: &str, namespace: &str, name: &str) -> (Value, String) {
-        let id = crate::structs::app_object::object_id(namespace, name);
-        let mut meta = json!({
-            "app": app,
-            "kind": kind,
-            "qualifiedKind": crate::structs::app_object::qualified_kind(app, kind),
-            "name": name,
-        });
-        // A namespaced object's events reach whoever reaches its namespace
-        // (`event_namespace` reads this), as `namespace.*` events do; a
-        // cluster object's reach operators.
-        if !namespace.is_empty() {
-            meta["namespace"] = json!(namespace);
-        }
-        (meta, format!("{kind} {id}"))
+    /// The object an `object.*` event is about: enough to name it and to
+    /// decide who may see the event (docs/app-objects.md, "Events"). Events
+    /// never carry a spec, status fields, or a redacted value.
+    pub struct ObjectEventRef<'a> {
+        pub app: &'a str,
+        pub kind: &'a str,
+        /// Empty for a cluster-scoped kind.
+        pub namespace: &'a str,
+        pub name: &'a str,
+        pub uid: u64,
+        /// The ACL resource governing the kind's objects (`object`, `job`,
+        /// `scale`, `node`): a tenant's feed shows the event only to a
+        /// caller who may read the kind on the object's scope.
+        pub access: &'a str,
     }
 
-    /// `object.applied`: an object of an app-declared kind was created, or
-    /// its spec or labels changed (docs/app-objects.md).
-    #[allow(clippy::too_many_arguments)]
+    fn object_meta(object: &ObjectEventRef<'_>) -> (Value, String) {
+        let qualified = crate::structs::app_object::qualified_kind(object.app, object.kind);
+        let id = crate::structs::app_object::object_id(object.namespace, object.name);
+        let mut meta = json!({
+            "app": object.app,
+            "kind": object.kind,
+            "qualifiedKind": qualified,
+            "name": object.name,
+            "uid": object.uid,
+            "access": object.access,
+        });
+        if !object.namespace.is_empty() {
+            meta["namespace"] = json!(object.namespace);
+        }
+        (meta, format!("{qualified} {id}"))
+    }
+
+    /// `object.applied`: an object was created, or its spec, labels, or
+    /// authority changed.
     pub fn object_applied(
-        app: &str,
-        kind: &str,
-        namespace: &str,
-        name: &str,
+        object: &ObjectEventRef<'_>,
         generation: u64,
-        version: u64,
         created: bool,
         by: &str,
     ) -> EventDraft {
-        let (mut meta, label) = object_meta(app, kind, namespace, name);
+        let (mut meta, label) = object_meta(object);
         meta["generation"] = json!(generation);
-        meta["version"] = json!(version);
         meta["created"] = json!(created);
         meta["by"] = json!(by);
         let verb = if created { "created" } else { "updated" };
         EventDraft::info(
             "object.applied",
-            format!("{label} ({app}) {verb} by {by} (generation {generation})"),
+            format!("{label} {verb} by {by} (generation {generation})"),
         )
         .meta(meta)
     }
 
-    /// `object.deleted`: an object was deleted.
-    pub fn object_deleted(
-        app: &str,
-        kind: &str,
-        namespace: &str,
-        name: &str,
-        by: &str,
-    ) -> EventDraft {
-        let (mut meta, label) = object_meta(app, kind, namespace, name);
+    /// `object.deleted`: an object was removed (by a delete, by its app's
+    /// release after a cleanup, or by a namespace cascade).
+    pub fn object_deleted(object: &ObjectEventRef<'_>, by: &str) -> EventDraft {
+        let (mut meta, label) = object_meta(object);
         meta["by"] = json!(by);
-        EventDraft::info("object.deleted", format!("{label} ({app}) deleted by {by}")).meta(meta)
+        EventDraft::info("object.deleted", format!("{label} deleted by {by}")).meta(meta)
     }
 
-    /// `object.status_changed`: the owning app wrote a new status.
-    pub fn object_status_changed(
-        app: &str,
-        kind: &str,
-        namespace: &str,
-        name: &str,
-        observed_generation: u64,
-        by: &str,
-    ) -> EventDraft {
-        let (mut meta, label) = object_meta(app, kind, namespace, name);
-        meta["observedGeneration"] = json!(observed_generation);
+    /// `object.deleting`: a delete started the kind's bounded cleanup.
+    pub fn object_deleting(object: &ObjectEventRef<'_>, by: &str, deadline_ms: i64) -> EventDraft {
+        let (mut meta, label) = object_meta(object);
         meta["by"] = json!(by);
+        meta["cleanupDeadlineUnixMs"] = json!(deadline_ms);
         EventDraft::info(
-            "object.status_changed",
-            format!("{label}: status updated by {app} (observed generation {observed_generation})"),
+            "object.deleting",
+            format!("{label} deleted by {by}; its app has until the cleanup deadline to release it"),
         )
         .meta(meta)
+    }
+
+    /// `object.cleanup_abandoned`: a cleanup reached its deadline (or the
+    /// kind was orphaned) before the app released the object; it was
+    /// removed anyway.
+    pub fn object_cleanup_abandoned(object: &ObjectEventRef<'_>, why: &str) -> EventDraft {
+        let (mut meta, label) = object_meta(object);
+        meta["reason"] = json!(why);
+        EventDraft::warn(
+            "object.cleanup_abandoned",
+            format!("{label} removed without its app's release: {why}"),
+        )
+        .meta(meta)
+    }
+
+    /// `object.status_changed`: the owning app's `Ready` or `Accepted`
+    /// condition changed.
+    pub fn object_status_changed(
+        object: &ObjectEventRef<'_>,
+        condition: &str,
+        from: &str,
+        to: &str,
+        reason: &str,
+        observed_generation: u64,
+    ) -> EventDraft {
+        let (mut meta, label) = object_meta(object);
+        meta["condition"] = json!(condition);
+        meta["from"] = json!(from);
+        meta["to"] = json!(to);
+        meta["reason"] = json!(reason);
+        meta["observedGeneration"] = json!(observed_generation);
+        let level_warn = to == "false";
+        let text = format!(
+            "{label}: {condition} {} → {to}{} (observed generation {observed_generation})",
+            if from.is_empty() { "unset" } else { from },
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" ({reason})")
+            }
+        );
+        let draft = if level_warn {
+            EventDraft::warn("object.status_changed", text)
+        } else {
+            EventDraft::info("object.status_changed", text)
+        };
+        draft.meta(meta)
     }
 
     /// A namespace was deleted.
@@ -3131,43 +3174,44 @@ impl EventRecorder<'_> {
         ));
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn object_applied(
         self,
-        app: &str,
-        kind: &str,
-        namespace: &str,
-        name: &str,
+        object: &drafts::ObjectEventRef<'_>,
         generation: u64,
-        version: u64,
         created: bool,
         by: &str,
     ) {
-        self.emit(drafts::object_applied(
-            app, kind, namespace, name, generation, version, created, by,
-        ));
+        self.emit(drafts::object_applied(object, generation, created, by));
     }
 
-    pub fn object_deleted(self, app: &str, kind: &str, namespace: &str, name: &str, by: &str) {
-        self.emit(drafts::object_deleted(app, kind, namespace, name, by));
+    pub fn object_deleted(self, object: &drafts::ObjectEventRef<'_>, by: &str) {
+        self.emit(drafts::object_deleted(object, by));
+    }
+
+    pub fn object_deleting(self, object: &drafts::ObjectEventRef<'_>, by: &str, deadline_ms: i64) {
+        self.emit(drafts::object_deleting(object, by, deadline_ms));
+    }
+
+    pub fn object_cleanup_abandoned(self, object: &drafts::ObjectEventRef<'_>, why: &str) {
+        self.emit(drafts::object_cleanup_abandoned(object, why));
     }
 
     pub fn object_status_changed(
         self,
-        app: &str,
-        kind: &str,
-        namespace: &str,
-        name: &str,
+        object: &drafts::ObjectEventRef<'_>,
+        condition: &str,
+        from: &str,
+        to: &str,
+        reason: &str,
         observed_generation: u64,
-        by: &str,
     ) {
         self.emit(drafts::object_status_changed(
-            app,
-            kind,
-            namespace,
-            name,
+            object,
+            condition,
+            from,
+            to,
+            reason,
             observed_generation,
-            by,
         ));
     }
 

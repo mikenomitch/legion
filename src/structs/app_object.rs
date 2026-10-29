@@ -2,45 +2,63 @@
 //! the kinds an app's manifest declares (`kinds`), the objects people write
 //! of them, and the checks both go through.
 //!
-//! An app declares a **kind** (`Repo`, `ScalingPolicy`) with a JSON Schema
-//! for its spec (draft 7, local `$ref`s only, at most 64 KiB: the jobspec
-//! extension rules, by the same code), an optional status schema, a scope
+//! A kind's name is `<app>/<Kind>` (`gitops/Repo`). It declares a JSON
+//! Schema for its spec (draft 7, local `$ref`s only, at most 64 KiB, closed
+//! by default), an optional schema for the `fields` of its status, a scope
 //! (`namespaced` or `cluster`), the ACL resource that governs its objects
-//! (`access`, default `object`), extra permissions writers need
-//! (`writeRequires`), and the columns `legion object list` shows. Kind names
-//! are unique cluster-wide, ignoring case; `<app>/<Kind>` always names one
-//! app's kind.
+//! (`access`: `object`, `job`, `scale`, or `node`), the permissions writing
+//! an object needs, resolved from its contents (`requires`), fields an
+//! update may not change (`immutable`), a bounded `cleanup` window,
+//! `maxObjects`, and the columns `legion object list` shows.
 //!
-//! Everything here is pure: the declarations and their install checks, the
-//! registry of installed kinds and how a typed kind resolves against it,
-//! parsing an object as a person writes it, the effective spec (defaults
-//! filled) and state (`valid`, `invalid`, `orphaned`) computed against the
-//! kinds installed *now*, the spec diff a dry run shows, and the watch's
-//! shard key.
+//! Everything here is pure: declarations and their install checks, the
+//! registry of kinds and how a typed kind resolves against it, parsing an
+//! object as a person writes it, schemas (closing, defaults, errors with
+//! paths, `writeOnly` redaction), `requires` resolution into concrete ACL
+//! checks, `immutable`, the status envelope and the summary every object
+//! reads as, the spec diff, and the watch's shard key.
 
-use crate::structs::acl::{AclAction, AclResource};
-use crate::structs::app::{AppManifest, AppRecord};
-use crate::structs::app_ui::{UiPermission, ViewContext};
-use crate::structs::extensions::{compiled_extension_schema, CompiledSchema};
+use crate::structs::acl::{AclAction, AclResource, AclScope};
+use crate::structs::app::{digest_value, AppManifest};
+use crate::structs::app_ui::ViewContext;
+use crate::structs::extensions::{compile_schema, fill_defaults};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, OnceLock};
 
-/// Longest kind name.
+/// Longest kind name (the part after `<app>/`).
 pub const MAX_KIND_NAME_LEN: usize = 63;
 /// Most kinds one app declares.
 pub const MAX_KINDS_PER_APP: usize = 32;
 /// Most `columns` a kind declares.
 pub const MAX_KIND_COLUMNS: usize = 8;
-/// Largest spec, and largest status, as JSON.
-pub const MAX_OBJECT_DOC_BYTES: usize = 256 * 1024;
+/// Largest kind schema (spec or status), as JSON.
+pub const MAX_KIND_SCHEMA_BYTES: usize = 64 * 1024;
+/// Largest spec, after defaults, as JSON.
+pub const MAX_SPEC_BYTES: usize = 64 * 1024;
+/// Largest status `fields`, as JSON.
+pub const MAX_STATUS_FIELDS_BYTES: usize = 16 * 1024;
+/// Most conditions in one status.
+pub const MAX_CONDITIONS: usize = 16;
+/// Longest condition message.
+pub const MAX_CONDITION_MESSAGE_BYTES: usize = 1024;
 /// Most labels on one object.
 pub const MAX_OBJECT_LABELS: usize = 32;
 /// Longest label key, and longest label value.
 pub const MAX_LABEL_KEY_LEN: usize = 63;
 pub const MAX_LABEL_VALUE_LEN: usize = 256;
+/// A kind's `maxObjects` when it names none, and the most it may name.
+pub const DEFAULT_MAX_OBJECTS: u64 = 10_000;
+pub const MAX_MAX_OBJECTS: u64 = 100_000;
+/// The longest `cleanup` window.
+pub const MAX_CLEANUP: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Most concrete permissions one object's `requires` may resolve to.
+pub const MAX_RESOLVED_REQUIREMENTS: usize = 64;
+/// What every read but the owning app's watch shows for a `writeOnly`
+/// value.
+pub const REDACTED: &str = "<redacted>";
 /// The path an app serves its object validate call on.
 pub const OBJECT_VALIDATE_PATH: &str = "/legion/v1/objects/validate";
 /// The name an object validate call's viewer assertion carries (an
@@ -49,12 +67,15 @@ pub const OBJECT_VALIDATE_NAME: &str = "object";
 /// The slot an object validate call's assertion context names: not a UI
 /// slot, a marker that binds the assertion to an object write.
 pub const OBJECT_VALIDATE_SLOT: &str = "object";
+/// The standard condition types (docs/app-objects.md, "Status").
+pub const CONDITION_ACCEPTED: &str = "Accepted";
+pub const CONDITION_READY: &str = "Ready";
 
 /// Legion's own nouns, which no kind may take (in any case, singular or
 /// plural): every top-level CLI noun (hyphens dropped), every ACL resource,
 /// and the core objects that are not top-level commands, plus the two
 /// fields every object has (`spec`, `status`). A test checks every
-/// top-level command is covered (app-object-kinds calls entry 9).
+/// top-level command is covered (app-object-kinds calls entry 20).
 pub const RESERVED_KIND_NOUNS: &[&str] = &[
     "acl",
     "action",
@@ -128,8 +149,7 @@ pub const RESERVED_KIND_NOUNS: &[&str] = &[
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum KindScope {
-    /// Each object lives in a namespace, and is reached with ACL rules on
-    /// it (the default).
+    /// Each object lives in a namespace (the default).
     #[default]
     Namespaced,
     /// Objects have no namespace.
@@ -153,26 +173,25 @@ impl KindScope {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct KindAccess {
-    /// An ACL resource whose scope fits the kind's: `object` (the default,
-    /// for either scope), a namespaced resource for a namespaced kind
-    /// (`job`, `scale`, …), a cluster-scoped one for a cluster kind
-    /// (`node`, `operator`, …).
+    /// `object` (the default), `job` or `scale` (namespaced kinds, checked
+    /// namespace-wide), or `node` (cluster kinds).
     pub resource: String,
 }
 
-/// A kind's status: what its app reports.
+/// A kind's status: the schema of the `fields` its app reports.
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct KindStatus {
-    /// JSON Schema (draft 7) every status write is checked against: an
-    /// object schema, at most 64 KiB, only local `$ref`s.
+    /// JSON Schema (draft 7) every status's `fields` are checked against:
+    /// an object schema, at most 64 KiB, only local `$ref`s, closed by
+    /// default.
     #[schemars(with = "serde_json::Map<String, Value>")]
     pub schema: Value,
 }
 
-/// One column `legion object list` shows: a JSON pointer into `{ name,
-/// namespace, labels, spec, status }` (`spec` with defaults filled), and a
-/// header (the pointer's last segment, upper-cased, when not named).
+/// One column `legion object list` shows: a JSON pointer into the object
+/// (`/spec/url`, `/status/fields/commit`), and a header (the pointer's last
+/// segment, upper-cased, when not named).
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum KindColumn {
@@ -201,12 +220,55 @@ impl KindColumn {
     }
 }
 
+/// One permission writing an object of a kind needs, its scope taken from
+/// the object (app-object-kinds plan §6.4). Every pointer points into the
+/// object document (`/spec/...`, `/name`, `/namespace`, `/labels/...`); a
+/// pointer may name a string or a list of strings.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KindRequirement {
+    /// An ACL resource (`job`, `kv`, `operator`, …).
+    pub resource: String,
+    /// `read` and/or `write`.
+    pub actions: Vec<String>,
+    /// For a namespaced resource: the namespace(s). Default (and when the
+    /// pointer names nothing): the object's own namespace, or every
+    /// namespace (`*`) for a cluster kind's object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// For a namespaced resource: the name(s) (job names for `job`).
+    /// Default: namespace-wide (`*`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// For `kv`: the key path(s). Required; when the pointer names nothing,
+    /// the entry does not apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// For `node`: the pool(s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    /// For `job`: the priority band claimed (default `normal`, as a submit
+    /// defaults it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band: Option<String>,
+    /// For `job`: the job template the work goes through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// For `job`: host-level work (only a `job` rule with `host = true`
+    /// covers it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host: bool,
+    /// The entry applies only when this pointer names a true value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+}
+
 /// One kind an app's manifest declares (`kinds[]`).
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KindDecl {
     /// PascalCase and singular (`Repo`): a capital letter, then letters and
-    /// digits, at most 63. Unique cluster-wide, ignoring case.
+    /// digits, at most 63. The kind's name is `<app>/<name>`.
     pub name: String,
     /// One line on what an object of the kind is.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -215,30 +277,46 @@ pub struct KindDecl {
     #[serde(default)]
     pub scope: KindScope,
     /// JSON Schema (draft 7) for the spec: an object schema, at most 64
-    /// KiB, with only local `$ref`s. `default`s are filled when an object
-    /// is read.
+    /// KiB, with only local `$ref`s, closed by default. `default`s are
+    /// filled at write.
     #[schemars(with = "serde_json::Map<String, Value>")]
     pub schema: Value,
-    /// The status the app reports, and its schema.
+    /// The schema of the status `fields` the app reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<KindStatus>,
     /// Example specs, each checked against the schema at install.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<Value>,
-    /// Also ask the app on every apply (`POST /legion/v1/objects/validate`),
-    /// for checks a schema cannot express. Fails open.
+    /// Also ask the app on every apply that changes the spec (`POST
+    /// /legion/v1/objects/validate`). Advisory: fails open.
     #[serde(default)]
     pub validate: bool,
     /// The ACL resource that governs the kind's objects (default `object`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<KindAccess>,
-    /// Permissions every writer (apply and delete) must also hold, on the
-    /// object's scope.
+    /// Permissions writing (apply or delete) an object needs, resolved from
+    /// its contents and checked as the writer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub write_requires: Vec<UiPermission>,
+    pub requires: Vec<KindRequirement>,
+    /// JSON pointers into the object (`/spec/url`) an update may not
+    /// change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub immutable: Vec<String>,
+    /// How long a delete waits for the app to release the object (`10m`,
+    /// at most `1h`); none deletes at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<String>,
+    /// At most this many objects of the kind (default 10,000, at most
+    /// 100,000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_objects: Option<u64>,
     /// The columns `legion object list` shows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<KindColumn>,
+    /// Reserved for CEL validation rules (Phase O4): refused until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Vec<serde_json::Map<String, Value>>>")]
+    pub rules: Option<Value>,
 }
 
 impl KindDecl {
@@ -250,39 +328,83 @@ impl KindDecl {
             .unwrap_or("object")
     }
 
-    /// The access resource, parsed (an install checked it).
+    /// The access resource, checked against the pinned set.
     pub fn access_resource(&self) -> Result<AclResource, String> {
-        AclResource::parse(self.access_name()).ok_or_else(|| {
-            format!(
-                "access.resource {:?} is not an ACL resource ({})",
-                self.access_name(),
-                AclResource::all().join(", ")
-            )
-        })
+        match self.access_name() {
+            "object" => Ok(AclResource::Object),
+            "job" => Ok(AclResource::Job),
+            "scale" => Ok(AclResource::Scale),
+            "node" => Ok(AclResource::Node),
+            other => Err(format!(
+                "access.resource {other:?} cannot govern objects; a kind maps onto object (the \
+                 default), job, scale, or node"
+            )),
+        }
     }
 
-    /// `writeRequires`, parsed.
-    pub fn write_requires_parsed(&self) -> Result<Vec<(AclResource, AclAction)>, String> {
-        self.write_requires
-            .iter()
-            .map(UiPermission::parsed)
-            .collect()
-    }
-
-    /// How the install prompt words the kind's access: `object:write on
-    /// gitops/Repo, plus job:write`.
-    pub fn access_label(&self, app: &str) -> String {
-        let mut text = if self.access_name() == "object" {
-            format!("object:write on {app}/{}", self.name)
-        } else {
-            format!("{}:write", self.access_name())
+    /// `cleanup`, parsed.
+    pub fn cleanup_window(&self) -> Result<Option<std::time::Duration>, String> {
+        let Some(raw) = self.cleanup.as_deref() else {
+            return Ok(None);
         };
-        if !self.write_requires.is_empty() {
-            let extra: Vec<String> = self.write_requires.iter().map(|p| p.label()).collect();
-            text.push_str(&format!(", plus {}", extra.join(", ")));
+        let window = humantime::parse_duration(raw.trim())
+            .map_err(|err| format!("cleanup {raw:?}: {err}"))?;
+        if window.is_zero() || window > MAX_CLEANUP {
+            return Err(format!(
+                "cleanup {raw:?} must be more than 0 and at most 1h"
+            ));
+        }
+        Ok(Some(window))
+    }
+
+    /// `maxObjects`, or its default.
+    pub fn max_objects(&self) -> u64 {
+        self.max_objects.unwrap_or(DEFAULT_MAX_OBJECTS)
+    }
+
+    /// How the install prompt words who may write the kind's objects.
+    pub fn access_label(&self, app: &str) -> String {
+        let mut text = match self.access_name() {
+            "object" => format!("object:write on {app}/{}", self.name),
+            resource if self.scope.is_namespaced() => {
+                format!("{resource}:write in the object's namespace")
+            }
+            resource => format!("{resource}:write"),
+        };
+        for requirement in &self.requires {
+            text.push_str(&format!(", and {}", requirement_label(requirement)));
         }
         text
     }
+}
+
+/// `job:write in the namespace spec.targetNamespace names`.
+fn requirement_label(requirement: &KindRequirement) -> String {
+    let mut text = format!("{}:{}", requirement.resource, requirement.actions.join("+"));
+    if let Some(pointer) = &requirement.namespace {
+        text.push_str(&format!(
+            " in the namespace {} names",
+            dotted(pointer.trim_start_matches('/'))
+        ));
+    }
+    if let Some(pointer) = &requirement.path {
+        text.push_str(&format!(" on the key {} names", dotted(pointer.trim_start_matches('/'))));
+    }
+    if let Some(pointer) = &requirement.pool {
+        text.push_str(&format!(" in the pool {} names", dotted(pointer.trim_start_matches('/'))));
+    }
+    if requirement.host {
+        text.push_str(" (host-level)");
+    }
+    if let Some(pointer) = &requirement.when {
+        text.push_str(&format!(" when {} is set", dotted(pointer.trim_start_matches('/'))));
+    }
+    text
+}
+
+/// `spec/target` → `spec.target`.
+fn dotted(path: &str) -> String {
+    path.replace('/', ".")
 }
 
 /// The manifest's `kinds`, parsed.
@@ -351,14 +473,115 @@ pub fn validate_kind_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A pointer into the object document: `/spec/…`, `/labels/…`, `/name`,
+/// `/namespace`, and (for columns) `/status/…`.
+fn validate_object_pointer(pointer: &str, allow_status: bool) -> Result<(), String> {
+    let first = pointer
+        .strip_prefix('/')
+        .map(|rest| rest.split('/').next().unwrap_or_default());
+    match first {
+        Some("spec" | "labels" | "name" | "namespace") => Ok(()),
+        Some("status") if allow_status => Ok(()),
+        _ => Err(format!(
+            "{pointer:?} must be a JSON pointer into the object: /spec/…, /labels/…, /name, \
+             /namespace{}",
+            if allow_status { ", or /status/…" } else { "" }
+        )),
+    }
+}
+
+/// Check one `requires` entry on its own.
+fn validate_requirement(scope: KindScope, requirement: &KindRequirement) -> Result<(), String> {
+    let resource = AclResource::parse(requirement.resource.trim()).ok_or_else(|| {
+        format!(
+            "{:?} is not an ACL resource ({})",
+            requirement.resource,
+            AclResource::all().join(", ")
+        )
+    })?;
+    if requirement.actions.is_empty() {
+        return Err(format!("{}: `actions` must not be empty", resource.as_str()));
+    }
+    for action in &requirement.actions {
+        AclAction::parse(action.trim()).ok_or_else(|| {
+            format!(
+                "{}: action {action:?} must be `read` or `write`",
+                resource.as_str()
+            )
+        })?;
+    }
+    let pointers = [
+        ("namespace", &requirement.namespace),
+        ("name", &requirement.name),
+        ("path", &requirement.path),
+        ("pool", &requirement.pool),
+        ("band", &requirement.band),
+        ("template", &requirement.template),
+        ("when", &requirement.when),
+    ];
+    for (field, pointer) in pointers {
+        if let Some(pointer) = pointer {
+            validate_object_pointer(pointer, false)
+                .map_err(|err| format!("{}: {field}: {err}", resource.as_str()))?;
+        }
+    }
+    let only = |field: &str, set: bool, fits: bool, what: &str| -> Result<(), String> {
+        if set && !fits {
+            Err(format!(
+                "{}: `{field}` applies only to {what}",
+                resource.as_str()
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    only(
+        "namespace",
+        requirement.namespace.is_some(),
+        resource.is_namespaced(),
+        "namespaced resources",
+    )?;
+    only(
+        "name",
+        requirement.name.is_some(),
+        resource.is_namespaced(),
+        "namespaced resources",
+    )?;
+    only(
+        "path",
+        requirement.path.is_some(),
+        resource == AclResource::Kv,
+        "kv",
+    )?;
+    only(
+        "pool",
+        requirement.pool.is_some(),
+        resource == AclResource::Node,
+        "node",
+    )?;
+    let is_job = resource == AclResource::Job;
+    only("band", requirement.band.is_some(), is_job, "job")?;
+    only("template", requirement.template.is_some(), is_job, "job")?;
+    only("host", requirement.host, is_job, "job")?;
+    if resource == AclResource::Kv && requirement.path.is_none() {
+        return Err(
+            "kv: a kv requirement names the key it is about with `path` (a pointer into the \
+             object)"
+                .into(),
+        );
+    }
+    let _ = scope;
+    Ok(())
+}
+
 /// Check an app's kind declarations on their own (app-object-kinds plan
-/// §6.1): at most [`MAX_KINDS_PER_APP`], names valid, not reserved, and not
-/// the same noun as each other; schemas that compile under the extension
-/// rules; examples that pass; an `access` resource whose scope fits the
-/// kind's; `writeRequires` that name ACL permissions; and columns that are
-/// JSON pointers into an object. Collisions with other apps' kinds depend
-/// on the cluster: [`ObjectKindRegistry::collision`].
-pub fn validate_kind_decls(_app: &str, decls: &[KindDecl]) -> Result<(), String> {
+/// §6.1): at most [`MAX_KINDS_PER_APP`]; names valid, not reserved, and not
+/// the same noun as each other (two apps may share one: the kind is
+/// `<app>/<Kind>`); schemas that compile, closed; examples that pass; an
+/// `access` resource from the pinned set whose scope fits; `requires`,
+/// `immutable`, and `columns` pointers into the object; `cleanup` at most an
+/// hour; `maxObjects` in range; no `rules` (CEL, Phase O4).
+pub fn validate_kind_decls(decls: &[KindDecl]) -> Result<(), String> {
     if decls.len() > MAX_KINDS_PER_APP {
         return Err(format!(
             "kinds: {} declared; an app declares at most {MAX_KINDS_PER_APP}",
@@ -373,15 +596,21 @@ pub fn validate_kind_decls(_app: &str, decls: &[KindDecl]) -> Result<(), String>
             .find(|other| same_noun(&other.name, &decl.name))
         {
             return Err(format!(
-                "{at}: the app already declares {}; kind names are unique ignoring case and \
-                 plurals",
+                "{at}: the app already declares {}; an app's kind names are unique ignoring case \
+                 and plurals",
                 other.name
             ));
         }
-        let compiled =
-            compiled_extension_schema(&decl.schema).map_err(|err| format!("{at}: schema {err}"))?;
+        if decl.rules.is_some() {
+            return Err(format!(
+                "{at}: `rules` (CEL validation rules) are not supported yet; use JSON Schema \
+                 (draft-7 conditionals included), `immutable`, and the app's Accepted condition"
+            ));
+        }
+        let schema =
+            KindSchema::compile(&decl.schema).map_err(|err| format!("{at}: schema {err}"))?;
         for (n, example) in decl.examples.iter().enumerate() {
-            compiled.check(example).map_err(|errors| {
+            schema.check("spec", example).map_err(|errors| {
                 format!(
                     "{at}: examples[{n}] does not match the kind's schema: {}",
                     errors.join("; ")
@@ -389,7 +618,7 @@ pub fn validate_kind_decls(_app: &str, decls: &[KindDecl]) -> Result<(), String>
             })?;
         }
         if let Some(status) = &decl.status {
-            compiled_extension_schema(&status.schema)
+            KindSchema::compile(&status.schema)
                 .map_err(|err| format!("{at}: status.schema {err}"))?;
         }
         let resource = decl
@@ -398,9 +627,9 @@ pub fn validate_kind_decls(_app: &str, decls: &[KindDecl]) -> Result<(), String>
         if resource != AclResource::Object && resource.is_namespaced() != decl.scope.is_namespaced()
         {
             return Err(format!(
-                "{at}: access.resource `{}` is {}, but the kind is {}; a namespaced kind maps onto \
-                 a namespaced resource and a cluster kind onto a cluster-scoped one (or leave \
-                 access out for the `object` resource)",
+                "{at}: access.resource `{}` is {}, but the kind is {}; job and scale govern \
+                 namespaced kinds, node governs cluster kinds (or leave access out for the \
+                 `object` resource)",
                 resource.as_str(),
                 if resource.is_namespaced() {
                     "namespaced"
@@ -410,8 +639,26 @@ pub fn validate_kind_decls(_app: &str, decls: &[KindDecl]) -> Result<(), String>
                 decl.scope.as_str()
             ));
         }
-        decl.write_requires_parsed()
-            .map_err(|err| format!("{at}: writeRequires: {err}"))?;
+        for (n, requirement) in decl.requires.iter().enumerate() {
+            validate_requirement(decl.scope, requirement)
+                .map_err(|err| format!("{at}: requires[{n}]: {err}"))?;
+        }
+        for pointer in &decl.immutable {
+            if !pointer.starts_with("/spec/") && pointer != "/spec" {
+                return Err(format!(
+                    "{at}: immutable: {pointer:?} must be a JSON pointer into the spec (/spec/…)"
+                ));
+            }
+        }
+        decl.cleanup_window()
+            .map_err(|err| format!("{at}: {err}"))?;
+        if let Some(max) = decl.max_objects {
+            if max == 0 || max > MAX_MAX_OBJECTS {
+                return Err(format!(
+                    "{at}: maxObjects must be 1 to {MAX_MAX_OBJECTS}, got {max}"
+                ));
+            }
+        }
         if decl.columns.len() > MAX_KIND_COLUMNS {
             return Err(format!(
                 "{at}: columns: at most {MAX_KIND_COLUMNS}, got {}",
@@ -419,7 +666,8 @@ pub fn validate_kind_decls(_app: &str, decls: &[KindDecl]) -> Result<(), String>
             ));
         }
         for column in &decl.columns {
-            validate_column_pointer(column.pointer()).map_err(|err| format!("{at}: {err}"))?;
+            validate_object_pointer(column.pointer(), true)
+                .map_err(|err| format!("{at}: columns: {err}"))?;
             if column.header().trim().is_empty() {
                 return Err(format!("{at}: columns: a column needs a name"));
             }
@@ -428,81 +676,488 @@ pub fn validate_kind_decls(_app: &str, decls: &[KindDecl]) -> Result<(), String>
     Ok(())
 }
 
-/// A column pointer: `/spec/...`, `/status/...`, `/labels/...`, `/name`,
-/// or `/namespace`.
-fn validate_column_pointer(pointer: &str) -> Result<(), String> {
-    let first = pointer
-        .strip_prefix('/')
-        .map(|rest| rest.split('/').next().unwrap_or_default());
-    match first {
-        Some("spec" | "status" | "labels" | "name" | "namespace") => Ok(()),
-        _ => Err(format!(
-            "columns: {pointer:?} must be a JSON pointer into the object: /spec/…, /status/…, \
-             /labels/…, /name, or /namespace"
-        )),
+/// A kind's schema, compiled: closed (every schema with `properties` and
+/// neither `additionalProperties` nor `patternProperties` refuses other
+/// fields, except branches of `allOf`, `anyOf`, and `oneOf`), with its
+/// `writeOnly` pointers collected.
+pub struct KindSchema {
+    /// The schema as declared.
+    pub raw: Value,
+    /// The schema as checked: closed.
+    pub closed: Value,
+    compiled: jsonschema::JSONSchema,
+    /// Pointers below the spec (or status fields) whose values are
+    /// `writeOnly`, with `*` for every key or item.
+    pub write_only: Vec<Vec<String>>,
+}
+
+impl std::fmt::Debug for KindSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KindSchema")
+            .field("raw", &self.raw)
+            .finish_non_exhaustive()
     }
 }
 
-/// One installed kind: its declaration, its owner, and its schemas
-/// compiled.
+fn kind_schema_cache() -> &'static Mutex<HashMap<String, Arc<KindSchema>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<KindSchema>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The most schemas the cache keeps; past it, it starts over.
+const KIND_SCHEMA_CACHE_LIMIT: usize = 512;
+
+/// `schema` with every subschema that has `properties` and neither
+/// `additionalProperties` nor `patternProperties` closed, except the
+/// branches of a composition.
+pub fn close_schema(schema: &Value) -> Value {
+    let mut closed = schema.clone();
+    close_into(&mut closed, true, 0);
+    closed
+}
+
+fn close_into(schema: &mut Value, close_here: bool, depth: usize) {
+    if depth > 64 {
+        return;
+    }
+    let Value::Object(map) = schema else {
+        return;
+    };
+    if close_here
+        && map.contains_key("properties")
+        && !map.contains_key("additionalProperties")
+        && !map.contains_key("patternProperties")
+    {
+        map.insert("additionalProperties".into(), Value::Bool(false));
+    }
+    for key in ["properties", "patternProperties", "definitions", "$defs"] {
+        if let Some(Value::Object(children)) = map.get_mut(key) {
+            for child in children.values_mut() {
+                close_into(child, true, depth + 1);
+            }
+        }
+    }
+    for key in ["items", "additionalProperties", "additionalItems", "contains"] {
+        match map.get_mut(key) {
+            Some(Value::Array(items)) => {
+                for item in items {
+                    close_into(item, true, depth + 1);
+                }
+            }
+            Some(child @ Value::Object(_)) => close_into(child, true, depth + 1),
+            _ => {}
+        }
+    }
+    // A composition's branches each describe part of the object: closing one
+    // would refuse the others' fields.
+    for key in ["allOf", "anyOf", "oneOf"] {
+        if let Some(Value::Array(branches)) = map.get_mut(key) {
+            for branch in branches {
+                close_into(branch, false, depth + 1);
+            }
+        }
+    }
+    for key in ["not", "if", "then", "else"] {
+        if let Some(child) = map.get_mut(key) {
+            close_into(child, false, depth + 1);
+        }
+    }
+}
+
+/// Every `writeOnly: true` property's pointer below the schema's root, with
+/// `*` for each key of an open map or item of a list.
+fn collect_write_only(root: &Value, schema: &Value, at: &mut Vec<String>, out: &mut Vec<Vec<String>>, depth: usize) {
+    if depth > 32 {
+        return;
+    }
+    let schema = match schema.get("$ref").and_then(Value::as_str) {
+        Some(reference) => match reference.strip_prefix('#') {
+            Some("") => root,
+            Some(pointer) => match root.pointer(pointer) {
+                Some(target) => target,
+                None => return,
+            },
+            None => return,
+        },
+        None => schema,
+    };
+    if schema.get("writeOnly").and_then(Value::as_bool) == Some(true) {
+        out.push(at.clone());
+        return;
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (name, child) in properties {
+            at.push(name.clone());
+            collect_write_only(root, child, at, out, depth + 1);
+            at.pop();
+        }
+    }
+    for key in ["additionalProperties", "items"] {
+        if let Some(child) = schema.get(key).filter(|child| child.is_object()) {
+            at.push("*".into());
+            collect_write_only(root, child, at, out, depth + 1);
+            at.pop();
+        }
+    }
+    for key in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(key).and_then(Value::as_array) {
+            for branch in branches {
+                collect_write_only(root, branch, at, out, depth + 1);
+            }
+        }
+    }
+}
+
+/// `/a/0/b` → `["a", "0", "b"]`.
+fn segments(pointer: &str) -> Vec<String> {
+    pointer
+        .split('/')
+        .skip(1)
+        .map(|segment| segment.replace("~1", "/").replace("~0", "~"))
+        .collect()
+}
+
+/// Whether `path` is at or below a `writeOnly` pattern.
+fn under_write_only(patterns: &[Vec<String>], path: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        pattern.len() <= path.len()
+            && pattern
+                .iter()
+                .zip(path)
+                .all(|(want, have)| want == "*" || want == have)
+    })
+}
+
+/// `["a", "0", "b"]` → `a[0].b`, below `root`.
+fn dotted_path(root: &str, path: &[String]) -> String {
+    let mut out = root.to_string();
+    for segment in path {
+        if segment.parse::<usize>().is_ok() {
+            out.push_str(&format!("[{segment}]"));
+        } else {
+            if !out.is_empty() {
+                out.push('.');
+            }
+            out.push_str(segment);
+        }
+    }
+    out
+}
+
+impl KindSchema {
+    /// Compile a kind's schema (cached by its digest): a JSON object of at
+    /// most 64 KiB describing an object, with only local `$ref`s, closed.
+    pub fn compile(schema: &Value) -> Result<Arc<KindSchema>, String> {
+        let digest = digest_value(schema);
+        if let Some(found) = kind_schema_cache()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&digest)
+        {
+            return Ok(found.clone());
+        }
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err("must describe an object (`type = \"object\"`)".into());
+        }
+        let closed = close_schema(schema);
+        let compiled = compile_schema(&closed, MAX_KIND_SCHEMA_BYTES * 2)?;
+        if schema.to_string().len() > MAX_KIND_SCHEMA_BYTES {
+            return Err(format!(
+                "is {} bytes; the limit is {MAX_KIND_SCHEMA_BYTES}",
+                schema.to_string().len()
+            ));
+        }
+        let mut write_only = Vec::new();
+        collect_write_only(schema, schema, &mut Vec::new(), &mut write_only, 0);
+        let compiled = Arc::new(KindSchema {
+            raw: schema.clone(),
+            closed,
+            compiled,
+            write_only,
+        });
+        let mut cache = kind_schema_cache()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if cache.len() >= KIND_SCHEMA_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(digest, compiled.clone());
+        Ok(compiled)
+    }
+
+    /// The schema's digest: what a stored object records it was checked
+    /// against.
+    pub fn digest(&self) -> String {
+        digest_value(&self.raw)
+    }
+
+    /// `value` with the schema's defaults filled in fields it lacks.
+    // TODO(apps hardening): `fill_defaults` gains `$ref`-cycle and size caps
+    // on PR #60's branch (security review M5); objects pick them up with the
+    // merge, since they call the same function.
+    pub fn filled(&self, value: &Value) -> Value {
+        let mut filled = value.clone();
+        fill_defaults(&self.raw, &self.raw, &mut filled, 0);
+        filled
+    }
+
+    /// Fill defaults, then validate: the filled value, or one message per
+    /// problem with its path below `root` (`spec.branch: 5 is not of type
+    /// "string"`, `spec.brnach: unknown field (did you mean branch?)`). A
+    /// problem at or below a `writeOnly` value never echoes it.
+    pub fn check(&self, root: &str, value: &Value) -> Result<Value, Vec<String>> {
+        let effective = self.filled(value);
+        let problems: Vec<String> = match self.compiled.validate(&effective) {
+            Ok(()) => Vec::new(),
+            Err(errors) => errors
+                .flat_map(|err| {
+                    let path = segments(&err.instance_path.to_string());
+                    match &err.kind {
+                        jsonschema::error::ValidationErrorKind::AdditionalProperties {
+                            unexpected,
+                        } => {
+                            let known = self.known_fields(&err.schema_path.to_string());
+                            unexpected
+                                .iter()
+                                .map(|field| {
+                                    let mut at = path.clone();
+                                    at.push(field.clone());
+                                    let hint = crate::structs::spec_fields::suggest_owned(
+                                        field,
+                                        &known.iter().map(String::as_str).collect::<Vec<_>>(),
+                                    )
+                                    .map(|index| format!(" (did you mean {}?)", known[index]))
+                                    .unwrap_or_default();
+                                    format!("{}: unknown field{hint}", dotted_path(root, &at))
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                        _ if under_write_only(&self.write_only, &path) => vec![format!(
+                            "{}: invalid value (write-only, not shown)",
+                            dotted_path(root, &path)
+                        )],
+                        _ => vec![format!("{}: {err}", dotted_path(root, &path))],
+                    }
+                })
+                .collect(),
+        };
+        if problems.is_empty() {
+            Ok(effective)
+        } else {
+            Err(problems)
+        }
+    }
+
+    /// The property names the object schema owning an `additionalProperties`
+    /// failure declares, for a did-you-mean.
+    fn known_fields(&self, schema_path: &str) -> Vec<String> {
+        let parent = schema_path
+            .strip_suffix("/additionalProperties")
+            .unwrap_or(schema_path);
+        let node = if parent.is_empty() {
+            Some(&self.closed)
+        } else {
+            self.closed.pointer(parent)
+        };
+        node.and_then(|node| node.get("properties"))
+            .and_then(Value::as_object)
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// `value` with every `writeOnly` value replaced by [`REDACTED`].
+    pub fn redacted(&self, value: &Value) -> Value {
+        let mut out = value.clone();
+        for pattern in &self.write_only {
+            redact_at(&mut out, pattern);
+        }
+        out
+    }
+
+    /// Whether `path` (below the spec) is write-only.
+    pub fn is_write_only(&self, path: &[String]) -> bool {
+        under_write_only(&self.write_only, path)
+    }
+}
+
+fn redact_at(value: &mut Value, pattern: &[String]) {
+    let Some((head, rest)) = pattern.split_first() else {
+        if !value.is_null() {
+            *value = Value::String(REDACTED.to_string());
+        }
+        return;
+    };
+    match value {
+        Value::Object(map) => {
+            if head == "*" {
+                for child in map.values_mut() {
+                    redact_at(child, rest);
+                }
+            } else if let Some(child) = map.get_mut(head) {
+                redact_at(child, rest);
+            }
+        }
+        Value::Array(items) => {
+            if head == "*" {
+                for child in items {
+                    redact_at(child, rest);
+                }
+            } else if let Some(child) = head.parse::<usize>().ok().and_then(|i| items.get_mut(i)) {
+                redact_at(child, rest);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a kind is installed or left behind by its app.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum KindState {
+    /// Its app is installed and declares it.
+    Active,
+    /// Its app was uninstalled, or dropped it, with `--force`; its objects
+    /// stay, readable and deletable with the kind's recorded access.
+    Orphaned,
+}
+
+impl KindState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KindState::Active => "active",
+            KindState::Orphaned => "orphaned",
+        }
+    }
+
+    pub fn parse(raw: &str) -> KindState {
+        if raw == "orphaned" {
+            KindState::Orphaned
+        } else {
+            KindState::Active
+        }
+    }
+}
+
+/// One kind as the manager knows it: its declaration, owner, state, and
+/// schemas compiled.
 #[derive(Debug, Clone)]
 pub struct InstalledKind {
     pub app: String,
-    /// The manifest's version, or a bundled app's build version.
+    /// The owning app's version, empty when it is not installed.
     pub app_version: String,
-    /// The app's manifest digest.
+    /// The manifest digest the declaration came from.
     pub digest: String,
-    pub enabled: bool,
+    /// Whether the owning app is installed and enabled.
+    pub app_enabled: bool,
+    pub state: KindState,
     pub decl: KindDecl,
-    pub schema: Arc<CompiledSchema>,
-    pub status_schema: Option<Arc<CompiledSchema>>,
+    pub schema: Arc<KindSchema>,
+    pub status_schema: Option<Arc<KindSchema>>,
     pub access: AclResource,
-    pub write_requires: Vec<(AclResource, AclAction)>,
+    pub cleanup: Option<std::time::Duration>,
 }
 
 impl InstalledKind {
-    /// `<app>/<Kind>`: what `kinds` selectors match and what always names
-    /// the kind.
-    pub fn qualified(&self) -> String {
-        qualified_kind(&self.app, &self.decl.name)
+    /// Compile a declaration as the kind registry holds it.
+    pub fn new(
+        app: &str,
+        decl: KindDecl,
+        digest: &str,
+        state: KindState,
+        app_version: &str,
+        app_enabled: bool,
+    ) -> Result<InstalledKind, String> {
+        let schema = KindSchema::compile(&decl.schema)
+            .map_err(|err| format!("kind {app}/{}: schema {err}", decl.name))?;
+        let status_schema = match &decl.status {
+            None => None,
+            Some(status) => Some(
+                KindSchema::compile(&status.schema)
+                    .map_err(|err| format!("kind {app}/{}: status.schema {err}", decl.name))?,
+            ),
+        };
+        let access = decl
+            .access_resource()
+            .map_err(|err| format!("kind {app}/{}: {err}", decl.name))?;
+        let cleanup = decl
+            .cleanup_window()
+            .map_err(|err| format!("kind {app}/{}: {err}", decl.name))?;
+        Ok(InstalledKind {
+            app: app.to_string(),
+            app_version: app_version.to_string(),
+            digest: digest.to_string(),
+            app_enabled,
+            state,
+            decl,
+            schema,
+            status_schema,
+            access,
+            cleanup,
+        })
     }
 
-    /// `<app>@<digest>`, the stamp an object it checked carries.
-    pub fn validated_by(&self) -> String {
-        format!("{}@{}", self.app, self.digest)
+    /// `<app>/<Kind>`: the kind's name, what `kinds` selectors match.
+    pub fn qualified(&self) -> String {
+        qualified_kind(&self.app, &self.decl.name)
     }
 
     pub fn is_namespaced(&self) -> bool {
         self.decl.scope.is_namespaced()
     }
 
+    pub fn is_active(&self) -> bool {
+        self.state == KindState::Active
+    }
+
     /// The spec with defaults filled, or one message per problem with its
     /// path below `spec`.
     pub fn check_spec(&self, spec: &Value) -> Result<Value, Vec<String>> {
-        self.schema
-            .check(spec)
-            .map_err(|errors| errors.iter().map(|err| prefixed("spec", err)).collect())
+        self.schema.check("spec", spec)
     }
 
-    /// A status checked against the status schema (any object without
-    /// one).
-    pub fn check_status(&self, status: &Value) -> Result<(), Vec<String>> {
-        if !status.is_object() {
-            return Err(vec!["status must be a JSON object".to_string()]);
+    /// Status `fields` checked against the status schema (any object
+    /// without one).
+    pub fn check_fields(&self, fields: &Value) -> Result<(), Vec<String>> {
+        if !fields.is_object() {
+            return Err(vec!["status.fields must be a JSON object".to_string()]);
         }
         match &self.status_schema {
             None => Ok(()),
-            Some(schema) => schema
-                .check(status)
-                .map(|_| ())
-                .map_err(|errors| errors.iter().map(|err| prefixed("status", err)).collect()),
+            Some(schema) => schema.check("status.fields", fields).map(|_| ()),
         }
+    }
+
+    /// The ACL scope reads and writes of an object of this kind are checked
+    /// on (app-object-kinds plan §6.4): the object's namespace and name for
+    /// the `object` resource (namespace `*` for a cluster kind), the
+    /// namespace with name `*` (namespace-wide) for `job` and `scale`, and
+    /// no instance attributes for `node`. Always the `<app>/<Kind>`
+    /// attribute, which `kinds` selectors match.
+    pub fn access_scope(&self, namespace: &str, name: &str) -> AclScope {
+        access_scope(self.access, &self.qualified(), namespace, name)
     }
 }
 
-/// `spec.branch: …` from `branch: …` (or `spec: …`).
-fn prefixed(root: &str, error: &str) -> String {
-    crate::structs::extensions::prefixed(root, error)
+/// See [`InstalledKind::access_scope`].
+pub fn access_scope(access: AclResource, qualified: &str, namespace: &str, name: &str) -> AclScope {
+    match access {
+        AclResource::Object => AclScope::object(qualified, namespace, name, true),
+        AclResource::Job | AclResource::Scale => AclScope {
+            namespace: Some(if namespace.is_empty() {
+                "*".to_string()
+            } else {
+                namespace.to_string()
+            }),
+            name: Some("*".to_string()),
+            kind: Some(qualified.to_string()),
+            band: (access == AclResource::Job).then(|| "normal".to_string()),
+            ..Default::default()
+        },
+        _ => AclScope {
+            kind: Some(qualified.to_string()),
+            ..Default::default()
+        },
+    }
 }
 
 /// `<app>/<Kind>`.
@@ -513,63 +1168,62 @@ pub fn qualified_kind(app: &str, kind: &str) -> String {
 /// Why a typed kind did not resolve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KindLookup {
-    /// No installed kind matches; the closest, if any.
+    /// No kind matches; the closest, if any.
     Unknown { suggestion: Option<String> },
-    /// `<app>/<Kind>` where the app is installed but declares no such kind,
-    /// or is not installed.
-    NotDeclared { app: String },
+    /// A short name that several kinds share: their qualified names.
+    Ambiguous { candidates: Vec<String> },
+    /// A short name where a qualified one is required; the one it would
+    /// mean, if exactly one.
+    Unqualified { candidate: Option<String> },
 }
 
-/// The kinds installed apps declare, with their schemas compiled.
+impl KindLookup {
+    /// The refusal, worded for `typed`.
+    pub fn message(&self, typed: &str) -> String {
+        match self {
+            KindLookup::Unknown { suggestion } => format!(
+                "unknown kind {typed:?}{}\nHint: `legion object kinds` lists the kinds installed \
+                 apps declare",
+                suggestion
+                    .as_ref()
+                    .map(|name| format!(" (did you mean {name}?)"))
+                    .unwrap_or_default()
+            ),
+            KindLookup::Ambiguous { candidates } => format!(
+                "{typed:?} names {} kinds: {}\nHint: name one: legion object get {} <name>",
+                candidates.len(),
+                candidates.join(", "),
+                candidates.first().map(String::as_str).unwrap_or("<app>/<Kind>")
+            ),
+            KindLookup::Unqualified { candidate } => match candidate {
+                Some(qualified) => format!(
+                    "kind {typed:?} must be qualified with its app: kind = \"{qualified}\"\nHint: \
+                     a file names the kind it means for good; a short name could mean another \
+                     app's kind tomorrow"
+                ),
+                None => format!(
+                    "kind {typed:?} must be qualified with its app: kind = \"<app>/{typed}\"\n\
+                     Hint: `legion object kinds` lists the kinds installed apps declare"
+                ),
+            },
+        }
+    }
+}
+
+/// The kinds the manager knows: active and orphaned, with their schemas
+/// compiled.
 #[derive(Debug, Clone, Default)]
 pub struct ObjectKindRegistry {
     kinds: Vec<InstalledKind>,
 }
 
 impl ObjectKindRegistry {
-    /// No kinds.
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// The registry of installed apps' kinds. A record whose declarations no
-    /// longer parse or compile contributes nothing, and is reported in the
-    /// second value.
-    pub fn from_records(records: &[AppRecord]) -> (Self, Vec<String>) {
-        let mut kinds = Vec::new();
-        let mut problems = Vec::new();
-        for record in records {
-            match installed_kinds(record) {
-                Ok(mut found) => kinds.append(&mut found),
-                Err(err) => problems.push(format!("app {}: {err}", record.name)),
-            }
-        }
-        (ObjectKindRegistry { kinds }, problems)
-    }
-
-    /// The registry with `record` installed in place of any record of the
-    /// same name.
-    pub fn with_record(&self, record: &AppRecord) -> Result<Self, String> {
-        let mut kinds: Vec<InstalledKind> = self
-            .kinds
-            .iter()
-            .filter(|kind| kind.app != record.name)
-            .cloned()
-            .collect();
-        kinds.extend(installed_kinds(record)?);
-        Ok(ObjectKindRegistry { kinds })
-    }
-
-    /// The registry without `app`.
-    pub fn without_app(&self, app: &str) -> Self {
-        ObjectKindRegistry {
-            kinds: self
-                .kinds
-                .iter()
-                .filter(|kind| kind.app != app)
-                .cloned()
-                .collect(),
-        }
+    pub fn from_kinds(kinds: Vec<InstalledKind>) -> Self {
+        ObjectKindRegistry { kinds }
     }
 
     pub fn kinds(&self) -> &[InstalledKind] {
@@ -580,7 +1234,7 @@ impl ObjectKindRegistry {
         self.kinds.is_empty()
     }
 
-    /// `app`'s kinds.
+    /// `app`'s kinds (active and orphaned).
     pub fn of_app<'a>(&'a self, app: &'a str) -> impl Iterator<Item = &'a InstalledKind> + 'a {
         self.kinds.iter().filter(move |kind| kind.app == app)
     }
@@ -592,120 +1246,77 @@ impl ObjectKindRegistry {
             .find(|installed| installed.app == app && installed.decl.name == kind)
     }
 
-    /// The installed kind a typed name means: `Repo`, `repo`, `repos`, or
-    /// `gitops/Repo` (`gitops/repos`).
-    pub fn resolve(&self, typed: &str) -> Result<&InstalledKind, KindLookup> {
+    /// The kind a qualified name means (`gitops/Repo`, any case, plural
+    /// optional after the app): what files and `ApplyObject` take. A short
+    /// name is refused, naming the qualified kind when exactly one matches.
+    pub fn resolve_qualified(&self, typed: &str) -> Result<&InstalledKind, KindLookup> {
         let typed = typed.trim();
-        if let Some((app, kind)) = typed.split_once('/') {
-            return self
+        match typed.split_once('/') {
+            Some((app, kind)) => self
                 .kinds
                 .iter()
                 .find(|installed| installed.app == app && same_noun(kind, &installed.decl.name))
-                .ok_or_else(|| KindLookup::NotDeclared {
-                    app: app.to_string(),
-                });
+                .ok_or_else(|| KindLookup::Unknown {
+                    suggestion: self.suggest(typed),
+                }),
+            None => {
+                let matches = self.short_matches(typed);
+                Err(KindLookup::Unqualified {
+                    candidate: (matches.len() == 1).then(|| matches[0].qualified()),
+                })
+            }
         }
+    }
+
+    /// The kind a name typed at a terminal means: qualified, or a short
+    /// name (any case, plural optional) that exactly one kind has.
+    pub fn resolve(&self, typed: &str) -> Result<&InstalledKind, KindLookup> {
+        let typed = typed.trim();
+        if typed.contains('/') {
+            return self.resolve_qualified(typed);
+        }
+        let mut matches = self.short_matches(typed);
+        match matches.len() {
+            0 => Err(KindLookup::Unknown {
+                suggestion: self.suggest(typed),
+            }),
+            1 => Ok(matches.remove(0)),
+            _ => {
+                // An active kind wins over orphaned ones of the same name.
+                let active: Vec<&InstalledKind> =
+                    matches.iter().copied().filter(|kind| kind.is_active()).collect();
+                if active.len() == 1 {
+                    return Ok(active[0]);
+                }
+                Err(KindLookup::Ambiguous {
+                    candidates: matches.iter().map(|kind| kind.qualified()).collect(),
+                })
+            }
+        }
+    }
+
+    fn short_matches(&self, typed: &str) -> Vec<&InstalledKind> {
         self.kinds
             .iter()
-            .find(|installed| same_noun(typed, &installed.decl.name))
-            .ok_or_else(|| KindLookup::Unknown {
-                suggestion: self.suggest(typed),
-            })
+            .filter(|installed| same_noun(typed, &installed.decl.name))
+            .collect()
     }
 
-    /// The installed kind name closest to `typed`, for a did-you-mean.
+    /// The kind closest to `typed`, qualified, for a did-you-mean.
     pub fn suggest(&self, typed: &str) -> Option<String> {
-        let names: Vec<&str> = self
-            .kinds
-            .iter()
-            .map(|kind| kind.decl.name.as_str())
-            .collect();
-        crate::structs::spec_fields::suggest_owned(typed, &names)
-            .map(|index| names[index].to_string())
-    }
-
-    /// The first of `decls` (app `app`'s) whose name another installed app
-    /// already declares (ignoring case and plurals), or a bundled manifest
-    /// in this binary declares, worded as the refusal.
-    pub fn collision(&self, app: &str, decls: &[KindDecl]) -> Option<String> {
-        for decl in decls {
-            if let Some(owner) = self
-                .kinds
-                .iter()
-                .find(|kind| kind.app != app && same_noun(&kind.decl.name, &decl.name))
-            {
-                return Some(format!(
-                    "{app} declares kind {}, which the {} app already owns (as {})\nHint: the \
-                     qualified spelling ({}/{}) always names that app's kind; rename this app's \
-                     kind to install it",
-                    decl.name, owner.app, owner.decl.name, owner.app, owner.decl.name
-                ));
-            }
-            if let Some(owner) = bundled_kind_owner(&decl.name).filter(|owner| *owner != app) {
-                return Some(format!(
-                    "{app} declares kind {}, which the bundled {owner} app declares\nHint: rename \
-                     this app's kind",
-                    decl.name
-                ));
-            }
-        }
-        None
+        let names: Vec<String> = self.kinds.iter().map(InstalledKind::qualified).collect();
+        let bare = typed.rsplit('/').next().unwrap_or(typed);
+        let short: Vec<&str> = self.kinds.iter().map(|kind| kind.decl.name.as_str()).collect();
+        crate::structs::spec_fields::suggest_owned(bare, &short).map(|index| names[index].clone())
     }
 }
 
-/// The bundled app (in this binary) declaring a kind named like `name`.
-fn bundled_kind_owner(name: &str) -> Option<&'static str> {
-    let manifests = crate::apps::bundled_manifests().ok()?;
-    manifests.iter().find_map(|manifest| {
-        let kinds = manifest_kinds(manifest).ok()?;
-        kinds
-            .iter()
-            .any(|kind| same_noun(&kind.name, name))
-            .then_some(manifest.name.as_str())
-    })
-}
-
-/// An installed record's kinds.
-fn installed_kinds(record: &AppRecord) -> Result<Vec<InstalledKind>, String> {
-    let decls = manifest_kinds(&record.manifest)?;
-    let mut kinds = Vec::new();
-    for decl in decls {
-        let schema = compiled_extension_schema(&decl.schema)
-            .map_err(|err| format!("kind {}: schema {err}", decl.name))?;
-        let status_schema = match &decl.status {
-            None => None,
-            Some(status) => Some(
-                compiled_extension_schema(&status.schema)
-                    .map_err(|err| format!("kind {}: status.schema {err}", decl.name))?,
-            ),
-        };
-        let access = decl
-            .access_resource()
-            .map_err(|err| format!("kind {}: {err}", decl.name))?;
-        let write_requires = decl
-            .write_requires_parsed()
-            .map_err(|err| format!("kind {}: writeRequires: {err}", decl.name))?;
-        kinds.push(InstalledKind {
-            app: record.name.clone(),
-            app_version: record.display_version(),
-            digest: record.manifest_digest.clone(),
-            enabled: record.enabled,
-            decl,
-            schema,
-            status_schema,
-            access,
-            write_requires,
-        });
-    }
-    Ok(kinds)
-}
-
-/// An object as a person writes it (`legion object apply -f`): a kind, a
-/// name, a namespace for a namespaced kind, labels, and the spec.
+/// An object as a person writes it (`legion object apply -f`): a qualified
+/// kind, a name, a namespace for a namespaced kind, labels, and the spec.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObjectInput {
-    /// The kind: `Repo`, `repos`, or `gitops/Repo`.
+    /// The kind: `<app>/<Kind>` (`gitops/Repo`).
     pub kind: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -725,13 +1336,14 @@ pub fn parse_object_input(value: &Value) -> Result<ObjectInput, String> {
     };
     if map.contains_key("status") {
         return Err(
-            "`status` is written by the app that owns the kind, never applied; leave it out".into(),
+            "`status` is written by the app that owns the kind, never applied; leave it out"
+                .into(),
         );
     }
     let input: ObjectInput =
         serde_json::from_value(value.clone()).map_err(|err| format!("the object: {err}"))?;
     if input.kind.trim().is_empty() {
-        return Err("the object needs a `kind`".into());
+        return Err("the object needs a `kind` (<app>/<Kind>)".into());
     }
     if input.spec.is_null() {
         return Err(format!(
@@ -814,15 +1426,522 @@ pub fn parse_label_filter(entries: &[String]) -> Result<BTreeMap<String, String>
     Ok(filter)
 }
 
-/// How an object reads now.
+/// The object as `legion object get -j` shows it, and every pointer in a
+/// kind's declaration points into.
+pub fn object_document(
+    name: &str,
+    namespace: &str,
+    labels: &BTreeMap<String, String>,
+    spec: &Value,
+    status: &Value,
+) -> Value {
+    json!({
+        "name": name,
+        "namespace": namespace,
+        "labels": labels,
+        "spec": spec,
+        "status": status,
+    })
+}
+
+/// One permission a `requires` entry resolved to for one object: the
+/// concrete check made against its writer, and kept on the object as part
+/// of its `authority`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedPermission {
+    pub resource: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host: bool,
+    /// The pointers that supplied the scope (`spec.targetNamespace`), for
+    /// messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from: Vec<String>,
+}
+
+impl ResolvedPermission {
+    /// The ACL scope the corresponding core RPC builds for this check.
+    pub fn scope(&self) -> AclScope {
+        AclScope {
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+            path: self.path.clone(),
+            pool: self.pool.clone(),
+            band: self.band.clone(),
+            template: self.template.clone(),
+            host: self.host,
+            ..Default::default()
+        }
+    }
+
+    /// `job:write in team-b (from spec.targetNamespace)`.
+    pub fn label(&self) -> String {
+        let mut text = format!("{}:{}", self.resource, self.action);
+        if let Some(namespace) = &self.namespace {
+            text.push_str(&format!(" in {namespace}"));
+        }
+        if let Some(name) = self.name.as_ref().filter(|name| name.as_str() != "*") {
+            text.push_str(&format!(" on {name}"));
+        }
+        if let Some(path) = &self.path {
+            text.push_str(&format!(" on {path}"));
+        }
+        if let Some(pool) = &self.pool {
+            text.push_str(&format!(" in pool {pool}"));
+        }
+        if let Some(band) = self.band.as_ref().filter(|band| band.as_str() != "normal") {
+            text.push_str(&format!(" in band {band}"));
+        }
+        if let Some(template) = &self.template {
+            text.push_str(&format!(" through template {template}"));
+        }
+        if self.host {
+            text.push_str(" (host-level)");
+        }
+        if !self.from.is_empty() {
+            text.push_str(&format!(" (from {})", self.from.join(", ")));
+        }
+        text
+    }
+}
+
+/// The strings a pointer names in the document: a string, or a list of
+/// strings. `Ok(None)` when it names nothing (or null).
+fn pointer_strings(doc: &Value, pointer: &str) -> Result<Option<Vec<String>>, String> {
+    match doc.pointer(pointer) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.trim().is_empty() => Ok(None),
+        Some(Value::String(text)) => Ok(Some(vec![text.trim().to_string()])),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::new();
+            for item in items {
+                match item {
+                    Value::String(text) if !text.trim().is_empty() => {
+                        out.push(text.trim().to_string())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{} must be a string or a list of strings",
+                            dotted(pointer.trim_start_matches('/'))
+                        ))
+                    }
+                }
+            }
+            Ok((!out.is_empty()).then_some(out))
+        }
+        Some(_) => Err(format!(
+            "{} must be a string or a list of strings",
+            dotted(pointer.trim_start_matches('/'))
+        )),
+    }
+}
+
+/// Whether a `when` pointer names a true value.
+fn truthy(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::String(text)) => !text.is_empty(),
+        Some(Value::Number(number)) => number.as_f64().is_some_and(|n| n != 0.0),
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Object(map)) => !map.is_empty(),
+    }
+}
+
+/// Resolve a kind's `requires` against one object (the document carries
+/// the effective spec): the concrete permissions its writer must hold, each
+/// with the scope the corresponding core RPC builds (app-object-kinds plan
+/// §6.4). `namespace` is the object's (empty for a cluster kind).
+pub fn resolve_requirements(
+    kind: &InstalledKind,
+    doc: &Value,
+    namespace: &str,
+) -> Result<Vec<ResolvedPermission>, String> {
+    let mut out = Vec::new();
+    for requirement in &kind.decl.requires {
+        if let Some(when) = &requirement.when {
+            if !truthy(doc.pointer(when)) {
+                continue;
+            }
+        }
+        let resource = AclResource::parse(requirement.resource.trim())
+            .ok_or_else(|| format!("requires: unknown resource {:?}", requirement.resource))?;
+        let mut from = Vec::new();
+        let mut pick = |pointer: &Option<String>| -> Result<Option<Vec<String>>, String> {
+            match pointer {
+                None => Ok(None),
+                Some(pointer) => {
+                    let found = pointer_strings(doc, pointer)?;
+                    if found.is_some() {
+                        from.push(dotted(pointer.trim_start_matches('/')));
+                    }
+                    Ok(found)
+                }
+            }
+        };
+        let namespaces: Vec<Option<String>> = if resource.is_namespaced() {
+            let named = pick(&requirement.namespace)?;
+            match named {
+                Some(values) => {
+                    for value in &values {
+                        crate::structs::namespace::validate_namespace_name(value)?;
+                    }
+                    values.into_iter().map(Some).collect()
+                }
+                None if namespace.is_empty() => vec![Some("*".to_string())],
+                None => vec![Some(namespace.to_string())],
+            }
+        } else {
+            vec![None]
+        };
+        let names: Vec<Option<String>> = if resource.is_namespaced() {
+            match pick(&requirement.name)? {
+                Some(values) => values.into_iter().map(Some).collect(),
+                None => vec![Some("*".to_string())],
+            }
+        } else {
+            vec![None]
+        };
+        let paths: Vec<Option<String>> = if resource == AclResource::Kv {
+            match pick(&requirement.path)? {
+                Some(values) => values.into_iter().map(Some).collect(),
+                // A key the object does not name is not read: the entry
+                // does not apply.
+                None => continue,
+            }
+        } else {
+            vec![None]
+        };
+        let pools: Vec<Option<String>> = match pick(&requirement.pool)? {
+            Some(values) => values.into_iter().map(Some).collect(),
+            None => vec![None],
+        };
+        let (band, template) = if resource == AclResource::Job {
+            let band = match pick(&requirement.band)? {
+                Some(values) => crate::structs::Band::parse(&values[0])?
+                    .as_str()
+                    .to_string(),
+                None => crate::structs::Band::default().as_str().to_string(),
+            };
+            let template = pick(&requirement.template)?.map(|values| values[0].clone());
+            (Some(band), template)
+        } else {
+            (None, None)
+        };
+        for action in &requirement.actions {
+            for namespace in &namespaces {
+                for name in &names {
+                    for path in &paths {
+                        for pool in &pools {
+                            out.push(ResolvedPermission {
+                                resource: resource.as_str().to_string(),
+                                action: action.trim().to_string(),
+                                namespace: namespace.clone(),
+                                name: name.clone(),
+                                path: path.clone(),
+                                pool: pool.clone(),
+                                band: band.clone(),
+                                template: template.clone(),
+                                host: requirement.host,
+                                from: from.clone(),
+                            });
+                            if out.len() > MAX_RESOLVED_REQUIREMENTS {
+                                return Err(format!(
+                                    "requires resolves to more than \
+                                     {MAX_RESOLVED_REQUIREMENTS} permissions for this object; \
+                                     name fewer namespaces, keys, or pools"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The permissions an object's writer was checked for, and who and when:
+/// stored on the object (app-object-kinds plan §6.4).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectAuthority {
+    pub permissions: Vec<ResolvedPermission>,
+    /// The writer's principal and accessor id.
+    pub authorized_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessor: Option<String>,
+    pub authorized_ms: i64,
+    /// The kind declaration's digest the permissions were resolved under.
+    #[serde(default)]
+    pub requires_digest: String,
+}
+
+/// The digest of a kind's `requires`, so an upgrade can count objects
+/// authorized under different requirements.
+pub fn requires_digest(decl: &KindDecl) -> String {
+    digest_value(&serde_json::to_value(&decl.requires).unwrap_or(Value::Null))
+}
+
+/// The `immutable` pointers whose value differs between the stored object
+/// and the update (both documents, effective specs).
+pub fn immutable_changes(kind: &InstalledKind, before: &Value, after: &Value) -> Vec<String> {
+    kind.decl
+        .immutable
+        .iter()
+        .filter(|pointer| before.pointer(pointer) != after.pointer(pointer))
+        .map(|pointer| {
+            let path = dotted(pointer.trim_start_matches('/'));
+            let spec_path: Vec<String> = segments(pointer).into_iter().skip(1).collect();
+            if kind.schema.is_write_only(&spec_path) {
+                format!("{path} is immutable")
+            } else {
+                format!(
+                    "{path} is immutable (was {})",
+                    before
+                        .pointer(pointer)
+                        .map(short)
+                        .unwrap_or_else(|| "unset".to_string())
+                )
+            }
+        })
+        .collect()
+}
+
+/// One line per field that differs between two specs (or label maps):
+/// `spec.branch: "main" → "release"`, `spec.path: added "jobs"`,
+/// `spec.depth: removed 3`, `spec.token: changed (redacted)`. Records are
+/// compared field by field; anything else (lists included) whole. `secret`
+/// says which paths below the root are write-only.
+pub fn spec_diff(
+    root: &str,
+    before: &Value,
+    after: &Value,
+    secret: &dyn Fn(&[String]) -> bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    diff_into(root, &mut Vec::new(), before, after, secret, &mut lines);
+    lines
+}
+
+fn diff_into(
+    root: &str,
+    at: &mut Vec<String>,
+    before: &Value,
+    after: &Value,
+    secret: &dyn Fn(&[String]) -> bool,
+    lines: &mut Vec<String>,
+) {
+    if before == after {
+        return;
+    }
+    let path = dotted_path(root, at);
+    if secret(at) {
+        let word = match (before.is_null(), after.is_null()) {
+            (true, false) => "added",
+            (false, true) => "removed",
+            _ => "changed",
+        };
+        lines.push(format!("{path}: {word} (redacted)"));
+        return;
+    }
+    match (before, after) {
+        (Value::Object(old), Value::Object(new)) => {
+            let mut keys: Vec<&String> = old.keys().chain(new.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                at.push(key.clone());
+                match (old.get(key), new.get(key)) {
+                    (Some(a), Some(b)) => diff_into(root, at, a, b, secret, lines),
+                    (None, Some(b)) => {
+                        if secret(at) {
+                            lines.push(format!("{}: added (redacted)", dotted_path(root, at)));
+                        } else {
+                            lines.push(format!("{}: added {}", dotted_path(root, at), short(b)));
+                        }
+                    }
+                    (Some(a), None) => {
+                        if secret(at) {
+                            lines.push(format!("{}: removed (redacted)", dotted_path(root, at)));
+                        } else {
+                            lines.push(format!("{}: removed {}", dotted_path(root, at), short(a)));
+                        }
+                    }
+                    (None, None) => {}
+                }
+                at.pop();
+            }
+        }
+        (a, b) => lines.push(format!("{path}: {} → {}", short(a), short(b))),
+    }
+}
+
+/// A value for a message, cut at 120 characters.
+fn short(value: &Value) -> String {
+    let text = value.to_string();
+    if text.chars().count() > 120 {
+        format!("{}…", text.chars().take(119).collect::<String>())
+    } else {
+        text
+    }
+}
+
+/// One condition of an object's status (`Ready`, `Accepted`, or the
+/// app's own).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectCondition {
+    /// PascalCase: `Ready`, `Accepted`, or the app's own.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// `true`, `false`, or `unknown`.
+    pub status: String,
+    /// PascalCase, machine-readable (`Synced`, `RepoUnreachable`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// For people, at most 1 KiB.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+    /// When `status` last changed (RFC 3339), kept by the manager.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub since: String,
+}
+
+/// An object's status as its app reports it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectStatus {
+    pub observed_generation: u64,
+    #[serde(default)]
+    pub conditions: Vec<ObjectCondition>,
+    /// The app's own payload, checked against the kind's status schema.
+    #[serde(default)]
+    pub fields: Value,
+}
+
+impl ObjectStatus {
+    pub fn condition(&self, kind: &str) -> Option<&ObjectCondition> {
+        self.conditions
+            .iter()
+            .find(|condition| condition.kind == kind)
+    }
+}
+
+/// Check the conditions an app reports (types PascalCase and unique,
+/// statuses `true`/`false`/`unknown`, the limits) and normalize them.
+pub fn validate_conditions(conditions: &mut [ObjectCondition]) -> Result<(), String> {
+    if conditions.len() > MAX_CONDITIONS {
+        return Err(format!(
+            "status: at most {MAX_CONDITIONS} conditions, got {}",
+            conditions.len()
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for condition in conditions.iter_mut() {
+        let shaped = !condition.kind.is_empty()
+            && condition.kind.len() <= 64
+            && condition.kind.starts_with(|c: char| c.is_ascii_uppercase())
+            && condition.kind.chars().all(|c| c.is_ascii_alphanumeric());
+        if !shaped {
+            return Err(format!(
+                "status: condition type {:?} must be PascalCase (Ready, Accepted), at most 64",
+                condition.kind
+            ));
+        }
+        if !seen.insert(condition.kind.clone()) {
+            return Err(format!(
+                "status: condition {} appears twice",
+                condition.kind
+            ));
+        }
+        condition.status = condition.status.trim().to_ascii_lowercase();
+        if !matches!(condition.status.as_str(), "true" | "false" | "unknown") {
+            return Err(format!(
+                "status: condition {}: status {:?} must be true, false, or unknown",
+                condition.kind, condition.status
+            ));
+        }
+        if condition.reason.len() > 128
+            || condition
+                .reason
+                .chars()
+                .any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        {
+            return Err(format!(
+                "status: condition {}: reason {:?} must be letters and digits, at most 128",
+                condition.kind, condition.reason
+            ));
+        }
+        if condition.message.len() > MAX_CONDITION_MESSAGE_BYTES {
+            return Err(format!(
+                "status: condition {}: the message is {} bytes; the limit is \
+                 {MAX_CONDITION_MESSAGE_BYTES}",
+                condition.kind,
+                condition.message.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Carry each condition's `since` over from the stored status when its
+/// status did not change, and stamp `now` when it did.
+pub fn stamp_condition_times(
+    conditions: &mut [ObjectCondition],
+    previous: Option<&ObjectStatus>,
+    now: &str,
+) {
+    for condition in conditions.iter_mut() {
+        let kept = previous
+            .and_then(|previous| previous.condition(&condition.kind))
+            .filter(|old| old.status == condition.status)
+            .map(|old| old.since.clone());
+        condition.since = kept.unwrap_or_else(|| now.to_string());
+    }
+}
+
+/// The condition transitions worth an event: `Ready` or `Accepted`
+/// changed status (or appeared).
+pub fn condition_transitions(
+    before: Option<&ObjectStatus>,
+    after: &ObjectStatus,
+) -> Vec<(String, String, String)> {
+    [CONDITION_READY, CONDITION_ACCEPTED]
+        .iter()
+        .filter_map(|kind| {
+            let new = after.condition(kind)?;
+            let old = before
+                .and_then(|before| before.condition(kind))
+                .map(|old| old.status.clone())
+                .unwrap_or_default();
+            (old != new.status).then(|| (kind.to_string(), old, new.status.clone()))
+        })
+        .collect()
+}
+
+/// How an object's spec reads against its kind now.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ObjectState {
-    /// Its app declares the kind, and the spec passes the current schema.
+    /// Its kind is active, and the spec passes the current schema.
     Valid,
     /// The spec fails the kind's current schema (an upgrade tightened it).
     Invalid,
-    /// Its app was uninstalled, or no longer declares the kind.
+    /// Its kind is orphaned (its app uninstalled or dropped it).
     Orphaned,
 }
 
@@ -836,21 +1955,135 @@ impl ObjectState {
     }
 }
 
-/// An object's spec judged against the kinds installed now: its effective
-/// spec (defaults filled; the spec as written when it cannot be judged),
-/// its state, and why.
+/// An object's stored spec judged against its kind now: its effective spec
+/// (defaults filled for fields it lacks; the stored spec when it cannot be
+/// judged), its state, and why.
 pub fn judge(kind: Option<&InstalledKind>, spec: &Value) -> (Value, ObjectState, String) {
     match kind {
         None => (
             spec.clone(),
             ObjectState::Orphaned,
-            "its app no longer declares the kind (uninstalled, or upgraded with --force)"
-                .to_string(),
+            "no declaration of its kind is recorded".to_string(),
         ),
-        Some(kind) => match kind.check_spec(spec) {
-            Ok(effective) => (effective, ObjectState::Valid, String::new()),
-            Err(errors) => (spec.clone(), ObjectState::Invalid, errors.join("; ")),
+        Some(kind) => {
+            let state_if_valid = if kind.is_active() {
+                ObjectState::Valid
+            } else {
+                ObjectState::Orphaned
+            };
+            match kind.check_spec(spec) {
+                Ok(effective) => (
+                    effective,
+                    state_if_valid,
+                    if kind.is_active() {
+                        String::new()
+                    } else {
+                        format!(
+                            "app {} no longer declares the kind (uninstalled, or upgraded with \
+                             --force)",
+                            kind.app
+                        )
+                    },
+                ),
+                Err(errors) if kind.is_active() => (
+                    kind.schema.filled(spec),
+                    ObjectState::Invalid,
+                    errors.join("; "),
+                ),
+                Err(_) => (
+                    spec.clone(),
+                    ObjectState::Orphaned,
+                    format!("app {} no longer declares the kind", kind.app),
+                ),
+            }
+        }
+    }
+}
+
+/// What an object's summary is built from.
+pub struct SummaryInputs<'a> {
+    pub state: ObjectState,
+    pub deleting: bool,
+    /// Whether the owning app is enabled and has a running allocation.
+    pub app_running: bool,
+    pub generation: u64,
+    pub status: Option<&'a ObjectStatus>,
+}
+
+/// An object's summary, whatever its kind (app-object-kinds plan §6.7):
+/// `Orphaned`, `Deleting`, `Invalid`, `Stale`, `Pending`, `Rejected:
+/// <reason>`, `NotReady: <reason>`, `Ready`, or (an app that reports only
+/// `Accepted`) `Accepted`. The second value is the reason or message, when
+/// there is one.
+pub fn summarize(inputs: &SummaryInputs<'_>) -> (String, String) {
+    if inputs.state == ObjectState::Orphaned {
+        return ("Orphaned".into(), String::new());
+    }
+    if inputs.deleting {
+        return ("Deleting".into(), String::new());
+    }
+    if inputs.state == ObjectState::Invalid {
+        return ("Invalid".into(), String::new());
+    }
+    if !inputs.app_running {
+        return ("Stale".into(), String::new());
+    }
+    let Some(status) = inputs.status else {
+        return ("Pending".into(), String::new());
+    };
+    if status.observed_generation < inputs.generation {
+        return ("Pending".into(), String::new());
+    }
+    let explain = |condition: &ObjectCondition| -> String {
+        match (condition.reason.is_empty(), condition.message.is_empty()) {
+            (false, false) => format!("{}: {}", condition.reason, condition.message),
+            (false, true) => condition.reason.clone(),
+            (true, false) => condition.message.clone(),
+            (true, true) => String::new(),
+        }
+    };
+    if let Some(accepted) = status
+        .condition(CONDITION_ACCEPTED)
+        .filter(|condition| condition.status == "false")
+    {
+        let reason = if accepted.reason.is_empty() {
+            "Rejected".to_string()
+        } else {
+            format!("Rejected: {}", accepted.reason)
+        };
+        return (reason, explain(accepted));
+    }
+    match status.condition(CONDITION_READY) {
+        Some(ready) if ready.status == "true" => ("Ready".into(), explain(ready)),
+        Some(ready) if ready.status == "false" => {
+            let label = if ready.reason.is_empty() {
+                "NotReady".to_string()
+            } else {
+                format!("NotReady: {}", ready.reason)
+            };
+            (label, explain(ready))
+        }
+        Some(ready) => ("Pending".into(), explain(ready)),
+        None => match status.condition(CONDITION_ACCEPTED) {
+            Some(accepted) if accepted.status == "true" => ("Accepted".into(), explain(accepted)),
+            _ => ("Pending".into(), String::new()),
         },
+    }
+}
+
+/// Whether a summary is settled for `--wait`: `Some(true)` on success,
+/// `Some(false)` on a failure, `None` while it may still change.
+pub fn summary_settled(summary: &str) -> Option<bool> {
+    if summary == "Ready" || summary == "Accepted" {
+        Some(true)
+    } else if summary.starts_with("Rejected")
+        || summary.starts_with("NotReady")
+        || summary == "Invalid"
+        || summary == "Orphaned"
+    {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -885,63 +2118,9 @@ pub fn object_shard(app: &str, kind: &str, namespace: &str, name: &str, count: u
     crate::autoscaler::shard::shard_of(&shard_key(app, kind, namespace, name), count)
 }
 
-/// One line per field that differs between two specs (or two label maps):
-/// `spec.branch: "main" → "release"`, `spec.path: added "jobs"`,
-/// `spec.depth: removed 3`. Records are compared field by field; anything
-/// else (lists included) whole.
-pub fn spec_diff(root: &str, before: &Value, after: &Value) -> Vec<String> {
-    let mut lines = Vec::new();
-    diff_into(root, before, after, &mut lines);
-    lines
-}
-
-fn diff_into(at: &str, before: &Value, after: &Value, lines: &mut Vec<String>) {
-    match (before, after) {
-        (Value::Object(old), Value::Object(new)) => {
-            let mut keys: Vec<&String> = old.keys().chain(new.keys()).collect();
-            keys.sort();
-            keys.dedup();
-            for key in keys {
-                let path = format!("{at}.{key}");
-                match (old.get(key), new.get(key)) {
-                    (Some(a), Some(b)) => diff_into(&path, a, b, lines),
-                    (None, Some(b)) => lines.push(format!("{path}: added {}", short(b))),
-                    (Some(a), None) => lines.push(format!("{path}: removed {}", short(a))),
-                    (None, None) => {}
-                }
-            }
-        }
-        (a, b) if a != b => lines.push(format!("{at}: {} → {}", short(a), short(b))),
-        _ => {}
-    }
-}
-
-/// A value for a diff line, cut at 120 characters.
-fn short(value: &Value) -> String {
-    let text = value.to_string();
-    if text.chars().count() > 120 {
-        format!("{}…", text.chars().take(119).collect::<String>())
-    } else {
-        text
-    }
-}
-
-/// The document `columns` point into.
-pub fn column_document(
-    name: &str,
-    namespace: &str,
-    labels: &BTreeMap<String, String>,
-    effective: &Value,
-    status: &Value,
-) -> Value {
-    json!({
-        "name": name,
-        "namespace": namespace,
-        "labels": labels,
-        "spec": effective,
-        "status": status,
-    })
-}
+/// The shard count stored (and indexed) with every object: the
+/// autoscaler's.
+pub const STORED_SHARD_COUNT: u32 = crate::autoscaler::shard::SHARDS;
 
 /// A column's cell: a string as itself, anything else as JSON, `-` when
 /// the pointer finds nothing.
@@ -958,8 +2137,7 @@ pub fn column_cell(document: &Value, pointer: &str) -> String {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObjectValidateCall {
-    pub app: String,
-    /// The kind as declared (`Repo`).
+    /// `<app>/<Kind>`.
     pub kind: String,
     /// Empty for a cluster kind.
     pub namespace: String,
@@ -1007,28 +2185,75 @@ pub fn kinds_prompt(app: &str, decls: &[KindDecl]) -> Vec<String> {
     let mut lines = vec!["Kinds:".to_string()];
     for decl in decls {
         let mut line = format!(
-            "  {:<14} {}; written with {}",
-            decl.name,
+            "  {:<22} {}; written with {}",
+            qualified_kind(app, &decl.name),
             decl.scope.as_str(),
             decl.access_label(app)
         );
         if decl.validate {
-            line.push_str("; checked by the app");
+            line.push_str("; checked by the app (advisory)");
+        }
+        if let Some(cleanup) = &decl.cleanup {
+            line.push_str(&format!("; deletes wait up to {cleanup} for the app"));
         }
         lines.push(line);
     }
     lines
 }
 
-/// A kind as JSON for `-j` outputs and MCP.
-pub fn kind_json(kind: &InstalledKind) -> Value {
-    let mut map = Map::new();
-    map.insert("kind".into(), json!(kind.decl.name));
-    map.insert("app".into(), json!(kind.app));
-    map.insert("qualified".into(), json!(kind.qualified()));
-    map.insert("scope".into(), json!(kind.decl.scope.as_str()));
-    map.insert("access".into(), json!(kind.access.as_str()));
-    Value::Object(map)
+/// What changed in one kind between two declarations, for the upgrade
+/// prompt: each spec default that changed (old → new), and whether
+/// `requires` changed.
+pub fn default_changes(before: &KindDecl, after: &KindDecl) -> Vec<(String, Value, Value)> {
+    let mut out = Vec::new();
+    collect_defaults(&before.schema, &before.schema, "", &mut |path, old| {
+        let new = default_at(&after.schema, path);
+        if let Some(new) = new {
+            if new != *old {
+                out.push((path.to_string(), old.clone(), new));
+            }
+        }
+    });
+    out
+}
+
+fn collect_defaults(root: &Value, schema: &Value, at: &str, f: &mut dyn FnMut(&str, &Value)) {
+    if at.len() > 1024 {
+        return;
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    for (name, child) in properties {
+        let child = match child.get("$ref").and_then(Value::as_str) {
+            Some(reference) => match reference.strip_prefix('#').and_then(|p| root.pointer(p)) {
+                Some(target) if target != schema => target,
+                _ => continue,
+            },
+            None => child,
+        };
+        let path = format!("{at}/{name}");
+        if let Some(default) = child.get("default") {
+            f(&path, default);
+        }
+        collect_defaults(root, child, &path, f);
+    }
+}
+
+fn default_at(schema: &Value, path: &str) -> Option<Value> {
+    let mut node = schema;
+    for segment in path.split('/').skip(1) {
+        node = node.get("properties")?.get(segment)?;
+        if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+            node = schema.pointer(reference.strip_prefix('#')?)?;
+        }
+    }
+    node.get("default").cloned()
+}
+
+/// A JSON object (map) of `json`, or an empty one.
+pub fn as_map(value: &Value) -> Map<String, Value> {
+    value.as_object().cloned().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1042,58 +2267,41 @@ mod app_object_tests {
             scope: KindScope::Namespaced,
             schema: json!({
                 "type": "object",
-                "additionalProperties": false,
                 "required": ["url"],
                 "properties": {
                     "url": { "type": "string" },
                     "branch": { "type": "string", "default": "main" },
+                    "token": { "type": "string", "writeOnly": true },
+                    "targetNamespace": { "type": "string" },
+                    "credentials": { "type": "object", "properties": { "kv": { "type": "string" } } },
+                    "allowHost": { "type": "boolean" },
                 },
             }),
             status: None,
             examples: vec![json!({ "url": "https://x" })],
             validate: false,
             access: None,
-            write_requires: Vec::new(),
+            requires: Vec::new(),
+            immutable: Vec::new(),
+            cleanup: None,
+            max_objects: None,
             columns: Vec::new(),
+            rules: None,
         }
     }
 
-    fn record(app: &str, kinds: Vec<KindDecl>) -> AppRecord {
-        let mut manifest: AppManifest = serde_json::from_value(json!({
-            "name": app,
-            "version": "0.1.0",
-            "job": { "task": { "name": "t", "runtime": "noop" } },
-        }))
-        .expect("manifest");
-        manifest.kinds = Some(serde_json::to_value(kinds).expect("kinds"));
-        AppRecord {
-            name: app.to_string(),
-            source: crate::structs::app::AppSource::File,
-            source_ref: String::new(),
-            manifest_digest: manifest.digest(),
-            enabled: true,
-            settings: crate::structs::app::AppSettings::from_manifest(&manifest),
-            config: json!({}),
-            grant: Default::default(),
-            installed_by: String::new(),
-            installed_at: String::new(),
-            updated_at: String::new(),
-            state: Default::default(),
-            manifest,
-        }
+    fn kind(app: &str, decl: KindDecl) -> InstalledKind {
+        InstalledKind::new(app, decl, "d1", KindState::Active, "0.1.0", true).expect("kind")
     }
 
     #[test]
     fn kind_names_are_pascal_case_and_not_legion_nouns_test() {
         assert!(validate_kind_name("Repo").is_ok());
         assert!(validate_kind_name("ScalingPolicy").is_ok());
-        assert!(validate_kind_name("NodeGroup").is_ok());
         for bad in ["repo", "Repo-x", "", "9Lives", "Re po"] {
             assert!(validate_kind_name(bad).is_err(), "{bad}");
         }
-        for reserved in [
-            "Job", "Jobs", "Policy", "Policies", "Token", "Node", "Events", "Event",
-        ] {
+        for reserved in ["Job", "Jobs", "Policy", "Policies", "Token", "Node", "Events", "Status"] {
             let err = validate_kind_name(reserved).expect_err(reserved);
             assert!(err.contains("reserved"), "{err}");
         }
@@ -1103,7 +2311,7 @@ mod app_object_tests {
     }
 
     /// Every top-level CLI command is a reserved noun, so a kind never reads
-    /// like a command (calls entry 9).
+    /// like a command (calls entry 20).
     #[test]
     fn every_top_level_command_is_reserved_test() {
         for command in crate::cmd::cli().get_subcommands() {
@@ -1120,215 +2328,351 @@ mod app_object_tests {
 
     #[test]
     fn declarations_are_checked_test() {
-        assert!(validate_kind_decls("gitops", &[decl("Repo")]).is_ok());
-        let err = validate_kind_decls("gitops", &[decl("Repo"), decl("Repos")])
-            .expect_err("plural duplicate");
+        assert!(validate_kind_decls(&[decl("Repo")]).is_ok());
+        let err = validate_kind_decls(&[decl("Repo"), decl("Repos")]).expect_err("plural duplicate");
         assert!(err.contains("already declares Repo"), "{err}");
 
         let mut bad_example = decl("Repo");
         bad_example.examples = vec![json!({ "branch": "x" })];
-        let err = validate_kind_decls("gitops", &[bad_example]).expect_err("example");
-        assert!(err.contains("examples[0]"), "{err}");
+        assert!(validate_kind_decls(&[bad_example])
+            .expect_err("example")
+            .contains("examples[0]"));
+        let mut typo = decl("Repo");
+        typo.examples = vec![json!({ "url": "x", "brnach": "y" })];
+        assert!(validate_kind_decls(&[typo]).expect_err("closed").contains("unknown field"));
 
         let mut remote = decl("Repo");
-        remote.schema =
-            json!({ "type": "object", "properties": { "a": { "$ref": "https://x/s.json" } } });
-        let err = validate_kind_decls("gitops", &[remote]).expect_err("remote ref");
-        assert!(err.contains("not local"), "{err}");
+        remote.schema = json!({ "type": "object", "properties": { "a": { "$ref": "https://x/s.json" } } });
+        assert!(validate_kind_decls(&[remote]).expect_err("remote").contains("not local"));
 
-        let mut not_object = decl("Repo");
-        not_object.schema = json!({ "type": "string" });
-        assert!(validate_kind_decls("gitops", &[not_object]).is_err());
-
-        // A namespaced kind maps onto a namespaced resource, a cluster
-        // kind onto a cluster-scoped one; `object` fits either.
+        // The access mapping is pinned, and must fit the scope.
         let mut scale = decl("Policyish");
-        scale.access = Some(KindAccess {
-            resource: "scale".into(),
-        });
-        assert!(validate_kind_decls("a", &[scale.clone()]).is_ok());
+        scale.access = Some(KindAccess { resource: "scale".into() });
+        assert!(validate_kind_decls(&[scale.clone()]).is_ok());
         scale.scope = KindScope::Cluster;
-        let err = validate_kind_decls("a", &[scale]).expect_err("scope mismatch");
-        assert!(err.contains("cluster kind onto a cluster-scoped"), "{err}");
+        assert!(validate_kind_decls(&[scale]).is_err());
+        let mut acl = decl("Repo");
+        acl.access = Some(KindAccess { resource: "acl".into() });
+        assert!(validate_kind_decls(&[acl]).expect_err("pinned").contains("object (the default), job, scale, or node"));
         let mut node = decl("NodeGroup");
         node.scope = KindScope::Cluster;
-        node.access = Some(KindAccess {
-            resource: "node".into(),
-        });
-        node.write_requires = vec![UiPermission {
+        node.access = Some(KindAccess { resource: "node".into() });
+        node.requires = vec![KindRequirement {
             resource: "operator".into(),
-            action: "write".into(),
+            actions: vec!["write".into()],
+            ..Default::default()
         }];
-        assert!(validate_kind_decls("a", &[node.clone()]).is_ok());
-        node.write_requires[0].action = "admin".into();
-        assert!(validate_kind_decls("a", &[node]).is_err());
-        let mut nowhere = decl("Repo");
-        nowhere.access = Some(KindAccess {
-            resource: "nope".into(),
-        });
-        assert!(validate_kind_decls("a", &[nowhere]).is_err());
+        assert!(validate_kind_decls(&[node.clone()]).is_ok());
+        node.requires[0].namespace = Some("/spec/x".into());
+        assert!(validate_kind_decls(&[node]).expect_err("namespace on operator").contains("namespaced"));
+
+        let mut kv = decl("Repo");
+        kv.requires = vec![KindRequirement { resource: "kv".into(), actions: vec!["read".into()], ..Default::default() }];
+        assert!(validate_kind_decls(&[kv]).expect_err("kv path").contains("path"));
+
+        let mut immutable = decl("Repo");
+        immutable.immutable = vec!["/url".into()];
+        assert!(validate_kind_decls(&[immutable]).is_err());
+        let mut cleanup = decl("Repo");
+        cleanup.cleanup = Some("2h".into());
+        assert!(validate_kind_decls(&[cleanup]).is_err());
+        let mut max = decl("Repo");
+        max.max_objects = Some(MAX_MAX_OBJECTS + 1);
+        assert!(validate_kind_decls(&[max]).is_err());
+        let mut rules = decl("Repo");
+        rules.rules = Some(json!([{ "rule": "self.a" }]));
+        assert!(validate_kind_decls(&[rules]).expect_err("rules").contains("not supported yet"));
 
         let mut columns = decl("Repo");
         columns.columns = vec![
             KindColumn::Pointer("/spec/url".into()),
-            KindColumn::Named {
-                name: "COMMIT".into(),
-                pointer: "/status/commit".into(),
-            },
+            KindColumn::Named { name: "COMMIT".into(), pointer: "/status/fields/commit".into() },
         ];
-        assert!(validate_kind_decls("a", &[columns.clone()]).is_ok());
+        assert!(validate_kind_decls(&[columns.clone()]).is_ok());
         assert_eq!(columns.columns[0].header(), "URL");
         columns.columns.push(KindColumn::Pointer("spec/x".into()));
-        assert!(validate_kind_decls("a", &[columns]).is_err());
+        assert!(validate_kind_decls(&[columns]).is_err());
     }
 
     #[test]
-    fn kinds_resolve_by_any_case_plural_or_qualified_name_test() {
-        let (registry, problems) = ObjectKindRegistry::from_records(&[
-            record("gitops", vec![decl("Repo")]),
-            record("certs", vec![decl("Certificate"), decl("Policyish")]),
+    fn schemas_are_closed_except_composition_branches_test() {
+        let closed = close_schema(&json!({
+            "type": "object",
+            "properties": { "a": { "type": "object", "properties": { "b": {} } } },
+            "allOf": [{ "properties": { "c": {} } }],
+            "definitions": { "d": { "type": "object", "properties": { "e": {} } } },
+        }));
+        assert_eq!(closed["additionalProperties"], false);
+        assert_eq!(closed["properties"]["a"]["additionalProperties"], false);
+        assert!(closed["allOf"][0].get("additionalProperties").is_none());
+        assert_eq!(closed["definitions"]["d"]["additionalProperties"], false);
+        let open = close_schema(&json!({ "type": "object", "properties": {}, "additionalProperties": true }));
+        assert_eq!(open["additionalProperties"], true);
+
+        let schema = KindSchema::compile(&decl("Repo").schema).expect("compiles");
+        let err = schema
+            .check("spec", &json!({ "url": "x", "brnach": "dev" }))
+            .expect_err("unknown");
+        assert_eq!(err, vec!["spec.brnach: unknown field (did you mean branch?)".to_string()]);
+        let err = schema
+            .check("spec", &json!({ "url": "x", "token": 5 }))
+            .expect_err("write-only type");
+        assert_eq!(err, vec!["spec.token: invalid value (write-only, not shown)".to_string()]);
+        let effective = schema.check("spec", &json!({ "url": "x" })).expect("valid");
+        assert_eq!(effective["branch"], "main");
+        assert_eq!(
+            schema.redacted(&json!({ "url": "x", "token": "s3cr3t" }))["token"],
+            REDACTED
+        );
+    }
+
+    #[test]
+    fn kinds_resolve_qualified_or_by_unambiguous_short_name_test() {
+        let registry = ObjectKindRegistry::from_kinds(vec![
+            kind("gitops", decl("Repo")),
+            kind("reposync", decl("Repo")),
+            kind("certs", decl("Certificate")),
         ]);
-        assert!(problems.is_empty(), "{problems:?}");
-        for typed in [
-            "Repo",
-            "repo",
-            "repos",
-            "REPOS",
-            "gitops/Repo",
-            "gitops/repos",
-        ] {
-            assert_eq!(
-                registry.resolve(typed).expect(typed).qualified(),
-                "gitops/Repo"
-            );
+        for typed in ["gitops/Repo", "gitops/repos", "gitops/REPO"] {
+            assert_eq!(registry.resolve_qualified(typed).expect(typed).qualified(), "gitops/Repo");
         }
         assert_eq!(
-            registry.resolve("certificates").expect("plural").decl.name,
-            "Certificate"
+            registry.resolve_qualified("Certificate"),
+            Err(KindLookup::Unqualified { candidate: Some("certs/Certificate".into()) })
         );
+        assert_eq!(registry.resolve("certificates").expect("short").qualified(), "certs/Certificate");
+        let ambiguous = registry.resolve("repo").expect_err("ambiguous");
         assert_eq!(
-            registry
-                .resolve("policyishes")
-                .expect("es plural")
-                .decl
-                .name,
-            "Policyish"
+            ambiguous,
+            KindLookup::Ambiguous { candidates: vec!["gitops/Repo".into(), "reposync/Repo".into()] }
         );
+        assert!(ambiguous.message("repo").contains("names 2 kinds: gitops/Repo, reposync/Repo"));
         assert_eq!(
-            registry.resolve("Rpeo"),
-            Err(KindLookup::Unknown {
-                suggestion: Some("Repo".into())
-            })
+            registry.resolve("Certifcate"),
+            Err(KindLookup::Unknown { suggestion: Some("certs/Certificate".into()) })
         );
-        assert_eq!(
-            registry.resolve("certs/Repo"),
-            Err(KindLookup::NotDeclared {
-                app: "certs".into()
-            })
-        );
-        // Another app may not take the name, in any case or as a plural.
-        let refusal = registry
-            .collision("other", &[decl("Repos")])
-            .expect("collision");
-        assert!(refusal.contains("the gitops app already owns"), "{refusal}");
-        assert!(registry.collision("gitops", &[decl("Repo")]).is_none());
+        // An orphaned kind yields to an active one of the same short name.
+        let mut orphan = kind("old", decl("Certificate"));
+        orphan.state = KindState::Orphaned;
+        let registry = ObjectKindRegistry::from_kinds(vec![orphan, kind("certs", decl("Certificate"))]);
+        assert_eq!(registry.resolve("certificate").expect("active wins").app, "certs");
     }
 
     #[test]
     fn objects_parse_and_judge_against_the_kind_now_test() {
         let input = parse_object_input(&json!({
-            "kind": "Repo", "name": "web", "namespace": "team-a",
+            "kind": "gitops/Repo", "name": "web", "namespace": "team-a",
             "labels": { "team": "a" }, "spec": { "url": "https://x" },
         }))
         .expect("parses");
         assert_eq!(input.namespace.as_deref(), Some("team-a"));
-        let err = parse_object_input(&json!({
-            "kind": "Repo", "name": "web", "spec": {}, "status": { "ok": true },
+        assert!(parse_object_input(&json!({
+            "kind": "gitops/Repo", "name": "web", "spec": {}, "status": { "ok": true },
         }))
-        .expect_err("status");
-        assert!(err.contains("written by the app"), "{err}");
-        assert!(parse_object_input(&json!({ "kind": "Repo", "name": "web", "spek": {} })).is_err());
-        assert!(parse_object_input(&json!({ "kind": "Repo", "name": "web" })).is_err());
+        .expect_err("status")
+        .contains("written by the app"));
+        assert!(parse_object_input(&json!({ "kind": "gitops/Repo", "name": "web", "spek": {} })).is_err());
         assert!(validate_object_name("web-1").is_ok());
         assert!(validate_object_name("Web").is_err());
-        assert_eq!(
-            parse_object_documents(&json!([{ "a": 1 }, { "b": 2 }]))
-                .expect("list")
-                .len(),
-            2
-        );
 
-        let (registry, _) =
-            ObjectKindRegistry::from_records(&[record("gitops", vec![decl("Repo")])]);
-        let kind = registry.resolve("Repo").expect("kind");
-        let (effective, state, _) = judge(Some(kind), &json!({ "url": "https://x" }));
+        let repo = kind("gitops", decl("Repo"));
+        let (effective, state, _) = judge(Some(&repo), &json!({ "url": "https://x" }));
         assert_eq!(state, ObjectState::Valid);
         assert_eq!(effective["branch"], "main");
-        let (_, state, detail) = judge(Some(kind), &json!({ "branch": "x" }));
+        // A stored default is kept: only missing fields are filled.
+        let (effective, _, _) = judge(Some(&repo), &json!({ "url": "https://x", "branch": "trunk" }));
+        assert_eq!(effective["branch"], "trunk");
+        let (_, state, detail) = judge(Some(&repo), &json!({ "branch": "x" }));
         assert_eq!(state, ObjectState::Invalid);
         assert!(detail.contains("spec"), "{detail}");
+        let mut orphan = repo.clone();
+        orphan.state = KindState::Orphaned;
+        assert_eq!(judge(Some(&orphan), &json!({ "url": "x" })).1, ObjectState::Orphaned);
         assert_eq!(judge(None, &json!({})).1, ObjectState::Orphaned);
     }
 
     #[test]
-    fn labels_and_filters_test() {
-        let mut labels = BTreeMap::new();
-        labels.insert("team".to_string(), "a".to_string());
-        assert!(validate_labels(&labels).is_ok());
-        labels.insert("9bad".to_string(), "x".to_string());
-        assert!(validate_labels(&labels).is_err());
-        let filter = parse_label_filter(&["team=a,tier=web".into(), "x=y".into()]).expect("filter");
-        assert_eq!(filter.len(), 3);
-        assert!(parse_label_filter(&["team".into()]).is_err());
+    fn requirements_resolve_from_the_object_test() {
+        let mut repo = decl("Repo");
+        repo.requires = vec![
+            KindRequirement { resource: "job".into(), actions: vec!["write".into()], namespace: Some("/spec/targetNamespace".into()), ..Default::default() },
+            KindRequirement { resource: "kv".into(), actions: vec!["read".into()], path: Some("/spec/credentials/kv".into()), ..Default::default() },
+            KindRequirement { resource: "job".into(), actions: vec!["write".into()], host: true, when: Some("/spec/allowHost".into()), ..Default::default() },
+            KindRequirement { resource: "operator".into(), actions: vec!["read".into()], ..Default::default() },
+        ];
+        let repo = kind("gitops", repo);
+        let doc = |spec: Value| object_document("web", "team-a", &BTreeMap::new(), &spec, &Value::Null);
+        let resolved = resolve_requirements(&repo, &doc(json!({ "url": "x", "targetNamespace": "team-b" })), "team-a").expect("resolves");
+        // The KV entry names no key, and the host entry is off: two checks.
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].namespace.as_deref(), Some("team-b"));
+        assert_eq!(resolved[0].name.as_deref(), Some("*"));
+        assert_eq!(resolved[0].band.as_deref(), Some("normal"));
+        assert_eq!(resolved[0].label(), "job:write in team-b (from spec.targetNamespace)");
+        assert_eq!(resolved[1].resource, "operator");
+        assert!(resolved[1].scope().namespace.is_none());
+
+        let resolved = resolve_requirements(
+            &repo,
+            &doc(json!({ "url": "x", "credentials": { "kv": "team-b/key" }, "allowHost": true })),
+            "team-a",
+        )
+        .expect("resolves");
+        assert_eq!(resolved.len(), 4);
+        // No pointer value: the object's own namespace.
+        assert_eq!(resolved[0].namespace.as_deref(), Some("team-a"));
+        assert_eq!(resolved[1].path.as_deref(), Some("team-b/key"));
+        assert!(resolved[2].host && resolved[2].scope().host);
+
+        // A list names several; a number is refused.
+        let listed = resolve_requirements(&repo, &doc(json!({ "url": "x", "targetNamespace": ["a", "b"] })), "team-a").expect("list");
+        assert_eq!(listed.len(), 3);
+        assert!(resolve_requirements(&repo, &doc(json!({ "url": "x", "targetNamespace": 5 })), "team-a").is_err());
+        // A cluster kind's object: every namespace.
+        assert_eq!(
+            resolve_requirements(&repo, &doc(json!({ "url": "x" })), "").expect("cluster")[0].namespace.as_deref(),
+            Some("*")
+        );
     }
 
     #[test]
-    fn diffs_name_each_changed_field_test() {
+    fn immutable_fields_and_redacted_diffs_test() {
+        let mut repo = decl("Repo");
+        repo.immutable = vec!["/spec/url".into(), "/spec/token".into()];
+        let repo = kind("gitops", repo);
+        let doc = |spec: Value| object_document("web", "team-a", &BTreeMap::new(), &spec, &Value::Null);
+        let changes = immutable_changes(
+            &repo,
+            &doc(json!({ "url": "a", "token": "x" })),
+            &doc(json!({ "url": "b", "token": "y" })),
+        );
+        assert_eq!(changes, vec!["spec.url is immutable (was \"a\")".to_string(), "spec.token is immutable".to_string()]);
+        let secret = |path: &[String]| repo.schema.is_write_only(path);
         let lines = spec_diff(
             "spec",
-            &json!({ "url": "a", "branch": "main", "depth": 3, "nested": { "x": 1 } }),
-            &json!({ "url": "a", "branch": "dev", "path": "jobs", "nested": { "x": 2 } }),
+            &json!({ "url": "a", "branch": "main", "token": "x", "nested": { "x": 1 } }),
+            &json!({ "url": "a", "branch": "dev", "token": "y", "path": "jobs", "nested": { "x": 2 } }),
+            &secret,
         );
         assert_eq!(
             lines,
             vec![
                 "spec.branch: \"main\" → \"dev\"".to_string(),
-                "spec.depth: removed 3".to_string(),
                 "spec.nested.x: 1 → 2".to_string(),
                 "spec.path: added \"jobs\"".to_string(),
+                "spec.token: changed (redacted)".to_string(),
             ]
         );
-        assert!(spec_diff("spec", &json!({ "a": [1] }), &json!({ "a": [1] })).is_empty());
     }
 
-    /// The shard of an object is stable and uses the autoscaler's hash, so a
-    /// replica's leased shards mean the same on both of its watches.
+    #[test]
+    fn summaries_follow_the_conditions_test() {
+        let status = |conditions: Vec<(&str, &str, &str)>, observed: u64| ObjectStatus {
+            observed_generation: observed,
+            conditions: conditions
+                .into_iter()
+                .map(|(kind, status, reason)| ObjectCondition {
+                    kind: kind.into(),
+                    status: status.into(),
+                    reason: reason.into(),
+                    ..Default::default()
+                })
+                .collect(),
+            fields: json!({}),
+        };
+        let summary = |state, deleting, running, status: Option<&ObjectStatus>| {
+            summarize(&SummaryInputs { state, deleting, app_running: running, generation: 4, status }).0
+        };
+        let ready = status(vec![("Ready", "true", "Synced")], 4);
+        assert_eq!(summary(ObjectState::Valid, false, true, Some(&ready)), "Ready");
+        assert_eq!(summary(ObjectState::Valid, false, true, Some(&status(vec![("Ready", "true", "")], 3))), "Pending");
+        assert_eq!(summary(ObjectState::Valid, false, true, None), "Pending");
+        assert_eq!(
+            summary(ObjectState::Valid, false, true, Some(&status(vec![("Ready", "false", "RepoUnreachable")], 4))),
+            "NotReady: RepoUnreachable"
+        );
+        assert_eq!(
+            summary(ObjectState::Valid, false, true, Some(&status(vec![("Accepted", "false", "BadUrl"), ("Ready", "true", "")], 4))),
+            "Rejected: BadUrl"
+        );
+        assert_eq!(summary(ObjectState::Valid, false, true, Some(&status(vec![("Accepted", "true", "")], 4))), "Accepted");
+        assert_eq!(summary(ObjectState::Valid, false, false, Some(&ready)), "Stale");
+        assert_eq!(summary(ObjectState::Invalid, false, true, Some(&ready)), "Invalid");
+        assert_eq!(summary(ObjectState::Valid, true, true, Some(&ready)), "Deleting");
+        assert_eq!(summary(ObjectState::Orphaned, true, true, Some(&ready)), "Orphaned");
+        assert_eq!(summary_settled("Ready"), Some(true));
+        assert_eq!(summary_settled("NotReady: X"), Some(false));
+        assert_eq!(summary_settled("Pending"), None);
+
+        let mut conditions = vec![ObjectCondition { kind: "Ready".into(), status: "TRUE".into(), ..Default::default() }];
+        validate_conditions(&mut conditions).expect("valid");
+        assert_eq!(conditions[0].status, "true");
+        stamp_condition_times(&mut conditions, Some(&ready), "now");
+        assert_eq!(conditions[0].since, "");
+        let mut bad = vec![ObjectCondition { kind: "ready".into(), status: "true".into(), ..Default::default() }];
+        assert!(validate_conditions(&mut bad).is_err());
+        let after = status(vec![("Ready", "false", "X")], 4);
+        assert_eq!(
+            condition_transitions(Some(&ready), &after),
+            vec![("Ready".to_string(), "true".to_string(), "false".to_string())]
+        );
+        assert!(condition_transitions(Some(&ready), &ready).is_empty());
+    }
+
+    #[test]
+    fn scopes_follow_the_access_mapping_test() {
+        let object = access_scope(AclResource::Object, "gitops/Repo", "team-a", "web");
+        assert_eq!((object.namespace.as_deref(), object.name.as_deref()), (Some("team-a"), Some("web")));
+        assert_eq!(access_scope(AclResource::Object, "a/K", "", "x").namespace.as_deref(), Some("*"));
+        let scale = access_scope(AclResource::Scale, "autoscaler/ScalingPolicy", "media", "render");
+        assert_eq!((scale.namespace.as_deref(), scale.name.as_deref(), scale.band.as_deref()), (Some("media"), Some("*"), None));
+        let job = access_scope(AclResource::Job, "gitops/Deploy", "team-a", "web");
+        assert_eq!(job.band.as_deref(), Some("normal"));
+        let node = access_scope(AclResource::Node, "autoscaler/NodeGroup", "", "workers");
+        assert!(node.namespace.is_none() && node.name.is_none() && node.pool.is_none());
+    }
+
+    #[test]
+    fn upgrades_report_changed_defaults_test() {
+        let before = decl("Repo");
+        let mut after = decl("Repo");
+        after.schema["properties"]["branch"]["default"] = json!("trunk");
+        assert_eq!(
+            default_changes(&before, &after),
+            vec![("/branch".to_string(), json!("main"), json!("trunk"))]
+        );
+        assert!(default_changes(&before, &before).is_empty());
+    }
+
     #[test]
     fn shards_use_the_autoscalers_hash_test() {
         let key = shard_key("autoscaler", "ScalingPolicy", "media", "render");
         assert_eq!(key, "autoscaler/ScalingPolicy:media/render");
+        assert_eq!(shard_key("a", "NodeGroup", "", "workers"), "a/NodeGroup:workers");
         assert_eq!(
-            shard_key("a", "NodeGroup", "", "workers"),
-            "a/NodeGroup:workers"
+            object_shard("autoscaler", "ScalingPolicy", "media", "render", 64),
+            crate::autoscaler::shard::shard_of(&key, 64)
         );
-        let shard = object_shard("autoscaler", "ScalingPolicy", "media", "render", 64);
-        assert_eq!(shard, crate::autoscaler::shard::shard_of(&key, 64));
         assert_eq!(object_shard("a", "K", "n", "x", 1), 0);
-        assert_eq!(object_shard("a", "K", "n", "x", 0), 0);
     }
 
     #[test]
-    fn columns_read_the_object_document_test() {
-        let document = column_document(
+    fn labels_columns_and_filters_test() {
+        let mut labels = BTreeMap::new();
+        labels.insert("team".to_string(), "a".to_string());
+        assert!(validate_labels(&labels).is_ok());
+        labels.insert("9bad".to_string(), "x".to_string());
+        assert!(validate_labels(&labels).is_err());
+        assert_eq!(parse_label_filter(&["team=a,tier=web".into(), "x=y".into()]).expect("filter").len(), 3);
+        let document = object_document(
             "web",
             "team-a",
             &BTreeMap::new(),
             &json!({ "url": "https://x" }),
-            &json!({ "commit": "3f9a", "ok": true }),
+            &json!({ "fields": { "commit": "3f9a" } }),
         );
         assert_eq!(column_cell(&document, "/spec/url"), "https://x");
-        assert_eq!(column_cell(&document, "/status/ok"), "true");
+        assert_eq!(column_cell(&document, "/status/fields/commit"), "3f9a");
         assert_eq!(column_cell(&document, "/status/missing"), "-");
-        assert_eq!(column_cell(&document, "/name"), "web");
     }
 }

@@ -65,8 +65,8 @@ pub use extension_ops::ExtensionJob;
 // Objects of app-declared kinds (`legion object`), compare-and-set.
 mod app_object_ops;
 pub use app_object_ops::{
-    AppObjectRow, DeleteObject, ObjectFilter, ObjectKey, ObjectWrite, PutObject, PutStatus,
-    StatusCas, VersionCas,
+    AppObjectRow, AppObjectStatusRow, DeleteObject, KindWrite, ObjectFilter, ObjectKey,
+    ObjectKindRow, ObjectWrite, PutObject, PutStatus, ReleaseObject, StatusWrite, VersionCas,
 };
 // GetCapacityDemand's pending work, and ForgetNode (autoscaler v2 plan
 // §6.11).
