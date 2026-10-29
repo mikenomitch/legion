@@ -2538,6 +2538,12 @@ impl ManagerDaemonService {
             }
         })?;
 
+        // An installed app's job is the app reconciler's alone (docs/apps.md,
+        // "Editing an app's job"): a direct submit is refused, not reverted.
+        if matches!(origin, SubmitOrigin::Principal) {
+            self.refuse_direct_app_job_write(&config.name, "submitting it directly")?;
+        }
+
         // After authorization, so a caller with no grant in the namespace
         // cannot learn whether it exists.
         self.ensure_namespace_exists(&namespace)?;
@@ -5999,6 +6005,15 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         let request = request.into_inner();
         self.enforce_rollout_job(&identity, AclAction::Write, request.id)?;
+        // Stopping (or reverting) an app's rollout fights the reconciler;
+        // advancing one moves toward what it submitted, and is allowed.
+        if let Some(rollout) = self
+            .store
+            .get_rollout(request.id)
+            .map_err(|e| map_store_error("Error loading rollout", e))?
+        {
+            self.refuse_direct_app_job_write(&rollout.job_id, "stopping its rollout")?;
+        }
         let priority = request.priority.unwrap_or(self.store.default_eval_priority);
         let rollout = stop_rollout_state(&self.store, request.id, request.revert, priority)
             .map_err(|e| Status::invalid_argument(format!("Error stopping rollout: {e}")))?;
@@ -6048,6 +6063,9 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             &AclScope::job(&config.name),
         )?;
+        // A plan predicts the run: a direct submit to an installed app's
+        // job would be refused.
+        self.refuse_direct_app_job_write(&config.name, "submitting it directly")?;
         self.ensure_namespace_exists(&namespace)?;
         enforce_kv_artifact_read(&identity, &config)?;
         let mut config = self
@@ -6627,6 +6645,8 @@ impl Manager for ManagerDaemonService {
                 deduplicated: true,
             }));
         }
+        // An installed app's job stops with `legion app disable`.
+        self.refuse_direct_app_job_write(&name, "stopping it directly")?;
 
         let job_config_id = self
             .store
@@ -6843,6 +6863,9 @@ impl Manager for ManagerDaemonService {
                 deduplicated: true,
             }));
         }
+        // An installed app's job is destroyed only once the app is
+        // uninstalled.
+        self.refuse_direct_app_job_write(&name, "destroying it")?;
 
         let _ = self.store.destroy_job(&name).map_err(|e| {
             self.job_lookup_error(&identity, &name, map_store_error("Error deleting job", e))

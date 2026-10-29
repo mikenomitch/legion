@@ -28,7 +28,7 @@
 //!   or `stopped-<version>`).
 //!
 //! Triggers: an app write (the RPC handlers nudge [`AppNudge`]), any job
-//! event of an app's job (a direct edit is reverted within seconds), node
+//! event of an app's job (a version stored some other way is reverted), node
 //! events (a node joining or rebuilding moves bundled apps' build markers),
 //! acquiring Control leadership (which also seeds bundled apps), and a full
 //! pass every [`FULL_PASS_INTERVAL`]. Bursts coalesce: one pass per app at a

@@ -377,43 +377,120 @@ async fn an_unchanged_record_makes_no_submit_test() -> R<()> {
     Ok(())
 }
 
-/// A direct submit is reverted within one pass and the event names who made
-/// it; the same edit made twice is reverted twice (the second revert starts
-/// from another version, so its key is new).
+/// Every direct write to an installed app's job is refused, for every
+/// caller, a management token included, and names the `legion app` verb
+/// that does it (hardening after the adversarial review, M3, which
+/// supersedes reverting them): a submit, a plan of one, a scale override (the
+/// review's `job scale --count 0` that silently disabled the app), a stop,
+/// a destroy. A version that reached the job some other way (a store a
+/// release before this one wrote) is still reverted, and the event names
+/// who made it.
 #[tokio::test(flavor = "multi_thread")]
-async fn direct_edits_are_reverted_every_time_test() -> R<()> {
+async fn direct_writes_to_an_app_job_are_refused_test() -> R<()> {
     let (fx, mut reconciler) = seeded().await?;
     let alice = fx.editor("alice").await?;
     let mut edited: Value = serde_json::to_value(fx.store.get_job_config(AUTOSCALER)?)?;
     edited["tasks"][0]["count"] = json!(2);
     edited["version"] = Value::Null;
 
-    for round in 1..=2 {
-        fx.run(&edited, &alice).await?;
-        let version = fx.version(AUTOSCALER)?.context("job")?;
-        assert_eq!(version.managed_by, None, "a direct edit clears the stamp");
-        assert_eq!(version.submitted_by.as_deref(), Some("alice"));
-        let outcome = reconciler.reconcile_app("autoscaler").await;
-        assert_eq!(
-            outcome,
-            PassOutcome::Submitted {
-                action: "reverted a direct edit by alice".into(),
-                deduplicated: false,
-            },
-            "round {round}"
+    for token in [&alice, &fx.admin] {
+        let refused = fx.run(&edited, token).await.expect_err("an app's job");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+        assert!(
+            refused
+                .message()
+                .contains("job legion-system/autoscaler is app autoscaler's")
+                && refused.message().contains("`legion app set autoscaler`"),
+            "{}",
+            refused.message()
         );
-        let reverted = fx.version(AUTOSCALER)?.context("job")?;
-        assert_eq!(reverted.version, 1 + 2 * round);
-        assert!(reverted.managed_by.is_some());
-        assert_eq!(fx.stored(AUTOSCALER)?["tasks"][0]["count"], 1);
     }
-    let reverted = fx.events("app.reconciled")?;
-    let reverted: Vec<&String> = reverted
-        .iter()
-        .map(|event| &event.message)
-        .filter(|message| message.contains("reverted a direct edit by alice"))
-        .collect();
-    assert_eq!(reverted.len(), 2, "{reverted:?}");
+    let planned = fx
+        .svc
+        .plan_job(req(
+            PlanJobRequest {
+                parsed_jobspec: edited.to_string(),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("a plan predicts the refusal");
+    assert_eq!(planned.code(), Code::FailedPrecondition);
+    let scaled = fx
+        .svc
+        .scale_task(req(
+            ScaleTaskRequest {
+                name: AUTOSCALER.into(),
+                task_name: Some("agent".into()),
+                count: Some(0),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("scaling an app's job");
+    assert_eq!(scaled.code(), Code::FailedPrecondition);
+    assert!(
+        scaled.message().contains("scaling it directly"),
+        "{}",
+        scaled.message()
+    );
+    let stopped = fx
+        .svc
+        .stop_job(req(
+            StopJobRequest {
+                name: AUTOSCALER.into(),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("stopping an app's job");
+    assert!(stopped.message().contains("legion app disable autoscaler"));
+    let destroyed = fx
+        .svc
+        .destroy_job(req(
+            DestroyJobRequest {
+                name: AUTOSCALER.into(),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("destroying an app's job");
+    assert_eq!(destroyed.code(), Code::FailedPrecondition);
+    assert_eq!(fx.version_number(AUTOSCALER)?, 1, "nothing was written");
+    assert!(!fx.version(AUTOSCALER)?.context("job")?.is_stopped());
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged
+    );
+
+    // A version stored some other way is reverted, and the event names who.
+    let config: JobConfig = serde_json::from_value(edited)?;
+    fx.store.handle_job_submit_as(
+        &config,
+        &[Submission {
+            path: "job.json".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }],
+        None,
+        "alice",
+        None,
+    )?;
+    let version = fx.version(AUTOSCALER)?.context("job")?;
+    assert_eq!(version.managed_by, None);
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert_eq!(
+        outcome,
+        PassOutcome::Submitted {
+            action: "reverted a direct edit by alice".into(),
+            deduplicated: false,
+        }
+    );
+    assert_eq!(fx.stored(AUTOSCALER)?["tasks"][0]["count"], 1);
     Ok(())
 }
 
@@ -440,16 +517,9 @@ async fn disable_enable_and_a_direct_stop_test() -> R<()> {
     assert!(submitted(&outcome), "{outcome:?}");
     assert!(!fx.version(AUTOSCALER)?.context("job")?.is_stopped());
 
-    // A direct stop.
-    fx.svc
-        .stop_job(req(
-            StopJobRequest {
-                name: AUTOSCALER.into(),
-                ..Default::default()
-            },
-            &fx.admin,
-        ))
-        .await?;
+    // A stop that reached the job some other way (StopJob itself is
+    // refused for an app's job).
+    fx.store.stop_job(AUTOSCALER)?;
     assert!(fx.version(AUTOSCALER)?.context("job")?.is_stopped());
     let outcome = reconciler.reconcile_app("autoscaler").await;
     assert!(
@@ -494,7 +564,7 @@ async fn kv_rerenders_keep_the_stamp_and_template_submits_clear_it_test() -> R<(
         PassOutcome::Unchanged
     );
 
-    // A template submit by the admin.
+    // A template submit by the admin is refused, like any direct submit.
     let mut through_template: Value = serde_json::to_value(&rerendered)?;
     through_template["tasks"][0]["count"] = json!(3);
     fx.svc
@@ -510,7 +580,8 @@ async fn kv_rerenders_keep_the_stamp_and_template_submits_clear_it_test() -> R<(
             &fx.admin,
         ))
         .await?;
-    fx.svc
+    let refused = fx
+        .svc
         .run_job_template(req(
             RunJobTemplateRequest {
                 name: "autoscaler-template".into(),
@@ -519,18 +590,12 @@ async fn kv_rerenders_keep_the_stamp_and_template_submits_clear_it_test() -> R<(
             },
             &fx.admin,
         ))
-        .await?;
+        .await
+        .expect_err("a template submit to an app's job");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
     let version = fx.version(AUTOSCALER)?.context("job")?;
-    assert_eq!(version.version, 3);
-    assert_eq!(
-        version.managed_by, None,
-        "a template submit clears the stamp"
-    );
-    let outcome = reconciler.reconcile_app("autoscaler").await;
-    assert!(
-        matches!(&outcome, PassOutcome::Submitted { action, .. } if action.starts_with("reverted a direct edit")),
-        "{outcome:?}"
-    );
+    assert_eq!(version.version, 2);
+    assert_eq!(version.managed_by, stamp, "nothing cleared the stamp");
     Ok(())
 }
 

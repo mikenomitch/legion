@@ -1670,11 +1670,26 @@ async fn only_a_stamped_allocation_speaks_for_its_app_test() -> R<()> {
         .watch_app_extensions(req(WatchAppExtensionsRequest::default(), &token))
         .await?;
 
-    // A direct submit of the app's job, as the admin: no stamp.
+    // A version of the app's job stored without the stamp. RunJob refuses
+    // a direct submit of an installed app's job, so this is what an older
+    // release could have left.
     let mut edited = serde_json::to_value(fx.store.get_job_config(&job)?)?;
     edited["version"] = Value::Null;
     edited["tasks"][0]["count"] = json!(2);
-    fx.run(&edited).await?;
+    let refused = fx.run(&edited).await.expect_err("an app's job");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    let edited: JobConfig = serde_json::from_value(edited)?;
+    fx.store.handle_job_submit_as(
+        &edited,
+        &[Submission {
+            path: "job.json".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }],
+        None,
+        "admin",
+        None,
+    )?;
     let config_id = fx.store.get_job_config(&job)?.id();
     assert!(fx.store.job_managed_by(&job)?.is_none());
     fx.store
