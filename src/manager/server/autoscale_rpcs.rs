@@ -313,9 +313,9 @@ impl ManagerDaemonService {
         if self.is_autoscaler_identity(&identity) {
             return Ok(identity);
         }
-        if identity.source == crate::structs::acl::AclSource::Delegated {
-            // Never through audit-only: an app acting for a viewer is not
-            // the app plane, whatever the mode.
+        if identity.source.is_acting() {
+            // Never through audit-only: an app acting for a viewer (or for
+            // one of its objects) is not the app plane, whatever the mode.
             warn!(
                 target: "acl_audit",
                 principal = %identity.principal,
@@ -327,7 +327,8 @@ impl ManagerDaemonService {
             );
             return Err(Status::permission_denied(format!(
                 "app-plane endpoints take the autoscaler's own identity, not one acting for a \
-                 viewer ({}): send the call without legion-on-behalf-of",
+                 viewer or an object ({}): send the call without legion-on-behalf-of or \
+                 legion-for-object",
                 identity.principal
             )));
         }

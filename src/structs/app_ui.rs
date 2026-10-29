@@ -36,6 +36,17 @@ pub const VIEWER_HEADER: &str = "legion-viewer";
 /// authenticates the call as `<viewer> via app <app>`, holding only the
 /// assertion's [`Delegation`] within the app's own grant.
 pub const ON_BEHALF_OF_HEADER: &str = "legion-on-behalf-of";
+/// The gRPC metadata key an app names one of its objects in, beside its own
+/// credential, to act for the object (docs/app-objects.md, "Acting for an
+/// object"): the manager then authenticates the call as `<app> for <Kind>
+/// <namespace>/<name>`, holding the object's recorded authority within the
+/// app's own grant (`via = "objects"` rules included). The value is
+/// [`FOR_OBJECT_FORMAT`]; parsed by [`crate::structs::acl::ActingFor`]. A
+/// call carries this header or [`ON_BEHALF_OF_HEADER`], never both.
+pub const FOR_OBJECT_HEADER: &str = "legion-for-object";
+/// The shape of a [`FOR_OBJECT_HEADER`] value. A cluster kind's object has
+/// an empty namespace: `autoscaler/NodeGroup//workers#17@3`.
+pub const FOR_OBJECT_FORMAT: &str = "<app>/<Kind>/<namespace>/<name>#<uid>@<generation>";
 /// Where an app serves view `<name>`: `GET /legion/v1/views/<name>?<context>`.
 pub const VIEW_PATH_PREFIX: &str = "/legion/v1/views/";
 /// Where an app serves action `<name>`: `POST /legion/v1/actions/<name>`

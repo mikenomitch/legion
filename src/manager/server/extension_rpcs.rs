@@ -672,8 +672,9 @@ impl ManagerDaemonService {
         request: &Request<T>,
         identity: &AclIdentity,
     ) -> Option<String> {
-        if identity.source == crate::structs::acl::AclSource::Delegated {
-            // An app acting for a viewer is not the app plane.
+        if identity.source.is_acting() {
+            // An app acting for a viewer, or for one of its objects, is not
+            // the app plane.
             return None;
         }
         if let (Some(state), Some(bearer)) = (

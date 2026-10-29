@@ -464,6 +464,17 @@ impl Store {
         Self::app_object_tx(&conn, key)
     }
 
+    /// The object with `uid` (deleting ones included): what an app names
+    /// when it acts for one (`legion-for-object`). One indexed read (`uid`
+    /// is unique).
+    pub fn app_object_by_uid(&self, uid: u64) -> R<Option<AppObjectRow>> {
+        let conn = self.read_connection()?;
+        Ok(conn
+            .prepare_cached(&format!("SELECT {COLUMNS} FROM app_object WHERE uid = ?1;"))?
+            .query_row([i64::try_from(uid).unwrap_or(i64::MAX)], from_row)
+            .optional()?)
+    }
+
     /// Objects, by app, kind, namespace, and name: every one, an app's
     /// (optionally in some stored shards), or one kind's.
     pub fn app_objects(&self, filter: &ObjectFilter) -> R<Vec<AppObjectRow>> {

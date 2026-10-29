@@ -721,9 +721,14 @@ impl ManagerDaemonService {
         Ok((namespace, name))
     }
 
-    /// The app a non-delegated caller's own identity speaks for, for the
-    /// `managed_by` stamp.
+    /// The app a write is made by, for the `managed_by` stamp: the caller's
+    /// own app identity, or the app acting for one of its objects (an app
+    /// writing objects for another object manages them). A delegated
+    /// identity (an app acting for a viewer) counts as the viewer: `None`.
     fn writing_app<T>(&self, request: &Request<T>, identity: &AclIdentity) -> Option<String> {
+        if let Some(actor) = &identity.acting_for {
+            return Some(actor.app.clone());
+        }
         self.calling_app(request, identity)
     }
 
@@ -1732,6 +1737,14 @@ impl ManagerDaemonService {
                 if identity.source == crate::structs::acl::AclSource::Anonymous {
                     return Err(Status::unauthenticated(format!(
                         "{rpc} is called by an app with its own workload identity"
+                    )));
+                }
+                if identity.source.is_acting() {
+                    return Err(Status::permission_denied(format!(
+                        "{rpc} takes the app's own identity, not one acting for a viewer or an \
+                         object ({}): send the call without legion-on-behalf-of or \
+                         legion-for-object",
+                        identity.principal
                     )));
                 }
                 Err(Status::permission_denied(format!(

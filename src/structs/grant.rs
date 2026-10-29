@@ -40,6 +40,10 @@
 //!   which can write any policy anyway.
 //! - Management tokens hold everything. A requested deny rule only takes
 //!   access away and is never checked.
+//! - **`via = "objects"`** (an app's rule usable only when it acts for one
+//!   of its objects) is checked like any other: the submitter must hold it
+//!   plainly. A held `via` rule covers nothing, since the holder could not
+//!   use it on its own.
 
 use serde::{Deserialize, Serialize};
 
@@ -300,6 +304,9 @@ impl Atom<'_> {
         if self.rule.host == Some(true) {
             text.push_str(" (host = true)");
         }
+        if self.rule.is_via_objects() {
+            text.push_str(" (via objects)");
+        }
         text
     }
 }
@@ -326,7 +333,12 @@ fn pattern_covers(held: &str, requested: &str, prefix: &str) -> bool {
 }
 
 fn held_covers(held: &AclRule, atom: &Atom<'_>) -> bool {
-    if held.is_deny() || !rule_covers_pair(held, atom.resource, atom.action) {
+    // A held `via = "objects"` rule is usable only through an object-scoped
+    // call, so it covers nothing a grant would let a plain credential do.
+    if held.is_deny()
+        || held.is_via_objects()
+        || !rule_covers_pair(held, atom.resource, atom.action)
+    {
         return false;
     }
     let requested = atom.rule;
@@ -498,6 +510,7 @@ mod grant_test {
             source: AclSource::Token,
             expires_at: None,
             audit_only: false,
+            acting_for: None,
         }
     }
 

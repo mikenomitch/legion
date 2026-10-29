@@ -20,13 +20,28 @@
 //! Verifying the assertion and deciding that the caller is the app happen in
 //! the manager service (`authenticate_acl`), which has the keys and the
 //! store; this module is the pure part, so it can be tested on its own.
+//!
+//! **Acting for an object** (docs/app-objects.md, "Acting for an object";
+//! app-object-kinds plan §8, O3) reuses the same intersection. An app names
+//! one of its objects in [`FOR_OBJECT_HEADER`], beside its own credential,
+//! and [`object_scoped_identity`] builds `<app> for <Kind> <ns>/<name>`:
+//!
+//! - one exact allow rule per permission of the object's recorded
+//!   `authority` (what its writer was checked for), kept only when the
+//!   app's grant covers that permission whole on its scope; the grant here
+//!   includes the app's `via = "objects"` rules, which no plain identity
+//!   can use;
+//! - the app's deny rules.
 
 // tonic::Status is ~176 bytes; returning it directly matches the rest of the
 // gRPC surface.
 #![allow(clippy::result_large_err)]
 
-use crate::structs::acl::{AclAction, AclIdentity, AclScope, AclSource};
-use crate::structs::app_ui::{Delegation, ON_BEHALF_OF_HEADER};
+use crate::structs::acl::{
+    ActingFor, AclAction, AclIdentity, AclResource, AclRule, AclScope, AclSource,
+};
+use crate::structs::app_object::ResolvedPermission;
+use crate::structs::app_ui::{Delegation, FOR_OBJECT_HEADER, ON_BEHALF_OF_HEADER};
 use tonic::metadata::MetadataMap;
 use tonic::Status;
 
@@ -133,7 +148,154 @@ pub fn delegated_identity(
         source: AclSource::Delegated,
         expires_at: Some(expires_at),
         audit_only: caller.audit_only,
+        acting_for: None,
     })
+}
+
+/// Every refusal of an object-scoped call names its header.
+pub fn for_object_refusal(reason: &str) -> String {
+    format!("{FOR_OBJECT_HEADER}: {reason}")
+}
+
+/// Whether a request carries [`FOR_OBJECT_HEADER`] at all (well-formed or
+/// not).
+pub fn names_an_object(metadata: &MetadataMap) -> bool {
+    metadata.get(FOR_OBJECT_HEADER).is_some()
+}
+
+/// Whether a request carries [`ON_BEHALF_OF_HEADER`] at all.
+pub fn names_a_viewer(metadata: &MetadataMap) -> bool {
+    metadata.get(ON_BEHALF_OF_HEADER).is_some()
+}
+
+/// The object a request names in [`FOR_OBJECT_HEADER`]: `Ok(None)` without
+/// the header, an error for one that is empty, not text, or not
+/// `<app>/<Kind>/<namespace>/<name>#<uid>@<generation>`.
+pub fn presented_object(metadata: &MetadataMap) -> Result<Option<ActingFor>, String> {
+    let Some(value) = metadata.get(FOR_OBJECT_HEADER) else {
+        return Ok(None);
+    };
+    let text = value
+        .to_str()
+        .map_err(|_| "the header is not ASCII".to_string())?
+        .trim();
+    if text.is_empty() {
+        return Err("the header is empty".to_string());
+    }
+    ActingFor::parse(text).map(Some)
+}
+
+/// The exact allow rule one recorded permission becomes: its resource and
+/// action, and a one-value selector for every attribute of the scope its
+/// writer was checked on. A namespace-wide check (name `*`) becomes a rule
+/// without `names`; the `*` namespace a cluster kind's object carries
+/// becomes `namespaces = ["*"]` (every namespace but the reserved ones, as
+/// it reached for the writer). `None` for a permission that names an
+/// unknown resource or action, or a value with a `*` in it, which a glob
+/// selector cannot name exactly: such a permission grants nothing.
+pub fn authority_rule(permission: &ResolvedPermission) -> Option<AclRule> {
+    let resource = AclResource::parse(&permission.resource)?;
+    let action = AclAction::parse(&permission.action)?;
+    let exact = |value: &Option<String>| -> Result<Option<Vec<String>>, ()> {
+        match value {
+            None => Ok(None),
+            Some(value) if value.is_empty() || value.contains('*') => Err(()),
+            Some(value) => Ok(Some(vec![value.clone()])),
+        }
+    };
+    let namespaces = match permission.namespace.as_deref() {
+        Some("*") => Some(vec!["*".to_string()]),
+        _ => exact(&permission.namespace).ok()?,
+    };
+    let names = match permission.name.as_deref() {
+        Some("*") => None,
+        _ => exact(&permission.name).ok()?,
+    };
+    Some(AclRule {
+        resources: vec![resource.as_str().to_string()],
+        actions: vec![action.as_str().to_string()],
+        namespaces,
+        names,
+        paths: exact(&permission.path).ok()?,
+        pools: exact(&permission.pool).ok()?,
+        bands: exact(&permission.band).ok()?,
+        templates: exact(&permission.template).ok()?,
+        host: permission.host.then_some(true),
+        ..Default::default()
+    })
+}
+
+/// The grant an app acts for its objects within: its own rules, with its
+/// `via = "objects"` rules made plain.
+pub fn object_grant(caller: &AclIdentity) -> AclIdentity {
+    AclIdentity {
+        rules: caller
+            .rules
+            .iter()
+            .map(|rule| AclRule {
+                via: None,
+                ..rule.clone()
+            })
+            .collect(),
+        ..caller.clone()
+    }
+}
+
+/// What [`object_scoped_identity`] built, and the recorded permissions the
+/// app's grant did not cover (labels, for the log).
+#[derive(Debug, Clone)]
+pub struct ObjectScoped {
+    pub identity: AclIdentity,
+    pub dropped: Vec<String>,
+}
+
+/// Build the identity `caller` (the app's own, already known to own the
+/// object) acts with for `actor`'s object, whose recorded authority is
+/// `authority`: each permission as an exact rule, kept when the app's grant
+/// ([`object_grant`]: `via = "objects"` rules included) allows it on its
+/// scope, plus the app's deny rules. Not management, no policies, no
+/// accessor; it expires with the caller's credential.
+pub fn object_scoped_identity(
+    caller: &AclIdentity,
+    actor: &ActingFor,
+    authority: &[ResolvedPermission],
+) -> ObjectScoped {
+    let grant = object_grant(caller);
+    let mut rules: Vec<AclRule> = Vec::new();
+    let mut dropped = Vec::new();
+    for permission in authority {
+        let (Some(resource), Some(action), Some(rule)) = (
+            AclResource::parse(&permission.resource),
+            AclAction::parse(&permission.action),
+            authority_rule(permission),
+        ) else {
+            dropped.push(permission.label());
+            continue;
+        };
+        if !grant.would_allow(resource, action, &permission.scope()) {
+            dropped.push(permission.label());
+            continue;
+        }
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    }
+    rules.extend(caller.rules.iter().filter(|rule| rule.is_deny()).cloned());
+    ObjectScoped {
+        identity: AclIdentity {
+            principal: actor.principal(),
+            accessor_id: None,
+            is_management: false,
+            is_worker: false,
+            policies: Vec::new(),
+            rules,
+            source: AclSource::ForObject,
+            expires_at: caller.expires_at.clone(),
+            audit_only: caller.audit_only,
+            acting_for: Some(actor.clone()),
+        },
+        dropped,
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +321,7 @@ mod delegation_test {
             source: AclSource::Token,
             expires_at: None,
             audit_only: false,
+            acting_for: None,
         }
     }
 

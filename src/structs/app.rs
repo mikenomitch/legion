@@ -281,6 +281,7 @@ const ACL_RULE_FIELDS: &[&str] = &[
     "bands",
     "host",
     "kinds",
+    "via",
 ];
 
 /// Drop the keys of `object` that are not in `known`; returns them, as
@@ -506,6 +507,18 @@ impl AppManifest {
             .map_err(|err| format!("app {}: {err}", self.name))?;
         crate::structs::app_object::validate_kind_decls(&kinds)
             .map_err(|err| format!("app {}: {err}", self.name))?;
+        // A `via = "objects"` rule holds only when the app acts for one of
+        // its objects (docs/app-objects.md, "Acting for an object"): an app
+        // with no kinds could never use it.
+        if kinds.is_empty() {
+            if let Some(index) = self.permissions.iter().position(AclRule::is_via_objects) {
+                return Err(format!(
+                    "app {}: permissions[{index}] says `via = \"objects\"`, but the app declares \
+                     no kinds, so it never acts for an object; declare the kind, or drop `via`",
+                    self.name
+                ));
+            }
+        }
         let schema = self.config_schema();
         let compiled = compile_config_schema(&schema)
             .map_err(|err| format!("app {}: config.schema: {err}", self.name))?;
@@ -1006,11 +1019,40 @@ pub fn app_name_of_job(job_id: &str) -> Option<&str> {
 /// The stamp the reconciler puts on the job versions it submits
 /// (`managedBy`, in the version's meta). Kept by KV re-renders, cleared by
 /// any other write that stores a version (apps plan §6.3).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedBy {
     pub app: String,
+    /// The digest of the render the app reconciler submitted (an app's own
+    /// job); empty on a write an app made for one of its objects.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub digest: String,
+    /// The object an app wrote the version for, acting for it
+    /// (`legion-for-object`; docs/app-objects.md, "Acting for an object"):
+    /// `<app>/<Kind>/<namespace>/<name>#<uid>`. Such a stamp never makes a
+    /// job an app's own ([`crate::storage::store::Store::allocation_app`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+}
+
+impl ManagedBy {
+    /// The stamp on a version an app wrote for one of its objects.
+    pub fn for_object(actor: &crate::structs::acl::ActingFor) -> ManagedBy {
+        ManagedBy {
+            app: actor.app.clone(),
+            digest: String::new(),
+            object: Some(actor.object_ref()),
+        }
+    }
+
+    /// `gitops for Repo team-a/storefront`, or the app's name for the
+    /// reconciler's own stamp.
+    pub fn label(&self) -> String {
+        match &self.object {
+            Some(object) => crate::structs::acl::object_stamp_label(object),
+            None => self.app.clone(),
+        }
+    }
 }
 
 /// Compile a config schema (JSON Schema draft 7) with the checks the plan
@@ -1694,6 +1736,11 @@ pub fn describe_rule(rule: &AclRule) -> String {
     if rule.host == Some(true) {
         selectors.push("host".to_string());
     }
+    if rule.is_via_objects() {
+        selectors.push(
+            "only for its objects (bounded by each object's recorded authority)".to_string(),
+        );
+    }
     let effect = if rule.is_deny() { "deny " } else { "" };
     format!(
         "{effect}{:<9} {:<13} {}",
@@ -1745,6 +1792,23 @@ pub fn install_prompt(manifest: &AppManifest) -> Vec<String> {
         lines.push(format!("in {SYSTEM_NAMESPACE}, and asks for:"));
         for rule in &manifest.permissions {
             lines.push(format!("  {}", describe_rule(rule)));
+        }
+        // What `via = "objects"` means, with the kinds it is about: the
+        // promise the installer is asked to rely on.
+        if manifest.permissions.iter().any(AclRule::is_via_objects) {
+            let kinds: Vec<String> = crate::structs::app_object::manifest_kinds(manifest)
+                .unwrap_or_default()
+                .iter()
+                .map(|kind| format!("{}/{}", manifest.name, kind.name))
+                .collect();
+            lines.push(format!(
+                "  (rules marked \"only for its objects\" hold only while {} acts for one of its \
+                 {} objects, and only as far as that object's writer was checked for: {} \
+                 writes them only where an object's author could)",
+                manifest.name,
+                kinds.join(", "),
+                manifest.name
+            ));
         }
     }
     let ui = manifest.ui_summary();

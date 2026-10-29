@@ -926,6 +926,7 @@ impl AppReconciler {
         let stamp = ManagedBy {
             app: name.to_string(),
             digest: rendered.digest.clone(),
+            object: None,
         };
         let failed = version.as_ref().is_some_and(AppJobVersion::is_failed);
         let current = version.as_ref().is_some_and(|v| {

@@ -15581,6 +15581,7 @@ mod tests {
             source,
             expires_at: None,
             audit_only: false,
+            acting_for: None,
         };
         let request = json!({ "name": "web" });
         let key = |identity: &AclIdentity| {
@@ -21480,6 +21481,7 @@ mod tests {
             source: AclSource::Token,
             expires_at: None,
             audit_only: false,
+            acting_for: None,
         };
         let start = |allocation_id: i64| crate::structs::ExecStart {
             allocation_id,
@@ -21564,6 +21566,7 @@ mod tests {
             source: AclSource::Token,
             expires_at: None,
             audit_only: false,
+            acting_for: None,
         };
         let exec_host = identity(json!([
             { "resources": ["exec"], "namespaces": ["*"], "actions": ["write"], "names": ["shell"], "host": true }

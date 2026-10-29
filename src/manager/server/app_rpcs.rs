@@ -139,6 +139,7 @@ fn reconciler_identity(record: &AppRecord) -> AclIdentity {
         source: crate::structs::acl::AclSource::Token,
         expires_at: None,
         audit_only: false,
+        acting_for: None,
     }
 }
 
@@ -329,6 +330,7 @@ impl ManagerDaemonService {
                     managed_by: ManagedBy {
                         app: record.name.clone(),
                         digest: rendered.digest.clone(),
+                        object: None,
                     },
                     record_updated_at: record.updated_at.clone(),
                 },
@@ -438,6 +440,7 @@ impl ManagerDaemonService {
         let managed_by = ManagedBy {
             app: record.name.clone(),
             digest: rendered.digest.clone(),
+            object: None,
         };
         let stored_key = format!("app-reconciler/{key}");
         if let Some(message) = self
