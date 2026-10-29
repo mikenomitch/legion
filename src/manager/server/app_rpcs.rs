@@ -258,12 +258,18 @@ impl ManagerDaemonService {
     /// the app's. `key` is `app:<name>:<digest>:<from>`: a key a previous
     /// leader recorded is `deduplicated` when the job shows its submit took,
     /// and submitted again otherwise (a resubmit of the same render is
-    /// `Unchanged`, so it never adds a version).
+    /// `Unchanged`, so it never adds a version). `force_reschedule` re-places
+    /// an unchanged job (a retry of an upgrade that did not take).
+    ///
+    /// Compare-and-set on `record`: the store refuses the submit
+    /// (`Aborted`) unless the record is still installed, enabled, and at
+    /// `record.updated_at`, in the same entry as the version.
     pub(crate) fn submit_app_job(
         &self,
         record: &AppRecord,
         rendered: &RenderedApp,
         key: &str,
+        force_reschedule: bool,
     ) -> Result<AppSubmit, Status> {
         let job_id = record.job_id();
         let managed_by = ManagedBy {
@@ -281,7 +287,9 @@ impl ManagerDaemonService {
                 .app_job_version(&job_id)
                 .map_err(|e| map_store_error("Error loading the app's job", e))?
                 .is_some_and(|version| {
-                    !version.is_stopped() && version.managed_by.as_ref() == Some(&managed_by)
+                    !version.is_stopped()
+                        && !version.is_failed()
+                        && version.managed_by.as_ref() == Some(&managed_by)
                 });
             if took {
                 return Ok(AppSubmit {
@@ -389,15 +397,9 @@ impl ManagerDaemonService {
     /// the status derived from both.
     pub(crate) fn app_info(&self, record: &AppRecord) -> Result<App, Status> {
         let job_id = record.job_id();
-        let version: Option<AppJobVersion> = self
-            .store
-            .app_job_version(&job_id)
+        let job = crate::manager::apps::AppJobState::read(&self.store, record)
             .map_err(|e| map_store_error("Error loading the app's job", e))?;
-        let allocations = self
-            .store
-            .app_job_allocations(&job_id)
-            .map_err(|e| map_store_error("Error loading the app's allocations", e))?;
-        let blocked = match &version {
+        let blocked = match &job.version {
             Some(_) => self
                 .store
                 .get_job_with_status(&job_id)
@@ -410,13 +412,12 @@ impl ManagerDaemonService {
                 }),
             None => None,
         };
-        let view = crate::manager::apps::derive_status(
-            record,
-            version.as_ref(),
-            &allocations,
-            crate::manager::apps::task_count(record),
-            blocked.as_deref(),
-        );
+        let view = crate::manager::apps::derive_status(record, &job, blocked.as_deref());
+        let crate::manager::apps::AppJobState {
+            version,
+            allocations,
+            ..
+        } = job;
         let keys = self.record_registry(record);
         let mut notes = keys.shadowed_notes(Some(&record.name));
         if self.workload_identity.is_none() {

@@ -1654,6 +1654,144 @@ async fn a_record_that_does_not_decode_breaks_nothing_else_test() -> R<()> {
     Ok(())
 }
 
+/// A job that failed (its reschedule policy gave up, a KV `onDelete =
+/// "fail"`, a gang that lost its quorum) is restarted, with backoff, and
+/// status says so (hardening after the adversarial review, M2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_job_restarts_with_backoff_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    fx.store.mark_job_failed(AUTOSCALER)?;
+    let app = fx.get_app("autoscaler").await?;
+    assert_eq!(app.status, "degraded");
+    assert!(
+        app.status_detail.contains("job failed"),
+        "{}",
+        app.status_detail
+    );
+
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert_eq!(
+        outcome,
+        PassOutcome::Submitted {
+            action: "restarted the job, which had failed (restart 1)".into(),
+            deduplicated: false,
+        }
+    );
+    assert!(!fx.version(AUTOSCALER)?.context("job")?.is_failed());
+    assert_eq!(
+        fx.version_number(AUTOSCALER)?,
+        1,
+        "the same version runs again"
+    );
+
+    // It fails again at once: the next restart waits for the backoff.
+    fx.store.mark_job_failed(AUTOSCALER)?;
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Skipped
+    );
+    let app = fx.get_app("autoscaler").await?;
+    assert!(
+        app.status_detail.contains("restarting it in") && app.status_detail.contains("(restart 2)"),
+        "{}",
+        app.status_detail
+    );
+    assert!(reconciler.next_retry().is_some(), "the loop wakes for it");
+    Ok(())
+}
+
+/// `legion app enable` on an enabled app whose job does not run healthy at
+/// the version the record renders (an upgrade whose rollout failed or rolled
+/// back, here a job nothing placed) resubmits it, once (hardening after the
+/// adversarial review, M1); a pass with no write in between leaves it be.
+#[tokio::test(flavor = "multi_thread")]
+async fn enable_retries_a_job_not_healthy_at_its_version_test() -> R<()> {
+    let (fx, mut reconciler) = seeded().await?;
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged,
+        "no write, no retry"
+    );
+    fx.set_enabled("autoscaler", true).await?;
+    let outcome = reconciler.reconcile_app("autoscaler").await;
+    assert!(
+        matches!(&outcome, PassOutcome::Submitted { action, .. }
+            if action.starts_with("resubmitted the job, which did not run healthy at version 1")),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        reconciler.reconcile_app("autoscaler").await,
+        PassOutcome::Unchanged
+    );
+    assert_eq!(fx.version_number(AUTOSCALER)?, 1, "no new version");
+    Ok(())
+}
+
+/// A parked refusal never hides a job that already runs the render (another
+/// leader got it submitted), and a new leadership term forgets what an
+/// earlier one parked (hardening after the adversarial review, L1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_term_retries_and_a_current_job_is_not_parked_test() -> R<()> {
+    let fx = fixture()?;
+    let manifest = legion::structs::app::AppManifest::from_json(&refused_manifest().to_string())
+        .map_err(|err| anyhow!(err))?;
+    let mut record = legion::manager::apps::seed_record(&manifest, None);
+    record.source = legion::structs::app::AppSource::File;
+    fx.store.insert_app(record)?;
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    assert!(matches!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Refused(_)
+    ));
+    assert_eq!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Skipped
+    );
+
+    // The job reaches the render some other way (another leader's submit).
+    let record = fx.app("rooted")?;
+    let rendered = legion::manager::apps::render_for(&record, None).map_err(|err| anyhow!(err))?;
+    let mut config: JobConfig = serde_json::from_value(rendered.jobspec.clone())?;
+    config.name = app_job_id("rooted");
+    fx.store.handle_job_submit_managed(
+        &config,
+        &[Submission {
+            path: "job.json".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }],
+        "legion:bootstrap (app rooted)",
+        legion::structs::app::ManagedBy {
+            app: "rooted".into(),
+            digest: rendered.digest.clone(),
+        },
+        &record.updated_at,
+    )?;
+    assert_eq!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Unchanged,
+        "the job runs the render: nothing is parked"
+    );
+
+    // Parked again (its job stopped, the restart refused); a new term tries
+    // again instead of trusting the earlier term.
+    fx.store.stop_job(&app_job_id("rooted"))?;
+    assert!(matches!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Refused(_)
+    ));
+    assert_eq!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Skipped
+    );
+    reconciler.reset_runtime();
+    assert!(matches!(
+        reconciler.reconcile_app("rooted").await,
+        PassOutcome::Refused(_)
+    ));
+    Ok(())
+}
+
 /// Install never takes over a `legion-system/<name>` job the app does not
 /// already manage (hardening after the adversarial review): an operator's
 /// own job by that name is refused; the stopped job an uninstall left is

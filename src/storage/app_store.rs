@@ -44,13 +44,24 @@ impl AppJobVersion {
     pub fn is_stopped(&self) -> bool {
         self.status == "stopped"
     }
+
+    /// The job gave up: a reschedule policy's `moveCount`, a KV
+    /// `onDelete = "fail"`, a gang that lost its quorum. The reconciler
+    /// restarts it with backoff.
+    pub fn is_failed(&self) -> bool {
+        self.status == "failed"
+    }
 }
 
 /// An app job's allocations.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppJobAllocations {
-    /// Allocations reported running and healthy.
+    /// Allocations of the job's latest version reported running and
+    /// healthy: what the app runs as its record says.
     pub running: u32,
+    /// Healthy allocations of older versions: what still serves while an
+    /// upgrade rolls, or after a rollout rolled back.
+    pub previous: u32,
     /// Allocations not yet complete or failed (pending and running).
     pub live: u32,
     /// The nodes running them, sorted.
@@ -617,28 +628,41 @@ impl Store {
             .and_then(|version| version.managed_by))
     }
 
-    /// Job `job_id`'s allocations across its versions: how many run (their
-    /// latest health report says healthy, as the scaling inputs' `ready`
-    /// counts them), how many are live, and where the running ones are.
+    /// Job `job_id`'s allocations across its versions: how many of the
+    /// latest version run (their latest health report says healthy, as the
+    /// scaling inputs' `ready` counts them), how many of older versions do,
+    /// how many are live, and where the healthy ones are.
     #[instrument(err, skip_all, fields(job_id))]
     pub fn app_job_allocations(&self, job_id: &str) -> R<AppJobAllocations> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
-            "SELECT COALESCE(ah.healthy, 0), a.node_id FROM allocation a
+            "SELECT COALESCE(ah.healthy, 0), a.node_id,
+                    jc.id = (SELECT latest.id FROM job_config latest
+                             WHERE latest.job_id = j.id
+                             ORDER BY latest.version DESC LIMIT 1)
+             FROM allocation a
              INNER JOIN job_config jc ON jc.id = a.job_config_id
              INNER JOIN job j ON j.id = jc.job_id
              LEFT JOIN allocation_health ah ON ah.allocation_id = a.id
              WHERE j.name = ?1 AND a.status NOT IN ('complete', 'failed');",
         )?;
         let rows = stmt.query_map([job_id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
         let mut counts = AppJobAllocations::default();
         for row in rows {
-            let (healthy, node) = row?;
+            let (healthy, node, latest) = row?;
             counts.live += 1;
             if healthy != 0 {
-                counts.running += 1;
+                if latest != 0 {
+                    counts.running += 1;
+                } else {
+                    counts.previous += 1;
+                }
                 if !counts.nodes.contains(&node) {
                     counts.nodes.push(node);
                 }
@@ -646,6 +670,21 @@ impl Store {
         }
         counts.nodes.sort();
         Ok(counts)
+    }
+
+    /// The newest rollout to job version `job_config_id`: (status,
+    /// message). `failed` is an upgrade that did not take (rolled back, or
+    /// stopped at a deadline).
+    pub fn rollout_to_version(&self, job_config_id: &str) -> R<Option<(String, String)>> {
+        let conn = self.read_connection()?;
+        Ok(conn
+            .query_row(
+                "SELECT status, message FROM rollout WHERE to_job_config_id = ?1
+                 ORDER BY id DESC LIMIT 1;",
+                [job_config_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
     }
 }
 

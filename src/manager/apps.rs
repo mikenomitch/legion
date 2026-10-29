@@ -13,7 +13,14 @@
 //!   defaults filled in and fields normalized, so a structural diff would
 //!   find differences that are not there.
 //! - **Check the job's state** too: an enabled app whose job was stopped is
-//!   resubmitted; a disabled app's running job is stopped.
+//!   resubmitted, one whose job failed is restarted with backoff, and one
+//!   whose job does not run healthy at the rendered version is resubmitted
+//!   with a forced reschedule after an operator's write (`legion app
+//!   enable`); a disabled app's running job is stopped, and so is a job
+//!   still stamped for an app that is no longer installed.
+//! - **Submit compare-and-set** on the record it rendered from: a submit
+//!   that loses to an uninstall, a disable, or any other write is refused
+//!   in the same entry, and the next pass renders from the new record.
 //! - **Submit once per transition**, through the normal RunJob path as
 //!   `legion:app-reconciler`, checked against the grant recorded on the app,
 //!   with `idempotency_key = app:<name>:<digest>:<from>`, where `<from>` is
@@ -31,7 +38,9 @@
 //! reconcile failing: <error>` and `app.reconcile_failed` at most every 10
 //! minutes; a submit the manager refuses on validation (a schema, grant, or
 //! quota problem) waits for the next change to the app or to its build
-//! marker instead.
+//! marker instead. A source that could not be reached (a registry blip) is
+//! not a refusal: it backs off and retries. Everything the reconciler keeps
+//! in memory is cleared when this manager acquires Control leadership.
 
 use crate::manager::server::ManagerDaemonService;
 use crate::prelude::*;
@@ -127,6 +136,11 @@ struct AppRuntime {
     last_failure_event: Option<Instant>,
     /// (record `updated_at`, render digest) of a refused submit.
     refused: Option<(String, String)>,
+    /// Restarts of a job that failed (its reschedule policy gave up, a KV
+    /// `onDelete = "fail"`, a gang that lost its quorum), and when the next
+    /// is due: the same 5s to 5m backoff as a failed submit.
+    restarts: u32,
+    restart_at: Option<Instant>,
 }
 
 /// The app reconciler.
@@ -177,20 +191,61 @@ pub fn task_count(record: &AppRecord) -> u32 {
 /// An app's status, as `legion app list` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppStatusView {
-    /// `running`, `degraded`, `pending`, or `stopped`.
+    /// `running`, `upgrading`, `degraded`, `pending`, or `stopped` (and
+    /// `corrupt` for a record that does not decode, which never gets here).
     pub status: &'static str,
     pub detail: String,
     /// Allocations the app should run.
     pub desired: u32,
 }
 
+/// What an app's status is derived from, besides its record.
+#[derive(Debug, Clone, Default)]
+pub struct AppJobState {
+    /// The job's latest version, when the job exists.
+    pub version: Option<AppJobVersion>,
+    pub allocations: AppJobAllocations,
+    /// The newest rollout to the latest version: (status, message).
+    pub rollout: Option<(String, String)>,
+}
+
+impl AppJobState {
+    /// Read app `record`'s job as status derives it.
+    pub fn read(store: &crate::storage::store::Store, record: &AppRecord) -> R<AppJobState> {
+        let job_id = record.job_id();
+        let version = store.app_job_version(&job_id)?;
+        let allocations = store.app_job_allocations(&job_id)?;
+        let rollout = match &version {
+            Some(version) => store.rollout_to_version(&version.job_config_id)?,
+            None => None,
+        };
+        Ok(AppJobState {
+            version,
+            allocations,
+            rollout,
+        })
+    }
+
+    /// Every allocation the record asks for runs healthy at the job's
+    /// latest version.
+    pub fn healthy(&self, record: &AppRecord) -> bool {
+        self.version
+            .as_ref()
+            .is_some_and(|version| !version.is_stopped() && !version.is_failed())
+            && self.allocations.running
+                >= record.settings.replicas.saturating_mul(task_count(record))
+    }
+}
+
 /// Derive an app's status from its record, its job, and its allocations
-/// (docs/apps.md, "Status").
+/// (docs/apps.md, "Status"). Only healthy allocations of the job's latest
+/// version count as `running`: an upgrade whose new version is not healthy
+/// while the old one still serves is `upgrading`, and one whose rollout
+/// failed (or rolled back) is `degraded: upgrade failing`, never `running`
+/// on the old version.
 pub fn derive_status(
     record: &AppRecord,
-    version: Option<&AppJobVersion>,
-    allocations: &AppJobAllocations,
-    tasks: u32,
+    job: &AppJobState,
     blocked: Option<&str>,
 ) -> AppStatusView {
     if !record.enabled {
@@ -200,7 +255,7 @@ pub fn derive_status(
             desired: 0,
         };
     }
-    let desired = record.settings.replicas.saturating_mul(tasks);
+    let desired = record.settings.replicas.saturating_mul(task_count(record));
     if !record.state.last_error.is_empty() {
         return AppStatusView {
             status: "degraded",
@@ -209,7 +264,14 @@ pub fn derive_status(
         };
     }
     let waiting = record.state.marker_reason.clone();
-    let Some(version) = version else {
+    if waiting.starts_with(crate::structs::app::UPGRADE_HELD) {
+        return AppStatusView {
+            status: "degraded",
+            detail: waiting,
+            desired,
+        };
+    }
+    let Some(version) = job.version.as_ref() else {
         return AppStatusView {
             status: "pending",
             detail: if waiting.is_empty() {
@@ -227,14 +289,57 @@ pub fn derive_status(
             desired,
         };
     }
-    if allocations.running >= desired {
+    if version.is_failed() {
+        return AppStatusView {
+            status: "degraded",
+            detail: "its job failed; the reconciler restarts it with backoff".to_string(),
+            desired,
+        };
+    }
+    let running = job.allocations.running;
+    let previous = job.allocations.previous;
+    if running >= desired {
         return AppStatusView {
             status: "running",
             detail: waiting,
             desired,
         };
     }
-    if allocations.running == 0 {
+    if let Some((rollout, message)) = &job.rollout {
+        if rollout == "failed" {
+            let serving = if previous > 0 {
+                format!("; the previous version still serves {previous}")
+            } else {
+                String::new()
+            };
+            let why = if message.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", message.trim())
+            };
+            return AppStatusView {
+                status: "degraded",
+                detail: format!(
+                    "upgrade failing: the rollout to job version {} failed{why}, {running}/{desired} \
+                     of it healthy{serving}; fix the app and run `legion app enable {}` to retry",
+                    version.version, record.name
+                ),
+                desired,
+            };
+        }
+    }
+    if previous > 0 {
+        return AppStatusView {
+            status: "upgrading",
+            detail: format!(
+                "{running}/{desired} of job version {} healthy; the previous version still serves \
+                 {previous}",
+                version.version
+            ),
+            desired,
+        };
+    }
+    if running == 0 {
         return AppStatusView {
             status: "pending",
             detail: blocked
@@ -245,7 +350,7 @@ pub fn derive_status(
     }
     AppStatusView {
         status: "degraded",
-        detail: format!("{}/{desired} running", allocations.running),
+        detail: format!("{running}/{desired} running"),
         desired,
     }
 }
@@ -326,8 +431,19 @@ pub fn seed_bundled_apps(
     seed: &BTreeMap<String, AppSeedConfig>,
     build: &BuildMarker,
 ) -> R<Vec<String>> {
+    seed_bundled_apps_noting(store, seed, build, true)
+}
+
+/// [`seed_bundled_apps`], saying what the manager config's `apps` block did
+/// not apply only when `note` (once per leadership term, not every pass).
+fn seed_bundled_apps_noting(
+    store: &crate::storage::store::Store,
+    seed: &BTreeMap<String, AppSeedConfig>,
+    build: &BuildMarker,
+    note: bool,
+) -> R<Vec<String>> {
     let manifests = crate::apps::bundled_manifests()?;
-    for name in seed.keys() {
+    for name in seed.keys().filter(|_| note) {
         if !crate::apps::is_bundled(name) {
             warn!(
                 app = %name,
@@ -434,38 +550,46 @@ impl AppReconciler {
         outcomes
     }
 
-    /// When the next backoff retry is due, if any.
+    /// When the next backoff retry (or restart of a failed job) is due, if
+    /// any.
     pub fn next_retry(&self) -> Option<(Instant, String)> {
         self.runtime
             .iter()
-            .filter_map(|(name, runtime)| runtime.retry_at.map(|at| (at, name.clone())))
+            .flat_map(|(name, runtime)| {
+                [runtime.retry_at, runtime.restart_at]
+                    .into_iter()
+                    .flatten()
+                    .map(move |at| (at, name.clone()))
+            })
             .min()
     }
 
-    /// Report `legion_apps{status}` from the stored records.
+    /// Report `legion_apps{status}` from the stored records; a record that
+    /// does not decode counts as `corrupt`.
     pub fn publish_metrics(&self) {
-        let Ok(apps) = self.store().list_apps() else {
+        let Ok(rows) = self.store().list_app_rows() else {
             return;
         };
         let mut counts: BTreeMap<&'static str, i64> = BTreeMap::new();
-        for status in ["running", "degraded", "pending", "stopped"] {
+        for status in [
+            "running",
+            "upgrading",
+            "degraded",
+            "pending",
+            "stopped",
+            "corrupt",
+        ] {
             counts.insert(status, 0);
         }
-        for record in &apps {
-            let job_id = record.job_id();
-            let version = self.store().app_job_version(&job_id).ok().flatten();
-            let allocations = self
-                .store()
-                .app_job_allocations(&job_id)
-                .unwrap_or_default();
-            let view = derive_status(
-                record,
-                version.as_ref(),
-                &allocations,
-                task_count(record),
-                None,
-            );
-            *counts.entry(view.status).or_default() += 1;
+        for row in &rows {
+            let status = match row {
+                Ok(record) => {
+                    let job = AppJobState::read(self.store(), record).unwrap_or_default();
+                    derive_status(record, &job, None).status
+                }
+                Err(_) => "corrupt",
+            };
+            *counts.entry(status).or_default() += 1;
         }
         let entries: Vec<(Vec<String>, i64)> = counts
             .into_iter()
@@ -756,37 +880,93 @@ impl AppReconciler {
                 return Ok(self.failed(name, &record, &before, state, &status, ""));
             }
         };
-        if runtime.refused.as_ref() == Some(&(record.updated_at.clone(), rendered.digest.clone())) {
-            self.write_state(name, &before, state);
-            return Ok(PassOutcome::Skipped);
-        }
 
         let stamp = ManagedBy {
             app: name.to_string(),
             digest: rendered.digest.clone(),
         };
-        let current = version
-            .as_ref()
-            .is_some_and(|v| !v.is_stopped() && v.managed_by.as_ref() == Some(&stamp));
-        if current {
+        let failed = version.as_ref().is_some_and(AppJobVersion::is_failed);
+        let current = version.as_ref().is_some_and(|v| {
+            !v.is_stopped() && !v.is_failed() && v.managed_by.as_ref() == Some(&stamp)
+        });
+        // The job already matches the record. A write to the record since
+        // the last action (`legion app enable`, or `legion app upgrade` with
+        // the same manifest) on a job that does not run healthy at that
+        // version is a retry: resubmitted with a forced reschedule, which is
+        // how an upgrade whose rollout failed or rolled back is tried again.
+        let job = if current {
+            Some(AppJobState::read(self.store(), &record)?)
+        } else {
+            None
+        };
+        let healthy = job.as_ref().is_some_and(|job| job.healthy(&record));
+        let retry = current && !record.state.pending_change.trim().is_empty() && !healthy;
+        if current && !retry {
             state.last_digest = rendered.digest.clone();
             state.last_error.clear();
             state.pending_change.clear();
             self.write_state(name, &before, state);
             self.clear_failure(name);
+            if healthy {
+                if let Some(runtime) = self.runtime.get_mut(name) {
+                    runtime.restarts = 0;
+                    runtime.restart_at = None;
+                }
+            }
             return Ok(PassOutcome::Unchanged);
         }
+        // Checked after "already current": a refusal is parked on the
+        // render, and a job that already runs it needs no submit at all.
+        if runtime.refused.as_ref() == Some(&(record.updated_at.clone(), rendered.digest.clone())) {
+            self.write_state(name, &before, state);
+            return Ok(PassOutcome::Skipped);
+        }
+        if failed {
+            if let Some(at) = runtime.restart_at {
+                let now = Instant::now();
+                if now < at {
+                    state.last_error = format!(
+                        "its job failed; restarting it in {}s (restart {})",
+                        at.saturating_duration_since(now).as_secs().max(1),
+                        runtime.restarts + 1
+                    );
+                    self.write_state(name, &before, state);
+                    return Ok(PassOutcome::Skipped);
+                }
+            }
+        }
 
-        let (from, action, detail) = describe_transition(name, &record, version.as_ref(), &stamp);
+        let (from, action, detail) = if retry {
+            let version = version.as_ref().expect("current");
+            (
+                format!("{}@{}", version.job_config_id, record.updated_at),
+                format!(
+                    "resubmitted the job, which did not run healthy at version {} ({})",
+                    version.version,
+                    record.state.pending_change.trim()
+                ),
+                format!("from {}", version.job_config_id),
+            )
+        } else {
+            describe_transition(name, &record, version.as_ref(), &stamp)
+        };
         let key = format!("app:{name}:{}:{from}", rendered.digest);
         let svc = self.svc.clone();
         let submit_record = record.clone();
         let submit_render = rendered.clone();
         let submitted = crate::manager::server::run_blocking(move || {
-            svc.submit_app_job(&submit_record, &submit_render, &key)
+            svc.submit_app_job(&submit_record, &submit_render, &key, retry)
         });
         match submitted {
             Ok(submit) => {
+                let action = if failed {
+                    let runtime = self.runtime.entry(name.to_string()).or_default();
+                    runtime.restarts += 1;
+                    runtime.restart_at = Some(Instant::now() + backoff_for(runtime.restarts));
+                    format!("{action} (restart {})", runtime.restarts)
+                } else {
+                    action
+                };
                 state.last_digest = rendered.digest.clone();
                 state.last_action = action.clone();
                 state.last_error.clear();
@@ -920,6 +1100,11 @@ fn describe_transition(
             },
             String::new(),
         ),
+        Some(version) if version.is_failed() => (
+            format!("failed-{}", version.job_config_id),
+            "restarted the job, which had failed".to_string(),
+            format!("from {}", version.job_config_id),
+        ),
         Some(version) if version.is_stopped() => (
             format!("stopped-{}", version.job_config_id),
             if pending.is_empty() || pending == "enabled" {
@@ -996,6 +1181,9 @@ pub fn spawn_reconciler(svc: Arc<ManagerDaemonService>, settings: ReconcilerSett
         let mut was_leader = false;
         let mut pending = Pending::default();
         let mut last_full: Option<Instant> = None;
+        // The first full pass of a term says what the manager config's
+        // `apps` block did not apply; later passes seed quietly.
+        let mut first_pass = true;
         loop {
             let leader = svc.store.is_raft_leader(crate::storage::Lane::Control);
             if !leader {
@@ -1012,13 +1200,11 @@ pub fn spawn_reconciler(svc: Arc<ManagerDaemonService>, settings: ReconcilerSett
             }
             if !was_leader {
                 was_leader = true;
-                match reconciler.seed() {
-                    Ok(seeded) if !seeded.is_empty() => {
-                        info!(apps = ?seeded, "Seeded bundled apps")
-                    }
-                    Ok(_) => {}
-                    Err(err) => warn!(error = ?err, "Failed seeding bundled apps"),
-                }
+                // A new term starts from nothing: failures, backoffs and
+                // parked refusals from an earlier term of this manager's are
+                // stale (another leader may have fixed what they were about).
+                reconciler.reset_runtime();
+                first_pass = true;
                 pending.full = true;
             }
             if last_full.is_none_or(|at| at.elapsed() >= FULL_PASS_INTERVAL) {
@@ -1117,7 +1303,7 @@ pub fn submit_rendered(
     rendered: &RenderedApp,
     key: &str,
 ) -> R<(String, bool)> {
-    crate::manager::server::run_blocking(|| svc.submit_app_job(record, rendered, key))
+    crate::manager::server::run_blocking(|| svc.submit_app_job(record, rendered, key, false))
         .map(|submit| (submit.message, submit.deduplicated))
         .map_err(|status| anyhow!("{}", status.message()))
 }
@@ -1215,6 +1401,76 @@ mod tests {
             PassOutcome::Waiting(_)
         ));
         Ok(())
+    }
+
+    /// Status reflects the version the job runs: only the latest version's
+    /// healthy allocations count as running; an upgrade the old version
+    /// still serves is `upgrading`, a failed rollout is `upgrade failing`,
+    /// and a failed job is degraded, not pending (hardening after the
+    /// adversarial review, M1 and M2).
+    #[test]
+    fn status_reflects_the_version_that_runs() {
+        let manifest = crate::apps::bundled_manifest("autoscaler").expect("bundled");
+        let record = seed_record(manifest, None);
+        let version = |status: &str| AppJobVersion {
+            status: status.into(),
+            version: 2,
+            job_config_id: "jc-2".into(),
+            managed_by: None,
+            submitted_by: None,
+        };
+        let job = |status: &str, running: u32, previous: u32, rollout: Option<&str>| AppJobState {
+            version: Some(version(status)),
+            allocations: AppJobAllocations {
+                running,
+                previous,
+                live: running + previous,
+                nodes: Vec::new(),
+            },
+            rollout: rollout.map(|status| (status.to_string(), "health deadline".to_string())),
+        };
+        let running = derive_status(&record, &job("active", 1, 0, Some("completed")), None);
+        assert_eq!(running.status, "running");
+
+        // The new version is not healthy yet; the old one serves.
+        let upgrading = derive_status(&record, &job("active", 0, 1, Some("running")), None);
+        assert_eq!(upgrading.status, "upgrading", "{upgrading:?}");
+        assert!(upgrading.detail.contains("previous version still serves 1"));
+
+        // The rollout rolled back: the old version runs, the record says new.
+        let failing = derive_status(&record, &job("active", 0, 1, Some("failed")), None);
+        assert_eq!(failing.status, "degraded");
+        assert!(
+            failing
+                .detail
+                .starts_with("upgrade failing: the rollout to job version 2 failed"),
+            "{}",
+            failing.detail
+        );
+        assert!(failing.detail.contains("legion app enable autoscaler"));
+
+        // A destroy-first rollout whose new version crash-loops.
+        let crashing = derive_status(&record, &job("active", 0, 0, Some("failed")), None);
+        assert!(
+            crashing.detail.starts_with("upgrade failing"),
+            "{}",
+            crashing.detail
+        );
+
+        // A failed job is degraded and says it is restarted.
+        let failed = derive_status(&record, &job("failed", 0, 0, None), None);
+        assert_eq!(failed.status, "degraded");
+        assert!(failed.detail.contains("job failed"), "{}", failed.detail);
+
+        // A held bundled upgrade is degraded with its reason.
+        let mut held = record.clone();
+        held.state.marker_reason = format!(
+            "{}build x changes the schema",
+            crate::structs::app::UPGRADE_HELD
+        );
+        let view = derive_status(&held, &job("active", 1, 0, None), None);
+        assert_eq!(view.status, "degraded");
+        assert!(view.detail.starts_with("upgrade held: "));
     }
 
     #[test]
