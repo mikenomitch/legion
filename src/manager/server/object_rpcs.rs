@@ -559,7 +559,8 @@ impl ManagerDaemonService {
                 .map(|namespace| namespace.trim().to_string())
                 .filter(|namespace| !namespace.is_empty())
                 .or_else(|| {
-                    Some(inner.namespace.trim().to_string()).filter(|namespace| !namespace.is_empty())
+                    Some(inner.namespace.trim().to_string())
+                        .filter(|namespace| !namespace.is_empty())
                 })
                 .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
             crate::structs::namespace::validate_namespace_name(&namespace)
@@ -713,7 +714,12 @@ impl ManagerDaemonService {
                 kind: kind.decl.name.clone(),
                 namespace: namespace.clone(),
                 name: name.clone(),
-                operation: if current.is_some() { "update" } else { "create" }.to_string(),
+                operation: if current.is_some() {
+                    "update"
+                } else {
+                    "create"
+                }
+                .to_string(),
                 spec: input.spec.clone(),
                 effective: effective.clone(),
                 previous: previous_spec.clone(),
@@ -765,9 +771,7 @@ impl ManagerDaemonService {
                     .as_ref()
                     .map(|row| row.status.clone())
                     .unwrap_or_default(),
-                observed_generation: current
-                    .as_ref()
-                    .map_or(0, |row| row.observed_generation),
+                observed_generation: current.as_ref().map_or(0, |row| row.observed_generation),
                 generation: match &current {
                     None => 1,
                     Some(row) if spec_changed => row.generation + 1,
@@ -901,8 +905,7 @@ impl ManagerDaemonService {
                         kind: Some(kind.name().to_string()),
                     })
                     .map_err(|e| map_store_error("Error reading objects", e))?;
-                rows.first()
-                    .is_none_or(|row| !row.key.namespace.is_empty())
+                rows.first().is_none_or(|row| !row.key.namespace.is_empty())
             }
         };
         let (namespace, name) = if namespaced {
@@ -1069,10 +1072,7 @@ impl ManagerDaemonService {
         {
             DeleteObject::Deleted(row) => row,
             DeleteObject::Missing => {
-                return Err(Status::not_found(format!(
-                    "{} {id} not found",
-                    kind.name()
-                )))
+                return Err(Status::not_found(format!("{} {id} not found", kind.name())))
             }
             DeleteObject::Conflict(row) => {
                 return Err(Status::aborted(format!(
@@ -1197,7 +1197,12 @@ impl ManagerDaemonService {
         let inner = request.get_ref();
         let registry = self.object_registry()?;
         let mut kinds = BTreeSet::new();
-        for typed in inner.kinds.iter().map(|kind| kind.trim()).filter(|k| !k.is_empty()) {
+        for typed in inner
+            .kinds
+            .iter()
+            .map(|kind| kind.trim())
+            .filter(|k| !k.is_empty())
+        {
             let bare = match typed.split_once('/') {
                 Some((owner, kind)) if owner == app => kind,
                 Some((owner, _)) => {
@@ -1308,7 +1313,10 @@ impl ManagerDaemonService {
                     }
                 };
                 generation += 1;
-                let event = ObjectEvent { generation, ..event };
+                let event = ObjectEvent {
+                    generation,
+                    ..event
+                };
                 if tx.send(Ok(event)).await.is_err() {
                     return;
                 }
@@ -1381,11 +1389,7 @@ impl ManagerDaemonService {
         let status: Value = serde_json::from_str(&inner.status_json)
             .map_err(|err| Status::invalid_argument(format!("the status is not JSON: {err}")))?;
         kind.check_status(&status).map_err(|errors| {
-            Status::invalid_argument(format!(
-                "{} {id}: {}",
-                kind.decl.name,
-                errors.join("; ")
-            ))
+            Status::invalid_argument(format!("{} {id}: {}", kind.decl.name, errors.join("; ")))
         })?;
         let idempotency_key = scoped_idempotency_key(
             &identity,

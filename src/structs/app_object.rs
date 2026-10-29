@@ -358,7 +358,7 @@ pub fn validate_kind_name(name: &str) -> Result<(), String> {
 /// kind's; `writeRequires` that name ACL permissions; and columns that are
 /// JSON pointers into an object. Collisions with other apps' kinds depend
 /// on the cluster: [`ObjectKindRegistry::collision`].
-pub fn validate_kind_decls(app: &str, decls: &[KindDecl]) -> Result<(), String> {
+pub fn validate_kind_decls(_app: &str, decls: &[KindDecl]) -> Result<(), String> {
     if decls.len() > MAX_KINDS_PER_APP {
         return Err(format!(
             "kinds: {} declared; an app declares at most {MAX_KINDS_PER_APP}",
@@ -620,7 +620,8 @@ impl ObjectKindRegistry {
             .iter()
             .map(|kind| kind.decl.name.as_str())
             .collect();
-        crate::structs::spec_fields::suggest_owned(typed, &names).map(|index| names[index].to_string())
+        crate::structs::spec_fields::suggest_owned(typed, &names)
+            .map(|index| names[index].to_string())
     }
 
     /// The first of `decls` (app `app`'s) whose name another installed app
@@ -637,11 +638,7 @@ impl ObjectKindRegistry {
                     "{app} declares kind {}, which the {} app already owns (as {})\nHint: the \
                      qualified spelling ({}/{}) always names that app's kind; rename this app's \
                      kind to install it",
-                    decl.name,
-                    owner.app,
-                    owner.decl.name,
-                    owner.app,
-                    owner.decl.name
+                    decl.name, owner.app, owner.decl.name, owner.app, owner.decl.name
                 ));
             }
             if let Some(owner) = bundled_kind_owner(&decl.name).filter(|owner| *owner != app) {
@@ -728,8 +725,7 @@ pub fn parse_object_input(value: &Value) -> Result<ObjectInput, String> {
     };
     if map.contains_key("status") {
         return Err(
-            "`status` is written by the app that owns the kind, never applied; leave it out"
-                .into(),
+            "`status` is written by the app that owns the kind, never applied; leave it out".into(),
         );
     }
     let input: ObjectInput =
@@ -1095,7 +1091,9 @@ mod app_object_tests {
         for bad in ["repo", "Repo-x", "", "9Lives", "Re po"] {
             assert!(validate_kind_name(bad).is_err(), "{bad}");
         }
-        for reserved in ["Job", "Jobs", "Policy", "Policies", "Token", "Node", "Events", "Event"] {
+        for reserved in [
+            "Job", "Jobs", "Policy", "Policies", "Token", "Node", "Events", "Event",
+        ] {
             let err = validate_kind_name(reserved).expect_err(reserved);
             assert!(err.contains("reserved"), "{err}");
         }
@@ -1133,7 +1131,8 @@ mod app_object_tests {
         assert!(err.contains("examples[0]"), "{err}");
 
         let mut remote = decl("Repo");
-        remote.schema = json!({ "type": "object", "properties": { "a": { "$ref": "https://x/s.json" } } });
+        remote.schema =
+            json!({ "type": "object", "properties": { "a": { "$ref": "https://x/s.json" } } });
         let err = validate_kind_decls("gitops", &[remote]).expect_err("remote ref");
         assert!(err.contains("not local"), "{err}");
 
@@ -1190,7 +1189,14 @@ mod app_object_tests {
             record("certs", vec![decl("Certificate"), decl("Policyish")]),
         ]);
         assert!(problems.is_empty(), "{problems:?}");
-        for typed in ["Repo", "repo", "repos", "REPOS", "gitops/Repo", "gitops/repos"] {
+        for typed in [
+            "Repo",
+            "repo",
+            "repos",
+            "REPOS",
+            "gitops/Repo",
+            "gitops/repos",
+        ] {
             assert_eq!(
                 registry.resolve(typed).expect(typed).qualified(),
                 "gitops/Repo"
@@ -1201,7 +1207,11 @@ mod app_object_tests {
             "Certificate"
         );
         assert_eq!(
-            registry.resolve("policyishes").expect("es plural").decl.name,
+            registry
+                .resolve("policyishes")
+                .expect("es plural")
+                .decl
+                .name,
             "Policyish"
         );
         assert_eq!(
@@ -1248,7 +1258,8 @@ mod app_object_tests {
             2
         );
 
-        let (registry, _) = ObjectKindRegistry::from_records(&[record("gitops", vec![decl("Repo")])]);
+        let (registry, _) =
+            ObjectKindRegistry::from_records(&[record("gitops", vec![decl("Repo")])]);
         let kind = registry.resolve("Repo").expect("kind");
         let (effective, state, _) = judge(Some(kind), &json!({ "url": "https://x" }));
         assert_eq!(state, ObjectState::Valid);
@@ -1256,10 +1267,7 @@ mod app_object_tests {
         let (_, state, detail) = judge(Some(kind), &json!({ "branch": "x" }));
         assert_eq!(state, ObjectState::Invalid);
         assert!(detail.contains("spec"), "{detail}");
-        assert_eq!(
-            judge(None, &json!({})).1,
-            ObjectState::Orphaned
-        );
+        assert_eq!(judge(None, &json!({})).1, ObjectState::Orphaned);
     }
 
     #[test]
@@ -1299,7 +1307,10 @@ mod app_object_tests {
     fn shards_use_the_autoscalers_hash_test() {
         let key = shard_key("autoscaler", "ScalingPolicy", "media", "render");
         assert_eq!(key, "autoscaler/ScalingPolicy:media/render");
-        assert_eq!(shard_key("a", "NodeGroup", "", "workers"), "a/NodeGroup:workers");
+        assert_eq!(
+            shard_key("a", "NodeGroup", "", "workers"),
+            "a/NodeGroup:workers"
+        );
         let shard = object_shard("autoscaler", "ScalingPolicy", "media", "render", 64);
         assert_eq!(shard, crate::autoscaler::shard::shard_of(&key, 64));
         assert_eq!(object_shard("a", "K", "n", "x", 1), 0);

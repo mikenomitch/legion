@@ -123,7 +123,10 @@ pub enum StatusCas {
 pub enum PutStatus {
     /// Written; `changed` is false when the status and observed generation
     /// were already stored (the version still moves).
-    Written { row: AppObjectRow, changed: bool },
+    Written {
+        row: AppObjectRow,
+        changed: bool,
+    },
     Missing,
     Conflict(AppObjectRow),
 }
@@ -431,8 +434,10 @@ mod tests {
     #[test]
     fn generations_versions_and_compare_and_set_test() -> R<()> {
         let (_dir, store) = store()?;
-        let PutObject::Written { row: first, previous } =
-            store.put_app_object(write("web", "{\"a\":1}", VersionCas::Missing))?
+        let PutObject::Written {
+            row: first,
+            previous,
+        } = store.put_app_object(write("web", "{\"a\":1}", VersionCas::Missing))?
         else {
             panic!("created")
         };
@@ -453,11 +458,18 @@ mod tests {
 
         // A stale version refuses; the current one writes and bumps both.
         assert!(matches!(
-            store.put_app_object(write("web", "{\"a\":2}", VersionCas::Version(first.version + 99)))?,
+            store.put_app_object(write(
+                "web",
+                "{\"a\":2}",
+                VersionCas::Version(first.version + 99)
+            ))?,
             PutObject::Conflict { .. }
         ));
-        let PutObject::Written { row: second, .. } =
-            store.put_app_object(write("web", "{\"a\":2}", VersionCas::Version(first.version)))?
+        let PutObject::Written { row: second, .. } = store.put_app_object(write(
+            "web",
+            "{\"a\":2}",
+            VersionCas::Version(first.version),
+        ))?
         else {
             panic!("updated")
         };
@@ -476,10 +488,20 @@ mod tests {
 
         // Status: CAS on generation; it never touches the spec.
         assert!(matches!(
-            store.update_app_object_status(&key("web"), "{\"ok\":true}", 2, StatusCas::Generation(1), "gitops", 2)?,
+            store.update_app_object_status(
+                &key("web"),
+                "{\"ok\":true}",
+                2,
+                StatusCas::Generation(1),
+                "gitops",
+                2
+            )?,
             PutStatus::Conflict(_)
         ));
-        let PutStatus::Written { row: status, changed } = store.update_app_object_status(
+        let PutStatus::Written {
+            row: status,
+            changed,
+        } = store.update_app_object_status(
             &key("web"),
             "{\"ok\":true}",
             2,
@@ -492,7 +514,11 @@ mod tests {
         };
         assert!(changed);
         assert_eq!(
-            (status.spec.as_str(), status.generation, status.observed_generation),
+            (
+                status.spec.as_str(),
+                status.generation,
+                status.observed_generation
+            ),
             ("{\"a\":2}", 2, 2)
         );
         assert!(status.version > third.version);
@@ -523,7 +549,10 @@ mod tests {
             store.delete_app_object(&key("web"), Some(latest.version))?,
             DeleteObject::Deleted(_)
         ));
-        assert_eq!(store.delete_app_object(&key("web"), None)?, DeleteObject::Missing);
+        assert_eq!(
+            store.delete_app_object(&key("web"), None)?,
+            DeleteObject::Missing
+        );
         let PutObject::Written { row: again, .. } =
             store.put_app_object(write("web", "{\"a\":1}", VersionCas::Any))?
         else {
@@ -551,12 +580,18 @@ mod tests {
             kind: Some("Repo".into()),
         })?;
         assert_eq!(
-            gitops.iter().map(|row| row.key.name.as_str()).collect::<Vec<_>>(),
+            gitops
+                .iter()
+                .map(|row| row.key.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
         let counts = store.app_object_counts()?;
         assert_eq!(counts.get(&("gitops".into(), "Repo".into())), Some(&2));
-        assert_eq!(counts.get(&("certs".into(), "Certificate".into())), Some(&1));
+        assert_eq!(
+            counts.get(&("certs".into(), "Certificate".into())),
+            Some(&1)
+        );
         Ok(())
     }
 }

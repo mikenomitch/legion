@@ -1818,7 +1818,13 @@ pub mod drafts {
     }
 
     /// `object.deleted`: an object was deleted.
-    pub fn object_deleted(app: &str, kind: &str, namespace: &str, name: &str, by: &str) -> EventDraft {
+    pub fn object_deleted(
+        app: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        by: &str,
+    ) -> EventDraft {
         let (mut meta, label) = object_meta(app, kind, namespace, name);
         meta["by"] = json!(by);
         EventDraft::info("object.deleted", format!("{label} ({app}) deleted by {by}")).meta(meta)

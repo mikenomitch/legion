@@ -951,7 +951,12 @@ impl AclIdentity {
     /// (`ListObjectKinds`), where the wildcard scope would ignore the
     /// `kinds` selector. A deny rule vetoes it when it carries no selector
     /// but (matching) `kinds`.
-    pub fn allows_kind_somewhere(&self, resource: AclResource, action: AclAction, kind: &str) -> bool {
+    pub fn allows_kind_somewhere(
+        &self,
+        resource: AclResource,
+        action: AclAction,
+        kind: &str,
+    ) -> bool {
         if self.is_management || self.audit_only {
             return true;
         }
@@ -1041,8 +1046,18 @@ mod acl_rules_test {
             r#"[{"resources": ["object"], "actions": ["read", "write"], "namespaces": ["team-a"], "kinds": ["gitops/*"]}]"#,
         );
         let repo = |ns: &str| AclScope::object("gitops/Repo", ns, "web", true);
-        assert!(evaluate(&held, AclResource::Object, AclAction::Write, &repo("team-a")));
-        assert!(!evaluate(&held, AclResource::Object, AclAction::Write, &repo("team-b")));
+        assert!(evaluate(
+            &held,
+            AclResource::Object,
+            AclAction::Write,
+            &repo("team-a")
+        ));
+        assert!(!evaluate(
+            &held,
+            AclResource::Object,
+            AclAction::Write,
+            &repo("team-b")
+        ));
         assert!(!evaluate(
             &held,
             AclResource::Object,
@@ -1050,11 +1065,21 @@ mod acl_rules_test {
             &AclScope::object("certs/Certificate", "team-a", "web", true)
         ));
         // A cluster kind's object: namespace `*`, reached only by `*`.
-        assert!(!evaluate(&held, AclResource::Object, AclAction::Write, &repo("")));
+        assert!(!evaluate(
+            &held,
+            AclResource::Object,
+            AclAction::Write,
+            &repo("")
+        ));
         let everywhere = rules(
             r#"[{"resources": ["object"], "actions": ["write"], "namespaces": ["*"], "kinds": ["gitops/*"]}]"#,
         );
-        assert!(evaluate(&everywhere, AclResource::Object, AclAction::Write, &repo("")));
+        assert!(evaluate(
+            &everywhere,
+            AclResource::Object,
+            AclAction::Write,
+            &repo("")
+        ));
         // ... and `*` still skips the reserved namespaces.
         assert!(!evaluate(
             &everywhere,
@@ -1073,7 +1098,12 @@ mod acl_rules_test {
             AclAction::Write,
             &AclScope::object("autoscaler/ScalingPolicy", "media", "render", true)
         ));
-        assert!(!evaluate(&scale, AclResource::Scale, AclAction::Write, &AclScope::job("media/render")));
+        assert!(!evaluate(
+            &scale,
+            AclResource::Scale,
+            AclAction::Write,
+            &AclScope::job("media/render")
+        ));
         // The per-kind listing gate honors `kinds` and blanket denies.
         let identity = |rules: Vec<AclRule>| AclIdentity {
             rules,

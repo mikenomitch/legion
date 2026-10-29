@@ -973,6 +973,9 @@ async fn upgrade(matches: &ArgMatches) -> R<()> {
         dry_run,
         idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
         config_json: config_json.clone(),
+        // Not yet a flag: removing an object kind that has objects
+        // (app-object-kinds plan §6.8) is wired with the lifecycle.
+        force: false,
     };
     let preview = output::resolve(
         format,
