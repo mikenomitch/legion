@@ -35918,6 +35918,13 @@ export class App extends Message<App> {
    */
   extensionKeys: AppExtensionKey[] = [];
 
+  /**
+   * The object kinds the app declares (docs/app-objects.md).
+   *
+   * @generated from field: repeated legion.ObjectKind kinds = 25;
+   */
+  kinds: ObjectKind[] = [];
+
   constructor(data?: PartialMessage<App>) {
     super();
     proto3.util.initPartial(data, this);
@@ -35950,6 +35957,7 @@ export class App extends Message<App> {
     { no: 22, name: "notes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 23, name: "running_on", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 24, name: "extension_keys", kind: "message", T: AppExtensionKey, repeated: true },
+    { no: 25, name: "kinds", kind: "message", T: ObjectKind, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): App {
@@ -36515,6 +36523,1870 @@ export class AppExtensionValueRef extends Message<AppExtensionValueRef> {
 }
 
 /**
+ * A column `legion object list` shows for a kind.
+ *
+ * @generated from message legion.ObjectKindColumn
+ */
+export class ObjectKindColumn extends Message<ObjectKindColumn> {
+  /**
+   * The header.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * A JSON pointer into the object (`/spec/url`, `/status/fields/commit`).
+   *
+   * @generated from field: string pointer = 2;
+   */
+  pointer = "";
+
+  constructor(data?: PartialMessage<ObjectKindColumn>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ObjectKindColumn";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "pointer", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ObjectKindColumn {
+    return new ObjectKindColumn().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ObjectKindColumn {
+    return new ObjectKindColumn().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ObjectKindColumn {
+    return new ObjectKindColumn().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ObjectKindColumn | PlainMessage<ObjectKindColumn> | undefined, b: ObjectKindColumn | PlainMessage<ObjectKindColumn> | undefined): boolean {
+    return proto3.util.equals(ObjectKindColumn, a, b);
+  }
+}
+
+/**
+ * One object kind (ListObjectKinds, App.kinds).
+ *
+ * @generated from message legion.ObjectKind
+ */
+export class ObjectKind extends Message<ObjectKind> {
+  /**
+   * The kind's name as declared (`Repo`). The kind is `<app>/<name>`.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * The app that declares it, and that app's version (empty once the kind
+   * is orphaned and the app uninstalled).
+   *
+   * @generated from field: string app = 2;
+   */
+  app = "";
+
+  /**
+   * @generated from field: string app_version = 3;
+   */
+  appVersion = "";
+
+  /**
+   * `<app>/<Kind>`: the kind's name in files and the API, and what ACL
+   * `kinds` selectors match.
+   *
+   * @generated from field: string qualified = 4;
+   */
+  qualified = "";
+
+  /**
+   * @generated from field: string description = 5;
+   */
+  description = "";
+
+  /**
+   * `namespaced` (each object lives in a namespace) or `cluster`.
+   *
+   * @generated from field: string scope = 6;
+   */
+  scope = "";
+
+  /**
+   * The spec's JSON Schema (draft 7) as declared, as JSON. It is checked
+   * closed: a schema with `properties` and neither `additionalProperties`
+   * nor `patternProperties` refuses other fields (composition branches
+   * excepted). Its defaults are filled at write.
+   *
+   * @generated from field: string schema_json = 7;
+   */
+  schemaJson = "";
+
+  /**
+   * The JSON Schema of the status `fields`, as JSON; empty when the kind
+   * declares none (any object).
+   *
+   * @generated from field: string status_schema_json = 8;
+   */
+  statusSchemaJson = "";
+
+  /**
+   * Example specs, as a JSON array; each passes the schema.
+   *
+   * @generated from field: string examples_json = 9;
+   */
+  examplesJson = "";
+
+  /**
+   * Whether every apply that changes the spec also asks the app (`POST
+   * /legion/v1/objects/validate`). Advisory, failing open.
+   *
+   * @generated from field: bool validate = 10;
+   */
+  validate = false;
+
+  /**
+   * The ACL resource that governs the kind's objects: `object` (the
+   * default, scoped by namespace, name, and `kinds`), `job` or `scale`
+   * (namespace-wide), or `node`.
+   *
+   * @generated from field: string access = 11;
+   */
+  access = "";
+
+  /**
+   * What writing an object requires, one line per entry (`job:write in the
+   * namespace spec.targetNamespace names`); `requires_json` has the
+   * declarations.
+   *
+   * @generated from field: repeated string requires = 12;
+   */
+  requires: string[] = [];
+
+  /**
+   * @generated from field: string requires_json = 13;
+   */
+  requiresJson = "";
+
+  /**
+   * The columns `legion object list` shows.
+   *
+   * @generated from field: repeated legion.ObjectKindColumn columns = 14;
+   */
+  columns: ObjectKindColumn[] = [];
+
+  /**
+   * Whether the owning app is installed and enabled. A disabled app's kinds
+   * still take writes (the validate call fails open); nothing acts on them.
+   *
+   * @generated from field: bool app_enabled = 15;
+   */
+  appEnabled = false;
+
+  /**
+   * `active`, or `orphaned`: its app was uninstalled, or dropped it, with
+   * `force`; its objects stay readable and deletable with this kind's
+   * access, and cannot be written.
+   *
+   * @generated from field: string state = 16;
+   */
+  state = "";
+
+  /**
+   * JSON pointers into the object an update may not change (`/spec/url`).
+   *
+   * @generated from field: repeated string immutable = 17;
+   */
+  immutable: string[] = [];
+
+  /**
+   * How long a delete waits for the app to release an object (`10m`);
+   * empty deletes at once.
+   *
+   * @generated from field: string cleanup = 18;
+   */
+  cleanup = "";
+
+  /**
+   * The most objects of the kind the cluster holds.
+   *
+   * @generated from field: uint64 max_objects = 19;
+   */
+  maxObjects = protoInt64.zero;
+
+  /**
+   * JSON pointers below the spec of `writeOnly` values, which every read
+   * but the owning app's watch shows as `<redacted>` (`*` for every key or
+   * item).
+   *
+   * @generated from field: repeated string write_only = 20;
+   */
+  writeOnly: string[] = [];
+
+  /**
+   * The digest of the manifest the declaration came from.
+   *
+   * @generated from field: string manifest_digest = 21;
+   */
+  manifestDigest = "";
+
+  constructor(data?: PartialMessage<ObjectKind>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ObjectKind";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "app_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "qualified", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "scope", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "schema_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "status_schema_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "examples_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "validate", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 11, name: "access", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "requires", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 13, name: "requires_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 14, name: "columns", kind: "message", T: ObjectKindColumn, repeated: true },
+    { no: 15, name: "app_enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 16, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 17, name: "immutable", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 18, name: "cleanup", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 19, name: "max_objects", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 20, name: "write_only", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 21, name: "manifest_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ObjectKind {
+    return new ObjectKind().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ObjectKind {
+    return new ObjectKind().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ObjectKind {
+    return new ObjectKind().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ObjectKind | PlainMessage<ObjectKind> | undefined, b: ObjectKind | PlainMessage<ObjectKind> | undefined): boolean {
+    return proto3.util.equals(ObjectKind, a, b);
+  }
+}
+
+/**
+ * Request payload for ListObjectKinds.
+ *
+ * @generated from message legion.ListObjectKindsRequest
+ */
+export class ListObjectKindsRequest extends Message<ListObjectKindsRequest> {
+  /**
+   * Only this app's kinds; empty for every app's.
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  constructor(data?: PartialMessage<ListObjectKindsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListObjectKindsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListObjectKindsRequest {
+    return new ListObjectKindsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListObjectKindsRequest {
+    return new ListObjectKindsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListObjectKindsRequest {
+    return new ListObjectKindsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListObjectKindsRequest | PlainMessage<ListObjectKindsRequest> | undefined, b: ListObjectKindsRequest | PlainMessage<ListObjectKindsRequest> | undefined): boolean {
+    return proto3.util.equals(ListObjectKindsRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListObjectKinds.
+ *
+ * @generated from message legion.ListObjectKindsReply
+ */
+export class ListObjectKindsReply extends Message<ListObjectKindsReply> {
+  /**
+   * The kinds the caller may read, by app and name.
+   *
+   * @generated from field: repeated legion.ObjectKind kinds = 1;
+   */
+  kinds: ObjectKind[] = [];
+
+  constructor(data?: PartialMessage<ListObjectKindsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListObjectKindsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "kinds", kind: "message", T: ObjectKind, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListObjectKindsReply {
+    return new ListObjectKindsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListObjectKindsReply {
+    return new ListObjectKindsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListObjectKindsReply {
+    return new ListObjectKindsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListObjectKindsReply | PlainMessage<ListObjectKindsReply> | undefined, b: ListObjectKindsReply | PlainMessage<ListObjectKindsReply> | undefined): boolean {
+    return proto3.util.equals(ListObjectKindsReply, a, b);
+  }
+}
+
+/**
+ * One condition of an object's status.
+ *
+ * @generated from message legion.ObjectCondition
+ */
+export class ObjectCondition extends Message<ObjectCondition> {
+  /**
+   * PascalCase: `Accepted`, `Ready`, or the app's own.
+   *
+   * @generated from field: string type = 1;
+   */
+  type = "";
+
+  /**
+   * `true`, `false`, or `unknown`.
+   *
+   * @generated from field: string status = 2;
+   */
+  status = "";
+
+  /**
+   * PascalCase, machine-readable (`Synced`, `RepoUnreachable`).
+   *
+   * @generated from field: string reason = 3;
+   */
+  reason = "";
+
+  /**
+   * For people, at most 1 KiB.
+   *
+   * @generated from field: string message = 4;
+   */
+  message = "";
+
+  /**
+   * When `status` last changed (RFC 3339), kept by the manager.
+   *
+   * @generated from field: string since = 5;
+   */
+  since = "";
+
+  constructor(data?: PartialMessage<ObjectCondition>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ObjectCondition";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "since", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ObjectCondition {
+    return new ObjectCondition().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ObjectCondition {
+    return new ObjectCondition().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ObjectCondition {
+    return new ObjectCondition().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ObjectCondition | PlainMessage<ObjectCondition> | undefined, b: ObjectCondition | PlainMessage<ObjectCondition> | undefined): boolean {
+    return proto3.util.equals(ObjectCondition, a, b);
+  }
+}
+
+/**
+ * An object's status, as its app reported it.
+ *
+ * @generated from message legion.ObjectStatus
+ */
+export class ObjectStatus extends Message<ObjectStatus> {
+  /**
+   * The spec generation the status describes. Lower than the object's
+   * `generation` means the app has not caught up with the spec yet.
+   *
+   * @generated from field: uint64 observed_generation = 1;
+   */
+  observedGeneration = protoInt64.zero;
+
+  /**
+   * @generated from field: repeated legion.ObjectCondition conditions = 2;
+   */
+  conditions: ObjectCondition[] = [];
+
+  /**
+   * The app's own payload, as JSON, checked against the kind's status
+   * schema.
+   *
+   * @generated from field: string fields_json = 3;
+   */
+  fieldsJson = "";
+
+  /**
+   * Who reported it (the app's principal), and when (Unix milliseconds).
+   *
+   * @generated from field: string updated_by = 4;
+   */
+  updatedBy = "";
+
+  /**
+   * @generated from field: int64 updated_at_unix_ms = 5;
+   */
+  updatedAtUnixMs = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ObjectStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ObjectStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "observed_generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "conditions", kind: "message", T: ObjectCondition, repeated: true },
+    { no: 3, name: "fields_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "updated_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "updated_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ObjectStatus {
+    return new ObjectStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ObjectStatus {
+    return new ObjectStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ObjectStatus {
+    return new ObjectStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ObjectStatus | PlainMessage<ObjectStatus> | undefined, b: ObjectStatus | PlainMessage<ObjectStatus> | undefined): boolean {
+    return proto3.util.equals(ObjectStatus, a, b);
+  }
+}
+
+/**
+ * The permissions an object's writer was checked for, from the kind's
+ * `requires`, recorded on the object.
+ *
+ * @generated from message legion.ObjectAuthority
+ */
+export class ObjectAuthority extends Message<ObjectAuthority> {
+  /**
+   * One line per permission: `job:write in team-b (from
+   * spec.targetNamespace)`.
+   *
+   * @generated from field: repeated string permissions = 1;
+   */
+  permissions: string[] = [];
+
+  /**
+   * The same, as JSON.
+   *
+   * @generated from field: string permissions_json = 2;
+   */
+  permissionsJson = "";
+
+  /**
+   * Who authorized them (principal, and accessor id when the credential has
+   * one), and when (Unix milliseconds).
+   *
+   * @generated from field: string authorized_by = 3;
+   */
+  authorizedBy = "";
+
+  /**
+   * @generated from field: string accessor = 4;
+   */
+  accessor = "";
+
+  /**
+   * @generated from field: int64 authorized_at_unix_ms = 5;
+   */
+  authorizedAtUnixMs = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ObjectAuthority>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ObjectAuthority";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "permissions", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 2, name: "permissions_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "authorized_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "accessor", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "authorized_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ObjectAuthority {
+    return new ObjectAuthority().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ObjectAuthority {
+    return new ObjectAuthority().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ObjectAuthority {
+    return new ObjectAuthority().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ObjectAuthority | PlainMessage<ObjectAuthority> | undefined, b: ObjectAuthority | PlainMessage<ObjectAuthority> | undefined): boolean {
+    return proto3.util.equals(ObjectAuthority, a, b);
+  }
+}
+
+/**
+ * One object of an app-declared kind.
+ *
+ * @generated from message legion.AppObject
+ */
+export class AppObject extends Message<AppObject> {
+  /**
+   * The app that owns the kind, the kind's name as declared, and
+   * `<app>/<Kind>`.
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * @generated from field: string kind = 2;
+   */
+  kind = "";
+
+  /**
+   * @generated from field: string qualified_kind = 3;
+   */
+  qualifiedKind = "";
+
+  /**
+   * The namespace; empty for a cluster-scoped kind.
+   *
+   * @generated from field: string namespace = 4;
+   */
+  namespace = "";
+
+  /**
+   * The object's name: a DNS label, unique within its kind and namespace.
+   *
+   * @generated from field: string name = 5;
+   */
+  name = "";
+
+  /**
+   * `namespace/name`, or `name` for a cluster-scoped kind.
+   *
+   * @generated from field: string id = 6;
+   */
+  id = "";
+
+  /**
+   * Never reused, even across a delete and a recreate of the same name.
+   * Status, the watch's tombstones, and an app's own records key on it.
+   *
+   * @generated from field: uint64 uid = 7;
+   */
+  uid = protoInt64.zero;
+
+  /**
+   * Labels, string to string (ListObjects filters by them).
+   *
+   * @generated from field: map<string, string> labels = 8;
+   */
+  labels: { [key: string]: string } = {};
+
+  /**
+   * The spec as stored (with the defaults of its write-time schema), and
+   * effective (plus defaults of fields added since), as JSON. `writeOnly`
+   * values read `<redacted>` everywhere but the owning app's watch.
+   *
+   * @generated from field: string spec_json = 9;
+   */
+  specJson = "";
+
+  /**
+   * @generated from field: string effective_json = 10;
+   */
+  effectiveJson = "";
+
+  /**
+   * Starts at 1 and bumps when the spec changes.
+   *
+   * @generated from field: uint64 generation = 11;
+   */
+  generation = protoInt64.zero;
+
+  /**
+   * The compare-and-set token: new on every write of the spec, labels,
+   * authority, or the deleting mark; never moved by a status report.
+   *
+   * @generated from field: uint64 spec_version = 12;
+   */
+  specVersion = protoInt64.zero;
+
+  /**
+   * What the app reported, if anything.
+   *
+   * @generated from field: legion.ObjectStatus status = 13;
+   */
+  status?: ObjectStatus;
+
+  /**
+   * The derived summary, whatever the kind: `Pending`, `Ready`,
+   * `NotReady: <reason>`, `Rejected: <reason>`, `Accepted` (an app that
+   * reports only `Accepted`), `Stale` (the owning app is disabled or not
+   * running), `Invalid`, `Orphaned`, or `Deleting`. `summary_detail` is the
+   * condition's reason and message.
+   *
+   * @generated from field: string summary = 14;
+   */
+  summary = "";
+
+  /**
+   * @generated from field: string summary_detail = 15;
+   */
+  summaryDetail = "";
+
+  /**
+   * `valid`, `invalid` (the spec fails the kind's current schema), or
+   * `orphaned` (its kind is); `detail` says why.
+   *
+   * @generated from field: string state = 16;
+   */
+  state = "";
+
+  /**
+   * @generated from field: string detail = 17;
+   */
+  detail = "";
+
+  /**
+   * What its writer was checked for.
+   *
+   * @generated from field: legion.ObjectAuthority authority = 18;
+   */
+  authority?: ObjectAuthority;
+
+  /**
+   * The app whose own identity last wrote it; empty when a person did.
+   *
+   * @generated from field: string managed_by = 19;
+   */
+  managedBy = "";
+
+  /**
+   * A bounded cleanup is running: when it started and its deadline (Unix
+   * milliseconds).
+   *
+   * @generated from field: bool deleting = 20;
+   */
+  deleting = false;
+
+  /**
+   * @generated from field: int64 deleting_since_unix_ms = 21;
+   */
+  deletingSinceUnixMs = protoInt64.zero;
+
+  /**
+   * @generated from field: int64 cleanup_deadline_unix_ms = 22;
+   */
+  cleanupDeadlineUnixMs = protoInt64.zero;
+
+  /**
+   * Who created it and last wrote it, and when (Unix milliseconds).
+   *
+   * @generated from field: string created_by = 23;
+   */
+  createdBy = "";
+
+  /**
+   * @generated from field: int64 created_at_unix_ms = 24;
+   */
+  createdAtUnixMs = protoInt64.zero;
+
+  /**
+   * @generated from field: string updated_by = 25;
+   */
+  updatedBy = "";
+
+  /**
+   * @generated from field: int64 updated_at_unix_ms = 26;
+   */
+  updatedAtUnixMs = protoInt64.zero;
+
+  /**
+   * The digest of the schema its spec was checked against at its last
+   * write.
+   *
+   * @generated from field: string schema_digest = 27;
+   */
+  schemaDigest = "";
+
+  /**
+   * The watch shard it belongs to (WatchObjects with `shard_count`; 0
+   * otherwise).
+   *
+   * @generated from field: uint32 shard = 28;
+   */
+  shard = 0;
+
+  constructor(data?: PartialMessage<AppObject>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppObject";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "qualified_kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "uid", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 8, name: "labels", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 9, name: "spec_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "effective_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 12, name: "spec_version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 13, name: "status", kind: "message", T: ObjectStatus },
+    { no: 14, name: "summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 15, name: "summary_detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 17, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 18, name: "authority", kind: "message", T: ObjectAuthority },
+    { no: 19, name: "managed_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 20, name: "deleting", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 21, name: "deleting_since_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 22, name: "cleanup_deadline_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 23, name: "created_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 24, name: "created_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 25, name: "updated_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 26, name: "updated_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 27, name: "schema_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 28, name: "shard", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppObject {
+    return new AppObject().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppObject {
+    return new AppObject().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppObject {
+    return new AppObject().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppObject | PlainMessage<AppObject> | undefined, b: AppObject | PlainMessage<AppObject> | undefined): boolean {
+    return proto3.util.equals(AppObject, a, b);
+  }
+}
+
+/**
+ * Request payload for ApplyObject.
+ *
+ * @generated from message legion.ApplyObjectRequest
+ */
+export class ApplyObjectRequest extends Message<ApplyObjectRequest> {
+  /**
+   * The object as JSON: `{ kind = "<app>/<Kind>", name, namespace?,
+   * labels?, spec }` (the CLI evaluates a Nickel file first). `status` is
+   * refused.
+   *
+   * @generated from field: string object_json = 1;
+   */
+  objectJson = "";
+
+  /**
+   * The namespace a namespaced object goes in when it names none (the
+   * CLI's `-n`, else `LEGION_NAMESPACE`); empty means `default`. Ignored,
+   * with a warning, for a cluster-scoped kind.
+   *
+   * @generated from field: string namespace = 2;
+   */
+  namespace = "";
+
+  /**
+   * Validate (the app's validate call included) and diff without writing.
+   *
+   * @generated from field: bool dry_run = 3;
+   */
+  dryRun = false;
+
+  /**
+   * Compare-and-set on the stored `spec_version`: `0` creates only; any
+   * other value must equal it. Unset writes whatever is stored.
+   *
+   * @generated from field: optional uint64 expected_version = 4;
+   */
+  expectedVersion?: bigint;
+
+  /**
+   * Optional key to dedupe retries; a repeat returns the first reply with
+   * `deduplicated = true`.
+   *
+   * @generated from field: optional string idempotency_key = 5;
+   */
+  idempotencyKey?: string;
+
+  /**
+   * Update an object an app manages (`managed_by`).
+   *
+   * @generated from field: bool force = 6;
+   */
+  force = false;
+
+  constructor(data?: PartialMessage<ApplyObjectRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ApplyObjectRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "object_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "expected_version", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ApplyObjectRequest {
+    return new ApplyObjectRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ApplyObjectRequest {
+    return new ApplyObjectRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ApplyObjectRequest {
+    return new ApplyObjectRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ApplyObjectRequest | PlainMessage<ApplyObjectRequest> | undefined, b: ApplyObjectRequest | PlainMessage<ApplyObjectRequest> | undefined): boolean {
+    return proto3.util.equals(ApplyObjectRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ApplyObject.
+ *
+ * @generated from message legion.ApplyObjectReply
+ */
+export class ApplyObjectReply extends Message<ApplyObjectReply> {
+  /**
+   * The object as stored (on a dry run, as it would be).
+   *
+   * @generated from field: legion.AppObject object = 1;
+   */
+  object?: AppObject;
+
+  /**
+   * It did not exist.
+   *
+   * @generated from field: bool created = 2;
+   */
+  created = false;
+
+  /**
+   * The spec, labels, or authority changed (false: the same object again,
+   * nothing written).
+   *
+   * @generated from field: bool changed = 3;
+   */
+  changed = false;
+
+  /**
+   * One line per changed field, against the stored object.
+   *
+   * @generated from field: repeated string diff = 4;
+   */
+  diff: string[] = [];
+
+  /**
+   * The app's warnings, a validate call that failed open, and an ignored
+   * default namespace.
+   *
+   * @generated from field: repeated string warnings = 5;
+   */
+  warnings: string[] = [];
+
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 6;
+   */
+  message = "";
+
+  /**
+   * True when `idempotency_key` matched an earlier call.
+   *
+   * @generated from field: bool deduplicated = 7;
+   */
+  deduplicated = false;
+
+  /**
+   * Echoes the request: nothing was written.
+   *
+   * @generated from field: bool dry_run = 8;
+   */
+  dryRun = false;
+
+  constructor(data?: PartialMessage<ApplyObjectReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ApplyObjectReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "object", kind: "message", T: AppObject },
+    { no: 2, name: "created", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "changed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "diff", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 6, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ApplyObjectReply {
+    return new ApplyObjectReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ApplyObjectReply {
+    return new ApplyObjectReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ApplyObjectReply {
+    return new ApplyObjectReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ApplyObjectReply | PlainMessage<ApplyObjectReply> | undefined, b: ApplyObjectReply | PlainMessage<ApplyObjectReply> | undefined): boolean {
+    return proto3.util.equals(ApplyObjectReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetObject.
+ *
+ * @generated from message legion.GetObjectRequest
+ */
+export class GetObjectRequest extends Message<GetObjectRequest> {
+  /**
+   * The kind: qualified (`gitops/Repo`), or a short name (`repo`, `repos`)
+   * exactly one kind has.
+   *
+   * @generated from field: string kind = 1;
+   */
+  kind = "";
+
+  /**
+   * The object's name, or `namespace/name` for a namespaced kind.
+   *
+   * @generated from field: string name = 2;
+   */
+  name = "";
+
+  /**
+   * The namespace, when `name` names none; empty means `default`. Ignored
+   * for a cluster-scoped kind.
+   *
+   * @generated from field: string namespace = 3;
+   */
+  namespace = "";
+
+  constructor(data?: PartialMessage<GetObjectRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetObjectRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetObjectRequest {
+    return new GetObjectRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetObjectRequest {
+    return new GetObjectRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetObjectRequest {
+    return new GetObjectRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetObjectRequest | PlainMessage<GetObjectRequest> | undefined, b: GetObjectRequest | PlainMessage<GetObjectRequest> | undefined): boolean {
+    return proto3.util.equals(GetObjectRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetObject.
+ *
+ * @generated from message legion.GetObjectReply
+ */
+export class GetObjectReply extends Message<GetObjectReply> {
+  /**
+   * @generated from field: legion.AppObject object = 1;
+   */
+  object?: AppObject;
+
+  /**
+   * The object's kind.
+   *
+   * @generated from field: legion.ObjectKind kind = 2;
+   */
+  kind?: ObjectKind;
+
+  constructor(data?: PartialMessage<GetObjectReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetObjectReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "object", kind: "message", T: AppObject },
+    { no: 2, name: "kind", kind: "message", T: ObjectKind },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetObjectReply {
+    return new GetObjectReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetObjectReply {
+    return new GetObjectReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetObjectReply {
+    return new GetObjectReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetObjectReply | PlainMessage<GetObjectReply> | undefined, b: GetObjectReply | PlainMessage<GetObjectReply> | undefined): boolean {
+    return proto3.util.equals(GetObjectReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListObjects.
+ *
+ * @generated from message legion.ListObjectsRequest
+ */
+export class ListObjectsRequest extends Message<ListObjectsRequest> {
+  /**
+   * The kind (qualified, or a short name exactly one kind has); empty lists
+   * every kind's objects.
+   *
+   * @generated from field: string kind = 1;
+   */
+  kind = "";
+
+  /**
+   * Namespaces to list: names or `*`-globs; empty means `default`, `*`
+   * every namespace the caller can read. Cluster-scoped kinds' objects are
+   * listed whatever is asked for.
+   *
+   * @generated from field: repeated string namespaces = 2;
+   */
+  namespaces: string[] = [];
+
+  /**
+   * Only objects carrying every one of these labels with these values.
+   *
+   * @generated from field: map<string, string> labels = 3;
+   */
+  labels: { [key: string]: string } = {};
+
+  constructor(data?: PartialMessage<ListObjectsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListObjectsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "labels", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListObjectsRequest {
+    return new ListObjectsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListObjectsRequest {
+    return new ListObjectsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListObjectsRequest {
+    return new ListObjectsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListObjectsRequest | PlainMessage<ListObjectsRequest> | undefined, b: ListObjectsRequest | PlainMessage<ListObjectsRequest> | undefined): boolean {
+    return proto3.util.equals(ListObjectsRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListObjects.
+ *
+ * @generated from message legion.ListObjectsReply
+ */
+export class ListObjectsReply extends Message<ListObjectsReply> {
+  /**
+   * The objects the caller may read, by app, kind, namespace, and name.
+   *
+   * @generated from field: repeated legion.AppObject objects = 1;
+   */
+  objects: AppObject[] = [];
+
+  /**
+   * The kinds among them, for their columns.
+   *
+   * @generated from field: repeated legion.ObjectKind kinds = 2;
+   */
+  kinds: ObjectKind[] = [];
+
+  constructor(data?: PartialMessage<ListObjectsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListObjectsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "objects", kind: "message", T: AppObject, repeated: true },
+    { no: 2, name: "kinds", kind: "message", T: ObjectKind, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListObjectsReply {
+    return new ListObjectsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListObjectsReply {
+    return new ListObjectsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListObjectsReply {
+    return new ListObjectsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListObjectsReply | PlainMessage<ListObjectsReply> | undefined, b: ListObjectsReply | PlainMessage<ListObjectsReply> | undefined): boolean {
+    return proto3.util.equals(ListObjectsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteObject.
+ *
+ * @generated from message legion.DeleteObjectRequest
+ */
+export class DeleteObjectRequest extends Message<DeleteObjectRequest> {
+  /**
+   * The kind: qualified, or a short name exactly one kind has.
+   *
+   * @generated from field: string kind = 1;
+   */
+  kind = "";
+
+  /**
+   * The object's name, or `namespace/name`.
+   *
+   * @generated from field: string name = 2;
+   */
+  name = "";
+
+  /**
+   * The namespace, when `name` names none; empty means `default`. Ignored
+   * for a cluster-scoped kind.
+   *
+   * @generated from field: string namespace = 3;
+   */
+  namespace = "";
+
+  /**
+   * Compare-and-set: the stored `spec_version` must be this one.
+   *
+   * @generated from field: optional uint64 expected_version = 4;
+   */
+  expectedVersion?: bigint;
+
+  /**
+   * Optional key to dedupe retries.
+   *
+   * @generated from field: optional string idempotency_key = 5;
+   */
+  idempotencyKey?: string;
+
+  /**
+   * Skip the kind's bounded cleanup: remove the object at once (also ends
+   * a cleanup already running).
+   *
+   * @generated from field: bool now = 6;
+   */
+  now = false;
+
+  /**
+   * Delete an object an app manages (`managed_by`).
+   *
+   * @generated from field: bool force = 7;
+   */
+  force = false;
+
+  constructor(data?: PartialMessage<DeleteObjectRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteObjectRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "expected_version", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "now", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteObjectRequest {
+    return new DeleteObjectRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteObjectRequest {
+    return new DeleteObjectRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteObjectRequest {
+    return new DeleteObjectRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteObjectRequest | PlainMessage<DeleteObjectRequest> | undefined, b: DeleteObjectRequest | PlainMessage<DeleteObjectRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteObjectRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteObject.
+ *
+ * @generated from message legion.DeleteObjectReply
+ */
+export class DeleteObjectReply extends Message<DeleteObjectReply> {
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * True when `idempotency_key` matched an earlier call.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  /**
+   * The object as it was (or, while deleting, as it is).
+   *
+   * @generated from field: legion.AppObject object = 3;
+   */
+  object?: AppObject;
+
+  /**
+   * The object is gone.
+   *
+   * @generated from field: bool deleted = 4;
+   */
+  deleted = false;
+
+  /**
+   * A bounded cleanup started (or was already running): the object stays
+   * until its app releases it or `cleanup_deadline_unix_ms` passes.
+   *
+   * @generated from field: bool deleting = 5;
+   */
+  deleting = false;
+
+  constructor(data?: PartialMessage<DeleteObjectReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteObjectReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "object", kind: "message", T: AppObject },
+    { no: 4, name: "deleted", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "deleting", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteObjectReply {
+    return new DeleteObjectReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteObjectReply {
+    return new DeleteObjectReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteObjectReply {
+    return new DeleteObjectReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteObjectReply | PlainMessage<DeleteObjectReply> | undefined, b: DeleteObjectReply | PlainMessage<DeleteObjectReply> | undefined): boolean {
+    return proto3.util.equals(DeleteObjectReply, a, b);
+  }
+}
+
+/**
+ * Request payload for WatchObjects.
+ *
+ * @generated from message legion.WatchObjectsRequest
+ */
+export class WatchObjectsRequest extends Message<WatchObjectsRequest> {
+  /**
+   * The app whose objects to watch: empty (or the caller's own name) for
+   * an app's identity; required for a management token.
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * Only these of the app's kinds (as declared, or qualified); empty for
+   * every kind it declares.
+   *
+   * @generated from field: repeated string kinds = 2;
+   */
+  kinds: string[] = [];
+
+  /**
+   * How many shards objects split into. 0 (or 1) means one shard: every
+   * object.
+   *
+   * @generated from field: uint32 shard_count = 3;
+   */
+  shardCount = 0;
+
+  /**
+   * The shards to watch, each below `shard_count`. Empty watches every
+   * shard.
+   *
+   * @generated from field: repeated uint32 shards = 4;
+   */
+  shards: number[] = [];
+
+  constructor(data?: PartialMessage<WatchObjectsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.WatchObjectsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "kinds", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "shard_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "shards", kind: "scalar", T: 13 /* ScalarType.UINT32 */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WatchObjectsRequest {
+    return new WatchObjectsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): WatchObjectsRequest {
+    return new WatchObjectsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): WatchObjectsRequest {
+    return new WatchObjectsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: WatchObjectsRequest | PlainMessage<WatchObjectsRequest> | undefined, b: WatchObjectsRequest | PlainMessage<WatchObjectsRequest> | undefined): boolean {
+    return proto3.util.equals(WatchObjectsRequest, a, b);
+  }
+}
+
+/**
+ * Identifies an object WatchObjects no longer reports: a tombstone.
+ *
+ * @generated from message legion.ObjectRef
+ */
+export class ObjectRef extends Message<ObjectRef> {
+  /**
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * @generated from field: string kind = 2;
+   */
+  kind = "";
+
+  /**
+   * Empty for a cluster-scoped kind.
+   *
+   * @generated from field: string namespace = 3;
+   */
+  namespace = "";
+
+  /**
+   * @generated from field: string name = 4;
+   */
+  name = "";
+
+  /**
+   * @generated from field: uint64 uid = 5;
+   */
+  uid = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ObjectRef>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ObjectRef";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "uid", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ObjectRef {
+    return new ObjectRef().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ObjectRef {
+    return new ObjectRef().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ObjectRef {
+    return new ObjectRef().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ObjectRef | PlainMessage<ObjectRef> | undefined, b: ObjectRef | PlainMessage<ObjectRef> | undefined): boolean {
+    return proto3.util.equals(ObjectRef, a, b);
+  }
+}
+
+/**
+ * One message of WatchObjects.
+ *
+ * @generated from message legion.ObjectEvent
+ */
+export class ObjectEvent extends Message<ObjectEvent> {
+  /**
+   * True on the first message of the snapshot: a consumer starts a fresh
+   * set (the snapshot may span several messages).
+   *
+   * @generated from field: bool snapshot = 1;
+   */
+  snapshot = false;
+
+  /**
+   * True on the last message of the snapshot: the set is complete, and a
+   * uid it lacks was deleted.
+   *
+   * @generated from field: bool snapshot_done = 2;
+   */
+  snapshotDone = false;
+
+  /**
+   * Objects: the snapshot's, then those new or changed since the previous
+   * message.
+   *
+   * @generated from field: repeated legion.AppObject upserts = 3;
+   */
+  upserts: AppObject[] = [];
+
+  /**
+   * Objects that are gone since the previous message (deleted, or no
+   * longer the app's).
+   *
+   * @generated from field: repeated legion.ObjectRef deletes = 4;
+   */
+  deletes: ObjectRef[] = [];
+
+  /**
+   * Increases by one with every message on this stream.
+   *
+   * @generated from field: uint64 sequence = 5;
+   */
+  sequence = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ObjectEvent>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ObjectEvent";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "snapshot", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "snapshot_done", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "upserts", kind: "message", T: AppObject, repeated: true },
+    { no: 4, name: "deletes", kind: "message", T: ObjectRef, repeated: true },
+    { no: 5, name: "sequence", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ObjectEvent {
+    return new ObjectEvent().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ObjectEvent {
+    return new ObjectEvent().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ObjectEvent {
+    return new ObjectEvent().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ObjectEvent | PlainMessage<ObjectEvent> | undefined, b: ObjectEvent | PlainMessage<ObjectEvent> | undefined): boolean {
+    return proto3.util.equals(ObjectEvent, a, b);
+  }
+}
+
+/**
+ * Request payload for UpdateObjectStatus.
+ *
+ * @generated from message legion.UpdateObjectStatusRequest
+ */
+export class UpdateObjectStatusRequest extends Message<UpdateObjectStatusRequest> {
+  /**
+   * The kind: the calling app's kind name, or qualified.
+   *
+   * @generated from field: string kind = 1;
+   */
+  kind = "";
+
+  /**
+   * The object's namespace (empty for a cluster-scoped kind), name, and
+   * uid.
+   *
+   * @generated from field: string namespace = 2;
+   */
+  namespace = "";
+
+  /**
+   * @generated from field: string name = 3;
+   */
+  name = "";
+
+  /**
+   * @generated from field: uint64 uid = 4;
+   */
+  uid = protoInt64.zero;
+
+  /**
+   * The spec generation this status describes.
+   *
+   * @generated from field: uint64 observed_generation = 5;
+   */
+  observedGeneration = protoInt64.zero;
+
+  /**
+   * The conditions (`Accepted`, `Ready`, or the app's own).
+   *
+   * @generated from field: repeated legion.ObjectCondition conditions = 6;
+   */
+  conditions: ObjectCondition[] = [];
+
+  /**
+   * The app's own payload, as a JSON object; empty for `{}`.
+   *
+   * @generated from field: string fields_json = 7;
+   */
+  fieldsJson = "";
+
+  /**
+   * Optional key to dedupe retries.
+   *
+   * @generated from field: optional string idempotency_key = 8;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<UpdateObjectStatusRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpdateObjectStatusRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "uid", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 5, name: "observed_generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 6, name: "conditions", kind: "message", T: ObjectCondition, repeated: true },
+    { no: 7, name: "fields_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpdateObjectStatusRequest {
+    return new UpdateObjectStatusRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpdateObjectStatusRequest {
+    return new UpdateObjectStatusRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpdateObjectStatusRequest {
+    return new UpdateObjectStatusRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpdateObjectStatusRequest | PlainMessage<UpdateObjectStatusRequest> | undefined, b: UpdateObjectStatusRequest | PlainMessage<UpdateObjectStatusRequest> | undefined): boolean {
+    return proto3.util.equals(UpdateObjectStatusRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for UpdateObjectStatus.
+ *
+ * @generated from message legion.UpdateObjectStatusReply
+ */
+export class UpdateObjectStatusReply extends Message<UpdateObjectStatusReply> {
+  /**
+   * The object, with the status now stored.
+   *
+   * @generated from field: legion.AppObject object = 1;
+   */
+  object?: AppObject;
+
+  /**
+   * Whether a write happened (an identical report is dropped).
+   *
+   * @generated from field: bool written = 2;
+   */
+  written = false;
+
+  /**
+   * True when `idempotency_key` matched an earlier call.
+   *
+   * @generated from field: bool deduplicated = 3;
+   */
+  deduplicated = false;
+
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 4;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<UpdateObjectStatusReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpdateObjectStatusReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "object", kind: "message", T: AppObject },
+    { no: 2, name: "written", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpdateObjectStatusReply {
+    return new UpdateObjectStatusReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpdateObjectStatusReply {
+    return new UpdateObjectStatusReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpdateObjectStatusReply {
+    return new UpdateObjectStatusReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpdateObjectStatusReply | PlainMessage<UpdateObjectStatusReply> | undefined, b: UpdateObjectStatusReply | PlainMessage<UpdateObjectStatusReply> | undefined): boolean {
+    return proto3.util.equals(UpdateObjectStatusReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ReleaseObject.
+ *
+ * @generated from message legion.ReleaseObjectRequest
+ */
+export class ReleaseObjectRequest extends Message<ReleaseObjectRequest> {
+  /**
+   * The kind: the calling app's kind name, or qualified.
+   *
+   * @generated from field: string kind = 1;
+   */
+  kind = "";
+
+  /**
+   * The deleting object's namespace (empty for a cluster-scoped kind),
+   * name, and uid.
+   *
+   * @generated from field: string namespace = 2;
+   */
+  namespace = "";
+
+  /**
+   * @generated from field: string name = 3;
+   */
+  name = "";
+
+  /**
+   * @generated from field: uint64 uid = 4;
+   */
+  uid = protoInt64.zero;
+
+  /**
+   * Optional key to dedupe retries.
+   *
+   * @generated from field: optional string idempotency_key = 5;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<ReleaseObjectRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ReleaseObjectRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "uid", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ReleaseObjectRequest {
+    return new ReleaseObjectRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ReleaseObjectRequest {
+    return new ReleaseObjectRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ReleaseObjectRequest {
+    return new ReleaseObjectRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ReleaseObjectRequest | PlainMessage<ReleaseObjectRequest> | undefined, b: ReleaseObjectRequest | PlainMessage<ReleaseObjectRequest> | undefined): boolean {
+    return proto3.util.equals(ReleaseObjectRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ReleaseObject.
+ *
+ * @generated from message legion.ReleaseObjectReply
+ */
+export class ReleaseObjectReply extends Message<ReleaseObjectReply> {
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * True when `idempotency_key` matched an earlier call.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<ReleaseObjectReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ReleaseObjectReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ReleaseObjectReply {
+    return new ReleaseObjectReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ReleaseObjectReply {
+    return new ReleaseObjectReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ReleaseObjectReply {
+    return new ReleaseObjectReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ReleaseObjectReply | PlainMessage<ReleaseObjectReply> | undefined, b: ReleaseObjectReply | PlainMessage<ReleaseObjectReply> | undefined): boolean {
+    return proto3.util.equals(ReleaseObjectReply, a, b);
+  }
+}
+
+/**
  * Request payload for GetApp.
  *
  * @generated from message legion.GetAppRequest
@@ -36823,6 +38695,15 @@ export class UpgradeAppRequest extends Message<UpgradeAppRequest> {
    */
   configJson?: string;
 
+  /**
+   * Upgrade even though the new manifest drops object kinds that still
+   * have objects. Those objects stay stored, read as `orphaned`: readable
+   * and deletable, not writable.
+   *
+   * @generated from field: bool force = 8;
+   */
+  force = false;
+
   constructor(data?: PartialMessage<UpgradeAppRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -36838,6 +38719,7 @@ export class UpgradeAppRequest extends Message<UpgradeAppRequest> {
     { no: 5, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 7, name: "config_json", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 8, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpgradeAppRequest {
@@ -37014,9 +38896,11 @@ export class UninstallAppRequest extends Message<UninstallAppRequest> {
   idempotencyKey?: string;
 
   /**
-   * Uninstall even though jobs set the app's jobspec keys. Their values
-   * stay stored, flagged `orphaned`; resubmitting such a job fails unless
-   * the key is removed or `--allow-unknown-fields` is passed.
+   * Uninstall even though jobs set the app's jobspec keys, or objects of
+   * its kinds exist. The values stay stored, flagged `orphaned`;
+   * resubmitting such a job fails unless the key is removed or
+   * `--allow-unknown-fields` is passed. The objects stay stored, read as
+   * `orphaned`: readable and deletable, not writable.
    *
    * @generated from field: bool force = 3;
    */
@@ -37087,6 +38971,13 @@ export class UninstallAppReply extends Message<UninstallAppReply> {
    */
   orphanedJobs: string[] = [];
 
+  /**
+   * How many objects of the app's kinds are now orphaned (with `force`).
+   *
+   * @generated from field: uint64 orphaned_objects = 5;
+   */
+  orphanedObjects = protoInt64.zero;
+
   constructor(data?: PartialMessage<UninstallAppReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -37099,6 +38990,7 @@ export class UninstallAppReply extends Message<UninstallAppReply> {
     { no: 2, name: "revoked_grants", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 4, name: "orphaned_jobs", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "orphaned_objects", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UninstallAppReply {
@@ -43613,6 +45505,14 @@ export class NamespaceCounts extends Message<NamespaceCounts> {
    */
   snapshots = 0;
 
+  /**
+   * Objects of app-declared kinds in the namespace (docs/app-objects.md),
+   * not counting ones whose bounded cleanup is running.
+   *
+   * @generated from field: uint32 objects = 4;
+   */
+  objects = 0;
+
   constructor(data?: PartialMessage<NamespaceCounts>) {
     super();
     proto3.util.initPartial(data, this);
@@ -43624,6 +45524,7 @@ export class NamespaceCounts extends Message<NamespaceCounts> {
     { no: 1, name: "jobs", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 2, name: "volumes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 3, name: "snapshots", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "objects", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NamespaceCounts {
@@ -43670,6 +45571,15 @@ export class NamespaceContents extends Message<NamespaceContents> {
    */
   snapshots: string[] = [];
 
+  /**
+   * Objects of app-declared kinds, as `<app>/<Kind> <name>`. A namespace
+   * holding any is not deleted without `cascade`, which deletes them with
+   * the caller's access to each kind and each object's `requires` checked.
+   *
+   * @generated from field: repeated string objects = 4;
+   */
+  objects: string[] = [];
+
   constructor(data?: PartialMessage<NamespaceContents>) {
     super();
     proto3.util.initPartial(data, this);
@@ -43681,6 +45591,7 @@ export class NamespaceContents extends Message<NamespaceContents> {
     { no: 1, name: "jobs", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 2, name: "volumes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 3, name: "snapshots", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 4, name: "objects", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NamespaceContents {

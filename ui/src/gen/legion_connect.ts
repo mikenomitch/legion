@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AppExtensionEvent, ApplyNamespacePolicyReply, ApplyNamespacePolicyRequest, ApplyNamespaceReply, ApplyNamespaceRequest, ApplyScalingDefaultsReply, ApplyScalingDefaultsRequest, ApplyScalingPolicyReply, ApplyScalingPolicyRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNamespacePolicyReply, DeleteNamespacePolicyRequest, DeleteNamespaceReply, DeleteNamespaceRequest, DeleteNetPluginReply, DeleteNetPluginRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteScalingPolicyReply, DeleteScalingPolicyRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForgetNodeReply, ForgetNodeRequest, ForkInstanceReply, ForkInstanceRequest, ForwardAppRequestReply, ForwardAppRequestRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetAppPageReply, GetAppPageRequest, GetAppReply, GetAppRequest, GetAppViewReply, GetAppViewRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetCapacityDemandReply, GetCapacityDemandRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSchemaReply, GetJobSchemaRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNamespacePolicyReply, GetNamespacePolicyRequest, GetNamespaceReply, GetNamespaceRequest, GetNetPluginReply, GetNetPluginRequest, GetNetPluginStatusReply, GetNetPluginStatusRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetScaleHistoryReply, GetScaleHistoryRequest, GetScalingDefaultsReply, GetScalingDefaultsRequest, GetScalingInputsReply, GetScalingInputsRequest, GetScalingStatusReply, GetScalingStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, InstallAppReply, InstallAppRequest, InvokeAppActionReply, InvokeAppActionRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListAppsReply, ListAppsRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListGrantsReply, ListGrantsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNamespacePoliciesReply, ListNamespacePoliciesRequest, ListNamespacesReply, ListNamespacesRequest, ListNetPluginsReply, ListNetPluginsRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListScalingPoliciesReply, ListScalingPoliciesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListUiExtensionsReply, ListUiExtensionsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PauseScalingReply, PauseScalingRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, RecordScalingActionReply, RecordScalingActionRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ReportScalingStatusReply, ReportScalingStatusRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RevokeGrantReply, RevokeGrantRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, ScalingPolicySet, SchedulerEvent, SetAppConfigReply, SetAppConfigRequest, SetAppEnabledReply, SetAppEnabledRequest, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UninstallAppReply, UninstallAppRequest, UpdateAppSettingsReply, UpdateAppSettingsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpgradeAppReply, UpgradeAppRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPluginReply, UpsertNetPluginRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WatchAppExtensionsRequest, WatchScalingPoliciesRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AppExtensionEvent, ApplyNamespacePolicyReply, ApplyNamespacePolicyRequest, ApplyNamespaceReply, ApplyNamespaceRequest, ApplyObjectReply, ApplyObjectRequest, ApplyScalingDefaultsReply, ApplyScalingDefaultsRequest, ApplyScalingPolicyReply, ApplyScalingPolicyRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNamespacePolicyReply, DeleteNamespacePolicyRequest, DeleteNamespaceReply, DeleteNamespaceRequest, DeleteNetPluginReply, DeleteNetPluginRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteObjectReply, DeleteObjectRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteScalingPolicyReply, DeleteScalingPolicyRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForgetNodeReply, ForgetNodeRequest, ForkInstanceReply, ForkInstanceRequest, ForwardAppRequestReply, ForwardAppRequestRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetAppPageReply, GetAppPageRequest, GetAppReply, GetAppRequest, GetAppViewReply, GetAppViewRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetCapacityDemandReply, GetCapacityDemandRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSchemaReply, GetJobSchemaRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNamespacePolicyReply, GetNamespacePolicyRequest, GetNamespaceReply, GetNamespaceRequest, GetNetPluginReply, GetNetPluginRequest, GetNetPluginStatusReply, GetNetPluginStatusRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObjectReply, GetObjectRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetScaleHistoryReply, GetScaleHistoryRequest, GetScalingDefaultsReply, GetScalingDefaultsRequest, GetScalingInputsReply, GetScalingInputsRequest, GetScalingStatusReply, GetScalingStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, InstallAppReply, InstallAppRequest, InvokeAppActionReply, InvokeAppActionRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListAppsReply, ListAppsRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListGrantsReply, ListGrantsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNamespacePoliciesReply, ListNamespacePoliciesRequest, ListNamespacesReply, ListNamespacesRequest, ListNetPluginsReply, ListNetPluginsRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListObjectKindsReply, ListObjectKindsRequest, ListObjectsReply, ListObjectsRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListScalingPoliciesReply, ListScalingPoliciesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListUiExtensionsReply, ListUiExtensionsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, ObjectEvent, PatchKvReply, PatchKvRequest, PauseScalingReply, PauseScalingRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, RecordScalingActionReply, RecordScalingActionRequest, ReleaseKvLockReply, ReleaseKvLockRequest, ReleaseObjectReply, ReleaseObjectRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ReportScalingStatusReply, ReportScalingStatusRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RevokeGrantReply, RevokeGrantRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, ScalingPolicySet, SchedulerEvent, SetAppConfigReply, SetAppConfigRequest, SetAppEnabledReply, SetAppEnabledRequest, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UninstallAppReply, UninstallAppRequest, UpdateAppSettingsReply, UpdateAppSettingsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpdateObjectStatusReply, UpdateObjectStatusRequest, UpgradeAppReply, UpgradeAppRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPluginReply, UpsertNetPluginRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WatchAppExtensionsRequest, WatchObjectsRequest, WatchScalingPoliciesRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -772,18 +772,21 @@ export const Manager = {
     },
     /**
      * Deletes a namespace. Refused with FAILED_PRECONDITION while it holds
-     * anything (jobs in any state, volumes, snapshots), naming what is in the
-     * way by kind. With `cascade`, stops and destroys every job, then deletes
-     * its volumes and snapshots, then the namespace — synchronously, in that
-     * order, reporting each step. There is no `Terminating` state: a cascade
+     * anything (jobs in any state, volumes, snapshots, objects of
+     * app-declared kinds), naming what is in the way by kind. With `cascade`,
+     * deletes its objects (a kind with a bounded `cleanup` starts it; such an
+     * object no longer holds the namespace), stops and destroys every job,
+     * then deletes its volumes and snapshots, then the namespace —
+     * synchronously, in that order, reporting each step. There is no `Terminating` state: a cascade
      * that fails halfway leaves the namespace present and the call re-runnable,
      * and the final delete is one conditional write, so a submit that races in
      * makes it refuse rather than succeed falsely. `default` cannot be deleted.
      *
      * ACL: `namespace:write` on the namespace; a cascade additionally needs
-     * `job:write` there (and `snapshot:write` when it holds snapshots), so the
-     * right to delete an environment is never a back door to destroying
-     * workloads the caller could not otherwise touch.
+     * `job:write` there (and `snapshot:write` when it holds snapshots, and,
+     * for each object, `write` on its kind's access resource and the
+     * object's `requires`), so the right to delete an environment is never a
+     * back door to destroying workloads the caller could not otherwise touch.
      *
      * @generated from rpc legion.Manager.DeleteNamespace
      */
@@ -3796,6 +3799,15 @@ export const Manager = {
      * values (kept under `allow_unknown_fields`) it adopts, and how they fare
      * against its schemas.
      *
+     * Object kinds (`kinds`; docs/app-objects.md): each declaration is checked
+     * (a PascalCase name that is not a Legion noun, an object schema under
+     * the extension rules, examples that pass it, an `access` resource whose
+     * scope fits the kind's, `writeRequires` that name permissions, columns
+     * that point into an object), and a kind another installed app or a
+     * bundled manifest declares (ignoring case and plurals) is refused. The
+     * prompt shows each kind and who may write it, and reports objects an
+     * earlier install of the same app left orphaned, which it adopts.
+     *
      * Errors:
      * - InvalidArgument: the manifest does not parse or validate (unknown
      *   fields, a bad name, a missing `version`, a config schema that does
@@ -3806,9 +3818,9 @@ export const Manager = {
      * - PermissionDenied: the caller lacks `app:write`, or a permission the
      *   manifest asks for.
      * - AlreadyExists: an app of that name is installed (use UpgradeApp).
-     * - FailedPrecondition: the name is a bundled app's, or one of its
-     *   jobspec keys is another installed app's at that point (the message
-     *   names the owner and the `--key` rename).
+     * - FailedPrecondition: the name is a bundled app's, one of its jobspec
+     *   keys is another installed app's at that point (the message names the
+     *   owner and the `--key` rename), or one of its kinds is another app's.
      *
      * @generated from rpc legion.Manager.InstallApp
      */
@@ -3837,6 +3849,13 @@ export const Manager = {
      * every stored value of the app's keys checked against the new schemas;
      * values that fail stay stored and read as `invalid`.
      *
+     * Object kinds: the new manifest may add kinds (checked as at install)
+     * and change existing ones. Every stored object of the app's kinds is
+     * checked against the new schemas and reported in the prompt; objects
+     * that fail stay stored and read as `invalid`. Dropping a kind that still
+     * has objects needs `force`, and leaves them `orphaned`. Changing a
+     * kind's scope while it has objects is refused.
+     *
      * Retry-safe with `idempotency_key`.
      *
      * Errors:
@@ -3845,7 +3864,8 @@ export const Manager = {
      *   stored config fails its schema.
      * - PermissionDenied: the caller lacks `app:write` or a permission.
      * - FailedPrecondition: the app is bundled (bundled apps upgrade with the
-     *   binary).
+     *   binary), it drops a kind that has objects without `force`, or it
+     *   changes the scope of a kind that has objects.
      *
      * @generated from rpc legion.Manager.UpgradeApp
      */
@@ -3864,12 +3884,17 @@ export const Manager = {
      * the values stay stored, read as `orphaned`, and are listed in
      * `orphaned_jobs`.
      *
+     * Likewise while objects of the app's kinds exist: they stay stored,
+     * read as `orphaned` (readable and deletable, not writable), and are
+     * counted in `orphaned_objects`. Installing the app again adopts them.
+     *
      * Retry-safe with `idempotency_key`; uninstalling an app that is not
      * installed is NotFound.
      *
      * Errors:
      * - FailedPrecondition: the app is bundled (disable it instead), or jobs
-     *   set its jobspec keys and `force` is not set (the message lists them).
+     *   set its jobspec keys or objects of its kinds exist, and `force` is
+     *   not set (the message lists them).
      *
      * @generated from rpc legion.Manager.UninstallApp
      */
@@ -3988,6 +4013,321 @@ export const Manager = {
       I: WatchAppExtensionsRequest,
       O: AppExtensionEvent,
       kind: MethodKind.ServerStreaming,
+    },
+    /**
+     * Lists object kinds (docs/app-objects.md; `legion object kinds`,
+     * `legion object explain`): the kinds installed apps declare, and the
+     * kinds left `orphaned` by an app uninstalled (or upgraded to drop them)
+     * with `force` while objects of them remained. Each kind is
+     * `<app>/<Kind>` and comes with its scope, the ACL resource that governs
+     * its objects (`access`), what writing one requires (`requires`), its
+     * immutable fields, cleanup window, `maxObjects`, the spec and status
+     * JSON Schemas, examples, and the columns `legion object list` shows.
+     * This is what an agent authors objects against.
+     *
+     * ACL: filtered per kind. A kind is listed when the caller holds `read`
+     * on its access resource somewhere (for the `object` resource, on that
+     * kind). A caller that may read no kind is refused with the
+     * `object:read` denial. Answers from the stored kind declarations alone.
+     *
+     * Errors:
+     * - Unauthenticated / PermissionDenied: the caller may read no kind.
+     *
+     * @generated from rpc legion.Manager.ListObjectKinds
+     */
+    listObjectKinds: {
+      name: "ListObjectKinds",
+      I: ListObjectKindsRequest,
+      O: ListObjectKindsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates or updates one object of an app-declared kind (`legion object
+     * apply -f FILE`). `object_json` is the object as a person writes it:
+     * `{ kind, name, namespace?, labels?, spec }`, where `kind` is qualified
+     * with its app (`gitops/Repo`; the app's part exactly, the kind's in any
+     * case, plural optional). `status` is the app's and is refused here.
+     *
+     * In order, the manager:
+     * 1. resolves the kind among active kinds (an unqualified kind is
+     *    refused, naming the qualified one; an orphaned kind cannot be
+     *    written);
+     * 2. works out the scope: a namespaced object's namespace is the one the
+     *    object names, else the request's `namespace`, else `default`; a
+     *    cluster kind's object has none (a namespace in the object is an
+     *    error; the request's default is ignored with a warning);
+     * 3. checks `write` on the kind's access resource on the object's scope
+     *    before reading anything: for `object`, the namespace (`*` for a
+     *    cluster kind), name, and the `kinds` attribute `<app>/<Kind>`; for
+     *    `job` and `scale`, the namespace with name `*` (namespace-wide);
+     *    for `node`, no instance attributes;
+     * 4. checks the name, the labels, that the namespace exists, and the spec
+     *    against the kind's schema, closed by default, with its defaults
+     *    filled (errors name the path: `spec.brnach: unknown field (did you
+     *    mean branch?)`); a spec over 64 KiB after defaults is refused;
+     * 5. resolves the kind's `requires` against the effective spec and
+     *    checks each, as the caller, with the scope the corresponding core
+     *    RPC builds (`job:write in team-b (from spec.targetNamespace)`,
+     *    `kv:read` on a key the spec names, `host` and `band` as a submit
+     *    carries them), fail-closed;
+     * 6. refuses a change to an `immutable` field, an update of an object
+     *    whose bounded cleanup is running, and, without `force`, a person's
+     *    update of an object an app manages (`managed_by`);
+     * 7. for a kind with `validate`, asks the app (`POST
+     *    /legion/v1/objects/validate` to one allocation, with a viewer
+     *    assertion naming the caller, two seconds). Advisory: its errors
+     *    refuse the apply and its warnings come back in `warnings`, but an
+     *    app that is disabled, unreachable, slow, or answers anything but 200
+     *    lets the write through with a warning (fail open). It is never a
+     *    security check;
+     * 8. writes the spec with its defaults, the labels, and the `authority`
+     *    (the permissions step 5 verified, and who and when). Applying what
+     *    is stored writes nothing. A spec change bumps `generation`; every
+     *    write gets a new `spec_version`; a create gets a `uid` and counts
+     *    against the kind's `max_objects` inside the write. A write by an
+     *    app's own identity stamps `managed_by` with the app.
+     *
+     * `dry_run` runs every step but the write (the app is asked too) and
+     * returns the object as it would be, with `diff`: one line per changed
+     * field (`spec.branch: "main" → "release"`; a `writeOnly` field as
+     * `changed (redacted)`). `expected_version` is a compare-and-set on the
+     * stored `spec_version` (`0` means "create only"); status writes never
+     * move it. Emits `object.applied`.
+     *
+     * Retry-safe: a repeated `idempotency_key` returns the first reply with
+     * `deduplicated` set.
+     *
+     * Errors:
+     * - InvalidArgument: the object does not parse (unknown fields, a
+     *   `status`, a missing `spec`), an unqualified or unknown kind (with a
+     *   did-you-mean), a bad name or labels, a namespace on a cluster kind, a
+     *   spec failing the schema or too large, an immutable change, a pointer
+     *   in `requires` naming something other than strings, or the app
+     *   refused it.
+     * - PermissionDenied: the caller lacks the access resource's `write` or a
+     *   resolved `requires` permission.
+     * - NotFound: the namespace does not exist.
+     * - Unavailable, with error code `KIND_NOT_INSTALLED`: no installed app
+     *   declares a kind of that name; retryable (an app and its objects
+     *   applied together converge on retry).
+     * - Aborted: `expected_version` does not match (the object changed since
+     *   it was read; read it again and apply on top).
+     * - FailedPrecondition: the kind is orphaned; the object is being
+     *   deleted; it is managed by an app and `force` is not set.
+     * - ResourceExhausted: the kind already holds `max_objects` objects.
+     *
+     * @generated from rpc legion.Manager.ApplyObject
+     */
+    applyObject: {
+      name: "ApplyObject",
+      I: ApplyObjectRequest,
+      O: ApplyObjectReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Shows one object (`legion object get KIND NAME`): its spec (stored,
+     * with defaults) and effective spec (plus defaults of fields an upgrade
+     * added), the status its app reported, the derived `summary` (`Ready`,
+     * `NotReady: <reason>`, `Pending`, …), its `uid`, `generation`,
+     * `spec_version`, labels, `authority`, `managed_by`, who wrote it and
+     * when, and its state: `valid`, `invalid` (the spec fails the kind's
+     * current schema), or `orphaned`. `writeOnly` values read as
+     * `<redacted>`. `kind` may be a short name (`repo`, `repos`) when exactly
+     * one kind has it, else qualified.
+     *
+     * ACL: `read` on the kind's access resource on the object's scope,
+     * checked before the object is looked up, so a caller without it gets
+     * PermissionDenied whether or not the object exists. An orphaned kind's
+     * objects keep its recorded access.
+     *
+     * Errors:
+     * - InvalidArgument: an unknown or ambiguous kind (the message lists the
+     *   qualified names).
+     * - PermissionDenied: the caller may not read objects of the kind there.
+     * - NotFound: no such object.
+     *
+     * @generated from rpc legion.Manager.GetObject
+     */
+    getObject: {
+      name: "GetObject",
+      I: GetObjectRequest,
+      O: GetObjectReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists objects (`legion object list [KIND]`): of one kind, or of every
+     * kind when `kind` is empty, in the selected namespaces (names or
+     * `*`-globs; empty means `default`; `*` every namespace). Cluster-scoped
+     * kinds' objects are listed whatever namespaces are asked for. `labels`
+     * keeps only objects carrying every given label value. Each object comes
+     * with its summary; the reply also carries the listed objects' kinds, for
+     * their columns.
+     *
+     * ACL: gated on `read` on the kind's access resource anywhere (any
+     * kind's, or `object`, when no kind is named), then filtered per object
+     * on its scope.
+     *
+     * Errors:
+     * - InvalidArgument: an unknown or ambiguous kind, or a bad namespace
+     *   selector.
+     * - PermissionDenied: the caller may not read the kind anywhere.
+     *
+     * @generated from rpc legion.Manager.ListObjects
+     */
+    listObjects: {
+      name: "ListObjects",
+      I: ListObjectsRequest,
+      O: ListObjectsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Deletes one object (`legion object delete KIND NAME`). Needs what an
+     * apply needs: `write` on the kind's access resource on the object's
+     * scope (checked before the lookup), then the object's `requires`
+     * resolved against its spec, and `force` for a person deleting an object
+     * an app manages. `expected_version` is a compare-and-set on the stored
+     * `spec_version`.
+     *
+     * For a kind with a bounded `cleanup`, the delete marks the object
+     * deleting (`deleted = false`, `deleting = true`): its spec freezes, its
+     * app sees it on its watch and calls ReleaseObject when it has cleaned
+     * up, and at the kind's deadline (or at once if the kind is orphaned) the
+     * manager removes it anyway (`object.cleanup_abandoned`). `now` skips the
+     * cleanup and removes the object at once, with the same rights. The app's
+     * validate call is never asked. Emits `object.deleting` or
+     * `object.deleted`.
+     *
+     * Retry-safe with `idempotency_key`.
+     *
+     * Errors:
+     * - InvalidArgument: an unknown or ambiguous kind.
+     * - PermissionDenied: the caller may not write objects of the kind there,
+     *   or lacks a resolved `requires` permission.
+     * - NotFound: no such object.
+     * - Aborted: `expected_version` does not match.
+     * - FailedPrecondition: the object is managed by an app and `force` is not
+     *   set.
+     *
+     * @generated from rpc legion.Manager.DeleteObject
+     */
+    deleteObject: {
+      name: "DeleteObject",
+      I: DeleteObjectRequest,
+      O: DeleteObjectReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Streams the calling app's objects (docs/app-objects.md, "Inside the
+     * app"): every object of every active kind the app declares, or of
+     * `kinds`, with its uid, spec (with `writeOnly` values: the owning app is
+     * the only reader that sees them), effective spec, generation,
+     * spec version, the stored status at the time it was read, whether it is
+     * being deleted and the cleanup deadline, its state, and its shard.
+     *
+     * The snapshot comes first, in messages of at most 1,000 objects: the
+     * first has `snapshot` set, the last `snapshot_done`. Later messages carry
+     * upserts (any write of an object: spec, labels, authority, the deleting
+     * mark; or a state that changed with its kind) and tombstones (`deletes`,
+     * with each object's uid). Status writes do not wake the watch. Every
+     * message's `sequence` increases by one. `invalid` objects are included,
+     * flagged; orphaned kinds' objects are not. A reconnect starts with a
+     * fresh snapshot; a uid the app held but the snapshot lacks was deleted.
+     * The manager checks a fingerprint of the app's objects and kinds about
+     * once a second; any manager answers.
+     *
+     * `shard_count` and `shards` split the objects across an app's replicas:
+     * an object belongs to shard FNV-1a-64(`<app>/<Kind>:<namespace>/<name>`,
+     * or `<app>/<Kind>:<name>` for a cluster kind) modulo `shard_count`, the
+     * hash the autoscaler's shard leases use; with 64 shards the filter runs
+     * in the query.
+     *
+     * ACL: app-plane. Only an app's own workload identity may call it (its
+     * `legion` token, through the API socket or as a bearer token, or an ACL
+     * token minted from it), and it returns only that app's objects: `app`
+     * must be empty or name the caller. A management token may name any
+     * installed `app`. An app acting as a viewer (`legion-on-behalf-of`) is
+     * refused. Re-checks the caller's credential periodically.
+     *
+     * Errors:
+     * - Unauthenticated: no credential.
+     * - PermissionDenied: the caller is not an app's workload identity, or
+     *   names another app.
+     * - InvalidArgument: a shard outside `shard_count`, a kind the app does
+     *   not declare, or a management caller that names no app.
+     * - NotFound: `app` is not installed.
+     *
+     * @generated from rpc legion.Manager.WatchObjects
+     */
+    watchObjects: {
+      name: "WatchObjects",
+      I: WatchObjectsRequest,
+      O: ObjectEvent,
+      kind: MethodKind.ServerStreaming,
+    },
+    /**
+     * Reports one object's status: what the app that owns its kind says
+     * about it (docs/app-objects.md, "Status"). The status is
+     * `{ observed_generation, conditions, fields }`: standard conditions are
+     * `Accepted` (the app understood and accepted the spec) and `Ready`
+     * (reconciled and working); `fields` is the app's own payload, checked
+     * against the kind's status schema. Limits: `fields` at most 16 KiB, at
+     * most 16 conditions, a message at most 1 KiB. Each condition's `since` is
+     * kept by the manager.
+     *
+     * Status is stored on the Status lane, keyed by the object's `uid`, apart
+     * from the spec: it never changes `spec_version`, `generation`, or the
+     * spec, and never wakes a watch. The write is refused unless `uid` is the
+     * current object's, `observed_generation` is not ahead of the generation
+     * this manager sees, and not behind the stored one (it never goes
+     * backwards). Because the Status lane may lag the Control lane, readers
+     * compare `observed_generation` with `generation`. An identical report is
+     * dropped without a write (`written = false`). An `Accepted` or `Ready`
+     * transition emits `object.status_changed`. Status is for facts that
+     * change when the world changes, not per-tick telemetry.
+     *
+     * ACL: app-plane. Only the workload identity of the app that owns the
+     * kind (`kind` is the app's kind name, or qualified), or a management
+     * token. Never a delegated identity, and never a person. Retry-safe with
+     * `idempotency_key`.
+     *
+     * Errors:
+     * - Unauthenticated / PermissionDenied: not the owning app.
+     * - InvalidArgument: a bad condition, `fields` failing the status schema
+     *   or too large; an unknown kind.
+     * - NotFound: no object of that name with that `uid`.
+     * - Aborted: `observed_generation` is ahead of the object, or behind the
+     *   stored status.
+     *
+     * @generated from rpc legion.Manager.UpdateObjectStatus
+     */
+    updateObjectStatus: {
+      name: "UpdateObjectStatus",
+      I: UpdateObjectStatusRequest,
+      O: UpdateObjectStatusReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Ends a deleting object's bounded cleanup (docs/app-objects.md,
+     * "Deleting"): the app that owns the kind has released what it held for
+     * the object, and the object is removed (`object.deleted`). `uid` must be
+     * the deleting object's, so a release never removes an object recreated
+     * under the same name.
+     *
+     * ACL: app-plane, like UpdateObjectStatus: the owning app's workload
+     * identity, or a management token. Retry-safe with `idempotency_key`.
+     *
+     * Errors:
+     * - Unauthenticated / PermissionDenied: not the owning app.
+     * - NotFound: no object of that name with that `uid`.
+     * - FailedPrecondition: the object is not being deleted.
+     *
+     * @generated from rpc legion.Manager.ReleaseObject
+     */
+    releaseObject: {
+      name: "ReleaseObject",
+      I: ReleaseObjectRequest,
+      O: ReleaseObjectReply,
+      kind: MethodKind.Unary,
     },
     /**
      * Lists the UI extensions installed apps register (docs/apps.md, "Views
