@@ -6451,6 +6451,10 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         forced removal at the deadline; no collision between a NodeGroup
         and a ScalingPolicy of one name; recreate inherits no pause; objects
         follow the replicas' shards.
+  - [x] Fixed on the way: `object` was missing from the grant resources
+        (`grant::resource_named`), so an app's permission rule naming
+        `object` (or `*`) skipped the installer's coverage check for it;
+        a unit test now holds every ACL resource to it.
 
 - [x] **App-owned object kinds, Phase O1: the generic system**
       (2026-10-29, branch `claude/app-objects`;

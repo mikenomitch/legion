@@ -876,23 +876,26 @@ impl Engine {
     }
 
     /// How many policies the caches hold: task policies, and the app's
-    /// ScalingPolicies and NodeGroups (`None` before the first policy set,
-    /// or while an object watch has not completed its first snapshot).
+    /// ScalingPolicies and NodeGroups (`None` before the first policy set).
     pub fn policy_count(&self) -> Option<usize> {
         let tasks = self
             .policies
             .read()
             .ok()
             .and_then(|cache| cache.as_ref().map(|cache| cache.tasks.len()))?;
-        let mut count = tasks;
-        for cache in [&self.policy_objects, &self.group_objects] {
-            let cache = cache.read().ok()?;
-            if !cache.synced() {
-                return None;
-            }
-            count += cache.len();
-        }
-        Some(count)
+        let objects: usize = [&self.policy_objects, &self.group_objects]
+            .iter()
+            .filter_map(|cache| cache.read().ok().map(|cache| cache.len()))
+            .sum();
+        Some(tasks + objects)
+    }
+
+    /// Whether both object watches (ScalingPolicies, NodeGroups) have
+    /// completed their first snapshot since they last (re)connected.
+    pub fn objects_synced(&self) -> bool {
+        [&self.policy_objects, &self.group_objects]
+            .iter()
+            .all(|cache| cache.read().is_ok_and(|cache| cache.synced()))
     }
 
     /// Replace the policy cache's task policies (tests, or a caller with

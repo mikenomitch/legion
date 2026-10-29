@@ -109,9 +109,6 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetScalingStatus", Plane::Protected("scale:read")),
         ("GetScaleHistory", Plane::Protected("scale:read")),
         ("PauseScaling", Plane::Protected("scale:write")),
-        // Standalone policies (`legion scaling apply`): scoped like a job
-        // named after the policy, in its namespace. A node-group policy
-        // also needs operator:write and node:write (checked after parse).
         // Node autoscaling's demand read: node-scoped (it sizes node
         // groups), and names only the jobs the caller can read.
         ("GetCapacityDemand", Plane::Protected("node:read")),

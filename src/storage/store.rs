@@ -55,8 +55,8 @@ mod scaling_ops;
 // Task autoscaling's state: scale writes with compare-and-set, pins,
 // history, pauses, the cluster's scaling defaults, policy snapshots.
 mod autoscale_ops;
-// Standalone scaling policies (`legion scaling apply`).
-// Their action intents (`RecordScalingAction`), compare-and-set.
+// The autoscaler's action intents (`RecordScalingAction`), compare-and-set,
+// and the sweep of deleted objects' scaling state.
 mod scaling_action_ops;
 // Jobspec extensions: the jobs holding values, and cheap fingerprints.
 mod extension_ops;

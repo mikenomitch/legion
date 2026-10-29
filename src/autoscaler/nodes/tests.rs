@@ -156,8 +156,9 @@ fn a_retiring_group_drains_everything_and_retires_test() {
     o.retiring = true;
     // Busy, just seen, a budget of one: every member is a victim anyway.
     let decision = decide(&policy, &mut state, &o, min(0), &no_fit);
+    // The emptiest first, as scale-in orders them.
     let victims: Vec<&str> = decision.victims.iter().map(|v| v.node.as_str()).collect();
-    assert_eq!(victims, vec!["a", "b", "c"], "{}", decision.summary);
+    assert_eq!(victims, vec!["b", "a", "c"], "{}", decision.summary);
     assert_eq!(decision.to, decision.from, "nothing is added");
     assert!(!decision.retired);
     assert!(decision

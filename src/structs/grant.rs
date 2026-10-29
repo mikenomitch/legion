@@ -202,6 +202,7 @@ pub fn resource_named(name: &str) -> Option<AclResource> {
         AclResource::Snapshot,
         AclResource::Namespace,
         AclResource::App,
+        AclResource::Object,
     ];
     ALL.iter()
         .copied()
@@ -475,6 +476,16 @@ fn reserved_is_why(rules: &[AclRule], atom: &Atom<'_>) -> bool {
 mod grant_test {
     use super::*;
     use crate::structs::acl::{parse_rules, AclSource};
+
+    /// Every ACL resource is one a grant can name: a resource missing here
+    /// would drop out of the coverage check, so a grant asking for it would
+    /// pass unchecked.
+    #[test]
+    fn every_acl_resource_is_a_grant_resource_test() {
+        for name in AclResource::all() {
+            assert!(resource_named(name).is_some(), "{name}");
+        }
+    }
 
     fn identity(rules_json: &str) -> AclIdentity {
         AclIdentity {

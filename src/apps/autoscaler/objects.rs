@@ -402,7 +402,8 @@ mod tests {
             "target": { "plugin": "noop" },
             "min": 0, "max": 10,
             "checks": [{ "name": "q", "source": "prom", "query": "sum(q)",
-                         "strategy": { "name": "per-replica", "value": 10 } }],
+                         "strategy": { "name": "per-replica", "value": 10 },
+                         "activation": 0 }],
         })
     }
 

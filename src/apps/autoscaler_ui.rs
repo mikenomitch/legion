@@ -1293,9 +1293,9 @@ fn render_node(
             tone: Tone::Info,
             title: None,
             text: format!(
-                "No node-group policy runs {group}: nothing adds or removes its nodes on its \
-                 own. `legion scaling apply` a policy named {group} to scale it. The demand \
-                 above is what `legion scaling demand --like-node {}` reports.",
+                "No NodeGroup runs {group}: nothing adds or removes its nodes on its own. \
+                 `legion object apply` an autoscaler/NodeGroup named {group} to scale it. The \
+                 demand above is what `legion scaling demand --like-node {}` reports.",
                 node.id
             ),
         })),
@@ -1682,12 +1682,7 @@ mod tests {
         let view = render_node(&one, "general", &members, demand(), None);
         valid(&view, Slot::Node);
         let text = serde_json::to_string(&view).unwrap();
-        for needle in [
-            "jt-1",
-            "i-0abc",
-            "/nodes/w-2",
-            "No node-group policy runs general",
-        ] {
+        for needle in ["jt-1", "i-0abc", "/nodes/w-2", "No NodeGroup runs general"] {
             assert!(text.contains(needle), "{needle}: {text}");
         }
 

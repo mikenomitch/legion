@@ -1279,9 +1279,9 @@ pub mod drafts {
         })))
     }
 
-    /// `scale.limited`, `scale.flapping`, `scale.check_failed` for a
-    /// standalone scaling policy (`legion scaling apply`): the same state
-    /// changes, named by the policy instead of a job.
+    /// `scale.limited`, `scale.flapping`, `scale.check_failed` for one of
+    /// the autoscaler's objects (a ScalingPolicy or a NodeGroup): the same
+    /// state changes, named by the object instead of a job.
     pub fn scale_policy_flag(
         kind: &str,
         object: &ObjectTarget<'_>,

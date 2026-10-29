@@ -976,6 +976,7 @@ stdin (`{ "apiVersion": 1, "op": "scale", "policy": "media/render-farm",
 "config": { "pool": "gpu" }, "desired": 9, "decision": "d-81f3a2c0" }`), and
 a JSON reply on stdout (`status` answers `{ "count": 7, "ready": 7 }`). The
 command comes from the app config, never the policy.
+
 ## Node groups
 
 A **node group** is a pool plus a template: machines a provider (an AWS
@@ -1430,9 +1431,10 @@ Unfittable (no template can host them):
     general: permit: task train's permit does not tolerate pool "default"
 ```
 
-Several templates at once, from a file (Nickel or JSON): a node-group policy
-(its `name` and `target.nodes` are the template), a bare template, or a list
-of either:
+Several templates at once, from a file (Nickel or JSON): an
+`autoscaler/NodeGroup` object (its name and `spec.target.nodes` are the
+template, so the file you apply works as is), a bare template, or a list of
+either:
 
 ```nickel
 # groups.ncl  —  legion scaling demand -f groups.ncl -j

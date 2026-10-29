@@ -1,22 +1,26 @@
 //! Node-group autoscaling: the policy spec and the pure decisions behind it
 //! (autoscaler v2 plan §6.11, calls entries 7 and 16).
 //!
-//! A node group is a pool plus a template. Its policy is a standalone object
-//! (`legion scaling apply nodes.ncl` stores it, from Phase 4 on):
+//! A node group is a pool plus a template. Its policy is the spec of an
+//! `autoscaler/NodeGroup` object (`legion object apply -f nodes.ncl`; the
+//! object's name is the group's, [`crate::autoscaler::policy::parse_node_group`]):
 //!
 //! ```nickel
 //! {
+//!   kind = "autoscaler/NodeGroup",
 //!   name = "workers-general",
-//!   target = { nodes = {
-//!     pool = "default", workerType = "default",
-//!     shape = { cpu = 8000, memory = 16384, attributes = { arch = "amd64" } },
-//!     plugin = "aws-asg", config = { asg = "legion-workers" },
-//!   } },
-//!   min = 1, max = 20,
-//!   up   = { step = { replicas = 5 }, every = "2m", joinTimeout = "10m" },
-//!   down = { when = "empty", for = "10m", step = { percent = 10, replicas = 1 },
-//!            every = "5m", drainDeadline = "10m" },
-//!   expander = "least-waste",
+//!   spec = {
+//!     target = { nodes = {
+//!       pool = "default", workerType = "default",
+//!       shape = { cpu = 8000, memory = 16384, attributes = { arch = "amd64" } },
+//!       plugin = "aws-asg", config = { asg = "legion-workers" },
+//!     } },
+//!     min = 1, max = 20,
+//!     up   = { step = { replicas = 5 }, every = "2m", joinTimeout = "10m" },
+//!     down = { when = "empty", for = "10m", step = { percent = 10, replicas = 1 },
+//!              every = "5m", drainDeadline = "10m" },
+//!     expander = "least-waste",
+//!   },
 //! }
 //! ```
 //!
@@ -418,7 +422,7 @@ impl EffectiveNodeGroup {
 }
 
 /// `field: old -> new` for every field of the effective record that
-/// differs (`legion scaling apply --dry-run`'s diff for a node group).
+/// differs.
 pub fn changed_fields(before: &EffectiveNodeGroup, after: &EffectiveNodeGroup) -> Vec<String> {
     fn flatten(prefix: &str, value: &Value, out: &mut BTreeMap<String, String>) {
         match value {
@@ -666,8 +670,9 @@ impl NodeGroupPolicy {
         })
     }
 
-    /// The JSON schema of a node-group policy, for `scaling apply`,
-    /// editors and agents.
+    /// The JSON schema of a node-group policy, as written in an
+    /// `autoscaler/NodeGroup` object's spec (with `name` taken from the
+    /// object; [`crate::autoscaler::policy::node_group_schema`]).
     pub fn json_schema_value() -> Value {
         serde_json::to_value(schemars::schema_for!(NodeGroupPolicy))
             .expect("node group schema should serialize")

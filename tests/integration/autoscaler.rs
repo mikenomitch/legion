@@ -340,8 +340,11 @@ impl Harness {
     ) -> R<(Engine, tokio::task::JoinHandle<()>)> {
         let engine = Engine::new(self.client.clone(), options, T0);
         let watch = engine.spawn_watch();
+        // With the app installed (its kinds registered), its objects too:
+        // a harness that never installs it has no objects to watch.
+        let objects = self.store.get_app("autoscaler")?.is_some();
         let deadline = Instant::now() + Duration::from_secs(20);
-        while engine.policy_count().unwrap_or(0) == 0 {
+        while engine.policy_count().unwrap_or(0) == 0 || (objects && !engine.objects_synced()) {
             anyhow::ensure!(Instant::now() < deadline, "no policy arrived on the watch");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
