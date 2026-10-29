@@ -179,6 +179,77 @@ fn namespace_policy_delete_schema() -> Value {
     })
 }
 
+fn object_kinds_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "app": { "type": "string", "description": "Only this app's kinds." } },
+        "additionalProperties": false
+    })
+}
+
+fn object_list_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": { "type": "string", "description": "The kind: <app>/<Kind> (gitops/Repo), or a short name exactly one installed kind has (repo, repos). Omit for every kind." },
+            "namespaces": { "type": "array", "items": { "type": "string" }, "description": "Namespaces or globs; [\"*\"] for every namespace you can read. Default: `default`." },
+            "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Only objects carrying all of these labels." }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn object_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": { "type": "string", "description": "The kind: <app>/<Kind>, or a unique short name." },
+            "name": { "type": "string", "description": "The object's name, or namespace/name." },
+            "namespace": { "type": "string", "description": "The namespace (namespaced kinds; default `default`)." }
+        },
+        "required": ["kind", "name"],
+        "additionalProperties": false
+    })
+}
+
+fn object_apply_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "object": {
+                "type": "object",
+                "description": "The object: { kind: \"<app>/<Kind>\" (qualified), name, namespace?, labels?, spec }. legion_object_kinds gives each kind's schema; unknown fields are errors. status is the app's and is refused here."
+            },
+            "namespace": { "type": "string", "description": "The namespace when the object does not name one (default `default`)." },
+            "dry_run": { "type": "boolean", "description": "Validate (schema, required permissions, the app's advice) and return the field diff without writing." },
+            "expected_version": { "type": "integer", "minimum": 0, "description": "Only write if the object is at this specVersion; 0 means only if it does not exist." },
+            "force": { "type": "boolean", "description": "Change an object an app manages (managedBy)." },
+            "wait": { "type": "boolean", "description": "After writing, wait until the app reports this generation: Ready or Accepted succeeds; Rejected, NotReady, Invalid or Orphaned fails." },
+            "timeout_seconds": { "type": "integer", "minimum": 1, "description": "How long wait waits (default 120)." },
+            "idempotency_key": { "type": "string" }
+        },
+        "required": ["object"],
+        "additionalProperties": false
+    })
+}
+
+fn object_delete_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": { "type": "string", "description": "The kind: <app>/<Kind>, or a unique short name." },
+            "name": { "type": "string", "description": "The object's name, or namespace/name." },
+            "namespace": { "type": "string" },
+            "expected_version": { "type": "integer", "minimum": 1, "description": "Only delete if the object is at this specVersion." },
+            "now": { "type": "boolean", "description": "Skip the kind's cleanup window and remove the object at once." },
+            "force": { "type": "boolean", "description": "Delete an object an app manages." },
+            "idempotency_key": { "type": "string" }
+        },
+        "required": ["kind", "name"],
+        "additionalProperties": false
+    })
+}
+
 fn name_arg_schema() -> Value {
     json!({
         "type": "object",
@@ -250,6 +321,36 @@ fn tool_defs() -> Vec<ToolDef> {
             name: "legion_namespace_policy_delete",
             description: "Delete a namespace policy (needs acl:write).",
             input_schema: namespace_policy_delete_schema,
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_object_kinds",
+            description: "List the object kinds installed apps declare (Legion's custom resources): each kind's qualified name (<app>/<Kind>), scope (namespaced or cluster), access (the permission that governs its objects), requires (what writing one also needs of the writer), JSON schema of spec and status fields, examples, columns, cleanup window and state (active, or orphaned when its app no longer declares it) (docs/app-objects.md).",
+            input_schema: object_kinds_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_object_list",
+            description: "List objects of one kind, or of every kind, with their spec, the app-reported status (conditions Accepted/Ready, observedGeneration, fields) and a summary (Ready, Accepted, Pending, NotReady: <reason>, Rejected: <reason>, Stale, Invalid, Deleting, Orphaned). Needs read on each kind's access.",
+            input_schema: object_list_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_object_get",
+            description: "Show one object: spec (writeOnly fields redacted), effective spec, status, summary, generation vs status.observedGeneration, specVersion (for expected_version), labels, managedBy, the authority recorded when it was written, and whether it is being deleted.",
+            input_schema: object_ref_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_object_apply",
+            description: "Create or update an object of an installed kind. The manager checks the spec against the kind's closed schema (unknown fields fail with a did-you-mean), checks what writing it requires of you (fail-closed), and asks the app's validator (advice only). Run with dry_run first to see the diff. wait returns once the app has reconciled the new generation.",
+            input_schema: object_apply_schema,
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_object_delete",
+            description: "Delete an object. A kind with a cleanup window marks it deleting (spec frozen) until its app releases it or the window ends; now skips that. Needs write on the kind's access and what its requires names.",
+            input_schema: object_delete_schema,
             mutates: true,
         },
         ToolDef {
@@ -1735,6 +1836,63 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 }),
             )
             .await
+        }
+        "legion_object_kinds" => {
+            let mut client = connect().await?;
+            grpc(
+                client.list_object_kinds(crate::structs::ListObjectKindsRequest {
+                    app: opt_str_arg(&args, "app").unwrap_or_default(),
+                }),
+            )
+            .await
+            .map(decode_object_json)
+        }
+        "legion_object_list" => {
+            let labels = args
+                .get("labels")
+                .and_then(Value::as_object)
+                .map(|labels| {
+                    labels
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut client = connect().await?;
+            grpc(client.list_objects(crate::structs::ListObjectsRequest {
+                kind: opt_str_arg(&args, "kind").unwrap_or_default(),
+                namespaces: namespaces_arg(&args),
+                labels,
+            }))
+            .await
+            .map(decode_object_json)
+        }
+        "legion_object_get" => {
+            let mut client = connect().await?;
+            grpc(client.get_object(crate::structs::GetObjectRequest {
+                kind: str_arg(&args, "kind")?,
+                name: str_arg(&args, "name")?,
+                namespace: opt_str_arg(&args, "namespace").unwrap_or_default(),
+            }))
+            .await
+            .map(decode_object_json)
+        }
+        "legion_object_apply" => object_apply_tool(args).await,
+        "legion_object_delete" => {
+            let mut client = connect().await?;
+            grpc(client.delete_object(crate::structs::DeleteObjectRequest {
+                kind: str_arg(&args, "kind")?,
+                name: str_arg(&args, "name")?,
+                namespace: opt_str_arg(&args, "namespace").unwrap_or_default(),
+                expected_version: args.get("expected_version").and_then(Value::as_u64),
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                now: args.get("now").and_then(Value::as_bool).unwrap_or(false),
+                force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
+            }))
+            .await
+            .map(decode_object_json)
         }
         "legion_namespace_policy_delete" => {
             let name = str_arg(&args, "name")?;
@@ -3277,6 +3435,109 @@ where
     }
 }
 
+/// `legion_object_apply`: apply, then (with `wait`) wait for the app to
+/// reconcile the new generation, as `legion object apply --wait` does.
+async fn object_apply_tool(args: Value) -> Result<Value, String> {
+    let object = args
+        .get("object")
+        .filter(|object| object.is_object())
+        .ok_or_else(|| "missing object argument: { kind, name, spec }".to_string())?;
+    let mut client = connect().await?;
+    let reply = client
+        .apply_object(crate::structs::ApplyObjectRequest {
+            object_json: object.to_string(),
+            namespace: opt_str_arg(&args, "namespace").unwrap_or_default(),
+            dry_run: args
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            expected_version: args.get("expected_version").and_then(Value::as_u64),
+            idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
+        })
+        .await;
+    let reply = match reply {
+        Ok(reply) => reply.into_inner(),
+        Err(status) => {
+            let err = CliError::from_status("request failed", &status);
+            return Err(
+                serde_json::to_string(&err).unwrap_or_else(|_| status.message().to_string())
+            );
+        }
+    };
+    let mut value = decode_object_json(serde_json::to_value(&reply).map_err(|e| e.to_string())?);
+    let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
+    if let (true, false, Some(object)) = (wait, reply.dry_run, reply.object.as_ref()) {
+        let timeout = std::time::Duration::from_secs(
+            args.get("timeout_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(120)
+                .clamp(1, 3600),
+        );
+        let waited = crate::cmd::object::wait_for_ready(
+            &mut client,
+            &object.qualified_kind,
+            &object.namespace,
+            &object.name,
+            object.generation,
+            timeout,
+        )
+        .await?;
+        value["waited"] = decode_object_json(
+            json!({ "object": serde_json::to_value(&waited).map_err(|e| e.to_string())? }),
+        )["object"]
+            .take();
+    }
+    Ok(value)
+}
+
+/// The JSON-text fields of object replies (`specJson`, `effectiveJson`,
+/// `fieldsJson`, `permissionsJson`, kinds' schemas), decoded in place so an
+/// agent reads them as JSON rather than strings inside JSON.
+fn decode_object_json(mut reply: Value) -> Value {
+    const OBJECT_FIELDS: [&str; 2] = ["specJson", "effectiveJson"];
+    const KIND_FIELDS: [&str; 4] = [
+        "schemaJson",
+        "statusSchemaJson",
+        "examplesJson",
+        "requiresJson",
+    ];
+    fn decode(value: &mut Value, keys: &[&str]) {
+        for key in keys {
+            let parsed = value
+                .get(*key)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .and_then(|text| serde_json::from_str::<Value>(text).ok());
+            if let Some(parsed) = parsed {
+                value[*key] = parsed;
+            }
+        }
+    }
+    fn object(value: &mut Value) {
+        decode(value, &OBJECT_FIELDS);
+        if let Some(status) = value.get_mut("status").filter(|v| v.is_object()) {
+            decode(status, &["fieldsJson"]);
+        }
+        if let Some(authority) = value.get_mut("authority").filter(|v| v.is_object()) {
+            decode(authority, &["permissionsJson"]);
+        }
+    }
+    if let Some(found) = reply.get_mut("object").filter(|v| v.is_object()) {
+        object(found);
+    }
+    if let Some(Value::Array(objects)) = reply.get_mut("objects") {
+        objects.iter_mut().for_each(object);
+    }
+    if let Some(kind) = reply.get_mut("kind").filter(|v| v.is_object()) {
+        decode(kind, &KIND_FIELDS);
+    }
+    if let Some(Value::Array(kinds)) = reply.get_mut("kinds") {
+        kinds.iter_mut().for_each(|kind| decode(kind, &KIND_FIELDS));
+    }
+    reply
+}
+
 /// `NodeMsg` fields that carry JSON as text on the wire.
 const NODE_JSON_FIELDS: [&str; 4] = [
     "configAttrs",
@@ -3588,6 +3849,30 @@ mod tests {
         assert!(!names.contains(&"legion_instance_start"));
         assert!(!names.contains(&"legion_instance_promote"));
         assert!(!names.contains(&"legion_instance_destroy"));
+    }
+
+    #[test]
+    fn object_tools_gate_writes_test() {
+        let read: Vec<&str> = available_tools(false).iter().map(|t| t.name).collect();
+        for name in [
+            "legion_object_kinds",
+            "legion_object_list",
+            "legion_object_get",
+        ] {
+            assert!(read.contains(&name), "{name}");
+        }
+        assert!(!read.contains(&"legion_object_apply"));
+        assert!(!read.contains(&"legion_object_delete"));
+        let write: Vec<&str> = available_tools(true).iter().map(|t| t.name).collect();
+        assert!(write.contains(&"legion_object_apply"));
+        assert!(write.contains(&"legion_object_delete"));
+        let decoded = decode_object_json(json!({
+            "object": { "specJson": "{\"url\":\"x\"}", "status": { "fieldsJson": "{\"n\":1}" } },
+            "kinds": [{ "schemaJson": "{\"type\":\"object\"}" }],
+        }));
+        assert_eq!(decoded["object"]["specJson"]["url"], "x");
+        assert_eq!(decoded["object"]["status"]["fieldsJson"]["n"], 1);
+        assert_eq!(decoded["kinds"][0]["schemaJson"]["type"], "object");
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub mod namespace_policy;
 pub mod net;
 pub mod net_plugin;
 pub mod node;
+pub mod object;
 pub mod oidc;
 pub mod output;
 pub mod raft;
@@ -70,6 +71,7 @@ fn base_cli() -> Command {
         .subcommand(scaling::config())
         .subcommand(app::config())
         .subcommand(namespace::config())
+        .subcommand(object::config())
         .subcommand(template::config())
         .subcommand(instance::config())
         .subcommand(node::config())
