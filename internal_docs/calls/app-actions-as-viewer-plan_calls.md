@@ -156,7 +156,7 @@ call. The repeated call can do nothing the first could not.
 `legion-on-behalf-of`:
 
 ```text
-PermissionDenied: legion-on-behalf-of covers single calls for the assertion's 60 seconds; streams take the caller's own credential
+PermissionDenied: legion-on-behalf-of: a delegation covers single calls for the assertion's 60 seconds; streams take the caller's own credential
 ```
 
 **Alternatives.** Carry the header into the stream's credential, so the
@@ -177,7 +177,9 @@ action needs one.
 wrong audience, expired, not an action, no delegation, viewer revoked,
 nothing left after the intersection) is `Unauthenticated` or
 `PermissionDenied`, logged under `acl_audit` as an `ACL denial` with
-`enforced = true`.
+`enforced = true`. The app plane (`ReportScalingStatus`,
+`RecordScalingAction`) likewise refuses a delegated identity before its
+audit-only bypass.
 
 **Alternatives.** In audit-only mode, log and continue as the app's own
 identity, as `enforce` does for policy denials.

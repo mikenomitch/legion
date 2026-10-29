@@ -27,15 +27,24 @@
 //! leave, so a handler bug shows up as a clear error here rather than a
 //! refusal at the manager.
 //!
+//! **Acting as the viewer.** An action's assertion also carries a
+//! delegation: the action's declared permission on the context.
+//! [`ActionRequest::client_as_viewer`] returns a Legion client that presents
+//! the assertion back in `legion-on-behalf-of` beside the app's own
+//! credential, so the manager runs its calls as `<viewer> via app <app>`,
+//! bounded by the delegation and by the app's grant (docs/apps.md, "Acting
+//! as the viewer").
+//!
 //! The keys come from the cluster: the framework fetches the issuer and the
 //! JWKS through `LEGION_ADDR`, the allocation's API socket, which needs
 //! workload identity on (`workloadIdentity.enabled`). Without it the app
 //! serves `/healthz` but refuses every view with 503.
 
+use crate::cmd::helpers::{AuthedManagerClient, ManagerConnection};
 use crate::prelude::*;
 use crate::structs::app_ui::{
     assertion_audience, assertion_mismatch, page_context, validate_view_value, AppView,
-    AssertionKind, AssertionScope, ViewContext, ViewerAssertion, ACTION_PATH_PREFIX,
+    AssertionKind, AssertionScope, Delegation, ViewContext, ViewerAssertion, ACTION_PATH_PREFIX,
     ASSERTION_CLAIM, ASSERTION_TTL_SECS, MAX_PAGE_BYTES, PAGE_PATH_PREFIX, VIEW_PATH_PREFIX,
 };
 use crate::structs::extensions::{
@@ -74,6 +83,9 @@ pub struct Viewer {
     /// globs where the viewer holds it. Filter cluster-wide rows by
     /// [`Viewer::sees_namespace`].
     pub namespaces: Vec<String>,
+    /// For an action: what [`ActionRequest::client_as_viewer`] may do as the
+    /// viewer (before the app's own grant bounds it).
+    pub delegation: Option<Delegation>,
 }
 
 impl Viewer {
@@ -84,6 +96,7 @@ impl Viewer {
             permission: assertion.permission.clone(),
             scope: assertion.scope,
             namespaces: assertion.namespaces.clone(),
+            delegation: assertion.delegation.clone(),
         }
     }
 
@@ -113,12 +126,64 @@ pub struct ViewRequest {
 
 /// An action request, verified. `inputs` are the action's declared inputs,
 /// checked and defaulted by the manager.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ActionRequest {
     pub action: String,
     pub context: ViewContext,
     pub inputs: Value,
     pub viewer: Viewer,
+    /// The viewer assertion the request carried, which the app presents
+    /// back to act as the viewer. Never logged.
+    assertion: String,
+}
+
+impl std::fmt::Debug for ActionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActionRequest")
+            .field("action", &self.action)
+            .field("context", &self.context)
+            .field("inputs", &self.inputs)
+            .field("viewer", &self.viewer)
+            .field("assertion", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ActionRequest {
+    /// A Legion client that acts as the viewer (docs/apps.md, "Acting as the
+    /// viewer"): it dials `LEGION_ADDR` like [`crate::apps::AppContext::client`],
+    /// the API socket still attaches the app's own token, and every call
+    /// also carries this action's viewer assertion in `legion-on-behalf-of`.
+    /// The manager runs those calls as `<viewer> via app <app>`, holding
+    /// only [`Viewer::delegation`] (the action's declared permission on its
+    /// context, and `read` there when the viewer holds it), within the
+    /// app's own grant, for the assertion's 60 seconds. Anything else is
+    /// `PermissionDenied`, whatever the app's own grant would allow.
+    pub async fn client_as_viewer(
+        &self,
+        context: &crate::apps::AppContext,
+    ) -> R<AuthedManagerClient> {
+        self.client_as_viewer_over(&context.connection()?)
+    }
+
+    /// [`Self::client_as_viewer`] over a connection the app already holds
+    /// (its own [`ManagerConnection`], which must present the app's own
+    /// identity: the manager refuses an assertion from anyone else).
+    pub fn client_as_viewer_over(&self, connection: &ManagerConnection) -> R<AuthedManagerClient> {
+        if self.viewer.delegation.is_none() {
+            bail!(
+                "this action's viewer assertion carries no delegation (the manager that signed \
+                 it predates acting as the viewer)"
+            );
+        }
+        connection.client_on_behalf_of(&self.assertion)
+    }
+
+    /// The raw viewer assertion, for an app that calls Legion its own way:
+    /// send it in `legion-on-behalf-of` with the app's own credential.
+    pub fn assertion(&self) -> &str {
+        &self.assertion
+    }
 }
 
 /// A submit's request to check this app's jobspec extension values
@@ -904,6 +969,7 @@ impl UiServer {
                     context,
                     inputs: inputs.unwrap_or_default(),
                     viewer,
+                    assertion: token.to_string(),
                 })
                 .await
                 {
@@ -960,6 +1026,7 @@ mod tests {
             permission: Some("scale:read".into()),
             scope: AssertionScope::Any,
             namespaces: vec!["team-*".into()],
+            delegation: None,
         };
         assert!(viewer.sees_namespace("team-a"));
         assert!(!viewer.sees_namespace("payments"));
@@ -1012,6 +1079,7 @@ mod tests {
             namespaces: Vec::new(),
             context: context(),
             inputs: inputs.map(crate::structs::app_ui::inputs_digest),
+            delegation: None,
         }
     }
 
@@ -1164,6 +1232,101 @@ mod tests {
             .await;
         assert_eq!(other_view.status, 403);
         assert_eq!(server.requests_seen(), 8);
+    }
+
+    /// An action's handler gets the raw assertion it ran on (to present
+    /// back as the viewer) and the delegation it carries; the request's
+    /// `Debug` never prints the token, and an assertion without a
+    /// delegation makes no viewer client.
+    #[tokio::test]
+    async fn an_action_gets_its_assertion_and_delegation_test() {
+        let issuer = issuer();
+        let registry = Arc::new(UiRegistry::default());
+        registry.action("go", |request: ActionRequest| async move {
+            assert!(!format!("{request:?}").contains(request.assertion()));
+            let connection = crate::cmd::helpers::manager_connection_with_token(
+                "http://127.0.0.1:1",
+                "app-token",
+                crate::cmd::helpers::ClientTimeouts {
+                    connect: None,
+                    request: None,
+                },
+            )?;
+            let viewer_client = request.client_as_viewer_over(&connection).is_ok();
+            Ok(ActionOutcome::done(format!(
+                "{} {} {viewer_client}",
+                request.assertion().len(),
+                request
+                    .viewer
+                    .delegation
+                    .as_ref()
+                    .map(Delegation::label)
+                    .unwrap_or_default()
+            )))
+        });
+        let keys = ClusterKeys {
+            issuer: ISSUER.into(),
+            jwks: issuer.jwks(),
+        };
+        let server = UiServer::new(
+            registry,
+            Some(Arc::new(AssertionVerifier::new(
+                "fake",
+                Arc::new(StaticKeys(keys)),
+            ))),
+        );
+        let inputs = json!({});
+        let mut claim = assertion(AssertionKind::Action, "go", Some(&inputs));
+        let body = json!({ "context": context(), "inputs": inputs }).to_string();
+        let run = |token: String| {
+            let server = &server;
+            let body = body.clone();
+            async move {
+                server
+                    .handle_at(
+                        "POST",
+                        "/legion/v1/actions/go",
+                        Some(&token),
+                        body.as_bytes(),
+                        NOW,
+                    )
+                    .await
+            }
+        };
+        let token = sign(
+            &issuer,
+            "app:fake",
+            Some(&claim),
+            "va_d0",
+            1_000_090,
+            1_000_150,
+        );
+        let ran = run(token.clone()).await;
+        assert_eq!(ran.status, 200, "{:?}", ran.body);
+        assert_eq!(ran.body["message"], format!("{}  false", token.len()));
+
+        claim.delegation = Some(
+            Delegation::new(
+                crate::structs::acl::AclResource::Job,
+                &[crate::structs::acl::AclAction::Write],
+                &crate::structs::acl::AclScope::job("web"),
+            )
+            .unwrap(),
+        );
+        let token = sign(
+            &issuer,
+            "app:fake",
+            Some(&claim),
+            "va_d1",
+            1_000_090,
+            1_000_150,
+        );
+        let ran = run(token.clone()).await;
+        assert_eq!(ran.status, 200, "{:?}", ran.body);
+        assert_eq!(
+            ran.body["message"],
+            format!("{} job:write on default/web true", token.len())
+        );
     }
 
     /// An action's assertion binds its inputs and is single-use.

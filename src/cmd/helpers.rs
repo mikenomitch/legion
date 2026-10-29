@@ -30,11 +30,14 @@ pub type AuthedManagerClient = ManagerClient<InterceptedService<Channel, AuthInt
 
 /// Attaches `authorization: Bearer <token>` to outgoing requests when a
 /// token is available (no-op otherwise, matching ACL-disabled clusters),
-/// and gives each bounded request its deadline.
+/// gives each bounded request its deadline, and, for an app acting as a
+/// viewer, stamps the viewer's assertion in `legion-on-behalf-of`
+/// ([`ManagerConnection::client_on_behalf_of`]).
 #[derive(Clone)]
 pub struct AuthInterceptor {
     token: Option<MetadataValue<Ascii>>,
     request_timeout: Option<Duration>,
+    on_behalf_of: Option<MetadataValue<Ascii>>,
 }
 
 impl Interceptor for AuthInterceptor {
@@ -43,6 +46,12 @@ impl Interceptor for AuthInterceptor {
             request
                 .metadata_mut()
                 .insert("authorization", token.clone());
+        }
+        if let Some(assertion) = &self.on_behalf_of {
+            request.metadata_mut().insert(
+                crate::structs::app_ui::ON_BEHALF_OF_HEADER,
+                assertion.clone(),
+            );
         }
         if let Some(timeout) = self.request_timeout {
             let unbounded = request
@@ -378,6 +387,42 @@ fn auth_interceptor(address: &str, request_timeout: Option<Duration>) -> AuthInt
     AuthInterceptor {
         token,
         request_timeout,
+        on_behalf_of: None,
+    }
+}
+
+/// A connection to a manager and the credential every client made from it
+/// presents. Clients share the connection: [`Self::client`] calls as the
+/// credential's own identity, and [`Self::client_on_behalf_of`] as an app
+/// acting for a viewer (docs/apps.md, "Acting as the viewer").
+#[derive(Clone)]
+pub struct ManagerConnection {
+    channel: Channel,
+    interceptor: AuthInterceptor,
+}
+
+impl ManagerConnection {
+    /// A client presenting the connection's own credential.
+    pub fn client(&self) -> AuthedManagerClient {
+        ManagerClient::with_interceptor(self.channel.clone(), self.interceptor.clone())
+    }
+
+    /// A client that also presents `assertion`, an action's viewer
+    /// assertion, in `legion-on-behalf-of` on every call: the manager then
+    /// authenticates it as `<viewer> via app <app>`, holding only the
+    /// assertion's delegation within the app's own grant. Only the app the
+    /// assertion was signed for may present it.
+    pub fn client_on_behalf_of(&self, assertion: &str) -> R<AuthedManagerClient> {
+        let assertion = assertion
+            .trim()
+            .parse::<MetadataValue<Ascii>>()
+            .context("the viewer assertion has non-ASCII characters")?;
+        let mut interceptor = self.interceptor.clone();
+        interceptor.on_behalf_of = Some(assertion);
+        Ok(ManagerClient::with_interceptor(
+            self.channel.clone(),
+            interceptor,
+        ))
     }
 }
 
@@ -393,8 +438,18 @@ pub fn connect_manager_client_at(
     address: &str,
     timeouts: ClientTimeouts,
 ) -> R<AuthedManagerClient> {
+    Ok(manager_connection_at(address, timeouts)?.client())
+}
+
+/// [`connect_manager_client_at`] as a [`ManagerConnection`], presenting the
+/// CLI's own token (`LEGION_TOKEN`, the token file; none on a task's API
+/// socket, which attaches the task's identity).
+pub fn manager_connection_at(address: &str, timeouts: ClientTimeouts) -> R<ManagerConnection> {
     let interceptor = auth_interceptor(address, timeouts.request);
-    connect_with_interceptor(address, timeouts, interceptor)
+    Ok(ManagerConnection {
+        channel: manager_channel(address, timeouts)?,
+        interceptor,
+    })
 }
 
 /// A client for the manager at `address` that presents `token` rather than
@@ -405,30 +460,36 @@ pub fn connect_manager_client_with_token(
     token: &str,
     timeouts: ClientTimeouts,
 ) -> R<AuthedManagerClient> {
+    Ok(manager_connection_with_token(address, token, timeouts)?.client())
+}
+
+/// [`connect_manager_client_with_token`] as a [`ManagerConnection`].
+pub fn manager_connection_with_token(
+    address: &str,
+    token: &str,
+    timeouts: ClientTimeouts,
+) -> R<ManagerConnection> {
     let token = format!("Bearer {}", token.trim())
         .parse::<MetadataValue<Ascii>>()
         .context("the token has non-ASCII characters")?;
-    let interceptor = AuthInterceptor {
-        token: Some(token),
-        request_timeout: timeouts.request,
-    };
-    connect_with_interceptor(address, timeouts, interceptor)
+    Ok(ManagerConnection {
+        channel: manager_channel(address, timeouts)?,
+        interceptor: AuthInterceptor {
+            token: Some(token),
+            request_timeout: timeouts.request,
+            on_behalf_of: None,
+        },
+    })
 }
 
-fn connect_with_interceptor(
-    address: &str,
-    timeouts: ClientTimeouts,
-    interceptor: AuthInterceptor,
-) -> R<AuthedManagerClient> {
+/// The channel to the manager at `address`, opened lazily.
+fn manager_channel(address: &str, timeouts: ClientTimeouts) -> R<Channel> {
     let address = address.to_owned();
     if let Some(path) = unix_socket_path(&address) {
         // A local socket (a task's API socket): no TLS, and the worker
         // behind it attaches the task's identity when the CLI sends no
         // token of its own.
-        return Ok(ManagerClient::with_interceptor(
-            unix_socket_channel(path, timeouts.connect),
-            interceptor,
-        ));
+        return Ok(unix_socket_channel(path, timeouts.connect));
     }
     let mut endpoint = Endpoint::from_shared(address.clone())
         .with_context(|| format!("invalid manager address: {address}"))?
@@ -467,8 +528,7 @@ fn connect_with_interceptor(
         endpoint
     };
 
-    let channel = endpoint.connect_lazy();
-    Ok(ManagerClient::with_interceptor(channel, interceptor))
+    Ok(endpoint.connect_lazy())
 }
 
 /// A client for one worker's plane (port 4848), for the commands that talk
@@ -1077,10 +1137,33 @@ mod tests {
         let mut interceptor = AuthInterceptor {
             token: None,
             request_timeout: timeout,
+            on_behalf_of: None,
         };
         interceptor
             .call(request)
             .expect("the interceptor never refuses")
+    }
+
+    /// A viewer client sends the app's own credential and the viewer's
+    /// assertion side by side; the app's own client sends no assertion.
+    #[test]
+    fn a_viewer_client_stamps_the_assertion_beside_the_token_test() {
+        let own = AuthInterceptor {
+            token: Some("Bearer app".parse().unwrap()),
+            request_timeout: None,
+            on_behalf_of: None,
+        };
+        let mut viewer = own.clone();
+        viewer.on_behalf_of = Some("a.b.c".parse().unwrap());
+        let request = viewer.call(tonic::Request::new(())).unwrap();
+        let header = crate::structs::app_ui::ON_BEHALF_OF_HEADER;
+        assert_eq!(request.metadata().get(header).unwrap(), "a.b.c");
+        assert_eq!(
+            request.metadata().get("authorization").unwrap(),
+            "Bearer app"
+        );
+        let request = own.clone().call(tonic::Request::new(())).unwrap();
+        assert!(request.metadata().get(header).is_none());
     }
 
     #[test]

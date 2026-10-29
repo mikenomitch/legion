@@ -536,6 +536,7 @@ async fn the_app_refuses_page_requests_without_a_page_assertion_test() -> R<()> 
             namespaces: Vec::new(),
             context: page_context(),
             inputs: None,
+            delegation: None,
         };
         let mut claims = serde_json::Map::new();
         claims.insert(ASSERTION_CLAIM.into(), serde_json::to_value(&claim)?);

@@ -728,6 +728,7 @@ async fn the_app_refuses_direct_calls_without_a_matching_assertion_test() -> R<(
             ..Default::default()
         },
         inputs: None,
+        delegation: None,
     };
 
     let (status, body) = get(path.clone(), None).await?;

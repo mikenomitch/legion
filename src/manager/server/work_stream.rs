@@ -125,7 +125,7 @@ impl ManagerDaemonService {
         // the first frame.
         let identity = self.authenticate_acl(&request)?;
         acl::enforce_worker_plane(&identity)?;
-        let credential = self.stream_credential(&request);
+        let credential = self.stream_credential(&request, &identity)?;
         let mut inbound = request.into_inner();
         let open = match inbound.message().await? {
             Some(StreamWorkRequest {

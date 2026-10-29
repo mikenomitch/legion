@@ -5,10 +5,11 @@
 //! the bundled autoscaler app seeded and placed on a manager node, its real
 //! views (`legion::apps::autoscaler_ui`) served by the app framework on
 //! loopback, and a forwarder that delivers to them as a worker does. The
-//! views call Legion with a token holding exactly the autoscaler's grant
-//! (its manifest's `permissions`), so a view that reads beyond it fails
-//! here. The engine runs a tick against the same service, so the job panel
-//! draws real status and the evaluation log.
+//! views call Legion with the app's own `legion` token, as its API socket
+//! would attach it, which holds exactly the autoscaler's grant (its
+//! manifest's `permissions`), so a view that reads beyond it fails here.
+//! The engine runs a tick against the same service, so the job panel draws
+//! real status and the evaluation log.
 //!
 //! - P6 acceptance: the job page shows the Autoscaling panel for an
 //!   autoscaled job; it renders nothing for a viewer without `scale:read` on
@@ -16,7 +17,9 @@
 //!   terminal (`legion app view autoscaler job web`) and over MCP.
 //! - The task badge, the sidebar page filtered by the viewer's namespaces,
 //!   and the node-group panel (hidden for a node in no group).
-//! - The Pause, Resume, and Release actions act on the job in their context.
+//! - The Pause, Resume, and Release actions act on the job in their context,
+//!   as the viewer: recorded by `alice via app autoscaler`
+//!   (app-actions-as-viewer plan); the app plane refuses a delegated call.
 
 // Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
 #![allow(clippy::result_large_err)]
@@ -25,15 +28,20 @@ use anyhow::{anyhow, Context};
 use legion::apps::autoscaler::{Engine, EngineOptions};
 use legion::apps::autoscaler_ui::AutoscalerUi;
 use legion::apps::ui::{AssertionVerifier, ClusterKeys, StaticKeys, UiRegistry, UiServer};
-use legion::cmd::helpers::{connect_manager_client_with_token, ClientTimeouts};
+use legion::cmd::helpers::{
+    connect_manager_client_with_token, manager_connection_with_token, ClientTimeouts,
+};
 use legion::manager::acl::Authenticator;
 use legion::manager::app_forward::AppForwarder;
 use legion::manager::apps::{AppReconciler, PassOutcome, ReconcilerSettings};
+use legion::manager::auth_method::ControlPlaneIdentityMethod;
 use legion::manager::server::ManagerDaemonService;
-use legion::manager::workload_identity::WorkloadIdentityState;
+use legion::manager::workload_identity::{claims_for_allocation, WorkloadIdentityState};
 use legion::storage::store::Store;
 use legion::structs::app::BuildMarker;
+use legion::structs::app_ui::ON_BEHALF_OF_HEADER;
 use legion::structs::manager_server::{Manager, ManagerServer};
+use legion::structs::workload_identity::{WorkloadIdentity, CONTROL_PLANE_IDENTITY_NAME};
 use legion::structs::*;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -149,6 +157,7 @@ impl AppForwarder for LoopbackForwarder {
 struct Fixture {
     svc: Arc<ManagerDaemonService>,
     store: Store,
+    state: Arc<WorkloadIdentityState>,
     admin: String,
     addr: String,
     app: Arc<UiServer>,
@@ -241,6 +250,15 @@ impl Fixture {
         action: &str,
         inputs: Value,
     ) -> Result<InvokeAppActionReply, tonic::Status> {
+        self.act_as(&self.admin, action, inputs).await
+    }
+
+    async fn act_as(
+        &self,
+        token: &str,
+        action: &str,
+        inputs: Value,
+    ) -> Result<InvokeAppActionReply, tonic::Status> {
         self.svc
             .invoke_app_action(req(
                 InvokeAppActionRequest {
@@ -250,10 +268,38 @@ impl Fixture {
                     inputs_json: inputs.to_string(),
                     idempotency_key: None,
                 },
-                &self.admin,
+                token,
             ))
             .await
             .map(tonic::Response::into_inner)
+    }
+
+    /// The `legion` token the manager would issue the autoscaler's
+    /// allocation: what its API socket attaches.
+    fn app_token(&self) -> R<String> {
+        let job = format!("legion-system/{APP}");
+        let allocation = self
+            .store
+            .allocs_for_job(&job)?
+            .into_iter()
+            .next()
+            .with_context(|| format!("{job} should be placed"))?;
+        let task = self
+            .store
+            .get_task_configs_for_job_config(&allocation.job_config_id)?
+            .into_iter()
+            .find(|(id, _)| *id == allocation.task_config_id)
+            .map(|(_, task)| task)
+            .context("task config")?;
+        let claims = claims_for_allocation(&self.store, &allocation, &task, "auto")?;
+        let identity = WorkloadIdentity {
+            name: CONTROL_PLANE_IDENTITY_NAME.into(),
+            ..Default::default()
+        };
+        Ok(self
+            .state
+            .issue(&claims, &identity, std::time::SystemTime::now())?
+            .token)
     }
 
     async fn status(&self) -> R<ScalingTargetStatus> {
@@ -322,13 +368,22 @@ async fn fixture() -> R<Fixture> {
         ISSUER,
         std::time::SystemTime::now(),
     )?);
-    let auth = Arc::new(Authenticator::from_config(
+    let mut auth = Authenticator::from_config(
         &AclConfig {
             enabled: Some(true),
             ..Default::default()
         }
         .with_defaults(),
-    )?);
+    )?;
+    // The app's `legion` token authenticates through this method, as on a
+    // manager with workload identity on.
+    auth.register_method(Box::new(ControlPlaneIdentityMethod::new(
+        state.clone(),
+        Vec::new(),
+        Duration::from_secs(3600),
+        store.clone(),
+    )))?;
+    let auth = Arc::new(auth);
     let (_, admin) = auth
         .mint_initial_management_token(&store, None)
         .map_err(|s| anyhow!(s.to_string()))?
@@ -374,6 +429,7 @@ async fn fixture() -> R<Fixture> {
     let fx = Fixture {
         svc,
         store,
+        state,
         admin,
         addr,
         app,
@@ -426,15 +482,10 @@ async fn fixture() -> R<Fixture> {
     .await?;
 
     // The app's two clients: the engine reports as a management caller (a
-    // report is app-plane), and the views read with exactly the app's grant.
-    let manifest = legion::apps::bundled_manifest(APP).context("bundled")?;
-    let grant = fx
-        .token(
-            "autoscaler-grant",
-            serde_json::to_value(&manifest.permissions)?,
-        )
-        .await?;
-    let views_client = connect_manager_client_with_token(&fx.addr, &grant, timeouts())?;
+    // report is app-plane), and the views and actions call with the app's
+    // own `legion` token, which holds exactly its grant; the actions' viewer
+    // clients ride on the same connection.
+    let connection = manager_connection_with_token(&fx.addr, &fx.app_token()?, timeouts())?;
     let mut engine_client = connect_manager_client_with_token(&fx.addr, &fx.admin, timeouts())?;
     let engine = Engine::new(
         engine_client.clone(),
@@ -450,7 +501,7 @@ async fn fixture() -> R<Fixture> {
         .into_inner();
     let set = watch.message().await?.context("a policy set")?;
     engine.set_policies(set.policies);
-    ui.connect(views_client, engine.evaluations());
+    ui.connect(connection, engine.evaluations());
     let mut engine = engine;
     for tick in 0..3 {
         engine.tick(T0 + tick * 15_000).await;
@@ -662,9 +713,10 @@ async fn the_sidebar_page_and_the_node_group_panel_test() -> R<()> {
     Ok(())
 }
 
-/// Pause, Resume, and Release act on the job the panel is for, as the app,
-/// with the viewer named in the reason; Release with nothing pinned is
-/// refused with the app's message.
+/// Pause, Resume, and Release act on the job the panel is for, as the
+/// viewer: the pause and the released pin are recorded by `<viewer> via app
+/// autoscaler`, not the app; Release with nothing pinned is refused with
+/// the app's message.
 #[tokio::test(flavor = "multi_thread")]
 async fn pause_resume_and_release_act_on_the_panels_job_test() -> R<()> {
     let fx = fixture().await?;
@@ -672,7 +724,8 @@ async fn pause_resume_and_release_act_on_the_panels_job_test() -> R<()> {
     assert!(paused.message.contains("web"), "{}", paused.message);
     let target = fx.status().await?;
     let pause = target.pause.context("paused")?;
-    assert!(pause.reason.contains("from the UI by"), "{pause:?}");
+    assert_eq!(pause.by, "bootstrap via app autoscaler", "{pause:?}");
+    assert_eq!(pause.reason, "paused from the UI", "{pause:?}");
     // The refreshed panel offers Resume, not Pause.
     let view: Value = serde_json::from_str(&paused.view_json)?;
     assert!(texts(&view).contains("\"resume\""), "{view}");
@@ -703,6 +756,153 @@ async fn pause_resume_and_release_act_on_the_panels_job_test() -> R<()> {
     assert!(fx.status().await?.pin.is_some());
     fx.act("release", json!({})).await?;
     assert!(fx.status().await?.pin.is_none());
+    Ok(())
+}
+
+/// A viewer's press runs as the viewer (app-actions-as-viewer plan, §12):
+/// Alice, who holds `scale` on `default` and `app:read` on the autoscaler,
+/// pauses web from its panel, and the pause, its `scale.paused` event, and
+/// a pin she releases are recorded by `alice via app autoscaler`, while the
+/// `app.action` event names her. The app plane refuses the autoscaler's own
+/// identity when it presents a viewer's assertion, and takes it without.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_viewers_press_is_recorded_as_the_viewer_through_the_app_test() -> R<()> {
+    let fx = fixture().await?;
+    let alice = fx
+        .token(
+            "alice",
+            json!([
+                { "resources": ["app"], "actions": ["read"], "names": ["autoscaler"] },
+                { "resources": ["scale"], "actions": ["read", "write"], "namespaces": ["default"] },
+            ]),
+        )
+        .await?;
+    fx.act_as(&alice, "pause", json!({ "for": "10m" })).await?;
+    let pause = fx.status().await?.pause.context("paused")?;
+    assert_eq!(pause.by, "alice via app autoscaler", "{pause:?}");
+    let events = |kind: &str| {
+        fx.store
+            .list_scheduler_events(&legion::storage::events::SchedulerEventFilter {
+                kind: Some(kind.into()),
+                limit: Some(20),
+                ..Default::default()
+            })
+            .map(|events| {
+                events
+                    .into_iter()
+                    .map(|event| event.message)
+                    .collect::<Vec<_>>()
+            })
+    };
+    let paused = events("scale.paused")?;
+    assert!(
+        paused
+            .iter()
+            .any(|message| message.ends_with("by alice via app autoscaler")),
+        "{paused:?}"
+    );
+    let pressed = events("app.action")?;
+    assert!(
+        pressed
+            .iter()
+            .any(|message| message.contains(": alice ran pause on web: ok")),
+        "{pressed:?}"
+    );
+    fx.act_as(&alice, "resume", json!({})).await?;
+    assert!(fx.status().await?.pause.is_none());
+
+    fx.svc
+        .scale_task(req(
+            ScaleTaskRequest {
+                name: "web".into(),
+                count: Some(3),
+                pin_for_seconds: Some(600),
+                reason: Some("launch".into()),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    fx.act_as(&alice, "release", json!({})).await?;
+    let history = fx
+        .svc
+        .get_scale_history(req(
+            GetScaleHistoryRequest {
+                job: "web".into(),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?
+        .into_inner()
+        .entries;
+    let released = history
+        .iter()
+        .find(|entry| entry.kind == "released")
+        .context("the release is in history")?;
+    assert_eq!(
+        released.principal, "alice via app autoscaler",
+        "{released:?}"
+    );
+    assert!(!released.summary.contains("by alice"), "{released:?}");
+
+    // The app plane: the autoscaler's own identity reports; the same
+    // identity presenting a viewer's assertion is refused.
+    let app = fx.app_token()?;
+    let report = ReportScalingStatusRequest {
+        instance: "probe".into(),
+        ..Default::default()
+    };
+    fx.svc
+        .report_scaling_status(req(report.clone(), &app))
+        .await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let claim = legion::structs::app_ui::ViewerAssertion {
+        kind: legion::structs::app_ui::AssertionKind::Action,
+        app: APP.into(),
+        name: "pause".into(),
+        principal: "alice".into(),
+        accessor: None,
+        permission: Some("scale:write".into()),
+        scope: legion::structs::app_ui::AssertionScope::Context,
+        namespaces: Vec::new(),
+        context: legion::structs::app_ui::ViewContext {
+            slot: "job".into(),
+            namespace: "default".into(),
+            job: "web".into(),
+            ..Default::default()
+        },
+        inputs: Some(String::new()),
+        delegation: Some(
+            legion::structs::app_ui::Delegation::new(
+                legion::structs::acl::AclResource::Scale,
+                &[legion::structs::acl::AclAction::Write],
+                &legion::structs::acl::AclScope::job("web"),
+            )
+            .map_err(|err| anyhow!(err))?,
+        ),
+    };
+    let mut claims = serde_json::Map::new();
+    claims.insert(
+        legion::structs::app_ui::ASSERTION_CLAIM.into(),
+        serde_json::to_value(&claim)?,
+    );
+    let assertion = fx
+        .state
+        .issue_viewer_assertion(APP, "va_probe", "principal:alice", claims, now, now + 60)?
+        .token;
+    let mut delegated = req(report, &app);
+    delegated
+        .metadata_mut()
+        .insert(ON_BEHALF_OF_HEADER, assertion.parse()?);
+    let refused = fx.svc.report_scaling_status(delegated).await.unwrap_err();
+    assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+    assert!(
+        refused.message().contains("legion-on-behalf-of"),
+        "{refused}"
+    );
     Ok(())
 }
 

@@ -130,6 +130,7 @@ mod app_rpcs;
 mod app_ui_rpcs;
 mod autoscale_rpcs;
 mod checkpoint_support;
+mod delegation;
 mod extension_rpcs;
 mod fork_rpcs;
 mod make_room;
@@ -2131,12 +2132,6 @@ impl ManagerDaemonService {
         self
     }
 
-    /// The caller's credential, kept so a long-lived stream can re-check it.
-    fn stream_credential<T>(&self, request: &Request<T>) -> acl::StreamCredential {
-        acl::StreamCredential::new(self.auth.clone(), request.metadata())
-            .with_interval(self.stream_reauth_interval)
-    }
-
     /// The store's network-policy generation, cached for
     /// `NET_POLICY_GENERATION_TTL`. Zero means no policy has ever been
     /// written on this cluster.
@@ -2218,8 +2213,14 @@ impl ManagerDaemonService {
 
     /// Resolves the caller's identity without enforcing anything. Pair with
     /// `acl::enforce` once the request body has been parsed.
+    ///
+    /// A request carrying `legion-on-behalf-of` (an app presenting an
+    /// action's viewer assertion beside its own credential) resolves to a
+    /// delegated identity, `<viewer> via app <app>`, or is refused; it never
+    /// falls back to the app's own identity (`delegation.rs`).
     fn authenticate_acl<T>(&self, request: &Request<T>) -> Result<AclIdentity, Status> {
-        self.auth.authenticate(request.metadata(), &self.store)
+        let caller = self.auth.authenticate(request.metadata(), &self.store)?;
+        self.with_delegation(caller, request.metadata())
     }
 
     /// Every manager a worker may dial (`HeartbeatReply.manager_addresses`,
@@ -5507,7 +5508,7 @@ impl Manager for ManagerDaemonService {
                 &AclScope::any(),
             )?;
         }
-        let credential = self.stream_credential(&request);
+        let credential = self.stream_credential(&request, &identity)?;
         let mut inbound = request.into_inner();
         let first = inbound
             .message()
@@ -5763,7 +5764,7 @@ impl Manager for ManagerDaemonService {
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
         let identity = self.authenticate_acl(&request)?;
         let audience = EventAudience::for_identity(&identity)?;
-        let credential = self.stream_credential(&request);
+        let credential = self.stream_credential(&request, &identity)?;
         let request = request.into_inner();
         // One predicate for replayed and live events alike.
         let audience = EventFeed {

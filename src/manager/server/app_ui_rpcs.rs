@@ -18,15 +18,21 @@
 //! the request to one allocation of the app's job over the worker plane. The
 //! answer is validated against the view schema before anyone sees it, and
 //! every action is recorded as an `app.action` event.
+//!
+//! An action's assertion also carries a [`Delegation`]: the declared
+//! permission (and `read` on the same resource, when the viewer holds it)
+//! on exactly the scope checked. The app presents the assertion back in
+//! `legion-on-behalf-of` to act as the viewer, within its own grant
+//! (`delegation.rs`; docs/auth-and-acls.md, "Delegated identities").
 
 use super::*;
 use crate::storage::app_store::AppUiAllocation;
 use crate::structs::app::AppRecord;
 use crate::structs::app_ui::{
     inputs_digest, page_context, page_rpc_kind, resolve_inputs, validate_view, validate_view_value,
-    ActionDecl, AppView, AssertionKind, AssertionScope, PageRpcKind, Slot, SlotEntry, UiPermission,
-    UiSpec, ViewContext, ViewerAssertion, ACTION_PATH_PREFIX, ASSERTION_CLAIM, ASSERTION_TTL_SECS,
-    MAX_PAGE_BYTES, VIEWER_HEADER, VIEW_PATH_PREFIX,
+    ActionDecl, AppView, AssertionKind, AssertionScope, Delegation, PageRpcKind, Slot, SlotEntry,
+    UiPermission, UiSpec, ViewContext, ViewerAssertion, ACTION_PATH_PREFIX, ASSERTION_CLAIM,
+    ASSERTION_TTL_SECS, MAX_PAGE_BYTES, VIEWER_HEADER, VIEW_PATH_PREFIX,
 };
 use crate::structs::{
     AppActionInfo, AppHttpHeader, AppPageRpc, AppViewContext, ForwardAppRequestReply,
@@ -128,6 +134,18 @@ fn app_error(app: &str, what: &str, reply: &ForwardAppRequestReply) -> Status {
     }
 }
 
+/// A declared permission, checked as the viewer: how the assertion
+/// describes the check, and the concrete scope it was checked on.
+struct CheckedPermission {
+    scope: AssertionScope,
+    /// For a namespaced permission checked on any scope: where the viewer
+    /// holds it.
+    namespaces: Vec<String>,
+    /// The resource, action, and concrete scope checked; `None` when no
+    /// permission was declared or it was checked on any scope.
+    checked: Option<(AclResource, AclAction, AclScope)>,
+}
+
 /// What a view request resolved to.
 struct ResolvedView<'a> {
     entry: &'a SlotEntry,
@@ -211,9 +229,13 @@ impl ManagerDaemonService {
         identity: &AclIdentity,
         permission: Option<&UiPermission>,
         context: &ViewContext,
-    ) -> Result<(AssertionScope, Vec<String>), Status> {
+    ) -> Result<CheckedPermission, Status> {
         let Some(permission) = permission else {
-            return Ok((AssertionScope::None, Vec::new()));
+            return Ok(CheckedPermission {
+                scope: AssertionScope::None,
+                namespaces: Vec::new(),
+                checked: None,
+            });
         };
         let (resource, action) = permission.parsed().map_err(|err| {
             Status::failed_precondition(format!("the app's manifest is invalid: {err}"))
@@ -240,10 +262,38 @@ impl ManagerDaemonService {
             } else {
                 identity.namespaces_granting(resource, action)
             };
-            Ok((AssertionScope::Any, namespaces))
+            Ok(CheckedPermission {
+                scope: AssertionScope::Any,
+                namespaces,
+                checked: None,
+            })
         } else {
-            Ok((AssertionScope::Context, Vec::new()))
+            Ok(CheckedPermission {
+                scope: AssertionScope::Context,
+                namespaces: Vec::new(),
+                checked: Some((resource, action, scope)),
+            })
         }
+    }
+
+    /// What an action's assertion lets its app do as the viewer: the
+    /// declared permission on the scope it was checked on, and `read` on
+    /// the same resource and scope when the viewer holds that too
+    /// (app-actions-as-viewer calls entry 8). A scope value with a `*` in
+    /// it is refused: a delegation names its scope exactly.
+    fn delegation_for(
+        identity: &AclIdentity,
+        resource: AclResource,
+        action: AclAction,
+        scope: &AclScope,
+    ) -> Result<Delegation, Status> {
+        let mut actions = vec![action];
+        if action != AclAction::Read && identity.would_allow(resource, AclAction::Read, scope) {
+            actions.push(AclAction::Read);
+        }
+        Delegation::new(resource, &actions, scope).map_err(|err| {
+            Status::invalid_argument(format!("this action cannot be delegated: {err}"))
+        })
     }
 
     /// Sign a viewer assertion with the cluster's workload-identity key.
@@ -589,7 +639,7 @@ impl ManagerDaemonService {
         let (record, ui) = self.load_ui_app(&name)?;
         let resolved =
             self.resolve_view(&identity, &name, &ui, slot, inner.view.trim(), &context)?;
-        let (scope, namespaces) =
+        let checked =
             self.enforce_ui_permission(&identity, resolved.entry.permission.as_ref(), &context)?;
         let assertion = ViewerAssertion {
             kind: AssertionKind::View,
@@ -598,10 +648,11 @@ impl ManagerDaemonService {
             principal: identity.principal.clone(),
             accessor: identity.accessor_id.clone(),
             permission: resolved.entry.permission.as_ref().map(UiPermission::label),
-            scope,
-            namespaces,
+            scope: checked.scope,
+            namespaces: checked.namespaces,
             context: context.clone(),
             inputs: None,
+            delegation: None,
         };
         let token = self.sign_viewer_assertion(&identity, &assertion)?;
         let path = format!("{VIEW_PATH_PREFIX}{}?{}", resolved.view, context.to_query());
@@ -679,7 +730,7 @@ impl ManagerDaemonService {
             })?,
         };
         let inputs = resolve_inputs(action, &given).map_err(Status::invalid_argument)?;
-        let (scope, namespaces) =
+        let checked =
             match self.enforce_ui_permission(&identity, Some(&action.permission), &context) {
                 Ok(checked) => checked,
                 Err(status) => {
@@ -717,6 +768,16 @@ impl ManagerDaemonService {
             return Ok(Response::new(reply));
         }
 
+        let delegation = match &checked.checked {
+            Some((resource, action, scope)) => {
+                Some(Self::delegation_for(&identity, *resource, *action, scope)?)
+            }
+            None => None,
+        };
+        let delegated = delegation
+            .as_ref()
+            .map(Delegation::label)
+            .unwrap_or_else(|| "-".to_string());
         let assertion = ViewerAssertion {
             kind: AssertionKind::Action,
             app: name.clone(),
@@ -724,10 +785,11 @@ impl ManagerDaemonService {
             principal: identity.principal.clone(),
             accessor: identity.accessor_id.clone(),
             permission: Some(action.permission.label()),
-            scope,
-            namespaces,
+            scope: checked.scope,
+            namespaces: checked.namespaces,
             context: context.clone(),
             inputs: Some(inputs_digest(&inputs)),
+            delegation,
         };
         let token = self.sign_viewer_assertion(&identity, &assertion)?;
         let body = json!({ "context": context, "inputs": inputs }).to_string();
@@ -821,6 +883,7 @@ impl ManagerDaemonService {
             task = if context.task.is_empty() { "-" } else { context.task.as_str() },
             node = if context.node.is_empty() { "-" } else { context.node.as_str() },
             allocation_id = allocation.id,
+            delegation = %delegated,
             "App action ran"
         );
         let reply = InvokeAppActionReply {
@@ -863,8 +926,7 @@ impl ManagerDaemonService {
             ))
         })?;
         let context = page_context();
-        let (scope, namespaces) =
-            self.enforce_ui_permission(&identity, page.permission.as_ref(), &context)?;
+        let checked = self.enforce_ui_permission(&identity, page.permission.as_ref(), &context)?;
         let assertion = ViewerAssertion {
             kind: AssertionKind::Page,
             app: name.clone(),
@@ -872,10 +934,11 @@ impl ManagerDaemonService {
             principal: identity.principal.clone(),
             accessor: identity.accessor_id.clone(),
             permission: page.permission.as_ref().map(UiPermission::label),
-            scope,
-            namespaces,
+            scope: checked.scope,
+            namespaces: checked.namespaces,
             context,
             inputs: None,
+            delegation: None,
         };
         let token = self.sign_viewer_assertion(&identity, &assertion)?;
         let (reply, allocation) = self

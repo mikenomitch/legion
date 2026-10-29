@@ -243,22 +243,12 @@ impl ManagerDaemonService {
     /// Whether `identity` is the bundled autoscaler app's own workload
     /// identity: a credential whose job grant belongs to an allocation of
     /// `legion-system/autoscaler` (a bearer `legion` token, or an ACL token
-    /// minted from one with `legion login --method legion`, both carry that
-    /// reference). Management tokens and ACL-disabled clusters count too.
+    /// minted from it with `legion login --method legion`, both carry that
+    /// reference; [`Self::app_of_identity`]). Management tokens and
+    /// ACL-disabled clusters count too; a delegated identity (`<viewer> via
+    /// app autoscaler`) does not.
     pub(super) fn is_autoscaler_identity(&self, identity: &AclIdentity) -> bool {
-        if identity.is_management {
-            return true;
-        }
-        let app_job = crate::structs::app::app_job_id(AUTOSCALER_APP);
-        identity.policies.iter().any(|policy| {
-            crate::structs::grant::parse_grant_policy_ref(policy).is_some_and(|allocation| {
-                self.store
-                    .allocation_job_id(allocation)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|job| job == app_job)
-            })
-        })
+        identity.is_management || self.app_of_identity(identity).as_deref() == Some(AUTOSCALER_APP)
     }
 
     /// The app-plane gate (`// ACL: app-plane`): only the autoscaler's own
@@ -267,6 +257,24 @@ impl ManagerDaemonService {
         let identity = self.authenticate_acl(request)?;
         if self.is_autoscaler_identity(&identity) {
             return Ok(identity);
+        }
+        if identity.source == crate::structs::acl::AclSource::Delegated {
+            // Never through audit-only: an app acting for a viewer is not
+            // the app plane, whatever the mode.
+            warn!(
+                target: "acl_audit",
+                principal = %identity.principal,
+                source = identity.source.as_str(),
+                resource = "app-plane",
+                action = "call",
+                enforced = true,
+                "ACL denial"
+            );
+            return Err(Status::permission_denied(format!(
+                "app-plane endpoints take the autoscaler's own identity, not one acting for a \
+                 viewer ({}): send the call without legion-on-behalf-of",
+                identity.principal
+            )));
         }
         warn!(
             target: "acl_audit",
@@ -766,13 +774,13 @@ impl ManagerDaemonService {
         &self,
         request: Request<WatchScalingPoliciesRequest>,
     ) -> Result<Response<ReceiverStream<Result<ScalingPolicySet, Status>>>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Scale,
             AclAction::Read,
             AclScope::any(),
         )?;
-        let credential = self.stream_credential(&request);
+        let credential = self.stream_credential(&request, &identity)?;
         let req = request.into_inner();
         let namespaces = if req.namespaces.is_empty() {
             None

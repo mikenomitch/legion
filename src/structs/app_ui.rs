@@ -30,6 +30,12 @@ use std::collections::BTreeMap;
 pub const VIEW_FORMAT: &str = "legion-view/1";
 /// The header the viewer assertion rides in.
 pub const VIEWER_HEADER: &str = "legion-viewer";
+/// The gRPC metadata key an app sends an action's viewer assertion back to
+/// the manager in, beside its own credential, to act as the viewer
+/// (docs/auth-and-acls.md, "Delegated identities"): the manager then
+/// authenticates the call as `<viewer> via app <app>`, holding only the
+/// assertion's [`Delegation`] within the app's own grant.
+pub const ON_BEHALF_OF_HEADER: &str = "legion-on-behalf-of";
 /// Where an app serves view `<name>`: `GET /legion/v1/views/<name>?<context>`.
 pub const VIEW_PATH_PREFIX: &str = "/legion/v1/views/";
 /// Where an app serves action `<name>`: `POST /legion/v1/actions/<name>`
@@ -1292,6 +1298,188 @@ pub struct ViewerAssertion {
     /// For an action: [`inputs_digest`] of the inputs the request carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<String>,
+    /// For an action: what the app may do as the viewer when it presents
+    /// this assertion back in [`ON_BEHALF_OF_HEADER`]. Never on a view,
+    /// page, or validate assertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<Delegation>,
+}
+
+/// What an action's assertion lets its app do as the viewer
+/// (docs/auth-and-acls.md, "Delegated identities"): one resource, the
+/// action's declared action (and `read` on the same resource when the
+/// viewer held it too), on exactly the scope the manager checked.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Delegation {
+    /// The ACL resource (`scale`).
+    pub resource: String,
+    /// The actions: the declared one first, then `read` when it differs and
+    /// the viewer holds it on the scope.
+    pub actions: Vec<String>,
+    /// The scope the declared permission was checked on.
+    pub scope: DelegationScope,
+}
+
+/// A delegation's scope: the concrete [`AclScope`] the manager checked,
+/// attribute by attribute. Empty for a cluster-scoped resource checked
+/// cluster-wide; `namespace = "*"` alone for a namespaced resource checked
+/// on every namespace (a node slot's `unowned` scope).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DelegationScope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// The job's bare name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The job template the job's latest version came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// The node pool (a node slot's `node` permission).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+}
+
+impl DelegationScope {
+    /// The scope as checked. Refuses the `any` scope (list gating, never
+    /// delegated) and a value with a `*` in it: rule selectors are globs, so
+    /// a literal `web*` would become a wildcard. The `unowned` namespace
+    /// (`*` with nothing else) is the one exception: it means every
+    /// namespace, which is what was checked.
+    pub fn of(scope: &AclScope) -> Result<DelegationScope, String> {
+        if scope.any {
+            return Err("a permission checked on any scope is not delegated".into());
+        }
+        let delegated = DelegationScope {
+            namespace: scope.namespace.clone(),
+            name: scope.name.clone(),
+            template: scope.template.clone(),
+            pool: scope.pool.clone(),
+        };
+        delegated.validate()?;
+        Ok(delegated)
+    }
+
+    /// See [`DelegationScope::of`].
+    pub fn validate(&self) -> Result<(), String> {
+        let unowned = self.namespace.as_deref() == Some("*")
+            && self.name.is_none()
+            && self.template.is_none()
+            && self.pool.is_none();
+        for (what, value) in [
+            ("namespace", &self.namespace),
+            ("job", &self.name),
+            ("template", &self.template),
+            ("pool", &self.pool),
+        ] {
+            let Some(value) = value else { continue };
+            if value.is_empty() {
+                return Err(format!("the delegation's {what} is empty"));
+            }
+            if value.contains('*') && !(unowned && what == "namespace") {
+                return Err(format!(
+                    "the {what} {value:?} has a `*`, which a delegation cannot name exactly"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The scope, as the ACL evaluator reads it.
+    pub fn acl_scope(&self) -> AclScope {
+        AclScope {
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+            template: self.template.clone(),
+            pool: self.pool.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// `default/web`, `pool gpu`, `every namespace`, `the cluster`.
+    pub fn label(&self) -> String {
+        match (&self.namespace, &self.name, &self.pool) {
+            (Some(namespace), Some(name), _) => format!("{namespace}/{name}"),
+            (Some(namespace), None, _) if namespace == "*" => "every namespace".to_string(),
+            (Some(namespace), None, _) => format!("namespace {namespace}"),
+            (None, _, Some(pool)) => format!("pool {pool}"),
+            _ => "the cluster".to_string(),
+        }
+    }
+}
+
+impl Delegation {
+    /// The delegation of `resource` with `actions` on `scope`.
+    pub fn new(
+        resource: AclResource,
+        actions: &[AclAction],
+        scope: &AclScope,
+    ) -> Result<Delegation, String> {
+        if actions.is_empty() {
+            return Err("a delegation names at least one action".into());
+        }
+        Ok(Delegation {
+            resource: resource.as_str().to_string(),
+            actions: actions
+                .iter()
+                .map(|action| action.as_str().to_string())
+                .collect(),
+            scope: DelegationScope::of(scope)?,
+        })
+    }
+
+    /// The resource and actions, validated, and the scope checked.
+    pub fn parsed(&self) -> Result<(AclResource, Vec<AclAction>), String> {
+        let resource = AclResource::parse(&self.resource).ok_or_else(|| {
+            format!(
+                "the delegation names {:?}, not an ACL resource",
+                self.resource
+            )
+        })?;
+        let mut actions = Vec::new();
+        for action in &self.actions {
+            let action = AclAction::parse(action)
+                .ok_or_else(|| format!("the delegation names action {action:?}"))?;
+            if !actions.contains(&action) {
+                actions.push(action);
+            }
+        }
+        if actions.is_empty() {
+            return Err("the delegation names no action".into());
+        }
+        self.scope.validate()?;
+        Ok((resource, actions))
+    }
+
+    /// The one allow rule a delegated identity holds: `resource` with
+    /// `actions`, and an exact selector for every attribute of the scope.
+    /// A rule with no `host` matches no host-level job write.
+    pub fn rule(&self, actions: &[AclAction]) -> crate::structs::acl::AclRule {
+        let exact = |value: &Option<String>| value.clone().map(|value| vec![value]);
+        crate::structs::acl::AclRule {
+            resources: vec![self.resource.clone()],
+            actions: actions
+                .iter()
+                .map(|action| action.as_str().to_string())
+                .collect(),
+            namespaces: exact(&self.scope.namespace),
+            names: exact(&self.scope.name),
+            pools: exact(&self.scope.pool),
+            templates: exact(&self.scope.template),
+            ..Default::default()
+        }
+    }
+
+    /// `scale:write,read on default/web`.
+    pub fn label(&self) -> String {
+        format!(
+            "{}:{} on {}",
+            self.resource,
+            self.actions.join(","),
+            self.scope.label()
+        )
+    }
 }
 
 /// Why an assertion does not match the request it rides on.
@@ -1329,6 +1517,12 @@ pub fn assertion_mismatch(
              task, node)"
                 .to_string(),
         );
+    }
+    if kind != AssertionKind::Action && assertion.delegation.is_some() {
+        return Some(format!(
+            "a {} assertion carries no delegation",
+            kind.as_str()
+        ));
     }
     match (kind, inputs, &assertion.inputs) {
         (AssertionKind::Action | AssertionKind::Validate, Some(inputs), Some(digest))
@@ -2515,6 +2709,7 @@ mod tests {
             namespaces: Vec::new(),
             context: ctx.clone(),
             inputs: Some(inputs_digest(&inputs)),
+            delegation: None,
         };
         let check = |app, kind, name, ctx: &ViewContext, inputs: Option<&Value>| {
             assertion_mismatch(&assertion, app, kind, name, ctx, inputs)
@@ -2562,5 +2757,98 @@ mod tests {
             Some(&json!({ "for": "9h" }))
         )
         .is_some());
+    }
+
+    /// A delegation names exactly the scope checked, round-trips as the
+    /// claim, refuses `any` and literal globs, and only an action's
+    /// assertion may carry one.
+    #[test]
+    fn a_delegation_is_the_checked_scope_exactly_test() {
+        let scope = AclScope::job("payments/web").with_template(Some("svc".into()));
+        let delegation = Delegation::new(
+            AclResource::Scale,
+            &[AclAction::Write, AclAction::Read],
+            &scope,
+        )
+        .expect("a job scope");
+        assert_eq!(
+            serde_json::to_value(&delegation).unwrap(),
+            json!({ "resource": "scale", "actions": ["write", "read"],
+                    "scope": { "namespace": "payments", "name": "web", "template": "svc" } })
+        );
+        assert_eq!(delegation.label(), "scale:write,read on payments/web");
+        let (resource, actions) = delegation.parsed().expect("valid");
+        assert_eq!(resource, AclResource::Scale);
+        assert_eq!(actions, vec![AclAction::Write, AclAction::Read]);
+        let rule = delegation.rule(&actions);
+        assert_eq!(rule.namespaces, Some(vec!["payments".to_string()]));
+        assert_eq!(rule.names, Some(vec!["web".to_string()]));
+        assert_eq!(rule.templates, Some(vec!["svc".to_string()]));
+        assert!(rule.pools.is_none() && rule.host.is_none() && !rule.is_deny());
+
+        let pool = Delegation::new(
+            AclResource::Node,
+            &[AclAction::Write],
+            &AclScope::pool("gpu"),
+        )
+        .expect("a pool scope");
+        assert_eq!(pool.scope.label(), "pool gpu");
+        assert_eq!(
+            pool.rule(&[AclAction::Write]).pools,
+            Some(vec!["gpu".into()])
+        );
+        let unowned = Delegation::new(AclResource::Job, &[AclAction::Read], &AclScope::unowned())
+            .expect("every namespace is a scope");
+        assert_eq!(unowned.scope.label(), "every namespace");
+        assert_eq!(
+            Delegation::new(AclResource::Node, &[AclAction::Read], &AclScope::none())
+                .expect("cluster-wide")
+                .scope,
+            DelegationScope::default()
+        );
+
+        assert!(
+            Delegation::new(AclResource::Scale, &[AclAction::Write], &AclScope::any())
+                .unwrap_err()
+                .contains("any scope")
+        );
+        assert!(Delegation::new(
+            AclResource::Scale,
+            &[AclAction::Write],
+            &AclScope::job("web*")
+        )
+        .unwrap_err()
+        .contains('*'));
+        assert!(Delegation::new(AclResource::Scale, &[], &scope).is_err());
+        let mut forged = delegation.clone();
+        forged.scope.namespace = Some("*".into());
+        assert!(forged.parsed().is_err(), "`*` with a job is not `unowned`");
+        let mut forged = delegation.clone();
+        forged.actions = vec!["admin".into()];
+        assert!(forged.parsed().is_err());
+        assert!(serde_json::from_value::<Delegation>(json!({
+            "resource": "scale", "actions": ["write"], "scope": {}, "extra": 1
+        }))
+        .is_err());
+
+        // Only an action's assertion carries one.
+        let ctx = context("job", "payments", "web");
+        let view = ViewerAssertion {
+            kind: AssertionKind::View,
+            app: "autoscaler".into(),
+            name: "job".into(),
+            principal: "alice".into(),
+            accessor: None,
+            permission: None,
+            scope: AssertionScope::None,
+            namespaces: Vec::new(),
+            context: ctx.clone(),
+            inputs: None,
+            delegation: Some(delegation),
+        };
+        let mismatch =
+            assertion_mismatch(&view, "autoscaler", AssertionKind::View, "job", &ctx, None)
+                .expect("refused");
+        assert!(mismatch.contains("no delegation"), "{mismatch}");
     }
 }

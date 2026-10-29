@@ -28,6 +28,7 @@ mod support;
 mod acl_default_on;
 mod acl_endpoints;
 mod api_socket;
+mod app_action_delegation;
 mod app_extensions;
 mod app_pages;
 mod app_views;

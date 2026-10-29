@@ -234,16 +234,27 @@ impl AppContext {
 
     /// A Legion client, authenticated as the app's `legion` identity by the
     /// worker behind the API socket. Errors when the task has no
-    /// `LEGION_ADDR`.
+    /// `LEGION_ADDR`. To act as the viewer in an action, use
+    /// [`ui::ActionRequest::client_as_viewer`] instead.
     pub async fn client(&self) -> R<crate::cmd::helpers::AuthedManagerClient> {
-        if self.legion_addr().is_none() {
+        Ok(self.connection()?.client())
+    }
+
+    /// The connection [`Self::client`] makes its client from: the app's own
+    /// clients and its viewer clients
+    /// ([`ui::ActionRequest::client_as_viewer_over`]) share it.
+    pub fn connection(&self) -> R<crate::cmd::helpers::ManagerConnection> {
+        let Some(address) = self.legion_addr() else {
             bail!(
                 "LEGION_ADDR is not set: the app has no way to reach Legion (workload identity \
                  is turned off on the managers, `workloadIdentity.enabled = false`, so its \
                  `legion` identity gets no API socket)"
             );
-        }
-        crate::cmd::helpers::connect_manager_client().await
+        };
+        crate::cmd::helpers::manager_connection_at(
+            address.trim(),
+            crate::cmd::helpers::ClientTimeouts::from_env()?,
+        )
     }
 
     /// Report health on `/healthz`: 200 when healthy, 503 otherwise, with

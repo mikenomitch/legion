@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::storage::store::ExtensionJob;
-use crate::structs::app::{app_name_of_job, AppRecord};
+use crate::structs::app::AppRecord;
 use crate::structs::app_ui::{inputs_digest, AssertionKind, AssertionScope, ViewerAssertion};
 use crate::structs::extensions::{
     job_extension_entries, point_plural, shard_of, validate_context, written_on, ExtensionEntry,
@@ -544,6 +544,7 @@ impl ManagerDaemonService {
             namespaces: Vec::new(),
             context: validate_context(&config.name),
             inputs: Some(inputs_digest(&body)),
+            delegation: None,
         };
         let token = self
             .sign_viewer_assertion(identity, &assertion)
@@ -598,6 +599,10 @@ impl ManagerDaemonService {
     /// a job in `legion-system`, or it carries a grant reference to an
     /// allocation of an app's job (an ACL token minted from the identity).
     fn calling_app<T>(&self, request: &Request<T>, identity: &AclIdentity) -> Option<String> {
+        if identity.source == crate::structs::acl::AclSource::Delegated {
+            // An app acting for a viewer is not the app plane.
+            return None;
+        }
         if let (Some(state), Some(bearer)) = (
             self.workload_identity.as_ref(),
             acl::extract_bearer(request.metadata()),
@@ -612,11 +617,7 @@ impl ManagerDaemonService {
                 }
             }
         }
-        identity.policies.iter().find_map(|policy| {
-            let allocation = crate::structs::grant::parse_grant_policy_ref(policy)?;
-            let job = self.store.allocation_job_id(allocation).ok().flatten()?;
-            app_name_of_job(&job).map(str::to_string)
-        })
+        self.app_of_identity(identity)
     }
 
     // ACL: app-plane (an app's own workload identity, or management naming
@@ -699,7 +700,7 @@ impl ManagerDaemonService {
                 "shard {bad} is not below shard_count {shard_count}"
             )));
         }
-        let credential = self.stream_credential(&request);
+        let credential = self.stream_credential(&request, &identity)?;
         let svc = self.clone_for_watch();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {

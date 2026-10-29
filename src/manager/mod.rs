@@ -12,6 +12,7 @@ pub(crate) mod capacity_demand;
 pub mod cluster_ca;
 pub mod concurrency;
 pub mod daemon;
+pub mod delegation;
 pub mod dispatcher;
 pub mod edge_boot;
 pub mod exec;

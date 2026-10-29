@@ -249,7 +249,7 @@ carrying the header gets a **delegated identity** instead:
 What a refusal looks like:
 
 ```text
-Error: PermissionDenied: legion-on-behalf-of: only app autoscaler's own identity may present its viewer assertions; this credential (bootstrap) is not that app's
+Error: PermissionDenied: legion-on-behalf-of: only an app's own identity presents a viewer assertion; this credential (bootstrap) is not an app's
 Error: Unauthenticated: legion-on-behalf-of: the viewer assertion expired at 1793280120 (manager clock 1793280125)
 Error: Unauthenticated: legion-on-behalf-of: the viewer's ACL token (accessor 8f2c…) was revoked
 Error: PermissionDenied: legion-on-behalf-of: app gitops's own grant does not hold scale:write on team-b/other, so it cannot act there as alice

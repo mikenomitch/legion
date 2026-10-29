@@ -26,10 +26,14 @@
 //! (`scale:read` on the job, `node:read` on the node's pool) before any of
 //! this runs. The data comes from the app's own state, the last hour of its
 //! evaluations ([`EvaluationLog`], kept by the engine), and from RPCs the app
-//! makes with its own grant (`scale:read`/`scale:write` in every namespace,
-//! `node:read`): `GetScalingStatus`, `GetScaleHistory`, `PauseScaling`,
-//! `ScaleTask`, `GetNode`, `GetNodes`, and `GetCapacityDemand`. Actions act
-//! only on the job in their context, and record the viewer in the reason.
+//! makes with its own grant (`scale:read` in every namespace, `node:read`):
+//! `GetScalingStatus`, `GetScaleHistory`, `GetNode`, `GetNodes`, and
+//! `GetCapacityDemand`. Actions act only on the job in their context, and
+//! make their writes (`PauseScaling`, `ScaleTask`) **as the viewer**,
+//! through [`ActionRequest::client_as_viewer_over`]: the pause or the
+//! released pin is recorded by `alice via app autoscaler`, and the manager
+//! refuses anything beyond `scale` on that job (docs/autoscaling.md, "In the
+//! UI").
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{OnceLock, RwLock};
@@ -38,7 +42,7 @@ use std::time::{Duration, Instant};
 use crate::apps::ui::{ActionOutcome, ActionRequest, Refused, UiRegistry, ViewRequest, Viewer};
 use crate::autoscaler::strategies::StrategyConfig;
 use crate::autoscaler::{Decision, EffectivePolicy};
-use crate::cmd::helpers::AuthedManagerClient;
+use crate::cmd::helpers::{AuthedManagerClient, ManagerConnection};
 use crate::prelude::*;
 use crate::structs::app_ui::{
     ActionButton, ActionsBlock, AppView, Badge, Block, Cell, Column, ColumnType, KeyValueBlock,
@@ -189,10 +193,10 @@ impl EvaluationLog {
     }
 }
 
-/// What the views share: the app's client (once it has one), its
-/// evaluation log, when it started, and recent capacity demand.
+/// What the views share: the app's connection to Legion (once it has one),
+/// its evaluation log, when it started, and recent capacity demand.
 pub struct AutoscalerUi {
-    connected: OnceLock<(AuthedManagerClient, Arc<EvaluationLog>)>,
+    connected: OnceLock<(ManagerConnection, Arc<EvaluationLog>)>,
     started_ms: i64,
     demand: tokio::sync::Mutex<HashMap<String, (Instant, Demand)>>,
 }
@@ -221,18 +225,26 @@ impl AutoscalerUi {
         })
     }
 
-    /// Hand the views the app's client and the engine's evaluation log.
-    pub fn connect(&self, client: AuthedManagerClient, log: Arc<EvaluationLog>) {
-        let _ = self.connected.set((client, log));
+    /// Hand the views the app's connection (presenting its own identity:
+    /// the actions' viewer clients ride on it too) and the engine's
+    /// evaluation log.
+    pub fn connect(&self, connection: ManagerConnection, log: Arc<EvaluationLog>) {
+        let _ = self.connected.set((connection, log));
     }
 
-    fn parts(&self) -> R<(AuthedManagerClient, Arc<EvaluationLog>)> {
-        self.connected.get().cloned().ok_or_else(|| {
+    fn connected(&self) -> R<&(ManagerConnection, Arc<EvaluationLog>)> {
+        self.connected.get().ok_or_else(|| {
             anyhow!(
                 "the autoscaler is starting and cannot reach Legion yet (it needs its API \
                  socket: workload identity on the managers)"
             )
         })
+    }
+
+    /// The app's own client, and the evaluation log.
+    fn parts(&self) -> R<(AuthedManagerClient, Arc<EvaluationLog>)> {
+        let (connection, log) = self.connected()?;
+        Ok((connection.client(), log.clone()))
     }
 }
 
@@ -1285,8 +1297,11 @@ fn refused_or_failed(what: &str, status: tonic::Status) -> anyhow::Error {
     }
 }
 
-/// Pause, resume, or release the job in the action's context, and answer
-/// with the refreshed panel.
+/// Pause, resume, or release the job in the action's context, as the
+/// viewer, and answer with the refreshed panel. The reads around the write
+/// use the app's own client, as views do; the write goes through the
+/// viewer client, so it is recorded by `<viewer> via app autoscaler` and the
+/// manager holds it to `scale` on this job.
 async fn run_action(ui: &AutoscalerUi, request: ActionRequest) -> R<ActionOutcome> {
     let Some(job) = request.context.job_id() else {
         return Err(Refused("autoscaling actions are pressed on a job".into()).into());
@@ -1299,7 +1314,8 @@ async fn run_action(ui: &AutoscalerUi, request: ActionRequest) -> R<ActionOutcom
         ))
         .into());
     };
-    let by = &request.viewer.principal;
+    let (connection, _) = ui.connected()?;
+    let mut as_viewer = request.client_as_viewer_over(connection)?;
     let message = match request.action.as_str() {
         "pause" => {
             let for_seconds = match request.inputs.get("for").and_then(Value::as_str) {
@@ -1310,11 +1326,11 @@ async fn run_action(ui: &AutoscalerUi, request: ActionRequest) -> R<ActionOutcom
                 ),
                 _ => None,
             };
-            client
+            as_viewer
                 .pause_scaling(PauseScalingRequest {
                     job: job.clone(),
                     for_seconds,
-                    reason: format!("paused from the UI by {by}"),
+                    reason: "paused from the UI".to_string(),
                     ..Default::default()
                 })
                 .await
@@ -1334,11 +1350,11 @@ async fn run_action(ui: &AutoscalerUi, request: ActionRequest) -> R<ActionOutcom
                 ))
                 .into());
             }
-            client
+            as_viewer
                 .pause_scaling(PauseScalingRequest {
                     job: job.clone(),
                     resume: true,
-                    reason: format!("resumed from the UI by {by}"),
+                    reason: "resumed from the UI".to_string(),
                     ..Default::default()
                 })
                 .await
@@ -1359,13 +1375,13 @@ async fn run_action(ui: &AutoscalerUi, request: ActionRequest) -> R<ActionOutcom
             }
             let mut said = Vec::new();
             for target in pinned {
-                let reply = client
+                let reply = as_viewer
                     .scale_task(ScaleTaskRequest {
                         name: job.clone(),
                         task_group: Some(target.task_group.clone()),
                         task_name: Some(target.task_name.clone()),
                         release: true,
-                        reason: Some(format!("released from the UI by {by}")),
+                        reason: Some("released from the UI".to_string()),
                         ..Default::default()
                     })
                     .await
@@ -1565,6 +1581,7 @@ mod tests {
             permission: Some("scale:read".into()),
             scope: AssertionScope::Any,
             namespaces: vec!["team-*".into()],
+            delegation: None,
         };
         let view = render_policies(&reply, &viewer);
         valid(&view, Slot::Nav);

@@ -816,6 +816,11 @@ pub enum AclSource {
     Jwt,
     /// No credential was presented.
     Anonymous,
+    /// An app's own credential presenting an action's viewer assertion in
+    /// `legion-on-behalf-of`: the identity is `<viewer> via app <app>`,
+    /// holding only the assertion's delegation within the app's grant
+    /// (docs/auth-and-acls.md, "Delegated identities").
+    Delegated,
 }
 
 impl AclSource {
@@ -825,6 +830,7 @@ impl AclSource {
             AclSource::Token => "token",
             AclSource::Jwt => "jwt",
             AclSource::Anonymous => "anonymous",
+            AclSource::Delegated => "delegated",
         }
     }
 }

@@ -169,9 +169,9 @@ async fn run_body(mut context: AppContext) -> R<()> {
     // view" until the app reaches Legion.
     let ui = crate::apps::autoscaler_ui::AutoscalerUi::new(now_ms());
     crate::apps::autoscaler_ui::register(context.ui(), ui.clone());
-    let client = loop {
-        match context.client().await {
-            Ok(client) => break client,
+    let connection = loop {
+        match context.connection() {
+            Ok(connection) => break connection,
             Err(err) => {
                 // No credentials: nothing to do but say so, and wait.
                 warn!("The autoscaler cannot reach Legion: {err:#}");
@@ -183,10 +183,11 @@ async fn run_body(mut context: AppContext) -> R<()> {
             }
         }
     };
-    let engine = Engine::new(client.clone(), options.clone(), now_ms());
-    // The views read the engine's last hour of evaluations, and call
-    // Legion as the app (docs/autoscaling.md, "In the UI").
-    ui.connect(client, engine.evaluations());
+    let engine = Engine::new(connection.client(), options.clone(), now_ms());
+    // The views read the engine's last hour of evaluations and call Legion
+    // as the app; the actions write as the viewer, over the same connection
+    // (docs/autoscaling.md, "In the UI").
+    ui.connect(connection, engine.evaluations());
     // Shard leases first, so the first watch and tick know what this
     // replica owns (everything, when it is alone).
     let mut leases = engine.shards(LeaseTiming::default());
