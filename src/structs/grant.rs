@@ -293,6 +293,9 @@ impl Atom<'_> {
         if let Some(bands) = &self.rule.bands {
             text.push_str(&format!(" in bands {}", bands.join(", ")));
         }
+        if let Some(kinds) = &self.rule.kinds {
+            text.push_str(&format!(" on kinds {}", kinds.join(", ")));
+        }
         if self.rule.host == Some(true) {
             text.push_str(" (host = true)");
         }
@@ -336,6 +339,7 @@ fn held_covers(held: &AclRule, atom: &Atom<'_>) -> bool {
         && plain_covered(&held.action_names, &requested.action_names)
         && plain_covered(&held.templates, &requested.templates)
         && plain_covered(&held.bands, &requested.bands)
+        && plain_covered(&held.kinds, &requested.kinds)
 }
 
 fn rule_covers_pair(rule: &AclRule, resource: AclResource, action: AclAction) -> bool {

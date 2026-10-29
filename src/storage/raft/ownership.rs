@@ -154,6 +154,11 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // App records (apps plan §6.3): operator intent, written by the app
     // RPCs and the app reconciler, next to the jobs it submits.
     ("app", Owner::Lane(Lane::Control)),
+    // Objects of app-declared kinds (app-object-kinds plan §6.3): operator
+    // and tenant intent like the jobs they sit beside, written by
+    // ApplyObject/DeleteObject and by the owning app's UpdateObjectStatus,
+    // with versions from `scaling_counter`, also Control.
+    ("app_object", Owner::Lane(Lane::Control)),
     ("saved_state_query", Owner::Lane(Lane::Control)),
     ("signing_key", Owner::Lane(Lane::Control)),
     // KV encryption keyring (docs/kv-encryption.md): the wrapped data keys.

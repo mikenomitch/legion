@@ -2381,6 +2381,36 @@ fn migration_list() -> Vec<M<'static>> {
         // 10,000 policies").
         M::up("CREATE INDEX IF NOT EXISTS idx_task_config_job_id ON task_config(job_id);")
             .down("DROP INDEX IF EXISTS idx_task_config_job_id;"),
+        // Objects of app-declared kinds (`legion object`; app-object-kinds
+        // plan §6.3): one row per object, keyed by its app, kind, namespace
+        // (empty for a cluster-scoped kind), and name. `spec` is the JSON
+        // as written (defaults are filled on read), `status` the JSON the
+        // app last wrote ('' for none). `generation` bumps when the spec
+        // changes; `version`, the CAS token, is a value of the `app_object`
+        // counter in `scaling_counter`, new on every write. Control lane.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS app_object (
+            app TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            name TEXT NOT NULL,
+            spec TEXT NOT NULL,
+            labels TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT '',
+            observed_generation INTEGER NOT NULL DEFAULT 0,
+            generation INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            created_by TEXT NOT NULL,
+            created_ms INTEGER NOT NULL,
+            updated_by TEXT NOT NULL,
+            updated_ms INTEGER NOT NULL,
+            status_updated_by TEXT NOT NULL DEFAULT '',
+            status_updated_ms INTEGER NOT NULL DEFAULT 0,
+            validated_by TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (app, kind, namespace, name)
+        );",
+        )
+        .down("DROP TABLE IF EXISTS app_object;"),
     ]
 }
 

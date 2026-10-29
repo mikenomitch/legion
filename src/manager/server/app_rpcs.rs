@@ -420,6 +420,7 @@ impl ManagerDaemonService {
                 .iter()
                 .map(super::extension_rpcs::key_proto)
                 .collect(),
+            kinds: self.record_kinds(record),
         })
     }
 
@@ -873,6 +874,7 @@ impl ManagerDaemonService {
                 revoked_grants: 0,
                 deduplicated: true,
                 orphaned_jobs: Vec::new(),
+                orphaned_objects: 0,
             }));
         }
         let record = self.load_app(&name)?;
@@ -954,6 +956,7 @@ impl ManagerDaemonService {
             revoked_grants: u32::try_from(revoked).unwrap_or(u32::MAX),
             deduplicated: false,
             orphaned_jobs: using,
+            orphaned_objects: 0,
         }))
     }
 

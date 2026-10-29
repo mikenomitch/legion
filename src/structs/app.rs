@@ -221,6 +221,12 @@ pub struct AppManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<Vec<crate::structs::extensions::ExtensionDecl>>")]
     pub extensions: Option<Value>,
+    /// Object kinds the app owns (app-object-kinds plan; docs/app-objects.md):
+    /// a list of `crate::structs::app_object::KindDecl`, checked at install
+    /// and kept as JSON so a record round-trips as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Vec<crate::structs::app_object::KindDecl>>")]
+    pub kinds: Option<Value>,
     /// The app's config: its JSON Schema and its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<AppConfigSpec>,
@@ -349,6 +355,13 @@ impl AppManifest {
         let decls = crate::structs::extensions::manifest_decls(self)
             .map_err(|err| format!("app {}: {err}", self.name))?;
         crate::structs::extensions::validate_decls(&self.name, &decls, &BTreeMap::new())
+            .map_err(|err| format!("app {}: {err}", self.name))?;
+        // Object kinds (app-object-kinds plan §6.1): checked on their own
+        // here; against the other installed apps' kinds at install and
+        // upgrade.
+        let kinds = crate::structs::app_object::manifest_kinds(self)
+            .map_err(|err| format!("app {}: {err}", self.name))?;
+        crate::structs::app_object::validate_kind_decls(&self.name, &kinds)
             .map_err(|err| format!("app {}: {err}", self.name))?;
         let schema = self.config_schema();
         let compiled = compile_config_schema(&schema)
@@ -1470,6 +1483,7 @@ pub fn describe_rule(rule: &AclRule) -> String {
         ("actions", &rule.action_names),
         ("templates", &rule.templates),
         ("bands", &rule.bands),
+        ("kinds", &rule.kinds),
     ] {
         if let Some(values) = values {
             selectors.push(format!("{label}: {}", values.join(", ")));
@@ -1539,6 +1553,14 @@ pub fn install_prompt(manifest: &AppManifest, app_user: &str) -> Vec<String> {
     let ui = manifest.ui_summary();
     if !ui.is_empty() {
         lines.push(format!("UI: {}", ui.join(", ")));
+    }
+    // The kinds it owns, and who will be able to write them: a mapping onto
+    // an existing resource is a decision about who may instruct the app.
+    if let Ok(kinds) = crate::structs::app_object::manifest_kinds(manifest) {
+        lines.extend(crate::structs::app_object::kinds_prompt(
+            &manifest.name,
+            &kinds,
+        ));
     }
     if !manifest.code_fields.is_empty() {
         lines.push(format!(

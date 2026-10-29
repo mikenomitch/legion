@@ -2642,6 +2642,15 @@ service Manager {
   // values (kept under `allow_unknown_fields`) it adopts, and how they fare
   // against its schemas.
   //
+  // Object kinds (`kinds`; docs/app-objects.md): each declaration is checked
+  // (a PascalCase name that is not a Legion noun, an object schema under
+  // the extension rules, examples that pass it, an `access` resource whose
+  // scope fits the kind's, `writeRequires` that name permissions, columns
+  // that point into an object), and a kind another installed app or a
+  // bundled manifest declares (ignoring case and plurals) is refused. The
+  // prompt shows each kind and who may write it, and reports objects an
+  // earlier install of the same app left orphaned, which it adopts.
+  //
   // Errors:
   // - InvalidArgument: the manifest does not parse or validate (unknown
   //   fields, a bad name, a missing `version`, a config schema that does
@@ -2652,9 +2661,9 @@ service Manager {
   // - PermissionDenied: the caller lacks `app:write`, or a permission the
   //   manifest asks for.
   // - AlreadyExists: an app of that name is installed (use UpgradeApp).
-  // - FailedPrecondition: the name is a bundled app's, or one of its
-  //   jobspec keys is another installed app's at that point (the message
-  //   names the owner and the `--key` rename).
+  // - FailedPrecondition: the name is a bundled app's, one of its jobspec
+  //   keys is another installed app's at that point (the message names the
+  //   owner and the `--key` rename), or one of its kinds is another app's.
   rpc InstallApp (InstallAppRequest) returns (InstallAppReply);
 
   // Replaces an installed app's manifest (`legion app upgrade`). Requires
@@ -2675,6 +2684,13 @@ service Manager {
   // every stored value of the app's keys checked against the new schemas;
   // values that fail stay stored and read as `invalid`.
   //
+  // Object kinds: the new manifest may add kinds (checked as at install)
+  // and change existing ones. Every stored object of the app's kinds is
+  // checked against the new schemas and reported in the prompt; objects
+  // that fail stay stored and read as `invalid`. Dropping a kind that still
+  // has objects needs `force`, and leaves them `orphaned`. Changing a
+  // kind's scope while it has objects is refused.
+  //
   // Retry-safe with `idempotency_key`.
   //
   // Errors:
@@ -2683,7 +2699,8 @@ service Manager {
   //   stored config fails its schema.
   // - PermissionDenied: the caller lacks `app:write` or a permission.
   // - FailedPrecondition: the app is bundled (bundled apps upgrade with the
-  //   binary).
+  //   binary), it drops a kind that has objects without `force`, or it
+  //   changes the scope of a kind that has objects.
   rpc UpgradeApp (UpgradeAppRequest) returns (UpgradeAppReply);
 
   // Uninstalls an app (`legion app uninstall`): stops its job, revokes the
@@ -2694,12 +2711,17 @@ service Manager {
   // the values stay stored, read as `orphaned`, and are listed in
   // `orphaned_jobs`.
   //
+  // Likewise while objects of the app's kinds exist: they stay stored,
+  // read as `orphaned` (readable and deletable, not writable), and are
+  // counted in `orphaned_objects`. Installing the app again adopts them.
+  //
   // Retry-safe with `idempotency_key`; uninstalling an app that is not
   // installed is NotFound.
   //
   // Errors:
   // - FailedPrecondition: the app is bundled (disable it instead), or jobs
-  //   set its jobspec keys and `force` is not set (the message lists them).
+  //   set its jobspec keys or objects of its kinds exist, and `force` is
+  //   not set (the message lists them).
   rpc UninstallApp (UninstallAppRequest) returns (UninstallAppReply);
 
   // Enables or disables an app (`legion app enable|disable`). Disabling
@@ -2779,6 +2801,190 @@ service Manager {
   //   caller that names no app.
   // - NotFound: `app` is not installed.
   rpc WatchAppExtensions (WatchAppExtensionsRequest) returns (stream AppExtensionEvent);
+
+  // Lists the object kinds installed apps declare (docs/app-objects.md;
+  // `legion object kinds`): each kind's name, owning app, scope
+  // (`namespaced` or `cluster`), the ACL resource that governs its objects
+  // (`access`) and the extra permissions a writer needs (`write_requires`),
+  // its spec and status JSON Schemas, examples, whether the app is asked on
+  // every apply (`validate`), and the columns `legion object list` shows.
+  // This is what an agent authors objects against.
+  //
+  // ACL: filtered per kind. A kind is listed when the caller holds `read`
+  // on its access resource anywhere (for the `object` resource, on that
+  // kind). A caller that may read no kind at all is refused with the
+  // `object:read` denial. Answers from the installed manifests alone.
+  //
+  // Errors:
+  // - Unauthenticated / PermissionDenied: the caller may read no kind.
+  rpc ListObjectKinds (ListObjectKindsRequest) returns (ListObjectKindsReply);
+
+  // Creates or updates one object of an app-declared kind (`legion object
+  // apply -f FILE`). `object_json` is the object as a person writes it:
+  // `{ kind, name, namespace?, labels?, spec }`. `kind` is the kind's name
+  // in any case, optionally plural (`Repo`, `repos`), or qualified
+  // (`gitops/Repo`), which always names that app's kind. `status` is the
+  // app's and is refused here.
+  //
+  // In order, the manager:
+  // 1. resolves the kind among installed apps' kinds (kinds are public
+  //    metadata); an orphaned kind (its app gone, or no longer declaring
+  //    it) cannot be written;
+  // 2. works out the scope: a namespaced object's namespace is the one the
+  //    object names, else the request's `namespace`, else `default`; a
+  //    cluster kind's object has none (a namespace in the object is an
+  //    error, the request's default is ignored with a warning);
+  // 3. checks the caller's ACL before reading anything: `write` on the
+  //    kind's access resource on the object's scope (namespace and name,
+  //    plus the `kinds` attribute `<app>/<Kind>`), then each of the kind's
+  //    `write_requires` on the same scope;
+  // 4. checks the name (a DNS label), the labels, that the namespace
+  //    exists, and the spec against the kind's schema with its defaults
+  //    filled (errors name the path: `spec.branch: 5 is not of type
+  //    "string"`);
+  // 5. for a kind with `validate`, asks the app (`POST
+  //    /legion/v1/objects/validate` to one allocation, with a viewer
+  //    assertion naming the caller, two seconds): its errors refuse the
+  //    apply, its warnings come back in `warnings`, and an app that is
+  //    disabled, unreachable, slow, or answers anything but 200 lets the
+  //    write through with a warning (fail open);
+  // 6. writes the spec as written. Applying the spec and labels already
+  //    stored writes nothing and keeps the version. A spec change bumps
+  //    `generation`; every write gets a new `version`.
+  //
+  // `dry_run` runs every step but the write (the app is asked too) and
+  // returns the object as it would be, with `diff`: one line per changed
+  // field (`spec.branch: "main" → "release"`, `labels.team: added "a"`).
+  // `expected_version` is a compare-and-set on the stored version: `0`
+  // means "create only", any other value must equal it. Emits
+  // `object.applied`.
+  //
+  // Retry-safe: a repeated `idempotency_key` returns the first reply with
+  // `deduplicated` set.
+  //
+  // Errors:
+  // - InvalidArgument: the object does not parse (unknown fields, a
+  //   `status`, a missing `spec`), an unknown kind (with a did-you-mean), a
+  //   bad name or labels, a namespace on a cluster kind, a spec over 256
+  //   KiB or failing the schema, or the app refused it.
+  // - PermissionDenied: the caller lacks the access resource's `write` or
+  //   a `write_requires` permission on the object's scope.
+  // - NotFound: the namespace does not exist.
+  // - Aborted: `expected_version` does not match (the object changed since
+  //   it was read; read it again and apply on top).
+  // - FailedPrecondition: the kind is orphaned.
+  rpc ApplyObject (ApplyObjectRequest) returns (ApplyObjectReply);
+
+  // Shows one object (`legion object get KIND NAME`): its spec as written,
+  // its effective spec (the kind's current schema defaults filled), the
+  // status its app wrote with `observed_generation`, its `generation` and
+  // `version`, labels, who wrote it and when, and its state: `valid`,
+  // `invalid` (the spec fails the kind's current schema, after an app
+  // upgrade tightened it), or `orphaned` (its app no longer declares the
+  // kind; then `kind` may be qualified, `gitops/Repo`, to reach it).
+  //
+  // ACL: `read` on the kind's access resource on the object's scope,
+  // checked before the object is looked up, so a caller without it gets
+  // PermissionDenied whether or not the object exists. An orphaned kind's
+  // objects are governed by the `object` resource.
+  //
+  // Errors:
+  // - InvalidArgument: an unknown kind.
+  // - PermissionDenied: the caller may not read objects of the kind there.
+  // - NotFound: no such object.
+  rpc GetObject (GetObjectRequest) returns (GetObjectReply);
+
+  // Lists objects (`legion object list [KIND]`): of one kind, or of every
+  // kind when `kind` is empty, in the selected namespaces (names or
+  // `*`-globs; empty means `default`; `*` every namespace). Cluster-scoped
+  // kinds' objects are listed whatever namespaces are asked for. `labels`
+  // keeps only objects carrying every given label value. The reply also
+  // carries the listed objects' kinds, for their columns.
+  //
+  // ACL: gated on `read` on the kind's access resource anywhere (any kind's
+  // when `kind` is empty), then filtered per object on its scope.
+  //
+  // Errors:
+  // - InvalidArgument: an unknown kind, or a bad namespace selector.
+  // - PermissionDenied: the caller may not read the kind anywhere.
+  rpc ListObjects (ListObjectsRequest) returns (ListObjectsReply);
+
+  // Deletes one object (`legion object delete KIND NAME`). Needs what an
+  // apply needs: `write` on the kind's access resource and each
+  // `write_requires`, on the object's scope, checked before the object is
+  // looked up. An orphaned object is deleted with `object:write` on its
+  // `<app>/<Kind>`. The app is not asked; it sees the delete on its watch.
+  // `expected_version` is a compare-and-set on the stored version. Emits
+  // `object.deleted`.
+  //
+  // Retry-safe with `idempotency_key`.
+  //
+  // Errors:
+  // - InvalidArgument: an unknown kind.
+  // - PermissionDenied: the caller may not write objects of the kind there.
+  // - NotFound: no such object.
+  // - Aborted: `expected_version` does not match.
+  rpc DeleteObject (DeleteObjectRequest) returns (DeleteObjectReply);
+
+  // Streams the calling app's objects (docs/app-objects.md, "Inside the
+  // app"): every object of every kind the app declares now, or of
+  // `kinds`, with its spec as written and effective, status, generation,
+  // version, and state.
+  //
+  // The first message has `snapshot` set and carries every current
+  // object. Later messages carry upserts (any write: spec, labels, or
+  // status, each a new `version`; or a state that changed with an app
+  // upgrade) and deletes. Every message's `generation` increases by one.
+  // `invalid` objects are included, flagged; orphaned ones are not (they
+  // are no longer the app's). The manager checks for changes about once a
+  // second and sends nothing while nothing changed; any manager answers.
+  //
+  // `shard_count` and `shards` split the objects across an app's replicas:
+  // an object belongs to shard FNV-1a-64(`<app>/<Kind>:<namespace>/<name>`,
+  // or `<app>/<Kind>:<name>` for a cluster kind) modulo `shard_count`, the
+  // hash the autoscaler's shard leases use. Each object carries its
+  // `shard`.
+  //
+  // ACL: app-plane. Only an app's own workload identity may call it (its
+  // `legion` token, through the API socket or as a bearer token, or an ACL
+  // token minted from it), and it returns only that app's objects: `app`
+  // must be empty or name the caller. A management token may name any
+  // installed `app`. An app acting as a viewer (`legion-on-behalf-of`) is
+  // refused. Re-checks the caller's credential periodically.
+  //
+  // Errors:
+  // - Unauthenticated: no credential.
+  // - PermissionDenied: the caller is not an app's workload identity, or
+  //   names another app.
+  // - InvalidArgument: a shard outside `shard_count`, a kind the app does
+  //   not declare, or a management caller that names no app.
+  // - NotFound: `app` is not installed.
+  rpc WatchObjects (WatchObjectsRequest) returns (stream ObjectEvent);
+
+  // Writes one object's status: what the app that owns its kind reports
+  // (docs/app-objects.md, "Status"). `status_json` must be a JSON object,
+  // checked against the kind's status schema when it declares one, at most
+  // 256 KiB; `observed_generation` says which spec generation it describes.
+  // Never changes the spec or `generation`; the `version` moves.
+  //
+  // Compare-and-set: `expected_generation` (the usual one: the status is
+  // for the spec generation the app saw) or `expected_version` must match
+  // what is stored. Writing the status already stored still moves the
+  // version but reports `changed = false` and emits nothing; a changed
+  // status emits `object.status_changed`.
+  //
+  // ACL: app-plane. Only the workload identity of the app that owns the
+  // kind (`kind` is the app's kind name, or qualified), or a management
+  // token. Never a delegated identity, and never a person: status is the
+  // app's report. Retry-safe with `idempotency_key`.
+  //
+  // Errors:
+  // - Unauthenticated / PermissionDenied: not the owning app.
+  // - InvalidArgument: the status is not an object, fails the status
+  //   schema, or is too large; an unknown kind.
+  // - NotFound: no such object.
+  // - Aborted: the generation or version does not match.
+  rpc UpdateObjectStatus (UpdateObjectStatusRequest) returns (UpdateObjectStatusReply);
 
   // Lists the UI extensions installed apps register (docs/apps.md, "Views
   // and actions"; docs/ui-architecture.md, "App extensions"): the pages,
@@ -14728,6 +14934,8 @@ message App {
   // The jobspec keys the app adds (docs/apps.md, "Jobspec extensions"),
   // with renames applied: `legion app extensions` lists them.
   repeated AppExtensionKey extension_keys = 24;
+  // The object kinds the app declares (docs/app-objects.md).
+  repeated ObjectKind kinds = 25;
 }
 
 // One jobspec key an installed app adds (App.extension_keys,
@@ -14872,6 +15080,358 @@ message AppExtensionValueRef {
   ExtensionPath path = 3;
 }
 
+// A column `legion object list` shows for a kind.
+message ObjectKindColumn {
+  // The header.
+  string name = 1;
+
+  // A JSON pointer into `{ name, namespace, labels, spec, status }`, with
+  // `spec` the effective spec (`/spec/url`, `/status/commit`).
+  string pointer = 2;
+}
+
+// One object kind an installed app declares (ListObjectKinds, App.kinds).
+message ObjectKind {
+  // The kind's name as declared (`Repo`): PascalCase, unique cluster-wide
+  // ignoring case. Typed in any case, optionally plural.
+  string name = 1;
+
+  // The app that declares it, and that app's version.
+  string app = 2;
+  string app_version = 3;
+
+  // `<app>/<Kind>`: always names this kind, and is what ACL `kinds`
+  // selectors match.
+  string qualified = 4;
+
+  string description = 5;
+
+  // `namespaced` (each object lives in a namespace) or `cluster`.
+  string scope = 6;
+
+  // The spec's JSON Schema (draft 7), as JSON. Its defaults are filled when
+  // an object is read.
+  string schema_json = 7;
+
+  // The status's JSON Schema, as JSON; empty when the kind declares none
+  // (any object).
+  string status_schema_json = 8;
+
+  // Example specs, as a JSON array; each passes the schema.
+  string examples_json = 9;
+
+  // Whether every apply also asks the app (`POST
+  // /legion/v1/objects/validate`), failing open.
+  bool validate = 10;
+
+  // The ACL resource that governs the kind's objects: `object` (the
+  // default, scoped with `namespaces`, `names`, and `kinds`), or the
+  // existing resource the kind maps onto (`scale`, `node`, …).
+  string access = 11;
+
+  // Permissions every writer also needs on the object's scope
+  // (`job:write`).
+  repeated string write_requires = 12;
+
+  // The columns `legion object list` shows.
+  repeated ObjectKindColumn columns = 13;
+
+  // Whether the owning app is enabled. A disabled app's kinds still take
+  // writes (the validate call fails open); nothing acts on them.
+  bool app_enabled = 14;
+}
+
+// Request payload for ListObjectKinds.
+message ListObjectKindsRequest {
+  // Only this app's kinds; empty for every app's.
+  string app = 1;
+}
+
+// Reply payload for ListObjectKinds.
+message ListObjectKindsReply {
+  // The kinds the caller may read, by app and name.
+  repeated ObjectKind kinds = 1;
+}
+
+// One object of an app-declared kind.
+message AppObject {
+  // The app that owns the kind, and the kind's name as declared.
+  string app = 1;
+  string kind = 2;
+
+  // The namespace; empty for a cluster-scoped kind.
+  string namespace = 3;
+
+  // The object's name: a DNS label, unique within its kind and namespace.
+  string name = 4;
+
+  // `namespace/name`, or `name` for a cluster-scoped kind.
+  string id = 5;
+
+  // Labels, string to string (ListObjects filters by them).
+  map<string, string> labels = 6;
+
+  // The spec as written, and with the kind's current schema defaults
+  // filled, as JSON.
+  string spec_json = 7;
+  string effective_json = 8;
+
+  // The status the app last wrote, as JSON; empty until it writes one.
+  string status_json = 9;
+
+  // The spec generation the status describes.
+  uint64 observed_generation = 10;
+
+  // Starts at 1, and bumps when the spec changes (not on label or status
+  // writes).
+  uint64 generation = 11;
+
+  // The compare-and-set token: new on every write of the object (spec,
+  // labels, or status), never repeated, even across a delete and a
+  // recreate.
+  uint64 version = 12;
+
+  // `valid`, `invalid` (the spec fails the kind's current schema), or
+  // `orphaned` (its app no longer declares the kind); `detail` says why.
+  string state = 13;
+  string detail = 14;
+
+  // Who created the object and last wrote its spec or labels, and when
+  // (Unix milliseconds).
+  string created_by = 15;
+  int64 created_at_unix_ms = 16;
+  string updated_by = 17;
+  int64 updated_at_unix_ms = 18;
+
+  // Who last wrote the status (the app's principal), and when.
+  string status_updated_by = 19;
+  int64 status_updated_at_unix_ms = 20;
+
+  // `<app>@<manifest digest>` that checked the spec at its last write.
+  string validated_by = 21;
+
+  // The watch shard the object belongs to (WatchObjects with
+  // `shard_count`; 0 otherwise).
+  uint32 shard = 22;
+}
+
+// Request payload for ApplyObject.
+message ApplyObjectRequest {
+  // The object as JSON: `{ kind, name, namespace?, labels?, spec }` (the
+  // CLI evaluates a Nickel file first). `status` is refused.
+  string object_json = 1;
+
+  // The namespace a namespaced object goes in when it names none (the
+  // CLI's `-n`, else `LEGION_NAMESPACE`); empty means `default`. Ignored,
+  // with a warning, for a cluster-scoped kind.
+  string namespace = 2;
+
+  // Validate (the app's validate call included) and diff without writing.
+  bool dry_run = 3;
+
+  // Compare-and-set on the stored version: `0` creates only; any other
+  // value must equal the stored version. Unset writes whatever is stored.
+  optional uint64 expected_version = 4;
+
+  // Optional key to dedupe retries; a repeat returns the first reply with
+  // `deduplicated = true`.
+  optional string idempotency_key = 5;
+}
+
+// Reply payload for ApplyObject.
+message ApplyObjectReply {
+  // The object as stored (on a dry run, as it would be).
+  AppObject object = 1;
+
+  // It did not exist.
+  bool created = 2;
+
+  // The spec or labels changed (false: the same object again, nothing
+  // written).
+  bool changed = 3;
+
+  // One line per changed field, against the stored object: `spec.branch:
+  // "main" → "release"`, `labels.team: added "a"`.
+  repeated string diff = 4;
+
+  // The app's warnings, a validate call that failed open, and an ignored
+  // default namespace.
+  repeated string warnings = 5;
+
+  // Human-readable status message.
+  string message = 6;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 7;
+
+  // Echoes the request: nothing was written.
+  bool dry_run = 8;
+}
+
+// Request payload for GetObject.
+message GetObjectRequest {
+  // The kind: `Repo`, `repos`, or `gitops/Repo` (the only way to name an
+  // orphaned kind whose short name another app took).
+  string kind = 1;
+
+  // The object's name, or `namespace/name` for a namespaced kind.
+  string name = 2;
+
+  // The namespace, when `name` names none; empty means `default`. Ignored
+  // for a cluster-scoped kind.
+  string namespace = 3;
+}
+
+// Reply payload for GetObject.
+message GetObjectReply {
+  AppObject object = 1;
+
+  // The object's kind, when its app still declares it.
+  ObjectKind kind = 2;
+}
+
+// Request payload for ListObjects.
+message ListObjectsRequest {
+  // The kind (any case, optionally plural or qualified); empty lists every
+  // kind's objects.
+  string kind = 1;
+
+  // Namespaces to list: names or `*`-globs; empty means `default`, `*`
+  // every namespace the caller can read. Cluster-scoped kinds' objects are
+  // listed whatever is asked for.
+  repeated string namespaces = 2;
+
+  // Only objects carrying every one of these labels with these values.
+  map<string, string> labels = 3;
+}
+
+// Reply payload for ListObjects.
+message ListObjectsReply {
+  // The objects the caller may read, by app, kind, namespace, and name.
+  repeated AppObject objects = 1;
+
+  // The installed kinds among them, for their columns.
+  repeated ObjectKind kinds = 2;
+}
+
+// Request payload for DeleteObject.
+message DeleteObjectRequest {
+  // The kind: `Repo`, `repos`, or `gitops/Repo`.
+  string kind = 1;
+
+  // The object's name, or `namespace/name`.
+  string name = 2;
+
+  // The namespace, when `name` names none; empty means `default`. Ignored
+  // for a cluster-scoped kind.
+  string namespace = 3;
+
+  // Compare-and-set: the stored version must be this one.
+  optional uint64 expected_version = 4;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 5;
+}
+
+// Reply payload for DeleteObject.
+message DeleteObjectReply {
+  // Human-readable status message.
+  string message = 1;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 2;
+
+  // The object as it was when deleted.
+  AppObject object = 3;
+}
+
+// Request payload for WatchObjects.
+message WatchObjectsRequest {
+  // The app whose objects to watch: empty (or the caller's own name) for
+  // an app's identity; required for a management token.
+  string app = 1;
+
+  // Only these of the app's kinds (as declared, or qualified); empty for
+  // every kind it declares.
+  repeated string kinds = 2;
+
+  // How many shards objects split into. 0 (or 1) means one shard: every
+  // object.
+  uint32 shard_count = 3;
+
+  // The shards to watch, each below `shard_count`. Empty watches every
+  // shard.
+  repeated uint32 shards = 4;
+}
+
+// Identifies an object WatchObjects no longer reports.
+message ObjectRef {
+  string app = 1;
+  string kind = 2;
+  // Empty for a cluster-scoped kind.
+  string namespace = 3;
+  string name = 4;
+}
+
+// One message of WatchObjects.
+message ObjectEvent {
+  // True for the first message: `upserts` is every current object, and a
+  // consumer replaces whatever it held.
+  bool snapshot = 1;
+
+  // Objects that are new or changed since the previous message.
+  repeated AppObject upserts = 2;
+
+  // Objects that are gone since the previous message (deleted, or no
+  // longer the app's).
+  repeated ObjectRef deletes = 3;
+
+  // Increases by one with every message on this stream.
+  uint64 generation = 4;
+}
+
+// Request payload for UpdateObjectStatus.
+message UpdateObjectStatusRequest {
+  // The kind: the calling app's kind name, or qualified.
+  string kind = 1;
+
+  // The object's namespace (empty for a cluster-scoped kind) and name.
+  string namespace = 2;
+  string name = 3;
+
+  // The status, as a JSON object.
+  string status_json = 4;
+
+  // The spec generation this status describes.
+  uint64 observed_generation = 5;
+
+  // Compare-and-set: the stored version must be this one.
+  optional uint64 expected_version = 6;
+
+  // Compare-and-set: the stored generation must be this one (the status is
+  // for the spec the app saw). Takes precedence over `expected_version`
+  // when both are set.
+  optional uint64 expected_generation = 7;
+
+  // Optional key to dedupe retries.
+  optional string idempotency_key = 8;
+}
+
+// Reply payload for UpdateObjectStatus.
+message UpdateObjectStatusReply {
+  // The object after the write.
+  AppObject object = 1;
+
+  // Whether the status or observed generation changed.
+  bool changed = 2;
+
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+
+  // Human-readable status message.
+  string message = 4;
+}
+
 // Request payload for GetApp.
 message GetAppRequest {
   // The app's name.
@@ -14959,6 +15519,10 @@ message UpgradeAppRequest {
   // The config to run the new manifest with, as JSON. Unset keeps the
   // stored config, which must then match the new manifest's schema.
   optional string config_json = 7;
+  // Upgrade even though the new manifest drops object kinds that still
+  // have objects. Those objects stay stored, read as `orphaned`: readable
+  // and deletable, not writable.
+  bool force = 8;
 }
 
 // How an upgrade changes an app's grant.
@@ -15002,9 +15566,11 @@ message UninstallAppRequest {
   // Optional key to dedupe retries.
   optional string idempotency_key = 2;
 
-  // Uninstall even though jobs set the app's jobspec keys. Their values
-  // stay stored, flagged `orphaned`; resubmitting such a job fails unless
-  // the key is removed or `--allow-unknown-fields` is passed.
+  // Uninstall even though jobs set the app's jobspec keys, or objects of
+  // its kinds exist. The values stay stored, flagged `orphaned`;
+  // resubmitting such a job fails unless the key is removed or
+  // `--allow-unknown-fields` is passed. The objects stay stored, read as
+  // `orphaned`: readable and deletable, not writable.
   bool force = 3;
 }
 
@@ -15022,6 +15588,8 @@ message UninstallAppReply {
   // The jobs whose values for the app's keys are now orphaned (with
   // `force`).
   repeated string orphaned_jobs = 4;
+  // How many objects of the app's kinds are now orphaned (with `force`).
+  uint64 orphaned_objects = 5;
 }
 
 // Request payload for SetAppEnabled.

@@ -88,6 +88,15 @@ pub enum AclResource {
     /// the app's grant: installing, upgrading, and changing an app's code
     /// fields also need every permission the app asks for.
     App,
+    /// Objects of the kinds apps declare (`legion object`,
+    /// docs/app-objects.md) whose kind keeps the default `access`: `read`
+    /// gets and lists them, `write` applies and deletes them. Namespaced;
+    /// scope with `namespaces`, `names` (object names), and `kinds` (globs
+    /// over `<app>/<Kind>`). A cluster-scoped kind's objects carry the
+    /// namespace `*`, which only `namespaces = ["*"]` reaches. A kind that
+    /// maps onto another resource (`access = { resource = "scale" }`) is
+    /// governed by that resource instead.
+    Object,
 }
 
 impl AclResource {
@@ -108,6 +117,7 @@ impl AclResource {
             AclResource::Snapshot => "snapshot",
             AclResource::Namespace => "namespace",
             AclResource::App => "app",
+            AclResource::Object => "object",
         }
     }
 
@@ -128,6 +138,7 @@ impl AclResource {
             "snapshot",
             "namespace",
             "app",
+            "object",
         ]
     }
 
@@ -143,6 +154,7 @@ impl AclResource {
             "boot",
             "snapshot",
             "namespace",
+            "object",
         ]
     }
 
@@ -169,6 +181,7 @@ impl AclResource {
             AclResource::Snapshot,
             AclResource::Namespace,
             AclResource::App,
+            AclResource::Object,
         ]
         .into_iter()
         .find(|resource| resource.as_str() == name)
@@ -209,7 +222,7 @@ impl AclAction {
 pub struct AclRule {
     /// Resource types: `job`, `node`, `kv`, `state`, `operator`, `acl`,
     /// `exec`, `action`, `template`, `scale`, `boot`, `net`, `snapshot`,
-    /// `namespace`, `app`, `*`.
+    /// `namespace`, `app`, `object`, `*`.
     pub resources: Vec<String>,
     /// Actions: `read`, `write`, `*`.
     pub actions: Vec<String>,
@@ -218,7 +231,7 @@ pub struct AclRule {
     pub effect: Option<String>,
     /// Glob selectors over namespaces. Required on allow rules that name a
     /// namespaced resource (`job`, `exec`, `action`, `scale`, `boot`,
-    /// `snapshot`, `namespace`), and rejected on rules that name only
+    /// `snapshot`, `namespace`, `object`), and rejected on rules that name only
     /// cluster-scoped ones: `["*"]` is how a rule says "every namespace,
     /// including ones created later", so that reach is always written, never
     /// implied by leaving the selector out (docs/namespaces.md).
@@ -276,6 +289,15 @@ pub struct AclRule {
     /// (worker-plane-auth plan §6.16). Reads are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<bool>,
+    /// Glob selectors over app-declared object kinds, written
+    /// `<app>/<Kind>` as the kind is declared (`gitops/Repo`, `gitops/*`;
+    /// docs/app-objects.md). Matched against requests on an object: on
+    /// `object` rules, which is where it belongs, and on a rule over a
+    /// resource a kind maps onto (`scale`), where it narrows that rule to
+    /// objects of those kinds. A rule naming `kinds` grants nothing to a
+    /// request that is not about an object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<String>>,
 }
 
 impl AclRule {
@@ -291,6 +313,7 @@ impl AclRule {
             || self.action_names.is_some()
             || self.templates.is_some()
             || self.bands.is_some()
+            || self.kinds.is_some()
     }
 }
 
@@ -325,6 +348,10 @@ pub struct AclScope {
     /// submitted job has a host-level task. Only an `exec` (or `job`) rule
     /// with `host: true` matches such a scope.
     pub host: bool,
+    /// The object kind, `<app>/<Kind>`, on every scope of a request about
+    /// an app-declared object (docs/app-objects.md): what `kinds`
+    /// selectors match.
+    pub kind: Option<String>,
 }
 
 impl AclScope {
@@ -412,6 +439,28 @@ impl AclScope {
     pub fn app(name: &str) -> Self {
         AclScope {
             name: Some(name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Scope for an object of an app-declared kind (docs/app-objects.md):
+    /// `kind` is `<app>/<Kind>`. A namespaced object carries its namespace
+    /// and name, like a job; a cluster-scoped one (`namespace` empty)
+    /// carries its name, and, when `unowned_namespace` is set (the `object`
+    /// resource, which is namespaced), the namespace `*`, which only a rule
+    /// reaching every namespace matches.
+    pub fn object(kind: &str, namespace: &str, name: &str, unowned_namespace: bool) -> Self {
+        let namespace = if !namespace.is_empty() {
+            Some(namespace.to_string())
+        } else if unowned_namespace {
+            Some("*".to_string())
+        } else {
+            None
+        };
+        AclScope {
+            namespace,
+            name: Some(name.to_string()),
+            kind: Some(kind.to_string()),
             ..Default::default()
         }
     }
@@ -602,6 +651,7 @@ fn rule_matches(
         && selector_matches(&rule.action_names, &scope.action_name)
         && selector_matches(&rule.templates, &scope.template)
         && selector_matches(&rule.bands, &scope.band)
+        && selector_matches(&rule.kinds, &scope.kind)
 }
 
 /// Default-deny evaluation over a flattened rule set.
@@ -896,6 +946,36 @@ impl AclIdentity {
         evaluate(&self.rules, resource, action, scope)
     }
 
+    /// Whether an allow rule grants `resource:action` on objects of `kind`
+    /// (`<app>/<Kind>`) in some scope: the per-kind gate of a listing
+    /// (`ListObjectKinds`), where the wildcard scope would ignore the
+    /// `kinds` selector. A deny rule vetoes it when it carries no selector
+    /// but (matching) `kinds`.
+    pub fn allows_kind_somewhere(&self, resource: AclResource, action: AclAction, kind: &str) -> bool {
+        if self.is_management || self.audit_only {
+            return true;
+        }
+        let attr = Some(kind.to_string());
+        let mut allowed = false;
+        for rule in &self.rules {
+            if !rule_covers(rule, resource, action) || !selector_matches(&rule.kinds, &attr) {
+                continue;
+            }
+            if rule.is_deny() {
+                let only_kinds = AclRule {
+                    kinds: None,
+                    ..rule.clone()
+                };
+                if !only_kinds.has_scope_selectors() {
+                    return false;
+                }
+            } else {
+                allowed = true;
+            }
+        }
+        allowed
+    }
+
     /// Whether this identity holds any allow in namespace `namespace`: the
     /// rule `ListNamespaces` and `WhoAmI.readable_namespaces` filter by
     /// (docs/namespaces.md, "Seeing namespaces"). True for management
@@ -949,6 +1029,69 @@ mod acl_rules_test {
 
     fn rules(json: &str) -> Vec<AclRule> {
         parse_rules(json).expect("rules should parse")
+    }
+
+    /// `object` is namespaced with a `kinds` selector over `<app>/<Kind>`
+    /// (docs/app-objects.md); a cluster kind's objects carry namespace `*`,
+    /// which only `namespaces = ["*"]` reaches, and a `kinds` rule grants
+    /// nothing to a request that is not about an object.
+    #[test]
+    fn object_rules_scope_by_namespace_and_kind() {
+        let held = rules(
+            r#"[{"resources": ["object"], "actions": ["read", "write"], "namespaces": ["team-a"], "kinds": ["gitops/*"]}]"#,
+        );
+        let repo = |ns: &str| AclScope::object("gitops/Repo", ns, "web", true);
+        assert!(evaluate(&held, AclResource::Object, AclAction::Write, &repo("team-a")));
+        assert!(!evaluate(&held, AclResource::Object, AclAction::Write, &repo("team-b")));
+        assert!(!evaluate(
+            &held,
+            AclResource::Object,
+            AclAction::Write,
+            &AclScope::object("certs/Certificate", "team-a", "web", true)
+        ));
+        // A cluster kind's object: namespace `*`, reached only by `*`.
+        assert!(!evaluate(&held, AclResource::Object, AclAction::Write, &repo("")));
+        let everywhere = rules(
+            r#"[{"resources": ["object"], "actions": ["write"], "namespaces": ["*"], "kinds": ["gitops/*"]}]"#,
+        );
+        assert!(evaluate(&everywhere, AclResource::Object, AclAction::Write, &repo("")));
+        // ... and `*` still skips the reserved namespaces.
+        assert!(!evaluate(
+            &everywhere,
+            AclResource::Object,
+            AclAction::Write,
+            &repo("legion-system")
+        ));
+        assert!(parse_rules(r#"[{"resources": ["object"], "actions": ["read"]}]"#).is_err());
+        // `kinds` narrows a rule on a resource a kind maps onto.
+        let scale = rules(
+            r#"[{"resources": ["scale"], "actions": ["write"], "namespaces": ["*"], "kinds": ["autoscaler/*"]}]"#,
+        );
+        assert!(evaluate(
+            &scale,
+            AclResource::Scale,
+            AclAction::Write,
+            &AclScope::object("autoscaler/ScalingPolicy", "media", "render", true)
+        ));
+        assert!(!evaluate(&scale, AclResource::Scale, AclAction::Write, &AclScope::job("media/render")));
+        // The per-kind listing gate honors `kinds` and blanket denies.
+        let identity = |rules: Vec<AclRule>| AclIdentity {
+            rules,
+            is_management: false,
+            ..AclIdentity::acl_disabled()
+        };
+        let reader = identity(held.clone());
+        assert!(reader.allows_kind_somewhere(AclResource::Object, AclAction::Read, "gitops/Repo"));
+        assert!(!reader.allows_kind_somewhere(AclResource::Object, AclAction::Read, "certs/X"));
+        let mut denied = held;
+        denied.extend(rules(
+            r#"[{"resources": ["object"], "actions": ["read"], "effect": "deny", "kinds": ["gitops/Repo"]}]"#,
+        ));
+        assert!(!identity(denied).allows_kind_somewhere(
+            AclResource::Object,
+            AclAction::Read,
+            "gitops/Repo"
+        ));
     }
 
     /// `app` is cluster-scoped with a `names` selector (docs/apps.md):

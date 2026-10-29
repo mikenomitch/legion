@@ -598,7 +598,7 @@ impl ManagerDaemonService {
     /// The app a caller is: its bearer is this cluster's `legion` token for
     /// a job in `legion-system`, or it carries a grant reference to an
     /// allocation of an app's job (an ACL token minted from the identity).
-    fn calling_app<T>(&self, request: &Request<T>, identity: &AclIdentity) -> Option<String> {
+    pub(super) fn calling_app<T>(&self, request: &Request<T>, identity: &AclIdentity) -> Option<String> {
         if identity.source == crate::structs::acl::AclSource::Delegated {
             // An app acting for a viewer is not the app plane.
             return None;

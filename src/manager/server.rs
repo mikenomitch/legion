@@ -138,6 +138,7 @@ mod material_rpcs;
 mod namespace_policy_rpcs;
 mod namespace_rpcs;
 mod node_content_rpcs;
+mod object_rpcs;
 mod node_group_rpcs;
 mod plugin_rpcs;
 mod scaling_policy_rpcs;
@@ -1170,13 +1171,15 @@ fn instance_volume_pin_detail(store: &Store, instance: &Instance) -> Option<Stri
 }
 
 /// The namespace an event belongs to: its job's, or (for a `namespace.*`
-/// lifecycle event) the namespace in its metadata. `None` for cluster
-/// events.
+/// lifecycle event, or an `object.*` event about a namespaced object) the
+/// namespace in its metadata. `None` for cluster events.
 fn event_namespace(event: &SchedulerEventRecord) -> Option<String> {
     if let Some(job_id) = event.job_id.as_deref().filter(|id| !id.is_empty()) {
         return Some(crate::structs::namespace::job_namespace(job_id).to_string());
     }
-    if event.kind.starts_with("namespace.") {
+    // `namespace.*` lifecycle events, and a namespaced object's events
+    // (docs/app-objects.md, "Events"), carry their namespace in metadata.
+    if event.kind.starts_with("namespace.") || event.kind.starts_with("object.") {
         return serde_json::from_str::<Value>(&event.metadata_json)
             .ok()
             .and_then(|meta| meta.get("namespace")?.as_str().map(str::to_string));
@@ -1999,6 +2002,9 @@ pub struct ManagerDaemonService {
     /// The keys installed apps add to the jobspec, rebuilt when an app
     /// record changes (`extension_rpcs`).
     extension_registry: extension_rpcs::RegistryCache,
+    /// The object kinds installed apps declare, rebuilt when an app record
+    /// changes (`object_rpcs`).
+    object_registry: object_rpcs::ObjectRegistryCache,
     /// Field names treated as core although this build has none (tests: a
     /// simulated release that adds a core field named like an app's key).
     simulated_core_fields: Vec<(crate::structs::spec_fields::ExtensionPoint, String)>,
@@ -2053,6 +2059,7 @@ impl ManagerDaemonService {
             app_nudge: Arc::new(std::sync::OnceLock::new()),
             app_forwarder: Arc::new(crate::manager::app_forward::WorkerPlaneForwarder),
             extension_registry: Arc::new(Mutex::new(None)),
+            object_registry: Arc::new(Mutex::new(None)),
             simulated_core_fields: Vec::new(),
         }
     }
@@ -12217,6 +12224,64 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::WatchAppExtensionsRequest>,
     ) -> Result<Response<Self::WatchAppExtensionsStream>, Status> {
         self.watch_app_extensions_rpc(request).await
+    }
+
+    // ACL: per kind (in the handler).
+    async fn list_object_kinds(
+        &self,
+        request: Request<crate::structs::ListObjectKindsRequest>,
+    ) -> Result<Response<crate::structs::ListObjectKindsReply>, Status> {
+        self.list_object_kinds_rpc(request).await
+    }
+
+    // ACL: the kind's access resource and writeRequires (in the handler).
+    async fn apply_object(
+        &self,
+        request: Request<crate::structs::ApplyObjectRequest>,
+    ) -> Result<Response<crate::structs::ApplyObjectReply>, Status> {
+        self.apply_object_rpc(request).await
+    }
+
+    // ACL: the kind's access resource (in the handler).
+    async fn get_object(
+        &self,
+        request: Request<crate::structs::GetObjectRequest>,
+    ) -> Result<Response<crate::structs::GetObjectReply>, Status> {
+        self.get_object_rpc(request).await
+    }
+
+    // ACL: the kind's access resource, per item (in the handler).
+    async fn list_objects(
+        &self,
+        request: Request<crate::structs::ListObjectsRequest>,
+    ) -> Result<Response<crate::structs::ListObjectsReply>, Status> {
+        self.list_objects_rpc(request).await
+    }
+
+    // ACL: the kind's access resource and writeRequires (in the handler).
+    async fn delete_object(
+        &self,
+        request: Request<crate::structs::DeleteObjectRequest>,
+    ) -> Result<Response<crate::structs::DeleteObjectReply>, Status> {
+        self.delete_object_rpc(request).await
+    }
+
+    type WatchObjectsStream = ReceiverStream<Result<crate::structs::ObjectEvent, Status>>;
+
+    // ACL: app-plane (in the handler).
+    async fn watch_objects(
+        &self,
+        request: Request<crate::structs::WatchObjectsRequest>,
+    ) -> Result<Response<Self::WatchObjectsStream>, Status> {
+        self.watch_objects_rpc(request).await
+    }
+
+    // ACL: app-plane (in the handler).
+    async fn update_object_status(
+        &self,
+        request: Request<crate::structs::UpdateObjectStatusRequest>,
+    ) -> Result<Response<crate::structs::UpdateObjectStatusReply>, Status> {
+        self.update_object_status_rpc(request).await
     }
 
     #[instrument(skip_all, fields(job))]

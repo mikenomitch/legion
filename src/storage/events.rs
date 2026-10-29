@@ -1772,6 +1772,77 @@ pub mod drafts {
             }))
     }
 
+    /// What every object event's metadata carries, and the object's label
+    /// (`Repo team-a/storefront`).
+    fn object_meta(app: &str, kind: &str, namespace: &str, name: &str) -> (Value, String) {
+        let id = crate::structs::app_object::object_id(namespace, name);
+        let mut meta = json!({
+            "app": app,
+            "kind": kind,
+            "qualifiedKind": crate::structs::app_object::qualified_kind(app, kind),
+            "name": name,
+        });
+        // A namespaced object's events reach whoever reaches its namespace
+        // (`event_namespace` reads this), as `namespace.*` events do; a
+        // cluster object's reach operators.
+        if !namespace.is_empty() {
+            meta["namespace"] = json!(namespace);
+        }
+        (meta, format!("{kind} {id}"))
+    }
+
+    /// `object.applied`: an object of an app-declared kind was created, or
+    /// its spec or labels changed (docs/app-objects.md).
+    #[allow(clippy::too_many_arguments)]
+    pub fn object_applied(
+        app: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        generation: u64,
+        version: u64,
+        created: bool,
+        by: &str,
+    ) -> EventDraft {
+        let (mut meta, label) = object_meta(app, kind, namespace, name);
+        meta["generation"] = json!(generation);
+        meta["version"] = json!(version);
+        meta["created"] = json!(created);
+        meta["by"] = json!(by);
+        let verb = if created { "created" } else { "updated" };
+        EventDraft::info(
+            "object.applied",
+            format!("{label} ({app}) {verb} by {by} (generation {generation})"),
+        )
+        .meta(meta)
+    }
+
+    /// `object.deleted`: an object was deleted.
+    pub fn object_deleted(app: &str, kind: &str, namespace: &str, name: &str, by: &str) -> EventDraft {
+        let (mut meta, label) = object_meta(app, kind, namespace, name);
+        meta["by"] = json!(by);
+        EventDraft::info("object.deleted", format!("{label} ({app}) deleted by {by}")).meta(meta)
+    }
+
+    /// `object.status_changed`: the owning app wrote a new status.
+    pub fn object_status_changed(
+        app: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        observed_generation: u64,
+        by: &str,
+    ) -> EventDraft {
+        let (mut meta, label) = object_meta(app, kind, namespace, name);
+        meta["observedGeneration"] = json!(observed_generation);
+        meta["by"] = json!(by);
+        EventDraft::info(
+            "object.status_changed",
+            format!("{label}: status updated by {app} (observed generation {observed_generation})"),
+        )
+        .meta(meta)
+    }
+
     /// A namespace was deleted.
     pub fn namespace_deleted(name: &str) -> EventDraft {
         EventDraft::info("namespace.deleted", format!("Namespace {name} deleted"))
@@ -3051,6 +3122,46 @@ impl EventRecorder<'_> {
     ) {
         self.emit(drafts::app_action(
             name, action, by, context, outcome, detail,
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn object_applied(
+        self,
+        app: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        generation: u64,
+        version: u64,
+        created: bool,
+        by: &str,
+    ) {
+        self.emit(drafts::object_applied(
+            app, kind, namespace, name, generation, version, created, by,
+        ));
+    }
+
+    pub fn object_deleted(self, app: &str, kind: &str, namespace: &str, name: &str, by: &str) {
+        self.emit(drafts::object_deleted(app, kind, namespace, name, by));
+    }
+
+    pub fn object_status_changed(
+        self,
+        app: &str,
+        kind: &str,
+        namespace: &str,
+        name: &str,
+        observed_generation: u64,
+        by: &str,
+    ) {
+        self.emit(drafts::object_status_changed(
+            app,
+            kind,
+            namespace,
+            name,
+            observed_generation,
+            by,
         ));
     }
 

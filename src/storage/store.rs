@@ -62,6 +62,12 @@ mod scaling_action_ops;
 // Jobspec extensions: the jobs holding values, and cheap fingerprints.
 mod extension_ops;
 pub use extension_ops::ExtensionJob;
+// Objects of app-declared kinds (`legion object`), compare-and-set.
+mod app_object_ops;
+pub use app_object_ops::{
+    AppObjectRow, DeleteObject, ObjectFilter, ObjectKey, ObjectWrite, PutObject, PutStatus,
+    StatusCas, VersionCas,
+};
 // GetCapacityDemand's pending work, and ForgetNode (autoscaler v2 plan
 // §6.11).
 mod demand_ops;
