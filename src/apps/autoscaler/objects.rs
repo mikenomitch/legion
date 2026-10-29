@@ -260,7 +260,10 @@ fn last_action(action: Option<&ScalingAction>) -> Option<Value> {
 fn stored_last_action(object: &AppObject) -> Option<Value> {
     let status = object.status.as_ref()?;
     let fields: Value = serde_json::from_str(&status.fields_json).ok()?;
-    fields.get("lastAction").filter(|action| action.is_object()).cloned()
+    fields
+        .get("lastAction")
+        .filter(|action| action.is_object())
+        .cloned()
 }
 
 /// One object's durable verdict from its tick: what its status says. Only
@@ -280,8 +283,8 @@ pub(crate) fn verdict(
         fields.insert("policy".to_string(), json!(target.summary));
         fields.insert("digest".to_string(), json!(target.digest));
     }
-    if let Some(action) = last_action(target.action.as_ref())
-        .or_else(|| stored_last_action(&target.object))
+    if let Some(action) =
+        last_action(target.action.as_ref()).or_else(|| stored_last_action(&target.object))
     {
         fields.insert("lastAction".to_string(), action);
     }
@@ -510,6 +513,54 @@ mod tests {
         }
         let outcome = verdict(&target, "paused", "", None);
         assert_eq!(outcome.conditions()[1].reason, "Paused");
+    }
+
+    /// `lastAction` is the last closed intent from the action row, and a
+    /// newer intent still open keeps the one the status already says
+    /// rather than dropping the field.
+    #[test]
+    fn the_last_action_survives_an_open_intent_test() {
+        let context = AutoscaleLayers::default().to_proto();
+        let layers = layers_of(Some(&context), &catalog()).expect("context");
+        let intent = |decision: &str, from: u32, to: u32| crate::structs::ScalingActionIntent {
+            decision_id: decision.into(),
+            from,
+            desired: Some(to),
+            ..Default::default()
+        };
+        let mut open = object(SCALING_POLICY_KIND, "media", "render", 7, policy_spec());
+        let closed = ScalingObjectState {
+            key: "object:7".into(),
+            uid: 7,
+            action: Some(ScalingAction {
+                state: "done".into(),
+                intent: Some(intent("d-1", 2, 4)),
+                closed_at_unix_ms: 1_800_000_000_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let target = resolve_target(&open, &layers, Some(&closed), None, false).expect("a policy");
+        let fields = verdict(&target, "ok", "", None).fields().clone();
+        assert_eq!(fields["lastAction"]["decision"], "d-1");
+        assert_eq!(fields["lastAction"]["to"], 4);
+
+        // The status now says d-1; d-2 opens.
+        open.status = Some(crate::structs::ObjectStatus {
+            fields_json: fields.to_string(),
+            ..Default::default()
+        });
+        let opened = ScalingObjectState {
+            action: Some(ScalingAction {
+                state: "open".into(),
+                intent: Some(intent("d-2", 4, 6)),
+                ..Default::default()
+            }),
+            ..closed
+        };
+        let target = resolve_target(&open, &layers, Some(&opened), None, false).expect("a policy");
+        let fields = verdict(&target, "ok", "", None).fields().clone();
+        assert_eq!(fields["lastAction"]["decision"], "d-1", "{fields}");
     }
 
     /// The validate call mirrors the engine: cross-field checks and the
