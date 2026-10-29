@@ -1,13 +1,15 @@
 import { useNavigate } from '@solidjs/router'
-import { Show, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js'
+import { Show, createEffect, createMemo, createResource, createSignal, on, onCleanup, onMount } from 'solid-js'
 import type { GetAppPageReply } from '../../gen/legion_pb'
 import { managerClient } from '../../grpcClient'
 import {
   APP_PAGE_HEADER,
   BRIDGE_PROTOCOL,
+  CONFIRM_ARM_MS,
   MAX_IN_FLIGHT,
   MAX_PENDING_CONFIRMATIONS,
   PAGE_SANDBOX,
+  aliasedField,
   bridgeScript,
   callTarget,
   contextFrom,
@@ -28,9 +30,12 @@ import { Button, CodeBlock, Note, Spinner } from '../ui'
  * checked before anything is sent:
  *
  * - `call`: the RPC must be in the page's allowlist (GetAppPage's `rpcs`)
- *   and unary; a mutating one waits for the viewer's yes in a dialog this
- *   SPA draws, naming the app, the RPC, and its target. The call carries
- *   `legion-app-page`, so the manager checks the allowlist again.
+ *   and unary, and the request may not spell a field both ways (`nodeId`
+ *   and `node_id`); a mutating one waits for the viewer's yes in a dialog
+ *   this SPA draws, naming the app, the RPC, and the target of the message
+ *   as it will be sent. The dialog arms after a moment, one confirmation
+ *   at a time. The call carries `legion-app-page`, so the manager checks
+ *   the allowlist again.
  * - `view` / `action`: the app's own tier-1 views and actions, through
  *   GetAppView and InvokeAppAction; actions are always confirmed.
  * - `navigate`: in-app routes only.
@@ -108,6 +113,22 @@ export function SandboxedPage(props: { app: string; page: string; onTitle?: (tit
   const closed = () => loads() > 1
   let inFlight = 0
   const [confirmations, setConfirmations] = createSignal<Confirmation[]>([])
+  // "Run as me" stays disabled for a moment after each confirmation
+  // appears, so a click (or the second half of a double-click) meant for
+  // something else cannot approve it.
+  const [armed, setArmed] = createSignal(false)
+  let armTimer: ReturnType<typeof setTimeout> | undefined
+  createEffect(
+    on(
+      () => confirmations()[0],
+      (head) => {
+        setArmed(false)
+        clearTimeout(armTimer)
+        if (head) armTimer = setTimeout(() => setArmed(true), CONFIRM_ARM_MS)
+      },
+    ),
+  )
+  onCleanup(() => clearTimeout(armTimer))
 
   const ask = (confirmation: Omit<Confirmation, 'resolve'>): Promise<boolean> => {
     if (confirmations().length >= MAX_PENDING_CONFIRMATIONS) {
@@ -117,7 +138,7 @@ export function SandboxedPage(props: { app: string; page: string; onTitle?: (tit
   }
   const answer = (yes: boolean) => {
     const [head, ...rest] = confirmations()
-    if (!head) return
+    if (!head || (yes && !armed())) return
     setConfirmations(rest)
     head.resolve(yes)
   }
@@ -145,6 +166,10 @@ export function SandboxedPage(props: { app: string; page: string; onTitle?: (tit
     if (!method || !isUnary(method)) {
       throw new BridgeRefusal('unimplemented', `the bridge calls unary Manager RPCs only, and ${name} is not one`)
     }
+    const aliased = aliasedField(method.I, request.request ?? {})
+    if (aliased) {
+      throw new BridgeRefusal('invalid_argument', `the request sets ${aliased} under both of its names (JSON and proto); set it once`)
+    }
     let message
     try {
       message = method.I.fromJson((request.request ?? {}) as never)
@@ -152,10 +177,14 @@ export function SandboxedPage(props: { app: string; page: string; onTitle?: (tit
       throw new BridgeRefusal('invalid_argument', `the request is not a valid ${method.I.typeName}: ${error instanceof Error ? error.message : String(error)}`)
     }
     if (allowlist().get(name)) {
+      // The confirmation names what will be sent: the decoded message, not
+      // the page's own JSON.
+      const sent = message.toJson({ emitDefaultValues: false })
+      const target = callTarget(sent)
       const yes = await ask({
-        title: `${appLabel()} wants to run ${name} on ${callTarget(request.request)} as you`,
-        target: callTarget(request.request),
-        detail: JSON.stringify(request.request ?? {}, null, 2),
+        title: `${appLabel()} wants to run ${name} on ${target} as you`,
+        target,
+        detail: JSON.stringify(sent ?? {}, null, 2),
       })
       if (!yes) throw new BridgeRefusal('cancelled', `you declined ${name}`)
     }
@@ -309,10 +338,10 @@ export function SandboxedPage(props: { app: string; page: string; onTitle?: (tit
                 <p class="text-2xs text-faint">{confirmations().length - 1} more waiting.</p>
               </Show>
               <div class="flex justify-end gap-2">
-                <Button variant="ghost" size="sm" onClick={() => answer(false)}>
+                <Button variant="ghost" size="sm" autofocus onClick={() => answer(false)}>
                   Cancel
                 </Button>
-                <Button variant="primary" size="sm" onClick={() => answer(true)}>
+                <Button variant="primary" size="sm" disabled={!armed()} data-testid="bridge-confirm-run" onClick={() => answer(true)}>
                   Run as me
                 </Button>
               </div>
