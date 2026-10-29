@@ -1394,6 +1394,67 @@ async fn each_app_runs_as_its_own_uid_test() -> R<()> {
     Ok(())
 }
 
+/// Moving an app off the managers, or to another pool, is a security
+/// decision (its token lands on those nodes), so it needs `operator:write`
+/// beside `app:write`, and so does installing an app placed elsewhere
+/// (hardening after the adversarial review).
+#[tokio::test(flavor = "multi_thread")]
+async fn placement_needs_operator_write_test() -> R<()> {
+    let (fx, _reconciler) = seeded().await?;
+    let operator = fx
+        .token(
+            "operator",
+            json!([{ "resources": ["app"], "actions": ["read", "write"] }]),
+        )
+        .await?;
+    let settings = |placement: Option<&str>, pool: Option<&str>, replicas: Option<u32>| {
+        UpdateAppSettingsRequest {
+            name: "autoscaler".into(),
+            placement: placement.map(str::to_string),
+            pool: pool.map(str::to_string),
+            replicas,
+            ..Default::default()
+        }
+    };
+    for (placement, pool) in [(Some("workers"), Some("ci")), (Some("any"), None)] {
+        let refused = fx
+            .svc
+            .update_app_settings(req(settings(placement, pool, None), &operator))
+            .await
+            .expect_err("app:write alone moves the app");
+        assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+        assert!(refused.message().contains("operator:write"), "{refused}");
+    }
+    // Replicas are not placement.
+    fx.svc
+        .update_app_settings(req(settings(None, None, Some(2)), &operator))
+        .await?;
+
+    let elsewhere = json!({ "name": "elsewhere", "version": "1.0.0", "placement": "workers",
+                            "job": { "task": { "name": "main", "runtime": "container",
+                   "config": { "image": "alpine", "command": ["true"] } } } });
+    let refused = install(&fx, &elsewhere, &operator)
+        .await
+        .expect_err("app:write alone installs an app placed on workers");
+    assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");
+    assert!(refused.message().contains("operator:write"), "{refused}");
+
+    let placer = fx
+        .token(
+            "placer",
+            json!([
+                { "resources": ["app"], "actions": ["read", "write"] },
+                { "resources": ["operator"], "actions": ["write"] },
+            ]),
+        )
+        .await?;
+    install(&fx, &elsewhere, &placer).await?;
+    fx.svc
+        .update_app_settings(req(settings(Some("workers"), Some("ci"), None), &placer))
+        .await?;
+    Ok(())
+}
+
 /// Scenario A (apps plan §3 and §12 A3), with the real binary: a fresh
 /// single manager with no workers seeds the autoscaler, and `legion app
 /// list` shows it running on the manager's system worker, from the node's

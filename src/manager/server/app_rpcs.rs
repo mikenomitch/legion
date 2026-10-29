@@ -142,6 +142,30 @@ fn reconciler_identity(record: &AppRecord) -> AclIdentity {
     }
 }
 
+/// Where an app runs is a security decision: its `legion` token lands, and
+/// its code runs with its grant, on the nodes its placement allows. So
+/// moving an app off its default (`managers`, no pool), at install or
+/// later, takes `operator:write` beside `app:write` (docs/apps.md,
+/// "Placement").
+fn enforce_placement_write(identity: &AclIdentity, name: &str, what: &str) -> Result<(), Status> {
+    acl::enforce(
+        identity,
+        AclResource::Operator,
+        AclAction::Write,
+        &AclScope::none(),
+    )
+    .map_err(|status| {
+        if status.code() == tonic::Code::PermissionDenied {
+            Status::permission_denied(format!(
+                "{what} decides which nodes hold app {name}'s token and run its code with its \
+                 grant, so it needs operator:write as well as app:write"
+            ))
+        } else {
+            status
+        }
+    })
+}
+
 /// The first permission behind a page's `rpcs` that `identity` does not hold
 /// everywhere the RPC reaches, worded as the refusal (docs/apps.md, "Which
 /// RPCs a page may call"). A page runs its RPCs as whoever views it, so
@@ -618,6 +642,13 @@ impl ManagerDaemonService {
         let now = now_rfc3339();
         let mut settings = AppSettings::from_manifest(&manifest);
         settings.keys = keys;
+        if settings.placement != Placement::Managers {
+            enforce_placement_write(
+                &identity,
+                &name,
+                &format!("installing with placement {}", settings.placement.as_str()),
+            )?;
+        }
         let record = AppRecord {
             name: name.clone(),
             source,
@@ -1136,6 +1167,10 @@ impl ManagerDaemonService {
                 (resources.cpu.is_some() || resources.memory.is_some()).then_some(resources);
         }
         settings.validate().map_err(Status::invalid_argument)?;
+        if settings.placement != record.settings.placement || settings.pool != record.settings.pool
+        {
+            enforce_placement_write(&identity, &name, "changing the placement or pool")?;
+        }
         let change = record.settings.describe_change(&settings);
         if settings == record.settings {
             return Ok(Response::new(UpdateAppSettingsReply {
