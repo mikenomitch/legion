@@ -286,8 +286,9 @@ pub fn config() -> Command {
                         .long("force")
                         .action(ArgAction::SetTrue)
                         .help(
-                            "Upgrade even though jobs set a jobspec key the new manifest no \
-                             longer declares; their values stay stored, flagged orphaned",
+                            "Upgrade even though jobs set a jobspec key, or objects exist of a \
+                             kind, that the new manifest no longer declares; they stay stored, \
+                             flagged orphaned",
                         ),
                 )
                 .arg(
@@ -295,14 +296,6 @@ pub fn config() -> Command {
                         .long("dry-run")
                         .action(ArgAction::SetTrue)
                         .help("Show the permission diff; upgrade nothing"),
-                )
-                .arg(
-                    Arg::new("force")
-                        .long("force")
-                        .action(ArgAction::SetTrue)
-                        .help(
-                            "Upgrade even though the new manifest drops object kinds that have                              objects; they stay stored, orphaned",
-                        ),
                 )
                 .arg(idempotency_arg())
                 .arg(json_flag()),
