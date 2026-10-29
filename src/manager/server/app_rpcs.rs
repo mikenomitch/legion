@@ -600,6 +600,25 @@ impl ManagerDaemonService {
                  upgrades with the binary"
             )));
         }
+        // The app's job is `legion-system/<name>`, which the reconciler
+        // then owns, reverting every other edit: a job by that name that is
+        // not already this app's (an operator's own, or another app's
+        // left behind) is never taken over.
+        let job_id = crate::structs::app::app_job_id(&name);
+        let existing = self
+            .store
+            .app_job_version(&job_id)
+            .map_err(|e| map_store_error("Error loading the app's job", e))?;
+        if let Some(version) = existing {
+            if version.managed_by.as_ref().map(|stamp| stamp.app.as_str()) != Some(name.as_str()) {
+                return Err(Status::failed_precondition(format!(
+                    "job {job_id} already exists and is not app {name}'s (its latest version \
+                     has no managedBy stamp for it), so installing would take it over\nHint: \
+                     install the app under another name, or destroy the job first (`legion job \
+                     destroy {job_id}`)"
+                )));
+            }
+        }
         let source = match inner.source.trim() {
             "" => AppSource::File,
             raw => match AppSource::parse(raw) {

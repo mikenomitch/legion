@@ -391,6 +391,38 @@ impl Store {
         }))
     }
 
+    /// The app allocation `allocation_id` runs for: its job is
+    /// `legion-system/<app>` **and** the version it runs carries the
+    /// reconciler's `managedBy` stamp for that same app. A version someone
+    /// submitted straight to the job carries none, so its allocations are
+    /// nobody's app. `None` for every other allocation, and for one that does
+    /// not exist.
+    #[instrument(err, skip_all, fields(allocation_id))]
+    pub fn allocation_app(&self, allocation_id: i64) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        let row: Option<(String, Option<Value>)> = conn
+            .prepare_cached(
+                "SELECT tc.job_id, jc.meta FROM allocation a
+                 INNER JOIN task_config tc ON tc.id = a.task_config_id
+                 LEFT JOIN job_config jc ON jc.id = a.job_config_id
+                 WHERE a.id = ?1;",
+            )?
+            .query_row([allocation_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        let Some((job, meta)) = row else {
+            return Ok(None);
+        };
+        let Some(app) = crate::structs::app::app_name_of_job(&job) else {
+            return Ok(None);
+        };
+        let stamp: Option<ManagedBy> = meta
+            .and_then(|meta| meta.get("managedBy").cloned())
+            .and_then(|value| serde_json::from_value(value).ok());
+        Ok(stamp
+            .filter(|stamp| stamp.app == app)
+            .map(|_| app.to_string()))
+    }
+
     /// The `managedBy` stamp on job `job_id`'s latest version.
     pub fn job_managed_by(&self, job_id: &str) -> R<Option<ManagedBy>> {
         Ok(self
@@ -436,6 +468,12 @@ impl Store {
     /// tries them in.
     #[instrument(err, skip_all, fields(job_id))]
     pub fn app_ui_allocations(&self, job_id: &str) -> R<Vec<AppUiAllocation>> {
+        // Only allocations of versions the reconciler stamped for this app
+        // ([`Self::allocation_app`]): a viewer assertion is never sent to a
+        // version someone submitted straight to the job.
+        let Some(app) = crate::structs::app::app_name_of_job(job_id) else {
+            return Ok(Vec::new());
+        };
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
             "SELECT a.id, a.node_id, COALESCE(ah.healthy, 0) FROM allocation a
@@ -443,9 +481,10 @@ impl Store {
              INNER JOIN job j ON j.id = jc.job_id
              LEFT JOIN allocation_health ah ON ah.allocation_id = a.id
              WHERE j.name = ?1 AND a.status NOT IN ('complete', 'failed', 'lost')
+               AND json_extract(jc.meta, '$.managedBy.app') = ?2
              ORDER BY COALESCE(ah.healthy, 0) DESC, a.id DESC;",
         )?;
-        let rows = stmt.query_map([job_id], |row| {
+        let rows = stmt.query_map(params![job_id, app], |row| {
             Ok(AppUiAllocation {
                 id: row.get(0)?,
                 node_id: row.get(1)?,

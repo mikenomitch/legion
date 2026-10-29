@@ -1455,6 +1455,52 @@ async fn placement_needs_operator_write_test() -> R<()> {
     Ok(())
 }
 
+/// Install never takes over a `legion-system/<name>` job the app does not
+/// already manage (hardening after the adversarial review): an operator's
+/// own job by that name is refused; the stopped job an uninstall left is
+/// the app's, so reinstalling works.
+#[tokio::test(flavor = "multi_thread")]
+async fn install_refuses_a_job_it_does_not_manage_test() -> R<()> {
+    let fx = fixture()?;
+    fx.run(
+        &json!({ "name": "takeover", "namespace": "legion-system",
+                 "task": { "name": "main", "runtime": "container",
+                           "config": { "image": "alpine", "command": ["true"] } } }),
+        &fx.admin,
+    )
+    .await?;
+    let manifest = |name: &str| {
+        json!({ "name": name, "version": "1.0.0",
+                "job": { "task": { "name": "main", "runtime": "container",
+                   "config": { "image": "alpine", "command": ["true"] } } } })
+    };
+    let refused = install(&fx, &manifest("takeover"), &fx.admin)
+        .await
+        .expect_err("the job is not the app's");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
+    assert!(
+        refused.message().contains("legion-system/takeover"),
+        "{refused}"
+    );
+    assert!(fx.store.get_app("takeover")?.is_none());
+
+    install(&fx, &manifest("again"), &fx.admin).await?;
+    let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
+    assert!(submitted(&reconciler.reconcile_app("again").await));
+    fx.svc
+        .uninstall_app(req(
+            UninstallAppRequest {
+                name: "again".into(),
+                idempotency_key: None,
+                force: false,
+            },
+            &fx.admin,
+        ))
+        .await?;
+    install(&fx, &manifest("again"), &fx.admin).await?;
+    Ok(())
+}
+
 /// Scenario A (apps plan §3 and §12 A3), with the real binary: a fresh
 /// single manager with no workers seeds the autoscaler, and `legion app
 /// list` shows it running on the manager's system worker, from the node's

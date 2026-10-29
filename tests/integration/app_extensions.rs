@@ -1656,3 +1656,57 @@ async fn kv_references_need_kv_read_wherever_they_are_test() -> R<()> {
     fx.run_as(&stored, false, &reader).await?;
     Ok(())
 }
+
+/// An allocation of `legion-system/<app>` speaks for the app only while the
+/// version it runs carries the reconciler's `managedBy` stamp for that app
+/// (hardening after the adversarial review): a version someone submitted
+/// straight to the job is not the app's.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_stamped_allocation_speaks_for_its_app_test() -> R<()> {
+    let fx = fixture().await?;
+    let job = format!("legion-system/{APP}");
+    let token = fx.app_token(APP)?;
+    fx.svc
+        .watch_app_extensions(req(WatchAppExtensionsRequest::default(), &token))
+        .await?;
+
+    // A direct submit of the app's job, as the admin: no stamp.
+    let mut edited = serde_json::to_value(fx.store.get_job_config(&job)?)?;
+    edited["version"] = Value::Null;
+    edited["tasks"][0]["count"] = json!(2);
+    fx.run(&edited).await?;
+    let config_id = fx.store.get_job_config(&job)?.id();
+    assert!(fx.store.job_managed_by(&job)?.is_none());
+    fx.store
+        .enqueue_eval("job_reschedule", Some(&job), Some(&config_id), None, None)?;
+    fx.drain_evals()?;
+    let allocation = fx
+        .store
+        .allocs_for_job(&job)?
+        .into_iter()
+        .find(|allocation| allocation.job_config_id == config_id)
+        .context("the unstamped version should be placed")?;
+    let task = fx
+        .store
+        .get_task_configs_for_job_config(&allocation.job_config_id)?
+        .into_iter()
+        .find(|(id, _)| *id == allocation.task_config_id)
+        .map(|(_, task)| task)
+        .context("task config")?;
+    let claims = claims_for_allocation(&fx.store, &allocation, &task, "auto")?;
+    let identity = WorkloadIdentity {
+        name: CONTROL_PLANE_IDENTITY_NAME.into(),
+        ..Default::default()
+    };
+    let unstamped = fx
+        .state
+        .issue(&claims, &identity, std::time::SystemTime::now())?
+        .token;
+    let status = fx
+        .svc
+        .watch_app_extensions(req(WatchAppExtensionsRequest::default(), &unstamped))
+        .await
+        .expect_err("an unstamped version's allocation is not the app");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status}");
+    Ok(())
+}

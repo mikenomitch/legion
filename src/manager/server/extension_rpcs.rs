@@ -606,8 +606,11 @@ impl ManagerDaemonService {
     }
 
     /// The app a caller is: its bearer is this cluster's `legion` token for
-    /// a job in `legion-system`, or it carries a grant reference to an
-    /// allocation of an app's job (an ACL token minted from the identity).
+    /// an allocation of an app's job, or it carries a grant reference to one
+    /// (an ACL token minted from the identity). Either way the allocation
+    /// must run a version the reconciler stamped `managedBy` that app
+    /// ([`crate::storage::store::Store::allocation_app`]): the job's name
+    /// alone is not the app.
     fn calling_app<T>(&self, request: &Request<T>, identity: &AclIdentity) -> Option<String> {
         if identity.source == crate::structs::acl::AclSource::Delegated {
             // An app acting for a viewer is not the app plane.
@@ -619,11 +622,12 @@ impl ManagerDaemonService {
         ) {
             if let Ok(claims) = state.verify_control_plane(&bearer) {
                 let namespace = claims.get("legion.io/namespace").and_then(Value::as_str);
-                let job = claims.get("legion.io/job").and_then(Value::as_str);
-                if let (Some(namespace), Some(job)) = (namespace, job) {
-                    if namespace == crate::structs::namespace::SYSTEM_NAMESPACE {
-                        return Some(job.to_string());
-                    }
+                let allocation = claims
+                    .get("legion.io/alloc")
+                    .and_then(Value::as_str)
+                    .and_then(|id| id.parse::<i64>().ok());
+                if namespace == Some(crate::structs::namespace::SYSTEM_NAMESPACE) {
+                    return allocation.and_then(|id| self.store.allocation_app(id).ok().flatten());
                 }
             }
         }
