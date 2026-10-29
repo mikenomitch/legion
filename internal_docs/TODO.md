@@ -511,7 +511,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6) and autoscaler v2 (Phases 1-7) | Both plans SHIPPED; their items are checked off and in Done |
+| [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), and app actions as the viewer | All three plans SHIPPED; their items are checked off and in Done |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -4441,8 +4441,36 @@ plan.
           fetch the keys that verify the viewer assertion
           ([calls 69](calls/legion-apps-plan_calls.md)).
     - [ ] **`legion app test`** (check that a third-party app refuses bad
-          assertions, plan §6.5) is not built
+          assertions, plan §6.5, and makes its action writes with
+          `legion-on-behalf-of`) is not built
           ([calls 78](calls/legion-apps-plan_calls.md)).
+    - [x] **Actions run with the app's grant**, with the viewer only in the
+          reason ([calls 68](calls/legion-apps-plan_calls.md),
+          [autoscaler calls 83](calls/autoscaler-v2-plan_calls.md)). Closed
+          by [app-actions-as-viewer-plan.md](plans/app-actions-as-viewer-plan.md):
+          actions run as `<viewer> via app <app>`; in Done under *Ecosystem
+          apps*.
+  - [ ] App-actions-as-viewer follow-ups, found while building it
+        ([plan](plans/app-actions-as-viewer-plan.md) ·
+        [calls](calls/app-actions-as-viewer-plan_calls.md)):
+    - [ ] **The `app.action` event does not name the delegation** (the
+          resource, actions and scope the press handed the app); only the
+          `app_audit` log line does. Add it to the event's meta if audits
+          ask ([calls 15](calls/app-actions-as-viewer-plan_calls.md)).
+    - [ ] **A delegation is reusable by its app for 60 seconds**: the
+          manager tracks no spent assertions. A per-call or single-use
+          check would need a replicated spent set
+          ([calls 5](calls/app-actions-as-viewer-plan_calls.md)).
+    - [ ] **A mixed-version cluster fails viewer-client calls**: an
+          assertion signed by a manager that predates delegation carries
+          none, so the autoscaler's Pause, Resume and Release fail until
+          every manager is upgraded (views are unaffected). Say so in
+          [upgrades.md](../docs/upgrades.md) or keep it in the apps doc's
+          limitations, where it is today.
+    - [ ] **A JWT (SSO) viewer's delegation is not re-checked**: without an
+          ACL token accessor, revoking their access takes effect when the
+          assertion expires (60 seconds), not at once
+          ([calls 4](calls/app-actions-as-viewer-plan_calls.md)).
     - [ ] **Pages only in the sidebar**: pages in job, task, and node slots
           are deferred ([calls 82](calls/legion-apps-plan_calls.md)).
     - [ ] **`PAGE_RPCS` must classify every new page-callable RPC**, or
@@ -6555,6 +6583,25 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         with the `PAGE_RPCS` allowlist re-checked by the manager and an
         SPA-owned confirmation for every write
   - [x] Playwright smoke tests (`npm run test:smoke` in `ui/`)
+- [x] **App actions run as the viewer** (2026-10-29,
+      [plan](plans/app-actions-as-viewer-plan.md) ·
+      [calls](calls/app-actions-as-viewer-plan_calls.md) · docs:
+      [auth-and-acls.md](../docs/auth-and-acls.md#delegated-identities),
+      [apps.md](../docs/apps.md#acting-as-the-viewer),
+      [autoscaling.md](../docs/autoscaling.md#in-the-ui),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] A `delegation` on an action's viewer assertion: the declared
+        permission, `read` on the same resource when the viewer holds it,
+        the exact scope checked
+  - [x] `legion-on-behalf-of`: the app presents the assertion beside its
+        own credential, and the manager authenticates the call as
+        `<viewer> via app <app>` (one synthesized rule, intersected with
+        the app's grant, both parties' deny rules; only that app may
+        present it; the viewer's token re-resolved per call; streams and
+        the app plane refuse it; `WhoAmI` reports `delegated`)
+  - [x] The framework's `ActionRequest::client_as_viewer` and
+        `ManagerConnection`; the autoscaler's Pause, Resume and Release
+        recorded by the viewer, the `by <viewer>` reason gone
 - [x] **Legion apps A6b: jobspec extensions** (2026-10-29,
       [plan](plans/legion-apps-plan.md) §6.6, §8 ·
       [calls 85-94](calls/legion-apps-plan_calls.md) · docs:

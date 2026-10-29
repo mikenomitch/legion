@@ -817,6 +817,10 @@ declared permission on the context) before the app is asked, so a
 `PERMISSION_DENIED` means the view is not yours to see, and the app saw
 nothing. Running an action (`InvokeAppAction`) is mutating, audited as
 `app.action`, and takes an idempotency key; agents read views only for now.
+An agent that does call `InvokeAppAction` is the viewer like anyone else:
+the app acts on its behalf, holding only the action's declared permission
+on that context, and what it writes is recorded as `<agent's token name>
+via app <app>` ([Delegated identities](auth-and-acls.md#delegated-identities)).
 
 An app may also ship **sandboxed pages** (`ui.pages`), single-file HTML the
 UI mounts in an iframe ([Apps: Sandboxed pages](apps.md#sandboxed-pages)).

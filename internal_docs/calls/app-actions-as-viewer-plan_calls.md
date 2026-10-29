@@ -320,3 +320,23 @@ what it did.
 **Why (simplicity).** The event records who pressed what; the delegation is
 what the app was allowed to do, which the manifest and the context already
 determine. Left as a follow-up if audits ask for it.
+
+## 16. A delegated identity's denial names the delegation, not a namespace reach
+
+**Call.** A call outside the delegation is denied with a message of its
+own:
+
+```text
+PermissionDenied: permission denied: scale:write is outside what alice via app autoscaler delegates
+Hint: an app acting for a viewer holds only the action's declared permission on what the action was pressed for (`WhoAmI` through the same client shows it)
+```
+
+**Alternatives.** The ordinary denial, whose hint reads the caller's reach
+off its rules.
+
+**Trade-off.** One more denial wording to keep in step with `enforce`.
+
+**Why (ease).** The ordinary hint would read "this token can write scale in
+default" off the synthesized rule, which holds one job, not the namespace:
+it would send an app author looking for a grant that is not the problem.
+

@@ -645,14 +645,28 @@ Actions: Pause…
   each check's reading) and the panel draws them. A restarted autoscaler
   starts the hour afresh, and the panel says it has no evaluations yet. The
   decisions below it are the durable [history](#seeing-what-it-did-and-why).
-- **The actions act on the panel's job, as the autoscaler.** The manager
-  checks `scale:write` on the job as you, and records an `app.action`
-  event naming you; the app then calls `PauseScaling` or `ScaleTask`
-  (`release`) with its own grant, with `paused from the UI by <you>` as the
-  reason. **Pause** takes a duration (default 1 hour) and pauses every
-  autoscaled task of the job; **Resume** lifts the job's pause (a
-  cluster-wide pause is lifted with `legion scaling resume --all`);
-  **Release the pin** ends every pin on the job's autoscaled tasks.
+- **The actions act on the panel's job, as you.** The manager checks
+  `scale:write` on the job as you and records an `app.action` event naming
+  you; the app then calls `PauseScaling` or `ScaleTask` (`release`) **on
+  your behalf** ([delegated identities](auth-and-acls.md#delegated-identities)):
+  the call holds `scale` on this job only, within the app's grant, so the
+  app cannot pause anything else with your press. The pause or the released
+  pin is recorded by **`alice via app autoscaler`**, with the reason
+  `paused from the UI` (`resumed from the UI`, `released from the UI`):
+
+  ```console
+  $ legion scaling status web
+  web/web/web   task   enforce   now 4   bounds 2..8   evaluated 3s ago
+    paused (job) by alice via app autoscaler until 15:04 UTC: "paused from the UI"
+  ```
+
+  **Pause** takes a duration (default 1 hour) and pauses every autoscaled
+  task of the job; **Resume** lifts the job's pause (a cluster-wide pause is
+  lifted with `legion scaling resume --all`); **Release the pin** ends every
+  pin on the job's autoscaled tasks. The `scale.paused` event and `legion
+  scaling history` (for a release) show the same principal. A press on a
+  job in a reserved `legion-*` namespace is refused: the autoscaler's grant
+  (`*`) does not reach them, and a delegation never exceeds it.
 - **Node groups are shown, not scaled.** The node panel reports a group's
   membership and its capacity demand; nothing adds or removes nodes yet
   ([Known limitations](#known-limitations)).
@@ -1471,7 +1485,7 @@ a job without the right to redeploy it. See [auth-and-acls.md](auth-and-acls.md)
 | `ApplyScalingDefaults` | `operator:write` |
 | `ReportScalingStatus`, `RecordScalingAction` | app-plane: only the bundled autoscaler's own identity (or a management token) |
 | the UI's panels, badges, and page (`GetAppView` on the `autoscaler` app) | `app:read` on `autoscaler`, and `scale:read` on the job (`node:read` on the node's pool for the node panel; `scale:read` somewhere for the sidebar page) |
-| the UI's Pause, Resume, and Release (`InvokeAppAction`) | `app:read` on `autoscaler`, and `scale:write` on the job |
+| the UI's Pause, Resume, and Release (`InvokeAppAction`) | `app:read` on `autoscaler`, and `scale:write` on the job; the app then writes as `<you> via app autoscaler`, holding `scale` on that job only ([delegated identities](auth-and-acls.md#delegated-identities)) |
 
 A standalone policy is scoped like a job of the same name in its
 namespace: a rule with `names = ["render-*"]` on `scale` covers the
@@ -1485,8 +1499,11 @@ allocation of `legion-system/autoscaler`, so a person with `scale:write`
 cannot forge the app's status or its dry-run records. Likewise
 `ScaleTask`'s `source = "autoscaler"` is honored only from that identity;
 from anyone else the write is recorded as `operator` (and is then a pin on
-an autoscaled task, which needs `--for`). With ACLs disabled every caller
-is trusted, as everywhere else.
+an autoscaled task, which needs `--for`). The autoscaler acting for a
+viewer (`alice via app autoscaler`) is "anyone else": its writes are
+operator writes, and the app plane refuses it. With ACLs disabled every
+caller is trusted, as everywhere else, and a UI press is recorded by
+`acl-disabled`.
 
 ## Observability
 

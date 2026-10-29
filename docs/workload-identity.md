@@ -1003,7 +1003,10 @@ worker listens on it and proxies gRPC to the managers:
   that failover the way a failed heartbeat does.
 - A call that carries no `authorization` header gets the allocation's current
   `legion` token, which the worker keeps fresh. A call that carries its own
-  credential (a token from `legion login`) keeps it.
+  credential (a token from `legion login`) keeps it. Every other header
+  passes through as sent, so an app acting for a viewer adds the viewer's
+  assertion in `legion-on-behalf-of` and the socket still attaches the
+  app's own token ([Delegated identities](auth-and-acls.md#delegated-identities)).
 - The task needs no route to a manager. That matters where it runs by
   default: the [host guard](network-handlers.md) drops a task's connections
   to Legion's own ports on a manager's node, and a gated task has no route

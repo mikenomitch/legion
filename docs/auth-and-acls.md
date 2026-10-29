@@ -489,8 +489,10 @@ rule; instead they accept only a credential whose job grant belongs to an
 allocation of `legion-system/autoscaler` (its `legion` token, or an ACL token
 minted from it), or a management token. Anyone else gets `PermissionDenied`
 (`Unauthenticated` without a credential), so a principal with `scale:write`
-cannot forge the autoscaler's status. `ScaleTask`'s `source = "autoscaler"`
-is honored on the same test ([autoscaling.md](autoscaling.md#access-control)).
+cannot forge the autoscaler's status. The autoscaler acting for a viewer
+([Delegated identities](#delegated-identities)) is not the app plane, and is
+refused too. `ScaleTask`'s `source = "autoscaler"` is honored on the same
+test ([autoscaling.md](autoscaling.md#access-control)).
 
 ### App views and the viewer assertion
 
@@ -503,9 +505,11 @@ the request to the app, with a **viewer assertion**: a 60-second JWT signed
 with the workload-identity key, `aud = app:<name>`, naming the viewer, the
 permission checked, and the context. The app verifies it and acts only on
 that context, so a viewer can press a button only where they hold the
-permission the manifest declares for it; that the declaration fits what the
-action does is part of what an installer approves. Every action is recorded
-as an `app.action` event. [Apps: Views and actions](apps.md#views-and-actions) has the details.
+permission the manifest declares for it. What the app then does on the
+press it does **as the viewer**, through a [delegated
+identity](#delegated-identities), so the declared permission is also what
+the press can do. Every action is recorded as an `app.action` event.
+[Apps: Views and actions](apps.md#views-and-actions) has the details.
 
 An app's **sandboxed page** is fetched the same way (`GetAppPage`: `app:read`
 on the app, then the page's declared permission, then a viewer assertion
@@ -519,6 +523,75 @@ what a page may ask for; it never widens what the viewer may do, which the
 RPC's own ACL check decides as for any call. A page can still read what its
 viewer can read through its RPCs and send it elsewhere
 ([Apps: What the sandbox does not stop](apps.md#what-the-sandbox-does-not-stop)).
+
+### Delegated identities
+
+An app acts on a viewer's button press **as the viewer**, not with its own
+grant. The action's viewer assertion carries a **delegation**: the action's
+declared permission (and `read` on the same resource, when the viewer holds
+it there), on exactly the scope the manager checked (the job, or the node's
+pool). The app sends the assertion back with its own calls, in one gRPC
+metadata entry, beside its own credential:
+
+```text
+authorization: Bearer <the app's legion token>       (attached by the API socket)
+legion-on-behalf-of: <the action's viewer assertion>
+```
+
+The manager answers such a call with a **delegated identity**:
+
+| | |
+| --- | --- |
+| principal | `alice via app autoscaler` |
+| rules | one allow rule: the delegated resource and actions, with exact `namespaces`, `names`, `templates`, or `pools` selectors for the scope; plus the app's and the viewer's deny rules |
+| bounded by | the app's own grant: an action the app does not hold on the scope is dropped |
+| `WhoAmI.source` | `delegated` (`rules_json` shows the one rule) |
+| lifetime | the assertion's 60 seconds, and the app credential's own expiry |
+
+Before it builds one, the manager checks that:
+
+- **the caller is the app** the assertion was signed for: its credential's
+  job grant belongs to an allocation of `legion-system/<app>` (its `legion`
+  token, or an ACL token minted from it). Anyone else presenting the
+  assertion, a management token included, is refused, so an assertion is
+  useless outside its app;
+- the assertion **verifies** against the cluster's workload-identity keys
+  for `aud = app:<app>`, has **not expired** (no clock leeway), and is an
+  action's, carrying a delegation;
+- the **viewer still may**: when the viewer used an ACL token, it is
+  looked up again on every call, so a deleted or expired token, or a policy
+  that no longer grants the permission, ends the delegation at once. A
+  viewer who signed in with a JWT bearer has no token to look up; the
+  assertion's 60 seconds bound them.
+
+A call that fails any check is `Unauthenticated` or `PermissionDenied`,
+names `legion-on-behalf-of` in its message, and is logged as an `ACL
+denial` under `acl_audit` (with `resource = delegation`), audit-only mode
+or not. It never falls back to the app's own identity. A delegated identity
+is also refused by **streams** (`StreamEvents`, `WatchScalingPolicies`,
+`WatchAppExtensions`, `ExecAllocation`), which re-check their caller every
+30 seconds from the bearer credential alone, and by the **app plane**
+(`ReportScalingStatus`, `RecordScalingAction`), which takes an app's own
+identity only. With ACLs disabled the header is ignored, like every
+credential.
+
+The delegated principal is what history records: a pause from the
+autoscaler's panel is `paused by alice via app autoscaler`, in `legion
+scaling status`, `legion scaling history`, and the `scale.paused` event. A
+call outside the delegation is denied as any call is, logged with `alice
+via app autoscaler` as the principal:
+
+```text
+PermissionDenied: permission denied: scale:write is outside what alice via app autoscaler delegates
+Hint: an app acting for a viewer holds only the action's declared permission on what the action was pressed for (`WhoAmI` through the same client shows it)
+```
+
+Delegation is how a well-behaved app acts as the viewer; it does not stop
+an app from calling with its own client, whose power is its grant
+([App grants](#app-grants)). The manifest's declared permission bounds an
+action's delegated calls, and the grant bounds everything the app does.
+[Apps: Acting as the viewer](apps.md#acting-as-the-viewer) shows the app
+side.
 
 ### Tokens
 
@@ -972,7 +1045,9 @@ a version with it: a manager from before it cannot talk to one after.
 `legion_acl_whoami` MCP tool all report whether ACLs are enabled, how the
 caller was authenticated, which policies apply, and which namespaces the
 caller can read (`readable_namespaces`). Start here when
-debugging a `PermissionDenied`.
+debugging a `PermissionDenied`. An app debugging its viewer client calls
+`WhoAmI` through it: `source = delegated`, the principal `<viewer> via app
+<app>`, and the rule the delegation holds.
 
 ### Recovery
 

@@ -7,6 +7,25 @@ package legion;
 // - `*_json` and many string fields contain JSON payloads serialized as strings.
 // - Timestamps are generally RFC3339 strings unless a field explicitly says Unix timestamp.
 // - Optional fields are omitted when not provided by the client/server.
+//
+// Authentication rides in gRPC metadata, not in messages
+// (docs/auth-and-acls.md):
+// - `authorization: Bearer <token>` (or `x-legion-token`): the caller's
+//   credential, a Legion ACL token or a JWT an auth method accepts. A task's
+//   API socket attaches the task's `legion` identity token when the caller
+//   sends none.
+// - `legion-on-behalf-of: <viewer assertion>`: an app acting as a viewer.
+//   An app's own credential presents the viewer assertion of an action
+//   InvokeAppAction forwarded to it, and the call is authenticated as the
+//   delegated identity `<viewer> via app <app>`: the action's declared
+//   permission on the context it was pressed on (and `read` on the same
+//   resource when the viewer holds it), within the app's own grant, for the
+//   assertion's 60 seconds, and only while the viewer's token is valid.
+//   Presented by anyone but that app, expired, or for a revoked viewer, the
+//   call is Unauthenticated or PermissionDenied; it never falls back to the
+//   app's own identity. Streaming RPCs and app-plane RPCs refuse it
+//   (PermissionDenied). Ignored when ACLs are disabled. See
+//   docs/auth-and-acls.md, "Delegated identities".
 
 // === MANAGER ===
 
@@ -277,8 +296,10 @@ service Manager {
   // ACL: app-plane. Only the bundled autoscaler's own workload identity (a
   // token whose job grant belongs to an allocation of
   // `legion-system/autoscaler`) or a management token may call it, so a
-  // caller with `scale:write` cannot forge the app's status. With ACLs
-  // disabled every caller is trusted, as everywhere else.
+  // caller with `scale:write` cannot forge the app's status. The app acting
+  // as a viewer (`legion-on-behalf-of`) is PermissionDenied, in audit-only
+  // mode too. With ACLs disabled every caller is trusted, as everywhere
+  // else.
   rpc ReportScalingStatus (ReportScalingStatusRequest) returns (ReportScalingStatusReply);
 
   // Records an autoscaler action that is not a task's count write:
@@ -2746,8 +2767,9 @@ service Manager {
   // `legion` token, through the API socket or as a bearer token, or an ACL
   // token minted from it with `legion login --method legion`), and it
   // returns only that app's values: `app` must be empty or name the caller.
-  // A management token may name any installed `app`. Re-checks the
-  // caller's credential periodically, like StreamEvents.
+  // A management token may name any installed `app`. An app acting as a
+  // viewer (`legion-on-behalf-of`) is refused. Re-checks the caller's
+  // credential periodically, like StreamEvents.
   //
   // Errors:
   // - Unauthenticated: no credential.
@@ -2854,6 +2876,19 @@ service Manager {
   // {...} }` and a viewer assertion that also carries the SHA-256 of the
   // inputs' canonical JSON, so an app acts only on the context and inputs
   // the manager authorized.
+  //
+  // The action's assertion also carries a `delegation`: the declared
+  // resource, the declared action (then `read` on the same resource when
+  // the caller holds it there), and exactly the scope checked (`namespace`
+  // and `name`, plus `template` when the job came from one, for job and
+  // task slots; `pool` for a node slot's `node` permission). The app may
+  // present the assertion back in the `legion-on-behalf-of` metadata, beside
+  // its own credential, to make its calls as `<caller> via app <app>`,
+  // holding only that delegation within its own grant, for the assertion's
+  // 60 seconds; the pause or pin it makes is then recorded by that
+  // principal, not by the app (docs/auth-and-acls.md, "Delegated
+  // identities"). A context whose job, namespace, or pool has a `*` in its
+  // name cannot be delegated: InvalidArgument.
   //
   // The app answers `{ "message": "...", "view": {...} }`; `view`, when
   // present, is a refreshed view, validated like GetAppView's.
@@ -14149,7 +14184,11 @@ message WhoAmIReply {
   // How the caller was identified.
   //
   // One of: `disabled` (ACLs off), `token` (Legion ACL token), `jwt`
-  // (external JWT validated by an auth method), `anonymous` (no credential).
+  // (external JWT validated by an auth method), `anonymous` (no credential),
+  // `delegated` (an app's own credential presenting a viewer's assertion in
+  // `legion-on-behalf-of`: `principal` is `<viewer> via app <app>`, and
+  // `rules_json` the one rule the delegation holds, plus any deny rules the
+  // app or the viewer carry).
   string source = 3;
 
   // Human-readable principal: token name, `user:<name>`, JWT subject, or

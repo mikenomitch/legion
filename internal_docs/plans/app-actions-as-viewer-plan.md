@@ -2,10 +2,14 @@
 
 > **Judgement calls:** [app-actions-as-viewer-plan_calls.md](../calls/app-actions-as-viewer-plan_calls.md)
 
-**Status: IN EXECUTION** (planned 2026-10-29, on PR #60). Deliberately
+**Status: SHIPPED** (planned and built 2026-10-29, on PR #60; every phase
+below; docs: [auth-and-acls.md](../../docs/auth-and-acls.md#delegated-identities),
+[apps.md](../../docs/apps.md#acting-as-the-viewer),
+[autoscaling.md](../../docs/autoscaling.md#in-the-ui)). Where the build
+differs from this text, the calls doc says how. Deliberately
 deferred: delegation for views and sandboxed
-pages (non-goal), a single-use or audience-bound manager-side check of the
-assertion (the 60-second TTL bounds reuse by the same app), naming the
+pages (non-goal), a single-use check of the assertion at the manager (the
+60-second TTL bounds reuse by the same app), naming the
 delegation in the `app.action` event, and a `legion app test` that checks a
 third-party app sends the header (with the rest of `legion app test`).
 

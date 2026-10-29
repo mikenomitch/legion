@@ -461,6 +461,14 @@ Limits:
 - **An app's power is its grant**, and the grant is never more than a person
   held: the installer (checked at install), an upgrader (checked at
   upgrade), or whoever changes a code field (checked at `config set`).
+- **A button press is the viewer's, not the app's.** An app that acts on an
+  action through its viewer client ([Acting as the
+  viewer](#acting-as-the-viewer)) does so as `<viewer> via app <app>`,
+  holding only the action's declared permission on the context it was
+  pressed on, within its grant; history records the person. The app's code
+  can still call with its own grant instead, so the manifest's declared
+  permission is the bound of a well-behaved app, and the grant the bound of
+  any.
   Bundled apps are the exception: their grants are recorded by
   `legion:bootstrap` at seed time, without a check, because the manifest is
   part of the binary you chose to run, which is already the manager.
@@ -694,6 +702,10 @@ An action is a button in a view's `actions` block, bound to an entry of
 - Every action that passes `app:read` is recorded as an `app.action` event:
   the app, the action, the caller, the context, and the outcome (`ok`,
   `failed`, or `denied`).
+- What the app then does, it does **as the viewer** when it uses the viewer
+  client: the action's assertion carries a delegation of the declared
+  permission on the context, and the writes are recorded by `<viewer> via
+  app <app>` ([Acting as the viewer](#acting-as-the-viewer)).
 - `InvokeAppAction` takes `idempotency_key`; the SPA sends one per press, so
   a retried press runs once.
 
@@ -717,12 +729,14 @@ and JWKS as workload identity tokens.
 | `sub` | `accessor:<id>` of the viewer's token, or `principal:<name>` |
 | `iat`, `exp` | issued now, expires 60 seconds later |
 | `jti` | unique per request |
-| `legion.io/viewer` | `{ kind: view \| action, app, name, principal, accessor?, permission?, scope: context \| any \| none, namespaces?, context, inputs? }` |
+| `legion.io/viewer` | `{ kind: view \| action, app, name, principal, accessor?, permission?, scope: context \| any \| none, namespaces?, context, inputs?, delegation? }` |
 
 `context` is the context exactly as the request carries it (the query, or
 the body's `context`), and `inputs` is the SHA-256, in hex, of the inputs'
-JSON with object keys sorted. An app **must** refuse a request whose
-assertion:
+JSON with object keys sorted. `delegation` is on an action's assertion only:
+what the app may do with it as the viewer
+([Acting as the viewer](#acting-as-the-viewer)). An app **must** refuse a
+request whose assertion:
 
 - is missing, or does not verify against the cluster's JWKS;
 - is for another issuer or another audience (`app:<another app>`);
@@ -739,6 +753,88 @@ request. A workload that can reach the app's port directly can therefore do
 nothing with it. Apps do not authorize viewers themselves: the manager
 already did, against the context in the assertion. An app's one obligation is
 to act only on that context.
+
+### Acting as the viewer
+
+An action's assertion is also the app's credential to act **as the
+viewer**. It carries a delegation:
+
+```json
+"delegation": {
+  "resource": "scale",
+  "actions": ["write", "read"],
+  "scope": { "namespace": "default", "name": "web" }
+}
+```
+
+- `resource` and the first action are the action's declared `permission`.
+  `read` on the same resource follows when the viewer holds it there too.
+- `scope` is exactly what the manager checked: the job (`namespace`,
+  `name`, and `template` when the job came from one) for the `job` and
+  `task` slots; the node's `pool` for a `node` permission in the `node`
+  slot; `{}` for a cluster-scoped resource; `namespace = "*"` for a
+  namespaced resource in the `node` slot, which is checked across every
+  namespace.
+
+An app presents the assertion back on its own calls to Legion, in the
+`legion-on-behalf-of` gRPC metadata, beside its own credential (which the
+API socket attaches). The Rust framework does it for you:
+
+```rust
+context.action("pause", move |request: ActionRequest| {
+    let context = context.clone();
+    async move {
+        let mut legion = request.client_as_viewer(&context).await?;
+        legion
+            .pause_scaling(PauseScalingRequest {
+                job: request.context.job_id().unwrap_or_default(),
+                ..Default::default()
+            })
+            .await?;
+        Ok(ActionOutcome::done("paused"))
+    }
+});
+```
+
+`client_as_viewer` dials `LEGION_ADDR` like `AppContext::client`;
+`client_as_viewer_over(&connection)` does the same over a
+`ManagerConnection` the app already holds (`AppContext::connection`). The
+manager authenticates every call made with it as **`alice via app
+<app>`**, which holds:
+
+- the delegated resource and actions, on exactly the delegated scope, and
+  nothing else: a call on another job, another resource, or another action
+  is `PermissionDenied`, whatever the app's own grant allows;
+- only what the app's own grant also holds there: a delegation never
+  widens the app, and an action the grant lacks on the scope is dropped
+  (with nothing left, the call is refused);
+- nothing the app or the viewer is denied by a deny rule.
+
+It lasts as long as the assertion (60 seconds) and covers any number of
+unary calls in that time; while the viewer's ACL token exists and still
+holds the permission. Revoking the token, or the policy, ends it at the
+next call. The pause, pin, or job change the app makes is recorded by
+`alice via app <app>`, so `legion scaling status`, `legion scaling
+history`, and the event stream name the person and the app, while the
+`app.action` event names who pressed. `WhoAmI` through a viewer client
+reports `source = delegated` and the one rule it holds.
+
+An app in another language does the same: keep the `Legion-Viewer` header
+of an action request, and send it as `legion-on-behalf-of` metadata on its
+gRPC calls to `LEGION_ADDR`.
+
+Only the app the assertion was signed for may present it: the manager
+checks that the caller's own credential is that app's `legion` identity (a
+token whose job grant belongs to an allocation of `legion-system/<app>`),
+so an assertion that leaks is useless to anyone else, a management token
+included. Views, pages, and validate calls carry no delegation: views read
+with the app's grant, after the manager checked the viewer may read.
+
+Using the viewer client is a choice the app's code makes. An app can still
+call with its own client from an action; its code is trusted with its
+grant, which is why installing an app shows that grant. A well-behaved app
+makes an action's writes through the viewer client, and the manifest's
+declared permission is then a bound the cluster enforces.
 
 ### Writing views
 
@@ -762,8 +858,12 @@ context.action("sync-now", |request: ActionRequest| async move {
 ```
 
 - A handler gets the verified context and the **viewer** (principal,
-  accessor, the permission checked, and where). Return `AppView::hidden()`
-  when there is nothing to show for a context.
+  accessor, the permission checked, and where; for an action, the
+  delegation). Return `AppView::hidden()` when there is nothing to show for
+  a context.
+- An action's writes go through `request.client_as_viewer(&context)`
+  ([Acting as the viewer](#acting-as-the-viewer)); its own client
+  (`context.client()`) is for reads and for work that is the app's own.
 - Return `Err(Refused("...".into()).into())` from an action to refuse it
   with a message the viewer sees (`FailedPrecondition` at the caller);
   any other error is a failure.
@@ -794,6 +894,22 @@ message.
 | `FailedPrecondition: ... something Legion does not render` | the app's answer fails the schema | the message names the block and the problem |
 | `NotFound` | no such app, or no such view in that slot, or no such action | `legion app view <app>` lists what it shows |
 | `DeadlineExceeded` | the app took more than 10 seconds | |
+| `InvalidArgument: this action cannot be delegated` | the context's job, namespace, or pool has a `*` in its name | name the target exactly |
+
+What an app's viewer client sees from the manager (the app usually turns
+these into its own refusal, which the viewer sees as `FailedPrecondition`):
+
+| Error | Why |
+| --- | --- |
+| `PermissionDenied: permission denied: job:write is outside what alice via app <app> delegates` | the call is outside the delegation: another job, resource, or action |
+| `PermissionDenied: legion-on-behalf-of: app <app>'s own grant does not hold scale:write on team-b/web, so it cannot act there as alice` | the viewer may, but the app's grant does not reach the context |
+| `PermissionDenied: legion-on-behalf-of: alice no longer holds scale:write on default/web` | the viewer's policy changed after the press |
+| `Unauthenticated: legion-on-behalf-of: the viewer's ACL token (accessor …) was revoked` | the viewer's token was deleted, or has expired |
+| `Unauthenticated: legion-on-behalf-of: the viewer assertion expired at …` | more than 60 seconds since the press |
+| `PermissionDenied: legion-on-behalf-of: only an app's own identity presents a viewer assertion` | the caller is not the app (a management or personal token) |
+| `Unauthenticated: legion-on-behalf-of: the viewer assertion does not verify for app <app>` | another app's assertion, or not one at all |
+| `PermissionDenied: legion-on-behalf-of: a delegation covers single calls …` | a stream (`StreamEvents`, `WatchScalingPolicies`, ...) was opened with it |
+| `PermissionDenied: legion-on-behalf-of: … carries no delegation` | the assertion came from a manager that predates delegation (a mixed-version cluster); retry once every manager is upgraded |
 
 ## Sandboxed pages
 
@@ -1301,7 +1417,9 @@ The app's tasks get, in their environment:
 | `LEGION_ADDR_API`, `LEGION_PORT_API` | the app's `api` port, when its task declares one |
 
 So `legion kv get legion/apps/gitops/state` inside the task just works,
-with the app's grant and no token handling.
+with the app's grant and no token handling. To act as a viewer from an
+action, the app's calls add the action's assertion in
+`legion-on-behalf-of` ([Acting as the viewer](#acting-as-the-viewer)).
 
 **`legion app run <name>`** is the entrypoint bundled apps run. It reads
 `$LEGION_APP_CONFIG` (validated against the app's schema), serves the app's
@@ -1407,6 +1525,21 @@ them, and which allocation answered. The MCP server exposes
 - **Actions run from the UI.** The terminal and MCP read views and list
   their actions; there is no `legion app` command or MCP tool that runs one
   yet (`InvokeAppAction` is a public RPC).
+- **Acting as the viewer is the app's choice.** An app's code can call with
+  its own grant from an action handler; the declared permission bounds only
+  the calls it makes through the viewer client. Install an app only if you
+  would trust it with its grant.
+- **A delegation is reusable for its minute.** The framework runs each
+  action assertion once, but the manager accepts its delegation on any
+  number of calls from the app until it expires, all bound to the same
+  context and permission.
+- **A delegation needs every manager on the same build.** An assertion
+  signed by a manager that predates delegation carries none, so during an
+  upgrade an action whose app uses the viewer client can fail (views do
+  not).
+- **No delegation on streams, views, or pages.** Streams refuse
+  `legion-on-behalf-of`; views and pages read with the app's grant (pages
+  call as the viewer through the bridge instead).
 - **Views are polled, not streamed**, at the app's `ui.refresh`, never more
   often than every 5 seconds.
 - **One replica answers.** A view or action goes to one running allocation
