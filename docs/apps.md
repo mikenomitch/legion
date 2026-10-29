@@ -9,8 +9,9 @@ install from a manifest. It is three things:
 3. **registrations**: the UI it adds (pages, panels, badges, and actions,
    drawn from the app's declarative views, and sandboxed pages for what the
    views cannot draw; see [Views and actions](#views-and-actions) and
-   [Sandboxed pages](#sandboxed-pages)) and the jobspec keys it adds
-   ([Jobspec extensions](#jobspec-extensions)).
+   [Sandboxed pages](#sandboxed-pages)), the jobspec keys it adds
+   ([Jobspec extensions](#jobspec-extensions)), and the object kinds it
+   owns ([Object kinds](#object-kinds)).
 
 A **manifest** declares all three. An **app record**, stored on the
 managers, holds the installed manifest, the operator's settings and config,
@@ -1405,6 +1406,23 @@ framework answers that every value passes.
   extension points as not checked.
 - The MCP tools `legion_job_schema` and `legion_job_validate` do the same.
 
+## Object kinds
+
+An app can also own **kinds of object**: `gitops` declares `Repo`, people
+apply Repos with `legion object apply`, and gitops watches them, deploys
+what each names, and reports each one's status. A manifest declares them in
+`kinds`: a schema, what governs the objects (`access`), what writing one
+also requires of its writer (`requires`), and how long a delete waits for
+the app to clean up. Legion stores and checks the objects; the app only
+reconciles them. [App Objects](app-objects.md) covers the manifest, the
+`legion object` CLI, the ACL model, status, deletion, and the reconcile
+loop apps use.
+
+Objects outlive their app: uninstalling an app with objects, or upgrading
+it to drop a kind that has objects, needs `--force` and leaves the objects
+orphaned (readable and deletable, never written) until the app is
+installed again, which adopts them.
+
 ## Inside an app
 
 The app's tasks get, in their environment:
@@ -1466,7 +1484,7 @@ manager ([Metrics](metrics.md)).
 | `legion app enable <app>`, `disable <app>` | `SetAppEnabled` |
 | `legion app install <file|url> [--config F] [--yes] [--dry-run] [--key P.K=NEW]` | `InstallApp` |
 | `legion app upgrade <app> <file|url> [--config F] [--yes] [--dry-run]` | `UpgradeApp` |
-| `legion app uninstall <app> [--force]` | `UninstallApp` |
+| `legion app uninstall <app> [--force]` (`--force` also when objects of its kinds exist) | `UninstallApp` |
 | `legion app extensions [app]` | `ListApps` / `GetApp` (`App.extension_keys`) |
 | `legion job schema` | `GetJobSchema` (the cluster's jobspec schema, installed keys included) |
 | (an app's own values) | `WatchAppExtensions` (app-plane) |
@@ -1475,6 +1493,7 @@ manager ([Metrics](metrics.md)).
 | (the UI's action buttons) | `InvokeAppAction` |
 | (the UI's sandboxed pages) | `GetAppPage` |
 | `legion app run <app> [--listen ADDR] [--config F]` | (the in-task entrypoint) |
+| `legion object kinds\|explain\|apply\|get\|list\|delete` | the object RPCs ([App Objects](app-objects.md#api-cli-and-mcp-reference)) |
 
 Every command but `run` takes `--json`; `legion app view -j` returns the
 validated view document, the actions it offers with whether you may run

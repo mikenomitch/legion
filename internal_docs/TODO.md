@@ -512,6 +512,7 @@ How to use it:
 | PR | What it lands | Notes |
 | --- | --- | --- |
 | [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), and app actions as the viewer | All three plans SHIPPED; their items are checked off and in Done |
+| branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phase O1 | Builds on #60; O1 is checked off and in Done; O2-O4 and the deferrals are open under Ecosystem apps |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -4508,9 +4509,55 @@ plan.
   - [ ] Deferred: install apps from a registry (waits on a registry plan
         that doesn't exist yet), tenant-owned apps, and pre-approved
         per-namespace grants, so GitOps needn't hold the union of what its
-        jobs request (plan §6.8, §11); app-defined object kinds (a CRD
-        equivalent) and extension points beyond job, group, task, volume,
-        port, and service (plan §11)
+        jobs request (plan §6.8, §11); extension points beyond job, group,
+        task, volume, port, and service (plan §11). App-defined object kinds
+        (a CRD equivalent) have their own plan now: see **App-owned object
+        kinds** below.
+
+- [ ] **App-owned object kinds** (Legion's CRDs):
+      [plan](plans/app-object-kinds-plan.md) (IN EXECUTION; O1 in Done) ·
+      [calls](calls/app-object-kinds-plan_calls.md) · docs:
+      [app-objects.md](../docs/app-objects.md)
+  - [ ] **O2: the autoscaler's policies become its objects** (plan §8):
+        `ScalingPolicy` (`access = scale`, `immutable` target plugin) and
+        `NodeGroup` (cluster, `access = node`, `requires` operator:write,
+        `cleanup = "15m"`), autoscaler state keyed by kind and uid, durable
+        verdicts in object status, the namespace plugin allowlist enforced
+        by the app fail-closed, every core reader of standalone policies
+        reworked (`ApplyScalingDefaults` invalidation, `GetScalingStatus`,
+        `RecordScalingAction`, pauses and history), `PAGE_RPCS`, and the
+        lease-based shards lifted into the framework's `Reconciler`
+        ([calls 23](calls/app-object-kinds-plan_calls.md)). Cross-field
+        checks (`min <= max`) move to the app until O4: a regression from
+        today's fail-closed apply, to record when it lands.
+  - [ ] **O3: objects carry their authority** (plan §8): the
+        `legion-for-object` header, the app's grant intersected with the
+        object's recorded `authority`, `managedBy = { app, object uid }`,
+        `via = "objects"` permissions, and `legion object list
+        --authority-lapsed` ([calls 1, 26](calls/app-object-kinds-plan_calls.md)).
+  - [ ] **O4: CEL `rules`** on kinds, evaluated in the manager; `rules` is
+        refused until then ([calls 10](calls/app-object-kinds-plan_calls.md)).
+  - [ ] Deferred from O1:
+    - [ ] **Per-namespace object quotas** in namespace policies; today
+          only a kind's cluster-wide `maxObjects` caps objects
+          ([calls 16](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **`since_version` resume for `WatchObjects`**: a reconnect
+          relists; fine to about 50,000 objects per app, needs a change
+          log beyond that ([calls 17](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **`legion object apply --allow-pending`**: keep an object whose
+          kind is not installed yet, instead of the retryable
+          `KIND_NOT_INSTALLED` ([calls 24](calls/app-object-kinds-plan_calls.md)).
+    - [ ] **An object browser in the SPA**: objects are CLI, API, and MCP
+          only.
+    - [ ] **`writeOnly` values are stored in the state store in the
+          clear**, readable with `state:read`; encrypting them like KV
+          values (or storing them in KV) is open
+          ([docs](../docs/app-objects.md#limitations)).
+    - [ ] **The framework is Rust only**: a small client library for apps
+          in other languages (watch cache, status, release) is open.
+    - [ ] **Merge with #60's hardening**: `KindSchema::filled` relies on
+          `fill_defaults`, whose cycle and size caps land on #60's branch
+          (TODO comment in `src/structs/app_object.rs`).
 
 - [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (SHIPPED; Phases 2, 3, 4, 5b, 6 and 7 in Done, Phase 5a below; open follow-ups here) ·
       [calls](calls/autoscaler-v2-plan_calls.md). Supersedes
@@ -6288,6 +6335,37 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       Federation still needs an explicit public `issuer`.
 
 ## Ecosystem apps
+
+- [x] **App-owned object kinds, Phase O1: the generic system**
+      (2026-10-29, branch `claude/app-objects`;
+      [plan](plans/app-object-kinds-plan.md) §6-§8 ·
+      [calls](calls/app-object-kinds-plan_calls.md) · docs:
+      [app-objects.md](../docs/app-objects.md),
+      [apps.md](../docs/apps.md#object-kinds),
+      [auth-and-acls.md](../docs/auth-and-acls.md),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] Manifest `kinds`: closed schemas, `immutable`, `writeOnly`,
+        `access` (object, job, scale, node, pinned), `requires` with
+        pointers into the object, `cleanup`, `maxObjects`, columns,
+        examples, reserved nouns; `rules` refused until O4.
+  - [x] Storage: `object_kind` and `app_object` on the Control lane,
+        `app_object_status` on the Status lane; uids, generation vs spec
+        version, CAS, `maxObjects` in the write, status CAS and orphan
+        sweep, bounded cleanup and its expiry, kind sync and orphaning.
+  - [x] RPCs: `ListObjectKinds`, `ApplyObject`, `GetObject`, `ListObjects`,
+        `DeleteObject`, and the app-plane `WatchObjects` (chunked
+        snapshot, tombstones, per-app fingerprint, shards),
+        `UpdateObjectStatus`, `ReleaseObject`; the `object` ACL resource
+        with the `kinds` selector; authority recorded on each object;
+        `KIND_NOT_INSTALLED`; the validate call (advisory); events filtered
+        by kind ACL; `legion_object_status_writes_total`.
+  - [x] Lifecycle: install/upgrade/uninstall prompts and `--force`,
+        orphaning and adoption, namespace contents and `--cascade`.
+  - [x] `legion object kinds|explain|apply|get|list|delete` with `--wait`;
+        MCP tools; capability entries; `acl_endpoints` rows.
+  - [x] The app framework's reconcile loop (`legion::apps::objects`) and
+        the object validate handler; the example `Repo` kind
+        (`configs/apps/example-app.ncl`, `configs/apps/example-repo.ncl`).
 
 - [x] **Autoscaler Phase 2: task autoscaling as the bundled app**
       (2026-10-28, [plan](plans/autoscaler-v2-plan.md) §6.3-§6.6, §8 ·

@@ -123,6 +123,7 @@ reports `aclEnabled: false`.
 | `snapshot` | instance snapshots ([Suspend and Resume](suspend-and-resume.md)) | list, inspect, warm a published one onto nodes, restore an instance from one, and create instances from one (restore and create also need `job:write`) | create (including `--publish`), delete, and name snapshots, suspend with a memory checkpoint, and fork (fork also needs `job:write`) (scope by job name and namespace) |
 | `namespace` | namespace objects ([Namespaces](namespaces.md)) | get a namespace (listing is per item: any allow in a namespace shows it) | create, update, and delete namespaces whose names match (scope with `namespaces`). A cascade delete also needs `job:write` there. |
 | `app` | [apps](apps.md): Legion's add-ons | list and show apps (scope with `names`, matched against app names), and see their views and sandboxed pages and run their actions, each also checked against the view's, page's, or action's own declared permission ([Apps: Who sees what](apps.md#who-sees-what)) | install, upgrade, uninstall, enable, disable, and change settings and config. Installing and upgrading also need every permission the manifest asks for, and a config change that touches a code field needs the app's whole grant: `app:write` alone never hands out an app's grant. Cluster-scoped. |
+| `object` | objects of the kinds apps declare ([App Objects](app-objects.md)) | get, list, and see the kinds (`legion object kinds`, `get`, `list`); scope with `namespaces`, `names` (object names), and `kinds` (globs over `<app>/<Kind>`) | apply and delete objects. Writing an object also needs whatever its kind's `requires` resolves to for that object, checked as the writer ([App Objects: Requires](app-objects.md#requires)). A kind may be governed by `job`, `scale`, or `node` instead (its `access`), checked namespace-wide. A cluster-scoped kind's objects need `namespaces = ["*"]`. |
 
 Actions are `read` and `write`. `write` does not imply `read`, so grant both.
 Grant `state:read` sparingly, since it can read every table in the state
@@ -193,10 +194,11 @@ A policy is a named JSON array of rules:
 - Scope selectors narrow a rule with `*`-globs: `namespaces`
   ([Namespaces](namespaces.md)), `names` (bare job names), `pools`
   (node pools), `paths` (KV keys), `actionNames` (declared actions),
-  `templates` (job-template names), and `bands` (job priority bands). A rule
-  with a selector only matches requests carrying that attribute.
+  `templates` (job-template names), `bands` (job priority bands), and
+  `kinds` (object kinds, `<app>/<Kind>`: [App Objects](app-objects.md#access)).
+  A rule with a selector only matches requests carrying that attribute.
 - **A rule over a namespaced resource** (`job`, `exec`, `action`, `scale`,
-  `boot`, `snapshot`, `namespace`) **must carry `namespaces`**, and a rule
+  `boot`, `snapshot`, `namespace`, `object`) **must carry `namespaces`**, and a rule
   over only cluster-scoped resources (`node`, `kv`, `state`, `operator`,
   `acl`, `template`, `net`, `app`) must not. `namespaces = ["*"]` covers every
   namespace, including ones created later. A rule mixing the two kinds is

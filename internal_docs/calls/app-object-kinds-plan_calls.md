@@ -7,8 +7,8 @@ number is its rank.**
 
 **Revised after adversarial review (2026-10-29).** Three reviews (of this
 plan, and of the apps substrate's security and correctness) changed O1
-before it shipped. Entries 1-27 are the decisions as they stand; entries
-28-34 are the original entries they supersede, kept as written at the end
+before it shipped. Entries 1-31 are the decisions as they stand (28-31 were made while
+building O1); entries 32-38 are the original entries they supersede, kept as written at the end
 so the reasoning that lost is not silently dropped. The guiding principle
 the review added: **an object can never make its app do more than its
 writer could do directly, and the write path never depends on the app being
@@ -38,7 +38,7 @@ Error: writing gitops/Repo team-a/storefront needs job:write in team-b (from spe
 ```
 
 **Alternatives.** (a) The original `writeRequires`, checked on the object's
-own namespace and name (entry 28): a team lead with `job:write` on
+own namespace and name (entry 32): a team lead with `job:write` on
 `names = ["storefront"]` could write a Repo named `storefront` that deploys
 `billing`, or into `team-b`; a tenant without `host = true` could have the
 app deploy host-level jobs; a `credentials.kv` field could make the app read
@@ -71,7 +71,7 @@ the replica sees. Only the owning app writes it (app-plane), and a person's
 apply refuses a file that sets `status`. Status is for facts that change
 when the world changes; per-tick numbers stay in memory.
 
-**Alternatives.** The original plan (entry 30): status in the spec row on
+**Alternatives.** The original plan (entry 34): status in the spec row on
 the Control lane, every write a new `version`. Or Kubernetes' status
 subresource with RBAC (anyone granted it writes).
 
@@ -103,7 +103,7 @@ Error: "repo" names 2 kinds: gitops/Repo, reposync/Repo
 Hint: name one: legion object get gitops/Repo storefront
 ```
 
-**Alternatives.** The original (entry 31): flat names unique cluster-wide,
+**Alternatives.** The original (entry 35): flat names unique cluster-wide,
 refused at install. A `--kind Repo=SyncRepo` rename at install, mirroring
 `--key`.
 
@@ -172,7 +172,7 @@ namespaces, as `*` reaches everything else.
 { resources = ["scale"], actions = ["write"], namespaces = ["media"], names = ["web-*"] }  # does not: it is about jobs
 ```
 
-**Alternatives.** The original (entry 28): any resource, scoped as "a job
+**Alternatives.** The original (entry 32): any resource, scoped as "a job
 named like the object", which let `names = ["web-*"]` grant writes to a
 policy named `web-proxy`, failed band-scoped rules silently, and could map
 onto `acl` or `state`. Kubernetes' choice: no mapping, every kind its own
@@ -222,7 +222,7 @@ derived from the app records by an idempotent sync after every app write
 and on the reconciler's full pass; an orphaned row with no objects left is
 dropped.
 
-**Alternatives.** The original (entry 29): orphans fall back to the `object`
+**Alternatives.** The original (entry 33): orphans fall back to the `object`
 resource, which locked `scale:write` holders out of the ScalingPolicies
 they wrote. Storing the access resource on every object row.
 
@@ -271,7 +271,7 @@ and `--cascade` deletes them with the caller's per-kind access and
 `requires` checked for each.
 
 **Alternatives.** Kubernetes finalizers (an object stays until its
-controller removes the finalizer). The original plan (entry 33): deleting a
+controller removes the finalizer). The original plan (entry 37): deleting a
 namespace leaves its objects.
 
 **Trade-off.** An app that needs longer than an hour to release external
@@ -327,6 +327,13 @@ per kind.
 
 **Why (simplicity, agents).** A generic wait is what lets GitOps and agents
 treat every kind the same, the lesson of Kubernetes' kstatus.
+
+*Built (O1).* The summary gained `Accepted`: an app that reports only
+`Accepted=true` (a kind with nothing further to reconcile) reads `Accepted`,
+and `--wait` succeeds on it, rather than `Pending` forever. Precedence is
+`Orphaned`, `Deleting`, `Invalid`, `Stale`, `Pending`, `Rejected`,
+`NotReady`, `Ready`, `Accepted` (`summarize` in
+`src/structs/app_object.rs`; docs/app-objects.md, "Status").
 
 ## 12. Object events reach only callers who may read the kind there, and carry no values
 
@@ -425,7 +432,7 @@ calling app's rows and kinds only, so other apps' writes and every status
 write leave it asleep; the 64-shard value is a stored column the query
 filters on. There is no `since_version` resume: a reconnect relists.
 
-**Alternatives.** The original (entry 32): one snapshot message and a
+**Alternatives.** The original (entry 36): one snapshot message and a
 table-wide fingerprint. A change log with tombstone retention and resume.
 
 **Trade-off.** Every reconnect is a full relist, fine to about 50,000
@@ -607,11 +614,88 @@ review's sketch wrote it.
 **Why (simplicity).** One convention for three fields; a pointer means the
 same thing wherever it is written.
 
+## 28. The owning app has no implicit rights over its kind's objects
+
+*Built (O1).* **Call.** An app's own identity reads and writes objects,
+including its own kind's, only as its grant allows: a `gitops` that writes
+Repos lists `{ resources = ["object"], kinds = ["gitops/Repo"], ... }` in its
+manifest's `permissions`, and its writes are checked against `requires` like
+anyone's. Only the app-plane calls (`WatchObjects`, `UpdateObjectStatus`,
+`ReleaseObject`) are implied by owning the kind.
+
+**Alternatives.** Implicit `object:read`/`write` on the app's own kinds for
+its identity, as owning a kind might suggest.
+
+**Trade-off.** One more permission line in a manifest that writes its own
+objects, and the installer must hold it.
+
+**Why (security, simplicity).** The guiding principle: the grant shown at
+install is everything the app can do. An implicit right would be a second,
+unprompted grant, and an app writing objects without `requires` would be the
+confused deputy entry 1 exists to stop.
+
+## 29. A caller with no object rights at all cannot tell which kinds exist
+
+*Built (O1).* **Call.** `ApplyObject`, `GetObject`, `ListObjects` with a
+kind, and `DeleteObject` first check that the caller may read (or write)
+some kind's objects somewhere, or `object` anywhere, before resolving the
+typed kind; only then does an unknown kind read `unknown kind "x" (did you
+mean ...)`.
+
+**Alternatives.** The plan's order: resolve the kind (public metadata)
+first, then check the object's scope.
+
+**Trade-off.** A caller with no object rights gets `PermissionDenied`
+instead of the kind lookup's hint.
+
+**Why (security).** `ListObjectKinds` already shows a caller only the kinds
+it may read; the other RPCs answering `unknown kind` vs `PermissionDenied`
+would have leaked the list anyway (AGENTS.md, "Check before you fetch").
+
+## 30. The framework's reconcile loop is a builder over an `ObjectPlane` trait, and outcomes are constructors
+
+*Built (O1).* **Call.** `ctx.reconcile("Repo", handler)`, or
+`ctx.start_reconciler(ctx.reconciler("Repo").resync(..).shards(..)
+.on_cleanup(..), handler)`; the handler returns `ObjectOutcome::ready()`,
+`not_ready(reason, msg)`, `rejected(reason, msg)`, or `accepted()`, refined
+with `because`, `with_fields`, `with_condition`, `requeue_after`. A handler
+`Err` is reported as `Ready=false` (`ReconcileFailed`) keeping the last
+`Accepted`, and retried with backoff (1 s doubling to 5 min); at most 4
+objects reconcile at once. The loop runs over an `ObjectPlane` trait
+(watch, status, release), implemented for the app's client.
+
+**Alternatives.** The plan's sketch, `Reconciler::new(handler)` with
+`Outcome::ready(reason, message)`; a loop hard-wired to the gRPC client.
+
+**Trade-off.** A slightly larger surface than one constructor; a trait
+apps never implement themselves.
+
+**Why (simplicity, testability).** Most outcomes need no reason (`ready()`),
+the rest read as sentences (`ready().because("Synced", ..)`). The trait
+lets the loop be tested against a scripted fake and against the real
+manager service in process (`tests/integration/app_objects.rs`), without a
+network.
+
+## 31. Watch messages are bounded by bytes as well as by count
+
+*Built (O1).* **Call.** A `WatchObjects` message holds at most 1,000
+objects and about 2 MiB of them (always at least one); the framework
+decodes messages up to 16 MiB.
+
+**Alternatives.** Count-only chunks (the plan), with a decode limit large
+enough for 1,000 maximal objects (about 150 MiB).
+
+**Trade-off.** More messages for a snapshot of large objects.
+
+**Why (performance).** A count bound alone lets one message reach the
+worst case of every object at its 64 KiB spec, twice (stored and
+effective), which no client should have to buffer.
+
 # Superseded entries
 
 Kept as written when they were superseded; they no longer describe the design.
 
-## 28. *Superseded.* A kind's ACL is one resource: the generic `object`, or an existing one of the same scope
+## 32. *Superseded.* A kind's ACL is one resource: the generic `object`, or an existing one of the same scope
 
 **Superseded by entries 1 (`requires`) and 5 (the access mapping)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -646,7 +730,7 @@ With (a), O2 would have needed every `scale:write` holder to also be given
 default stays K8s-like (`object` with `kinds`), so a kind that maps onto
 nothing is still governed separately.
 
-## 29. *Superseded.* An orphaned object is governed by the `object` resource
+## 33. *Superseded.* An orphaned object is governed by the `object` resource
 
 **Superseded by entry 7 (orphans keep their kind's mapping)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -665,7 +749,7 @@ upgrade changes it, and then two rows of one kind answer to different
 resources. Orphans are an operator's clean-up after a forced removal, and
 the rule fits in one sentence.
 
-## 30. *Superseded.* Status is the owning app's alone, with CAS on version or generation
+## 34. *Superseded.* Status is the owning app's alone, with CAS on version or generation
 
 **Superseded by entry 2 (status on the Status lane, `specVersion` CAS)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -684,7 +768,7 @@ delegate status writes to a helper with another identity.
 it makes it a claim nobody can trust at 3am. App identity is already the
 app plane's key (`WatchAppExtensions`, `ReportScalingStatus`).
 
-## 31. *Superseded.* Kind names are flat, unique cluster-wide case-insensitively, with `<app>/<Kind>` as the qualified spelling
+## 35. *Superseded.* Kind names are flat, unique cluster-wide case-insensitively, with `<app>/<Kind>` as the qualified spelling
 
 **Superseded by entry 3 (`<app>/<Kind>` is the name)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -707,7 +791,7 @@ its kind. Install says so, naming the owner.
 rule already established "the short name may collide, the qualified one
 never does" (apps calls on `apps.<app>`), so it is one idea, not two.
 
-## 32. *Superseded.* `WatchObjects` polls a fingerprint each second
+## 36. *Superseded.* `WatchObjects` polls a fingerprint each second
 
 **Superseded by entry 17 (chunked, per-app watch)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -724,7 +808,7 @@ per second.
 90), whose cost was measured acceptable; both move to events together when
 it is not.
 
-## 33. *Superseded.* Deleting a namespace leaves its objects
+## 37. *Superseded.* Deleting a namespace leaves its objects
 
 **Superseded by entry 9 (objects are namespace contents)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
 
@@ -744,7 +828,7 @@ and a proto change to the namespace contents reply; the standalone scaling
 policies O2 replaces behave the same way today. Recorded as a TODO with the
 plan's lean (refuse, and cascade).
 
-## 34. *Superseded.* Defaults filled on read (the defaults half of the original entry 1)
+## 38. *Superseded.* Defaults filled on read (the defaults half of the original entry 1)
 
 **Superseded by entry 6** (adversarial review, 2026-10-29). The original
 argued that deriving defaults on read lets an upgrade that adds or changes

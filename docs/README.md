@@ -155,6 +155,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   placement on the managers' system workers, install and upgrade with a
   permission prompt, config and code fields, how direct edits are reverted,
   bundled apps rolling with the build, and `legion app`.
+- [App Objects](app-objects.md): object kinds apps declare (Legion's
+  custom resources): the manifest's `kinds`, `legion object`, the `object`
+  ACL resource and `requires`, status and the summary, bounded cleanup on
+  delete, and the reconcile loop apps use.
 - [Workload Identity (OIDC)](workload-identity.md): short-lived, verifiable task
   identity for external providers.
 - [Exec & Actions](exec-and-actions.md): running commands inside a workload,
