@@ -177,6 +177,81 @@
     },
   ],
 
+  # Object kinds the app owns (docs/app-objects.md): Legion's custom
+  # resources. People apply objects of them with `legion object apply`
+  # (configs/apps/example-repo.ncl); the manager checks each against its
+  # schema and what writing it requires of the writer, and stores it; the
+  # app watches them (WatchObjects), does the work, and reports status. The
+  # kind's name is `gitops/Repo`; `legion object get repo storefront` works
+  # while no other app declares a Repo.
+  kinds = [
+    {
+      # PascalCase, singular. Reserved: Legion's own nouns (job, node, ...).
+      name = "Repo",
+      description = "A git repository gitops deploys jobs from into this namespace.",
+      # `namespaced` (the default) or `cluster`.
+      scope = "namespaced",
+      # The spec's JSON Schema. Closed by default: a field it does not name
+      # is an error (with a did-you-mean). `default`s are stored with the
+      # object at write.
+      schema = {
+        type = "object",
+        required = ["url"],
+        properties = {
+          url = { type = "string", description = "The repository URL." },
+          branch = { type = "string", default = "main", description = "The branch to deploy." },
+          path = { type = "string", default = "jobs/", description = "The directory of jobspecs." },
+          jobs = {
+            type = "array",
+            items = { type = "string" },
+            description = "The jobs it may write; default every job in the namespace.",
+          },
+          # Shown as <redacted> to everyone but the app. A credential is
+          # better kept in KV and named here by path.
+          deployKey = {
+            type = "string",
+            writeOnly = true,
+            description = "A read-only deploy key.",
+          },
+        },
+      },
+      # The schema of the status `fields` the app reports (facts, at most
+      # 16 KiB), beside its Accepted and Ready conditions.
+      status = {
+        schema = {
+          type = "object",
+          properties = {
+            commit = { type = "string" },
+            jobs = { type = "integer" },
+          },
+        },
+      },
+      examples = [{ url = "https://github.com/acme/deploy", path = "jobs/storefront" }],
+      # Also ask the app on each apply (`POST /legion/v1/objects/validate`).
+      # Advice: it fails open when the app does not answer.
+      validate = true,
+      # What governs a Repo itself: `object` (the default) by namespace and
+      # kind; or `job` / `scale` (namespace-wide) or `node` (cluster kinds).
+      access = { resource = "object" },
+      # What writing (or deleting) a Repo also needs of its writer, scoped
+      # from the object: write on the jobs it names (`/spec/jobs`; every job
+      # when it names none) in its namespace. A Repo can never make gitops
+      # deploy more than its author could.
+      requires = [
+        { resource = "job", actions = ["write"], name = "/spec/jobs" },
+      ],
+      # Pointers an update may not change.
+      immutable = ["/spec/url"],
+      # A delete waits up to this long for gitops to clean up (and release
+      # the object); then the object is removed anyway.
+      cleanup = "10m",
+      # At most this many Repos (default 10,000).
+      maxObjects = 500,
+      # The columns `legion object list repos` shows.
+      columns = ["/spec/branch", { name = "COMMIT", pointer = "/status/fields/commit" }],
+    },
+  ],
+
   # The app's config: a JSON Schema (draft 7, only local $refs) and the
   # config a fresh install starts with. `legion app config set` validates
   # against it; the app reads it from $LEGION_APP_CONFIG.

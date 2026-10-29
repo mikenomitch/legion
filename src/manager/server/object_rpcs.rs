@@ -44,6 +44,34 @@ const WATCH_POLL: Duration = Duration::from_secs(1);
 const WATCH_FULL_READ: Duration = Duration::from_secs(30);
 /// Most objects in one `WatchObjects` message.
 pub(crate) const WATCH_CHUNK: usize = 1_000;
+/// Most encoded bytes of objects in one `WatchObjects` message (a message
+/// holds at least one object). One object is at most a few hundred KiB, so
+/// a message stays under the 16 MiB the app framework decodes
+/// ([`crate::apps::objects::MAX_WATCH_MESSAGE_BYTES`]).
+pub(crate) const WATCH_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
+/// `objects` split into watch messages: at most [`WATCH_CHUNK`] objects
+/// and about [`WATCH_CHUNK_BYTES`] each; one empty chunk for no objects.
+pub(crate) fn watch_chunks(objects: Vec<AppObject>) -> Vec<Vec<AppObject>> {
+    use prost::Message;
+    let mut chunks = vec![Vec::new()];
+    let mut bytes = 0usize;
+    for object in objects {
+        let size = object.encoded_len();
+        let full = chunks.last().is_some_and(|current: &Vec<AppObject>| {
+            !current.is_empty()
+                && (current.len() >= WATCH_CHUNK || bytes + size > WATCH_CHUNK_BYTES)
+        });
+        if full {
+            chunks.push(Vec::new());
+            bytes = 0;
+        }
+        bytes += size;
+        chunks.last_mut().expect("one chunk").push(object);
+    }
+    chunks
+}
+
 /// The error code an apply of a kind no app declares carries (on a
 /// retryable `UNAVAILABLE`).
 pub const KIND_NOT_INSTALLED: &str = "KIND_NOT_INSTALLED";
@@ -474,7 +502,7 @@ impl ManagerDaemonService {
     /// declared kinds active, the rest orphaned while they have objects).
     /// Every app write calls it; the reconciler's full pass covers the
     /// rest.
-    pub(crate) fn sync_object_kinds_for(&self, app: &str) -> Result<bool, Status> {
+    pub fn sync_object_kinds_for(&self, app: &str) -> Result<bool, Status> {
         let record = self
             .store
             .get_app(app)
@@ -487,7 +515,7 @@ impl ManagerDaemonService {
 
     /// [`Self::sync_object_kinds_for`] for every app with a record or kind
     /// rows (the reconciler's full pass).
-    pub(crate) fn sync_all_object_kinds(&self) -> Result<(), Status> {
+    pub fn sync_all_object_kinds(&self) -> Result<(), Status> {
         let mut apps: BTreeSet<String> = self
             .store
             .list_apps()
@@ -509,7 +537,7 @@ impl ManagerDaemonService {
     /// Remove deleting objects whose cleanup ran out (or whose kind is
     /// orphaned), emitting `object.cleanup_abandoned` for each. The app
     /// reconciler runs it on the Control-lane leader.
-    pub(crate) fn expire_object_cleanups(&self) -> Result<usize, Status> {
+    pub fn expire_object_cleanups(&self) -> Result<usize, Status> {
         let registry = self.object_registry()?;
         let orphaned: BTreeSet<(String, String)> = registry
             .kinds()
@@ -641,6 +669,26 @@ impl ManagerDaemonService {
 
     /// The kind `typed` names (a qualified name, or a short name exactly one
     /// kind has), active or orphaned.
+    /// The coarse gate before a typed kind is looked up: the caller may
+    /// `action` some kind's objects somewhere (or `object` anywhere), so a
+    /// caller with no object rights at all learns nothing about which kinds
+    /// exist (AGENTS.md, "Check before you fetch").
+    fn gate_objects(
+        &self,
+        identity: &AclIdentity,
+        registry: &ObjectKindRegistry,
+        action: AclAction,
+    ) -> Result<(), Status> {
+        if registry
+            .kinds()
+            .iter()
+            .any(|kind| identity.allows_kind_somewhere(kind.access, action, &kind.qualified()))
+        {
+            return Ok(());
+        }
+        acl::enforce(identity, AclResource::Object, action, &AclScope::any())
+    }
+
     fn lookup_kind(
         &self,
         registry: &ObjectKindRegistry,
@@ -801,8 +849,9 @@ impl ManagerDaemonService {
         }
         let value: Value = serde_json::from_str(&inner.object_json)
             .map_err(|err| Status::invalid_argument(format!("the object is not JSON: {err}")))?;
-        let input = parse_object_input(&value).map_err(Status::invalid_argument)?;
         let registry = self.object_registry()?;
+        self.gate_objects(&identity, &registry, AclAction::Write)?;
+        let input = parse_object_input(&value).map_err(Status::invalid_argument)?;
         let kind = registry
             .resolve_qualified(&input.kind)
             .cloned()
@@ -1232,6 +1281,7 @@ impl ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         let inner = request.into_inner();
         let registry = self.object_registry()?;
+        self.gate_objects(&identity, &registry, AclAction::Read)?;
         let kind = self.lookup_kind(&registry, &inner.kind)?;
         let (namespace, name) = self.object_ref(&kind, &inner.name, &inner.namespace)?;
         self.enforce_access(&identity, &kind, AclAction::Read, &namespace, &name)?;
@@ -1291,6 +1341,7 @@ impl ManagerDaemonService {
             }
             (ObjectFilter::default(), None)
         } else {
+            self.gate_objects(&identity, &registry, AclAction::Read)?;
             let kind = self.lookup_kind(&registry, &inner.kind)?;
             acl::enforce(&identity, kind.access, AclAction::Read, &AclScope::any())?;
             (
@@ -1426,6 +1477,7 @@ impl ManagerDaemonService {
         let writer_app = self.writing_app(&request, &identity);
         let inner = request.into_inner();
         let registry = self.object_registry()?;
+        self.gate_objects(&identity, &registry, AclAction::Write)?;
         let kind = self.lookup_kind(&registry, &inner.kind)?;
         let qualified = kind.qualified();
         let (namespace, name) = self.object_ref(&kind, &inner.name, &inner.namespace)?;
@@ -1845,15 +1897,7 @@ impl ManagerDaemonService {
                 let mut messages: Vec<ObjectEvent> = Vec::new();
                 match &sent {
                     None => {
-                        let objects: Vec<AppObject> = current.into_values().collect();
-                        let chunks: Vec<Vec<AppObject>> = if objects.is_empty() {
-                            vec![Vec::new()]
-                        } else {
-                            objects
-                                .chunks(WATCH_CHUNK)
-                                .map(<[AppObject]>::to_vec)
-                                .collect()
-                        };
+                        let chunks = watch_chunks(current.into_values().collect());
                         let last = chunks.len() - 1;
                         for (index, upserts) in chunks.into_iter().enumerate() {
                             messages.push(ObjectEvent {
@@ -1887,9 +1931,14 @@ impl ManagerDaemonService {
                         if upserts.is_empty() && deletes.is_empty() {
                             continue;
                         }
-                        for (index, chunk) in upserts.chunks(WATCH_CHUNK.max(1)).enumerate() {
+                        let chunks = if upserts.is_empty() {
+                            Vec::new()
+                        } else {
+                            watch_chunks(upserts)
+                        };
+                        for (index, chunk) in chunks.into_iter().enumerate() {
                             messages.push(ObjectEvent {
-                                upserts: chunk.to_vec(),
+                                upserts: chunk,
                                 deletes: if index == 0 {
                                     deletes.clone()
                                 } else {
@@ -2333,6 +2382,25 @@ pub(crate) fn state_name(state: ObjectState) -> &'static str {
 #[cfg(test)]
 mod object_rpcs_tests {
     use super::*;
+
+    #[test]
+    fn watch_chunks_bound_count_and_bytes_test() {
+        assert_eq!(watch_chunks(Vec::new()), vec![Vec::<AppObject>::new()]);
+        let small = |name: &str| AppObject {
+            name: name.into(),
+            ..Default::default()
+        };
+        let many: Vec<AppObject> = (0..2_500).map(|i| small(&format!("o{i}"))).collect();
+        let sizes: Vec<usize> = watch_chunks(many).iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![1_000, 1_000, 500]);
+        let big = |name: &str| AppObject {
+            name: name.into(),
+            spec_json: "x".repeat(900 * 1024),
+            ..Default::default()
+        };
+        let chunks = watch_chunks(vec![big("a"), big("b"), big("c"), big("d")]);
+        assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 2]);
+    }
 
     #[test]
     fn references_split_into_namespace_and_name_test() {

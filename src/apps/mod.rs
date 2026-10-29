@@ -27,6 +27,7 @@
 
 pub mod autoscaler;
 pub mod autoscaler_ui;
+pub mod objects;
 pub mod ui;
 
 use crate::prelude::*;

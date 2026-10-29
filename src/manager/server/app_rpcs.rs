@@ -795,8 +795,9 @@ impl ManagerDaemonService {
                 .any(|old| old.decl.name == kind.decl.name && old.decl.scope != kind.decl.scope);
             if rescoped && count > 0 {
                 return Err(Status::failed_precondition(format!(
-                    "{name} {to} changes the scope of {} to {} while {count} object(s) of it                      exist; an object cannot change scope
-Hint: delete them first, or give the                      kind a new name",
+                    "{name} {to} changes the scope of {} to {} while {count} object(s) of it \
+                     exist; an object cannot change scope\nHint: delete them first, or give the \
+                     kind a new name",
                     kind.qualified(),
                     kind.decl.scope.as_str()
                 )));
@@ -819,8 +820,9 @@ Hint: delete them first, or give the                      kind a new name",
         ));
         if !dropped.is_empty() && !inner.force && !inner.dry_run {
             return Err(Status::failed_precondition(format!(
-                "{name} {to} no longer declares kinds that have objects: {}. Upgrading leaves                  them stored, orphaned: readable and deletable, not writable
-Hint: pass --force                  to upgrade anyway",
+                "{name} {to} no longer declares kinds that have objects: {}. Upgrading leaves \
+                 them stored, orphaned: readable and deletable, not writable\nHint: pass --force \
+                 to upgrade anyway",
                 dropped.join(", ")
             )));
         }
@@ -976,8 +978,9 @@ Hint: pass --force                  to upgrade anyway",
                 .map(|(kind, count)| format!("{name}/{kind}: {count}"))
                 .collect();
             return Err(Status::failed_precondition(format!(
-                "{objects} object(s) of {name}'s kinds exist ({}). Uninstalling leaves them                  stored, orphaned: readable and deletable with their kind's access, not                  writable{}
-Hint: pass --force to uninstall anyway",
+                "{objects} object(s) of {name}'s kinds exist ({}). Uninstalling leaves them \
+                 stored, orphaned: readable and deletable with their kind's access, not \
+                 writable{}\nHint: pass --force to uninstall anyway",
                 kinds.join(", "),
                 if using.is_empty() {
                     String::new()
@@ -1053,7 +1056,8 @@ Hint: pass --force to uninstall anyway",
         }
         if objects > 0 {
             message.push_str(&format!(
-                "; {objects} object(s) of its kinds are left orphaned (`legion object list` shows                  them; installing {name} again adopts them)"
+                "; {objects} object(s) of its kinds are left orphaned (`legion object list` shows \
+                 them; installing {name} again adopts them)"
             ));
         }
         self.store

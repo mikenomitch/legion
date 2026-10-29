@@ -387,6 +387,12 @@ pub fn requirement_label(requirement: &KindRequirement) -> String {
             dotted(pointer.trim_start_matches('/'))
         ));
     }
+    if let Some(pointer) = &requirement.name {
+        text.push_str(&format!(
+            " on what {} names",
+            dotted(pointer.trim_start_matches('/'))
+        ));
+    }
     if let Some(pointer) = &requirement.path {
         text.push_str(&format!(
             " on the key {} names",
@@ -2509,10 +2515,12 @@ mod app_object_tests {
             );
         }
         assert_eq!(
-            registry.resolve_qualified("Certificate"),
-            Err(KindLookup::Unqualified {
+            registry
+                .resolve_qualified("Certificate")
+                .expect_err("short"),
+            KindLookup::Unqualified {
                 candidate: Some("certs/Certificate".into())
-            })
+            }
         );
         assert_eq!(
             registry.resolve("certificates").expect("short").qualified(),
@@ -2529,10 +2537,10 @@ mod app_object_tests {
             .message("repo")
             .contains("names 2 kinds: gitops/Repo, reposync/Repo"));
         assert_eq!(
-            registry.resolve("Certifcate"),
-            Err(KindLookup::Unknown {
+            registry.resolve("Certifcate").expect_err("typo"),
+            KindLookup::Unknown {
                 suggestion: Some("certs/Certificate".into())
-            })
+            }
         );
         // An orphaned kind yields to an active one of the same short name.
         let mut orphan = kind("old", decl("Certificate"));
@@ -2905,5 +2913,53 @@ mod app_object_tests {
         assert_eq!(column_cell(&document, "/spec/url"), "https://x");
         assert_eq!(column_cell(&document, "/status/fields/commit"), "3f9a");
         assert_eq!(column_cell(&document, "/status/missing"), "-");
+    }
+
+    /// The shipped example: gitops's `Repo` kind installs, and the example
+    /// object passes it, with its defaults filled and the requirement it
+    /// resolves to.
+    #[test]
+    fn the_example_repo_kind_and_object_are_valid_test() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let manifest = crate::structs::app::AppManifest::from_json(
+            &crate::config_lang::eval_file(format!("{root}/configs/apps/example-app.ncl"))
+                .expect("the manifest evaluates"),
+        )
+        .expect("parses");
+        let decls = manifest_kinds(&manifest).expect("kinds");
+        validate_kind_decls(&decls).expect("valid kinds");
+        let kind = InstalledKind::new(
+            "gitops",
+            decls[0].clone(),
+            "digest",
+            KindState::Active,
+            "0.2.0",
+            true,
+        )
+        .expect("compiles");
+        assert_eq!(kind.qualified(), "gitops/Repo");
+        let object: Value = serde_json::from_str(
+            &crate::config_lang::eval_file(format!("{root}/configs/apps/example-repo.ncl"))
+                .expect("the object evaluates"),
+        )
+        .expect("JSON");
+        let documents = parse_object_documents(&object).expect("documents");
+        let input = parse_object_input(&documents[0]).expect("an object");
+        assert_eq!(input.kind, "gitops/Repo");
+        let effective = kind.check_spec(&input.spec).expect("the spec passes");
+        assert_eq!(effective["branch"], "main");
+        let doc = object_document(
+            &input.name,
+            "team-a",
+            &input.labels,
+            &effective,
+            &Value::Null,
+        );
+        let permissions = resolve_requirements(&kind, &doc, "team-a").expect("resolves");
+        let labels: Vec<String> = permissions.iter().map(ResolvedPermission::label).collect();
+        assert_eq!(labels.len(), 2, "{labels:?}");
+        assert!(labels
+            .iter()
+            .all(|label| label.starts_with("job:write in team-a")));
     }
 }
