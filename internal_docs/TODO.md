@@ -511,7 +511,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after an adversarial security review | All three plans SHIPPED; their items, and the hardening, are checked off and in Done; the review's open and design-level items are under *Ecosystem apps* |
+| [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after adversarial security and correctness reviews | All three plans SHIPPED; their items, and both hardening passes, are checked off and in Done; the reviews' open and design-level items are under *Ecosystem apps* |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -4552,6 +4552,42 @@ plan.
           lookaround and backreferences at install, or cache validity per
           schema digest
           ([docs](../docs/apps.md#values-as-they-read-now)).
+  - [ ] Left open by the apps hardening after the adversarial correctness
+        and operability review (the fixed findings are in Done under
+        *Ecosystem apps*; [calls 111-129](calls/legion-apps-plan_calls.md)):
+    - [ ] **No `legion app rollback`**: the record keeps only the installed
+          manifest, so going back means upgrading to the old file. Keep
+          the previous manifest (and config) on the record and add the
+          verb ([calls 115](calls/legion-apps-plan_calls.md),
+          [docs](../docs/apps.md#upgrading)).
+    - [ ] **The reconciler is one serial loop** that blocks on admission
+          (pin resolution can reach registries): one slow app stalls every
+          other app's pass ([calls 129](calls/legion-apps-plan_calls.md)).
+    - [ ] **Renders depend on the leader's build**: a mixed-version manager
+          set can re-roll every app when leadership moves
+          ([calls 129](calls/legion-apps-plan_calls.md)).
+    - [ ] **Apps have no health of their own**: status reflects allocation
+          health only, and validate calls fail open with warnings buried in
+          submit replies ([calls 129](calls/legion-apps-plan_calls.md)).
+    - [ ] **A keyed action can run twice across a leadership change**: the
+          in-flight key set is the leader's memory
+          ([calls 113](calls/legion-apps-plan_calls.md),
+          [docs](../docs/apps.md#actions)).
+    - [ ] **A held bundled upgrade does not hold the binary**: `legion:self`
+          runs the node's build, so an allocation restarted on an upgraded
+          node runs the new build with the old config until it is set
+          ([calls 120](calls/legion-apps-plan_calls.md),
+          [docs](../docs/apps.md#upgrades-of-bundled-apps)).
+    - [ ] **Git pin failures are classified by stderr text**: a new git
+          wording for a network failure parks the app instead of retrying
+          ([calls 118](calls/legion-apps-plan_calls.md)).
+    - [ ] **An app's job cannot be autoscaled**: `ScaleTask` on it is
+          refused for everyone; scaling an app is `replicas`
+          ([calls 111](calls/legion-apps-plan_calls.md)).
+    - [ ] **A submit's stopped-status clear is a separate write** after the
+          version's compare-and-set entry: an uninstall in between leaves a
+          stamped job running until the next full pass sweeps it
+          ([calls 114](calls/legion-apps-plan_calls.md)).
   - [ ] Deferred: install apps from a registry (waits on a registry plan
         that doesn't exist yet), tenant-owned apps, and pre-approved
         per-namespace grants, so GitOps needn't hold the union of what its
@@ -6701,6 +6737,51 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
   - [x] Install takes over no `legion-system` job; an app's identity and
         its forwarded requests need the reconciler's `managedBy` stamp
   - [x] Idempotency scopes include how the caller authenticated
+- [x] **Apps hardening after an adversarial correctness and operability
+      review** (2026-10-29,
+      [#60](https://github.com/mikenomitch/legion/pull/60) ·
+      [calls 111-129](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md#editing-an-apps-job),
+      [autoscaling.md](../docs/autoscaling.md#no-duplicate-actions),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] An app action runs once wherever it lands: actions run on the
+        Control leader (a follower refuses before forwarding), and a keyed
+        duplicate waits for the first and gets its reply
+  - [x] The reconciler's submit is compare-and-set on the app record, and a
+        job stamped for an app with no record is stopped and revoked
+  - [x] One app record that does not decode breaks nothing else: rows
+        decode one at a time, stored records read leniently, the bad one is
+        `corrupt` in the list and status, and uninstall removes it by name
+  - [x] Status counts only the job's latest version (`upgrading`,
+        `upgrade failing`), and `app enable` or a same-manifest upgrade
+        resubmits a job not healthy at its version
+  - [x] A failed app job is restarted with backoff, and status says why
+  - [x] Direct writes to an installed app's job (run, plan, scale, stop,
+        destroy, stop-rollout) are refused, superseding reverting
+  - [x] A pin whose source cannot be reached is `UNAVAILABLE` and retried;
+        a bad reference is still a refusal
+  - [x] Bundled apps agree on a marker on mixed-architecture fleets, and
+        adopt on the version
+  - [x] A bundled upgrade whose schema refuses the stored config is held,
+        reported, and released by a matching `config set`
+  - [x] An upgrade that drops an extension point jobs use needs `--force`;
+        the prompt reports orphaned values apart
+  - [x] Install, upgrade, `config set` and `set` run the job's admission
+        chain first
+  - [x] The reconciler forgets its runtime on acquiring leadership, and a
+        current job is never parked
+  - [x] `uninstall --purge` deletes the app's KV; installs are told about
+        leftovers
+  - [x] Install and uninstall record their idempotency key in the same
+        entry, and uninstall's retry returns the whole first reply
+  - [x] A node-group intent is acted on for at most 120 seconds
+  - [x] Validate calls are asked on the Control leader, and a short answer
+        warns
+  - [x] `--dry-run` on `set`, `config set`, `enable`, `disable`,
+        `uninstall`; `upgrade --dry-run -j` reports `uncovered` and
+        `orphanedJobs`, and the CLI refuses before asking
+  - [x] Docs: an upgrade keeps operator settings (and says so), and the
+        lease cost of several autoscaler replicas
 - [x] **Legion apps A1 follow-ups** (2026-10-29,
       [calls 95-97](calls/legion-apps-plan_calls.md))
   - [x] The host guard's `nftables` table and BPF pin directory are named

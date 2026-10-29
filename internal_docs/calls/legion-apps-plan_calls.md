@@ -17,7 +17,10 @@ whose own calls are in
 Entries 99-110 are the hardening after an adversarial security review of
 the apps subsystem, ranked among themselves (the two critical holes first,
 the accepted design-level risks at 105-106); they revise entries 5, 42, 80,
-81, and 93, and supersede 55, each of which says so.
+81, and 93, and supersede 55, each of which says so. Entries 111-129 are
+the hardening after an adversarial correctness and operability review,
+ranked among themselves; entry 111 supersedes entry 13's reverting of
+direct edits, and 114 revises 51.
 Autoscaler-specific calls are in
 [autoscaler-v2-plan_calls.md](autoscaler-v2-plan_calls.md).
 
@@ -569,6 +572,10 @@ manifest. (b) needs a container runtime on every manager. Third-party apps
 use (a) or (b) like any job.
 
 ## 13. The reconciler is event-driven, compares a digest stamped on the job, and submits with an idempotency key
+
+> **Superseded in part by entry 111** (hardening): direct writes to an
+> installed app's job are refused, not reverted (alternative (c) below);
+> a version that reaches the job some other way is still reverted.
 
 **Call.**
 - The reconciler renders each app's job as a pure function of the app
@@ -1517,6 +1524,11 @@ grant (entry 5), so the upgrader must hold all of it. An upgrade that only
 narrows the grant asks nothing new, so a prompt would be noise.
 
 ## 51. Uninstall disables, stops, revokes, then deletes, and leaves the stopped job (A3)
+
+> **Revised by entry 114** (hardening): "every interleaving stops it" did
+> not hold for a submit already past its read of the record; the submit is
+> now compare-and-set on the record, and jobs stamped for no record are
+> swept.
 
 **Call.** `UninstallApp` first writes the record disabled, then stops the
 job, revokes its grants, and deletes the record; the stopped job stays in
@@ -2650,3 +2662,478 @@ accessor.
 
 **Why (simplicity).** One shape for every caller; a JWT subject named like a
 delegated identity or an accessor can never share another's scope.
+
+## 111. Direct writes to an installed app's job are refused, for everyone, with no `--force` (supersedes entry 13's reverting)
+
+*Hardening after adversarial review.*
+
+**Call.** While an app has a record, `RunJob`, `RunJobTemplate` (and
+`PlanJob`, which predicts them), `ScaleTask`, `StopJob`, `DestroyJob`, and
+`StopRollout` on `legion-system/<app>` are `FAILED_PRECONDITION`, for every
+caller, management tokens included, naming the `legion app` verb that does
+the job instead. `AdvanceRollout` stays allowed. Once the app is
+uninstalled, its stopped job is an ordinary job. The reconciler still
+reverts a version that reached the job some other way (one an older
+release let through), and the `job info` banner says edits are refused.
+
+```text
+$ legion job scale legion-system/autoscaler --count 0
+Error: job legion-system/autoscaler is app autoscaler's, and the app reconciler owns it, so scaling it directly is refused (docs/apps.md, "Editing an app's job")
+Hint: `legion app set autoscaler` changes its replicas, placement and resources, `legion app config set autoscaler` its config, `legion app disable autoscaler` stops it, and `legion app uninstall autoscaler` removes the app, after which the job is an ordinary job
+```
+
+**Alternatives.**
+- (a) Keep reverting (entry 13), and also clear foreign scale overrides in
+  the reconcile pass (the review's second fix for M3).
+- (b) Refuse, but let a management token override with `--force` (a flag
+  on each job verb).
+- (c) Refuse `AdvanceRollout` too, as the brief's list of rollouts said.
+
+**Trade-off.** An admin's emergency hand edit of an app's job is gone; the
+paths are `legion app disable` (which relies on the reconciler to stop the
+job) and `legion app uninstall` (which stops it in the RPC). An app's job
+can no longer be autoscaled (its count is `replicas`; the autoscaler's own
+`ScaleTask` is refused too). A GitOps tool that syncs `legion-system` must
+switch to `legion app`. Breaking (no installed base).
+
+**Why (simplicity, correctness).** Reverting was a fight: a GitOps or CI
+tool that syncs `legion-system` and the reconciler each wrote a version per
+round, forever, with two restarts each, and versions are never pruned; and
+a scale override is not a version, so it survived every revert and
+silently disabled the app (M3). Refusing gives the writer an error it can
+act on, and makes "the job is the record" true by construction. (a) keeps
+the fight and adds a second reconcile rule. (b) adds a flag to five verbs
+for a case `disable` and `uninstall` already cover, and an escape hatch is
+exactly what a sync tool would learn to pass. (c) would deadlock an app
+whose manifest asks for manual rollouts: advancing moves toward the
+reconciler's version, not away from it.
+
+## 112. Stored app records read leniently, and one that still does not decode is that record's problem only (H3; design concern 5)
+
+*Hardening after adversarial review.*
+
+**Call.** The store decodes app rows one at a time. A manifest or grant
+first decodes strictly; on failure, the fields this build's typed parts do
+not know (`AppManifest`, its `config` and `codeFields` entries, `AclRule`)
+are dropped and it decodes again (`AppManifest::from_stored`). A row that
+still fails (a changed type) is `CorruptApp`: logged once per (name,
+`updated_at`, error), counted as `legion_apps{status="corrupt"}`, listed by
+`ListApps`/`GetApp` with status `corrupt` and `corrupt: <error>`, skipped by
+the reconciler (`PassOutcome::Corrupt`) and by the registry of jobspec keys,
+and removed by `UninstallApp` by name (a bundled one included; the
+reconciler's full pass now seeds every time, so it comes back from the
+running build). Installs and upgrades keep parsing strictly.
+
+```text
+NAME  VERSION  SOURCE  STATUS   ...  DETAIL
+lite  -        file    corrupt  ...  corrupt: app.manifest: invalid type: string "three", expected u32 (`legion app uninstall lite` removes the record)
+```
+
+**Alternatives.**
+- (a) Keep `deny_unknown_fields` on stored records and only isolate rows
+  (any rename makes the row corrupt).
+- (b) Drop `deny_unknown_fields` everywhere and check unknown fields at
+  install another way.
+- (c) A migration per manifest-format change.
+
+**Trade-off.** A field renamed between releases silently loses its value
+on read (it gets its default), instead of failing loudly; the next
+`upgrade` (or, for a bundled app, adoption) rewrites the record whole. The
+known-field lists are hand-kept beside the structs; a unit test holds them
+to the schema and serialization.
+
+**Why (simplicity, robustness).** AGENTS.md says to rename freely, and the
+bundled autoscaler's manifest is a stored record every release rewrites, so
+the strict read was a cluster-wide outage waiting for the first rename:
+every submit reads the installed keys, and one bad row failed them all.
+Lenient reads make the common case (a field added, renamed, removed) a
+non-event, and per-row isolation makes the rare one (a changed type) one
+app's problem with a one-command fix. (a) turns every rename into that
+fix. (b) loses serde's "unknown field `x`, expected one of …" at install,
+which is the message authors need. (c) is the ceremony the policy exists
+to avoid.
+
+## 113. Keyed app actions run on the Control leader and hold their key while they run (H1)
+
+*Hardening after adversarial review.*
+
+**Call.** `InvokeAppAction` calls `require_lane_leader(Control)` right after
+its ACL check: a follower answers the typed not-the-leader rejection before
+anything reaches the app, so the leader-forward layer's replay is the only
+run. With an idempotency key, the leader holds the key in memory
+(`InFlightKeys`) from before the lookup until the reply is recorded; a
+duplicate waits up to 45 seconds and then finds the reply
+(`deduplicated`), or gets `ABORTED`. Recording the key after the app ran is
+best effort: a failure is logged, never returned, because a returned
+not-the-leader would be replayed.
+
+The other RPCs with an external side effect before a replicated write were
+checked for the same replay hazard:
+- `ask_apps_to_validate` (RunJob, RunJobTemplate): same fix (entry 127).
+- `GetAppView`, `GetAppPage` (`ForwardAppRequest`): a read, and nothing
+  replicated after it; a follower answers them itself.
+- `ForwardAppRequest` users are only those three and the validate call.
+- The autoscaler's plugin calls are made by the app, not inside a manager
+  RPC: its intents are compare-and-set rows written *before* the calls
+  (`RecordScalingAction`), so a replayed write cannot repeat a call.
+- `IssueBootTicket`, `CreateJoinToken` and the other keyed writes have no
+  external effect before their replicated write.
+
+**Alternatives.**
+- (a) Write a "pending" idempotency row before forwarding, and update it
+  after.
+- (b) Check leadership only when a key is present.
+
+**Trade-off.** An action on a follower costs a forward to the leader even
+without a key; an action fails while the leader is unreachable. A
+leadership change while an action runs can still let a retry with the same
+key run it again on the new leader (the in-flight set is per manager), as
+can a retry after the 24-hour key expiry. Documented.
+
+**Why (correctness, simplicity).** The bug was a side effect before the
+write that the forward layer assumes nothing precedes; failing first is the
+one ordering that makes the replay safe. (a) needs UPDATE and DELETE on
+`idempotency_record`, which is a commutative insert-only table (the raft
+capture guard refuses anything else), and a pending row left by a crash
+would block the key for a day. (b) leaves unkeyed actions running on
+followers, where their audit events are forwarded best-effort.
+
+## 114. The reconciler's submit is compare-and-set on the app record, and jobs stamped for no record are swept (H2)
+
+*Hardening after adversarial review.*
+
+**Call.** `GrantSource::App` carries the record's `updated_at`; inside the
+submit's own transaction (`handle_job_submit_tx`, before the version or its
+grant is written), the store refuses with `StorageError::Aborted` (gRPC
+`ABORTED`) unless the app's row exists, is enabled, and is at that
+`updated_at`. The reconciler treats `ABORTED` as "render again" (no
+backoff, no event). Uninstall's first step (disable) therefore defeats any
+submit in flight. Each full pass also finds jobs in `legion-system` whose
+latest version is stamped for an app with no row and that are not stopped,
+and stops them and revokes their grants (`stopped the job of an app that
+is not installed`); a pass for a missing app does the same.
+
+**Alternatives.**
+- (a) Only the sweep (the review's first fix).
+- (b) Compare the manifest digest instead of `updated_at`.
+
+**Trade-off.** Any record write during a submit (a settings change, a
+second `config set`) aborts it and costs one more render. The window
+between the submit's commit and its separate `clear_job_stopped_status`
+write remains; the sweep closes it within a pass.
+
+**Why (correctness).** Entry 51's "disable first" argument assumed every
+submit reads the record after the disable; one already past its read was
+the counterexample. Checking in the same entry as the version is the only
+check that cannot be raced. (a) lets the job run with a fresh grant until
+the next full pass. `updated_at` moves on every operator write, including
+disable, which a digest would not show.
+
+## 115. Status counts only the latest version's healthy allocations; a record write retries an unhealthy job; rollback is deferred (M1; design concern 2)
+
+*Hardening after adversarial review.*
+
+**Call.** `app_job_allocations` splits healthy allocations into `running`
+(the job's latest version) and `previous`. `derive_status` reads `running`
+only at the latest version; `upgrading` when it falls short and
+`previous > 0`; `degraded: upgrade failing: the rollout to job version N
+failed (…)` when the newest rollout to that version is `failed` (rolled
+back or stopped at a deadline). A pass that finds the job current but not
+healthy, after a write that left `pending_change` set (`legion app enable`,
+`legion app upgrade` with the same manifest), resubmits it with
+`force_reschedule` under the key `…:<version>@<updated_at>`. No `previous
+manifest` column and no `legion app rollback`.
+
+**Alternatives.**
+- (a) Keep `previous_manifest` on the record and add `legion app rollback`
+  (a proto field or RPC, a migration, a CLI verb, a capability, docs).
+- (b) Retry an unhealthy job on every pass.
+
+**Trade-off.** Going back means keeping the old manifest file and
+upgrading to it. A config change's rollout shows `upgrading` too (any new
+version is an upgrade of the job).
+
+**Why (simplicity).** The review's harm was that a failed upgrade looked
+like success and could not be retried; status and the retry fix both, and
+rollback is a new surface the brief allowed only if small. It is not: a
+migration, a reply shape, and a decision about which config goes back with
+the manifest. (b) would restart a crash-looping job every minute. Recorded
+in TODO.md.
+
+## 116. Install, upgrade, config and settings changes dry-run the submit's admission chain (M8)
+
+*Hardening after adversarial review.*
+
+**Call.** `submit_rendered_job_from` is split into `admit_rendered_job`
+(everything before the store write) and the write. The app RPCs call
+`admit_app_job`: the render, as the reconciler's identity (the record's
+grant), through `admit_rendered_job` with `SubmitOrigin::App`, then the
+namespace quota check `PlanJob` runs. A refusal keeps its code and reads
+`app <name>'s job would be refused when the reconciler submits it: …`; on
+`install --dry-run` it is the error, not `uncovered`.
+
+**Alternatives.** Run `PlanJob` itself; check only at install.
+
+**Trade-off.** Install and upgrade resolve pins (a registry round trip) and
+hold the RPC for it; a registry blip refuses the install (`UNAVAILABLE`,
+retryable) rather than parking the app.
+
+**Why (correctness).** The checks the reconciler's submit makes are the
+contract; running the same function as the same identity cannot drift from
+it, which a plan-shaped copy could. Settings and config changes can trip a
+quota or a pool policy just as an install can.
+
+## 117. A failed app job is restarted with backoff (M2)
+
+*Hardening after adversarial review.*
+
+**Call.** A latest version whose job status is `failed` is never current.
+The reconciler resubmits it (the submit's `clear_job_failed_status` starts
+the same version again), with key `…:failed-<version>`, and backs off
+5s→5m between restarts while it keeps failing (`restarts`, `restart_at` in
+the leader's memory; the loop wakes for it). Status reads `degraded: its job
+failed; …`, and while waiting, `its job failed; restarting it in Ns
+(restart N)`. The count resets once the job runs healthy.
+
+**Alternatives.** Leave a failed job to the operator (`legion app
+disable`/`enable`); restart without backoff.
+
+**Trade-off.** A job whose own policy gave up is overruled; an app that
+fails for good restarts every five minutes.
+
+**Why (correctness).** An app is the platform's own add-on: "keep it
+running" is the reconciler's whole job, and the job's `moveCount` or a KV
+`onDelete = "fail"` describe one placement's failure, not the app's wish
+to stop. The backoff keeps a hard failure from spinning.
+
+## 118. A pin that could not be reached is `UNAVAILABLE`, classified by the error's type (M4)
+
+*Hardening after adversarial review.*
+
+**Call.** The submit puts a `PinResolveFailure { transient }` context on a
+pin resolution's error. Transient: an OCI `RequestError`/`IoError`, a
+`ServerError` 5xx or 429, a `reqwest` connect or timeout error, an I/O
+error of a connection kind, or git's stderr naming DNS, a refused or reset
+connection, a timeout, or an HTTP 5xx/429. Those make the submit
+`UNAVAILABLE` ("the source could not be reached; the submit can be retried
+as it is"), which the reconciler backs off on; everything else stays
+`INVALID_ARGUMENT`, a refusal.
+
+**Alternatives.** Map every resolution error to `UNAVAILABLE`; retry
+refusals on a slow timer too.
+
+**Trade-off.** Git's classification reads text, and a new failure wording
+falls back to "refusal" (parked until a write, as before).
+
+**Why (correctness).** A typo'd tag should stop and say so; a registry
+blip should not park an app until someone touches it. Classifying by type
+keeps both, and RunJob's callers get a `retryable` envelope that is true.
+
+## 119. Bundled apps agree on the version; mixed builds of it get a set id, and adoption needs the version only (M5)
+
+*Hardening after adversarial review.*
+
+**Call.** `decide_build_marker` groups ready eligible nodes by
+`buildVersion`. One version: the marker is that version with the single
+build id, or `mixed-<hash of the sorted distinct ids>` when several
+binaries of it run. Several versions: hold, naming the nodes behind the
+newest. Adoption compares the leader's `buildVersion` with the marker's,
+not the pair.
+
+**Alternatives.** Key the marker on the version alone (no rebuild rolls);
+key `buildId` per architecture.
+
+**Trade-off.** A dev rebuild rolled out one node at a time rolls the app at
+each step (the set changes each time), instead of once; two builds of one
+version that embed different manifests could flap adoption between leaders
+(only in development).
+
+**Why (correctness).** amd64 and arm64 builds, and distro and tarball
+packages, always differ in `buildId`, so a mixed fleet never agreed: a fresh
+cluster's autoscaler never started. The set id keeps entry 14's point (a
+rebuild without a version bump rolls) while letting a mixed fleet settle.
+
+## 120. A bundled upgrade whose new schema refuses the stored config is held, and `config set` accepts a config for the held schema (M6)
+
+*Hardening after adversarial review.*
+
+**Call.** When the embedded manifest's config schema refuses the stored
+config, adoption returns `Held`: the manifest is not adopted, the job stays
+rendered for the record's previous marker, `marker_reason` starts
+`upgrade held: ` (status `degraded` with it), and `app.reconcile_failed` is
+emitted when the reason first appears. `SetAppConfig` on a bundled app in
+that state accepts a config that fails the stored schema if it matches the
+embedded one; the next pass adopts.
+
+**Alternatives.** Adopt anyway and report (as before); migrate the config
+(drop what the new schema refuses).
+
+**Trade-off.** Holding the job spec does not hold the binary: `legion:self`
+runs whatever its node has, so an allocation that restarts on an upgraded
+node runs the new build with the old config and fails until the config is
+set (documented). The rest of the upgrade (new permissions, a new job
+shape) waits on the operator.
+
+**Why (correctness).** Adopting guaranteed a crash loop with the failure
+buried in `last_action`; holding keeps whatever still runs running and puts
+the reason in status. Migrating would guess at the operator's intent.
+
+## 121. An upgrade that drops an extension point jobs use needs `--force`, and the prompt reports orphaned values apart (M7)
+
+*Hardening after adversarial review.*
+
+**Call.** `UpgradeApp` computes the jobs whose values the upgraded registry
+reads as `orphaned` (`orphaned_jobs`); without `force` the upgrade is
+`FAILED_PRECONDITION` naming them, as uninstall is, and the dry run lists
+them and says so. `lifecycle_report` lists orphaned values on their own
+lines instead of counting them as passing.
+
+**Alternatives.** Report only, as before.
+
+**Trade-off.** One more flag on `upgrade`.
+
+**Why (consistency).** Dropping a point is uninstall's effect on those
+values; every such job's next submit fails. The gate already existed for
+uninstall.
+
+## 122. Uninstall keeps the app's KV unless `--purge`, and the next app of that name is told (L3)
+
+*Hardening after adversarial review.*
+
+**Call.** Keys under `legion/apps/<name>/` stay. `--purge` (needs `kv:write`
+on the prefix) deletes them and their locks in the same replicated entry as
+the record's deletion. The reply carries `kv_keys` and `purged`; an install
+whose prefix holds keys adds a prompt line before approval.
+
+**Alternatives.** Delete on every uninstall; refuse an install while keys
+are left.
+
+**Trade-off.** Leftover state by default, and a same-named app from
+another vendor can still take it over after the prompt.
+
+**Why (safety).** Uninstall-and-reinstall to fix something is common, and
+losing an app's state to it is not recoverable; telling the next installer
+is enough for "not silently".
+
+## 123. Every `legion app` write has a dry run
+
+*Hardening after adversarial review.*
+
+**Call.** `dry_run` on `SetAppEnabled`, `UpdateAppSettings`,
+`SetAppConfig`, `UninstallApp` (with `--dry-run` on the CLI); settings and
+config dry runs run the admission chain. `UpgradeAppReply` gains
+`uncovered` and `orphaned_jobs`, and the CLI refuses before asking when
+either says it must.
+
+**Alternatives.** Dry runs on install and upgrade only (as before).
+
+**Trade-off.** Four proto fields.
+
+**Why (agent surface).** AGENTS.md asks for a preview path wherever one
+can exist; the upgrade's refusal was only in message text.
+
+## 124. A node-group intent is acted on for at most 120 seconds (L6)
+
+*Hardening after adversarial review.*
+
+**Call.** `act_node_group` runs every step under one deadline
+(`ACT_BUDGET`, `RECONCILE_AFTER_MS` − 30 s) from winning the intent: a step
+not started by then fails with "not started, the 120s act budget was
+spent", one still running is abandoned at it; both close the intent as
+`failed`, and the next tick decides again.
+
+**Alternatives.** Renew the intent while acting; raise
+`RECONCILE_AFTER_MS`.
+
+**Trade-off.** A decision with several slow target calls finishes over
+several ticks.
+
+**Why (correctness).** Sequential `target/terminate` calls of up to 120 s
+each, behind a plugin's single turn, could outlast the 150 s after which
+another replica reconciles the intent and acts on the group: two replicas
+acting at once. A deadline needs no new protocol; renewal would need
+another compare-and-set write per step.
+
+## 125. Install and uninstall write their idempotency key in the record's own entry, and uninstall's retry returns the first reply (L5)
+
+*Hardening after adversarial review.*
+
+**Call.** `insert_app_recorded` and `delete_app_recorded` call
+`idempotency_record` inside the same `replicated` closure (it composes into
+the capture), with the uninstall's whole reply as JSON.
+
+**Alternatives.** Document the gap.
+
+**Trade-off.** None found.
+
+**Why (correctness).** A crash between the two entries made a retry read
+"already installed" or `NotFound`; one entry cannot split.
+
+## 126. The reconciler forgets everything on acquiring leadership, and checks "already current" before a parked refusal (L1)
+
+*Hardening after adversarial review.*
+
+**Call.** `reset_runtime` on every acquisition; the refused-skip moved after
+the current check.
+
+**Alternatives.** Clear only refusals.
+
+**Trade-off.** A failing app is retried once more after a leadership flip.
+
+**Why (correctness).** Another leader may have fixed what this one's
+earlier term parked; entry 53's "a new leader retries once" is now true of
+the same manager too.
+
+## 127. Apps' validate calls are asked on the Control leader, and a short answer warns (L2)
+
+*Hardening after adversarial review.*
+
+**Call.** `ask_apps_to_validate` requires Control leadership before calling
+any app (when any app is to be asked), so a follower's submit is replayed
+before the calls. A value past the end of an app's `results` gets the
+fail-open warning instead of passing silently.
+
+**Alternatives.** Correct the docs only.
+
+**Trade-off.** A submit with validated keys on a follower fails while the
+leader is unreachable (it would have failed at the write anyway).
+
+**Why (correctness).** Same as entry 113, for a side effect that is only a
+cost, and the docs' "one call per submit" becomes true.
+
+## 128. An upgrade keeps the operator's settings, and says so where the new defaults differ
+
+*Hardening after adversarial review.*
+
+**Call.** Unchanged behavior, now stated: replicas, placement, pool and
+resources stay; the prompt adds `Keeps replicas 1 (this version's default
+is 3; …)` when the new manifest's default differs from both the old
+default and the current setting.
+
+**Alternatives.** Adopt the new defaults when the setting still equals the
+old default.
+
+**Trade-off.** A vendor's new default reaches only new installs.
+
+**Why (simplicity).** Settings are the operator's; guessing whether an
+equal value was chosen or inherited would move apps under people.
+
+## 129. Design concerns 3, 4 and 7 of the review are accepted for now
+
+*Hardening after adversarial review.*
+
+**Call.** Not changed: the reconciler is one serial loop that blocks on
+admission (3); a render depends on the leader's build, so a mixed-version
+manager set re-rolls apps when leadership moves (4); validation fails open,
+and an app has no health of its own beyond its allocations' (7). Concern 5
+is entry 112, concern 2 entries 115 and 117, concern 1 entry 111, and
+concern 6 (placement as a path to the grant) was closed by entry 104. Each
+open one is a TODO.md item.
+
+**Alternatives.** A worker pool per app; pinning renders to the record;
+app-reported health in status.
+
+**Trade-off.** One slow registry stalls every app's pass for its timeout;
+an upgrade window can roll apps twice.
+
+**Why (scope).** Each is a design change with its own plan, not a fix.

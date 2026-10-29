@@ -18,6 +18,16 @@
 > placement changes take `operator:write`; an app's identity needs the
 > reconciler's `managedBy` stamp.
 
+> **Hardened after an adversarial correctness and operability review**
+> (2026-10-29; calls entries 111-129 win where they differ from the text
+> below, which is kept as written): direct edits to an installed app's job
+> are **refused**, not reverted (§6.3, §12); the reconciler's submit is
+> compare-and-set on the record; stored records read leniently and a
+> corrupt one is isolated; status counts only the job's latest version; a
+> failed job restarts with backoff; bundled markers agree on the version;
+> a bundled upgrade whose schema refuses the stored config is held; install
+> and upgrade run the job's admission chain. Rollback is deferred.
+
 **Status: SHIPPED** (every phase, A1-A6, by 2026-10-29; written 2026-10-19; reconciler and upgrade
 details, jobspec extensions, and strict unknown fields added 2026-10-27).
 **A1 shipped 2026-10-28** (the `legion-system` namespace, the reserved-glob

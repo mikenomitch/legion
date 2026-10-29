@@ -822,6 +822,21 @@ the app acts on its behalf, holding only the action's declared permission
 on that context, and what it writes is recorded as `<agent's token name>
 via app <app>` ([Delegated identities](auth-and-acls.md#delegated-identities)).
 
+**Changing apps safely.** Every `legion app` write has a dry run:
+`install`, `upgrade`, `set`, `config set`, `enable`, `disable`, and
+`uninstall` take `--dry-run`, validate everything the real call would
+(install, upgrade, `set` and `config set` also run the app's job through the
+submit's admission chain), and change nothing. `upgrade --dry-run -j`
+reports `uncovered` (the permission your token lacks, empty when it holds
+them all) and `orphanedJobs` (jobs whose jobspec values the new manifest
+would orphan; the real upgrade then needs `--force`), so an agent never
+parses a message to learn it would be refused. An app's status
+(`legion app status -j`, `legion_app_status`) reads `upgrading`,
+`degraded` with `upgrade failing: …`, or `corrupt` when an upgrade has not
+taken or a record cannot be read. Direct writes to an installed app's job
+(`legion job run|scale|stop|destroy` on `legion-system/<app>`) are refused
+with `FAILED_PRECONDITION` and the `legion app` verb to use instead.
+
 An app may also ship **sandboxed pages** (`ui.pages`), single-file HTML the
 UI mounts in an iframe ([Apps: Sandboxed pages](apps.md#sandboxed-pages)).
 They are for people: `legion app view <app>` lists them, and

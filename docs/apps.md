@@ -15,8 +15,9 @@ install from a manifest. It is three things:
 A **manifest** declares all three. An **app record**, stored on the
 managers, holds the installed manifest, the operator's settings and config,
 and the grant. The manager's **app reconciler** keeps the job matching the
-record: it submits the job, re-renders it when the record changes, reverts
-direct edits to it, and restarts it when someone stops it.
+record: it submits the job, re-renders it when the record changes, restarts
+it when it stops or fails, and is the only writer of it: direct edits to an
+installed app's job are refused.
 
 An app is an ordinary job. It is scheduled, restarted, rolled out, logged,
 metered, and exec'd into (by those allowed) like any other. Everything that
@@ -274,6 +275,30 @@ Error: app checker: task "main" declares exec health check "probe", which the wo
 Hint: use an `http` or `tcp` health check, and fetch artifacts from a URL
 ```
 
+**The job must pass admission.** Install then runs the rendered job through
+everything the reconciler's submit will check, as the reconciler submits it
+(the app's recorded grant, the namespace's policies and quota, `kv:read` on
+every KV key the job references, artifacts and their pins, volumes,
+capabilities), and writes nothing. A job the reconciler would be refused is
+refused at install, with the reason, instead of installing and sitting in
+`reconcile refused`:
+
+```text
+Error: app rooted's job would be refused when the reconciler submits it: permission denied: ... (the jobspec reads kv secret/db; the submitter needs kv read on it)
+```
+
+Upgrades, config changes, and settings changes run the same check. A pin
+whose source cannot be reached right now is `Unavailable`: retry.
+
+**State an earlier app left.** An app's own KV lives under
+`legion/apps/<name>/`, and `legion app uninstall` leaves it unless
+`--purge` ([Uninstalling](#uninstalling)). When keys are there, the prompt
+says so before you approve, because the new app's grant may reach them:
+
+```text
+1 KV key under legion/apps/gitops/ was left by an earlier install of an app named gitops; this app takes it over (`legion app uninstall --purge` removes an app's keys).
+```
+
 A bundled app's name cannot be installed, and an installed name cannot be
 installed again (`legion app upgrade` replaces a manifest). Install never
 takes over a job: if `legion-system/<name>` exists and its latest version is
@@ -298,12 +323,37 @@ A new manifest is new code running with the grant, so upgrading needs
 `rpcs`, as installing does; its job is held to the same rules (nothing
 host-level, no `user`). When the new manifest asks for anything the installed one did not, the
 upgrade needs approval (`--yes`, or the question); one that only keeps or
-drops permissions upgrades without asking. The stored config must match the
-new schema; `--config <file>` replaces it in the same step. `--dry-run`
-shows the diff and changes nothing. Bundled apps cannot be upgraded this
-way. The prompt reports every stored jobspec value of the app's keys checked
-against the new schemas ([Installing, upgrading,
-uninstalling](#installing-upgrading-uninstalling)).
+drops permissions upgrades without asking. A token that does not hold the
+new manifest's permissions is refused before anything is asked. The stored
+config must match the new schema; `--config <file>` replaces it in the same
+step. The new job passes admission first, as at install. `--dry-run` shows
+the diff and changes nothing; with `--json` it carries `uncovered` (the
+permission the token lacks, empty when it holds them all) and
+`orphanedJobs`. Bundled apps cannot be upgraded this way. The prompt reports
+every stored jobspec value of the app's keys checked against the new
+schemas ([Installing, upgrading,
+uninstalling](#installing-upgrading-uninstalling)); a new manifest that
+drops an extension point jobs set a key at needs `--force`.
+
+**Your settings stay.** An upgrade keeps the replicas, placement, pool, and
+resources you set (or seeded), even when the new manifest's defaults differ:
+they are the operator's, and the manifest's are only where an install
+starts. The prompt says so when they differ:
+
+```text
+Keeps replicas 1 (this version's default is 3; `legion app set gitops --replicas 3` takes it).
+```
+
+**An upgrade that does not take.** `upgraded gitops 0.2.0 → 0.3.0` means the
+record holds the new manifest. Whether the new version runs is the app's
+status ([Status](#status)): `upgrading` while the previous version still
+serves, `degraded: upgrade failing: …` when the new version's rollout failed
+or rolled back (the old version keeps running), never `running` on the old
+version. To retry after fixing the cause (a registry, a quota), run `legion
+app enable <app>` or `legion app upgrade` with the same manifest: either is
+a write, and the reconciler resubmits a job that does not run healthy at the
+version the record renders, with a forced reschedule. There is no `legion
+app rollback`; to go back, upgrade with the previous manifest.
 
 ### Config
 
@@ -349,7 +399,11 @@ $ legion app enable autoscaler
 `--placement` or `--pool` needs `operator:write` as well as `app:write`
 ([Placement](#placement)); replicas and resources need only `app:write`.
 Enabling an app that is already enabled is not a no-op: it is a record
-write, which retries a reconcile a refusal parked ([Failures](#failures)).
+write, which retries a reconcile a refusal parked ([Failures](#failures)),
+and resubmits a job that does not run healthy at its current version (a
+failed upgrade). `set`, `config set`, `enable`, `disable`, and `uninstall`
+take `--dry-run`: they validate (a settings or config change runs the job's
+admission too) and say what would change, without changing it.
 
 ### Uninstalling
 
@@ -359,9 +413,30 @@ uninstalled gitops; job legion-system/gitops stopped and 3 grant(s) revoked (`le
 ```
 
 Uninstall disables the app, stops its job, revokes the job's grants (its
-workload tokens lose them at their next request), and deletes the record. The
-stopped job stays until someone destroys it. Bundled apps cannot be
-uninstalled; disable them.
+workload tokens lose them at their next request), and deletes the record.
+Disabling first means a reconciler submit already in flight loses its
+compare-and-set on the record ([How an app stays
+running](#how-an-app-stays-running)). The stopped job stays until someone
+destroys it; with the app gone it is an ordinary job (`legion job destroy`
+works). Bundled apps cannot be uninstalled; disable them. A retry with the
+same `--idempotency-key` gets the first reply back, whole.
+
+**The app's KV stays unless `--purge`.** Keys under `legion/apps/<name>/`
+(the app's own state, which its grant usually covers) are left, and the
+reply says how many. `--purge` deletes them, and their locks, in the same
+replicated entry as the record; it needs `kv:write` on that prefix besides
+`app:write`. A later app installed under the same name, from any vendor, is
+told about leftover keys in its prompt, since its grant may reach them.
+
+```console
+$ legion app uninstall gitops --purge
+uninstalled gitops; job legion-system/gitops stopped and 3 grant(s) revoked (`legion job destroy legion-system/gitops` removes the job); deleted 4 KV key(s) under legion/apps/gitops/
+```
+
+**A record that does not decode** (`legion app list` shows it `corrupt`) is
+removed by name the same way, a bundled app's included; the reconciler seeds
+a bundled app again from the running build within a minute ([Upgrading
+Legion](#upgrading-legion)).
 
 While jobs set the app's jobspec keys, uninstall needs `--force`, and the
 values stay stored, flagged `orphaned`:
@@ -393,42 +468,81 @@ app. Each pass, for each app:
 
 **Which writes keep the stamp.** The reconciler's own submits set it. A KV
 re-render of the job ([KV Store](kv-store.md)) keeps it, because it
-re-renders the same spec. Any other write that stores a version (`RunJob`,
-`RunJobTemplate`) clears it.
+re-renders the same spec. No other write may store a version of an
+installed app's job (below); a version stored some other way (one a release
+before this one let through) has no stamp, and the next pass reverts it,
+naming who stored it.
 
-**Direct edits are reverted.** A direct submit of an app's job clears the
-stamp, and its job event wakes the reconciler, so the edit is reverted within
-seconds, and the event says by whom:
+### Editing an app's job
+
+While an app is installed, its job is the reconciler's alone. Every direct
+write to `legion-system/<app>` is refused (`FailedPrecondition`), for every
+caller, management tokens included, and the error names the `legion app`
+verb that does it:
+
+```text
+$ legion job scale legion-system/autoscaler --count 0
+Error: job legion-system/autoscaler is app autoscaler's, and the app reconciler owns it, so scaling it directly is refused (docs/apps.md, "Editing an app's job")
+Hint: `legion app set autoscaler` changes its replicas, placement and resources, `legion app config set autoscaler` its config, `legion app disable autoscaler` stops it, and `legion app uninstall autoscaler` removes the app, after which the job is an ordinary job
+```
+
+| Write | Refused | Instead |
+| --- | --- | --- |
+| `RunJob`, `RunJobTemplate` (and `PlanJob`, which predicts it) | yes | `legion app set`, `legion app config set`, `legion app upgrade` |
+| `ScaleTask` (`legion job scale`) | yes | `legion app set --replicas` |
+| `StopJob` | yes | `legion app disable` |
+| `DestroyJob` | yes | `legion app uninstall`, then `legion job destroy` |
+| `StopRollout` | yes | `legion app upgrade` with the previous manifest |
+| `AdvanceRollout` | no: it moves toward the version the reconciler submitted | |
+
+Refusing beats reverting: a GitOps tool or a CI job that syncs
+`legion-system` gets an error it can act on, instead of fighting the
+reconciler forever (each round a new version and two restarts), and a scale
+override, which is not a version and so survives every resubmit, can no
+longer quietly disable an app. The `job info` banner says so:
 
 ```console
 $ legion job info legion-system/autoscaler
 ...
-managed by app autoscaler (digest 3f9a12c4…); direct edits are reverted. Use `legion app`.
-
-$ legion events --kind app.reconciled
-app.reconciled  App autoscaler: reverted a direct edit by userpass:alice (from legion-system/autoscaler-7)
+managed by app autoscaler (digest 3f9a12c4…); direct edits are refused. Use `legion app`.
 ```
-
-Submitting an app's job directly still needs everything the app's grant
-holds (a submit always checks the job's `permissions` against the
-submitter), so a token with `job:write` on `legion-system` alone cannot
-launder the app's grant by editing its job.
 
 **Exactly once per transition.** Each submit carries the idempotency key
 `app:<name>:<digest>:<from>`, where `<from>` is the state it starts from (the
-job's latest version, `none`, or `stopped-<version>`). If the leader dies
+job's latest version, `none`, `stopped-<version>`, `failed-<version>`, or,
+for a retry after a record write, `<version>@<updated_at>`). If the leader dies
 after its submit lands but before it records that, the next leader's pass
 finds the stamp and does nothing, and a retry of the same key is
-deduplicated. A new transition (reverting the same edit a second time,
+deduplicated. A new transition (restarting a job that failed again,
 enabling within a day of disabling) starts from another state and gets a new
 key.
+
+**Compare-and-set on the record.** A submit can take seconds (pin
+resolution reaches registries), and the record can change meanwhile. The
+submit carries the record's `updated_at` it rendered from, and the store
+refuses it, in the same entry as the version, unless the record is still
+installed, enabled, and unchanged. So an uninstall or a disable that lands
+mid-submit never has the job come back with a fresh grant; the next pass
+renders from the new record. And a job still stamped for an app that has no
+record (stopped by nothing) is stopped, and its grants revoked, by the next
+full pass.
+
+**A failed job is restarted.** A job whose own policy gave up (a reschedule
+policy's `moveCount`, a KV key's `onDelete = "fail"`, a gang that lost its
+quorum) has status `failed`. The reconciler resubmits it (the same version
+starts again), backing off from 5 seconds doubling to 5 minutes while it
+keeps failing; the app reads `degraded: its job failed; restarting it in
+20s (restart 3)`. The backoff resets once the job runs healthy.
 
 **Triggers.** A pass runs for an app when its record changes (any `legion
 app` write), when its job changes (a new version, a stop), when a node joins
 or re-registers (bundled apps' build markers), when a manager takes over the
-Control lane (it also seeds bundled apps then), and every 60 seconds for
-every app, in case an event was missed. Bursts coalesce: changes that arrive
-during a pass queue one more pass, not one each.
+Control lane (it also seeds bundled apps then, and on every full pass), and
+every 60 seconds for every app, in case an event was missed. Bursts
+coalesce: changes that arrive during a pass queue one more pass, not one
+each. A manager that takes over the Control lane starts with no memory of
+failures, backoffs, or parked refusals, even ones from its own earlier
+term: it tries everything once.
 
 ### Failures
 
@@ -441,7 +555,13 @@ during a pass queue one more pass, not one each.
   status reads `reconcile refused: <error>`, and the reconciler waits for the
   next change to the app's record or to its build marker. `legion app enable
   <app>` is a write that retries it after you fix the cause elsewhere (a
-  namespace quota, say).
+  namespace quota, say). A job that already runs the render is never held
+  back by a refusal parked earlier.
+- **A source that cannot be reached is not a refusal.** A pin whose
+  registry or git remote refuses the connection, times out, or answers 5xx
+  or 429 fails the submit with `Unavailable`, which backs off and retries
+  like any other failure; a reference that does not resolve (a tag that
+  does not exist, refused credentials) is still a refusal.
 
 ### Status
 
@@ -451,9 +571,15 @@ when they are read:
 | Status | When |
 | --- | --- |
 | `stopped` | the app is disabled |
-| `degraded` | the last reconcile failed, or fewer allocations run healthy than it asks for (`2/3 running`) |
+| `degraded` | the last reconcile failed; its job failed (and is being restarted); a bundled upgrade is held (`upgrade held: …`); the latest version's rollout failed or rolled back (`upgrade failing: …`); or fewer allocations of the latest version run healthy than it asks for (`2/3 running`) |
+| `upgrading` | the job's latest version is not fully healthy yet, and the previous version still serves |
 | `pending` | nothing runs yet: no build marker, no job yet, the job was stopped and is being restarted, or the scheduler's reason it is blocked (`no room in pool legion-system`) |
-| `running` | every allocation it asks for runs and reports healthy (its health checks pass) |
+| `running` | every allocation it asks for runs **the job's latest version** and reports healthy (its health checks pass) |
+| `corrupt` | this manager cannot decode the app's record (the detail says why); nothing reconciles it until `legion app uninstall` removes it |
+
+Only allocations of the job's latest version count as running, so an
+upgrade whose new version never became healthy cannot read `running` while
+the old version serves.
 
 `legion app status` also shows the record, the grant and who approved it,
 the reconciler's last action, error, and digest, the build marker and what
@@ -469,8 +595,13 @@ restarts it only when there is one new build to move to:
   of their own executable, computed at startup) when they register. A
   rebuild without a version bump changes `buildId`.
 - The app's **build marker** is the (`buildVersion`, `buildId`) pair, defined
-  when every ready node its placement allows reports the same one. Nodes that
-  report `unknown`, an unparsable version, or no build id are left out.
+  when every ready node its placement allows reports the same
+  `buildVersion`. When they all run one binary, its `buildId` is the
+  marker's; when they run different binaries of that version (amd64 and
+  arm64 nodes, a distro package beside a tarball), the marker's build id is
+  `mixed-` and a digest of the set, so a mixed fleet agrees, and a rebuild of
+  any one binary still rolls the app. Nodes that report `unknown`, an
+  unparsable version, or no build id are left out.
 - While those nodes disagree (during an upgrade), the marker keeps its last
   value: a straggler holds it, and an older node joining later does not move
   it backwards. When they agree again, the marker moves and the app rolls
@@ -488,12 +619,29 @@ autoscaler  0.14.0   bundled  running  managers   1/1       -   upgrade waiting:
 
 **New bundled manifests.** A new build can change a bundled app's job,
 permissions, or config schema. The reconciler adopts the new manifest only
-when the leading manager itself runs the marker's build, since it can read
-only manifests compiled into its own binary; until then it renders from the
-manifest stored on the record. New permissions are recorded as granted by
-`legion:bootstrap` and reported in the `app.upgraded` event. A stored config
-that no longer matches the new schema is kept, and reported in the app's
-status.
+when the leading manager itself runs the marker's version, since it can
+read only manifests compiled into its own binary (builds of one version for
+other architectures carry the same manifest); until then it renders from
+the manifest stored on the record. New permissions are recorded as granted
+by `legion:bootstrap` and reported in the `app.upgraded` event.
+
+**A config the new build would refuse holds the upgrade.** When the stored
+config does not match the new manifest's config schema (a property renamed
+or removed under `additionalProperties = false`), the new build's app would
+refuse it and crash-loop. So the reconciler does not adopt the manifest:
+the job stays rendered for the previous marker, the app reads `degraded`,
+and `app.reconcile_failed` says why, once:
+
+```text
+autoscaler  0.14.0  bundled  degraded  managers  1/1  -  upgrade held: build 0.15.0+3f9a12c4e1b0 changes autoscaler's config schema, and the stored config does not match it (...); the app stays on its previous build until `legion app config set autoscaler <file>` sets a config that does
+```
+
+`legion app config set` accepts a config that matches the new build's
+schema while the upgrade is held, even where the stored schema refuses it;
+the next pass adopts the manifest and rolls the app. The job keeps the
+previous build marker, but `legion:self` runs whatever binary its node has:
+an allocation that restarts on an upgraded node runs the new build with the
+old config, and fails until the config is set.
 
 Limits:
 
@@ -504,6 +652,23 @@ Limits:
   pre-release of a newer version (`0.16.0-rc.1`) does not satisfy
   `>=0.15.0`. During a mixed window, such nodes cannot host the app; once
   every eligible node runs the pre-release, the marker moves to it.
+
+## Upgrading Legion
+
+Legion breaks freely between releases ([upgrades](upgrades.md)), and app
+records are stored data. So the store reads them leniently and installs
+read them strictly:
+
+- **A field this release does not know** in a stored manifest or grant (one
+  another release added, or one it renamed or removed) is dropped when the
+  record is read. A typo in a manifest you install is still an error.
+- **A record that still does not decode** (a field whose type changed) is
+  that record's problem only. It is logged once per manager, counted as
+  `legion_apps{status="corrupt"}`, listed by `legion app list` with status
+  `corrupt` and the reason, and skipped by the reconciler and by the
+  registry of jobspec keys, so every job submit and every other app keeps
+  working. `legion app uninstall <app>` removes it by name; a bundled app is
+  then seeded again from the running build within a minute.
 
 ## Trust model
 
@@ -773,7 +938,14 @@ An action is a button in a view's `actions` block, bound to an entry of
   permission on the context, and the writes are recorded by `<viewer> via
   app <app>` ([Acting as the viewer](#acting-as-the-viewer)).
 - `InvokeAppAction` takes `idempotency_key`; the SPA sends one per press, so
-  a retried press runs once.
+  a retried press runs once. Actions run on the manager that leads the
+  Control lane: one that reaches a follower is refused there before the app
+  sees it, and replayed on the leader, so it runs once wherever it lands. A
+  call with a key that is still running (a retry after a client timeout, a
+  double press) waits for it, up to 45 seconds, and returns its reply,
+  `deduplicated` (`Aborted`, retryable with the same key, if it still runs).
+  Limitation: a leadership change while an action runs can let a retry with
+  the same key run it again on the new leader.
 
 ### The viewer assertion
 
@@ -1449,10 +1621,15 @@ The app answers one result per value, in order:
 ```
 
 Errors refuse the submit; warnings pass through to the reply's `warnings`.
-Each app gets one call per submit, with all its values, and two seconds.
-**An app that cannot be reached, is disabled, answers anything but `200`,
-or does not answer in time passes the values with a warning**: a broken
-add-on must not block deploys. The app checks values again when they reach
+Each app gets one call per submit, with all its values, and two seconds:
+apps are asked on the Control lane's leader, and a submit that reaches a
+follower is refused there before any app is asked, then replayed on the
+leader, so a submit through any manager asks once (and waits up to two
+seconds, not four). **An app that cannot be reached, is disabled, answers
+anything but `200`, or does not answer in time passes the values with a
+warning**: a broken add-on must not block deploys. So does a value past the
+end of an answer with too few results: it was not checked, and the warning
+says so. The app checks values again when they reach
 it through its watch, and reports problems on its own status and views.
 
 ```text
@@ -1485,6 +1662,16 @@ framework answers that every value passes.
   ```text
   14 jobs set backup on volumes; 2 fail this version's schema (flagged invalid; each job's next submit must conform):
     orders-db/postgres/data: backup: "schedule" is a required property
+  ```
+
+  A new manifest that **drops a point** jobs set a key at orphans those
+  values, which is uninstall's effect on them, so it needs `--force` too,
+  and the prompt lists them apart from the passing ones (`--dry-run --json`
+  has them as `orphanedJobs`):
+
+  ```text
+  1 value of tier on tasks is orphaned: this version no longer declares the key there. The values stay stored, flagged orphaned, and each job's next submit fails until the key is removed:
+    web/main: tier
   ```
 
 - **Disable** keeps the keys registered, so submits are still checked;
@@ -1548,14 +1735,15 @@ worker's executable.
 | `app.uninstalled` | an app was uninstalled (grants revoked) |
 | `app.enabled`, `app.disabled` | an app was enabled or disabled |
 | `app.config_changed` | an app's config was replaced (the code fields it touched) |
-| `app.reconciled` | the reconciler changed an app's job: `created the job`, `config changed`, `settings changed (…)`, `reverted a direct edit by <who>`, `started the job, which was stopped`, `stopped (app disabled)` |
-| `app.reconcile_failed` | a reconcile failed (`refused` when it waits for a change) |
+| `app.reconciled` | the reconciler changed an app's job: `created the job`, `config changed`, `settings changed (…)`, `reverted a direct edit by <who>`, `started the job, which was stopped`, `restarted the job, which had failed (restart N)`, `resubmitted the job, which did not run healthy at version N (…)`, `stopped (app disabled)`, `stopped the job of an app that is not installed` |
+| `app.reconcile_failed` | a reconcile failed (`refused` when it waits for a change), or a bundled upgrade is held (`upgrade held: …`) |
 | `app.action` | someone ran an app's action: who, which, where (`meta.context`), and the outcome (`ok`, `failed`, `denied`) |
 
 App events are scoped to the app's job, so `legion events --job
 legion-system/<app>` shows them, and they reach whoever may read that job.
-`legion_apps{status}` on `/metrics` counts apps by status, from the leading
-manager ([Metrics](metrics.md)).
+`legion_apps{status}` on `/metrics` counts apps by status (`running`,
+`upgrading`, `degraded`, `pending`, `stopped`, and `corrupt` for records the
+manager cannot decode), from the leading manager ([Metrics](metrics.md)).
 
 ## API and CLI reference
 
@@ -1565,12 +1753,12 @@ manager ([Metrics](metrics.md)).
 | `legion app status <app>` | `GetApp` |
 | `legion app logs <app> [-f] [--stream S] [--tail]` | `legion job logs legion-system/<app>` |
 | `legion app config get <app>`, `config schema <app>` | `GetApp` |
-| `legion app config set <app> -f <file>` | `SetAppConfig` |
-| `legion app set <app> [--replicas N] [--placement P] [--pool P] [--cpu MHZ] [--memory MIB]` | `UpdateAppSettings` |
-| `legion app enable <app>`, `disable <app>` | `SetAppEnabled` |
+| `legion app config set <app> -f <file> [--dry-run]` | `SetAppConfig` |
+| `legion app set <app> [--replicas N] [--placement P] [--pool P] [--cpu MHZ] [--memory MIB] [--dry-run]` | `UpdateAppSettings` |
+| `legion app enable <app>`, `disable <app>` `[--dry-run]` | `SetAppEnabled` |
 | `legion app install <file|url> [--config F] [--yes] [--dry-run] [--key P.K=NEW]` | `InstallApp` |
-| `legion app upgrade <app> <file|url> [--config F] [--yes] [--dry-run]` | `UpgradeApp` |
-| `legion app uninstall <app> [--force]` | `UninstallApp` |
+| `legion app upgrade <app> <file|url> [--config F] [--yes] [--force] [--dry-run]` | `UpgradeApp` |
+| `legion app uninstall <app> [--force] [--purge] [--dry-run]` | `UninstallApp` |
 | `legion app extensions [app]` | `ListApps` / `GetApp` (`App.extension_keys`) |
 | `legion job schema` | `GetJobSchema` (the cluster's jobspec schema, installed keys included) |
 | (an app's own values) | `WatchAppExtensions` (app-plane) |
@@ -1678,12 +1866,22 @@ them, and which allocation answered. The MCP server exposes
 - **No host-level constructs in an app's job, even for an admin.** An app
   that would need an `exec` health check, a node file, or the node's
   identity cannot be an app; run it as an ordinary job.
-- **Backoff is the leader's memory.** A new leader retries a failing or
-  refused app once, then backs off from scratch.
+- **Backoff is the leader's memory.** A new leader (or the same manager
+  leading again) retries a failing or refused app once, then backs off from
+  scratch.
+- **No rollback verb.** The record keeps only the installed manifest: to go
+  back, `legion app upgrade` with the previous manifest file.
+- **An app's job is not autoscaled.** Its count is the app's `replicas`;
+  `ScaleTask` on it is refused, the autoscaler's included.
+- **Reverting is gone; refusing replaced it.** A tool that syncs
+  `legion-system` jobs directly gets `FailedPrecondition` for installed
+  apps' jobs: drive apps through `legion app` (or `InstallApp`,
+  `UpdateAppSettings`, `SetAppConfig`) instead.
 - **`config get` prints JSON**, not Nickel. JSON is valid input for `config
   set`.
-- **Uninstall leaves the stopped job.** `legion job destroy
-  legion-system/<app>` removes it.
+- **Uninstall leaves the stopped job, and the app's KV.** `legion job
+  destroy legion-system/<app>` removes the job; `--purge` removes the KV
+  under `legion/apps/<app>/` (or `legion kv delete` later).
 - **A worker hashes its executable at startup** for its build id: under a
   second for a release binary, longer for a debug build.
 - **Stopping a manager leaves its app processes running.** Like any task,
