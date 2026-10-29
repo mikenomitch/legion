@@ -9,7 +9,11 @@ rank.** Entries 1-17 are design-time calls. Implementation calls start at
 58-67), 68 (phase A4, UI tier 1, entries 68-79), 80 (phase A5, sandboxed
 pages, entries 80-84), 85 (phase A6b, jobspec extensions, entries 85-94),
 and 95 (A1 follow-ups, entries 95-97), appended after the design calls, since none outranks them; each
-phase's entries are ranked among themselves.
+phase's entries are ranked among themselves. Entry 98 records the A4
+follow-up that made actions run as the viewer
+([app-actions-as-viewer-plan.md](../plans/app-actions-as-viewer-plan.md)),
+whose own calls are in
+[app-actions-as-viewer-plan_calls.md](app-actions-as-viewer-plan_calls.md).
 Autoscaler-specific calls are in
 [autoscaler-v2-plan_calls.md](autoscaler-v2-plan_calls.md).
 
@@ -1807,6 +1811,11 @@ manifest from running on an older manager.
 
 ## 68. Running an app action needs `app:read` plus the action's declared permission, not `app:write` (A4, deviates from plan §6.5 and entry 11)
 
+> **Partly superseded (2026-10-29) by entry 98.** The gate below stands. What
+> an action then does is no longer "the app, with its own grant": the app
+> acts as the viewer, bounded by the declared permission on the context and
+> by its grant ([app-actions-as-viewer-plan.md](../plans/app-actions-as-viewer-plan.md)).
+
 **Call.** `InvokeAppAction` is gated on `app:read` on the app, then the
 permission the action declares in the manifest, checked on the context it
 is pressed in (the job, task, or node).
@@ -2258,3 +2267,24 @@ single-pool policy.
 
 **Why (ease).** Ordinary workers still refuse `legion-system` through
 their `namespaces`, and the list form is reusable.
+
+## 98. Actions run as the viewer, through a delegation on the viewer assertion (A4 follow-up, supersedes the "runs as the app" half of entry 68)
+
+**Call.** An action's assertion carries a `delegation` (the declared
+permission, `read` on the same resource when the viewer holds it, the exact
+scope checked); the app presents it back in `legion-on-behalf-of`, and the
+manager runs those calls as `alice via app <app>`, bounded by the
+delegation and by the app's grant. The gate of entry 68 is unchanged. The
+design and its own calls are in
+[app-actions-as-viewer-plan.md](../plans/app-actions-as-viewer-plan.md) and
+[app-actions-as-viewer-plan_calls.md](app-actions-as-viewer-plan_calls.md).
+
+**Alternatives.** Keep actions running with the app's grant, with the
+viewer in the reason (entry 68 as built, autoscaler calls entry 83).
+
+**Trade-off.** Apps that want the bound must use the viewer client (or send
+the header); an app's own client still works in a handler.
+
+**Why (security).** The manifest's declared permission becomes a bound the
+cluster enforces, and history names the person.
+

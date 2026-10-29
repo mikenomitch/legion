@@ -2,6 +2,12 @@
 
 > **Judgement calls:** [legion-apps-plan_calls.md](../calls/legion-apps-plan_calls.md)
 
+> **§6.5's actions are extended by
+> [app-actions-as-viewer-plan.md](app-actions-as-viewer-plan.md)** (2026-10-29):
+> an app now acts on a press as the viewer (`alice via app <app>`), bounded by
+> the declared permission and its grant, rather than with its own grant.
+> That plan wins where they differ; the text below is kept as written.
+
 **Status: SHIPPED** (every phase, A1-A6, by 2026-10-29; written 2026-10-19; reconciler and upgrade
 details, jobspec extensions, and strict unknown fields added 2026-10-27).
 **A1 shipped 2026-10-28** (the `legion-system` namespace, the reserved-glob

@@ -1979,6 +1979,13 @@ for any source, plugins included.
 
 *Implementation, Phase 6.*
 
+> **Superseded (2026-10-29)** by
+> [app-actions-as-viewer-plan.md](../plans/app-actions-as-viewer-plan.md):
+> the buttons now call `PauseScaling` and `ScaleTask` as the viewer
+> (`alice via app autoscaler`), and the `by <viewer>` reason is gone
+> ([its calls, entry 12](app-actions-as-viewer-plan_calls.md)). Kept as
+> written below.
+
 **Call.** The panel offers Pause (with a duration), Resume, and Release.
 The action runs as the app, with `by <viewer>` in the reason; the
 `app.action` event names the viewer. Resume is an addition to the plan's
