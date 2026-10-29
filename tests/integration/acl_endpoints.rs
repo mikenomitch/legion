@@ -301,18 +301,55 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         // identity, or management naming the app).
         ("GetJobSchema", Plane::Protected("job:read")),
         ("WatchAppExtensions", Plane::App),
+        // App objects (docs/app-objects.md): `object` (or the kind's
+        // `access` resource) on the object's namespace and kind, plus what
+        // the kind `requires` of the writer. The owning app's reads and
+        // status reports are app-plane.
+        ("ListObjectKinds", Plane::Protected("object:read")),
+        ("ApplyObject", Plane::Protected("object:write")),
+        ("GetObject", Plane::Protected("object:read")),
+        ("ListObjects", Plane::Protected("object:read")),
+        ("DeleteObject", Plane::Protected("object:write")),
+        ("WatchObjects", Plane::App),
+        ("UpdateObjectStatus", Plane::App),
+        ("ReleaseObject", Plane::App),
     ]
 }
 
 const FIXTURE_APP: &str = "acl-app";
 const DELETABLE_APP: &str = "deletable-app";
 
-/// A minimal third-party app manifest, as JSON.
+/// The fixture app's object kind, `acl-app/Widget` (docs/app-objects.md).
+const FIXTURE_KIND: &str = "acl-app/Widget";
+
+/// A minimal third-party app manifest, as JSON. The fixture app declares
+/// one object kind.
 fn app_manifest_json(name: &str, version: &str) -> String {
-    serde_json::json!({
+    let mut manifest = serde_json::json!({
         "name": name,
         "version": version,
         "job": { "task": { "name": "main", "runtime": "noop", "config": {} } },
+    });
+    if name == FIXTURE_APP {
+        manifest["kinds"] = serde_json::json!([{
+            "name": "Widget",
+            "description": "A widget",
+            "schema": {
+                "type": "object",
+                "properties": { "size": { "type": "integer", "default": 1 } },
+            },
+        }]);
+    }
+    manifest.to_string()
+}
+
+/// The object document the ApplyObject builder writes.
+fn fixture_object_json() -> String {
+    serde_json::json!({
+        "kind": FIXTURE_KIND,
+        "name": "acl-widget",
+        "namespace": FIXTURE_NAMESPACE,
+        "spec": { "size": 2 },
     })
     .to_string()
 }
@@ -1958,6 +1995,91 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "ListObjectKinds" => svc
+            .list_object_kinds(req(ListObjectKindsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "ApplyObject" => svc
+            .apply_object(req(
+                ApplyObjectRequest {
+                    object_json: fixture_object_json(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetObject" => svc
+            .get_object(req(
+                GetObjectRequest {
+                    kind: FIXTURE_KIND.into(),
+                    name: "acl-widget".into(),
+                    namespace: FIXTURE_NAMESPACE.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListObjects" => svc
+            .list_objects(req(
+                ListObjectsRequest {
+                    kind: FIXTURE_KIND.into(),
+                    namespaces: vec![FIXTURE_NAMESPACE.into()],
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteObject" => svc
+            .delete_object(req(
+                DeleteObjectRequest {
+                    kind: FIXTURE_KIND.into(),
+                    name: "acl-widget".into(),
+                    namespace: FIXTURE_NAMESPACE.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "WatchObjects" => svc
+            .watch_objects(req(
+                WatchObjectsRequest {
+                    app: FIXTURE_APP.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "UpdateObjectStatus" => svc
+            .update_object_status(req(
+                UpdateObjectStatusRequest {
+                    kind: FIXTURE_KIND.into(),
+                    namespace: FIXTURE_NAMESPACE.into(),
+                    name: "acl-widget".into(),
+                    uid: 1,
+                    observed_generation: 1,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ReleaseObject" => svc
+            .release_object(req(
+                ReleaseObjectRequest {
+                    kind: FIXTURE_KIND.into(),
+                    namespace: FIXTURE_NAMESPACE.into(),
+                    name: "acl-widget".into(),
+                    uid: 1,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         other => {
             panic!("endpoint_table contains `{other}` but call_endpoint has no builder for it")
         }
@@ -2069,6 +2191,19 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
     for name in [FIXTURE_APP, DELETABLE_APP] {
         store.insert_app(app_fixture(name)?)?;
     }
+    // The manager derives `object_kind` rows from app records after every
+    // app write; seed the fixture app's the same way.
+    let record = app_fixture(FIXTURE_APP)?;
+    let kinds = legion::structs::app_object::manifest_kinds(&record.manifest)
+        .map_err(|e| anyhow!(e))?
+        .into_iter()
+        .map(|decl| legion::storage::store::KindWrite {
+            kind: decl.name.clone(),
+            decl: serde_json::to_string(&decl).expect("kind decl serializes"),
+            digest: record.manifest_digest.clone(),
+        })
+        .collect();
+    store.sync_object_kinds(FIXTURE_APP, kinds, 0)?;
 
     store.put_kv(KV_KEY, "v1", KvValueType::String, None, None)?;
     store.put_kv("team/deletable", "v1", KvValueType::String, None, None)?;
