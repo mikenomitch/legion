@@ -521,6 +521,17 @@ How to use it:
 
 ## Scheduling & placement
 
+- [ ] **Node namespace restrictions cost one attribute lookup per node per
+      task on the candidate scan.** `PermitSet::is_permitted` reads the
+      node's `namespaces` config attribute after the permit check
+      (apps A1, [calls 25](calls/legion-apps-plan_calls.md)).
+      `candidate_construction` on 10,000 nodes with indexes measured 11.0
+      → 12.2 ms against `main` (2026-10-29, one sequential run each on a
+      4-core VM; 1,000 and 5,000 nodes within noise; the Scheduler Benchmark
+      Gate SLO passes). Precompute "accepts every namespace" per node in the
+      read model, or fold the lookup into `permits_restrictions`' single
+      pass over `config_attrs`, and re-measure.
+
 - [x] **Per-eval planning cost no longer grows with node count
       (local; AWS retest pending).** Phases 1-2 of
       [plan-path-fleet-scaling-plan.md](plans/plan-path-fleet-scaling-plan.md)
