@@ -62,6 +62,7 @@ fn counts_of(contents: &NamespaceContents) -> NamespaceCounts {
         jobs: contents.jobs.len() as u32,
         volumes: contents.volumes.len() as u32,
         snapshots: contents.snapshots.len() as u32,
+        objects: contents.objects.len() as u32,
     }
 }
 
@@ -70,6 +71,7 @@ fn contents_to_proto(contents: &NamespaceContents) -> crate::structs::NamespaceC
         jobs: contents.jobs.clone(),
         volumes: contents.volumes.clone(),
         snapshots: contents.snapshots.clone(),
+        objects: contents.objects.clone(),
     }
 }
 
@@ -452,14 +454,21 @@ impl ManagerDaemonService {
                     )?;
                 }
             }
+            // Objects of app-declared kinds: the caller's access and each
+            // object's `requires`, as deleting them one by one would check
+            // (docs/app-objects.md, "Namespaces"). Checked for every object
+            // before any is deleted, then deleted first, so their apps stop
+            // acting on them before the jobs go.
+            let objects = self.namespace_objects_for_cascade(&identity, &name)?;
+            steps.extend(self.cascade_delete_objects(&identity, objects)?);
             let store = self.store.clone();
             let priority = self.store.default_eval_priority;
             let jobs = contents.jobs.clone();
             let volumes = contents.volumes.clone();
             let snapshots = contents.snapshots.clone();
-            steps = run_blocking_admission(move || {
+            steps.extend(run_blocking_admission(move || {
                 cascade_namespace(&store, &jobs, &volumes, &snapshots, priority)
-            })?;
+            })?);
         }
 
         self.store

@@ -385,6 +385,12 @@ the root disk as `/legion/legion` and started by init (`guest-agent`):
   `none` sandbox the agent runs `--no-relay`: no loopback listeners, and the
   node binds nothing the guest could dial, so the guest still cannot reach
   the host.
+- **The park relay**, on a sandbox whose task sets `suspend.park`, gated or
+  not (`--park`). It serves `/legion/park.sock` in the guest
+  (`$LEGION_PARK_SOCKET`) and relays each connection to host vsock port
+  1090, where the node answers the [park protocol](park.md). On a TAP or
+  `none` sandbox this is the one host endpoint the guest can dial, and it
+  speaks only that protocol, only about that sandbox.
 - **The resume handler**, on a sandbox launched for memory checkpoints or
   with identity token files. It refreshes the guest's identity, RNG, clock,
   token files, and a TAP guest's address after a restore and runs `onResume`

@@ -80,6 +80,15 @@ pub fn config() -> Command {
                         .value_hint(ValueHint::FilePath),
                 )
                 .arg(
+                    Arg::new("force")
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Apply even when the policy's autoscale leaves some autoscaled \
+                             tasks' policies invalid; they are held until fixed",
+                        ),
+                )
+                .arg(
                     Arg::new("dry-run")
                         .long("dry-run")
                         .action(ArgAction::SetTrue)
@@ -212,8 +221,13 @@ pub fn print_status(status: &NamespacePolicyStatus, indent: &str) {
             let names: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
             println!("{indent}  pools: [{}]", names.join(", "));
         }
-        if let Some(default) = pools.get("default").and_then(Value::as_str) {
-            println!("{indent}  default pool: {default}");
+        match pools.get("default") {
+            Some(Value::String(default)) => println!("{indent}  default pool: {default}"),
+            Some(Value::Array(defaults)) => {
+                let names: Vec<&str> = defaults.iter().filter_map(Value::as_str).collect();
+                println!("{indent}  default pools: [{}]", names.join(", "));
+            }
+            _ => {}
         }
     }
 }
@@ -343,6 +357,7 @@ async fn apply(matches: &ArgMatches) -> R<()> {
                 object_json: text,
                 dry_run,
                 idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
+                force: matches.get_flag("force"),
             })
             .await,
     )?

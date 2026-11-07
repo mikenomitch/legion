@@ -395,6 +395,17 @@ policy](namespaces.md#namespace-policies)'s quota is checked against
 yet placed (`legion namespace get` shows it), so the gauges can read lower
 while admitted work is still placing.
 
+### Apps
+
+- **`legion_apps{status}`** (gauge): installed [apps](apps.md) by status,
+  `running`, `upgrading`, `degraded`, `pending`, `stopped`, or `corrupt`, as
+  `legion app list` derives it. Set by the control-lane leader's app
+  reconciler after each pass (at least once a minute); zero on other
+  managers. A `stopped` or `degraded` count is worth an alert: a bundled app
+  (the autoscaler) that is not running is a cluster-health finding, not a
+  silent absence. A `corrupt` count is a record this manager cannot decode
+  (logged once, with the reason): `legion app uninstall <app>` removes it.
+
 ### Node usage
 
 Per-node gauges from the usage reports workers with
@@ -441,8 +452,8 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   [How memory comes back](task-runtime-sandbox.md#how-memory-comes-back)).
 - **`legion_instance_suspends_total{reason}`** (counter): suspends applied,
   by `reason`: `manual` (SuspendInstance), `idle` (a task's idle policy),
-  `pressure` (a node's `suspend` pressure step), or `make_room` (to make room
-  for a resume, see
+  `pressure` (a node's `suspend` pressure step), `park` (the workload
+  [parked](park.md) itself), or `make_room` (to make room for a resume, see
   [Capacity for resumes](suspend-and-resume.md#capacity-for-resumes)).
 - **`legion_idle_sweep_suspends_total{outcome}`** (counter): suspends the
   idle sweep tried to start, by `outcome`: `started`, or `skipped` (the
@@ -591,6 +602,26 @@ status transitions are replicated. See
   "nothing was marked lost" apart from "nothing was wrong".
 - **`legion_liveness_checkpoint_seconds`** (histogram): wall-clock time of one
   replicated liveness checkpoint (the display-only batched write).
+
+### Scaling inputs
+
+Every manager rolls up the usage and service-graph samples its workers send,
+per (node, task), every 10 seconds, and ships them to the status-lane leader
+on the liveness digest RPC. The leader merges them and serves
+`GetScalingInputs`. See [autoscaling.md](autoscaling.md#scaling-inputs).
+
+- **`legion_scaling_rollup_syncs_total{outcome}`** (counter): rollup ticks.
+  `local` on the status-lane leader, which merges its own rollups with no
+  RPC. Elsewhere: `ok` (shipped and applied), `resync` (the leader held
+  nothing for this manager, usually after a takeover, and took a full set),
+  `error` (not delivered: no leader, unreachable, or a refused resync; the
+  next tick sends a full set). A manager whose `error` rate keeps rising
+  leaves its nodes' tasks reading `missing` on the leader.
+- **`legion_scaling_rollup_rows{kind}`** (gauge): rollups, one per (node,
+  task). `kind="local"` is what this manager built from its own workers at
+  the last tick; `kind="merged"` is what it holds from every manager while it
+  leads the status lane, and `0` elsewhere. `merged` grows with how widely
+  tasks spread across nodes, not with replica count or sample rate.
 
 ### Async runtime
 
@@ -891,6 +922,13 @@ of worker readiness. Default: disabled.
   node's memory pressure response took, by `step` (`reclaim`,
   `evict-bursting`, `evict-reserved`). Counted when the worker acts, before
   the manager hears about it.
+- **`legion_worker_parks_total{outcome}`** (counter): what the
+  [park sockets](park.md) on this node did, by `outcome`: `parked` (a
+  `park` accepted), `unparked` (a pending park cancelled by `unpark` or
+  `busy`), `suspended` (a deadline passed and the suspend ran), `failed`
+  (the suspend did not, and the task keeps running). `parked` well above
+  `suspended` plus `unparked` means parks are being replaced before their
+  deadlines.
 - **`legion_worker_allocations_running`** (gauge): allocations this worker
   currently runs, as reported on its last heartbeat.
 - **`legion_worker_allocation_failures_reported_total`** (counter):

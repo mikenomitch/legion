@@ -205,10 +205,176 @@ impl From<Node> for NodePrint {
     }
 }
 
+// ── Node attributes from the join (docs/auth-and-acls.md, "Node attributes
+// from the join") ─────────────────────────────────────────────────────────
+
+/// The node group a node belongs to. A node group's join token stamps it,
+/// and the demand simulation gives it to every template node.
+pub const NODEGROUP_ATTR: &str = "legion.nodegroup";
+/// The provider's id for the machine (`i-0abc...`), which node-group
+/// scale-in passes to `target/terminate`. Per host: `legion join --attr`.
+pub const PROVIDER_ID_ATTR: &str = "legion.provider-id";
+/// `"never"` keeps a node out of node-group scale-in.
+pub const SCALE_IN_ATTR: &str = "legion.scale-in";
+/// Which join token introduced a node and what it stamped:
+/// `{"token": "<id>", "attributes": {...}}`. Written by the manager only;
+/// it is how the stamped attributes survive the node's restarts and how a
+/// re-registration through the same token is told from a new node.
+pub const JOIN_ATTR: &str = "legion.join";
+/// Node attributes under this prefix are Legion's. A worker cannot report
+/// them, and `--attr` may set only the per-host ones ([`HOST_ATTRS`]).
+pub const RESERVED_ATTR_PREFIX: &str = "legion.";
+/// The `legion.`-prefixed attributes a host may set with `--attr`: values
+/// only the host knows.
+pub const HOST_ATTRS: &[&str] = &[PROVIDER_ID_ATTR];
+/// Most join attributes one token or one registration may carry.
+pub const MAX_JOIN_ATTRS: usize = 64;
+/// Longest join attribute key, in bytes.
+pub const MAX_JOIN_ATTR_KEY: usize = 128;
+/// Longest join attribute value, in bytes.
+pub const MAX_JOIN_ATTR_VALUE: usize = 1024;
+
+/// Node config attributes Legion reads as structure rather than labels:
+/// what the worker reports about itself (address, capacity, cadence) and
+/// what the manager pins (namespaces). Neither a join token nor `--attr`
+/// may set them: a string there would break the node, or lift a
+/// restriction.
+const STRUCTURAL_NODE_ATTRS: &[&str] = &[
+    // crate::constraints::NODE_NAMESPACES_ATTR
+    "namespaces",
+    "restriction",
+    "resources",
+    "reservedResources",
+    "reserved_resources",
+    "maxAllocations",
+    "max_allocations",
+    // crate::resources::CAPACITY_ATTR
+    "capacity",
+    "oversubscribe",
+    "workerAddress",
+    "publicAddress",
+    "heartbeatSeconds",
+    // crate::manager::worker_plane::WORKER_FLEET_ATTR
+    "workerFleet",
+    "hostGuard",
+    "netKernel",
+    "sandbox.bridges",
+];
+
+/// Whether `key` is a node attribute Legion reads as structure.
+pub fn is_structural_node_attr(key: &str) -> bool {
+    STRUCTURAL_NODE_ATTRS.contains(&key)
+}
+
+/// Who sets a join attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinAttrSource {
+    /// `CreateJoinToken.attributes`: stamped on every node of the token.
+    Token,
+    /// `legion join --attr` (`WorkerRegisterRequest.join_attributes`).
+    Host,
+}
+
+/// Check a set of join attributes. The error names the key and says what
+/// to do instead.
+pub fn check_join_attributes<'a>(
+    attributes: impl IntoIterator<Item = (&'a String, &'a String)>,
+    source: JoinAttrSource,
+) -> Result<(), String> {
+    let (flag, what) = match source {
+        JoinAttrSource::Token => ("join token attribute", "the join token"),
+        JoinAttrSource::Host => ("--attr", "--attr"),
+    };
+    let mut count = 0;
+    for (key, value) in attributes {
+        count += 1;
+        if key.trim().is_empty() || key.trim() != key {
+            return Err(format!(
+                "{flag} key {key:?} is empty or has surrounding spaces"
+            ));
+        }
+        if key.len() > MAX_JOIN_ATTR_KEY {
+            return Err(format!(
+                "{flag} key {key:?} is longer than {MAX_JOIN_ATTR_KEY} bytes"
+            ));
+        }
+        if value.len() > MAX_JOIN_ATTR_VALUE {
+            return Err(format!(
+                "{flag} {key}: the value is longer than {MAX_JOIN_ATTR_VALUE} bytes"
+            ));
+        }
+        if is_structural_node_attr(key) {
+            return Err(format!(
+                "{flag} {key} is a node attribute Legion reads as structure, not a label; \
+                 {what} may not set it. Hint: set it in the worker type's config"
+            ));
+        }
+        if key == crate::structs::config::MANAGER_ROLE_ATTR || key == JOIN_ATTR {
+            return Err(format!(
+                "{flag} {key} is written by Legion itself; {what} may not set it"
+            ));
+        }
+        if source == JoinAttrSource::Host
+            && key.starts_with(RESERVED_ATTR_PREFIX)
+            && !HOST_ATTRS.contains(&key.as_str())
+        {
+            return Err(format!(
+                "--attr {key} is reserved: only the join token may set {RESERVED_ATTR_PREFIX}* \
+                 attributes (a host may set {}). Hint: mint the token with \
+                 `legion join-token create --attr {key}=...`, or drop the prefix",
+                HOST_ATTRS.join(", ")
+            ));
+        }
+    }
+    if count > MAX_JOIN_ATTRS {
+        return Err(format!(
+            "{count} {flag}s; at most {MAX_JOIN_ATTRS} are allowed"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod node_test {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn structural_attrs_match_the_constants_they_mirror_test() {
+        for key in [
+            crate::constraints::NODE_NAMESPACES_ATTR,
+            crate::resources::CAPACITY_ATTR,
+            crate::manager::worker_plane::WORKER_FLEET_ATTR,
+            crate::worker::netd::kernel_guard::NODE_ATTR,
+            crate::worker::netd::kernel::NODE_ATTR,
+            crate::task_plugins::sandbox_addr::BRIDGES_ATTR,
+        ] {
+            assert!(is_structural_node_attr(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn join_attributes_keep_reserved_keys_for_the_token_test() {
+        let check = |key: &str, value: &str, source| {
+            check_join_attributes([(&key.to_string(), &value.to_string())], source)
+        };
+        // A token may set Legion's labels; a host only the per-host ones.
+        assert!(check(NODEGROUP_ATTR, "workers", JoinAttrSource::Token).is_ok());
+        let err = check(NODEGROUP_ATTR, "workers", JoinAttrSource::Host).unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+        assert!(check(PROVIDER_ID_ATTR, "i-0abc", JoinAttrSource::Host).is_ok());
+        assert!(check("rack", "r12", JoinAttrSource::Host).is_ok());
+        // Nobody sets structure, the role, or the join record.
+        for source in [JoinAttrSource::Token, JoinAttrSource::Host] {
+            assert!(check("namespaces", "*", source).is_err());
+            assert!(check("workerAddress", "https://x", source).is_err());
+            assert!(check("legion.role", "manager", source).is_err());
+            assert!(check(JOIN_ATTR, "{}", source).is_err());
+            assert!(check("", "x", source).is_err());
+            assert!(check(&"k".repeat(129), "x", source).is_err());
+            assert!(check("k", &"v".repeat(1025), source).is_err());
+        }
+    }
 
     fn node(dynamic: serde_json::Value) -> Node {
         Node {

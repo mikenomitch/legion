@@ -59,6 +59,10 @@ enum Plane {
     /// token (heartbeats/health) when ACLs are enforced; anonymous callers
     /// are rejected as Unauthenticated.
     Worker,
+    /// App plane (`// ACL: app-plane`): only the bundled autoscaler's own
+    /// workload identity, or a management token; anonymous callers are
+    /// rejected as Unauthenticated, other tokens as PermissionDenied.
+    App,
 }
 
 struct Fixtures {
@@ -92,6 +96,22 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         // (docs/autoscaling.md): resize rights without redeploy rights.
         ("ScaleTask", Plane::Protected("scale:write")),
         ("GetJobScaleStatus", Plane::Protected("scale:read")),
+        ("GetScalingInputs", Plane::Protected("scale:read")),
+        // Task autoscaling (docs/autoscaling.md): the policy stream and the
+        // read surface are `scale:read`; pausing is `scale:write`
+        // (`operator:write` for `all`); the cluster's defaults are
+        // operator state. The app's reports are app-plane.
+        ("WatchScalingPolicies", Plane::Protected("scale:read")),
+        ("ApplyScalingDefaults", Plane::Protected("operator:write")),
+        ("GetScalingDefaults", Plane::Protected("scale:read")),
+        ("ReportScalingStatus", Plane::App),
+        ("RecordScalingAction", Plane::App),
+        ("GetScalingStatus", Plane::Protected("scale:read")),
+        ("GetScaleHistory", Plane::Protected("scale:read")),
+        ("PauseScaling", Plane::Protected("scale:write")),
+        // Node autoscaling's demand read: node-scoped (it sizes node
+        // groups), and names only the jobs the caller can read.
+        ("GetCapacityDemand", Plane::Protected("node:read")),
         ("DestroyJob", Plane::Protected("job:write")),
         ("ListJobs", Plane::Protected("job:read")),
         // Namespaces (docs/namespaces.md). ListNamespaces filters per item
@@ -139,6 +159,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetNode", Plane::Protected("node:read")),
         ("RestartWorker", Plane::Protected("node:write")),
         ("SetNodeAvailability", Plane::Protected("node:write")),
+        ("ForgetNode", Plane::Protected("node:write")),
         ("GetLedger", Plane::Protected("node:read")),
         ("UpdateNodeDynamic", Plane::Protected("node:write")),
         ("GetManagerConfigs", Plane::Protected("operator:read")),
@@ -249,7 +270,109 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("UpsertAclUser", Plane::Protected("acl:write")),
         ("ListAclUsers", Plane::Protected("acl:read")),
         ("DeleteAclUser", Plane::Protected("acl:write")),
+        // Job grants (docs/workload-identity.md, "Permissions"): ACL state.
+        ("ListGrants", Plane::Protected("acl:read")),
+        ("RevokeGrant", Plane::Protected("acl:write")),
+        // Apps (docs/apps.md): the cluster-scoped `app` resource. Install,
+        // upgrade, and code-field config changes also run the grant check.
+        ("ListApps", Plane::Protected("app:read")),
+        ("GetApp", Plane::Protected("app:read")),
+        ("InstallApp", Plane::Protected("app:write")),
+        ("UpgradeApp", Plane::Protected("app:write")),
+        ("UninstallApp", Plane::Protected("app:write")),
+        ("SetAppEnabled", Plane::Protected("app:write")),
+        ("UpdateAppSettings", Plane::Protected("app:write")),
+        ("SetAppConfig", Plane::Protected("app:write")),
+        // App views and actions: `app:read`, then the entry's or action's
+        // declared permission as the caller on the context.
+        ("ListUiExtensions", Plane::Protected("app:read")),
+        ("GetAppView", Plane::Protected("app:read")),
+        ("InvokeAppAction", Plane::Protected("app:read")),
+        ("GetAppPage", Plane::Protected("app:read")),
+        // Jobspec extensions (docs/apps.md, "Jobspec extensions"): the
+        // cluster's jobspec schema describes jobspecs, not jobs (`job:read`
+        // on any scope); an app's own values are app-plane (its workload
+        // identity, or management naming the app).
+        ("GetJobSchema", Plane::Protected("job:read")),
+        ("WatchAppExtensions", Plane::App),
+        // App objects (docs/app-objects.md): `object` (or the kind's
+        // `access` resource) on the object's namespace and kind, plus what
+        // the kind `requires` of the writer. The owning app's reads and
+        // status reports are app-plane.
+        ("ListObjectKinds", Plane::Protected("object:read")),
+        ("ApplyObject", Plane::Protected("object:write")),
+        ("GetObject", Plane::Protected("object:read")),
+        ("ListObjects", Plane::Protected("object:read")),
+        ("DeleteObject", Plane::Protected("object:write")),
+        ("WatchObjects", Plane::App),
+        ("UpdateObjectStatus", Plane::App),
+        ("ReleaseObject", Plane::App),
     ]
+}
+
+const FIXTURE_APP: &str = "acl-app";
+const DELETABLE_APP: &str = "deletable-app";
+
+/// The fixture app's object kind, `acl-app/Widget` (docs/app-objects.md).
+const FIXTURE_KIND: &str = "acl-app/Widget";
+
+/// A minimal third-party app manifest, as JSON. The fixture app declares
+/// one object kind.
+fn app_manifest_json(name: &str, version: &str) -> String {
+    let mut manifest = serde_json::json!({
+        "name": name,
+        "version": version,
+        "job": { "task": { "name": "main", "runtime": "noop", "config": {} } },
+    });
+    if name == FIXTURE_APP {
+        manifest["kinds"] = serde_json::json!([{
+            "name": "Widget",
+            "description": "A widget",
+            "schema": {
+                "type": "object",
+                "properties": { "size": { "type": "integer", "default": 1 } },
+            },
+        }]);
+    }
+    manifest.to_string()
+}
+
+/// The object document the ApplyObject builder writes.
+fn fixture_object_json() -> String {
+    serde_json::json!({
+        "kind": FIXTURE_KIND,
+        "name": "acl-widget",
+        "namespace": FIXTURE_NAMESPACE,
+        "spec": { "size": 2 },
+    })
+    .to_string()
+}
+
+/// An installed (file) app record for the fixtures.
+fn app_fixture(name: &str) -> R<legion::structs::app::AppRecord> {
+    use legion::structs::app::*;
+    let manifest =
+        AppManifest::from_json(&app_manifest_json(name, "1.0.0")).map_err(|e| anyhow!(e))?;
+    Ok(AppRecord {
+        name: name.into(),
+        source: AppSource::File,
+        source_ref: "./app.json".into(),
+        manifest_digest: manifest.digest(),
+        enabled: true,
+        settings: AppSettings::from_manifest(&manifest),
+        config: serde_json::json!({}),
+        grant: AppGrant {
+            rules: Vec::new(),
+            granted_by: "fixture".into(),
+            granted_at: "2026-01-01T00:00:00Z".into(),
+        },
+        installed_by: "fixture".into(),
+        installed_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+        state: AppReconcileState::default(),
+        manifest,
+        uid: 0,
+    })
 }
 
 /// An empty client-streaming request body, for exercising the ACL gate of
@@ -434,6 +557,7 @@ async fn call_endpoint(
                     priority: None,
                     force_reschedule: false,
                     idempotency_key: None,
+                    allow_unknown_fields: Default::default(),
                 },
                 token,
             ))
@@ -530,6 +654,7 @@ async fn call_endpoint(
             .plan_job(req(
                 PlanJobRequest { namespace: Default::default(),
                     parsed_jobspec: jobspec(JOB_NAME),
+                    allow_unknown_fields: Default::default(),
                 },
                 token,
             ))
@@ -560,6 +685,112 @@ async fn call_endpoint(
             .get_job_scale_status(req(
                 GetJobScaleStatusRequest {
                     name: JOB_NAME.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetScalingInputs" => svc
+            .get_scaling_inputs(req(
+                GetScalingInputsRequest {
+                    targets: vec![ScalingTargetSelector {
+                        job: JOB_NAME.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "WatchScalingPolicies" => svc
+            .watch_scaling_policies(req(WatchScalingPoliciesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "ApplyScalingDefaults" => svc
+            .apply_scaling_defaults(req(
+                ApplyScalingDefaultsRequest {
+                    defaults_json: r#"{"cpu":0.6}"#.into(),
+                    dry_run: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetScalingDefaults" => svc
+            .get_scaling_defaults(req(GetScalingDefaultsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "ReportScalingStatus" => svc
+            .report_scaling_status(req(
+                ReportScalingStatusRequest {
+                    instance: "acl-test".into(),
+                    interval_seconds: 15,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "RecordScalingAction" => svc
+            .record_scaling_action(req(
+                RecordScalingActionRequest {
+                    job_id: JOB_NAME.into(),
+                    task_group: "default".into(),
+                    task_name: "web".into(),
+                    kind: "would".into(),
+                    from: 1,
+                    to: 2,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetScalingStatus" => svc
+            .get_scaling_status(req(
+                GetScalingStatusRequest {
+                    job: JOB_NAME.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetScaleHistory" => svc
+            .get_scale_history(req(
+                GetScaleHistoryRequest {
+                    job: JOB_NAME.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "PauseScaling" => svc
+            .pause_scaling(req(
+                PauseScalingRequest {
+                    job: JOB_NAME.into(),
+                    for_seconds: Some(60),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetCapacityDemand" => svc
+            .get_capacity_demand(req(
+                GetCapacityDemandRequest {
+                    templates: vec![NodeGroupTemplate {
+                        name: "acl-group".into(),
+                        shape: Some(NodeGroupShape {
+                            cpu: Some(8000),
+                            memory: Some(16384),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
                 },
                 token,
             ))
@@ -842,6 +1073,20 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        // A node that does not exist: the ACL gate runs before the lookup
+        // (NotFound for an authorized caller), and the fixture node, which
+        // the matrix cordons just before, is kept for the endpoints after.
+        "ForgetNode" => svc
+            .forget_node(req(
+                ForgetNodeRequest {
+                    node_id: "acl-forget-missing".into(),
+                    force: false,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         "GetLedger" => svc
             .get_ledger(req(GetLedgerRequest::default(), token))
             .await
@@ -943,6 +1188,7 @@ async fn call_endpoint(
                 ListKvRequest {
                     prefix: String::new(),
                     include_values: true,
+                    include_locks: true,
                 },
                 token,
             ))
@@ -1405,6 +1651,7 @@ async fn call_endpoint(
                     worker_type: "default".into(),
                     ttl: None,
                     description: "test".into(),
+                    ..Default::default()
                 },
                 token,
             ))
@@ -1543,6 +1790,256 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "ListGrants" => svc
+            .list_grants(req(
+                ListGrantsRequest {
+                    job: Some(JOB_NAME.into()),
+                    include_revoked: true,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "RevokeGrant" => svc
+            .revoke_grant(req(
+                RevokeGrantRequest {
+                    job: JOB_NAME.into(),
+                    version: None,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListApps" => svc
+            .list_apps(req(ListAppsRequest {}, token))
+            .await
+            .map(|_| ()),
+        "GetApp" => svc
+            .get_app(req(
+                GetAppRequest {
+                    name: FIXTURE_APP.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "InstallApp" => svc
+            .install_app(req(
+                InstallAppRequest {
+                    manifest_json: app_manifest_json("acl-new-app", "1.0.0"),
+                    source: "file".into(),
+                    source_ref: "./new.json".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "UpgradeApp" => svc
+            .upgrade_app(req(
+                UpgradeAppRequest {
+                    name: FIXTURE_APP.into(),
+                    manifest_json: app_manifest_json(FIXTURE_APP, "2.0.0"),
+                    approve: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "UninstallApp" => svc
+            .uninstall_app(req(
+                UninstallAppRequest {
+                    name: DELETABLE_APP.into(),
+                    idempotency_key: None,
+                    force: false,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "SetAppEnabled" => svc
+            .set_app_enabled(req(
+                SetAppEnabledRequest {
+                    name: FIXTURE_APP.into(),
+                    enabled: true,
+                    idempotency_key: None,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "UpdateAppSettings" => svc
+            .update_app_settings(req(
+                UpdateAppSettingsRequest {
+                    name: FIXTURE_APP.into(),
+                    replicas: Some(2),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "SetAppConfig" => svc
+            .set_app_config(req(
+                SetAppConfigRequest {
+                    name: FIXTURE_APP.into(),
+                    config_json: "{}".into(),
+                    idempotency_key: None,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListUiExtensions" => svc
+            .list_ui_extensions(req(ListUiExtensionsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetAppView" => svc
+            .get_app_view(req(
+                GetAppViewRequest {
+                    app: FIXTURE_APP.into(),
+                    view: String::new(),
+                    context: Some(AppViewContext {
+                        slot: "job".into(),
+                        job: JOB_NAME.into(),
+                        ..Default::default()
+                    }),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "InvokeAppAction" => svc
+            .invoke_app_action(req(
+                InvokeAppActionRequest {
+                    app: FIXTURE_APP.into(),
+                    action: "go".into(),
+                    context: Some(AppViewContext {
+                        slot: "job".into(),
+                        job: JOB_NAME.into(),
+                        ..Default::default()
+                    }),
+                    inputs_json: String::new(),
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetAppPage" => svc
+            .get_app_page(req(
+                GetAppPageRequest {
+                    app: FIXTURE_APP.into(),
+                    page: "console".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetJobSchema" => svc
+            .get_job_schema(req(GetJobSchemaRequest {}, token))
+            .await
+            .map(|_| ()),
+        "WatchAppExtensions" => svc
+            .watch_app_extensions(req(
+                WatchAppExtensionsRequest {
+                    app: FIXTURE_APP.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListObjectKinds" => svc
+            .list_object_kinds(req(ListObjectKindsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "ApplyObject" => svc
+            .apply_object(req(
+                ApplyObjectRequest {
+                    object_json: fixture_object_json(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetObject" => svc
+            .get_object(req(
+                GetObjectRequest {
+                    kind: FIXTURE_KIND.into(),
+                    name: "acl-widget".into(),
+                    namespace: FIXTURE_NAMESPACE.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListObjects" => svc
+            .list_objects(req(
+                ListObjectsRequest {
+                    kind: FIXTURE_KIND.into(),
+                    namespaces: vec![FIXTURE_NAMESPACE.into()],
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteObject" => svc
+            .delete_object(req(
+                DeleteObjectRequest {
+                    kind: FIXTURE_KIND.into(),
+                    name: "acl-widget".into(),
+                    namespace: FIXTURE_NAMESPACE.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "WatchObjects" => svc
+            .watch_objects(req(
+                WatchObjectsRequest {
+                    app: FIXTURE_APP.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "UpdateObjectStatus" => svc
+            .update_object_status(req(
+                UpdateObjectStatusRequest {
+                    kind: FIXTURE_KIND.into(),
+                    namespace: FIXTURE_NAMESPACE.into(),
+                    name: "acl-widget".into(),
+                    uid: 1,
+                    observed_generation: 1,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ReleaseObject" => svc
+            .release_object(req(
+                ReleaseObjectRequest {
+                    kind: FIXTURE_KIND.into(),
+                    namespace: FIXTURE_NAMESPACE.into(),
+                    name: "acl-widget".into(),
+                    uid: 1,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         other => {
             panic!("endpoint_table contains `{other}` but call_endpoint has no builder for it")
         }
@@ -1651,6 +2148,23 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
         "fixture",
     )?;
 
+    for name in [FIXTURE_APP, DELETABLE_APP] {
+        store.insert_app(app_fixture(name)?)?;
+    }
+    // The manager derives `object_kind` rows from app records after every
+    // app write; seed the fixture app's the same way.
+    let record = app_fixture(FIXTURE_APP)?;
+    let kinds = legion::structs::app_object::manifest_kinds(&record.manifest)
+        .map_err(|e| anyhow!(e))?
+        .into_iter()
+        .map(|decl| legion::storage::store::KindWrite {
+            kind: decl.name.clone(),
+            decl: serde_json::to_string(&decl).expect("kind decl serializes"),
+            digest: record.manifest_digest.clone(),
+        })
+        .collect();
+    store.sync_object_kinds(FIXTURE_APP, kinds, 0)?;
+
     store.put_kv(KV_KEY, "v1", KvValueType::String, None, None)?;
     store.put_kv("team/deletable", "v1", KvValueType::String, None, None)?;
     store.put_kv("secret/hidden", "v1", KvValueType::String, None, None)?;
@@ -1681,6 +2195,10 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
         description: "fixture".into(),
         expires_at: None,
         created_at: "2026-01-01T00:00:00Z".into(),
+        pinned_attrs: None,
+        max_uses: None,
+        uses: 0,
+        attributes: Default::default(),
     })?;
 
     Ok(Fixtures {
@@ -1734,6 +2252,30 @@ fn setup_enabled() -> R<(ManagerDaemonService, Fixtures, String)> {
 
 fn is_auth_error(code: Code) -> bool {
     matches!(code, Code::PermissionDenied | Code::Unauthenticated)
+}
+
+/// Guard: a sandboxed page's RPC list is bounded by its installer's rights
+/// through the permissions `PAGE_RPCS` names for each RPC (docs/apps.md,
+/// "Which RPCs a page may call"), so each one's first permission must be the
+/// gate this table records for it, and an open RPC needs none.
+#[test]
+fn page_rpc_permissions_match_the_endpoint_gates_test() {
+    let table: std::collections::HashMap<&str, Plane> = endpoint_table().into_iter().collect();
+    for (method, _, needs) in legion::structs::app_ui::PAGE_RPCS {
+        match table.get(method) {
+            Some(Plane::Protected(gate)) => {
+                let first = needs.first().unwrap_or_else(|| {
+                    panic!("{method} is protected ({gate}) but PAGE_RPCS names no permission")
+                });
+                assert!(
+                    gate.starts_with(first),
+                    "{method}: PAGE_RPCS names {first}, the endpoint table gates it on {gate}"
+                );
+            }
+            Some(Plane::Open) => assert!(needs.is_empty(), "{method} is open: {needs:?}"),
+            other => panic!("{method} is page-callable, but the endpoint table says {other:?}"),
+        }
+    }
 }
 
 /// Guard: every RPC in the Manager proto service must have a row in
@@ -1798,9 +2340,10 @@ async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
                     status.message(),
                 );
             }
-            Plane::Worker => {
+            Plane::Worker | Plane::App => {
                 // Without a join token (registration) or node token
-                // (heartbeats), the worker plane rejects anonymous callers.
+                // (heartbeats), the worker plane rejects anonymous callers;
+                // without the autoscaler's identity, so does the app plane.
                 let status = result.expect_err(&format!(
                     "{method} must reject credential-less workers when ACLs are enabled"
                 ));
@@ -1830,6 +2373,122 @@ async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
     Ok(())
 }
 
+/// A node's `namespaces` restriction and `legion.role` come from its
+/// registration's grant, never from what the worker reports (apps plan
+/// calls entry 19): a join token's worker type, the attributes a manager
+/// pinned on its own in-process worker's token, or, on a re-registration
+/// with the node's token, what the node registered with.
+#[tokio::test]
+async fn registration_pins_namespaces_and_role_test() -> R<()> {
+    let store = setup_store()?;
+    seed_fixtures(&store)?;
+    store.insert_worker_type(&WorkerConfig {
+        name: "ci".into(),
+        pool: "ci".into(),
+        namespaces: vec!["ci-*".into()],
+        ..Default::default()
+    })?;
+    let authenticator = enabled_authenticator();
+    let (_, admin) = authenticator
+        .mint_initial_management_token(&store, None)
+        .map_err(|s| anyhow!(s.to_string()))?
+        .expect("a fresh store has no management token");
+    let svc = ManagerDaemonService::with_acl(store.clone(), authenticator.clone());
+    let attrs = |node: &str| -> R<serde_json::Value> { Ok(store.get_node(node)?.config_attrs) };
+
+    // A forged registration through a `ci` token: the restriction and role
+    // it reports are replaced by the type's; other attributes stay.
+    let created = svc
+        .create_join_token(req(
+            CreateJoinTokenRequest {
+                worker_type: "ci".into(),
+                ttl: Some("1h".into()),
+                description: String::new(),
+                ..Default::default()
+            },
+            Some(&admin),
+        ))
+        .await?
+        .into_inner();
+    let secret = legion::structs::token::JoinToken::decode(&created.token)?.secret;
+    let forged = serde_json::json!({
+        "namespaces": ["*", "legion-*"],
+        "legion.role": "manager",
+        "region": "eu",
+    });
+    let registered = svc
+        .worker_register(req(
+            WorkerRegisterRequest {
+                name: "ci-1".into(),
+                pool: "ci".into(),
+                config_attrs: forged.to_string(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                join_token: Some(secret),
+                ..Default::default()
+            },
+            None,
+        ))
+        .await?
+        .into_inner();
+    let ci = attrs("ci-1")?;
+    assert_eq!(ci["namespaces"], serde_json::json!(["ci-*"]), "{ci}");
+    assert!(ci.get("legion.role").is_none(), "{ci}");
+    assert_eq!(ci["region"], "eu", "{ci}");
+
+    // Re-registering with the node's token keeps what it registered with,
+    // whatever it reports now.
+    let node_token = registered.node_token.expect("a node token");
+    svc.worker_register(req(
+        WorkerRegisterRequest {
+            name: "ci-1".into(),
+            pool: "ci".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            health_checks: "[]".into(),
+            ..Default::default()
+        },
+        Some(&node_token),
+    ))
+    .await?;
+    assert_eq!(attrs("ci-1")?["namespaces"], serde_json::json!(["ci-*"]));
+
+    // A manager's own in-process worker: its token pins the manager's
+    // settings, and a registration reporting none still gets them.
+    let pinned = serde_json::json!({ "namespaces": ["legion-system"], "legion.role": "manager" });
+    let (_, composite) = authenticator
+        .mint_local_worker_join_token(
+            &store,
+            "http://127.0.0.1:4747",
+            "default",
+            Some(std::time::Duration::from_secs(60)),
+            "system worker",
+            &pinned,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+    svc.worker_register(req(
+        WorkerRegisterRequest {
+            name: "legion-system-1".into(),
+            pool: "default".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            health_checks: "[]".into(),
+            join_token: Some(legion::structs::token::JoinToken::decode(&composite)?.secret),
+            ..Default::default()
+        },
+        None,
+    ))
+    .await?;
+    let system = attrs("legion-system-1")?;
+    assert_eq!(
+        system["namespaces"],
+        serde_json::json!(["legion-system"]),
+        "{system}"
+    );
+    assert_eq!(system["legion.role"], "manager", "{system}");
+    Ok(())
+}
+
 /// End-to-end worker join flow with ACLs enforced: a join token admits a
 /// worker, registration mints a node token for heartbeats, re-registration
 /// rotates it, and revoking the join token closes the door.
@@ -1844,6 +2503,7 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
                 worker_type: "default".into(),
                 ttl: Some("1h".into()),
                 description: "test rack".into(),
+                ..Default::default()
             },
             Some(&management_secret),
         ))
@@ -2079,6 +2739,7 @@ async fn a_fleet_claim_needs_a_worker_type_grant() -> R<()> {
                         worker_type: worker_type.into(),
                         ttl: Some("1h".into()),
                         description: "fleet test".into(),
+                        ..Default::default()
                     },
                     Some(&management_secret),
                 ))
@@ -2160,6 +2821,7 @@ async fn worker_plane_binds_node_ids_to_the_caller() -> R<()> {
                 worker_type: "default".into(),
                 ttl: Some("1h".into()),
                 description: "binding test".into(),
+                ..Default::default()
             },
             Some(&management_secret),
         ))
@@ -2380,6 +3042,259 @@ async fn unknown_token_is_unauthenticated() -> R<()> {
     Ok(())
 }
 
+/// The autoscaler's app-plane RPCs refuse every token but the app's own
+/// (and management), however much `scale` it holds: a person with
+/// `scale:write` cannot forge the app's status or its dry-run records. And
+/// the cluster-wide pause is `operator:write`, not `scale:write`.
+#[tokio::test]
+async fn app_plane_refuses_tokens_that_are_not_the_autoscaler_test() -> R<()> {
+    let (svc, fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    svc.store.upsert_acl_policy(
+        "scaler",
+        "",
+        r#"[{"resources": ["scale"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
+    )?;
+    let (_, secret) = authenticator
+        .mint_token(&svc.store, "scaler", "client", &["scaler".into()], None)
+        .map_err(|s| anyhow!(s.to_string()))?;
+    for method in ["ReportScalingStatus", "RecordScalingAction"] {
+        let status = call_endpoint(&svc, &fixtures, method, Some(&secret))
+            .await
+            .expect_err("a scale:write token is not the autoscaler");
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{method}: {}",
+            status.message()
+        );
+    }
+    // Its own job's pause is fine; the cluster-wide one is not.
+    call_endpoint(&svc, &fixtures, "PauseScaling", Some(&secret))
+        .await
+        .expect("scale:write pauses a job");
+    let status = svc
+        .pause_scaling(req(
+            PauseScalingRequest {
+                all: true,
+                ..Default::default()
+            },
+            Some(&secret),
+        ))
+        .await
+        .expect_err("--all needs operator:write");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    // Cluster defaults are operator state.
+    let status = call_endpoint(&svc, &fixtures, "ApplyScalingDefaults", Some(&secret))
+        .await
+        .expect_err("defaults need operator:write");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    Ok(())
+}
+
+/// The autoscaler's objects are governed by their kinds: an
+/// `autoscaler/ScalingPolicy` by `scale` namespace-wide (a `scale:write`
+/// grant without names writes them; one with job-name selectors writes
+/// none, whatever the policy's name, and gets PermissionDenied for a
+/// missing one too), and an `autoscaler/NodeGroup` by `node:write` plus the
+/// `operator:write` it requires. A node group and a policy may share a
+/// name: their state is keyed by uid, so pausing one leaves the other.
+#[tokio::test]
+async fn autoscaler_objects_follow_their_kinds_access_test() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    let manifest = legion::apps::bundled_manifest("autoscaler")
+        .ok_or_else(|| anyhow!("the bundled autoscaler"))?;
+    let mut record = legion::manager::apps::seed_record(manifest, None);
+    record.config = serde_json::json!({ "plugins": { "machines": {
+        "builtin": "exec", "config": { "command": ["/bin/true"] },
+    } } });
+    svc.store.seed_app(record)?;
+    svc.sync_object_kinds_for("autoscaler")
+        .map_err(|s| anyhow!(s.to_string()))?;
+    let policy = |name: &str| {
+        serde_json::json!({
+            "kind": "autoscaler/ScalingPolicy",
+            "name": name,
+            "spec": {
+                "target": { "plugin": "noop" },
+                "min": 1, "max": 3,
+                "checks": [{ "name": "steady", "source": "legion", "strategy": { "name": "fixed", "value": 2 } }],
+            },
+        })
+        .to_string()
+    };
+    let group = |name: &str| {
+        serde_json::json!({
+            "kind": "autoscaler/NodeGroup",
+            "name": name,
+            "spec": { "target": { "nodes": { "pool": "default", "plugin": "machines" } }, "min": 1, "max": 3 },
+        })
+        .to_string()
+    };
+    let apply = |object: String, token: &str| {
+        req(
+            ApplyObjectRequest {
+                object_json: object,
+                ..Default::default()
+            },
+            Some(token),
+        )
+    };
+    let token = |name: &str, rules: &str| -> R<String> {
+        svc.store.upsert_acl_policy(name, "", rules)?;
+        let (_, secret) = svc
+            .auth
+            .clone()
+            .mint_token(&svc.store, name, "client", &[name.to_string()], None)
+            .map_err(|s| anyhow!(s.to_string()))?;
+        Ok(secret)
+    };
+    let scaler = token(
+        "scaler",
+        r#"[{"resources": ["scale"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
+    )?;
+    let named = token(
+        "named-scaler",
+        r#"[{"resources": ["scale"], "namespaces": ["*"], "actions": ["read", "write"], "names": ["render"]}]"#,
+    )?;
+    let nodes_only = token(
+        "nodes-only",
+        r#"[{"resources": ["node"], "actions": ["read", "write"]}]"#,
+    )?;
+    let operator = token(
+        "node-operator",
+        r#"[{"resources": ["operator"], "actions": ["write"]},
+            {"resources": ["node"], "actions": ["read", "write"]}]"#,
+    )?;
+
+    // scale:write, namespace-wide: writes ScalingPolicies.
+    svc.apply_object(apply(policy("render"), &scaler))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?;
+    // A scale rule with job-name selectors writes none, even one named
+    // after a job it covers, and reads a missing one as PermissionDenied.
+    let status = svc
+        .apply_object(apply(policy("render"), &named))
+        .await
+        .expect_err("selectors written about jobs do not reach policies");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    for name in ["render", "never-existed"] {
+        let status = svc
+            .get_object(req(
+                GetObjectRequest {
+                    kind: "autoscaler/ScalingPolicy".into(),
+                    name: name.into(),
+                    namespace: String::new(),
+                },
+                Some(&named),
+            ))
+            .await
+            .expect_err("outside the grant");
+        assert_eq!(status.code(), Code::PermissionDenied, "{name}");
+    }
+    // Broad scale:write does not add machines; node:write alone does not
+    // either (a node group requires operator:write).
+    for secret in [&scaler, &nodes_only] {
+        let status = svc
+            .apply_object(apply(group("workers"), secret))
+            .await
+            .expect_err("node groups need node:write and operator:write");
+        assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    }
+    svc.apply_object(apply(group("workers"), &operator))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?;
+    // A ScalingPolicy may share the node group's name.
+    svc.apply_object(apply(policy("workers"), &management))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?;
+
+    // Pausing an object needs what writing it needs, checked before the
+    // lookup.
+    let pause = |kind: &str, name: &str, token: &str| {
+        req(
+            PauseScalingRequest {
+                object: Some(ScalingObjectRef {
+                    kind: kind.into(),
+                    name: name.into(),
+                    ..Default::default()
+                }),
+                reason: "maintenance".into(),
+                ..Default::default()
+            },
+            Some(token),
+        )
+    };
+    for name in ["workers", "no-such-group"] {
+        let status = svc
+            .pause_scaling(pause("nodegroup", name, &scaler))
+            .await
+            .expect_err("node groups need the node-group grant");
+        assert_eq!(status.code(), Code::PermissionDenied, "{name}: {status:?}");
+    }
+    svc.pause_scaling(pause("nodegroup", "workers", &operator))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?;
+    // No collision: the policy named `workers` is not paused.
+    let status = svc
+        .get_scaling_status(req(
+            GetScalingStatusRequest {
+                object: Some(ScalingObjectRef {
+                    kind: "scalingpolicy".into(),
+                    name: "workers".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(&management),
+        ))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?
+        .into_inner();
+    assert!(status.targets[0].pause.is_none(), "{:?}", status.targets[0]);
+    let status = svc
+        .get_scaling_status(req(
+            GetScalingStatusRequest {
+                object: Some(ScalingObjectRef {
+                    kind: "nodegroup".into(),
+                    name: "workers".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(&management),
+        ))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?
+        .into_inner();
+    assert!(status.targets[0].pause.is_some(), "{:?}", status.targets[0]);
+    // The scaler's status lists its policies and no node group.
+    let listed = svc
+        .get_scaling_status(req(
+            GetScalingStatusRequest {
+                namespaces: vec!["*".into()],
+                ..Default::default()
+            },
+            Some(&scaler),
+        ))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?
+        .into_inner();
+    assert!(
+        listed.targets.iter().all(|t| t.kind != "nodes"),
+        "{listed:?}"
+    );
+    assert_eq!(
+        listed
+            .targets
+            .iter()
+            .filter(|t| t.kind == "external")
+            .count(),
+        2
+    );
+    Ok(())
+}
+
 /// Job-name-scoped policies allow matching jobs and deny others, and list
 /// endpoints filter rather than fail.
 #[tokio::test]
@@ -2531,6 +3446,7 @@ async fn template_scoped_policy_gates_submission_channel() -> R<()> {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             },
             Some(&secret),
         ))
@@ -2597,6 +3513,7 @@ async fn host_level_jobs_need_the_host_grant_test() -> R<()> {
                     priority: None,
                     force_reschedule: false,
                     idempotency_key: None,
+                    allow_unknown_fields: Default::default(),
                 },
                 Some(&secret),
             ))
@@ -2705,6 +3622,7 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
                     priority: None,
                     force_reschedule: false,
                     idempotency_key: None,
+                    allow_unknown_fields: Default::default(),
                 },
                 Some(&secret),
             ))
@@ -2790,6 +3708,7 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             },
             Some(&template_secret),
         ))
@@ -2864,6 +3783,7 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
             ListKvRequest {
                 prefix: String::new(),
                 include_values: true,
+                include_locks: false,
             },
             Some(&secret),
         ))
@@ -2881,6 +3801,161 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
             .map(|entry| &entry.key)
             .collect::<Vec<_>>(),
     );
+    assert!(reply.locks.is_empty(), "locks only on request");
+
+    // With include_locks: the unexpired locks it may read, never their ids.
+    for key in ["team/leader", "secret/leader"] {
+        svc.store
+            .acquire_kv_lock(key, None, Some("alloc-1"), 60, false)?;
+    }
+    let reply = svc
+        .list_kv(req(
+            ListKvRequest {
+                prefix: String::new(),
+                include_values: false,
+                include_locks: true,
+            },
+            Some(&secret),
+        ))
+        .await?
+        .into_inner();
+    let locks: Vec<(&str, &str, Option<&str>)> = reply
+        .locks
+        .iter()
+        .map(|lock| {
+            (
+                lock.key.as_str(),
+                lock.lock_id.as_str(),
+                lock.owner.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(locks, vec![("team/leader", "", Some("alloc-1"))]);
+    Ok(())
+}
+
+/// Reserved names are out of `*`'s reach (apps plan §6.2, calls entry 6): a
+/// tenant admin holding `namespaces = ["*"]` and `paths = ["*"]` deploys to
+/// every tenant namespace and writes every tenant key, but cannot run a job
+/// in `legion-system` or write under `legion/`. A rule that names the prefix
+/// reaches both, and even then a root exec task is refused there.
+#[tokio::test]
+async fn star_policies_do_not_reach_legion_system_or_legion_kv_test() -> R<()> {
+    let (svc, _fixtures, management) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    assert!(svc.store.ensure_system_namespace()?);
+    svc.store
+        .apply_namespace(legion::structs::namespace::Namespace {
+            name: "payments".into(),
+            ..Default::default()
+        })?;
+    svc.store.upsert_acl_policy(
+        "tenant-admin",
+        "",
+        r#"[
+            {"resources": ["job", "exec", "scale"], "namespaces": ["*"], "actions": ["*"], "host": true},
+            {"resources": ["kv"], "actions": ["read", "write"], "paths": ["*"]}
+        ]"#,
+    )?;
+    svc.store.upsert_acl_policy(
+        "system-admin",
+        "",
+        r#"[
+            {"resources": ["job"], "namespaces": ["*", "legion-*"], "actions": ["*"], "host": true},
+            {"resources": ["kv"], "actions": ["read", "write"], "paths": ["*", "legion/*"]}
+        ]"#,
+    )?;
+    let mint = |policy: &str| {
+        authenticator
+            .mint_token(&svc.store, policy, "client", &[policy.into()], None)
+            .map(|(_, secret)| secret)
+            .map_err(|s| anyhow!(s.to_string()))
+    };
+    let tenant = mint("tenant-admin")?;
+    let system = mint("system-admin")?;
+    let run = |namespace: &str, task: serde_json::Value, secret: String| {
+        let svc = &svc;
+        let namespace = namespace.to_string();
+        async move {
+            svc.run_job(req(
+                RunJobRequest {
+                    namespace: Some(namespace),
+                    parsed_jobspec: serde_json::json!({ "name": "agent", "tasks": [task] })
+                        .to_string(),
+                    submissions: vec![],
+                    priority: None,
+                    force_reschedule: false,
+                    idempotency_key: None,
+                    allow_unknown_fields: false,
+                },
+                Some(&secret),
+            ))
+            .await
+        }
+    };
+    let task = serde_json::json!({
+        "name": "main", "runtime": "exec",
+        "config": { "command": ["sleep", "600"], "user": "nobody" },
+    });
+
+    run("payments", task.clone(), tenant.clone())
+        .await
+        .expect("`*` reaches a tenant namespace");
+    let status = run("legion-system", task.clone(), tenant.clone())
+        .await
+        .expect_err("`*` must not reach legion-system");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert!(
+        status
+            .message()
+            .contains("does not reach reserved `legion-*`"),
+        "the denial says why: {status:?}"
+    );
+    run("legion-system", task.clone(), system.clone())
+        .await
+        .expect("a pattern starting legion- reaches it");
+
+    // Even with the right to deploy there, a root exec task is refused.
+    let mut root_exec = task.clone();
+    root_exec["config"]
+        .as_object_mut()
+        .expect("config")
+        .remove("user");
+    for secret in [system.clone(), management.clone()] {
+        let status = run("legion-system", root_exec.clone(), secret)
+            .await
+            .expect_err("a root exec task in legion-system");
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().contains("runs as root"), "{status:?}");
+    }
+
+    let put = |key: &str, secret: &str| {
+        let svc = &svc;
+        let request = req(
+            PutKvRequest {
+                key: key.into(),
+                value: "v".into(),
+                value_type: KvValueType::String.into(),
+                ..Default::default()
+            },
+            Some(secret),
+        );
+        async move { svc.put_kv(request).await }
+    };
+    put("team-a/config", &tenant)
+        .await
+        .expect("`*` reaches tenant keys");
+    let status = put("legion/apps/autoscaler/lease", &tenant)
+        .await
+        .expect_err("`*` must not reach legion/");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert!(
+        status.message().contains("reserved `legion/` prefix"),
+        "the denial says why: {status:?}"
+    );
+    put("legion/apps/autoscaler/lease", &system)
+        .await
+        .expect("a pattern starting legion/ reaches it");
     Ok(())
 }
 
@@ -2936,6 +4011,7 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
                     priority: None,
                     force_reschedule: false,
                     idempotency_key: None,
+                    allow_unknown_fields: Default::default(),
                 },
                 Some(&token),
             ))
@@ -3018,6 +4094,7 @@ async fn upstream_credential_needs_kv_read_on_the_path() -> R<()> {
                     priority: None,
                     force_reschedule: false,
                     idempotency_key: None,
+                    allow_unknown_fields: Default::default(),
                 },
                 Some(&token),
             ))
@@ -3086,6 +4163,216 @@ fn token_with_rules(svc: &ManagerDaemonService, name: &str, rules: &str) -> R<(S
     Ok((info.accessor_id, secret))
 }
 
+/// GetScalingInputs gates before it fetches and filters listings: a caller
+/// with `scale:read` on one job reads that job, is refused (not told "job not
+/// found") for a job outside its grant, and sees only its job in a namespace
+/// listing; a caller with no `scale` grant at all is refused outright.
+#[tokio::test]
+async fn scaling_inputs_check_before_fetch_and_filter_listings() -> R<()> {
+    let (svc, _fixtures, _) = setup_enabled()?;
+    let (_, scoped) = token_with_rules(
+        &svc,
+        "scale-one-job",
+        &format!(
+            r#"[{{"resources": ["scale"], "namespaces": ["*"], "actions": ["read"], "names": ["{JOB_NAME}"]}}]"#
+        ),
+    )?;
+    let named = |job: &str| GetScalingInputsRequest {
+        targets: vec![ScalingTargetSelector {
+            job: job.into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let reply = svc
+        .get_scaling_inputs(req(named(JOB_NAME), Some(&scoped)))
+        .await?
+        .into_inner();
+    assert!(!reply.inputs.is_empty());
+    assert!(reply
+        .inputs
+        .iter()
+        .all(|inputs| inputs.job_id == JOB_NAME && inputs.error.is_empty()));
+
+    let status = svc
+        .get_scaling_inputs(req(named("no-such-job"), Some(&scoped)))
+        .await
+        .expect_err("a job outside the grant is refused before any lookup");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    let listing = svc
+        .get_scaling_inputs(req(
+            GetScalingInputsRequest {
+                namespaces: vec!["*".into()],
+                ..Default::default()
+            },
+            Some(&scoped),
+        ))
+        .await?
+        .into_inner();
+    assert!(
+        listing
+            .inputs
+            .iter()
+            .all(|inputs| inputs.job_id == JOB_NAME),
+        "a listing shows only jobs the caller may read, got {:?}",
+        listing
+            .inputs
+            .iter()
+            .map(|inputs| &inputs.job_id)
+            .collect::<Vec<_>>()
+    );
+
+    let (_, job_reader) = token_with_rules(
+        &svc,
+        "job-read-only",
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
+    )?;
+    let status = svc
+        .get_scaling_inputs(req(named(JOB_NAME), Some(&job_reader)))
+        .await
+        .expect_err("job:read is not scale:read");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    Ok(())
+}
+
+/// GetCapacityDemand is gated on `node:read` for every template's pool, and
+/// names only the jobs the caller can read: a pool-scoped node reader sizes
+/// its own pool, is refused another pool's template, and sees the fixture
+/// job (pending: it was stored without an eval) without its name.
+/// ForgetNode needs `node:write` on the node's pool.
+#[tokio::test]
+async fn capacity_demand_and_forget_are_pool_scoped() -> R<()> {
+    let (svc, _, admin) = setup_enabled()?;
+    let (_, node_reader) = token_with_rules(
+        &svc,
+        "default-pool-reader",
+        r#"[{"resources": ["node"], "actions": ["read"], "pools": ["default"]}]"#,
+    )?;
+    let template = |pool: &str| NodeGroupTemplate {
+        name: format!("{pool}-group"),
+        pool: Some(pool.into()),
+        shape: Some(NodeGroupShape {
+            cpu: Some(4000),
+            memory: Some(8192),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let reply = svc
+        .get_capacity_demand(req(
+            GetCapacityDemandRequest {
+                templates: vec![template("default")],
+            },
+            Some(&node_reader),
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(reply.groups.len(), 1);
+    assert_eq!(reply.pending.len(), 1, "{reply:?}");
+    let pending = &reply.pending[0];
+    assert!(pending.redacted, "{reply:?}");
+    assert!(
+        pending.job_id.is_empty() && pending.tasks.is_empty(),
+        "{reply:?}"
+    );
+    assert_eq!(
+        (pending.namespace.as_str(), pending.pending),
+        ("default", 1)
+    );
+    assert_eq!(reply.groups[0].replicas, 1, "counts cover every job");
+
+    // A job whose eval has not run is listed by name only to its readers.
+    svc.run_job(req(
+        RunJobRequest {
+            parsed_jobspec: serde_json::json!({
+                "name": "acl-late-job",
+                "tasks": [{
+                    "name": "main", "runtime": "exec",
+                    "config": { "command": ["sleep", "60"] },
+                    "resources": {},
+                }],
+            })
+            .to_string(),
+            ..Default::default()
+        },
+        Some(&admin),
+    ))
+    .await?;
+    let reply = svc
+        .get_capacity_demand(req(
+            GetCapacityDemandRequest {
+                templates: vec![template("default")],
+            },
+            Some(&node_reader),
+        ))
+        .await?
+        .into_inner();
+    assert!(reply.awaiting_scheduler.is_empty(), "{reply:?}");
+    assert_eq!(reply.awaiting_scheduler_redacted, 1, "{reply:?}");
+    let status = svc
+        .get_capacity_demand(req(
+            GetCapacityDemandRequest {
+                templates: vec![template("default"), template("gpu")],
+            },
+            Some(&node_reader),
+        ))
+        .await
+        .expect_err("another pool's template is refused");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    let (_, node_and_jobs) = token_with_rules(
+        &svc,
+        "node-and-jobs-reader",
+        r#"[{"resources": ["node"], "actions": ["read"], "pools": ["*"]},
+            {"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
+    )?;
+    let reply = svc
+        .get_capacity_demand(req(
+            GetCapacityDemandRequest {
+                templates: vec![template("gpu")],
+            },
+            Some(&node_and_jobs),
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(reply.pending[0].job_id, JOB_NAME);
+    assert!(!reply.pending[0].redacted);
+    assert_eq!(reply.awaiting_scheduler, vec!["acl-late-job".to_string()]);
+
+    // ForgetNode: write on the node's pool, not read, not another pool.
+    let (_, gpu_writer) = token_with_rules(
+        &svc,
+        "gpu-node-writer",
+        r#"[{"resources": ["node"], "actions": ["read", "write"], "pools": ["gpu"]}]"#,
+    )?;
+    for secret in [&node_reader, &gpu_writer] {
+        let status = svc
+            .forget_node(req(
+                ForgetNodeRequest {
+                    node_id: NODE_ID.into(),
+                    force: true,
+                    ..Default::default()
+                },
+                Some(secret),
+            ))
+            .await
+            .expect_err("forgetting a default-pool node needs node:write there");
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{}",
+            status.message()
+        );
+    }
+    assert!(
+        svc.store.get_node(NODE_ID).is_ok(),
+        "the node is still there"
+    );
+    Ok(())
+}
+
 /// Node lookups gate before they fetch: a caller with no node access gets
 /// PermissionDenied for a node that does not exist, not NotFound, so it
 /// cannot probe which node ids exist.
@@ -3127,6 +4414,33 @@ async fn node_lookups_check_before_fetch() -> R<()> {
                 UpdateNodeDynamicRequest {
                     id: missing.clone(),
                     dynamic_diff: "{}".into(),
+                },
+                Some(&secret),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "ForgetNode",
+            svc.forget_node(req(
+                ForgetNodeRequest {
+                    node_id: missing.clone(),
+                    ..Default::default()
+                },
+                Some(&secret),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "GetCapacityDemand",
+            svc.get_capacity_demand(req(
+                GetCapacityDemandRequest {
+                    templates: vec![NodeGroupTemplate {
+                        name: "g".into(),
+                        like_node: Some(missing.clone()),
+                        ..Default::default()
+                    }],
                 },
                 Some(&secret),
             ))
@@ -3578,6 +4892,8 @@ async fn worker_register_version_handshake_round_trip() -> R<()> {
                 build_version: "9.9.9-test".into(),
                 protocol_version: PROTOCOL_VERSION,
                 capabilities: vec!["checkpoint".into()],
+                build_id: "test-build".into(),
+                ..Default::default()
             },
             None,
         ))
@@ -3637,6 +4953,8 @@ async fn worker_register_version_handshake_round_trip() -> R<()> {
                 build_version: "99.0.0".into(),
                 protocol_version: PROTOCOL_VERSION + 1,
                 capabilities: Vec::new(),
+                build_id: String::new(),
+                ..Default::default()
             },
             None,
         ))

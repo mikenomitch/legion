@@ -471,6 +471,34 @@ fn validate_gated_guest_ports(task: &crate::structs::TaskConfig) -> Result<(), S
             upstream.port.unwrap_or_default()
         ));
     }
+    // A parking guest's park socket is relayed to host vsock port 1090
+    // (docs/park.md), which an upstream on that port would land on too.
+    let parks = task
+        .suspend
+        .as_ref()
+        .and_then(|suspend| suspend.resolve().ok())
+        .is_some_and(|resolved| resolved.park.is_some());
+    let park_port = u16::try_from(legion_guest::agent::PARK_PORT).unwrap_or(u16::MAX);
+    let on_park = parks
+        .then(|| {
+            task.connect.as_ref().and_then(|connect| {
+                connect
+                    .upstreams
+                    .iter()
+                    .find(|upstream| upstream.port == Some(park_port))
+            })
+        })
+        .flatten();
+    if let Some(upstream) = on_park {
+        return Err(format!(
+            "task {:?} connect.upstreams entry {:?} sets port {park_port}, but a gated sandbox's \
+             upstreams are relayed to the node on vsock ports of the same number, and this task \
+             sets suspend.park, whose socket the guest relays to vsock port {park_port}\nHint: \
+             pick another port, or drop it to take a dynamic one",
+            task.name,
+            upstream.key(),
+        ));
+    }
     Ok(())
 }
 
@@ -613,6 +641,10 @@ pub struct NetworkConfig {
     pub egress: Option<crate::structs::netpolicy::ChainConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<crate::structs::netpolicy::ChainConfig>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl Default for NetworkConfig {
@@ -623,6 +655,7 @@ impl Default for NetworkConfig {
             labels: BTreeMap::new(),
             egress: None,
             ingress: None,
+            unknown_fields: Default::default(),
         }
     }
 }
@@ -656,11 +689,20 @@ pub struct PortConfig {
     /// port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<PortTls>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
+    /// Unknown keys kept on this extension point under
+    /// `allow_unknown_fields`, as written and unvalidated
+    /// (`structs::spec_fields`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pending_extensions: crate::structs::spec_fields::PendingExtensions,
 }
 
 /// `network.ports[].tls`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PortTls {
     /// The certificate chain and key: `{ kv = "<path>" }` (one PEM bundle,
     /// swapped live when the key changes) or `{ file = { cert, key } }` (or
@@ -670,15 +712,23 @@ pub struct PortTls {
     /// that verifies against `ca`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clients: Option<ClientAuth>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// `network.ports[].tls.clients`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientAuth {
     /// The CA bundle client certificates are verified against:
     /// `{ kv = "<path>" }` or `{ file = "<path>" }` (PEM).
     pub ca: crate::structs::source::Source,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl PortTls {
@@ -739,6 +789,15 @@ pub struct ServiceConfig {
     /// verified caller's job.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
+    /// Unknown keys kept on this extension point under
+    /// `allow_unknown_fields`, as written and unvalidated
+    /// (`structs::spec_fields`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pending_extensions: crate::structs::spec_fields::PendingExtensions,
 }
 
 impl ServiceConfig {
@@ -831,6 +890,10 @@ pub struct ConnectConfig {
     /// (docs/service-discovery.md, "Templates").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub templates: Vec<ConnectTemplate>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl ConnectConfig {
@@ -866,6 +929,10 @@ pub struct ConnectTemplate {
     /// rewritten at once; the signal or restart waits). Default `0s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coalesce: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// One declared upstream. `to` names it, and its scheme alone decides the
@@ -885,7 +952,7 @@ pub struct ConnectTemplate {
 /// `127.0.0.1:<port>`, for a client config that needs a literal loopback
 /// address. `balance` overrides the default strategy for this upstream only.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct UpstreamConfig {
     /// A catalog service name or an external URL (see above).
     pub to: String,
@@ -923,6 +990,10 @@ pub struct UpstreamConfig {
     /// `{ kv = "<path>" }` or `{ file = "<path>" }` (PEM).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca: Option<crate::structs::source::Source>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// Where an upstream's `to` points.
@@ -1015,7 +1086,7 @@ pub fn parse_upstream_to(to: &str) -> R<UpstreamDestination> {
 /// the task sent for `header` is dropped and replaced with `prefix` + the
 /// secret, so a placeholder the task's SDK insists on is harmless.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct UpstreamCredential {
     /// The request header to set (`x-api-key`, `Authorization`). Stored
     /// lower-cased; HTTP header names are case-insensitive.
@@ -1027,6 +1098,10 @@ pub struct UpstreamCredential {
     /// `{ identity = "<task identity>" }`. Never a `file`: credentials stay
     /// cluster-held, so a node's disk never becomes a secret store.
     pub from: crate::structs::source::Source,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl UpstreamCredential {
@@ -1285,7 +1360,7 @@ impl UpstreamConfig {
 /// Every field is optional. An endpoint that answers 5xx five times in a row
 /// is ejected for 30 seconds, with no setting to write.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct UpstreamHttpConfig {
     /// Per-request deadline (`3s`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1296,10 +1371,14 @@ pub struct UpstreamHttpConfig {
     /// the remainder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub split: Vec<SplitConfig>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RetryConfig {
     /// Extra attempts after the first (default 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1315,6 +1394,10 @@ pub struct RetryConfig {
     /// Only these methods are retried (default: idempotent methods).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -1323,6 +1406,10 @@ pub struct SplitConfig {
     pub tag: String,
     /// Percent of requests, 0–100.
     pub weight: u32,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// A parsed `connect.upstreams[].to`.
@@ -2110,6 +2197,8 @@ pub fn normalize_task_network(
                 static_port,
                 to: None,
                 tls: None,
+                pending_extensions: Default::default(),
+                unknown_fields: Default::default(),
             });
         }
     }
@@ -2475,6 +2564,89 @@ fn validate_upstream_http(task_name: &str, key: &str, http: &UpstreamHttpConfig)
     Ok(())
 }
 
+// Unknown-field capture (`structs::spec_fields`): the keys each block
+// accepts, for did-you-mean, and the blocks nested in it. `egress`,
+// `ingress`, `handlers`, and the `{ kv | identity | file }` sources are the
+// network policy language shared with `legion net policy` objects, and stay
+// strict on their own (`deny_unknown_fields`).
+
+use crate::structs::spec_fields::{extension_point, spec_block, ExtensionPoint};
+
+spec_block!(
+    NetworkConfig,
+    ["mode", "ports", "labels", "egress", "ingress"],
+    |this, walk| {
+        for port in this.ports.iter_mut() {
+            walk.scoped(
+                crate::structs::spec_fields::Scope::Port(port.name.clone()),
+                port,
+            );
+        }
+    }
+);
+extension_point!(
+    PortConfig,
+    ExtensionPoint::Port,
+    ["name", "static", "to", "tls"],
+    |this, walk| {
+        walk.opt("tls", this.tls.as_mut());
+    }
+);
+spec_block!(PortTls, ["cert", "clients"], |this, walk| {
+    walk.opt("clients", this.clients.as_mut());
+});
+spec_block!(ClientAuth, ["ca"]);
+extension_point!(
+    ServiceConfig,
+    ExtensionPoint::Service,
+    ["name", "port", "tags", "meta", "mesh", "allow"]
+);
+spec_block!(ConnectConfig, ["upstreams", "templates"], |this, walk| {
+    walk.list("upstreams", &mut this.upstreams);
+    walk.list("templates", &mut this.templates);
+});
+spec_block!(
+    ConnectTemplate,
+    [
+        "name",
+        "destination",
+        "source",
+        "changeMode",
+        "changeSignal",
+        "splay",
+        "coalesce"
+    ]
+);
+spec_block!(
+    UpstreamConfig,
+    [
+        "to",
+        "namespace",
+        "name",
+        "port",
+        "balance",
+        "http",
+        "handlers",
+        "credentials",
+        "ca"
+    ],
+    |this, walk| {
+        walk.opt("http", this.http.as_mut());
+        walk.list("credentials", &mut this.credentials);
+    }
+);
+spec_block!(
+    UpstreamHttpConfig,
+    ["timeout", "retries", "split"],
+    |this, walk| {
+        walk.opt("retries", this.retries.as_mut());
+        walk.list("split", &mut this.split);
+    }
+);
+spec_block!(RetryConfig, ["attempts", "on", "budget", "methods"]);
+spec_block!(SplitConfig, ["tag", "weight"]);
+spec_block!(UpstreamCredential, ["header", "prefix", "from"]);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2621,6 +2793,8 @@ mod tests {
                 static_port: Some(8080),
                 to: None,
                 tls: None,
+                pending_extensions: Default::default(),
+                unknown_fields: Default::default(),
             }],
             ..NetworkConfig::default()
         });
@@ -2637,6 +2811,8 @@ mod tests {
                 static_port: None,
                 to: Some(8080),
                 tls: None,
+                pending_extensions: Default::default(),
+                unknown_fields: Default::default(),
             }],
             ..NetworkConfig::default()
         };
@@ -2656,12 +2832,16 @@ mod tests {
                     static_port: None,
                     to: None,
                     tls: None,
+                    pending_extensions: Default::default(),
+                    unknown_fields: Default::default(),
                 },
                 PortConfig {
                     name: "http".into(),
                     static_port: Some(80),
                     to: None,
                     tls: None,
+                    pending_extensions: Default::default(),
+                    unknown_fields: Default::default(),
                 },
             ],
             ..NetworkConfig::default()
@@ -2679,12 +2859,16 @@ mod tests {
                     static_port: Some(9090),
                     to: None,
                     tls: None,
+                    pending_extensions: Default::default(),
+                    unknown_fields: Default::default(),
                 },
                 PortConfig {
                     name: "http".into(),
                     static_port: None,
                     to: Some(8080),
                     tls: None,
+                    pending_extensions: Default::default(),
+                    unknown_fields: Default::default(),
                 },
             ],
             ..NetworkConfig::default()
@@ -2955,6 +3139,15 @@ mod tests {
         }
         let fine = with_connect(gated.clone(), json!({ "to": "db", "port": 5432 }));
         assert!(validate_gated_sandbox(&fine, false).is_ok());
+        // Port 1090 is the park socket's host port, held only when the task
+        // parks.
+        let mut on_park = with_connect(gated.clone(), json!({ "to": "db", "port": 1090 }));
+        assert!(validate_gated_sandbox(&on_park, false).is_ok());
+        on_park.suspend =
+            Some(serde_json::from_value(json!({ "park": {} })).expect("a suspend block parses"));
+        let err = validate_gated_sandbox(&on_park, false).unwrap_err();
+        assert!(err.contains("sets suspend.park"), "{err}");
+        assert!(err.contains("vsock port 1090"), "{err}");
         // Off gated networking the agent relays nothing.
         let tap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "tap" } });
         let mut on_tap = task_of("sandbox", None, tap);
@@ -3068,12 +3261,16 @@ mod tests {
                     static_port: Some(8080),
                     to: None,
                     tls: None,
+                    pending_extensions: Default::default(),
+                    unknown_fields: Default::default(),
                 },
                 PortConfig {
                     name: "admin".into(),
                     static_port: None,
                     to: None,
                     tls: None,
+                    pending_extensions: Default::default(),
+                    unknown_fields: Default::default(),
                 },
             ],
             ..NetworkConfig::default()
@@ -3120,12 +3317,16 @@ mod tests {
                     static_port: None,
                     to: None,
                     tls: None,
+                    pending_extensions: Default::default(),
+                    unknown_fields: Default::default(),
                 },
                 PortConfig {
                     name: "metrics".into(),
                     static_port: Some(9090),
                     to: None,
                     tls: None,
+                    pending_extensions: Default::default(),
+                    unknown_fields: Default::default(),
                 },
             ],
             ..NetworkConfig::default()
@@ -3182,6 +3383,8 @@ mod tests {
                 static_port: Some(6379),
                 to: None,
                 tls: None,
+                pending_extensions: Default::default(),
+                unknown_fields: Default::default(),
             }],
             ..NetworkConfig::default()
         };
@@ -3247,6 +3450,8 @@ mod tests {
                 static_port: Some(8080),
                 to: None,
                 tls: None,
+                pending_extensions: Default::default(),
+                unknown_fields: Default::default(),
             }],
             ..NetworkConfig::default()
         };
@@ -3512,11 +3717,24 @@ mod tests {
             err.to_string().contains("write to = \"http://api\""),
             "{err}"
         );
-        // Outlier ejection has no knob.
-        assert!(serde_json::from_value::<ConnectConfig>(json!({
-            "upstreams": [{ "to": "http://api", "http": { "outlier": { "consecutive5xx": 5 } } }]
+        // Outlier ejection has no knob: the key is refused when the jobspec
+        // is parsed.
+        let err = serde_json::from_value::<crate::structs::JobConfig>(json!({
+            "name": "web",
+            "task": {
+                "name": "web",
+                "runtime": "exec",
+                "connect": {
+                    "upstreams": [{ "to": "http://api", "http": { "outlier": { "consecutive5xx": 5 } } }]
+                }
+            }
         }))
-        .is_err());
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown field `connect.upstreams[0].http.outlier`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3734,6 +3952,8 @@ mod tests {
                 static_port: Some(8080),
                 to: None,
                 tls: None,
+                pending_extensions: Default::default(),
+                unknown_fields: Default::default(),
             }],
             ..NetworkConfig::default()
         };

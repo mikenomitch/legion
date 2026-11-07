@@ -764,6 +764,10 @@ pub struct Metrics {
     pub eval_conflict_requeues_total: Arc<Counter>,
     /// `legion_evals_blocked{key_kind}`
     pub evals_blocked: Arc<GaugeVec>,
+    /// `legion_apps{status}` (docs/apps.md, "Health and visibility")
+    pub apps: Arc<GaugeVec>,
+    /// `legion_object_status_writes_total{app}` (docs/app-objects.md)
+    pub object_status_writes_total: Arc<CounterVec>,
     /// `legion_gang_blocked_jobs`
     pub gang_blocked_jobs: Arc<Gauge>,
     /// `legion_gang_outcomes_total{outcome}`
@@ -972,6 +976,11 @@ pub struct Metrics {
     pub liveness_peer_stale: Arc<GaugeVec>,
     /// `legion_liveness_loss_suppressed_total{reason}`
     pub liveness_loss_suppressed_total: Arc<CounterVec>,
+    /// `legion_scaling_rollup_syncs_total{outcome}` (docs/metrics.md,
+    /// "Scaling inputs")
+    pub scaling_rollup_syncs_total: Arc<CounterVec>,
+    /// `legion_scaling_rollup_rows{kind}`
+    pub scaling_rollup_rows: Arc<GaugeVec>,
     /// `legion_liveness_checkpoint_seconds`
     pub liveness_checkpoint_seconds: Arc<Histogram>,
     /// Render order for the exposition endpoint.
@@ -1083,6 +1092,22 @@ impl Metrics {
                 name: "legion_evals_blocked",
                 help: "Evals waiting blocked on capacity, by the kind of key they wait under: `class` (a pool and pinned attributes), `node` (a resume pinned to the node holding its checkpoint), `escaped` (no schedulable node at all). Set by the scheduler-lane leader's wake pass; zero elsewhere.",
                 labels: &["key_kind"],
+            },
+            series: Series::new(),
+        });
+        let apps = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_apps",
+                help: "Installed apps by status: `running`, `upgrading`, `degraded`, `pending`, `stopped`, `corrupt` (a record the manager cannot decode) (docs/apps.md). Set by the control-lane leader's app reconciler after each pass; zero elsewhere. A `stopped` bundled app is worth a look: Legion's own add-ons are not running.",
+                labels: &["status"],
+            },
+            series: Series::new(),
+        });
+        let object_status_writes_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_object_status_writes_total",
+                help: "Status reports apps wrote for their objects (docs/app-objects.md, \"Status\"), by app. Counts writes that reached the Status lane; identical reports are dropped first and not counted. A steep rate means an app is writing telemetry into status, which belongs in memory instead. Counted on the manager that handled the report.",
+                labels: &["app"],
             },
             series: Series::new(),
         });
@@ -1262,7 +1287,7 @@ impl Metrics {
         let instance_suspends_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_instance_suspends_total",
-                help: "Suspends applied, by reason: manual (SuspendInstance), idle (the task's suspend.idle policy), or pressure (a node's suspend pressure step). Counted when the node's capture report reaches this manager.",
+                help: "Suspends applied, by reason: manual (SuspendInstance), idle (the task's suspend.idle policy), pressure (a node's suspend pressure step), park (the workload parked itself on its park socket), or make_room (room for a pinned resume). Counted when the node's capture report reaches this manager.",
                 labels: &["reason"],
             },
             series: Series::new(),
@@ -1876,6 +1901,22 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let scaling_rollup_syncs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scaling_rollup_syncs_total",
+                help: "Scaling-input rollup ticks, by outcome: local (this manager leads the status lane and merged its own), ok (shipped to the leader), resync (the leader asked for a full set and took it), error (not delivered; the next tick sends a full set).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let scaling_rollup_rows = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_scaling_rollup_rows",
+                help: "Scaling-input rollups, one per (node, task): kind=local is what this manager built from its own workers' reports at the last tick; kind=merged is what it holds from every manager while it leads the status lane (0 elsewhere).",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+        });
         let liveness_checkpoint_seconds = Arc::new(Histogram {
             meta: FamilyMeta {
                 name: "legion_liveness_checkpoint_seconds",
@@ -1902,6 +1943,8 @@ impl Metrics {
             Arc::clone(&liveness_peer_stale) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_loss_suppressed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_checkpoint_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&scaling_rollup_syncs_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scaling_rollup_rows) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
             Arc::clone(&namespace_jobs) as Arc<dyn RenderMetric>,
             Arc::clone(&namespace_allocations) as Arc<dyn RenderMetric>,
@@ -1937,8 +1980,10 @@ impl Metrics {
             Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
+            Arc::clone(&apps) as Arc<dyn RenderMetric>,
             Arc::clone(&gang_blocked_jobs) as Arc<dyn RenderMetric>,
             Arc::clone(&gang_outcomes_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&object_status_writes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
             Arc::clone(&blocked_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
@@ -2011,8 +2056,10 @@ impl Metrics {
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
             evals_blocked,
+            apps,
             gang_blocked_jobs,
             gang_outcomes_total,
+            object_status_writes_total,
             evals_unblocked_total,
             blocked_wait_seconds,
             scheduler_concurrency_limit,
@@ -2107,6 +2154,8 @@ impl Metrics {
             liveness_peer_stale,
             liveness_loss_suppressed_total,
             liveness_checkpoint_seconds,
+            scaling_rollup_syncs_total,
+            scaling_rollup_rows,
             families,
         }
     }
@@ -2172,6 +2221,11 @@ pub struct WorkerMetrics {
     /// `legion_worker_pressure_actions_total{step}` — actions this node's
     /// memory pressure response took (docs/resource-enforcement.md).
     pub pressure_actions_total: Arc<CounterVec>,
+    /// `legion_worker_parks_total{outcome}` — what the park sockets on this
+    /// node did (docs/park.md): `parked` (a park accepted), `unparked` (one
+    /// cancelled before its deadline), `suspended` (a deadline passed and
+    /// the suspend ran), `failed` (it did not, and the task keeps running).
+    pub parks_total: Arc<CounterVec>,
     /// `legion_provisional_starts_total{origin,gate}` — provisional
     /// allocations admitted on this node (docs/edge-boot.md).
     pub provisional_starts_total: Arc<CounterVec>,
@@ -2442,6 +2496,14 @@ impl WorkerMetrics {
             },
             series: Series::new(),
         });
+        let parks_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_worker_parks_total",
+                help: "What this node's park sockets did, by outcome (parked|unparked|suspended|failed).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
         let simulated_registrations_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_worker_simulated_registrations_total",
@@ -2553,6 +2615,7 @@ impl WorkerMetrics {
             Arc::clone(&provisional_refused_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_starts_total) as Arc<dyn RenderMetric>,
             Arc::clone(&pressure_actions_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&parks_total) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_nodes_target) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_registrations_total) as Arc<dyn RenderMetric>,
@@ -2565,6 +2628,7 @@ impl WorkerMetrics {
             allocations_running,
             allocation_failures_reported_total,
             pressure_actions_total,
+            parks_total,
             provisional_starts_total,
             provisional_refused_total,
             provisional_killed_total,
@@ -3576,6 +3640,7 @@ mod tests {
         metrics().store_write_lock_wait_seconds.observe(0.002);
         let out = render();
         for family in [
+            "legion_apps",
             "legion_allocations",
             "legion_namespace_jobs",
             "legion_namespace_allocations",

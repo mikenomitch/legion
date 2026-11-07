@@ -340,7 +340,7 @@ pub const DEFAULT_SNAPSHOT_KEEP: u32 = 5;
 /// checkpoints (an API socket on Firecracker, stable device links, an
 /// identity disk), unless `memory = false`.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct SnapshotsConfig {
     /// How long a snapshot lives before it is deleted automatically, as a
     /// duration (`"7d"`, `"12h"`). Unset: snapshots never expire on their
@@ -356,6 +356,10 @@ pub struct SnapshotsConfig {
     /// without a `snapshots` block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<bool>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// [`SnapshotsConfig`] with defaults applied and durations parsed.
@@ -433,6 +437,9 @@ pub fn memory_checkpoint_ask(task: &crate::structs::TaskConfig) -> Option<Memory
     None
 }
 
+// Unknown-field capture (`structs::spec_fields`).
+crate::structs::spec_fields::spec_block!(SnapshotsConfig, ["ttl", "keep", "memory"]);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +480,7 @@ mod tests {
             ttl: Some("7d".into()),
             keep: Some(2),
             memory: Some(false),
+            unknown_fields: Default::default(),
         }
         .resolve()
         .unwrap();

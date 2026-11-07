@@ -126,6 +126,23 @@ impl UsageTable {
         due
     }
 
+    /// Every node's latest report received within `max_age` of `now`, as the
+    /// scaling-input rollup folds it (`crate::manager::scaling_inputs`).
+    /// One pass over the table; the caller holds the lock only for this.
+    pub fn current_samples(
+        &self,
+        now: Instant,
+        max_age: Duration,
+    ) -> Vec<crate::manager::scaling_inputs::NodeSample> {
+        self.nodes
+            .iter()
+            .filter(|(_, entry)| now.saturating_duration_since(entry.received_at) <= max_age)
+            .map(|(node_id, entry)| {
+                crate::manager::scaling_inputs::NodeSample::from_report(node_id, &entry.report)
+            })
+            .collect()
+    }
+
     /// Whether `node_id` has a current usage report. A node without one
     /// cannot run an idle policy (no worker-side activity tracking).
     pub fn reports_for(&self, node_id: &str) -> bool {

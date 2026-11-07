@@ -273,6 +273,7 @@ impl Store {
         let since = self.claim_capacity_seq(&eval.id);
         if let Some((node_id, cause)) = self.first_helpful_node(
             &blocked.key,
+            &eval.job_id,
             &eval.job_config_id,
             &blocked.detail,
             &self.capacity_nodes_after(since),
@@ -306,10 +307,12 @@ impl Store {
     }
 
     /// The first of `nodes` (with the kind of its event) that is available
-    /// and that a blocked eval with this key and detail could use.
+    /// and that a blocked eval of job `job_id` with this key and detail
+    /// could use.
     fn first_helpful_node(
         &self,
         key: &str,
+        job_id: &str,
         job_config_id: &str,
         detail: &Value,
         nodes: &[(String, &'static str)],
@@ -321,7 +324,7 @@ impl Store {
         let task = self.blocked_task(job_config_id, detail);
         nodes.iter().find_map(|(node_id, kind)| {
             let node = available.get(node_id)?;
-            node_could_help(key, task.as_ref(), node).then(|| (node_id.clone(), *kind))
+            node_could_help(key, task.as_ref(), job_id, node).then(|| (node_id.clone(), *kind))
         })
     }
 
@@ -440,9 +443,13 @@ impl Store {
         let blocked = self.blocked_evals()?;
         let mut woken: Vec<(BlockedEval, String, &'static str)> = Vec::new();
         for eval in &blocked {
-            if let Some((node_id, cause)) =
-                self.first_helpful_node(&eval.key, &eval.job_config_id, &eval.detail, &nodes)
-            {
+            if let Some((node_id, cause)) = self.first_helpful_node(
+                &eval.key,
+                &eval.job_id,
+                &eval.job_config_id,
+                &eval.detail,
+                &nodes,
+            ) {
                 woken.push((eval.clone(), node_id, cause));
             }
         }

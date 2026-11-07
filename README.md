@@ -44,6 +44,9 @@ still be happy with at fifty thousand nodes.
   [rollouts](docs/rollouts.md), [ACLs](docs/auth-and-acls.md) on by default,
   [namespaces](docs/namespaces.md) with per-team quotas,
   [workload identity (OIDC)](docs/workload-identity.md), and a [web UI](#web-ui).
+  Add-ons run as [apps](docs/apps.md): jobs on the managers that Legion keeps
+  running, each with a grant it shows you before you install it, and able to
+  add [object kinds](docs/app-objects.md) of their own.
 - **Readable job specs.** [Nickel](docs/configuration-language.md) gives you
   types, imports, and functions for DRY specs. You don't need YAML or Helm
   charts.
@@ -150,6 +153,8 @@ features that make sandboxes work great:
   sandboxes first and evicts other work only if that isn't enough. A
   suspended sandbox resumes in place with its processes intact when you
   start it or when the next request reaches the [gateway](docs/gateway.md).
+  An agent that knows it is about to wait can [park](docs/park.md) itself
+  and suspend within seconds, instead of waiting for the idle policy.
   Snapshots let you roll one back, and fork copies a running one for an
   agent to explore from. See the
   [agent sandboxes guide](docs/guides/agent-sandboxes.md).
@@ -437,7 +442,8 @@ start:
   [Adaptive Scheduler Concurrency](docs/adaptive-scheduler-concurrency.md)
 - **Running workloads:** [Task Runtimes](docs/task-runtime-plugins.md) ·
   [Artifacts](docs/artifacts.md) · [Rollouts](docs/rollouts.md) ·
-  [Scaling Jobs](docs/autoscaling.md) ·
+  [Autoscaling](docs/autoscaling.md) ·
+  [Autoscaling Plugins](docs/autoscaling-plugins.md) ·
   [Gang Scheduling](docs/gang-scheduling.md) ·
   [Task Supervision](docs/task-supervision.md) ·
   [Resource Enforcement](docs/resource-enforcement.md)
@@ -445,7 +451,7 @@ start:
   [Running Agent Sandboxes](docs/guides/agent-sandboxes.md) ·
   [Sandboxes at Scale](docs/sandboxes-at-scale.md) ·
   [Session Mode](docs/session-mode.md) · [Edge Boot](docs/edge-boot.md) ·
-  [Suspend and Resume](docs/suspend-and-resume.md) ·
+  [Suspend and Resume](docs/suspend-and-resume.md) · [Park](docs/park.md) ·
   [Gateway: Wake on Request](docs/gateway.md)
 - **Guides:** [Running Postgres](docs/guides/postgres.md) ·
   [Running Redis](docs/guides/redis.md) ·
@@ -461,7 +467,8 @@ start:
   [Upgrades](docs/upgrades.md) · [Data Directory](docs/data-directory.md) ·
   [Logging](docs/logging.md) ·
   [Metrics](docs/metrics.md) · [Observability](docs/observability.md)
-- **Extending Legion:** [Plugin System](docs/plugin-system.md) ·
+- **Extending Legion:** [Apps](docs/apps.md) · [App Objects](docs/app-objects.md) ·
+  [Plugin System](docs/plugin-system.md) ·
   [Codebase Conventions](docs/codebase-conventions.md) ·
   [Testing and Benchmarks](docs/testing-and-benchmarks.md) ·
   [Benchmarks](docs/benchmarks.md)

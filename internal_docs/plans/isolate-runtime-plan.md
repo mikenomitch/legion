@@ -915,6 +915,13 @@ how long the isolate has been idle (or waiting):
   first. The isolate host also calls the same reclaim hook on its own when
   an isolate passes `pageOutAfter`; other runtimes can adopt idle-time
   reclaim through that hook later (TODO), with no isolate code involved.
+- **Park works for isolates too.** [Park](park-plan.md) lets a workload
+  say it is waiting, so its node suspends it at once instead of after
+  `idle.after`. A session isolate gets the same contract as a host call
+  instead of a socket: a guest that parks is hibernated at its next turn
+  boundary. Park's other problem, a quiet open connection read as idle,
+  does not arise here, because the host holds the connection and its
+  response wakes the isolate.
 - **Paging needs the node to have somewhere to page.** Without zswap,
   zram, or swap, `MADV_PAGEOUT` does nothing for anonymous pages and the
   paged-out tier collapses into hot. The public doc says so and the worker
@@ -1272,6 +1279,7 @@ isolate-specific:
 | Reclaim hook | a runtime gives memory back without stopping (`memory.reclaim`, a balloon, isolate page-out) | exists in the pressure response; isolates add an idle trigger (§6.7) |
 | Derived content | node-local artifacts built from verified inputs (root disks, compiled modules, pre-initialized images) | [derived-content-plan.md](derived-content-plan.md) generalizes the root disk cache |
 | Runtime disable | a cluster-wide switch that refuses new starts of a runtime | [runtime-disable-plan.md](runtime-disable-plan.md) |
+| Park | the workload says it is waiting, and its node suspends it | exists ([park-plan.md](park-plan.md)); isolates take it as a host call (§6.7) |
 | Workload channel | the one way a workload reaches its worker, with one attribution rule | legion-apps-plan §6.4, amended |
 
 | Feature | Composed from |

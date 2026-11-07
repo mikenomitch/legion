@@ -501,8 +501,8 @@ impl ManagerDaemonService {
         let identity_name = input.name;
         let Some(state) = self.workload_identity.as_ref() else {
             return ProviderRead::Failed(
-                "workload identity is not enabled on this manager (set \
-                 workloadIdentity.enabled: true in the manager config)"
+                "workload identity is turned off on this manager \
+                 (workloadIdentity.enabled = false; it is on by default)"
                     .to_string(),
             );
         };

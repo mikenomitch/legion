@@ -1,3 +1,5 @@
+pub mod api_socket;
+pub mod app_forward;
 pub mod artifact_credentials;
 pub mod balance;
 pub mod boot_ticket;
@@ -19,6 +21,7 @@ pub mod logs;
 pub mod managers;
 pub mod netd;
 pub mod node_check;
+pub mod park;
 pub mod plane;
 pub mod pressure;
 pub mod resources;

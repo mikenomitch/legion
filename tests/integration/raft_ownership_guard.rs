@@ -80,6 +80,8 @@ fn test_job(name: &str) -> JobConfig {
         name: name.to_string(),
         tasks: vec![task],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -346,6 +348,8 @@ fn worker_exit_report_ops_pass_the_ownership_guard() -> R<()> {
         name: "guard-dag".into(),
         tasks: vec![step("fetch"), validate],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let outcome = store.handle_job_submit(&job, &[submission("guard-dag")])?;
     let job_config_id = outcome.job_config_id().to_string();
@@ -480,6 +484,8 @@ fn volume_ops_pass_the_ownership_guard() -> R<()> {
         params: None,
         path: Some("/mnt/data".into()),
         read_only: None,
+        pending_extensions: Default::default(),
+        unknown_fields: Default::default(),
     }];
 
     // Submit: the control op, the status-lane task_status seed, and the

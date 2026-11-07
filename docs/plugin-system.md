@@ -345,6 +345,15 @@ policy names. This keeps custom auth code behind a process or network trust
 boundary. Webhooks are only called at login. See
 [Auth & ACLs](auth-and-acls.md).
 
+## Out-of-Process Plugins: Autoscaling
+
+The autoscaler's metric sources, strategies, and targets are a different
+kind of plugin: separate programs (or URLs) speaking a JSON-RPC protocol,
+`legion-scaling/1`, installed in the autoscaler app's config rather than
+loaded into a Legion process. A crash or a hang costs one call, not the
+host. See [Writing Autoscaling Plugins](autoscaling-plugins.md) and
+[Autoscaling, "Plugins"](autoscaling.md#plugins).
+
 ## Planned Plugin Categories (Not Implemented Yet)
 
 Legion has no plugin kind for networking (CNI), API extensions, logging

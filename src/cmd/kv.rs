@@ -330,6 +330,7 @@ async fn list_kv(prefix: &str, include_values: bool, format: OutputFormat) -> R<
     let request = ListKvRequest {
         prefix: prefix.to_string(),
         include_values,
+        include_locks: false,
     };
     let response = output::resolve(
         format,

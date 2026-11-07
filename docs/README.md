@@ -79,6 +79,9 @@ Plans, roadmaps, to-do lists, and development notes live in
   when idle or under memory pressure, identity refresh after a restore, disk
   and memory snapshots, restoring an instance in place, expiry, and the
   `snapshot` ACL resource.
+- [Park](park.md): `suspend.park` and `$LEGION_PARK_SOCKET`, where the
+  workload says when it is waiting (`park`) or working (`busy`) and its node
+  suspends it at the park's deadline, with the checkpoint it chose.
 - [Gateway: Wake on Request](gateway.md): `legion start gateway`, a stateless
   front door that routes requests to keyed instances by host, header, or
   `CONNECT`, resumes a suspended one on a request, and holds the request
@@ -86,8 +89,17 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Rollouts](rollouts.md): update strategies, health gating, manual/auto
   progression.
 - [Rollout Strategy Plugins](rollout-strategy-plugins.md)
-- [Scaling Jobs](autoscaling.md): `legion job scale` sets count overrides
-  without a new version or rollout. This is the manual half of the autoscaler.
+- [Autoscaling](autoscaling.md): `autoscale = true` on a task, layered
+  defaults (task, namespace, cluster), the safeguard pipeline, pins and
+  pauses, `legion scaling status|explain|history`; Prometheus, HTTP, and
+  plugin sources, scale to zero, `legion scaling simulate`, standalone
+  policies for external targets and node groups (`autoscaler/ScalingPolicy`
+  and `autoscaler/NodeGroup` objects, `legion object apply`); and `legion job
+  scale`, which sets count overrides without a new version or rollout.
+- [Writing Autoscaling Plugins](autoscaling-plugins.md): the
+  `legion-scaling/1` JSON-RPC protocol for sources, strategies, and
+  targets, `legion scaling plugin test`, the Rust SDK, and the example
+  plugins.
 - [Graceful Stop](graceful-stop.md): the signal, grace period, and SIGKILL
   sequence every platform-initiated stop uses, the machine-readable stop
   notice, and why an allocation was removed.
@@ -142,6 +154,15 @@ Plans, roadmaps, to-do lists, and development notes live in
   intermediate from your own PKI (`file`) or an external signer such as
   Vault PKI (`exec`), with every certificate checked, managers checked for
   agreement, and rotation per provider.
+- [Apps](apps.md): Legion's add-ons as jobs in `legion-system` with a granted
+  identity, kept running by the app reconciler. Covers the manifest,
+  placement on the managers' system workers, install and upgrade with a
+  permission prompt, config and code fields, why direct edits are refused,
+  bundled apps rolling with the build, and `legion app`.
+- [App Objects](app-objects.md): object kinds apps declare (Legion's
+  custom resources): the manifest's `kinds`, `legion object`, the `object`
+  ACL resource and `requires`, status and the summary, bounded cleanup on
+  delete, and the reconcile loop apps use.
 - [Workload Identity (OIDC)](workload-identity.md): short-lived, verifiable task
   identity for external providers.
 - [Exec & Actions](exec-and-actions.md): running commands inside a workload,

@@ -197,11 +197,14 @@ application has to:
   not ended.
 - **Work reaches nodes** on the `StreamWork` stream, with `PostWork` and
   the heartbeat as fallbacks (`proto/legion.proto:1331`, `:9845`).
-- **The per-allocation API socket** is planned in
-  [legion-apps-plan.md](legion-apps-plan.md) §6.4: a unix socket per
-  allocation whose connections the worker attributes by `SO_PEERCRED` and
-  cgroup. It is not built. The isolate host needs no such socket: it already
-  talks to the worker over its own socketpair.
+- **The per-allocation API socket** ([legion-apps-plan.md](legion-apps-plan.md)
+  §6.4, built in `src/worker/api_socket.rs`): a unix socket per allocation
+  whose connections the worker attributes by `SO_PEERCRED` and cgroup where
+  every task has a leaf, and by file modes otherwise (apps calls entry 31).
+  It proxies the Legion API to the managers today; this plan adds
+  worker-local calls to it (apps calls entry 130). The isolate host needs no
+  such socket: it talks to the worker over its own socketpair under the same
+  attribution rule.
 - **Splice.** The datapath already moves bulk L4 bytes with `splice(2)` on
   Linux ([datapath-performance-plan.md](datapath-performance-plan.md)),
   which connection handoff (§6.8) reuses.
@@ -437,8 +440,7 @@ bytes.
   session children with the managers' "owners ended" notice and the
   full-report check; promotion that carries ownership; router fallback to
   another node and the orphan sweep for session owners; starts from inside
-  any runtime through the per-allocation API socket (built here if the apps
-  plan's has not landed).
+  any runtime through the per-allocation API socket.
 - **Phase 3: keyed children.** The `owner` column and the in-transaction
   cascade.
 - **Phase 4: connection handoff** (§6.8).

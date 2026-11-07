@@ -148,6 +148,19 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("kv_entry", Owner::Lane(Lane::Control)),
     ("kv_lock", Owner::Lane(Lane::Control)),
     ("job_kv_reference", Owner::Lane(Lane::Control)),
+    // Job grants (apps plan §6.4): written by the submit entry that stores
+    // the version they grant, and by revocation.
+    ("job_grant", Owner::Lane(Lane::Control)),
+    // App records (apps plan §6.3): operator intent, written by the app
+    // RPCs and the app reconciler, next to the jobs it submits.
+    ("app", Owner::Lane(Lane::Control)),
+    // App-owned object kinds (app-object-kinds plan §6.2-§6.3): the kinds
+    // installed apps declare, synced from the app records, and the objects
+    // people write of them (ApplyObject, DeleteObject, ReleaseObject, the
+    // cleanup expiry), with uids and versions from `scaling_counter`, also
+    // Control. An object's status rides the Status lane (below).
+    ("object_kind", Owner::Lane(Lane::Control)),
+    ("app_object", Owner::Lane(Lane::Control)),
     ("saved_state_query", Owner::Lane(Lane::Control)),
     ("signing_key", Owner::Lane(Lane::Control)),
     // KV encryption keyring (docs/kv-encryption.md): the wrapped data keys.
@@ -210,6 +223,18 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // reconciling `job_scale` eval is its own sequential scheduler-lane
     // enqueue, exactly the JC-33 wrapper-sequential shape stop_job uses.
     ("task_scale", Owner::Lane(Lane::Control)),
+    // Task autoscaling's state rides Control beside `task_scale` (plan
+    // non-goal: no new lane): every autoscaler write is a `task_scale`
+    // write plus its history row in one entry, and the defaults and pauses
+    // are operator intent read by the same submit and scale ops.
+    ("scaling_counter", Owner::Lane(Lane::Control)),
+    ("scaling_defaults", Owner::Lane(Lane::Control)),
+    ("scale_history", Owner::Lane(Lane::Control)),
+    ("scaling_pause", Owner::Lane(Lane::Control)),
+    ("scaling_policy_snapshot", Owner::Lane(Lane::Control)),
+    // A standalone policy's action intent: compare-and-set writes beside
+    // the policy they act for.
+    ("scaling_action", Owner::Lane(Lane::Control)),
     // ── scheduler lane: placement + rollout progression ──────────────────
     ("allocation", Owner::Lane(Lane::Scheduler)),
     ("allocation_epoch", Owner::Lane(Lane::Scheduler)),
@@ -332,6 +357,12 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // status lane (heartbeats, health checks, registration's status-lane
     // seed op, lost marks, and the orphan sweep).
     ("node_health", Owner::Lane(Lane::Status)),
+    // `app_object_status` (app-object-kinds plan §6.7): an owning app's
+    // report on an object, keyed by its uid, written only by
+    // UpdateObjectStatus and swept by `prune_app_object_status_orphans` on
+    // the status-lane leader. Status churn stays off the Control lane, as
+    // node liveness does.
+    ("app_object_status", Owner::Lane(Lane::Status)),
     // ── commutative class (JC-28) ────────────────────────────────────────
     ("scheduler_event", Owner::Commutative),
     ("idempotency_record", Owner::Commutative),

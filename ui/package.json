@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "typecheck": "tsc --noEmit",
     "gen": "protoc -I ../proto --plugin=protoc-gen-connect-es=./node_modules/.bin/protoc-gen-connect-es --plugin=protoc-gen-es=./node_modules/.bin/protoc-gen-es --connect-es_out=src/gen --connect-es_opt=target=ts --es_out=src/gen --es_opt=target=ts ../proto/legion.proto",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:smoke": "node tests/smoke/run.cjs"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^1.10.1",

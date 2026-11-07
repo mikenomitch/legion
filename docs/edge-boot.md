@@ -734,7 +734,7 @@ $ legion sandbox start agent-sandboxes --id user-42 --node https://10.0.1.7:4848
     defaultTicketTtl = "5m",
     maxTicketTtl = "1h",
   },
-  workloadIdentity = { enabled = true },  # boot tickets are signed by this issuer
+  # Boot tickets are signed by the workload-identity issuer (on by default).
 }
 ```
 

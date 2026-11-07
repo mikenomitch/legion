@@ -79,6 +79,10 @@ pub struct ArtifactAuth {
     /// the fetch authenticates as the cluster's worker nodes, not as the task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_identity: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl ArtifactAuth {
@@ -175,6 +179,10 @@ pub struct ArtifactSpec {
     /// (`"task"` or `"cluster"`). Unset means anonymous.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_origin: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 fn is_default_unpack(unpack: &ArtifactUnpack) -> bool {
@@ -183,7 +191,7 @@ fn is_default_unpack(unpack: &ArtifactUnpack) -> bool {
 
 /// Mirror of [`ArtifactSpec`] used for object-form deserialization.
 #[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 struct ArtifactSpecObject {
     source: String,
     #[serde(default)]
@@ -206,6 +214,10 @@ struct ArtifactSpecObject {
     pinned_from: Option<String>,
     #[serde(default)]
     auth_origin: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl From<ArtifactSpecObject> for ArtifactSpec {
@@ -222,31 +234,69 @@ impl From<ArtifactSpecObject> for ArtifactSpec {
             media_type: input.media_type,
             pinned_from: input.pinned_from,
             auth_origin: input.auth_origin,
+            unknown_fields: input.unknown_fields,
         }
     }
 }
 
+/// A bare source string, or the object form, decided by shape. Not an
+/// untagged enum: that replaced the object form's own error (a wrong type,
+/// a missing `source`) with serde's generic "did not match any variant".
 impl<'de> Deserialize<'de> for ArtifactSpec {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Input {
-            Source(String),
-            Full(Box<ArtifactSpecObject>),
+        struct ShapeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ShapeVisitor {
+            type Value = ArtifactSpec;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an artifact source string, or an artifact object")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, source: &str) -> Result<ArtifactSpec, E> {
+                Ok(ArtifactSpec {
+                    source: source.to_string(),
+                    ..ArtifactSpec::default()
+                })
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<ArtifactSpec, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                ArtifactSpecObject::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(ArtifactSpec::from)
+            }
         }
 
-        match Input::deserialize(deserializer)? {
-            Input::Source(source) => Ok(ArtifactSpec {
-                source,
-                ..ArtifactSpec::default()
-            }),
-            Input::Full(full) => Ok((*full).into()),
-        }
+        deserializer.deserialize_any(ShapeVisitor)
     }
 }
+
+crate::structs::spec_fields::spec_block!(
+    ArtifactAuth,
+    ["kv", "identity", "assumeRole", "nodeIdentity"]
+);
+crate::structs::spec_fields::spec_block!(
+    ArtifactSpec,
+    [
+        "source",
+        "name",
+        "dest",
+        "checksum",
+        "unpack",
+        "resolve",
+        "auth",
+        "mode",
+        "mediaType"
+    ],
+    |this, walk| {
+        walk.opt("auth", this.auth.as_mut());
+    }
+);
 
 /// Source after scheme normalization: `git::https://…` becomes scheme `git`
 /// with the inner transport URL preserved.
@@ -621,7 +671,29 @@ mod tests {
 
     #[test]
     fn unknown_fields_rejected_in_object_form() {
-        assert!(spec(json!({"source": "https://x/y", "nope": 1})).is_err());
+        // The block captures the key; the jobspec parse refuses it, with its
+        // path and the closest known key.
+        let artifact = spec(json!({"source": "https://x/y", "dset": "bin"})).expect("captured");
+        assert_eq!(artifact.unknown_fields["dset"], json!("bin"));
+        let err = serde_json::from_value::<crate::structs::JobConfig>(json!({
+            "name": "web",
+            "task": {
+                "name": "web",
+                "runtime": "exec",
+                "artifacts": [{"source": "https://x/y", "dset": "bin"}]
+            }
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "web: task web: unknown field `artifacts[0].dset` (did you mean `artifacts[0].dest`?)"
+            ),
+            "{err}"
+        );
+        // The object form's own errors are no longer "did not match any
+        // variant".
+        let err = spec(json!({"name": "no-source"})).unwrap_err();
+        assert!(err.to_string().contains("missing field `source`"), "{err}");
     }
 
     #[test]

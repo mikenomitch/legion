@@ -94,6 +94,10 @@ pub struct SnapshotReportRecord {
     /// forwarded by an older manager.
     #[serde(default)]
     pub manifest_url: String,
+    /// With `local_suspension`: why the node suspended on its own
+    /// (`pressure` or `park`). Empty reads as `pressure`.
+    #[serde(default)]
+    pub local_suspension_reason: String,
 }
 
 impl From<&crate::structs::SnapshotReport> for SnapshotReportRecord {
@@ -110,6 +114,7 @@ impl From<&crate::structs::SnapshotReport> for SnapshotReportRecord {
             local_suspension: report.local_suspension,
             pause_ms: report.pause_ms,
             manifest_url: report.manifest_url.clone(),
+            local_suspension_reason: report.local_suspension_reason.clone(),
         }
     }
 }
@@ -1267,6 +1272,7 @@ mod tests {
             },
             manifest_json: "{}".into(),
             manifest_url: String::new(),
+            local_suspension_reason: String::new(),
             duration_ms: 1,
             total_bytes: 1,
             allocation_id: 7,

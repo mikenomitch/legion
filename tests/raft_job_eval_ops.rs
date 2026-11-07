@@ -92,12 +92,17 @@ fn job() -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
+/// Raft entries applied so far, summed over the lanes, from the state
+/// machine's applied marker: exact as soon as a write returns, where the
+/// engine's metrics (`raft_status`) are published a moment later and made
+/// a count taken right after a write flaky under load.
 fn entries(store: &Store) -> R<u64> {
-    let status = store.raft_status().context("raft status")?;
-    Ok(status.lanes.iter().map(|lane| lane.applied_index).sum())
+    store.raft_applied_entries()
 }
 
 /// `legion_raft_ops_total{op, outcome="applied"}`, summed over lanes.

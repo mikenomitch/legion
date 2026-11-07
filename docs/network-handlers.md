@@ -1474,7 +1474,10 @@ applies a floor to every socket an allocation opens. On a node that can run
 the [kernel classifier](#the-kernel-classifier), the classifier's eBPF
 programs apply it (`hostGuard = active (ebpf)`), with the same classes,
 `EPERM`, and `net.denied` events described here. Elsewhere the worker
-installs one `nftables` table, `inet legion_host_guard`. It matches sockets by the
+installs one `nftables` table, `inet legion_host_guard` (named after the
+worker's cgroup parent when it is not the default `legion`:
+`inet legion_host_guard_legion-system` for a manager's system worker, so two
+workers on one host keep their own). It matches sockets by the
 allocation's cgroup leaf (`<cgroupParent>/{share,reserve}/legion-<alloc>`)
 in the output hook and drops:
 
@@ -1607,7 +1610,10 @@ task: connect(151.101.0.223:443)
 - **Raw and packet sockets are refused** to governed tasks, so raw IP cannot
   slip past the rest.
 - **Fail-static across restarts.** With bpffs mounted at `/sys/fs/bpf`, the
-  programs and maps are pinned under `/sys/fs/bpf/legion/`. A worker that
+  programs and maps are pinned under `/sys/fs/bpf/legion/` (under
+  `/sys/fs/bpf/legion_<cgroupParent>/` for a worker whose cgroup parent is
+  not the default, such as a manager's system worker, so two workers on one
+  host never share pins). A worker that
   restarts re-opens them, attaches fresh programs, and drops the old ones;
   in between, the kernel keeps enforcing the last policy it was given, and
   allowed flows that never entered netd are untouched. Without bpffs, the

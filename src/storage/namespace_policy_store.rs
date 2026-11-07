@@ -569,6 +569,8 @@ mod namespace_policy_store_test {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 

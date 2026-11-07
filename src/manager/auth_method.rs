@@ -562,10 +562,19 @@ impl AuthMethod for JwtAuthMethod {
 /// `workloadIdentity.enabled`, so a workload can authenticate back to Legion
 /// with the same token it federates outward with.
 ///
-/// This delivers the *verified identity primitive*: with no binding rules a
-/// control-plane token verifies to a principal but grants no policies. Mapping
-/// claims to permissions is done via `workloadIdentity.controlPlaneBindings`,
-/// the seam the broader ACL effort builds on.
+/// What the token may do comes from two places:
+///
+/// - **The job's grant** (docs/workload-identity.md, "Permissions"): what the
+///   job's `legion` identity asked for and the submitter held, recorded for
+///   the job config version the token's allocation runs. The identity
+///   carries a reference to it (`grant:alloc/<id>`), resolved when the rules
+///   are read, so a revoked grant stops working at the next request. Keyed
+///   by the allocation, so by the canonical job id, never the bare name.
+/// - **`workloadIdentity.controlPlaneBindings`**: claim-based rules mapping
+///   identities to policies wholesale, as before.
+///
+/// With neither, a control-plane token verifies to a principal but grants
+/// nothing.
 pub struct ControlPlaneIdentityMethod {
     state: std::sync::Arc<crate::manager::workload_identity::WorkloadIdentityState>,
     binding_rules: Vec<AclBindingRule>,
@@ -605,12 +614,34 @@ impl ControlPlaneIdentityMethod {
             .get("sub")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        let mut policies = Vec::new();
+        // The job's grant first, when its allocation's version has a live
+        // one. The token names its allocation; the claims are the manager's
+        // own, signed, so the allocation is the one it was issued to.
+        if let Some(allocation_id) = claims
+            .get("legion.io/alloc")
+            .and_then(Value::as_str)
+            .and_then(|alloc| alloc.parse::<i64>().ok())
+        {
+            let granted = self
+                .store
+                .task_grant_for_allocation(allocation_id)
+                .map_err(|e| AuthError::Internal(format!("reading the job's grant: {e:#}")))?;
+            if granted.is_some() {
+                policies.push(crate::structs::grant::grant_policy_ref(allocation_id));
+            }
+        }
+        for policy in bound_policies(&self.binding_rules, &claims) {
+            if !policies.contains(&policy) {
+                policies.push(policy);
+            }
+        }
         Ok(VerifiedIdentity {
             // The authenticator prefixes this with the method name, yielding a
             // `legion:<sub>` principal — distinct from node (`node:`) and user
             // principals.
             principal: sub.to_string(),
-            policies: bound_policies(&self.binding_rules, &claims),
+            policies,
             expires_at: claims
                 .get("exp")
                 .and_then(Value::as_i64)
@@ -639,7 +670,9 @@ impl AuthMethod for ControlPlaneIdentityMethod {
             let identity = self.identity_from_token(jwt)?;
             if identity.policies.is_empty() {
                 return Err(AuthError::Denied(
-                    "control-plane token verified but no controlPlaneBindings granted any policies"
+                    "control-plane token verified, but its job holds no grant (declare \
+                     `permissions` on its `legion` identity, or check `legion acl grants list`) \
+                     and no controlPlaneBindings granted any policies"
                         .into(),
                 ));
             }

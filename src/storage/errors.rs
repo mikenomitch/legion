@@ -25,6 +25,12 @@ pub enum StorageError {
     FailedPrecondition {
         message: String,
     },
+    /// A compare-and-set write lost to a concurrent change and nothing was
+    /// written: the caller reads again and retries (`ABORTED`). The app
+    /// reconciler's submit after the app record moved under it.
+    Aborted {
+        message: String,
+    },
     DatabaseBusy,
     DatabaseLocked,
     DatabaseReadOnly,
@@ -131,6 +137,7 @@ impl fmt::Display for StorageError {
             }
             StorageError::InvalidInput { message } => write!(f, "invalid data: {message}"),
             StorageError::FailedPrecondition { message } => write!(f, "{message}"),
+            StorageError::Aborted { message } => write!(f, "{message}"),
             StorageError::DatabaseBusy => write!(f, "storage is busy; retry the request"),
             StorageError::DatabaseLocked => write!(f, "storage is locked; retry the request"),
             StorageError::DatabaseReadOnly => write!(f, "storage is read-only"),

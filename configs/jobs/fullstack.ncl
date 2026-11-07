@@ -124,7 +124,7 @@ let http_check = fun check_path =>
     port = "http",
     every = "5s",
     timeout = "2s",
-    unhealthy_after_count = 3,
+    unhealthyAfterCount = 3,
   }
 in
 
@@ -184,7 +184,7 @@ in
       # Least-connections, so a slow query doesn't pile more requests on
       # the replica that's already busy.
       connect = { upstreams = [{ to = "postgres", balance = "least_conn" }] },
-      checks = [http_check "/healthz" & { boot_grace_time = "60s" }],
+      checks = [http_check "/healthz" & { bootGraceTime = "60s" }],
       resources = { cpus = 0.25, memory = 128 },
     },
     {
@@ -213,7 +213,7 @@ in
       # A TCP check, not `pg_isready`: exec checks run on the host, outside
       # the container, where neither the binary nor the task env exists.
       checks = [
-        { type = "health", kind = "tcp", port = "pg", every = "10s", timeout = "5s", boot_grace_time = "60s" },
+        { type = "health", kind = "tcp", port = "pg", every = "10s", timeout = "5s", bootGraceTime = "60s" },
       ],
       resources = { cpus = 0.5, memory = 512 },
     },

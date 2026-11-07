@@ -75,6 +75,9 @@ fn worker_table() -> Vec<(&'static str, &'static [Caller])> {
         // PostWork and StopSessions.
         ("StartSession", &[Caller::Ticket]),
         ("StopSession", &[Caller::Ticket]),
+        // App views and actions: the manager authorized the viewer and
+        // signed an assertion; the worker only delivers.
+        ("ForwardAppRequest", &[Caller::Manager]),
     ]
 }
 
@@ -280,6 +283,18 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
             .stop_session(legion::structs::StopSessionRequest {
                 session_id: "workspace-not-running".into(),
                 ticket: String::new(),
+            })
+            .await
+            .map(|_| ()),
+        // An allocation this worker does not run: NotFound once admitted.
+        "ForwardAppRequest" => client
+            .forward_app_request(legion::structs::ForwardAppRequestRequest {
+                allocation_id: 404,
+                job_id: "legion-system/fake".into(),
+                port: "api".into(),
+                method: "GET".into(),
+                path: "/legion/v1/views/job".into(),
+                ..Default::default()
             })
             .await
             .map(|_| ()),

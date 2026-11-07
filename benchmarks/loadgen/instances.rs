@@ -252,6 +252,7 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
                 priority: None,
                 force_reschedule: false,
                 idempotency_key: None,
+                allow_unknown_fields: Default::default(),
             }))
             .await
             .context("submitting the instances job")?;
