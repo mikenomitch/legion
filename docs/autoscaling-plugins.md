@@ -129,6 +129,13 @@ should only add capacity can answer 0 outside its window.
 
 ## Targets: `target/status`, `target/scale`, `target/terminate`
 
+A target is named by an `autoscaler/ScalingPolicy` object's
+`spec.target.plugin` (a target outside Legion), or by an
+`autoscaler/NodeGroup`'s `spec.target.nodes.plugin` ([Standalone
+policies](autoscaling.md#standalone-policies), [Node
+groups](autoscaling.md#node-groups)), written with `legion object apply`.
+`params.policy` is the object's `namespace/name` (a node group's `name`).
+
 ```json
 → {"jsonrpc":"2.0","id":4,"method":"target/status",
    "params":{"policy":"media/render-farm","config":{"pool":"gpu"}}}
@@ -158,7 +165,7 @@ should only add capacity can answer 0 outside its window.
 
 A target that runs a node group declares `capabilities.nodes = true` in its
 `initialize` answer. The autoscaler refuses to run a node group on a target
-that does not (the policy reads `invalid`), and the built-in `noop` target
+that does not (the group reads `Rejected: Invalid`), and the built-in `noop` target
 does not; the `exec` builtin does. A node target:
 
 - **`target/status`** returns `count` (the instances the provider holds,
@@ -199,7 +206,9 @@ Legion already uses.
 | `target/scale` | `ssm:PutParameter` (the join token, as a `SecureString`, when `joinTokenParameter` is set), then `SetDesiredCapacity` |
 | `target/terminate` | `TerminateInstanceInAutoScalingGroup` with `ShouldDecrementDesiredCapacity`, per instance |
 
-Install it in the autoscaler's app config, and name it from a node group:
+Install it in the autoscaler's app config, and name it from an
+`autoscaler/NodeGroup` (`configs/scaling/nodes-aws.ncl`, applied with
+`legion object apply -f`):
 
 ```nickel
 # legion app config set autoscaler -f autoscaler.ncl

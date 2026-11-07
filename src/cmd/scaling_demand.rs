@@ -3,12 +3,13 @@
 //! demand").
 //!
 //! One template from flags, or any number from a file (`-f`): Nickel or
-//! JSON holding a node-group policy (its `name` and `target.nodes` are the
-//! template, so the file `legion scaling apply` will take works as is), a
-//! bare template `{ name, pool, workerType, shape, likeNode, upcoming }`,
-//! or a list of either.
+//! JSON holding an `autoscaler/NodeGroup` object (its name and
+//! `spec.target.nodes` are the template, so the file `legion object apply`
+//! takes works as is), a bare template `{ name, pool, workerType, shape,
+//! likeNode, upcoming }`, or a list of either.
 
 use crate::autoscaler::nodes::{NodeGroupPolicy, NodeShape};
+use crate::autoscaler::policy;
 use crate::cmd::helpers::{connect_manager_client, json_flag};
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
@@ -47,7 +48,8 @@ pub fn demand_command() -> Command {
         namespaces, constraints, distinct, static ports, resources, gangs),\n\
         and reports the nodes needed and the replicas no template can host,\n\
         with the rule that fails. Read-only. One template from the flags, or\n\
-        several from -f (a node-group policy, a template, or a list).\n\
+        several from -f (an autoscaler/NodeGroup object, a template, or a\n\
+        list).\n\
         \n\
         Examples:\n\
         \x20 legion scaling demand --pool gpu --cpu 16000 --memory 65536 --attr gpu=a100\n\
@@ -60,7 +62,7 @@ pub fn demand_command() -> Command {
                 .long("file")
                 .value_name("PATH")
                 .value_hint(ValueHint::FilePath)
-                .help("Nickel or JSON: a node-group policy, a template, or a list of either")
+                .help("Nickel or JSON: an autoscaler/NodeGroup object, a template, or a list of either")
                 .conflicts_with_all([
                     "name",
                     "pool",
@@ -170,9 +172,21 @@ fn proto_shape(shape: &NodeShape) -> R<NodeGroupShape> {
 }
 
 fn template_from_value(value: Value) -> R<NodeGroupTemplate> {
-    if value.get("target").is_some() {
+    if let Some(kind) = value.get("kind") {
+        let kind = kind.as_str().unwrap_or_default();
+        if kind != policy::NODE_GROUP {
+            bail!(
+                "an object of kind {kind:?} is not a node group: name {}",
+                policy::NODE_GROUP
+            );
+        }
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .context("the object has no name")?;
+        let spec = value.get("spec").cloned().unwrap_or(Value::Null);
         let policy: NodeGroupPolicy =
-            serde_json::from_value(value).context("not a node-group policy")?;
+            policy::parse_node_group(name, &spec).map_err(|err| anyhow!(err))?;
         let policy_name = policy.name.clone();
         let effective = policy.resolve().map_err(|err| anyhow!(err))?;
         return Ok(NodeGroupTemplate {
@@ -466,13 +480,16 @@ mod tests {
             &path,
             serde_json::to_string(&json!([
                 {
+                    "kind": "autoscaler/NodeGroup",
                     "name": "workers-general",
-                    "target": { "nodes": {
-                        "workerType": "default",
-                        "shape": { "cpu": 8000, "memory": 16384 },
-                        "plugin": "aws-asg",
-                    } },
-                    "max": 20,
+                    "spec": {
+                        "target": { "nodes": {
+                            "workerType": "default",
+                            "shape": { "cpu": 8000, "memory": 16384 },
+                            "plugin": "aws-asg",
+                        } },
+                        "max": 20,
+                    },
                 },
                 { "name": "gpu", "pool": "gpu", "shape": { "cpu": 16000 }, "upcoming": 2 },
             ]))?,
@@ -490,7 +507,7 @@ mod tests {
 
         std::fs::write(
             &path,
-            r#"{ "name": "x", "max": 1, "target": { "nodes": {} } }"#,
+            r#"{ "kind": "autoscaler/NodeGroup", "name": "x", "spec": { "max": 1, "target": { "nodes": {} } } }"#,
         )?;
         let err = templates_from_file(path.to_str().context("utf-8")?).unwrap_err();
         assert!(format!("{err:#}").contains("entry 0"), "{err:#}");

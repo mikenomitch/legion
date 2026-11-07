@@ -237,6 +237,7 @@ impl Authenticator {
             source: AclSource::Anonymous,
             expires_at: None,
             audit_only: self.audit_only,
+            acting_for: None,
         })
     }
 
@@ -300,6 +301,7 @@ impl Authenticator {
             source: AclSource::Token,
             expires_at: record.expires_at.clone(),
             audit_only: self.audit_only,
+            acting_for: None,
         })
     }
 
@@ -351,6 +353,7 @@ impl Authenticator {
             source: AclSource::Jwt,
             expires_at: verified.expires_at,
             audit_only: self.audit_only,
+            acting_for: None,
         })
     }
 
@@ -898,6 +901,19 @@ pub fn enforce(
     // An app acting for a viewer holds one target's permission; a reach
     // hint read off its rule ("this token can write scale in default")
     // would suggest the whole namespace.
+    // An app acting for an object holds the object's recorded authority
+    // within its grant: name that, not a reach read off synthesized rules.
+    if identity.source == AclSource::ForObject {
+        return Err(Status::permission_denied(format!(
+            "permission denied: {}:{} is outside what {} holds\n\
+             Hint: an app acting for an object holds only the permissions the object's writer \
+             was checked for (its recorded authority, `legion object get`), within the app's \
+             own grant; re-applying the object as someone who holds more records more",
+            resource.as_str(),
+            action.as_str(),
+            identity.principal,
+        )));
+    }
     if identity.source == AclSource::Delegated {
         return Err(Status::permission_denied(format!(
             "permission denied: {}:{} is outside what {} delegates\n\
@@ -1309,6 +1325,7 @@ mod authenticator_test {
         // Audit-only mode logs the mismatch but lets it through.
         let audit_worker = AclIdentity {
             audit_only: true,
+            acting_for: None,
             ..worker
         };
         assert!(enforce_node_binding(&audit_worker, "worker-b").is_ok());

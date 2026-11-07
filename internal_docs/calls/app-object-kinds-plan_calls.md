@@ -1,0 +1,1637 @@
+# Judgement Calls: app-object-kinds-plan
+
+Decisions made while designing and building
+[`plans/app-object-kinds-plan.md`](../plans/app-object-kinds-plan.md).
+**Entries are ordered by project impact, highest first, and an entry's
+number is its rank.**
+
+**Revised after adversarial review (2026-10-29).** Three reviews (of this
+plan, and of the apps substrate's security and correctness) changed O1
+before it shipped. Entries 1-59 are the decisions as they stand (28-31 were made while
+building O1, 32-43 building O2, 44-52 building O3, 53-59 building O4); entries 60-66 are the
+original entries they supersede, kept as written at the end
+so the reasoning that lost is not silently dropped. The guiding principle
+the review added: **an object can never make its app do more than its
+writer could do directly, and the write path never depends on the app being
+up.** Most of the new entries follow from it.
+
+## 1. An object's contents are authorized against its writer: `requires` with spec pointers, fail-closed, in core, recorded as `authority`
+
+*Adversarial review.* **Call.** A kind declares `requires`: permissions
+writing an object needs, whose scope may come from the object's contents
+through JSON pointers. The manager resolves them against the effective spec
+and checks them as the writer, with the scope the corresponding core RPC
+builds, on apply and on delete, fail-closed, with no app call. The resolved
+list is stored on the object as `authority`, with who authorized it and
+when.
+
+```nickel
+requires = [
+  { resource = "job", actions = ["write"], namespace = "/spec/targetNamespace" },
+  { resource = "kv",  actions = ["read"],  path = "/spec/credentials/kv" },
+  { resource = "job", actions = ["write"], host = true, when = "/spec/allowHost" },
+  { resource = "operator", actions = ["write"] },
+]
+```
+
+```text
+Error: writing gitops/Repo team-a/storefront needs job:write in team-b (from spec.targetNamespace), which your token does not hold
+```
+
+**Alternatives.** (a) The original `writeRequires`, checked on the object's
+own namespace and name (entry 60): a team lead with `job:write` on
+`names = ["storefront"]` could write a Repo named `storefront` that deploys
+`billing`, or into `team-b`; a tenant without `host = true` could have the
+app deploy host-level jobs; a `credentials.kv` field could make the app read
+another team's secret. (b) Leave cross-references to the app's validate
+call, which fails open and which a writer can make time out. (c) Reconcile
+as the writer's current rights through delegation (entry 26).
+
+**Trade-off.** A kind's author must describe, in pointers, what its objects
+make the app do; a requirement the author forgets is not checked until O3
+bounds the app by `authority`. Pointers are a small language of their own
+(string or list, fallbacks, `when`). An upgrade that tightens `requires`
+does not re-authorize stored objects.
+
+**Why (security, simplicity).** It is the only place the check can be both
+binding and independent of the app: core already does exactly this for
+jobspec credentials (`enforce_kv_credential_read`: "job submit access would
+be a way to exfiltrate any secret in KV"). Recording `authority` gives O3 a
+fixed, auditable bound for the app's object-scoped calls rather than the
+kind's current declaration.
+
+## 2. Status is its own row, on the Status lane; the CAS token is `specVersion`, which status never moves
+
+*Adversarial review.* **Call.** An object's status lives in
+`app_object_status`, keyed by the object's `uid`, on the Status lane beside
+`node_health` and `task_status`. Status writes never touch the Control lane,
+never move `specVersion` (the apply and delete CAS token), and never wake
+watches. Identical writes are dropped without a raft proposal. Status CAS is
+the uid plus a generation that never goes backwards and never exceeds what
+the replica sees. Only the owning app writes it (app-plane), and a person's
+apply refuses a file that sets `status`. Status is for facts that change
+when the world changes; per-tick numbers stay in memory.
+
+**Alternatives.** The original plan (entry 62): status in the spec row on
+the Control lane, every write a new `version`. Or Kubernetes' status
+subresource with RBAC (anyone granted it writes).
+
+**Trade-off.** Cross-lane lag: the Status leader may see an older
+generation than the Control leader, so a status write can be refused as
+"ahead of the spec" until the lane catches up, and a reader must use
+`observedGeneration` to know which spec a status describes. Two tables to
+keep consistent: status rows for deleted objects are swept, not deleted in
+the same entry.
+
+**Why (performance).** After O2, 10,000 policies reporting every 15 seconds
+would have been about 670 Control-lane entries a second, every one waking
+every app's watch, echoing back to the autoscaler, flooding the event
+journal, and making a person's `--expected-version` stale within a tick.
+Legion already learned this with node liveness (phase C-1); this follows
+its own precedent.
+
+## 3. A kind's name is `<app>/<Kind>`; files and the API require it, short names are a CLI convenience
+
+*Adversarial review.* **Call.** Two apps may both declare `Repo`; they are
+`gitops/Repo` and `reposync/Repo`. Install refuses only a duplicate within
+one app or a reserved noun. Object files and `ApplyObject` require the
+qualified kind; `get`, `list`, `delete`, and `explain` take a short name in
+any case, plural optional, when exactly one kind matches.
+
+```text
+Error: kind "Repo" must be qualified with its app: kind = "gitops/Repo"
+Error: "repo" names 2 kinds: gitops/Repo, reposync/Repo
+Hint: name one: legion object get gitops/Repo storefront
+```
+
+**Alternatives.** The original (entry 63): flat names unique cluster-wide,
+refused at install. A `--kind Repo=SyncRepo` rename at install, mirroring
+`--key`.
+
+**Trade-off.** Files are wordier (`kind = "gitops/Repo"`), and an
+interactive short name can stop working the day a second app with the same
+noun is installed (the error says what to type instead).
+
+**Why (simplicity, extensibility).** A file has to mean the same thing
+forever: with short names in files, installing an unrelated app would break
+every GitOps repository that used the noun. That is why Kubernetes requires
+`apiVersion` and `kind` in every manifest. And common nouns (`Repo`,
+`Certificate`, `Route`) would have made third-party apps mutually exclusive
+in a way only their authors could fix.
+
+## 4. Objects are one generic table; state is derived on read
+
+*Revised by the adversarial review.* The table, keyed by (app, kind, namespace, name) with a never-reused `uid`, stands. The spec is no longer stored exactly as written: defaults are persisted at write (entry 6), and status moved to its own table (entry 2). What is still derived on read is the state (`valid`, `invalid`, `orphaned`) and the defaults of fields an upgrade added. The original text follows; its defaults-on-read argument is superseded by entry 6.
+
+**Call.** Every app's objects live in one Control-lane table, `app_object`,
+keyed by (app, kind, namespace, name). The spec is stored exactly as
+written; the effective spec (schema defaults filled) and the state
+(`valid`, `invalid`, `orphaned`) are computed on every read against the
+kind as installed *now*.
+
+```console
+$ legion object get repo storefront -n team-a
+Repo team-a/storefront (gitops)  valid  generation 4  version 118
+spec:      {"url":"https://github.com/acme/deploy"}
+effective: {"branch":"main","path":".","url":"https://github.com/acme/deploy"}
+```
+
+**Alternatives.** (a) A table per kind, created at install: what a
+database-minded design does, with typed columns and indexes per kind.
+(b) Kubernetes' behavior: defaults are applied and *stored* on write
+(`apiserver` defaulting), and a validity flag is written when an upgrade
+re-validates.
+
+**Trade-off.** Every read re-checks the spec against the compiled schema
+(cached by digest, so one validation per object per read, no compile), and
+a list of 10,000 objects validates 10,000 specs. Nothing can index into a
+spec's fields; `-l` filters by labels only. Accepted until a kind has that
+many objects; the autoscaler's 10,000-policy load test in O2 is the first
+place it will show.
+
+**Why (simplicity, extensibility).** One table means installing an app runs
+no DDL on a replicated store, raft ownership is one line, and an uninstall
+leaves rows rather than orphaned tables. Deriving state on read is the
+jobspec-extension rule (apps calls 85-86): an upgrade that adds a default or
+tightens a schema reaches every object at once with no rewrite, which an
+upgrade over a raft log would otherwise have to batch and could leave half
+done.
+
+## 5. The access mapping is pinned to `object`, `job`, `scale`, `node`, checked namespace-wide, and `*` keeps its meaning
+
+*Adversarial review.* **Call.** `access.resource` is `object` (the default),
+`job`, `scale`, or `node`; install refuses anything else. A mapped
+namespaced kind is checked on the object's namespace with name `*`, so
+job-name selectors never decide who writes objects; a `job` mapping carries
+`band = "normal"` as a submit does. A mapped cluster kind is checked on
+`AclScope::none()`. Per-name control is the `object` resource's `names`.
+A `resources = ["*"]` rule reaches objects of every kind in its
+namespaces, as `*` reaches everything else.
+
+```nickel
+{ resources = ["scale"], actions = ["write"], namespaces = ["media"] }                    # writes ScalingPolicies in media
+{ resources = ["scale"], actions = ["write"], namespaces = ["media"], names = ["web-*"] }  # does not: it is about jobs
+```
+
+**Alternatives.** The original (entry 60): any resource, scoped as "a job
+named like the object", which let `names = ["web-*"]` grant writes to a
+policy named `web-proxy`, failed band-scoped rules silently, and could map
+onto `acl` or `state`. Kubernetes' choice: no mapping, every kind its own
+resource. Making `*` skip `object` unless the rule names `kinds`.
+
+**Trade-off.** A mapped kind cannot be granted per name. `*` rules reach
+kinds installed later, so §10's original "default-deny" claim was false and
+is corrected: the bound is `requires` (entry 1), not the mapping.
+
+**Why (simplicity).** A few documented translations are explainable; an
+arbitrary one is a coincidence trap. Keeping `*` meaning everything avoids
+a special case every policy author would trip over.
+
+## 6. Defaults are persisted at write
+
+*Adversarial review.* **Call.** The stored spec is the written spec plus the
+defaults of the schema current at write. On read, defaults fill only fields
+the stored spec lacks (fields an upgrade added). The upgrade prompt reports
+changed defaults:
+
+```text
+gitops/Repo.branch default "main" → "trunk": 14 existing Repos keep "main"; re-apply to adopt
+```
+
+**Alternatives.** The original (entry 4's superseded half): store as
+written, fill every default on read, so an upgrade's new default reaches
+every object that did not set it.
+
+**Trade-off.** Changing a default no longer reaches existing objects; their
+owners re-apply. The stored spec is not exactly what the person wrote
+(`legion object get` shows the stored spec; the dry-run diff compares what
+is stored).
+
+**Why (correctness).** Defaults filled on read let an upgrade silently
+redeploy every Repo from another branch with no generation bump, no event,
+no actor, and an `observedGeneration` that claims the app reconciled a spec
+it never saw. Kubernetes persists defaults for the same reason.
+
+## 7. Kind definitions persist in `object_kind`; orphans keep their schema and access mapping
+
+*Adversarial review.* **Call.** One Control-lane row per (app, kind) holds
+the declaration, manifest digest, and state (`active` or `orphaned`).
+Uninstalling with `--force`, or dropping a kind with `--force`, marks it
+`orphaned` and keeps the declaration, so its objects are read and deleted
+with the kind's own access mapping, schema, and columns. The rows are
+derived from the app records by an idempotent sync after every app write
+and on the reconciler's full pass; an orphaned row with no objects left is
+dropped.
+
+**Alternatives.** The original (entry 61): orphans fall back to the `object`
+resource, which locked `scale:write` holders out of the ScalingPolicies
+they wrote. Storing the access resource on every object row.
+
+**Trade-off.** A second source of truth beside the app record, kept in step
+by a sync rather than in the same raft entry: between an app write and its
+sync (normally the same request), kinds can lag the record.
+
+**Why (simplicity).** One row per kind is the natural home for "what this
+kind was", and the orphan rule stays one sentence: an orphan answers to the
+rules its kind had.
+
+## 8. The validate call fails open, and is advice, never a control
+
+*Revised by the adversarial review.* The call stands, but its role is narrowed: because a writer can make it time out (a tarpit URL in a field the app probes), it is user experience only. Everything a writer must be refused is in core: the schema, `immutable`, and `requires` (entry 1). The public doc says so.
+
+**Call.** A kind with `validate = true` is checked by its app on every apply,
+with two seconds to answer; an app that is disabled, unreachable, slow, or
+answers anything but `200` lets the write through with a warning.
+
+```text
+warning: Repo team-a/storefront was not checked by the gitops app (did not answer within 2s); the schema check passed
+```
+
+**Alternatives.** Fail closed: Kubernetes admission webhooks with
+`failurePolicy: Fail`, which is what makes an app's checks binding.
+
+**Trade-off.** A write can store an object the app would have refused.
+The app must check again when the object reaches it on its watch, and say so
+in the object's status. O2 makes this concrete: an unknown scaling plugin
+surfaces in status, not at apply, while the autoscaler is down.
+
+**Why (simplicity).** The same rule as jobspec extensions (apps calls 87),
+for the same reason: a broken add-on must never block writes, and the
+Kubernetes failure mode (a webhook down blocks every write it covers) is
+the one lesson the prior art teaches loudest.
+
+## 9. Bounded cleanup instead of finalizers; objects are namespace contents
+
+*Adversarial review.* **Call.** A kind may declare `cleanup = "10m"` (at
+most `1h`). Deleting such an object marks it deleting (its spec freezes),
+the app sees it on its watch and calls `ReleaseObject` when done, and at the
+deadline (or at once when its kind is orphaned) the manager removes it
+anyway, emitting `object.cleanup_abandoned`. Objects count as namespace
+contents: a namespace delete is refused while non-deleting objects remain,
+and `--cascade` deletes them with the caller's per-kind access and
+`requires` checked for each.
+
+**Alternatives.** Kubernetes finalizers (an object stays until its
+controller removes the finalizer). The original plan (entry 65): deleting a
+namespace leaves its objects.
+
+**Trade-off.** An app that needs longer than an hour to release external
+resources must do the rest from its own records, keyed by `uid`. A cascade
+can be refused because the caller lacks one kind's access.
+
+**Why (simplicity).** Nothing can stay stuck: the stuck `Terminating`
+namespace is Kubernetes' most familiar failure. And leaving objects behind
+let a recreated namespace resurrect another team's Repos for GitOps to
+deploy with its own grant.
+
+## 10. Schemas are closed by default, with `immutable` and `writeOnly` fields; CEL `rules` wait for O4
+
+*Adversarial review.* **Call.** A schema with `properties` and neither
+`additionalProperties` nor `patternProperties` is treated as
+`additionalProperties = false` (`allOf`/`anyOf`/`oneOf` branches excepted),
+so an unknown field is an error naming its path, as an unknown jobspec key
+is. `immutable` lists pointers an update may not change, checked in core.
+`writeOnly: true` marks secrets, redacted on every read but the owning
+app's watch and in diffs, events, and errors. `rules` (CEL) is reserved and
+refused until O4.
+
+```text
+Error: gitops/Repo team-a/storefront: spec.brnach: unknown field (did you mean branch?)
+Error: gitops/Repo team-a/storefront: spec.url is immutable (was "https://github.com/acme/deploy"); delete and recreate the object to change it
+```
+
+**Alternatives.** Open schemas (the original: only where the author wrote
+`additionalProperties = false`). CEL now (`cel-interpreter` 0.10, MIT).
+
+**Trade-off.** Composed schemas (`allOf` of property sets) must opt out
+explicitly; cross-field checks (`min <= max`) wait for O4 and sit with the
+app's `Accepted` condition meanwhile, which is the regression O2 records.
+
+**Why (simplicity).** "Told at apply, with the path" is the job the job
+author asked for, and Legion already made jobspecs strict for it. CEL is a
+new language and dependency whose cost bounds need their own design; draft-7
+conditionals, `immutable`, and `Accepted` cover the interim.
+
+*Phase O4 shipped `rules` (entries 53-59).*
+
+## 11. Status has a standard envelope, and the manager derives a summary anyone can wait on
+
+*Adversarial review.* **Call.** Status is `{ observedGeneration, conditions,
+fields }`, with standard condition types `Accepted` and `Ready`; the
+manager derives `Pending`, `Ready`, `NotReady: <reason>`, `Rejected:
+<reason>`, `Stale`, `Invalid`, `Orphaned`, or `Deleting` for every object,
+and `legion object apply --wait` waits on it for every kind.
+
+**Alternatives.** Free-form status JSON (the original), leaving readiness
+per kind.
+
+**Trade-off.** Apps must speak conditions; a kind whose app sets neither
+`Accepted` nor `Ready` reads `Pending` forever and `--wait` times out.
+
+**Why (simplicity, agents).** A generic wait is what lets GitOps and agents
+treat every kind the same, the lesson of Kubernetes' kstatus.
+
+*Built (O1).* The summary gained `Accepted`: an app that reports only
+`Accepted=true` (a kind with nothing further to reconcile) reads `Accepted`,
+and `--wait` succeeds on it, rather than `Pending` forever. Precedence is
+`Orphaned`, `Deleting`, `Invalid`, `Stale`, `Pending`, `Rejected`,
+`NotReady`, `Ready`, `Accepted` (`summarize` in
+`src/structs/app_object.rs`; docs/app-objects.md, "Status").
+
+## 12. Object events reach only callers who may read the kind there, and carry no values
+
+*Adversarial review.* **Call.** `object.*` events carry the kind's access
+resource and the object's scope in metadata, and a tenant's feed shows one
+only when it may read that kind on that scope (operators see all). Events
+carry the ref, uid, generation, actor, and condition transition, never spec
+or status values.
+
+**Alternatives.** The original: namespaced object events reach whoever
+reaches the namespace, as `namespace.*` events do.
+
+**Trade-off.** An event records the access the kind had when it was
+emitted; an upgrade that changes the mapping does not re-filter history.
+
+**Why (security).** Reaching a namespace is any allow rule there
+(`exec:read` will do), so the original leaked the names, kinds, and writers
+that `GetObject` hides behind check-before-fetch.
+
+## 13. Objects have a never-reused `uid`
+
+*Adversarial review.* **Call.** Every object gets a `uid` at create, a value
+of a never-repeating counter. Status, the watch's tombstones, and app-side
+state (O2's pauses and intents) key on it.
+
+**Alternatives.** Key everything by (app, kind, namespace, name), as the
+original did.
+
+**Trade-off.** One more identifier in every API object.
+
+**Why (correctness).** Without it, a delete and a recreate under the same
+name inherits stale status, a pause, or a half-done drain.
+
+## 14. `object` is a namespaced resource; a cluster kind's objects carry namespace `*`
+
+**Call.** The new `object` resource is namespaced, so its rules carry
+`namespaces`. A cluster kind's object is checked with the namespace `*` on
+its scope, which only a rule reaching every namespace (`namespaces =
+["*"]`) matches.
+
+```nickel
+{ resources = ["object"], actions = ["write"], namespaces = ["*"], kinds = ["backup/Schedule"] }   # cluster kind
+{ resources = ["object"], actions = ["write"], namespaces = ["team-a"], kinds = ["gitops/Repo"] }  # namespaced kind
+```
+
+**Alternatives.** (a) Two resources, `object` (namespaced) and
+`clusterobject`. (b) A cluster-scoped `object` resource with namespaces
+matched as an ordinary selector.
+
+**Trade-off.** "Write cluster objects" reads as "write in every namespace",
+which over-reaches for a rule that also covers namespaced kinds: `kinds =
+["gitops/*"]` with `namespaces = ["*"]` covers both gitops's cluster kinds
+and its namespaced ones everywhere. Narrow with `kinds`.
+
+**Why (simplicity).** One resource, and the namespace rules
+(`namespaces` required, the reserved `legion-*` prefix) work unchanged. The
+`*` namespace is already how Legion scopes an object no namespace owns
+(`AclScope::unowned`, unowned volumes), so it is not a new idea to explain.
+
+## 15. Objects an app writes are `managedBy` it, and a person needs `force` to change them
+
+*Adversarial review.* **Call.** An apply by an app's own identity stamps the
+object `managedBy = <app>`, as the jobs an app submits are stamped. A
+person's apply or delete of a managed object needs `--force`. A delegated
+viewer identity (`alice via app gitops`) counts as the person.
+
+**Alternatives.** Only the owning app may write spec (Kubernetes has no
+such rule either), or no distinction.
+
+**Trade-off.** One more flag a person may need.
+
+**Why (simplicity).** Apps create objects too (cert-manager creates its own
+children); a person editing one should know an app will likely overwrite
+it, as with an app's job.
+
+## 16. Objects have size limits and a per-kind `maxObjects`
+
+*Adversarial review.* **Call.** A spec is at most 64 KiB after defaults,
+status `fields` 16 KiB, 32 labels; a kind's `maxObjects` (default 10,000, at
+most 100,000) is enforced inside the replicated write that creates an
+object. Per-namespace quotas are deferred to namespace policy.
+
+**Alternatives.** No limits (the original); per-namespace quotas now.
+
+**Trade-off.** One tenant can still use a kind's whole `maxObjects`.
+
+**Why (performance).** Anyone with `object:write` in one namespace could
+otherwise grow the Control lane's snapshot and every app's relist.
+
+## 17. The watch chunks its snapshot, carries uids and tombstones, and polls a per-app fingerprint; no resume yet
+
+*Adversarial review.* **Call.** `WatchObjects` sends its snapshot in
+messages of at most 1,000 objects, the last marked `snapshotDone`; deletes
+are tombstones with the uid; it polls, every second, a fingerprint of the
+calling app's rows and kinds only, so other apps' writes and every status
+write leave it asleep; the 64-shard value is a stored column the query
+filters on. There is no `since_version` resume: a reconnect relists.
+
+**Alternatives.** The original (entry 64): one snapshot message and a
+table-wide fingerprint. A change log with tombstone retention and resume.
+
+**Trade-off.** Every reconnect is a full relist, fine to about 50,000
+objects per app; past that, resume needs a change log.
+
+**Why (performance, simplicity).** It takes what `WatchScalingPolicies`
+already learned (chunking) and stops one app's churn costing every other
+app, without a new table.
+
+The original entry's claim that the poll's cost "was measured acceptable"
+(citing apps calls 90) was unsupported: that entry records no measurement.
+Nothing has been measured for this watch either; the bound above is an
+estimate from the relist cost, and resume is the follow-up if it is wrong.
+
+## 18. Watch shards use the autoscaler's FNV-1a over a per-object key, not the extensions' SHA-256 of the job id
+
+**Call.** `WatchObjects` shards by FNV-1a 64 of `<app>/<Kind>:<id>` modulo
+`shard_count`, the hash and 64-shard count the autoscaler's Phase 7 leases
+use.
+
+**Alternatives.** The `WatchAppExtensions` hash (SHA-256 of the canonical
+job id), so the two app-plane watches agree with each other.
+
+**Trade-off.** The two watches shard differently. An app that shards both
+its extension values and its objects holds two sets of leases, or one set
+interpreted two ways.
+
+**Why (extensibility).** The only sharded app is the autoscaler, and O2 moves
+its policies onto objects: matching its hash means its lease code is
+untouched and a replica's shard set means the same thing on both of its
+streams (`WatchScalingPolicies` for tasks, `WatchObjects` for standalone
+policies).
+
+## 19. No schema versions or conversion in v1
+
+**Call.** A kind has one schema. An upgrade that changes it re-checks every
+object and flags failures `invalid`; nothing converts them.
+
+**Alternatives.** Kubernetes' versioned CRDs with a storage version and
+conversion webhooks.
+
+**Trade-off.** An app that renames a field breaks its users' objects until
+they re-apply. Apps must evolve schemas additively or accept that.
+
+**Why (simplicity).** Legion has no installed base (AGENTS.md); conversion
+webhooks are the most complex part of CRDs and the most often broken. The
+upgrade prompt makes the cost visible before anyone pays it.
+
+## 20. The reserved-noun list is every CLI noun, every ACL resource, and the core object nouns
+
+*Revised by the adversarial review*: unchanged, except that the error now names the qualified kind and the list also reserves `spec` and `status`.
+
+**Call.** A kind may not be named, in any case, singular or plural, after a
+top-level CLI noun (`job`, `node`, `scaling`, `events`, …), an ACL resource
+(`object`, `scale`, …), or a core object noun that is not a top-level
+command (`task`, `group`, `allocation`, `policy`, `token`, `grant`,
+`rollout`, `eval`, `pool`, `secret`, `user`, `kind`, …). The list is
+`RESERVED_KIND_NOUNS`, and a test checks it covers every top-level CLI
+command.
+
+```text
+Error: app gitops: kinds (Policy): `Policy` is a Legion noun (policy) and is reserved; pick a name that says what the app means (RolloutPolicy, ScalingPolicy)
+```
+
+**Alternatives.** Reserve only what collides with a CLI path today.
+
+**Trade-off.** `Policy`, `Token`, and `Secret` are natural names apps lose.
+`ScalingPolicy` is fine: only exact nouns are reserved.
+
+**Why (simplicity).** An object called `Job` that is not a job is the kind
+of ambiguity that costs an incident; the test keeps the list honest as
+commands are added.
+
+## 21. A cluster kind ignores the request's default namespace but refuses a namespace written in the object
+
+**Call.** `ApplyObject` takes the object (which may say `namespace`) and a
+default namespace (the CLI's `-n` or `LEGION_NAMESPACE`). For a cluster
+kind, the default is ignored with a warning; a namespace written in the
+object is an error. `get` and `delete` ignore the namespace for a cluster
+kind.
+
+**Alternatives.** (a) Refuse any namespace on a cluster kind (then an
+exported `LEGION_NAMESPACE` breaks every cluster apply). (b) Ignore both
+silently, as kubectl does (kubectl#1413).
+
+**Trade-off.** Two rules where one would be simpler to state.
+
+**Why (simplicity).** Each matches what the user meant: an environment
+default is not a statement about this object, and a file that says
+`namespace = "x"` for a cluster kind is a mistake worth stopping.
+
+## 22. A cleanup ends with a `ReleaseObject` RPC, not a flag on the status write
+
+*Adversarial review.* **Call.** The app ends a deleting object's cleanup
+with `ReleaseObject`, an app-plane Control-lane write that removes the row
+when the uid still matches.
+
+**Alternatives.** `UpdateObjectStatus` with `release = true`.
+
+**Trade-off.** One more RPC.
+
+**Why (simplicity).** Status writes are Status-lane and releasing deletes a
+Control-lane row; one RPC doing both would be two raft entries on two lanes
+pretending to be one.
+
+## 23. O2 keeps scaling defaults in core
+
+**Call.** When the autoscaler's standalone policies become objects, the
+cluster's scaling defaults (`legion scaling defaults apply`) stay a core
+table and RPC.
+
+**Alternatives.** Make them a `ScalingDefaults` kind the autoscaler owns.
+
+**Trade-off.** One autoscaler concept stays outside the generic system.
+
+**Why (correctness).** The manager resolves a task's `autoscale` against the
+defaults at submit and in `job plan`, synchronously, and must not depend on
+an app being up to admit a job.
+
+## 24. Applying an object of a kind not installed yet fails retryably; pending objects are deferred
+
+*Adversarial review.* **Call.** `ApplyObject` of a kind no app declares
+fails with `KIND_NOT_INSTALLED` on a retryable status.
+
+**Alternatives.** `--allow-pending`: store it and adopt it at install if its
+writer still passes `access` and `requires`, as pending jobspec values are.
+
+**Trade-off.** A GitOps sync that applies an app and its objects in one
+pass needs a retry.
+
+**Why (simplicity).** Retrying converges with no new state; pending objects
+can come when GitOps needs them.
+
+## 25. Object versions come from the `app_object` counter in `scaling_counter`
+
+*Revised by the adversarial review*: the counter now also mints `uid`s and `specVersion`s; status has no version.
+
+**Call.** `version` is the next value of the `app_object` counter in the
+existing `scaling_counter` table.
+
+**Alternatives.** A new counter table, or `MAX(version) + 1`.
+
+**Trade-off.** A table named for scaling holds a counter for every app's
+objects.
+
+**Why (simplicity).** The table is a generic name-to-counter map on the
+Control lane already, and `MAX + 1` would repeat a version after the newest
+object is deleted and recreated, which breaks CAS.
+
+## 26. O3 bounds an app by the authority recorded at write, not by its writer's current rights
+
+*Adversarial review.* **Call.** When an app acts for an object (O3), the
+manager evaluates the call as the app's grant intersected with the object's
+recorded `authority`. Authority is not revoked when the writer later loses
+rights; `legion object list --authority-lapsed` finds such objects, and a
+re-apply re-authorizes.
+
+**Alternatives.** Reconcile as the writer's current rights (the plan
+review's option C), through the delegation that shipped for actions.
+
+**Trade-off.** A writer who loses a permission keeps their past objects'
+power until someone re-applies them.
+
+**Why (correctness).** A departing engineer must not break production
+deploys (Kubernetes and Flux semantics); the lapsed list makes the gap
+visible instead.
+
+*Built in Phase O3:* entry 44 (the identity, and this alternative's full
+trade-off) and entry 47 (the lapsed list).
+
+## 27. Every pointer in a kind's declaration points into the object document
+
+**Call.** `requires`, `immutable`, and `columns` all take JSON pointers into
+the object as `legion object get -j` shows it (`/spec/url`,
+`/status/fields/commit`, `/name`).
+
+**Alternatives.** Pointers into the spec for `immutable` (`/url`), as the
+review's sketch wrote it.
+
+**Trade-off.** Every spec pointer starts with `/spec`.
+
+**Why (simplicity).** One convention for three fields; a pointer means the
+same thing wherever it is written.
+
+## 28. The owning app has no implicit rights over its kind's objects
+
+*Built (O1).* **Call.** An app's own identity reads and writes objects,
+including its own kind's, only as its grant allows: a `gitops` that writes
+Repos lists `{ resources = ["object"], kinds = ["gitops/Repo"], ... }` in its
+manifest's `permissions`, and its writes are checked against `requires` like
+anyone's. Only the app-plane calls (`WatchObjects`, `UpdateObjectStatus`,
+`ReleaseObject`) are implied by owning the kind.
+
+**Alternatives.** Implicit `object:read`/`write` on the app's own kinds for
+its identity, as owning a kind might suggest.
+
+**Trade-off.** One more permission line in a manifest that writes its own
+objects, and the installer must hold it.
+
+**Why (security, simplicity).** The guiding principle: the grant shown at
+install is everything the app can do. An implicit right would be a second,
+unprompted grant, and an app writing objects without `requires` would be the
+confused deputy entry 1 exists to stop.
+
+## 29. A caller with no object rights at all cannot tell which kinds exist
+
+*Built (O1).* **Call.** `ApplyObject`, `GetObject`, `ListObjects` with a
+kind, and `DeleteObject` first check that the caller may read (or write)
+some kind's objects somewhere, or `object` anywhere, before resolving the
+typed kind; only then does an unknown kind read `unknown kind "x" (did you
+mean ...)`.
+
+**Alternatives.** The plan's order: resolve the kind (public metadata)
+first, then check the object's scope.
+
+**Trade-off.** A caller with no object rights gets `PermissionDenied`
+instead of the kind lookup's hint.
+
+**Why (security).** `ListObjectKinds` already shows a caller only the kinds
+it may read; the other RPCs answering `unknown kind` vs `PermissionDenied`
+would have leaked the list anyway (AGENTS.md, "Check before you fetch").
+
+## 30. The framework's reconcile loop is a builder over an `ObjectPlane` trait, and outcomes are constructors
+
+*Built (O1).* **Call.** `ctx.reconcile("Repo", handler)`, or
+`ctx.start_reconciler(ctx.reconciler("Repo").resync(..).shards(..)
+.on_cleanup(..), handler)`; the handler returns `ObjectOutcome::ready()`,
+`not_ready(reason, msg)`, `rejected(reason, msg)`, or `accepted()`, refined
+with `because`, `with_fields`, `with_condition`, `requeue_after`. A handler
+`Err` is reported as `Ready=false` (`ReconcileFailed`) keeping the last
+`Accepted`, and retried with backoff (1 s doubling to 5 min); at most 4
+objects reconcile at once. The loop runs over an `ObjectPlane` trait
+(watch, status, release), implemented for the app's client.
+
+**Alternatives.** The plan's sketch, `Reconciler::new(handler)` with
+`Outcome::ready(reason, message)`; a loop hard-wired to the gRPC client.
+
+**Trade-off.** A slightly larger surface than one constructor; a trait
+apps never implement themselves.
+
+**Why (simplicity, testability).** Most outcomes need no reason (`ready()`),
+the rest read as sentences (`ready().because("Synced", ..)`). The trait
+lets the loop be tested against a scripted fake and against the real
+manager service in process (`tests/integration/app_objects.rs`), without a
+network.
+
+## 31. Watch messages are bounded by bytes as well as by count
+
+*Built (O1).* **Call.** A `WatchObjects` message holds at most 1,000
+objects and about 2 MiB of them (always at least one); the framework
+decodes messages up to 16 MiB.
+
+**Alternatives.** Count-only chunks (the plan), with a decode limit large
+enough for 1,000 maximal objects (about 150 MiB).
+
+**Trade-off.** More messages for a snapshot of large objects.
+
+**Why (performance).** A count bound alone lets one message reach the
+worst case of every object at its 64 KiB spec, twice (stored and
+effective), which no client should have to buffer.
+
+## 32. The autoscaler keys its objects' scaling state by uid, `object:<uid>`
+
+*Implementation, Phase O2 (`object_target_key`,
+`Store::sweep_object_scaling_state`).* **Call.** A scaling policy's or
+node group's history, pause, action row, and status-board entry live in
+core's scaling tables under `object:<uid>`, never under its name. The API
+names the object (`ScalingObjectRef { kind, namespace, name, uid }`); a
+person's reference (`legion scaling history workers --kind nodegroup`) is
+resolved to the current object's uid. The scaling state of deleted objects
+is swept on the app reconciler's full pass.
+
+```console
+$ legion scaling pause workers --kind nodegroup --for 1h     # the node group's pause
+$ legion scaling explain workers --kind scalingpolicy         # ScalingPolicy default/workers: not paused
+```
+
+**Alternatives.** (a) Key by kind and reference (`autoscaler/NodeGroup:workers`),
+so history outlives a delete and a recreate, and sweep the pause and the
+action row on delete (or stamp them with the uid). (b) Keep today's
+`policy:<id>` with a `nodes/` prefix for node groups (the plan review's
+suggestion).
+
+**Trade-off.** An object's history goes with it: a policy deleted and
+created again under the same name starts with no history (the events stay
+in the journal). Ids break once: `policy:<id>` keys, `--standalone`, and the
+bare-name lookup are gone (no installed base; the PR says so).
+
+**Why (correctness, simplicity).** A uid cannot collide (`NodeGroup
+workers` and `ScalingPolicy default/workers` are two objects) and cannot be
+inherited: a recreated object is never paused by a pause meant for the old
+one, and never resumes a drain the old one's intent recorded. The sweep
+only tidies; nothing depends on it for correctness, so object deletes stay
+generic and know nothing of scaling.
+
+## 33. Cross-field checks move to the app: a fail-open regression until O4
+
+*Implementation, Phase O2.* **Call.** The manager checks a ScalingPolicy
+or NodeGroup against its kind's schema at apply; what a schema cannot
+express (`min` above `max`, a check's strategy settings, a plugin the
+namespace may not use) is refused at apply only by the autoscaler's
+validate call, and otherwise by the autoscaler at evaluation, which holds
+the object `Accepted=false`:
+
+```text
+$ legion object apply -f inverted.ncl     # the autoscaler is down
+autoscaler/ScalingPolicy media/render: created (generation 1, spec version 52)
+warning: autoscaler/ScalingPolicy media/render was not checked by the autoscaler app (...)
+$ legion object get scalingpolicy render -n media
+autoscaler/ScalingPolicy media/render (valid)  Rejected: Invalid (render: min = 9 is above max = 3)
+```
+
+**Alternatives.** (a) Run the policy parser in `ApplyObject` for the
+autoscaler's kinds (an autoscaler-specific hook in the generic write
+path). (b) Wait for O4's CEL `rules` before moving the policies.
+
+**Trade-off.** Today's `legion scaling apply` refused such a policy
+fail-closed, in the manager. Now, with the app down, it is stored and
+reads `Rejected` once the app runs. It is never acted on, so the
+regression is in feedback, not in safety.
+
+**Why (extensibility).** The generic write path stays generic (§1: it
+never depends on the app), and O4's `rules` restore the fail-closed check
+for every kind, not just this one. Recorded as a known limitation in
+docs/autoscaling.md.
+
+**Fixed by O4** (entries 53 and 57). Both kinds declare the parser's
+cross-field checks as CEL `rules`, so the manager refuses the inverted
+policy at apply, autoscaler up or down:
+
+```text
+$ legion object apply -f inverted.ncl     # the autoscaler is down
+Error: autoscaler/ScalingPolicy media/render: spec.min: min must not exceed max
+```
+
+What needs the cluster (a strategy's settings, durations, the plugin
+allowlist) is still the validate call's and the engine's; docs/autoscaling.md
+says so in place of the old limitation.
+
+## 34. `WatchScalingPolicies` keeps serving the autoscaler what only core holds; the app resolves its objects itself
+
+*Implementation, Phase O2.* **Call.** `WatchScalingPolicies` streams task
+policies only. To the autoscaler's own identity (or a management token) it
+also carries `context` (the cluster's scaling defaults, every namespace
+policy's `autoscale`, the cluster-wide pause) and `objects` (each object
+target's own pause and action row, keyed `object:<uid>`, unsharded). The
+app reads the objects over `WatchObjects` and resolves each ScalingPolicy
+against `context` with the same code core uses.
+
+**Alternatives.** (a) Keep the manager resolving standalone policies and
+streaming them (`StandaloneScalingPolicy`), reading `app_object` instead of
+`scaling_policy`. (b) The app polls `GetScalingDefaults` per namespace and
+the pauses through `GetScalingInputs`. (c) A new app-plane RPC.
+
+**Trade-off.** The layered resolution runs in two places (the app, to
+evaluate; the manager, for status and the defaults check), from one
+function in one binary. Object targets' pauses and action rows go to every
+replica, not just the one that owns the object.
+
+**Why (simplicity).** The app reads its objects through the generic
+system, as any app would (the point of O2), and core serves only what core
+owns. (a) would keep a second, autoscaler-shaped object feed in core; (b)
+replaces a push with polling and loses change notification for the
+defaults; the existing stream already wakes on defaults, namespace-policy,
+pause, and action-row changes.
+
+## 35. The policy parser stays linked into the manager
+
+*Implementation, Phase O2 (`manager/server/scaling_objects.rs`).*
+**Call.** Core reads the autoscaler's objects, through the generic
+`Store::app_objects` by kind, in four places, and parses them with the
+autoscaler's parser: `ApplyScalingDefaults`' impact check (ScalingPolicies
+inherit the same layers as tasks), `GetScalingStatus` (mode, bounds, and
+the effective policy with provenance), `RecordScalingAction`'s existence
+check (by uid), and history and pause lookups (name to uid). No storage and
+no ACL in core are autoscaler-specific.
+
+**Alternatives.** `GetScalingStatus` shows only what the app reported, and
+the defaults check ignores ScalingPolicies.
+
+**Trade-off.** Core still knows the ScalingPolicy spec format; a change to
+it must keep both readers in step (they share the code, so a build does).
+
+**Why (correctness).** A defaults change that would invalidate a
+ScalingPolicy must be refused as it is for a task (fail-closed, before the
+write), and `legion scaling status` must say what a policy is, and why it
+is invalid, while the app is down.
+
+## 36. A deleted node group retires through the scale-in path
+
+*Implementation, Phase O2 (`NodeGroupObservation::retiring`,
+`NodeDecision::retired`).* **Call.** A NodeGroup has `cleanup = "15m"`.
+While it is Deleting, the engine adds nothing, makes every member a victim
+at once (ignoring `down.when`, `down.for`, the step budget, and `min`),
+keeps the never-victim protections, scales the provider to 0 once no member
+is left (an instance that never joined strands nothing), and the app
+releases the object when no member, drain, or provider instance is left. A
+pause holds the cleanup; a dry-run group is released at once.
+
+```text
+autoscaler/NodeGroup workers-general (valid)  Deleting
+  fields: {"cleanup":"1 member(s) left, 0 draining; 1 protected (they stay: w-3 (runs legion-system job ...))"}
+```
+
+**Alternatives.** (a) `target/scale` to 0 at once (the provider stops
+instances undrained). (b) Keep `down`'s budget (a 10-node group at one
+drain per 5 minutes cannot finish in 15). (c) Drain protected members too.
+
+**Trade-off.** A protected member, or work that cannot move within the
+drain deadline, outlives the window: the manager removes the object at the
+deadline and the machine is left to the operator, still labeled with the
+group's name.
+
+**Why (correctness).** The scale-in path is the one that never strands work
+or stops the wrong machine (provider-id checks, drains before terminate,
+forget after); deletion reuses it rather than inventing a second way to
+remove machines.
+
+## 37. The autoscaler runs its own loop over the object cache; the dynamic shard hook goes in both
+
+*Implementation, Phase O2 (`run_object_watch`, `ShardSelection`,
+`Reconciler::shards_from`, `StatusBook`).* **Call.** The autoscaler keeps
+two `ObjectCache`s current with `run_object_watch` (ScalingPolicies of the
+shards it holds; every NodeGroup on the replica holding the `nodegroups`
+shard), evaluates them on its tick, and writes status through a
+`StatusBook`. The selection a replica watches is a `tokio::sync::watch`
+channel the lease controller's ownership feeds; `Reconciler::shards_from`
+gives the reconcile loop the same hook.
+
+**Alternatives.** The framework's reconcile loop, one handler per object.
+
+**Trade-off.** The bundled app does not exercise the reconcile loop; the
+framework has two ways to own objects.
+
+**Why (performance).** An evaluation tick reads every target's inputs in
+one batched call and runs the expander across all node groups at once; a
+per-object handler would split both. The shard hook belongs in the
+framework, so any sharded app gets it.
+
+## 38. Object status holds verdicts, written on change; the last action comes from the action row
+
+*Implementation, Phase O2 (`objects::verdict`).* **Call.** Status says
+`Accepted` (the spec parses, resolves, and its plugins are open to it),
+`Ready` (the last evaluation worked; reason `Paused` while paused,
+`TargetError`, `MissingData`, `Deleting`), and fields `target`, `policy`,
+`digest`, `error`, `lastAction` (the last closed action intent, from the
+replicated action row), `cleanup`. The current and wanted counts stay on
+the scaling status board.
+
+**Alternatives.** Report every evaluation in status; keep the last action
+in the replica's memory.
+
+**Trade-off.** `legion object get` does not show the current count; that
+is `legion scaling status`.
+
+**Why (performance, correctness).** Ten thousand policies reporting every
+15 seconds is the Status-lane churn entry 2 exists to avoid. The action row
+is replicated, so a replica that restarts or takes a shard over reports
+the same last action instead of dropping it.
+
+## 39. The kinds' schemas are generated from the parser's types and filled in when the bundled manifest loads
+
+*Implementation, Phase O2 (`BundledApp::generated`,
+`policy::scaling_policy_schema`).* **Call.** `autoscaler.ncl` declares the
+kinds without `schema`; the app's Rust types (schemars over
+`AutoscaleRecord` and `NodeGroupPolicy`, with every `$ref` inlined and
+`null` alternatives dropped) fill `schema` and `status.schema` before the
+manifest is parsed.
+
+**Alternatives.** Hand-write the schemas in Nickel, with a test that they
+match the types.
+
+**Trade-off.** The manifest file alone does not show the schemas
+(`legion object explain` and `legion object kinds -j` do).
+
+**Why (simplicity).** One source of truth: a field added to the policy
+record reaches the kind's schema, its `explain` text (the doc comments),
+and the parser at once.
+
+## 40. Pausing and naming an object follow its kind; a node group and a policy may share a name
+
+*Implementation, Phase O2.* **Call.** Reading an object's status or
+history needs its kind's read access; pausing one needs what writing it
+needs (its access and `requires`), checked before the lookup. The scaling
+verbs name an object with `--kind` (`legion scaling explain workers --kind
+nodegroup`). The manager-side node-group special case
+(`enforce_policy_write`, `gate_policy_ref`, the shared bare-name space) is
+gone.
+
+**Alternatives.** Keep `scale:write` for any pause, and `operator:write`
+plus `node:write` for a node group's, hard-coded.
+
+**Trade-off.** A `scale:write` holder who could pause a policy by its job-
+like name before now needs `scale:write` namespace-wide in its namespace.
+
+**Why (simplicity).** One rule: the kind's declaration decides. A third-
+party app's kinds get the same treatment with no core change.
+
+## 41. Both kinds' target plugin is immutable
+
+*Implementation, Phase O2.* **Call.** `immutable = ["/spec/target/plugin"]`
+on ScalingPolicy, as the plan says, and `["/spec/target/nodes/plugin"]` on
+NodeGroup, which the plan did not ask for.
+
+**Alternatives.** Let a node group change provider in place.
+
+**Trade-off.** Moving a group to another provider is a delete (which
+drains it) and a create.
+
+**Why (correctness).** A group's members belong to the provider that
+started them; a new provider would not list them, so every member would
+read "the provider does not list its instance" and could never be scaled
+in.
+
+## 42. Pages read objects, never write them; the Autoscaling page lists policies, not node groups
+
+*Implementation, Phase O2 (`PAGE_RPCS`, `render_policies`).* **Call.**
+`ListObjectKinds`, `GetObject`, and `ListObjects` are page-callable reads
+(installing a page that lists one needs `object`, `job`, `scale`, and
+`node` read everywhere). `ApplyObject` and `DeleteObject` are refused for
+pages. The removed scaling-policy RPCs leave the list; `PauseScaling` now
+names `node:write` too. The Autoscaling page shows ScalingPolicies in the
+viewer's namespaces, and no node groups.
+
+**Alternatives.** Classify object writes with a permission list.
+
+**Trade-off.** A page cannot write objects; an app that needs it uses an
+action.
+
+**Why (security).** What writing an object needs is whatever its kind
+`requires`, which no fixed list bounds, so no installer check could bound a
+page that writes them. The page's `scale:read` says nothing about the
+viewer's `node:read`, which a node group needs.
+
+## 43. `legion scaling simulate` resolves a ScalingPolicy file on the client
+
+*Implementation, Phase O2.* **Call.** `GetScalingDefaultsReply` gains
+`governing` (the namespace's governing policies' `autoscale` records), and
+`simulate` resolves an `autoscaler/ScalingPolicy` object file against it
+and the cluster record locally.
+
+**Alternatives.** An RPC that resolves a spec without storing it (today's
+`ApplyScalingPolicy --dry-run`).
+
+**Trade-off.** Plugins are not checked in a simulation (it runs none).
+
+**Why (simplicity).** `GetScalingDefaults` already shows the same values
+with provenance to the same callers; no new RPC.
+
+## 44. An app acting for an object holds the object's recorded authority within its grant, one exact rule per permission
+
+*Implementation, Phase O3 (`object_scoped_identity`,
+`ManagerDaemonService::act_for_object`).* **Call.** An app names one of
+its objects in `legion-for-object: <app>/<Kind>/<ns>/<name>#<uid>@<generation>`
+beside its own credential, and the manager answers with `<app> for <Kind>
+<ns>/<name>`: one exact allow rule per permission of the object's
+**recorded `authority`** (each attribute it was checked on becomes a
+one-value selector; a namespace-wide check becomes a rule without
+`names`), kept only when the app's grant allows that permission on its
+scope (the delegation intersection, `would_allow`), plus the app's deny
+rules. Only the owning app's own identity may name the object (the
+hardened `app_of_identity`), the uid must exist and match the reference,
+and a refusal never falls back to the app's own identity.
+
+```text
+legion-for-object: gitops/Repo/team-a/storefront#812@4
+PermissionDenied: permission denied: job:write is outside what gitops for Repo team-a/storefront holds
+```
+
+**Alternatives.** (a) **Reconcile as the writer's current rights** (the plan
+review's option C): re-resolve the object's writer on every call and
+delegate as them, the way an action delegates as its viewer. (b) Bound the
+app by the kind's *current* `requires`, resolved against the object's spec
+on each call. (c) The status quo: the app acts with its own grant, and
+`requires` only checks the writer at write.
+
+**Trade-off.** Power outlives its holder: a writer who loses a right keeps
+their objects' power until someone re-applies them (entry 47 makes that
+findable). An object whose authority the app's grant does not cover does
+nothing for the app; the grant must still be wide enough for the objects
+people will write. (a) would have revoked at once, at the cost of breaking
+every deploy a departing engineer's Repos drive, of failing for every
+writer without a token to re-resolve (JWT and SSO logins, workload
+identities), and of a store lookup per call; (b) would let an upgrade that
+loosens `requires` widen every stored object's power without anyone
+re-applying it.
+
+**Why (security, simplicity).** It closes the confused-deputy gap entry 1
+left open: the writer's check at write is now also the bound on what the
+app does with the object, so "an object can never make its app do more
+than its writer could" holds for the app's calls too, not just for the
+write. The authority is a fixed, auditable record (`legion object get`
+shows it), the intersection is the one delegation already uses, and it
+costs one indexed read per call. Entry 26 was the design call; this is how
+it was built.
+
+## 45. `via = "objects"` is a flag on a rule that the evaluator never matches
+
+*Implementation, Phase O3 (`AclRule.via`, `rule_matches`).* **Call.** A
+manifest permission may say `via = "objects"`. Evaluation skips such a rule
+on every identity, so the app's plain credential cannot use it; the
+object-scoped intersection uses the app's grant with `via` cleared. Grant
+coverage treats it like any other rule (the installer must hold it); a held
+`via` rule covers only a requested `via` rule, so the app reconciler can
+grant the app's job its recorded grant. Stored ACL policies refuse it (no
+token ever acts for an object), and so does a manifest with no kinds. The
+install prompt and `legion acl grants list` mark it.
+
+```nickel
+{ resources = ["job"], actions = ["write"], namespaces = ["*"], via = "objects" }
+```
+
+```text
+  job       write         namespaces: *; only for its objects (bounded by each object's recorded authority)
+```
+
+**Alternatives.** (a) A separate manifest block, `objectPermissions`, kept
+off the job's grant and joined in at the intersection. (b) Per-kind grants
+(`kinds[].grant`), so each kind names what its objects may make the app
+do. (c) No flag: the intersection alone, with the app's full grant usable
+on its own.
+
+**Trade-off.** One more field on every rule, inert everywhere but one path,
+so a reader of a raw grant must know it (the prompt and the grants listing
+say it). A `via` rule does not take part in acting as a viewer, so an app
+action that deploys must act for the object instead. The filter is in the
+evaluator, the reach and hint helpers, and coverage: a new rule-reading
+helper must skip it too.
+
+**Why (simplicity, security).** The rule stays where every other permission
+is, granted and covered by the same code and shown in the same prompt;
+(a) and (b) would each be a second grant to install, upgrade, revoke, and
+explain. Without a flag, (c), "gitops writes jobs only where a Repo's
+author could" would be a convention the app keeps, not a property the
+installer can rely on. Skipping in the evaluator rather than filtering at
+token resolution means no path that builds an identity can forget it.
+
+## 46. Jobs written for an object are stamped `managedBy = { app, object }`; a person's submit over one warns rather than needing `--force`
+
+*Implementation, Phase O3 (`GrantSource::Object`,
+`ManagedBy::for_object`).* **Call.** `RunJob` and `RunJobTemplate` through
+an object-scoped identity store the version with `managedBy = { app,
+object: "<app>/<Kind>/<ns>/<name>#<uid>" }` and the grant in the
+object-scoped principal's name; an unchanged resubmit restamps in place.
+`legion job status` says `managed by gitops for Repo team-a/storefront`.
+A person's changed submit over such a job is accepted, drops the stamp,
+and warns who will likely write it back. An object stamp never makes a job
+an app's own (`allocation_app` and the app-job queries ignore it). Other
+writes are not stamped; the principal is their actor.
+
+```text
+warning: team-a/storefront was managed by gitops for Repo team-a/storefront; this version replaces it, and gitops will likely write the job back on its next reconcile
+```
+
+**Alternatives.** (a) Refuse a person's submit over an object-stamped job
+without `--force`, as objects (entry 15) and app jobs in `legion-system`
+(refused outright) are. (b) Stamp every table an object-scoped call
+writes (KV entries, scaling pauses, volumes).
+
+**Trade-off.** Nothing stops a person and the app fighting over a job
+except the warning and the app's next reconcile; a person's hotfix lasts
+until then. Only jobs show which object wrote them.
+
+**Why (simplicity).** No mechanism refuses a person's submit over an
+app-written job outside `legion-system` today, and RunJob has no `force`;
+inventing both for this would make the namespace's owner ask an app for
+permission to change their own job, in an incident too. GitOps tools
+(Flux, Argo CD) treat that as drift to revert, not a write to refuse. Jobs
+are what users ask "who deployed this?" about; the principal already names
+the object everywhere else.
+
+## 47. Authority is listed when it lapses, never revoked; `--authority-lapsed` needs `acl:read`
+
+*Implementation, Phase O3 (`ListObjectsRequest.authority_lapsed`,
+`authority_check`).* **Call.** `legion object list --authority-lapsed`
+(and the MCP tool's `authorityLapsed`) re-resolves each object's
+authorizer through its token's accessor (`identity_for_accessor`) and
+lists the objects whose authorizer no longer holds every recorded
+permission (`lapsed`: the token is gone or expired, or a permission is
+gone) or cannot be re-resolved (`unknown`: no accessor, as for JWT, SSO,
+and workload identities), with why. It needs `acl:read` beside object
+read. Re-applying an object re-authorizes it as the applier.
+
+```console
+$ legion object list repos -A --authority-lapsed
+NAME        NAMESPACE  STATUS  AGE  AUTHORITY                                                        AUTHORIZED BY
+storefront  team-a     Ready   3d   lapsed: alice no longer holds job:write in team-a on storefront  alice
+```
+
+**Alternatives.** (a) Object read alone suffices, since the objects are
+already visible. (b) Show the check on every `get` and `list`. (c) Revoke
+(entry 44's alternative (a)).
+
+**Trade-off.** A team lead without `acl:read` cannot audit their own
+team's Repos this way; an operator has to. JWT and SSO writers are always
+`unknown`, so a cluster that logs everyone in through OIDC learns little.
+
+**Why (security).** The check answers "does alice still hold job:write in
+team-a?", which is ACL state that `legion acl token list` and policy reads
+keep behind `acl:read`; read on an object must not become a probe of other
+principals' rights. Computing it only on request keeps ordinary listings
+free of a token lookup per object.
+
+## 48. The bundled autoscaler keeps acting with its own grant
+
+*Implementation, Phase O3.* **Call.** The autoscaler does not act for its
+`ScalingPolicy` and `NodeGroup` objects. Its grant stays as it was.
+
+**Alternatives.** Run its object-driven calls object-scoped: a NodeGroup's
+drains and forgets, and its `RecordScalingAction` intents.
+
+**Trade-off.** The bundled app does not exercise O3, so the example gitops
+manifest is its only shipped user; the autoscaler's `node:write` and
+`scale:write` stay usable for any of its objects.
+
+**Why (simplicity).** Little of what its objects make it do goes through
+Legion's ACLs: a ScalingPolicy's target and a NodeGroup's provider are
+plugins calling systems outside Legion, where a Legion credential bounds
+nothing, and `ScaleTask` for task policies is not object-driven. Its Legion
+calls for objects are the app plane (`RecordScalingAction`,
+`ReportScalingStatus`), which by design take only its own identity. The
+one remaining write, draining a group's members, is governed by the kind's
+access (`node`), which a NodeGroup's writer is checked for at write but
+which its `requires` (and so its authority) does not record; making it
+object-scoped would mean adding `node:write` to `requires` for no new
+protection. And one evaluation tick spans every object, which per-object
+identities would split.
+
+## 49. The intersection is per permission: a permission the grant covers only in part is dropped, not narrowed
+
+*Implementation, Phase O3.* **Call.** Each recorded permission is kept
+whole or dropped: kept when the app's grant allows it on its exact scope.
+An authority of "job:write on every job in team-a" against a grant of
+"job:write on `web-*` in team-a" yields nothing in team-a, not "`web-*` in
+team-a". A value with a literal `*` that a selector cannot name exactly
+grants nothing.
+
+**Alternatives.** A true rule intersection: intersect the two rules'
+selectors glob by glob.
+
+**Trade-off.** An app whose grant is narrower than the objects' authority
+gets less than the true intersection; the fix is to widen the grant (with
+`via = "objects"`) or narrow `requires`.
+
+**Why (simplicity, security).** Glob intersection is set algebra Legion
+avoids everywhere else (grant coverage decides a sufficient condition, not
+containment, for the same reason); a sound under-approximation is easy to
+explain and cannot over-grant.
+
+## 50. The generation an app names is advisory
+
+*Implementation, Phase O3.* **Call.** The `@<generation>` in the header is
+logged, not checked: the object's current recorded authority applies
+whatever generation the app read, stale or ahead.
+
+**Alternatives.** Refuse a generation other than the stored one.
+
+**Trade-off.** An app acting on a stale read deploys stale content with
+the current authority.
+
+**Why (correctness).** Authority changes only on an apply, so a stale
+generation can do no more than the current one; refusing it would fail
+every call made between an apply and the watch delivering it, and every
+call a lagging replica serves.
+
+## 51. Acting for an object is its own identity source, refused where a delegation is, and ignored with ACLs off
+
+*Implementation, Phase O3 (`AclSource::ForObject`).* **Call.**
+`WhoAmI.source` reads `for-object`; streams, the app plane
+(`WatchObjects`, `UpdateObjectStatus`, `ReleaseObject`, the autoscaler's
+RPCs), and the jobspec-extension plane refuse it, as they refuse a
+delegated identity, and a call carrying both `legion-for-object` and
+`legion-on-behalf-of` is `InvalidArgument`. With ACLs disabled the header
+is ignored, as `legion-on-behalf-of` is, so nothing is stamped.
+
+**Alternatives.** Reuse `AclSource::Delegated`; honor the header with ACLs
+off (verify the object and stamp the job).
+
+**Trade-off.** One more source every source check must consider; a cluster
+with ACLs off loses the stamps.
+
+**Why (simplicity, security).** The two are different principals (a
+person through an app, the app through an object) with different messages;
+sharing the source would have muddled both. A stream re-authenticates from
+the bearer alone, which would silently turn the object-scoped identity
+into the app's own. With ACLs off every caller is `acl-disabled`; treating
+one header as a credential there would be the only exception.
+
+## 52. Objects an app writes while acting for an object are managed by the app; a deleting object can be acted for, an orphaned kind's cannot
+
+*Implementation, Phase O3.* **Call.** An object applied through an
+object-scoped identity is stamped `managedBy` the app (entry 15), unlike
+one an app writes as a viewer. The header accepts a deleting object, so the
+app's cleanup can act for it, and refuses an object whose kind is orphaned.
+
+**Alternatives.** Treat the object-scoped identity as nobody's app (no
+stamp); refuse deleting objects.
+
+**Trade-off.** A person must `--force` to change a child object the app
+wrote for its parent.
+
+**Why (correctness).** The app, not a person, decided to write the child,
+and will likely overwrite a change (cert-manager's children). A cleanup
+that cannot act for the object it is cleaning up could not undeploy what
+the object deployed; an orphaned kind has no app reconciling it.
+
+## 53. Kinds validate across fields with CEL `rules`, evaluated in the manager and failing closed
+
+*Implementation, Phase O4 (`src/structs/object_rules.rs`).* **Call.** A
+kind declares `rules`: CEL expressions over `self` (the effective spec,
+defaults filled) and `oldSelf` (the stored spec, on update), each with a
+fixed `message` and an optional `path`. The manager compiles them at
+install and upgrade, refusing a rule that does not parse, names any other
+variable, is known not to evaluate to a bool, breaks a cost bound (entry
+54), or that an example fails. It evaluates every rule on every apply, dry
+runs included, and refuses the write naming every failing rule; a rule
+that errors, returns something other than a bool, or runs out of time
+fails too. A rule that uses `oldSelf` is a transition rule, skipped on
+create. Stored objects are judged against the current rules wherever they
+are judged against the schema (reads, the upgrade and install reports),
+inline and without `oldSelf`: one that fails reads `invalid`.
+
+```nickel
+rules = [
+  { rule = "self.min <= self.max", message = "min must not exceed max", path = "/spec/min" },
+  { rule = "self.replicas >= oldSelf.replicas", message = "replicas may only grow" },
+]
+```
+
+```text
+Error: autoscaler/ScalingPolicy media/render: spec.min: min must not exceed max; spec.checks: every check needs its own name
+Hint: `legion object explain autoscaler/ScalingPolicy` lists the kind's rules
+```
+
+**Alternatives.** (a) **Nickel contracts.** Legion already embeds Nickel
+for jobspecs, so a kind could ship a contract the manager applies to each
+spec. (b) **A homegrown rule set**: a few declarative checks
+(`{ lessOrEqual = ["/spec/min", "/spec/max"] }`, `{ unique =
+"/spec/checks/*/name" }`). (c) Leave cross-field checks to the app's
+validate call, O2's state (entry 33).
+
+**Trade-off.** A new language on the write path, and a dependency (entry
+55) whose evaluator has no cost model of its own (entry 54). There is no
+type checker: a rule that compiles can fail at evaluation (`no such key:
+max` when a field it reads is absent and unguarded by `has()`), and that
+refuses the write, so kind authors test with `--dry-run`. Judging on read
+evaluates every rule for every object a list returns, about 10-20 µs per
+rule.
+
+**Why (simplicity, extensibility).** CEL is what Kubernetes moved CRD
+validation to for the same reason (no webhook in the write path, entry 8),
+so kind authors arrive knowing it, and it is built to be embedded: no side
+effects, no recursion, termination by construction, only cost left to
+bound. Nickel contracts are a general language with recursion and imports,
+no cost bound the manager could enforce, and the evaluator jobspec loading
+already pays dearly for, now on every apply; (b) grows a field per check
+until it is a worse CEL; (c) fails open, which is the regression this
+fixes. Judging stored objects by the same rules keeps `invalid` meaning one
+thing: the object would be refused if written today.
+
+## 54. A rule's cost is bounded by construction and a clock, failing closed; a blocking thread under a timeout covers what cannot be interrupted
+
+*Implementation, Phase O4 (`compile_rule`, `CompiledRules::evaluate`,
+`evaluate_bounded`).* **Call.** No Rust CEL crate estimates or interrupts
+cost, so the manager bounds it:
+
+- a rule's source is at most 1 KiB, and its bracket nesting and
+  conditionals at most 32 each, **counted on the raw text before any
+  parser runs**;
+- once parsed, the expression is at most 24 levels deep (evaluation
+  recurses once per level), and comprehensions nest at most 2 deep;
+- every comprehension is **rewritten at compile time to call a budget
+  check on each iteration**: the loop condition of `all` and `exists`, the
+  step's guard of `exists_one`, `map`, and `filter` (an always-true guard
+  for `map`), which keeps the evaluator's in-place append. In cel 0.15
+  these are parse-time macros, not functions that could be replaced, and
+  rewriting their expansion does the same job, so nesting 2 is allowed
+  rather than the fallback of 1;
+- each rule has 10 ms and all of a kind's rules 50 ms. The clock is checked
+  after each rule whatever it returned, since a rule can absorb the budget
+  check's error (`... || true`);
+- at apply the rules run in `spawn_blocking`, and the RPC waits at most
+  100 ms (the 50 ms budget plus 50 ms of grace) before refusing the write;
+- a failure or overrun is `InvalidArgument`, never a retryable code.
+
+```text
+Error: gitops/Repo team-a/web: spec.jobs: jobs are unique (not checked: rules[0] ran past its 10 ms budget, so the write is refused)
+```
+
+**Alternatives.** (a) A static cost estimate, as Kubernetes computes from
+the CEL type checker and the schema's `maxItems` and `maxLength`:
+cel-rust has no checker to hang one on, and a schema without `maxItems`
+would need a pessimistic bound that refuses ordinary rules. (b)
+Comprehension nesting capped at 1 with the clock alone. (c) Evaluating on
+the async runtime with only the in-loop checks. (d) A thread per apply
+with a large stack, instead of the depth cap.
+
+**Trade-off.** **The thread finishes, but the write is refused.** Work
+between two budget checks cannot be stopped: a 1 KiB rule of 100 list
+concatenations over a 32,000-item list runs about 0.9 s (release build;
+the deepest left-to-right chain the depth cap allows, 22 terms, about
+0.35 s) on its blocking thread after the write is refused at 100 ms.
+Reads and the install and upgrade reports evaluate inline, bounded by the
+same clocks but on the caller's thread. A wall-clock budget lets a rule
+near its limit pass on an idle manager and fail on a busy one. The depth
+cap of 24 refuses a few legitimate rules (a sum of 25 fields).
+
+**Why (performance, simplicity).** The writer controls the data; the rule
+is the app's, approved at install with its grant. Everything data can make
+expensive goes through a comprehension, and those stop on time (a nested
+`all` over 30,000 items returns at about 12 ms); what is left takes a
+pathological rule, which the source and depth caps hold to about a
+second, off the write's latency. The raw-text count exists because of a
+measured crash: a 500-deep nested rule (about 1 KiB) overflowed a 2 MiB
+stack inside cel-interpreter 0.10's ANTLR parser and aborted the process;
+it is now refused before any parser sees it. The depth cap is set by the
+evaluator's stack: at `-O0` (tests) one level takes 30-40 KiB, and 64 levels
+overflowed a 2 MiB thread. A typical rule costs 10-20 µs including the
+spec's conversion, and compiles in 1-50 µs.
+
+## 55. The engine is the `cel` crate 0.15.0 with its Pratt parser, not cel-interpreter 0.10 or 0.9, or our own
+
+*Implementation, Phase O4 (`Cargo.toml`).* **Call.** `cel = "=0.15.0"`
+(cel-rust, MIT, 2026-10-06), with no default features (no `regex`,
+`chrono`, or encoders) and `parser_pratt`. Rules parse with its
+`PrattParser` (recursion limit 96, at most 4,096 nodes) and evaluate on one
+shared `Env::stdlib()`. New crates: `cel`, `antlr4rust` 0.6.0 (BSD-3, built
+though nothing calls it), `bit-set` 0.11 and `bit-vec` 0.10, `murmur3`, and
+`pastey`; `uuid` moved from 1.23 to 1.26.1, and `borsh` 1.8 and `syn` 3
+entered the lock without being built for any target Legion uses.
+
+**Alternatives.**
+
+- **`cel-interpreter` 0.10.0**, the brief's choice: its parser is ANTLR on
+  a pre-release runtime (`antlr4rust ^0.3.0-beta2`, resolving to
+  0.3.0-rc2), and a 500-deep nested rule overflowed a 2 MiB stack inside
+  it, aborting the process (release build). The line ended there: the
+  crate was renamed `cel`.
+- **`cel-interpreter` 0.9.1**: an lalrpop parser and two new crates only
+  (its `lalrpop-util` and `regex` are already in the tree), at comparable
+  speed (parse 0.3-0.75 ms, evaluate about 10 µs). But it is a dead line,
+  `--1` and `!!x` do not lex, and its evaluator overflowed a 2 MiB stack at
+  510 nested lists in a debug build.
+- **A homegrown CEL subset**: no dependency, but a parser and evaluator to
+  own, against a spec people know from Kubernetes.
+
+**Trade-off.** About five new crates, among them an ANTLR runtime nothing
+calls. The Pratt parser is `#[doc(hidden)]` in 0.15, which the exact pin
+covers: an upgrade is a reviewed change. The 0.15 evaluator concatenates
+lists slower than 0.10's (4.0 s against 0.17 s for 70 terms over 30,000
+items), the cost entry 54's trade-off measures.
+
+**Why (simplicity, performance).** A validation engine in the control
+plane should stand on a maintained line, a stable runtime, and a parser
+that bounds its own recursion behind the raw-text cap. 0.15 also parses a
+rule 10 to 100 times faster than 0.9 (1-50 µs) and evaluates a typical one
+in 10-20 µs.
+
+## 56. The apply order is schema, `immutable`, rules, `requires`
+
+*Implementation, Phase O4 (`apply_object_rpc`).* **Call.** `ApplyObject`
+reads the stored object right after the schema check (the caller already
+holds `write` on the kind's access resource on its scope), checks
+`immutable` and the rules (a transition rule needs the stored spec as
+`oldSelf`), and only then resolves and checks `requires`. Before, the code
+checked `requires` first and read the stored object after, which
+contradicted docs/app-objects.md (schema, `immutable`, `requires`).
+
+**Alternatives.** (a) Keep `requires` first and split the rules: plain
+rules before it, transition rules after. (b) Keep the code's order and fix
+the doc.
+
+**Trade-off.** A writer lacking a `requires` permission now learns an
+immutable field's stored value (`spec.url is immutable (was "...")`) and
+which rules the spec breaks before the refusal. For a requirement without
+a pointer (NodeGroup's `operator:write`), that writer still holds `write`
+on the kind's access resource there (`node:write`).
+
+**Why (simplicity).** It leaks nothing a writer could not learn anyway:
+`requires` resolves from the spec the writer submits, so naming nothing
+they lack passes it and reaches the `immutable` check. One order, written
+once: validity before authority, as a jobspec is validated before the
+resolved spec is authorized.
+
+## 57. The autoscaler declares its parser's cross-field checks as rules; `immutable` and the validate call stay
+
+*Implementation, Phase O4 (`src/apps/bundled/autoscaler.ncl`).* **Call.**
+ScalingPolicy declares 11 rules: `min <= max`, `max >= 1`, unique check
+names, no `query` on the `legion` source, `activation >= 0`, `tolerance`
+in [0, 1), a schedule window sets a bound and orders its bounds when both
+are counts, each `step` names `percent` or `replicas`, and
+`down.step.percent <= 100`. NodeGroup declares 5: `min <= max` (`min`
+defaulting to 0), `max >= 1`, no `legion.nodegroup` in
+`shape.attributes`, and the two `step` rules. A test runs every failing
+spec through both the rules and the parser. `target.plugin` stays
+`immutable`; the validate call stays for what needs the cluster: strategy
+settings, durations, plugin configs, and the plugin allowlist, which the
+app enforces fail-closed at evaluation.
+
+**Alternatives.** (a) `min <= max` alone, the regression entry 33 named.
+(b) Transition rules in place of `immutable`
+(`self.target.plugin == oldSelf.target.plugin`). (c) Rules generated from
+the parser.
+
+**Trade-off.** The checks now live in Rust and in CEL and can drift; the
+test pins the listed cases. Where they differ (a `query` of only spaces),
+the parser decides, and the object reads `Rejected`. A duration of `0s`
+and a strategy's settings stay fail-open at apply.
+
+**Why (correctness).** Every check that can refuse a policy without the
+cluster now refuses it in the manager, whether or not the app is up, which
+is what `legion scaling apply` did before O2. `immutable` says "cannot
+change" more simply, with the stored value in the error.
+
+## 58. Rules are per kind only; per-field `x-legion-validations` and `messageExpression` are deferred
+
+*Implementation, Phase O4.* **Call.** `rules` is one list on the kind,
+and every rule sees the whole spec. No rules on a subschema, no
+`messageExpression` (refused with a hint), no `reason` or
+`optionalOldSelf`.
+
+**Alternatives.** Kubernetes' `x-kubernetes-validations` on any schema
+node, where `self` is that node (a rule on a list's `items` runs per item),
+with `messageExpression`, `reason`, and `optionalOldSelf`.
+
+**Trade-off.** A per-item check is a comprehension
+(`self.checks.all(c, ...)`): it counts toward the nesting limit of 2, and
+reports at the list, not the item's index. A message cannot include the
+offending value.
+
+**Why (simplicity).** One place to declare rules, one `self`, and a cost
+bound per rule rather than per rule times items; a message that evaluates
+is a second program per failure and a path for a `writeOnly` value into an
+error. Per-node rules can come later without changing these: a kind-level
+rule is a rule on the root.
+
+## 59. A rule's `path` points into the object document (`/spec/min`), not into the spec
+
+*Implementation, Phase O4.* **Call.** `path` is `/spec` or starts with
+`/spec/`, and a failure reads `spec.min: ...`. The brief's sketch wrote
+`path = "/min"`, relative to `self`.
+
+**Alternatives.** Spec-relative pointers that mirror `self` (`/min` for
+`self.min`).
+
+**Trade-off.** Five more characters, and a pointer that does not mirror
+the rule's own `self.min`.
+
+**Why (simplicity).** Entry 27: every pointer in a declaration points into
+one document, so `/spec/min` means the same in `immutable`, `columns`,
+`requires`, and a rule, and a rule's error path reads like the schema's
+(`spec.min: ...`).
+
+# Superseded entries
+
+Kept as written when they were superseded; they no longer describe the design.
+
+## 60. *Superseded.* A kind's ACL is one resource: the generic `object`, or an existing one of the same scope
+
+**Superseded by entries 1 (`requires`) and 5 (the access mapping)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
+
+**Call.** `access = { resource = … }` names the ACL resource that governs a
+kind's objects, default `object`. A namespaced kind may map to a namespaced
+resource, a cluster kind to a cluster-scoped one; install refuses a
+mismatch. `writeRequires` adds permissions every writer must also hold, on
+the object's scope.
+
+```nickel
+# O2's ScalingPolicy: governed by exactly the scale:write that governs scaling
+{ name = "ScalingPolicy", scope = "namespaced", access = { resource = "scale" }, ... }
+# O2's NodeGroup: creating machines needs what creating machines needs
+{ name = "NodeGroup", scope = "cluster", access = { resource = "node" },
+  writeRequires = [{ resource = "operator", action = "write" }], ... }
+```
+
+**Alternatives.** (a) Kubernetes': every kind is its own resource, always
+(`object` with `kinds` only). (b) A per-kind permission table the app ships
+(aggregated ClusterRoles).
+
+**Trade-off.** A mapped kind's objects are reachable by every holder of that
+resource on that scope: anyone with `scale:write` in `media` can write
+`ScalingPolicy` objects there, whether or not an admin meant "scaling
+policies" when they granted it. The install prompt shows the mapping so the
+installer decides. A mapped kind also cannot be granted separately from the
+resource (no "may write policies but not resize jobs").
+
+**Why (simplicity).** Grants that mean the same thing should be one grant.
+With (a), O2 would have needed every `scale:write` holder to also be given
+`object:write` on `autoscaler/ScalingPolicy`, and the two would drift. The
+default stays K8s-like (`object` with `kinds`), so a kind that maps onto
+nothing is still governed separately.
+
+## 61. *Superseded.* An orphaned object is governed by the `object` resource
+
+**Superseded by entry 7 (orphans keep their kind's mapping)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
+
+**Call.** Once a kind's declaration is gone (uninstall, or an upgrade that
+drops it, both with `--force`), its objects are read and deleted with
+`object:read`/`object:write` on `<app>/<Kind>`, whatever the kind mapped to.
+
+**Alternatives.** Store the access resource on every row, so an orphan
+keeps its last mapping.
+
+**Trade-off.** A team that managed its `ScalingPolicy` orphans with
+`scale:write` needs `object:write` (or an operator) to clean them up.
+
+**Why (simplicity).** A stored per-row mapping goes stale the moment an
+upgrade changes it, and then two rows of one kind answer to different
+resources. Orphans are an operator's clean-up after a forced removal, and
+the rule fits in one sentence.
+
+## 62. *Superseded.* Status is the owning app's alone, with CAS on version or generation
+
+**Superseded by entry 2 (status on the Status lane, `specVersion` CAS)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
+
+**Call.** `UpdateObjectStatus` is app-plane: only the app that owns the
+kind (its workload identity) writes status, never the spec. `ApplyObject`
+refuses a file that sets `status`. The app passes `expected_generation`
+("this status is for the spec I saw") or `expected_version`.
+
+**Alternatives.** Kubernetes' `/status` subresource with RBAC: any principal
+granted `update` on `repos/status` writes it, including people.
+
+**Trade-off.** A person cannot correct a status by hand, and an app cannot
+delegate status writes to a helper with another identity.
+
+**Why (simplicity).** Status is the app's report; letting anyone else write
+it makes it a claim nobody can trust at 3am. App identity is already the
+app plane's key (`WatchAppExtensions`, `ReportScalingStatus`).
+
+## 63. *Superseded.* Kind names are flat, unique cluster-wide case-insensitively, with `<app>/<Kind>` as the qualified spelling
+
+**Superseded by entry 3 (`<app>/<Kind>` is the name)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
+
+**Call.** No API groups. `Repo` is unique across installed apps and bundled
+manifests, ignoring case; the CLI, MCP, and API accept any case and an
+optional plural; `gitops/Repo` always names gitops's kind.
+
+```console
+$ legion object list repos -n team-a
+$ legion object get gitops/Repo storefront -n team-a
+```
+
+**Alternatives.** Kubernetes' group-qualified kinds (`repos.gitops.legion.io`)
+with declared plural and short names.
+
+**Trade-off.** Two apps cannot both ship a `Repo`; the second must rename
+its kind. Install says so, naming the owner.
+
+**Why (simplicity).** Kind names are typed at a terminal. The jobspec-key
+rule already established "the short name may collide, the qualified one
+never does" (apps calls on `apps.<app>`), so it is one idea, not two.
+
+## 64. *Superseded.* `WatchObjects` polls a fingerprint each second
+
+**Superseded by entry 17 (chunked, per-app watch)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
+
+**Call.** The watch re-reads when the apps' fingerprint or the table's
+(count, highest version) moves, checked every second, with a full re-read
+every 30 seconds.
+
+**Alternatives.** Event-driven delivery from the store's change feed.
+
+**Trade-off.** Up to a second of latency, and one cheap query per stream
+per second.
+
+**Why (simplicity).** The same shape as `WatchAppExtensions` (apps calls
+90), whose cost was measured acceptable; both move to events together when
+it is not.
+
+## 65. *Superseded.* Deleting a namespace leaves its objects
+
+**Superseded by entry 9 (objects are namespace contents)** (adversarial review, 2026-10-29). The original reasoning, kept as written (entry numbers in it refer to the original ranking):
+
+**Call.** A namespace's emptiness check and `--cascade` ignore objects.
+Objects in a deleted namespace stay readable and deletable; applying one is
+refused until the namespace exists again.
+
+**Alternatives.** Count objects as contents (refusing the delete), and have
+`--cascade` delete them, as Kubernetes does.
+
+**Trade-off.** An app can be left acting on objects in a namespace that no
+longer exists (GitOps would fail to deploy into it, and report that in
+status).
+
+**Why (scope).** Cascading needs a per-kind ACL check inside the cascade
+and a proto change to the namespace contents reply; the standalone scaling
+policies O2 replaces behave the same way today. Recorded as a TODO with the
+plan's lean (refuse, and cascade).
+
+## 66. *Superseded.* Defaults filled on read (the defaults half of the original entry 1)
+
+**Superseded by entry 6** (adversarial review, 2026-10-29). The original
+argued that deriving defaults on read lets an upgrade that adds or changes
+a default reach every object with no rewrite, which a raft-replicated
+upgrade would otherwise have to batch and could leave half done. The review
+showed the cost: a changed default silently changes what the app does with
+no generation bump, event, or actor. The original entry's full text is kept
+as entry 4's body.

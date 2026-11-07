@@ -8,8 +8,8 @@
 //! | Policy | Key |
 //! | --- | --- |
 //! | an autoscaled task | `<job id>/<group>/<task>` |
-//! | an external-target standalone policy | `policy:<id>` |
-//! | every node group | `nodegroups`: one shard, so the expander sees every group that could host the same work |
+//! | an `autoscaler/ScalingPolicy` object | `autoscaler/ScalingPolicy:<namespace>/<name>`, the object shard every app's watch uses ([`crate::structs::app_object::object_shard`]) |
+//! | every `autoscaler/NodeGroup` | `nodegroups`: one shard, so the expander sees every group that could host the same work |
 
 /// How many shards policies hash to.
 pub const SHARDS: u32 = 64;
@@ -40,16 +40,6 @@ pub fn task_key(job_id: &str, group: &str, task: &str) -> String {
     format!("{job_id}/{group}/{task}")
 }
 
-/// A standalone policy's shard key: its own for an external target, the
-/// shared [`NODE_GROUPS_KEY`] for a node group.
-pub fn standalone_key(kind: &str, id: &str) -> String {
-    if kind == "nodes" {
-        NODE_GROUPS_KEY.to_string()
-    } else {
-        format!("policy:{id}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,11 +63,6 @@ mod tests {
         assert!(
             counts.iter().all(|count| (100..220).contains(count)),
             "{counts:?}"
-        );
-        assert_eq!(standalone_key("nodes", "a"), standalone_key("nodes", "b"));
-        assert_eq!(
-            standalone_key("external", "media/render"),
-            "policy:media/render"
         );
     }
 }

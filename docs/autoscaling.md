@@ -19,10 +19,12 @@ Beyond Legion's own measurements, a policy can scale on a Prometheus query,
 an HTTP endpoint, or a [plugin](#plugins) the operator installs, and go to
 zero replicas when idle ([Scale to zero](#scale-to-zero)). Something that
 is not a Legion task (a render farm, a fleet of VMs) gets a
-[standalone policy](#standalone-policies) with a target plugin.
+[standalone policy](#standalone-policies), an `autoscaler/ScalingPolicy`
+object, with a target plugin.
 `legion scaling simulate` runs any policy over the last hour of history
 before you submit it ([Simulating a policy](#simulating-a-policy)).
-Machines themselves scale as [node groups](#node-groups): a pool of
+Machines themselves scale as [node groups](#node-groups) (`autoscaler/NodeGroup`
+objects): a pool of
 workers a provider (an AWS Auto Scaling group, a script) starts when work
 is waiting that they could host, and Legion drains, terminates, and forgets
 when they sit empty.
@@ -545,8 +547,8 @@ $ legion scaling history web
   There is no event per evaluation.
 - **MCP**: `legion_scaling_status`, `legion_scaling_explain`,
   `legion_scaling_history`, and `legion_scaling_simulate` (read-only);
-  `legion_scaling_pause` and `legion_scaling_apply` (write-gated)
-  ([agent-readiness.md](agent-readiness.md)).
+  `legion_scaling_pause` (write-gated); scaling policies and node groups
+  are written with `legion_object_apply` ([agent-readiness.md](agent-readiness.md)).
 
 ### Simulating a policy
 
@@ -557,7 +559,7 @@ series, and prints the decisions it makes. Nothing is written.
 $ legion scaling simulate web                     # the live policy, last hour
 $ legion scaling simulate web.ncl --since 30m     # the policy you are about to submit
 $ legion scaling simulate web.ncl --series load.csv
-$ legion scaling simulate render-farm.ncl --series queue.csv   # a standalone policy
+$ legion scaling simulate render-farm.ncl --series queue.csv   # an autoscaler/ScalingPolicy file
 
 $ legion scaling simulate web
 web/default/web: replay 360 evaluation(s) from 13:02 UTC to 14:02 UTC (history), policy 9c1e04aa61f2
@@ -569,7 +571,9 @@ web/default/web: replay 360 evaluation(s) from 13:02 UTC to 14:02 UTC (history),
 
 - **The target** is a job (its live policy), a jobspec file (resolved with
   `legion job plan`, so the layered defaults apply exactly as on submit), or
-  a standalone policy file (resolved with `legion scaling apply --dry-run`).
+  an `autoscaler/ScalingPolicy` object file (resolved against its
+  namespace's layered defaults, which `legion scaling defaults get -n`
+  shows, exactly as the autoscaler resolves it).
 - **History** is the hour of 10-second points the status-lane leader keeps
   for each task ([Scaling inputs](#scaling-inputs)), with the task's count,
   healthy and unplaced replicas, and the `legion` source's readings. Each
@@ -611,7 +615,7 @@ the terminal, and agents all see the same thing:
 
 | Where | What | Who sees it |
 | --- | --- | --- |
-| **Autoscaling** in the sidebar's Apps section | every autoscaled task you may read: target (linking to its job), mode, now, want, bounds, state, the last change, and why; counts of policies, pending changes, pauses, pins, and targets needing attention; whether the autoscaler is running | `scale:read` somewhere; rows only from namespaces where you hold it |
+| **Autoscaling** in the sidebar's Apps section | every autoscaled task and `autoscaler/ScalingPolicy` you may read: target (a task links to its job), mode, now, want, bounds, state, the last change, and why; counts of policies, pending changes, pauses, pins, and targets needing attention; whether the autoscaler is running | `scale:read` somewhere; rows only from namespaces where you hold it |
 | a panel on an autoscaled **job's page** | per autoscaled task: now, want, bounds (with the policy in one line), state (with the last evaluation's why), and mode; an hour of replicas against the signal its first check reads, with the target; the job's last 20 scaling decisions, by people and the autoscaler; pauses and pins; **Pause**, **Resume**, and **Release the pin** | `scale:read` on the job |
 | a badge on an autoscaled **task's row** | `auto 6 · 2..8` (`auto 6→8` while it wants a change; `paused`, `pinned`, `dry-run 4 (would 7)`, `autoscale invalid`) | `scale:read` on the job |
 | a panel on a **node's page**, for a node in a node group | the group its join token stamped (`legion.nodegroup`), the token, its provider id and scale-in protection; the group's members in the node's pool; and how many nodes like it the pending work would need ([Capacity demand](#capacity-demand)) | `node:read` on the node's pool |
@@ -688,9 +692,10 @@ and `scale:write` and `job:read` in every namespace, `node:read` and
 `kv` under its reserved `legion/apps/autoscaler/` for its replicas' shard
 leases: it can resize, and read jobs, but not redeploy.
 
-It watches policies (`WatchScalingPolicies`: the full set once, then the
-changes whenever a job, a standalone policy, a pause, the defaults, a
-namespace policy, or its own app config changes), reads every target's
+It watches task policies (`WatchScalingPolicies`: the full set once, then
+the changes whenever a job, a pause, the defaults, a namespace policy, or
+its own app config changes) and its own objects, scaling policies and node
+groups (`WatchObjects`, [App Objects](app-objects.md)), reads every target's
 inputs in one batched `GetScalingInputs` per 1,000 targets per interval,
 evaluates, writes, and reports (`ReportScalingStatus`, which is also its
 heartbeat). One replica evaluated 10,000 task policies in about 7.7
@@ -827,7 +832,7 @@ the code the app runs, so it needs the app's whole grant
 address, need only `app:write` on the autoscaler.
 
 **Policies name plugins**: a check's `source`, a strategy's `name`, a
-standalone policy's `target.plugin`. A policy never carries a command or a
+scaling policy's `target.plugin`. A policy never carries a command or a
 URL. That is the trust boundary:
 
 - Plugins run inside the autoscaler, with its identity, which can resize
@@ -857,75 +862,159 @@ missing data (a source, a strategy) or its target `error`.
 
 ## Standalone policies
 
-A policy whose target is not a Legion task is its own object: `legion
-scaling apply` stores it, versioned, on the Control lane, and the
-autoscaler runs it next to the task policies.
+A policy whose target is not a Legion task is an **object**: an
+`autoscaler/ScalingPolicy`, a kind the bundled autoscaler app declares
+([App Objects](app-objects.md)). `legion object apply` stores it, the
+manager checks it against the kind's schema, its validation rules, and your
+rights, and the
+autoscaler runs it next to the task policies and reports on it in the
+object's status.
 
 ```nickel
-# legion scaling apply render-farm.ncl
+# configs/scaling/render-farm.ncl  —  legion object apply -f render-farm.ncl
 {
+  kind = "autoscaler/ScalingPolicy",
   name = "render-farm",
   namespace = "media",                 # default: -n, else `default`
-  description = "GPU render workers",
-  target = { plugin = "render-exec", config = { pool = "gpu" } },
-  min = 0,
-  max = 50,
-  checks = [{
-    name = "queue", source = "team-prom", query = "sum(render_queue_depth)",
-    strategy = { name = "per-replica", value = 10 }, activation = 0,
-  }],
-  down = { stabilize = "10m" },
-  mode = "dry-run",
+  spec = {
+    description = "GPU render workers",
+    target = { plugin = "render-exec", config = { pool = "gpu" } },
+    min = 0,
+    max = 50,
+    checks = [{
+      name = "queue", source = "team-prom", query = "sum(render_queue_depth)",
+      strategy = { name = "per-replica", value = 10 }, activation = 0,
+    }],
+    down = { stabilize = "10m" },
+    mode = "dry-run",
+  },
 }
 ```
 
 ```console
-$ legion scaling apply render-farm.ncl --dry-run
-scaling policy media/render-farm: would be created; dry run, nothing written
-$ legion scaling apply render-farm.ncl --wait
-scaling policy media/render-farm: created (v1)
-autoscaler: dry-run: queue 120 / 10 per replica
-$ legion scaling list -n media
- POLICY                 | KIND     | NAMESPACE | MODE    | BOUNDS | TARGET
-------------------------+----------+-----------+---------+--------+--------------------
- media/encode/default/x | task     | media     | enforce | 2..8   | job media/encode
- media/render-farm      | external | media     | dry-run | 0..50  | plugin render-exec
-$ legion scaling explain render-farm -n media --standalone
-$ legion scaling history render-farm -n media --standalone
-$ legion scaling pause render-farm -n media --standalone --for 1h
-$ legion scaling delete render-farm -n media
+$ legion object apply -f render-farm.ncl --dry-run
+autoscaler/ScalingPolicy media/render-farm: would be created; dry run, nothing written
+$ legion object apply -f render-farm.ncl --wait
+autoscaler/ScalingPolicy media/render-farm: created (generation 1, spec version 41)
+autoscaler/ScalingPolicy media/render-farm: Ready
+$ legion object list scalingpolicies -n media
+NAME         STATUS  AGE  TARGET       MIN  MAX  MODE
+render-farm  Ready   1m   render-exec  0    50   dry-run
+$ legion object get scalingpolicy render-farm -n media
+$ legion scaling status -n media
+$ legion scaling explain render-farm --kind scalingpolicy -n media
+$ legion scaling history render-farm --kind scalingpolicy -n media
+$ legion scaling pause render-farm --kind scalingpolicy -n media --for 1h
+$ legion object delete scalingpolicy render-farm -n media
 ```
 
-- **The record** is the `autoscale` record (checks, `up`, `down`, `headroom`,
+- **The spec** is the `autoscale` record (checks, `up`, `down`, `headroom`,
   `warmup`, `tolerance`, `window`, `schedule`, `onMissing`, `mode`) plus
-  `name`, `namespace`, `description`, and `target`. `min`, `max`, and
-  `checks` are required: `min` and `max` are replica counts (there is no
-  `count` for `"Nx"`), and `cpu`, `memory`, and `legion` queries read a
-  task's own usage, which an external target has none of. The fields it
-  leaves out take the layered defaults like a task's (cluster defaults,
-  then the namespace's policies), live.
+  `description` and `target`; the object's `name` and `namespace` are the
+  policy's. `min`, `max`, and `checks` are required: `min` and `max` are
+  replica counts (there is no `count` for `"Nx"`), and `cpu`, `memory`, and
+  `legion` queries read a task's own usage, which an external target has
+  none of. The fields it leaves out take the layered defaults like a
+  task's (cluster defaults, then the namespace's policies), live: a
+  defaults change reaches every policy with no re-apply, and `legion scaling
+  defaults apply` refuses a change that would leave one invalid, as for
+  tasks. `legion object explain scalingpolicy` lists every field.
+- **Writing one** needs `scale:write` in its namespace, namespace-wide: a
+  `scale` rule that names jobs (`names = ["web-*"]`) does not reach
+  policies, so a selector written about jobs never decides who aims the
+  autoscaler at an external target ([Access control](#access-control)).
+  Reading one needs `scale:read` there.
+- **Checked at apply, in the manager, fail-closed**, whether or not the
+  autoscaler is running: the schema (closed: an unknown field is an error
+  with its path, `spec.stabilise: unknown field (did you mean ...)`);
+  `target.plugin` is **immutable** (a policy that moves to another target
+  is a new policy: delete and recreate it); and the kind's
+  [validation rules](#the-policy-rules), what a schema cannot say across
+  fields, such as `min` above `max`:
+
+  ```text
+  $ legion object apply -f inverted.ncl
+  Error: autoscaler/ScalingPolicy media/render: spec.min: min must not exceed max
+  Hint: `legion object explain autoscaler/ScalingPolicy` lists the kind's rules
+  ```
+
+  The autoscaler is also asked (the validate call) about what needs the
+  cluster: a check's strategy settings, durations, or a plugin the
+  namespace may not use. That call is advice and fails open: when the app
+  is down or slow, the write goes through with a warning, and the app
+  rejects the policy when it evaluates it (below).
 - **The target** is a target plugin: `noop` (built in: it records
   decisions and events and changes nothing), an `exec` builtin, or an
   installed plugin. `target.config` is passed to it as data. Each
   evaluation asks the target for its count (`target/status`); a change is
-  recorded first as an action intent on the policy (so a pause refuses it
-  on the server, and two autoscaler replicas cannot both make it: [No
-  duplicate actions](#no-duplicate-actions)), then made (`target/scale`),
-  then closed with its outcome. A failed `target/scale` adds a `failed`
-  history row and reports `error`.
-- **`--dry-run`** validates, resolves, and diffs against the stored version
-  (`max: 10 -> 20`) without writing. Applying an unchanged file writes
-  nothing and keeps the version. **`--wait`** waits until the autoscaler
-  has evaluated the new version and reports what it found: the plugin's
-  kind and schema are checked only there.
-- **History, pauses, status** work as for tasks, with `--standalone` on
-  `explain`, `history`, `pause`, and `resume` naming the policy instead of
-  a job. `legion scaling status` lists standalone policies with tasks
-  (kind `external`). `pause --all` covers them too. Deleting a policy
-  deletes its pause; its history stays until the cap ages it out.
-- **Node groups** (`target = { nodes = … }`) are standalone policies too,
-  cluster-scoped, needing `operator:write` and `node:write`
-  ([Node groups](#node-groups)).
+  recorded first as an action intent (so a pause refuses it on the server,
+  and two autoscaler replicas cannot both make it: [No duplicate
+  actions](#no-duplicate-actions)), then made (`target/scale`), then closed
+  with its outcome. A failed `target/scale` adds a `failed` history row and
+  reports `error`.
+- **The plugin allowlist is enforced by the autoscaler**, every
+  evaluation, fail-closed: a policy naming a plugin that is not installed,
+  or one whose `namespaces` do not include the policy's, is never run. It
+  reads `Rejected` with the reason.
+- **History, pauses, status** work as for tasks, with `--kind` on
+  `explain`, `history`, `pause`, and `resume` naming the object instead of
+  a job. Pausing a policy needs what writing it needs. `legion scaling
+  status` lists ScalingPolicies with tasks (kind `ScalingPolicy`), and
+  `pause --all` covers them too.
+- **Keyed by the object's uid.** Its history, pause, action intents, and
+  status-board entry belong to the object, not its name: deleting a policy
+  ends its pause and its history (swept on the managers' next pass), and a
+  policy created again under the same name starts fresh, unpaused, with no
+  history.
+
+### The policy rules
+
+Both kinds declare [validation rules](app-objects.md#validation-rules):
+the policy parser's cross-field checks, written in CEL, which the manager
+evaluates on every apply (dry runs too), fail-closed, whether or not the
+autoscaler is running. Every failing rule is reported at once, at its
+field; `legion object explain scalingpolicy` (or `nodegroup`) prints them.
+
+| Kind | Rule |
+| --- | --- |
+| ScalingPolicy | `min` is at most `max`, and `max` is at least 1 |
+| ScalingPolicy | every check has its own `name` |
+| ScalingPolicy | a check on the `legion` source has no `query` (a policy has no Legion task to measure) |
+| ScalingPolicy | a check's `activation` is 0 or more; `tolerance` is at least 0 and below 1 |
+| ScalingPolicy | a `schedule` window sets `min`, `max`, or both, and its `min` is at most its `max` when both are replica counts |
+| ScalingPolicy | `up.step` and `down.step` name `percent`, `replicas`, or both; `down.step.percent` is at most 100 |
+| NodeGroup | `min` is at most `max`, and `max` is at least 1 |
+| NodeGroup | `target.nodes.shape.attributes` does not set `legion.nodegroup` (every member gets it from the group's name) |
+| NodeGroup | `up.step` and `down.step` name `percent`, `replicas`, or both |
+
+The rules are a subset of what the parser checks; the parser runs again
+when the autoscaler evaluates an object, and holds anything else it
+refuses `Accepted=false`. `target.plugin` (and a node group's
+`target.nodes.plugin`) stays `immutable` rather than a transition rule: it
+says the same thing more simply.
+
+### Status and conditions
+
+The autoscaler reports each object's durable verdict in its status, and
+only when it changes; the per-evaluation numbers (current and wanted
+count, the last decision) stay on the scaling status board that `legion
+scaling status` and `explain` read.
+
+| Condition | Means |
+| --- | --- |
+| `Accepted=true` | the spec parses, resolves against the layered defaults, and every plugin it names is installed and open to its namespace |
+| `Accepted=false` (`Invalid`) | it does not: the message says why (`check 'queue' uses source 'team-prom', which is not available to namespace payments`). The policy is held, never run. The kind's rules keep the cross-field mistakes (`min` above `max`) from being stored at all. |
+| `Ready=true` | its last evaluation worked (reason `Paused` while a pause holds it) |
+| `Ready=false` (`TargetError`, `MissingData`) | its target's `target/status` or `target/scale` failed, or its checks have no data |
+
+Its status `fields` are `target` (`plugin render-exec`), `policy` (the
+effective policy in one line), `digest` (the effective policy's, as each
+history row carries), `error`, and `lastAction` (the last closed action
+intent: `from`, `to`, `at`, `decision`, `outcome`). The object's summary
+(`Ready`, `Rejected: Invalid`, `NotReady: TargetError`, `Stale` while the
+autoscaler is not running) is what `legion object list` shows and `legion
+object apply --wait` waits for: it returns once the autoscaler has
+evaluated the new generation, and fails on `Rejected` or `NotReady`.
 
 The `exec` builtin runs one command per operation, volume-driver style: the
 operation (`status`, `scale`, and for a node group `terminate`) appended to
@@ -934,63 +1023,76 @@ stdin (`{ "apiVersion": 1, "op": "scale", "policy": "media/render-farm",
 "config": { "pool": "gpu" }, "desired": 9, "decision": "d-81f3a2c0" }`), and
 a JSON reply on stdout (`status` answers `{ "count": 7, "ready": 7 }`). The
 command comes from the app config, never the policy.
+
 ## Node groups
 
 A **node group** is a pool plus a template: machines a provider (an AWS
 Auto Scaling group, a script, a cloud API) starts and stops, that join
 Legion as workers carrying `legion.nodegroup = <name>`. The autoscaler grows
 a group when work is waiting that its nodes could host, and shrinks it by
-draining, terminating, and forgetting members that sit empty.
+draining, terminating, and forgetting members that sit empty. A group is an
+object of the autoscaler's `autoscaler/NodeGroup` kind
+([App Objects](app-objects.md)).
 
 ```nickel
-# nodes.ncl  —  legion scaling apply nodes.ncl
+# configs/scaling/nodes-aws.ncl  —  legion object apply -f nodes-aws.ncl
 {
+  kind = "autoscaler/NodeGroup",
   name = "workers-general",
-  target = {
-    nodes = {
-      pool = "default",
-      workerType = "default",
-      # What a member looks like before one has joined (to scale from zero).
-      shape = { cpu = 8000, memory = 16384, attributes = { arch = "amd64" } },
-      plugin = "aws-asg",
-      config = { asg = "legion-workers", joinTokenParameter = "/legion/workers-general/join" },
+  spec = {
+    target = {
+      nodes = {
+        pool = "default",
+        workerType = "default",
+        # What a member looks like before one has joined (to scale from zero).
+        shape = { cpu = 8000, memory = 16384, attributes = { arch = "amd64" } },
+        plugin = "aws-asg",
+        config = { asg = "legion-workers", joinTokenParameter = "/legion/workers-general/join" },
+      },
     },
+    min = 0,
+    max = 20,
+    up   = { step = { percent = 100, replicas = 5 }, every = "2m", joinTimeout = "10m" },
+    down = { when = "empty", for = "10m", step = { percent = 10, replicas = 1 },
+             every = "5m", drainDeadline = "10m" },
   },
-  min = 0,
-  max = 20,
-  up   = { step = { percent = 100, replicas = 5 }, every = "2m", joinTimeout = "10m" },
-  down = { when = "empty", for = "10m", step = { percent = 10, replicas = 1 },
-           every = "5m", drainDeadline = "10m" },
 }
 ```
 
 ```console
-$ legion scaling apply nodes.ncl
-scaling policy workers-general: created (v4)
+$ legion object apply -f nodes-aws.ncl --wait
+autoscaler/NodeGroup workers-general: created (generation 1, spec version 44)
+autoscaler/NodeGroup workers-general: Ready
 $ legion scaling status
- TARGET           | KIND  | NOW | WANT | BOUNDS | MODE    | STATE    | LAST
-------------------+-------+-----+------+--------+---------+----------+----------------------------
- workers-general  | nodes | 3   | 5    | 0..20  | enforce | scaled   | 3 → 5 4s ago (autoscaler)
-$ legion scaling explain workers-general --standalone
-$ legion scaling history workers-general --standalone
-$ legion scaling pause workers-general --standalone --for 1h
-$ legion scaling delete workers-general
+ TARGET           | KIND      | NOW | WANT | BOUNDS | MODE    | STATE    | LAST
+------------------+-----------+-----+------+--------+---------+----------+----------------------------
+ workers-general  | NodeGroup | 3   | 5    | 0..20  | enforce | scaled   | 3 → 5 4s ago (autoscaler)
+$ legion object list nodegroups
+$ legion scaling explain workers-general --kind nodegroup
+$ legion scaling history workers-general --kind nodegroup
+$ legion scaling pause workers-general --kind nodegroup --for 1h
+$ legion object delete nodegroup workers-general --wait
 ```
 
-A node group is **cluster-scoped**: it has no namespace, and applying,
-deleting, or pausing one needs `operator:write` and `node:write` (a job
-owner with broad `scale:write` cannot add machines). Its name may not be
-the name of a standalone policy in the `default` namespace, and the reverse:
-both are addressed by the bare name. It is listed, and its status and
-history read, with `node:read`.
+A node group is **cluster-scoped**: it has no namespace, and writing,
+deleting, or pausing one needs `node:write` and `operator:write` (a job
+owner with broad `scale:write` cannot add machines). Reading one, its
+status, and its history needs `node:read`. Its name is its own: a node
+group and a scaling policy may share a name, since their kinds tell them
+apart and each keeps its own history and pause. `target.nodes.plugin` is
+immutable: a group's members belong to the provider that started them. The
+manager refuses, at apply, a group whose `min` is above its `max`, whose
+`max` is 0, whose `shape.attributes` set `legion.nodegroup`, or whose
+`up.step` or `down.step` names neither `percent` nor `replicas` (the
+kind's [rules](#the-policy-rules)).
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `name` | (required) | Lowercase letters, digits, `-`; at most 63. Every member carries it as `legion.nodegroup`. |
+| `name` (the object's) | (required) | Lowercase letters, digits, `-`; at most 63. Every member carries it as `legion.nodegroup`. |
 | `target.nodes.pool` | the worker type's | The pool members join. |
 | `target.nodes.workerType` | `default` | The worker type members join as (the join token's type). |
 | `target.nodes.shape` | none | `cpu` (MHz), `memory` (MiB), `cores`, `attributes`, `resources`, `maxAllocations` of a member: needed to scale from zero. Once a member has joined, its observed capacity is the template. |
-| `target.nodes.plugin` | (required) | A target plugin that declares the `nodes` capability: `aws-asg`, or the `exec` builtin. |
+| `target.nodes.plugin` | (required) | A target plugin that declares the `nodes` capability: `aws-asg`, or the `exec` builtin. Immutable. |
 | `target.nodes.config` | `{}` | The plugin's per-group settings, checked against its schema. |
 | `min` / `max` | `0` / (required) | The group's floor and ceiling. A floor applies at once. |
 | `up.step` / `up.every` | `{ percent = 100, replicas = 5 }` / `"2m"` | At most this many nodes added per window (the larger half). |
@@ -1001,6 +1103,42 @@ history read, with `node:read`.
 | `down.drainDeadline` | `"10m"` | A drain that outlives it is abandoned: the node is uncordoned. |
 | `expander` | `"least-waste"` | How groups that could host the same work compete. |
 | `mode` | `"enforce"` | `dry-run` records what it would do (`legion scaling history`). |
+
+Its status says the same as a scaling policy's ([Status and
+conditions](#status-and-conditions)): `Accepted=false` when its plugin is
+not installed, is `noop`, or is not a node target; its `target` field reads
+`nodes via aws-asg in pool default (worker type default)`.
+
+### Deleting a node group
+
+The kind has a 15-minute **cleanup window** (`cleanup = "15m"` in the
+autoscaler's manifest): deleting a group does not just forget it.
+
+```console
+$ legion object delete nodegroup workers-general
+autoscaler/NodeGroup workers-general: deleting; the autoscaler app has until its cleanup deadline (15m) to release it (`--now` skips the cleanup)
+$ legion object get nodegroup workers-general
+autoscaler/NodeGroup workers-general (valid)  Deleting
+...
+  fields: {"cleanup":"2 member(s) left, 2 draining", ...}
+```
+
+While it is **Deleting**, the group grows no more (the expander skips it),
+and every member is drained, terminated, and forgotten through the
+[scale-in](#scale-in) path at once: not only empty ones, and with no
+`down.step` budget and no `min` floor. Members the scale-in path never
+drains (a `legion-system` allocation, node-local storage,
+`legion.scale-in = "never"`, `disruption.minAvailable`, a provider id the
+provider does not list) stay, and the status's `cleanup` field names them.
+Once no member is left and the provider reports no instance (an instance
+that never joined is scaled away, since no Legion node can be stranded),
+the autoscaler releases the object and it is gone. When the window ends
+first, the manager removes the object anyway (`object.cleanup_abandoned`)
+and whatever was not cleaned up is left to you. `legion object delete
+--wait` waits for it to go; `--now` removes it at once, leaving every
+member running. A dry-run group is released at once (it never started a
+machine), and a paused group's cleanup waits for the pause, or the
+deadline.
 
 ### Scale-up
 
@@ -1078,7 +1216,7 @@ which decides again from what happened, and one still running at the
 deadline is abandoned and recorded as failed. So the owner is done before
 anyone else may take the intent over, and two replicas never act on one
 group at once. `legion scaling history workers-general
---standalone` shows each step: `scaled`, `drain`, `terminate`, `forget`,
+--kind nodegroup` shows each step: `scaled`, `drain`, `terminate`, `forget`,
 `uncordon`, and `failed`.
 
 ## Scaling by hand
@@ -1350,9 +1488,10 @@ Unfittable (no template can host them):
     general: permit: task train's permit does not tolerate pool "default"
 ```
 
-Several templates at once, from a file (Nickel or JSON): a node-group policy
-(its `name` and `target.nodes` are the template), a bare template, or a list
-of either:
+Several templates at once, from a file (Nickel or JSON): an
+`autoscaler/NodeGroup` object (its name and `spec.target.nodes` are the
+template, so the file you apply works as is), a bare template, or a list of
+either:
 
 ```nickel
 # groups.ncl  —  legion scaling demand -f groups.ncl -j
@@ -1492,23 +1631,26 @@ a job without the right to redeploy it. See [auth-and-acls.md](auth-and-acls.md)
 | `ScaleTask` (`legion job scale`) | `scale:write` on the job |
 | `GetJobScaleStatus`, `GetScalingInputs` | `scale:read` on the job |
 | `WatchScalingPolicies` | `scale:read`; jobs and policies outside the grant are left out |
-| `GetScalingStatus`, `GetScaleHistory` | `scale:read` on the job(s) or the standalone policy; `node:read` for a node group |
-| `PauseScaling` | `scale:write` on the job or the standalone policy; `operator:write` and `node:write` for a node group; `operator:write` for `--all` |
-| `ApplyScalingPolicy` (`legion scaling apply`) | `scale:write` on the policy's namespace and name; a node group: `operator:write` and `node:write` |
-| `DeleteScalingPolicy` | `scale:write` on the policy (`operator:write` and `node:write` for a node group), checked before the lookup |
-| `ListScalingPolicies` | `scale:read`; policies outside the grant are left out, and node groups need `node:read` |
+| `GetScalingStatus`, `GetScaleHistory` | `scale:read` on the job(s); a scaling policy's with `scale:read` in its namespace, a node group's with `node:read`, checked before the lookup |
+| `PauseScaling` | `scale:write` on the job; an object needs what writing it needs (`scale:write` in its namespace for a scaling policy, `node:write` and `operator:write` for a node group), checked before the lookup; `operator:write` for `--all` |
+| `ApplyObject`, `DeleteObject` of an `autoscaler/ScalingPolicy` | `scale:write` in its namespace, namespace-wide (a `scale` rule with `names` does not reach it) |
+| `ApplyObject`, `DeleteObject` of an `autoscaler/NodeGroup` | `node:write` (its access) and `operator:write` (its `requires`) |
+| `GetObject`, `ListObjects` | `scale:read` in the namespace for scaling policies; `node:read` for node groups; others are left out |
 | `GetScalingDefaults` | `scale:read` on the namespace |
 | `ApplyScalingDefaults` | `operator:write` |
 | `ReportScalingStatus`, `RecordScalingAction` | app-plane: only the bundled autoscaler's own identity (or a management token) |
 | the UI's panels, badges, and page (`GetAppView` on the `autoscaler` app) | `app:read` on `autoscaler`, and `scale:read` on the job (`node:read` on the node's pool for the node panel; `scale:read` somewhere for the sidebar page) |
 | the UI's Pause, Resume, and Release (`InvokeAppAction`) | `app:read` on `autoscaler`, and `scale:write` on the job; the app then writes as `<you> via app autoscaler`, holding `scale` on that job only ([delegated identities](auth-and-acls.md#delegated-identities)) |
 
-A standalone policy is scoped like a job of the same name in its
-namespace: a rule with `names = ["render-*"]` on `scale` covers the
-`render-farm` policy. Using a plugin is not an ACL: the plugin's
-`namespaces` allowlist in the autoscaler's app config decides which
-namespaces' policies may name it ([Plugins](#plugins)), and installing one
-is changing that app config ([apps.md](apps.md)).
+A scaling policy is governed by `scale` **namespace-wide**: whoever may
+scale anything in `media` writes `media`'s policies, and a rule with
+`names = ["render-*"]` on `scale` reaches no policy, whatever its name
+(selectors written about jobs never decide who aims the autoscaler at an
+external target; [App Objects, "Access"](app-objects.md#access)). Using a
+plugin is not an ACL: the plugin's `namespaces` allowlist in the
+autoscaler's app config decides which namespaces' policies may name it
+([Plugins](#plugins)), the autoscaler enforces it every evaluation, and
+installing one is changing that app config ([apps.md](apps.md)).
 
 The app-plane RPCs accept a credential only when its job grant belongs to an
 allocation of `legion-system/autoscaler`, so a person with `scale:write`
@@ -1526,8 +1668,9 @@ caller is trusted, as everywhere else, and a UI press is recorded by
 - Events: `scale.applied`, `scale.deferred`, `scale.reset`,
   `scale.pinned`, `scale.paused`, `scale.resumed`, `scale.limited`,
   `scale.flapping`, and `scale.check_failed` in the event stream
-  ([event-stream.md](event-stream.md)). A standalone policy's events carry
-  `policy` in their metadata instead of a job. A node group adds
+  ([event-stream.md](event-stream.md)). A scaling policy's or node group's
+  events carry the object (`kind`, `object`, `uid`) in their metadata
+  instead of a job. A node group adds
   `nodegroup.pending` (waiting work needs its nodes, once per episode),
   `nodegroup.join_timeout` (nodes asked for did not join), and
   `nodegroup.scale_in` (a drain finished: `outcome` is `completed` or
@@ -1602,13 +1745,19 @@ caller is trusted, as everywhere else, and a UI press is recorded by
 - **A plugin that keeps failing**: it is restarted with backoff (up to a
   minute between starts); its last stderr lines are in the error. Test it
   with `legion scaling plugin test`.
-- **A standalone policy reads `error`**: its target's `target/status` or
-  `target/scale` failed. A failed scale is a `failed` row in `legion scaling
-  history --standalone NAME`; the next evaluation asks the target again.
-- **A node group reads `invalid`**: its plugin is `noop` or a source, is
-  not installed, does not declare `capabilities.nodes`, or its
-  `target.nodes.config` does not match the plugin's schema. `legion scaling
-  explain NAME --standalone` prints which.
+- **A scaling policy reads `error`** (`NotReady: TargetError`): its
+  target's `target/status` or `target/scale` failed. A failed scale is a
+  `failed` row in `legion scaling history NAME --kind scalingpolicy`; the
+  next evaluation asks the target again.
+- **A scaling policy or node group reads `Rejected: Invalid`**: it does
+  not resolve (the object's status says why: a plugin that is not
+  installed or not open to its namespace, a node group's
+  plugin that is `noop`, a source, or does not declare
+  `capabilities.nodes`, or a config that does not match the plugin's
+  schema). It is held, never run, until fixed and applied again.
+- **A Deleting node group outlives its members**: a member the scale-in
+  path never drains holds the cleanup until its deadline; the status's
+  `cleanup` field names it. `legion object delete --now` ends it.
 - **A node group grows, but nodes never join**: after `up.joinTimeout` it
   reports `nodegroup.join_timeout` and backs off for one `joinTimeout`.
   Check that the machines got the join token (`aws-asg`:
@@ -1617,8 +1766,8 @@ caller is trusted, as everywhere else, and a UI press is recorded by
   legion.provider-id=<instance id>`. A token is spent after the nodes it
   was minted for (`max_uses`); a machine that boots later needs the next
   scale-up's.
-- **A node that should go stays**: `legion scaling explain NAME
-  --standalone` lists `never a victim` with the rule (a `legion-system`
+- **A node that should go stays**: `legion scaling explain NAME --kind
+  nodegroup` lists `never a victim` with the rule (a `legion-system`
   allocation, node-local storage, `legion.scale-in = "never"`,
   `disruption.minAvailable`, or a provider id the provider does not list),
   or why scale-in held (the group is growing or has waiting work it could
@@ -1697,6 +1846,23 @@ caller is trusted, as everywhere else, and a UI press is recorded by
   empty and shows `starting`, then fills on the app's next report.
 - **Group targets share one count.** A group's tasks cannot be autoscaled
   separately.
+- **What needs the cluster is the autoscaler's to check.** The manager
+  refuses, at apply, what a ScalingPolicy's or NodeGroup's schema and
+  rules can say (`min` above `max`, duplicate check names). A strategy's
+  settings, a duration, and a plugin closed to the namespace are refused at
+  apply only by the autoscaler's validate call, which fails open: when the
+  autoscaler is down, such an object is stored, and reads `Rejected:
+  Invalid` once it runs. It is never acted on. A rule's checks are a
+  subset of the parser's: where they differ (a `query` of only spaces on
+  the `legion` source), the parser decides, as `Rejected`.
+- **An object's scaling state goes with it.** A scaling policy's or node
+  group's history, pause, and action intents are keyed by its uid: they are
+  swept once it is deleted, and an object created again under the same
+  name starts with none. The events stay in the event journal.
+- **The Autoscaling page lists scaling policies, not node groups.** A node
+  group needs `node:read`, which the page's `scale:read` does not
+  establish; node groups are on their members' node pages and in `legion
+  scaling status`.
 - Scaling inputs are held in the status-lane leader's memory. A takeover
   starts them empty for up to 10 seconds and starts the hour of history
   afresh. History is kept for at most 4096 tasks; past that, a task still

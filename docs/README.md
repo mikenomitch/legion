@@ -89,8 +89,9 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Autoscaling](autoscaling.md): `autoscale = true` on a task, layered
   defaults (task, namespace, cluster), the safeguard pipeline, pins and
   pauses, `legion scaling status|explain|history`; Prometheus, HTTP, and
-  plugin sources, scale to zero, `legion scaling simulate`, and standalone
-  policies for external targets (`legion scaling apply`); and `legion job
+  plugin sources, scale to zero, `legion scaling simulate`, standalone
+  policies for external targets and node groups (`autoscaler/ScalingPolicy`
+  and `autoscaler/NodeGroup` objects, `legion object apply`); and `legion job
   scale`, which sets count overrides without a new version or rollout.
 - [Writing Autoscaling Plugins](autoscaling-plugins.md): the
   `legion-scaling/1` JSON-RPC protocol for sources, strategies, and
@@ -155,6 +156,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   placement on the managers' system workers, install and upgrade with a
   permission prompt, config and code fields, why direct edits are refused,
   bundled apps rolling with the build, and `legion app`.
+- [App Objects](app-objects.md): object kinds apps declare (Legion's
+  custom resources): the manifest's `kinds`, `legion object`, the `object`
+  ACL resource and `requires`, status and the summary, bounded cleanup on
+  delete, and the reconcile loop apps use.
 - [Workload Identity (OIDC)](workload-identity.md): short-lived, verifiable task
   identity for external providers.
 - [Exec & Actions](exec-and-actions.md): running commands inside a workload,

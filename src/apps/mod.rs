@@ -27,6 +27,7 @@
 
 pub mod autoscaler;
 pub mod autoscaler_ui;
+pub mod objects;
 pub mod ui;
 
 use crate::prelude::*;
@@ -60,6 +61,9 @@ pub struct BundledApp {
     /// refused.
     pub manifest_source: &'static str,
     pub body: AppBody,
+    /// Fills in what the manifest leaves to the app's Rust types (its
+    /// kinds' schemas), on the evaluated manifest before it is parsed.
+    pub generated: Option<fn(&mut Value)>,
 }
 
 /// Every bundled app. The first Control leader seeds a record for each
@@ -69,6 +73,7 @@ pub const BUNDLED: &[BundledApp] = &[BundledApp {
     name: "autoscaler",
     manifest_source: include_str!("bundled/autoscaler.ncl"),
     body: autoscaler::run,
+    generated: Some(autoscaler::objects::fill_manifest),
 }];
 
 /// The bundled manifests, evaluated and validated once.
@@ -84,6 +89,15 @@ fn evaluated() -> &'static Result<Vec<AppManifest>, String> {
                     None,
                 )
                 .map_err(|err| format!("bundled app {}: {err:#}", app.name))?;
+                let json = match app.generated {
+                    Some(fill) => {
+                        let mut value: Value = serde_json::from_str(&json)
+                            .map_err(|err| format!("bundled app {}: {err}", app.name))?;
+                        fill(&mut value);
+                        value.to_string()
+                    }
+                    None => json,
+                };
                 let manifest = AppManifest::from_json(&json)
                     .map_err(|err| format!("bundled app {}: {err}", app.name))?;
                 manifest.validate(true)?;

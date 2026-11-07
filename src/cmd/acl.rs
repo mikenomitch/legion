@@ -779,6 +779,10 @@ fn grant_summary(grant: &JobGrant) -> String {
             if let Some(namespaces) = &rule.namespaces {
                 line.push_str(&format!(" in {}", namespaces.join(",")));
             }
+            // Usable only when the app acts for one of its objects.
+            if rule.is_via_objects() {
+                line.push_str(" (via objects)");
+            }
             lines.push(if grant.tasks.len() > 1 {
                 format!("{}: {line}", task.task)
             } else {

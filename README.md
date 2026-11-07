@@ -45,7 +45,8 @@ still be happy with at fifty thousand nodes.
   [namespaces](docs/namespaces.md) with per-team quotas,
   [workload identity (OIDC)](docs/workload-identity.md), and a [web UI](#web-ui).
   Add-ons run as [apps](docs/apps.md): jobs on the managers that Legion keeps
-  running, each with a grant it shows you before you install it.
+  running, each with a grant it shows you before you install it, and able to
+  add [object kinds](docs/app-objects.md) of their own.
 - **Readable job specs.** [Nickel](docs/configuration-language.md) gives you
   types, imports, and functions for DRY specs. You don't need YAML or Helm
   charts.
@@ -464,7 +465,8 @@ start:
   [Upgrades](docs/upgrades.md) · [Data Directory](docs/data-directory.md) ·
   [Logging](docs/logging.md) ·
   [Metrics](docs/metrics.md) · [Observability](docs/observability.md)
-- **Extending Legion:** [Plugin System](docs/plugin-system.md) ·
+- **Extending Legion:** [Apps](docs/apps.md) · [App Objects](docs/app-objects.md) ·
+  [Plugin System](docs/plugin-system.md) ·
   [Codebase Conventions](docs/codebase-conventions.md) ·
   [Testing and Benchmarks](docs/testing-and-benchmarks.md) ·
   [Benchmarks](docs/benchmarks.md)

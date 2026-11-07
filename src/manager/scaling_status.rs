@@ -285,7 +285,7 @@ mod tests {
             decision_json: decision.into(),
             policy_digest: "abc".into(),
             events: Vec::new(),
-            policy: String::new(),
+            object: None,
         }
     }
 

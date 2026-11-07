@@ -2394,6 +2394,93 @@ fn migration_list() -> Vec<M<'static>> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_app_uid ON app(uid) WHERE uid > 0;",
         )
         .down("DROP INDEX IF EXISTS idx_app_uid;"),
+        // App-owned object kinds (`legion object`; app-object-kinds plan
+        // §6.2-§6.7). `object_kind`: one row per (app, kind), the
+        // declaration as installed and whether it is `active` or `orphaned`
+        // (its app uninstalled or dropped it with --force); `revision` is a
+        // value of the `object_kind` counter in `scaling_counter`, new on
+        // every write. Control lane.
+        //
+        // `app_object`: one row per object, keyed by app, kind, namespace
+        // (empty for a cluster kind), and name. `uid` never repeats; `spec`
+        // is the spec with the defaults of its write-time schema filled;
+        // `generation` bumps when it changes; `spec_version`, the CAS token,
+        // is new on every write of the spec, labels, authority, or deleting
+        // mark (never on status). `authority` is the JSON of the permissions
+        // its writer was checked for. `shard` is its watch shard among 64.
+        // Control lane.
+        //
+        // `app_object_status`: the owning app's report on an object, keyed
+        // by its `uid`. Status lane, so status churn never touches the
+        // Control lane.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS object_kind (
+            app TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            decl TEXT NOT NULL,
+            digest TEXT NOT NULL,
+            state TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            created_ms INTEGER NOT NULL,
+            updated_ms INTEGER NOT NULL,
+            PRIMARY KEY (app, kind)
+        );
+        CREATE TABLE IF NOT EXISTS app_object (
+            app TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            name TEXT NOT NULL,
+            uid INTEGER NOT NULL UNIQUE,
+            spec TEXT NOT NULL,
+            labels TEXT NOT NULL DEFAULT '{}',
+            generation INTEGER NOT NULL,
+            spec_version INTEGER NOT NULL,
+            authority TEXT NOT NULL DEFAULT '{}',
+            managed_by TEXT NOT NULL DEFAULT '',
+            deleting_since INTEGER NOT NULL DEFAULT 0,
+            cleanup_deadline INTEGER NOT NULL DEFAULT 0,
+            shard INTEGER NOT NULL DEFAULT 0,
+            schema_digest TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL,
+            created_ms INTEGER NOT NULL,
+            updated_by TEXT NOT NULL,
+            updated_ms INTEGER NOT NULL,
+            PRIMARY KEY (app, kind, namespace, name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_app_object_app_shard ON app_object(app, shard);
+        CREATE INDEX IF NOT EXISTS idx_app_object_namespace ON app_object(namespace);
+        CREATE TABLE IF NOT EXISTS app_object_status (
+            uid INTEGER PRIMARY KEY,
+            app TEXT NOT NULL,
+            observed_generation INTEGER NOT NULL,
+            conditions TEXT NOT NULL DEFAULT '[]',
+            fields TEXT NOT NULL DEFAULT '{}',
+            updated_by TEXT NOT NULL,
+            updated_ms INTEGER NOT NULL
+        );",
+        )
+        .down(
+            "DROP TABLE IF EXISTS app_object_status;
+        DROP INDEX IF EXISTS idx_app_object_namespace;
+        DROP INDEX IF EXISTS idx_app_object_app_shard;
+        DROP TABLE IF EXISTS app_object;
+        DROP TABLE IF EXISTS object_kind;",
+        ),
+        // The autoscaler's standalone policies and node groups became its
+        // object kinds (`autoscaler/ScalingPolicy`, `autoscaler/NodeGroup`
+        // in `app_object`; app-object-kinds plan §8 O2): `scaling_policy`
+        // goes, its rows not converted (no installed base). The scaling
+        // state they kept under `policy:<id>` keys goes too: object targets
+        // key it `object:<uid>`, and `scaling_action.policy` now holds that
+        // key.
+        M::up(
+            "DROP TABLE IF EXISTS scaling_policy;
+        DELETE FROM scaling_action;
+        DELETE FROM scaling_pause WHERE job_id LIKE 'policy:%';
+        DELETE FROM scale_history WHERE job_id LIKE 'policy:%';
+        DELETE FROM scaling_counter WHERE name = 'scaling_policy';",
+        )
+        .down(""),
     ]
 }
 

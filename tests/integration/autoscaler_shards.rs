@@ -22,11 +22,10 @@ use legion::autoscaler::shard::SHARDS;
 use legion::autoscaler::shard::{shard_of, task_key};
 use legion::prelude::{json, R};
 use legion::structs::{
-    ApplyScalingPolicyRequest, GetScaleHistoryRequest, ScalingPolicySet, StopJobRequest,
-    WatchScalingPoliciesRequest,
+    GetScaleHistoryRequest, ScalingPolicySet, StopJobRequest, WatchScalingPoliciesRequest,
 };
 
-use crate::autoscaler::{Harness, T0, TICK_MS};
+use crate::autoscaler::{object_ref, Harness, T0, TICK_MS};
 use crate::node_groups::{boot, group_policy, have_python, Provider};
 
 const TIMING: LeaseTiming = LeaseTiming {
@@ -194,13 +193,8 @@ async fn an_overlap_calls_the_provider_once_per_decision_test() -> R<()> {
     let mut h = Harness::start(0).await?;
     let provider = Provider::new()?;
     h.install_plugins(provider.plugin_config())?;
-    h.client
-        .apply_scaling_policy(ApplyScalingPolicyRequest {
-            spec_json: group_policy("workers", 6).to_string(),
-            ..Default::default()
-        })
-        .await
-        .map_err(|status| anyhow::anyhow!("apply: {}", status.message()))?;
+    h.apply_object("NodeGroup", "", "workers", group_policy(6))
+        .await?;
     h.run(json!({
         "name": "batch",
         "task": {
@@ -242,7 +236,7 @@ async fn an_overlap_calls_the_provider_once_per_decision_test() -> R<()> {
     let history = h
         .client
         .get_scale_history(GetScaleHistoryRequest {
-            policy: "workers".into(),
+            object: Some(object_ref("NodeGroup", "", "workers")),
             limit: 100,
             ..Default::default()
         })
@@ -362,5 +356,98 @@ async fn the_policy_watch_sends_deltas_for_its_shards_test() -> R<()> {
         .await
         .expect_err("shard 64 of 64");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    Ok(())
+}
+
+/// The autoscaler's objects follow the replicas' lease shards: two
+/// replicas, once balanced, each run the `autoscaler/ScalingPolicy` objects
+/// of the shards they hold (by the object's shard key) and no other, so
+/// every policy is evaluated exactly once; and only the replica holding the
+/// `nodegroups` shard runs node groups.
+#[tokio::test(flavor = "multi_thread")]
+async fn objects_follow_the_replicas_shards_test() -> R<()> {
+    let mut h = Harness::start(1).await?;
+    h.install_plugins(json!({ "plugins": {} }))?;
+    let names: Vec<String> = (0..12).map(|n| format!("p-{n}")).collect();
+    for name in &names {
+        h.apply_object(
+            "ScalingPolicy",
+            "default",
+            name,
+            json!({
+                "target": { "plugin": "noop" },
+                "min": 1, "max": 3,
+                "checks": [{ "name": "floor", "source": "legion",
+                             "strategy": { "name": "fixed", "value": 2 } }],
+            }),
+        )
+        .await?;
+    }
+    let engines: Vec<Engine> = ["alloc-1", "alloc-2"]
+        .iter()
+        .map(|name| Engine::new(h.client.clone(), options(name), T0))
+        .collect();
+    let mut leases: Vec<_> = engines.iter().map(|engine| engine.shards(TIMING)).collect();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut owned = Vec::new();
+        for lease in leases.iter_mut() {
+            owned.push(lease.step().await);
+        }
+        if disjoint_cover(&owned).is_ok() && owned.iter().all(|o| o.shards.is_some()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no balance: {owned:?}");
+        tokio::time::sleep(TIMING.renew).await;
+    }
+    let watches: Vec<_> = engines.iter().map(Engine::spawn_watch).collect();
+    let mut engines = engines;
+    // Both replicas' object watches follow their shards.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let counts: Vec<Option<usize>> = engines.iter().map(Engine::policy_count).collect();
+        if counts.iter().flatten().sum::<usize>() == names.len()
+            && counts.iter().all(Option::is_some)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the watches never split: {counts:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut evaluated: Vec<String> = Vec::new();
+    for engine in engines.iter_mut() {
+        let owned = engine.ownership();
+        let report = engine.tick(T0).await;
+        for name in &names {
+            let label = format!("ScalingPolicy default/{name}");
+            let shard = legion::structs::app_object::object_shard(
+                "autoscaler",
+                "ScalingPolicy",
+                "default",
+                name,
+                SHARDS,
+            );
+            assert_eq!(
+                report.states.contains_key(&label),
+                owned.owns(shard),
+                "{label} (shard {shard}) on {owned:?}: {:?}",
+                report.states
+            );
+        }
+        evaluated.extend(report.states.into_keys());
+    }
+    evaluated.sort();
+    let mut expected: Vec<String> = names
+        .iter()
+        .map(|name| format!("ScalingPolicy default/{name}"))
+        .collect();
+    expected.sort();
+    assert_eq!(evaluated, expected, "each policy exactly once");
+    for watch in watches {
+        watch.abort();
+    }
     Ok(())
 }

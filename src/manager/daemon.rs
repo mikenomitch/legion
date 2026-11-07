@@ -2084,6 +2084,14 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                 ),
                 Err(err) => warn!(error = ?err, "Failed sweeping orphaned allocation_health rows"),
             }
+            // An object's status rows (Status lane) outlive its delete
+            // (Control lane); swept here once they are past a grace period
+            // (docs/app-objects.md, "Status").
+            match store.prune_app_object_status_orphans(crate::util::now_unix_ms()) {
+                Ok(0) => {}
+                Ok(swept) => info!(swept, "Swept status rows of deleted objects"),
+                Err(err) => warn!(error = ?err, "Failed sweeping status rows of deleted objects"),
+            }
             // Submit seeds deferred under divergent lane leadership
             // (plan §8, D1): `handle_job_submit` tolerates a status-lane
             // rejection of its seed half; this pass completes those seeds

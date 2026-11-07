@@ -139,8 +139,9 @@ mod namespace_policy_rpcs;
 mod namespace_rpcs;
 mod node_content_rpcs;
 mod node_group_rpcs;
+mod object_rpcs;
 mod plugin_rpcs;
-mod scaling_policy_rpcs;
+mod scaling_objects;
 mod scaling_rpcs;
 mod session_rpcs;
 mod snapshot_rpcs;
@@ -1202,13 +1203,15 @@ fn instance_volume_pin_detail(store: &Store, instance: &Instance) -> Option<Stri
 }
 
 /// The namespace an event belongs to: its job's, or (for a `namespace.*`
-/// lifecycle event) the namespace in its metadata. `None` for cluster
-/// events.
+/// lifecycle event, or an `object.*` event about a namespaced object) the
+/// namespace in its metadata. `None` for cluster events.
 fn event_namespace(event: &SchedulerEventRecord) -> Option<String> {
     if let Some(job_id) = event.job_id.as_deref().filter(|id| !id.is_empty()) {
         return Some(crate::structs::namespace::job_namespace(job_id).to_string());
     }
-    if event.kind.starts_with("namespace.") {
+    // `namespace.*` lifecycle events, and a namespaced object's events
+    // (docs/app-objects.md, "Events"), carry their namespace in metadata.
+    if event.kind.starts_with("namespace.") || event.kind.starts_with("object.") {
         return serde_json::from_str::<Value>(&event.metadata_json)
             .ok()
             .and_then(|meta| meta.get("namespace")?.as_str().map(str::to_string));
@@ -1298,6 +1301,13 @@ impl EventAudience {
     fn sees(&self, event: &SchedulerEventRecord) -> bool {
         match self {
             EventAudience::Operator => true,
+            // An object's events reach only a caller who may read that kind
+            // on that object's scope: reaching its namespace is not enough,
+            // or the feed would undo check-before-fetch (docs/app-objects.md,
+            // "Events").
+            EventAudience::Tenant(identity) if event.kind.starts_with("object.") => {
+                object_event_visible(identity, event)
+            }
             EventAudience::Tenant(identity) => match event.job_id.as_deref() {
                 Some(job_id) if !job_id.is_empty() => {
                     identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(job_id))
@@ -1326,6 +1336,25 @@ impl EventAudience {
             ),
         }
     }
+}
+
+/// Whether a tenant may see an `object.*` event: `read` on the kind's
+/// access resource (recorded in the event) on the object's scope.
+fn object_event_visible(identity: &AclIdentity, event: &SchedulerEventRecord) -> bool {
+    let Ok(meta) = serde_json::from_str::<Value>(&event.metadata_json) else {
+        return false;
+    };
+    let text = |key: &str| meta.get(key).and_then(Value::as_str).unwrap_or_default();
+    let Some(access) = AclResource::parse(text("access")) else {
+        return false;
+    };
+    let scope = crate::structs::app_object::access_scope(
+        access,
+        text("qualifiedKind"),
+        text("namespace"),
+        text("name"),
+    );
+    identity.allows(access, AclAction::Read, &scope)
 }
 
 fn map_scheduler_event(event: SchedulerEventRecord) -> SchedulerEvent {
@@ -2128,6 +2157,9 @@ pub struct ManagerDaemonService {
     /// The keys installed apps add to the jobspec, rebuilt when an app
     /// record changes (`extension_rpcs`).
     extension_registry: extension_rpcs::RegistryCache,
+    /// The object kinds installed apps declare, rebuilt when an app record
+    /// changes (`object_rpcs`).
+    object_registry: object_rpcs::ObjectRegistryCache,
     /// Field names treated as core although this build has none (tests: a
     /// simulated release that adds a core field named like an app's key).
     simulated_core_fields: Vec<(crate::structs::spec_fields::ExtensionPoint, String)>,
@@ -2182,6 +2214,7 @@ impl ManagerDaemonService {
             app_forwarder: Arc::new(crate::manager::app_forward::WorkerPlaneForwarder),
             app_actions_in_flight: Arc::new(app_ui_rpcs::InFlightKeys::default()),
             extension_registry: Arc::new(Mutex::new(None)),
+            object_registry: Arc::new(Mutex::new(None)),
             simulated_core_fields: Vec::new(),
         }
     }
@@ -2675,17 +2708,41 @@ impl ManagerDaemonService {
             &origin,
             unknown_field_mode,
         )?;
+        // A person's submit over a version an app wrote for one of its
+        // objects replaces it, stamp and all (no `--force`: the object's
+        // namespace owner may always take a job over); say who will likely
+        // write it back.
+        let object_stamp = match (&origin, &identity.acting_for) {
+            (SubmitOrigin::Principal, None) => self
+                .store
+                .job_managed_by(&config.name)
+                .ok()
+                .flatten()
+                .filter(|stamp| stamp.object.is_some()),
+            _ => None,
+        };
         // The version's grant is recorded in the submitter's name, in the
         // same entry as the version (`enforce_identity_grants` above checked
-        // they hold it).
+        // they hold it). An app acting for an object (`legion-for-object`)
+        // stamps the version with the object.
         let submit_outcome = match origin {
-            SubmitOrigin::Principal => self.store.handle_job_submit_as(
-                &config,
-                &subs,
-                template,
-                &identity.principal,
-                Some(&unknown_fields),
-            ),
+            SubmitOrigin::Principal => match &identity.acting_for {
+                Some(actor) => self.store.handle_job_submit_for_object(
+                    &config,
+                    &subs,
+                    template,
+                    &identity.principal,
+                    crate::structs::app::ManagedBy::for_object(actor),
+                    Some(&unknown_fields),
+                ),
+                None => self.store.handle_job_submit_as(
+                    &config,
+                    &subs,
+                    template,
+                    &identity.principal,
+                    Some(&unknown_fields),
+                ),
+            },
             SubmitOrigin::App {
                 granted_by,
                 managed_by,
@@ -2776,6 +2833,7 @@ impl ManagerDaemonService {
                 .len();
         }
 
+        let replaced_version = !matches!(submit_outcome, JobSubmitOutcome::Unchanged { .. });
         let in_place = if matches!(submit_outcome, JobSubmitOutcome::Updated { .. }) {
             self.update_in_place(&config, &job_config_id)?
         } else {
@@ -2944,6 +3002,15 @@ impl ManagerDaemonService {
             }
         }
 
+        let takeover = object_stamp.filter(|_| replaced_version).map(|stamp| {
+            format!(
+                "{} was managed by {}; this version replaces it, and {} will likely write the \
+                 job back on its next reconcile",
+                config.name,
+                stamp.label(),
+                stamp.app
+            )
+        });
         Ok(SubmittedJob {
             message,
             job_name: config.name.clone(),
@@ -2952,6 +3019,7 @@ impl ManagerDaemonService {
             warnings: unknown_fields
                 .warnings()
                 .into_iter()
+                .chain(takeover)
                 .chain(app_warnings)
                 .chain(self.band_submit_warnings(&config))
                 .chain(autoscale_warnings)
@@ -5450,6 +5518,7 @@ impl Manager for ManagerDaemonService {
             .map(|stamp| ManagedByInfo {
                 app: stamp.app,
                 digest: stamp.digest,
+                object: stamp.object.unwrap_or_default(),
             });
         let unknown_fields = self
             .store
@@ -6862,30 +6931,6 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::PauseScalingRequest>,
     ) -> Result<Response<crate::structs::PauseScalingReply>, Status> {
         self.pause_scaling_rpc(request).await
-    }
-
-    // ACL: scale:write, coarse then on the policy (in the handler).
-    async fn apply_scaling_policy(
-        &self,
-        request: Request<crate::structs::ApplyScalingPolicyRequest>,
-    ) -> Result<Response<crate::structs::ApplyScalingPolicyReply>, Status> {
-        self.apply_scaling_policy_rpc(request).await
-    }
-
-    // ACL: scale:write, coarse then on the policy (in the handler).
-    async fn delete_scaling_policy(
-        &self,
-        request: Request<crate::structs::DeleteScalingPolicyRequest>,
-    ) -> Result<Response<crate::structs::DeleteScalingPolicyReply>, Status> {
-        self.delete_scaling_policy_rpc(request).await
-    }
-
-    // ACL: scale:read, filtered (in the handler).
-    async fn list_scaling_policies(
-        &self,
-        request: Request<crate::structs::ListScalingPoliciesRequest>,
-    ) -> Result<Response<crate::structs::ListScalingPoliciesReply>, Status> {
-        self.list_scaling_policies_rpc(request).await
     }
 
     async fn get_capacity_demand(
@@ -11971,6 +12016,20 @@ impl Manager for ManagerDaemonService {
             AclScope::none(),
         )?;
         let req = request.into_inner();
+        // `via = "objects"` belongs in an app manifest's permissions: a
+        // token holding a policy never acts for an object, so the rule
+        // would silently grant nothing.
+        if let Some(index) = crate::structs::acl::parse_rules(&req.rules_json)
+            .unwrap_or_default()
+            .iter()
+            .position(crate::structs::acl::AclRule::is_via_objects)
+        {
+            return Err(Status::invalid_argument(format!(
+                "rule {index}: `via = \"objects\"` is for an app manifest's permissions (the app \
+                 uses it only when it acts for one of its objects); a policy's rules apply to \
+                 tokens, which never do. Remove `via`"
+            )));
+        }
         let policy = self
             .store
             .upsert_acl_policy(&req.name, &req.description, &req.rules_json)
@@ -12416,6 +12475,72 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::WatchAppExtensionsRequest>,
     ) -> Result<Response<Self::WatchAppExtensionsStream>, Status> {
         self.watch_app_extensions_rpc(request).await
+    }
+
+    // ACL: per kind (in the handler).
+    async fn list_object_kinds(
+        &self,
+        request: Request<crate::structs::ListObjectKindsRequest>,
+    ) -> Result<Response<crate::structs::ListObjectKindsReply>, Status> {
+        self.list_object_kinds_rpc(request).await
+    }
+
+    // ACL: the kind's access resource and writeRequires (in the handler).
+    async fn apply_object(
+        &self,
+        request: Request<crate::structs::ApplyObjectRequest>,
+    ) -> Result<Response<crate::structs::ApplyObjectReply>, Status> {
+        self.apply_object_rpc(request).await
+    }
+
+    // ACL: the kind's access resource (in the handler).
+    async fn get_object(
+        &self,
+        request: Request<crate::structs::GetObjectRequest>,
+    ) -> Result<Response<crate::structs::GetObjectReply>, Status> {
+        self.get_object_rpc(request).await
+    }
+
+    // ACL: the kind's access resource, per item (in the handler).
+    async fn list_objects(
+        &self,
+        request: Request<crate::structs::ListObjectsRequest>,
+    ) -> Result<Response<crate::structs::ListObjectsReply>, Status> {
+        self.list_objects_rpc(request).await
+    }
+
+    // ACL: the kind's access resource and writeRequires (in the handler).
+    async fn delete_object(
+        &self,
+        request: Request<crate::structs::DeleteObjectRequest>,
+    ) -> Result<Response<crate::structs::DeleteObjectReply>, Status> {
+        self.delete_object_rpc(request).await
+    }
+
+    type WatchObjectsStream = ReceiverStream<Result<crate::structs::ObjectEvent, Status>>;
+
+    // ACL: app-plane (in the handler).
+    async fn watch_objects(
+        &self,
+        request: Request<crate::structs::WatchObjectsRequest>,
+    ) -> Result<Response<Self::WatchObjectsStream>, Status> {
+        self.watch_objects_rpc(request).await
+    }
+
+    // ACL: app-plane (in the handler).
+    async fn update_object_status(
+        &self,
+        request: Request<crate::structs::UpdateObjectStatusRequest>,
+    ) -> Result<Response<crate::structs::UpdateObjectStatusReply>, Status> {
+        self.update_object_status_rpc(request).await
+    }
+
+    // ACL: app-plane (in the handler).
+    async fn release_object(
+        &self,
+        request: Request<crate::structs::ReleaseObjectRequest>,
+    ) -> Result<Response<crate::structs::ReleaseObjectReply>, Status> {
+        self.release_object_rpc(request).await
     }
 
     #[instrument(skip_all, fields(job))]
@@ -15506,6 +15631,7 @@ mod tests {
             source,
             expires_at: None,
             audit_only: false,
+            acting_for: None,
         };
         let request = json!({ "name": "web" });
         let key = |identity: &AclIdentity| {
@@ -21405,6 +21531,7 @@ mod tests {
             source: AclSource::Token,
             expires_at: None,
             audit_only: false,
+            acting_for: None,
         };
         let start = |allocation_id: i64| crate::structs::ExecStart {
             allocation_id,
@@ -21489,6 +21616,7 @@ mod tests {
             source: AclSource::Token,
             expires_at: None,
             audit_only: false,
+            acting_for: None,
         };
         let exec_host = identity(json!([
             { "resources": ["exec"], "namespaces": ["*"], "actions": ["write"], "names": ["shell"], "host": true }

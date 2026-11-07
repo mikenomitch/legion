@@ -154,6 +154,13 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // App records (apps plan §6.3): operator intent, written by the app
     // RPCs and the app reconciler, next to the jobs it submits.
     ("app", Owner::Lane(Lane::Control)),
+    // App-owned object kinds (app-object-kinds plan §6.2-§6.3): the kinds
+    // installed apps declare, synced from the app records, and the objects
+    // people write of them (ApplyObject, DeleteObject, ReleaseObject, the
+    // cleanup expiry), with uids and versions from `scaling_counter`, also
+    // Control. An object's status rides the Status lane (below).
+    ("object_kind", Owner::Lane(Lane::Control)),
+    ("app_object", Owner::Lane(Lane::Control)),
     ("saved_state_query", Owner::Lane(Lane::Control)),
     ("signing_key", Owner::Lane(Lane::Control)),
     // KV encryption keyring (docs/kv-encryption.md): the wrapped data keys.
@@ -225,7 +232,6 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("scale_history", Owner::Lane(Lane::Control)),
     ("scaling_pause", Owner::Lane(Lane::Control)),
     ("scaling_policy_snapshot", Owner::Lane(Lane::Control)),
-    ("scaling_policy", Owner::Lane(Lane::Control)),
     // A standalone policy's action intent: compare-and-set writes beside
     // the policy they act for.
     ("scaling_action", Owner::Lane(Lane::Control)),
@@ -351,6 +357,12 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // status lane (heartbeats, health checks, registration's status-lane
     // seed op, lost marks, and the orphan sweep).
     ("node_health", Owner::Lane(Lane::Status)),
+    // `app_object_status` (app-object-kinds plan §6.7): an owning app's
+    // report on an object, keyed by its uid, written only by
+    // UpdateObjectStatus and swept by `prune_app_object_status_orphans` on
+    // the status-lane leader. Status churn stays off the Control lane, as
+    // node liveness does.
+    ("app_object_status", Owner::Lane(Lane::Status)),
     // ── commutative class (JC-28) ────────────────────────────────────────
     ("scheduler_event", Owner::Commutative),
     ("idempotency_record", Owner::Commutative),

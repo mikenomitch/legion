@@ -6,7 +6,7 @@
 //! $ legion scaling simulate web --since 1h          # the live policy over the last hour
 //! $ legion scaling simulate web.ncl --since 6h      # an edited jobspec over the same hour
 //! $ legion scaling simulate web.ncl --series load.csv
-//! $ legion scaling simulate render-farm.ncl --series queue.csv   # a standalone policy
+//! $ legion scaling simulate render-farm.ncl --series queue.csv   # an autoscaler/ScalingPolicy object
 //! ```
 //!
 //! Nothing is written. Over history (the status-lane leader's hour of
@@ -37,8 +37,8 @@ use crate::cmd::helpers::{
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
-    ApplyScalingPolicyRequest, GetScalingInputsRequest, GetScalingStatusRequest, PlanJobRequest,
-    ScalingInputsPoint, ScalingTargetSelector,
+    GetScalingInputsRequest, GetScalingStatusRequest, PlanJobRequest, ScalingInputsPoint,
+    ScalingTargetSelector,
 };
 use tabled::Tabled;
 
@@ -52,7 +52,7 @@ pub struct SimulateArgs {
     /// unless `spec_json` gives another.
     pub job: Option<String>,
     /// A jobspec (as JSON) whose autoscaled task's policy to simulate
-    /// instead, or a standalone policy (as JSON).
+    /// instead, or an `autoscaler/ScalingPolicy` object document (as JSON).
     pub spec_json: Option<String>,
     /// The namespace for a bare job name or a spec that names none.
     pub namespace: Option<String>,
@@ -93,7 +93,7 @@ pub struct SimulatedDecision {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SimulationReport {
-    /// What was simulated (`web/default/web`, or a standalone policy's id).
+    /// What was simulated (`web/default/web`, or `autoscaler/ScalingPolicy media/render-farm`).
     pub target: String,
     /// The effective policy's digest.
     pub policy_digest: String,
@@ -121,7 +121,7 @@ pub fn simulate_command() -> Command {
         .about("Run a policy over the last hour of history, or a CSV series, and show the decisions it makes")
         .long_about(
             "TARGET is a running job (its live policy), a jobspec file (the policy you are \
-             about to submit), or a standalone policy file. Over history the replay sees what \
+             about to submit), or an autoscaler/ScalingPolicy object file. Over history the replay sees what \
              the live autoscaler saw, so the live policy makes the decisions it made; an edited \
              policy shows what it would have done instead. Nothing is written.",
         )
@@ -129,7 +129,7 @@ pub fn simulate_command() -> Command {
             Arg::new("target")
                 .required(true)
                 .value_name("JOB | FILE")
-                .help("A job name, a jobspec (.ncl/.json), or a standalone policy file"),
+                .help("A job name, a jobspec (.ncl/.json), or an autoscaler/ScalingPolicy object file"),
         )
         .arg(namespace_flag())
         .arg(Arg::new("group").long("group").value_name("GROUP").help("Task group, when the job has more than one autoscaled task"))
@@ -330,7 +330,7 @@ fn print_report(report: &SimulationReport, all: bool) {
 }
 
 /// The effective policy to simulate, and the target it belongs to:
-/// `(label, policy, job selector)`. The selector is `None` for a standalone
+/// `(label, policy, job selector)`. The selector is `None` for a scaling
 /// policy, which has no history.
 async fn resolve_policy(
     client: &mut AuthedManagerClient,
@@ -342,19 +342,11 @@ async fn resolve_policy(
     };
     if let Some(spec) = &args.spec_json {
         let value: Value = serde_json::from_str(spec).context("the file is not JSON")?;
-        if value.get("target").is_some() {
-            // A standalone policy: the manager resolves it without storing it.
-            let reply = client
-                .apply_scaling_policy(ApplyScalingPolicyRequest {
-                    spec_json: spec.clone(),
-                    namespace: args.namespace.clone().unwrap_or_default(),
-                    dry_run: true,
-                    idempotency_key: None,
-                })
-                .await
-                .map_err(|status| anyhow!("resolving the policy: {}", status.message()))?
-                .into_inner();
-            return Ok((reply.id.clone(), parse(&reply.policy_json)?, None));
+        if value.get("kind").and_then(Value::as_str).is_some() {
+            // An `autoscaler/ScalingPolicy` object file: resolved here
+            // against its namespace's layered defaults, exactly as the
+            // autoscaler resolves the stored object.
+            return resolve_scaling_policy(client, &value, args).await;
         }
         let reply = client
             .plan_job(PlanJobRequest {
@@ -453,6 +445,61 @@ async fn resolve_policy(
     ))
 }
 
+/// The effective policy of an `autoscaler/ScalingPolicy` object document,
+/// resolved against the layered defaults of its namespace
+/// (`GetScalingDefaults`' cluster record and governing namespace policies).
+/// Plugins are not checked: a simulation runs none.
+async fn resolve_scaling_policy(
+    client: &mut AuthedManagerClient,
+    document: &Value,
+    args: &SimulateArgs,
+) -> R<(String, EffectivePolicy, Option<ScalingTargetSelector>)> {
+    use crate::autoscaler::policy::{parse_scaling_policy, PolicyKind, SCALING_POLICY};
+    let input = crate::structs::app_object::parse_object_input(document)
+        .map_err(|err| anyhow!("the file: {err}"))?;
+    if input.kind != SCALING_POLICY {
+        bail!(
+            "simulate takes a jobspec or an {SCALING_POLICY} object; {} is {}",
+            input.name,
+            match PolicyKind::of_kind(&input.kind) {
+                Some(PolicyKind::Nodes) => "a node group, which has no replica policy to simulate",
+                _ => "not a scaling policy",
+            }
+        );
+    }
+    let namespace = input
+        .namespace
+        .clone()
+        .or_else(|| args.namespace.clone())
+        .filter(|namespace| !namespace.trim().is_empty())
+        .unwrap_or_else(|| crate::structs::namespace::DEFAULT_NAMESPACE.to_string());
+    let policy = parse_scaling_policy(&namespace, &input.name, &input.spec)
+        .map_err(|err| anyhow!("the policy: {err}"))?;
+    let defaults = client
+        .get_scaling_defaults(crate::structs::GetScalingDefaultsRequest {
+            namespace: namespace.clone(),
+        })
+        .await
+        .map_err(|status| anyhow!("reading the scaling defaults: {}", status.message()))?
+        .into_inner();
+    let layers = crate::manager::autoscale::AutoscaleLayers::from_proto(
+        &crate::structs::ScalingAppContext {
+            cluster_json: defaults.cluster_json,
+            cluster_version: defaults.version,
+            policies: defaults.governing,
+            paused_all: None,
+        },
+    )?;
+    let resolved = layers
+        .resolve_standalone(&policy)
+        .map_err(|err| anyhow!("the policy does not resolve: {err}"))?;
+    Ok((
+        format!("{SCALING_POLICY} {namespace}/{}", input.name),
+        resolved.policy,
+        None,
+    ))
+}
+
 /// The manager's history points, as the simulator's samples.
 pub fn samples(points: &[ScalingInputsPoint]) -> Vec<HistorySample> {
     points
@@ -483,7 +530,7 @@ pub async fn run(client: &mut AuthedManagerClient, args: &SimulateArgs) -> R<Sim
         None => {
             let Some(selector) = selector else {
                 bail!(
-                    "{label} is a standalone policy: its sources have no history in Legion. \
+                    "{label} is a scaling policy: its sources have no history in Legion. \
                      Hint: pass --series with a CSV of their readings"
                 );
             };

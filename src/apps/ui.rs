@@ -42,6 +42,10 @@
 
 use crate::cmd::helpers::{AuthedManagerClient, ManagerConnection};
 use crate::prelude::*;
+use crate::structs::app_object::{
+    object_validate_context, ObjectValidateAnswer, ObjectValidateCall, OBJECT_VALIDATE_NAME,
+    OBJECT_VALIDATE_PATH,
+};
 use crate::structs::app_ui::{
     assertion_audience, assertion_mismatch, page_context, validate_view_value, AppView,
     AssertionKind, AssertionScope, Delegation, ViewContext, ViewerAssertion, ACTION_PATH_PREFIX,
@@ -198,6 +202,17 @@ pub struct ValidateRequest {
     pub viewer: Viewer,
 }
 
+/// An object validate call, verified (docs/app-objects.md, "Validating
+/// objects"): an apply of `call.kind` that passed the schema and the
+/// writer's permission checks. Errors in the answer refuse the apply;
+/// warnings pass through. The call is advice: the manager lets the write
+/// through when the app does not answer.
+#[derive(Debug, Clone)]
+pub struct ObjectValidateRequest {
+    pub call: ObjectValidateCall,
+    pub viewer: Viewer,
+}
+
 /// A page request, verified: the page's bundle, for this viewer.
 #[derive(Debug, Clone)]
 pub struct PageRequest {
@@ -248,6 +263,8 @@ type ActionHandler =
 type PageHandler = Arc<dyn Fn(PageRequest) -> BoxFuture<'static, R<String>> + Send + Sync>;
 type ValidateHandler =
     Arc<dyn Fn(ValidateRequest) -> BoxFuture<'static, R<Vec<ValidateResult>>> + Send + Sync>;
+type ObjectValidateHandler =
+    Arc<dyn Fn(ObjectValidateRequest) -> BoxFuture<'static, R<ObjectValidateAnswer>> + Send + Sync>;
 
 /// The views and actions an app serves. Registrations may happen at any
 /// time, also after the port is up.
@@ -257,6 +274,8 @@ pub struct UiRegistry {
     actions: std::sync::RwLock<HashMap<String, ActionHandler>>,
     pages: std::sync::RwLock<HashMap<String, PageHandler>>,
     validate: std::sync::RwLock<Option<ValidateHandler>>,
+    /// Object validate handlers by the kind's name as declared (`Repo`).
+    object_validate: std::sync::RwLock<HashMap<String, ObjectValidateHandler>>,
 }
 
 impl UiRegistry {
@@ -313,6 +332,26 @@ impl UiRegistry {
         if let Ok(mut validate) = self.validate.write() {
             *validate = Some(handler);
         }
+    }
+
+    /// Answer the object validate calls (`validate = true` on a kind) for
+    /// `kind`, named as declared (`Repo`) or qualified (`gitops/Repo`).
+    /// Without one, the framework answers that the object passes.
+    pub fn object_validate<F, Fut>(&self, kind: &str, handler: F)
+    where
+        F: Fn(ObjectValidateRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R<ObjectValidateAnswer>> + Send + 'static,
+    {
+        let handler: ObjectValidateHandler = Arc::new(move |request| Box::pin(handler(request)));
+        let bare = kind.split_once('/').map_or(kind, |(_, bare)| bare);
+        if let Ok(mut handlers) = self.object_validate.write() {
+            handlers.insert(bare.to_string(), handler);
+        }
+    }
+
+    fn object_validate_handler(&self, kind: &str) -> Option<ObjectValidateHandler> {
+        let bare = kind.split_once('/').map_or(kind, |(_, bare)| bare);
+        self.object_validate.read().ok()?.get(bare).cloned()
     }
 
     fn validate_handler(&self) -> Option<ValidateHandler> {
@@ -783,6 +822,11 @@ impl UiServer {
                 return UiAnswer::error(405, "pages are fetched with GET");
             }
             (AssertionKind::Page, name)
+        } else if path == OBJECT_VALIDATE_PATH {
+            if method != "POST" {
+                return UiAnswer::error(405, "objects are validated with POST");
+            }
+            (AssertionKind::Validate, OBJECT_VALIDATE_NAME)
         } else if path == VALIDATE_PATH {
             if method != "POST" {
                 return UiAnswer::error(405, "extension values are validated with POST");
@@ -810,7 +854,29 @@ impl UiServer {
             Err(refusal) => return UiAnswer::error(refusal.status(), refusal.message()),
         };
         let mut validate_call = None;
+        let mut object_call = None;
         let (context, inputs) = match kind {
+            AssertionKind::Validate if name == OBJECT_VALIDATE_NAME => {
+                if body.len() > MAX_ACTION_BODY {
+                    return UiAnswer::error(413, "the object validate request is too large");
+                }
+                let raw: Value = match serde_json::from_slice(body) {
+                    Ok(raw) => raw,
+                    Err(err) => {
+                        return UiAnswer::error(400, format!("the object validate request: {err}"))
+                    }
+                };
+                match serde_json::from_value::<ObjectValidateCall>(raw.clone()) {
+                    Ok(call) => {
+                        let context = object_validate_context(&call.namespace);
+                        object_call = Some(call);
+                        (context, Some(raw))
+                    }
+                    Err(err) => {
+                        return UiAnswer::error(400, format!("the object validate request: {err}"))
+                    }
+                }
+            }
             AssertionKind::Validate => {
                 if body.len() > MAX_ACTION_BODY {
                     return UiAnswer::error(413, "the validate request is too large");
@@ -876,6 +942,27 @@ impl UiServer {
         let viewer = Viewer::from_assertion(&claimed);
         let slot = context.slot().ok();
         match kind {
+            AssertionKind::Validate if name == OBJECT_VALIDATE_NAME => {
+                let call = object_call.expect("parsed above");
+                if call.kind.split_once('/').map(|(app, _)| app) != Some(verifier.app()) {
+                    return UiAnswer::error(
+                        400,
+                        format!("{} is not one of this app's kinds", call.kind),
+                    );
+                }
+                let Some(handler) = self.registry.object_validate_handler(&call.kind) else {
+                    return UiAnswer::json(
+                        serde_json::to_value(ObjectValidateAnswer::default()).unwrap_or_default(),
+                    );
+                };
+                match handler(ObjectValidateRequest { call, viewer }).await {
+                    Ok(answer) => UiAnswer::json(serde_json::to_value(answer).unwrap_or_default()),
+                    Err(err) => {
+                        warn!(error = %format!("{err:#}"), "Validating an object failed");
+                        UiAnswer::error(500, format!("{err:#}"))
+                    }
+                }
+            }
             AssertionKind::Validate => {
                 let call = validate_call.expect("parsed above");
                 let count = call.values.len();

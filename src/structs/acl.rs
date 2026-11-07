@@ -88,6 +88,15 @@ pub enum AclResource {
     /// the app's grant: installing, upgrading, and changing an app's code
     /// fields also need every permission the app asks for.
     App,
+    /// Objects of the kinds apps declare (`legion object`,
+    /// docs/app-objects.md) whose kind keeps the default `access`: `read`
+    /// gets and lists them, `write` applies and deletes them. Namespaced;
+    /// scope with `namespaces`, `names` (object names), and `kinds` (globs
+    /// over `<app>/<Kind>`). A cluster-scoped kind's objects carry the
+    /// namespace `*`, which only `namespaces = ["*"]` reaches. A kind that
+    /// maps onto another resource (`access = { resource = "scale" }`) is
+    /// governed by that resource instead.
+    Object,
 }
 
 impl AclResource {
@@ -108,6 +117,7 @@ impl AclResource {
             AclResource::Snapshot => "snapshot",
             AclResource::Namespace => "namespace",
             AclResource::App => "app",
+            AclResource::Object => "object",
         }
     }
 
@@ -128,6 +138,7 @@ impl AclResource {
             "snapshot",
             "namespace",
             "app",
+            "object",
         ]
     }
 
@@ -143,6 +154,7 @@ impl AclResource {
             "boot",
             "snapshot",
             "namespace",
+            "object",
         ]
     }
 
@@ -169,6 +181,7 @@ impl AclResource {
             AclResource::Snapshot,
             AclResource::Namespace,
             AclResource::App,
+            AclResource::Object,
         ]
         .into_iter()
         .find(|resource| resource.as_str() == name)
@@ -209,7 +222,7 @@ impl AclAction {
 pub struct AclRule {
     /// Resource types: `job`, `node`, `kv`, `state`, `operator`, `acl`,
     /// `exec`, `action`, `template`, `scale`, `boot`, `net`, `snapshot`,
-    /// `namespace`, `app`, `*`.
+    /// `namespace`, `app`, `object`, `*`.
     pub resources: Vec<String>,
     /// Actions: `read`, `write`, `*`.
     pub actions: Vec<String>,
@@ -218,7 +231,7 @@ pub struct AclRule {
     pub effect: Option<String>,
     /// Glob selectors over namespaces. Required on allow rules that name a
     /// namespaced resource (`job`, `exec`, `action`, `scale`, `boot`,
-    /// `snapshot`, `namespace`), and rejected on rules that name only
+    /// `snapshot`, `namespace`, `object`), and rejected on rules that name only
     /// cluster-scoped ones: `["*"]` is how a rule says "every namespace,
     /// including ones created later", so that reach is always written, never
     /// implied by leaving the selector out (docs/namespaces.md).
@@ -276,11 +289,37 @@ pub struct AclRule {
     /// (worker-plane-auth plan §6.16). Reads are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<bool>,
+    /// Glob selectors over app-declared object kinds, written
+    /// `<app>/<Kind>` as the kind is declared (`gitops/Repo`, `gitops/*`;
+    /// docs/app-objects.md). Matched against requests on an object: on
+    /// `object` rules, which is where it belongs, and on a rule over a
+    /// resource a kind maps onto (`scale`), where it narrows that rule to
+    /// objects of those kinds. A rule naming `kinds` grants nothing to a
+    /// request that is not about an object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kinds: Option<Vec<String>>,
+    /// `"objects"` (the only value): the rule is part of an app's grant
+    /// only for the calls it makes **for one of its objects**
+    /// (`legion-for-object`; docs/app-objects.md, "Acting for an object"),
+    /// where it is intersected with the object's recorded authority. It
+    /// grants nothing to a plain credential, the app's own included: the
+    /// evaluator skips it. Allow rules only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
+
+/// The one value of [`AclRule::via`].
+pub const VIA_OBJECTS: &str = "objects";
 
 impl AclRule {
     pub fn is_deny(&self) -> bool {
         matches!(self.effect.as_deref(), Some("deny"))
+    }
+
+    /// Whether the rule is usable only through an object-scoped call
+    /// (`via = "objects"`): the evaluator never matches it.
+    pub fn is_via_objects(&self) -> bool {
+        self.via.is_some()
     }
 
     fn has_scope_selectors(&self) -> bool {
@@ -291,6 +330,7 @@ impl AclRule {
             || self.action_names.is_some()
             || self.templates.is_some()
             || self.bands.is_some()
+            || self.kinds.is_some()
     }
 }
 
@@ -325,6 +365,10 @@ pub struct AclScope {
     /// submitted job has a host-level task. Only an `exec` (or `job`) rule
     /// with `host: true` matches such a scope.
     pub host: bool,
+    /// The object kind, `<app>/<Kind>`, on every scope of a request about
+    /// an app-declared object (docs/app-objects.md): what `kinds`
+    /// selectors match.
+    pub kind: Option<String>,
 }
 
 impl AclScope {
@@ -412,6 +456,28 @@ impl AclScope {
     pub fn app(name: &str) -> Self {
         AclScope {
             name: Some(name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Scope for an object of an app-declared kind (docs/app-objects.md):
+    /// `kind` is `<app>/<Kind>`. A namespaced object carries its namespace
+    /// and name, like a job; a cluster-scoped one (`namespace` empty)
+    /// carries its name, and, when `unowned_namespace` is set (the `object`
+    /// resource, which is namespaced), the namespace `*`, which only a rule
+    /// reaching every namespace matches.
+    pub fn object(kind: &str, namespace: &str, name: &str, unowned_namespace: bool) -> Self {
+        let namespace = if !namespace.is_empty() {
+            Some(namespace.to_string())
+        } else if unowned_namespace {
+            Some("*".to_string())
+        } else {
+            None
+        };
+        AclScope {
+            namespace,
+            name: Some(name.to_string()),
+            kind: Some(kind.to_string()),
             ..Default::default()
         }
     }
@@ -573,7 +639,10 @@ fn rule_matches(
     action: AclAction,
     scope: &AclScope,
 ) -> bool {
-    if !rule_covers(rule, resource, action) {
+    // A `via = "objects"` rule is held only through an object-scoped call,
+    // whose identity carries it intersected with the object's authority
+    // (as plain rules); on any identity it is inert.
+    if rule.is_via_objects() || !rule_covers(rule, resource, action) {
         return false;
     }
     if scope.any {
@@ -602,6 +671,7 @@ fn rule_matches(
         && selector_matches(&rule.action_names, &scope.action_name)
         && selector_matches(&rule.templates, &scope.template)
         && selector_matches(&rule.bands, &scope.band)
+        && selector_matches(&rule.kinds, &scope.kind)
 }
 
 /// Default-deny evaluation over a flattened rule set.
@@ -640,7 +710,7 @@ pub fn evaluate(
 /// Whether an allow rule grants anything inside `namespace` (see
 /// [`AclIdentity::reaches_namespace`]). Deny rules reach nothing.
 pub fn rule_reaches_namespace(rule: &AclRule, namespace: &str) -> bool {
-    if rule.is_deny() {
+    if rule.is_deny() || rule.is_via_objects() {
         return false;
     }
     let namespaced = rule
@@ -746,6 +816,19 @@ pub fn parse_rules(rules_json: &str) -> Result<Vec<AclRule>, String> {
                 ));
             }
         }
+        if let Some(via) = &rule.via {
+            if via != VIA_OBJECTS {
+                return Err(format!(
+                    "rule {i}: unknown `via` {via:?} (the only value is `{VIA_OBJECTS}`: the \
+                     rule holds only when an app acts for one of its objects)"
+                ));
+            }
+            if rule.is_deny() {
+                return Err(format!(
+                    "rule {i}: a deny rule cannot say `via`: a deny applies to every call"
+                ));
+            }
+        }
         validate_namespace_selector(i, rule)?;
     }
 
@@ -821,6 +904,12 @@ pub enum AclSource {
     /// holding only the assertion's delegation within the app's grant
     /// (docs/auth-and-acls.md, "Delegated identities").
     Delegated,
+    /// An app's own credential naming one of its objects in
+    /// `legion-for-object`: the identity is `<app> for <Kind>
+    /// <namespace>/<name>`, holding the object's recorded authority within
+    /// the app's grant ([`AclIdentity::acting_for`];
+    /// docs/app-objects.md, "Acting for an object").
+    ForObject,
 }
 
 impl AclSource {
@@ -831,8 +920,112 @@ impl AclSource {
             AclSource::Jwt => "jwt",
             AclSource::Anonymous => "anonymous",
             AclSource::Delegated => "delegated",
+            AclSource::ForObject => "for-object",
         }
     }
+
+    /// An app acting for someone or something else (a viewer, an object):
+    /// never the app plane, never a stream.
+    pub fn is_acting(&self) -> bool {
+        matches!(self, AclSource::Delegated | AclSource::ForObject)
+    }
+}
+
+/// The object an app acts for (`legion-for-object: <app>/<Kind>/<namespace>/
+/// <name>#<uid>@<generation>`; docs/app-objects.md, "Acting for an
+/// object"). A cluster kind's object has an empty namespace:
+/// `autoscaler/NodeGroup//workers#17@3`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActingFor {
+    pub app: String,
+    /// The kind as declared (`Repo`).
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub uid: u64,
+    /// The generation the app acted on: advisory (the object's current
+    /// recorded authority applies, whatever generation is named).
+    pub generation: u64,
+}
+
+impl ActingFor {
+    /// Parse a `legion-for-object` value.
+    pub fn parse(value: &str) -> Result<ActingFor, String> {
+        let value = value.trim();
+        let shape = "expected <app>/<Kind>/<namespace>/<name>#<uid>@<generation> \
+                     (an empty namespace for a cluster kind)";
+        let (rest, generation) = value
+            .rsplit_once('@')
+            .ok_or_else(|| format!("{value:?} has no @<generation>; {shape}"))?;
+        let generation: u64 = generation
+            .parse()
+            .map_err(|_| format!("generation {generation:?} is not a number; {shape}"))?;
+        let (reference, uid) = rest
+            .rsplit_once('#')
+            .ok_or_else(|| format!("{value:?} has no #<uid>; {shape}"))?;
+        let uid: u64 = uid
+            .parse()
+            .ok()
+            .filter(|uid| *uid > 0)
+            .ok_or_else(|| format!("uid {uid:?} is not a positive number; {shape}"))?;
+        let parts: Vec<&str> = reference.split('/').collect();
+        let [app, kind, namespace, name] = parts.as_slice() else {
+            return Err(format!(
+                "{reference:?} is not four `/`-separated parts; {shape}"
+            ));
+        };
+        if app.is_empty() || kind.is_empty() || name.is_empty() {
+            return Err(format!(
+                "{reference:?} names no app, kind, or name; {shape}"
+            ));
+        }
+        Ok(ActingFor {
+            app: app.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            uid,
+            generation,
+        })
+    }
+
+    /// The header value: `gitops/Repo/team-a/storefront#17@3`.
+    pub fn header_value(&self) -> String {
+        format!("{}@{}", self.object_ref(), self.generation)
+    }
+
+    /// The object, without the generation: `gitops/Repo/team-a/storefront#17`.
+    /// What a write made for it is stamped with (`managedBy.object`).
+    pub fn object_ref(&self) -> String {
+        format!(
+            "{}/{}/{}/{}#{}",
+            self.app, self.kind, self.namespace, self.name, self.uid
+        )
+    }
+
+    /// `team-a/storefront`, or `workers` for a cluster kind.
+    pub fn id(&self) -> String {
+        if self.namespace.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}/{}", self.namespace, self.name)
+        }
+    }
+
+    /// The principal the identity is recorded as: `gitops for Repo
+    /// team-a/storefront`.
+    pub fn principal(&self) -> String {
+        format!("{} for {} {}", self.app, self.kind, self.id())
+    }
+}
+
+/// `gitops for Repo team-a/storefront`, from a stored `managedBy.object`
+/// stamp (`gitops/Repo/team-a/storefront#17`); the stamp itself when it does
+/// not parse.
+pub fn object_stamp_label(stamp: &str) -> String {
+    ActingFor::parse(&format!("{stamp}@0"))
+        .map(|actor| actor.principal())
+        .unwrap_or_else(|_| stamp.to_string())
 }
 
 /// The caller's resolved identity: principal, policy set, and flattened rules.
@@ -862,6 +1055,10 @@ pub struct AclIdentity {
     pub expires_at: Option<String>,
     /// True when ACLs run in audit-only mode (denials logged, not enforced).
     pub audit_only: bool,
+    /// The object an app acts for ([`AclSource::ForObject`]): what the
+    /// writes it makes are stamped with. `None` for every other identity.
+    /// Boxed: identities are cloned per request and kept in enums.
+    pub acting_for: Option<Box<ActingFor>>,
 }
 
 impl AclIdentity {
@@ -877,6 +1074,7 @@ impl AclIdentity {
             source: AclSource::Disabled,
             expires_at: None,
             audit_only: false,
+            acting_for: None,
         }
     }
 
@@ -894,6 +1092,44 @@ impl AclIdentity {
             return true;
         }
         evaluate(&self.rules, resource, action, scope)
+    }
+
+    /// Whether an allow rule grants `resource:action` on objects of `kind`
+    /// (`<app>/<Kind>`) in some scope: the per-kind gate of a listing
+    /// (`ListObjectKinds`), where the wildcard scope would ignore the
+    /// `kinds` selector. A deny rule vetoes it when it carries no selector
+    /// but (matching) `kinds`.
+    pub fn allows_kind_somewhere(
+        &self,
+        resource: AclResource,
+        action: AclAction,
+        kind: &str,
+    ) -> bool {
+        if self.is_management || self.audit_only {
+            return true;
+        }
+        let attr = Some(kind.to_string());
+        let mut allowed = false;
+        for rule in &self.rules {
+            if rule.is_via_objects()
+                || !rule_covers(rule, resource, action)
+                || !selector_matches(&rule.kinds, &attr)
+            {
+                continue;
+            }
+            if rule.is_deny() {
+                let only_kinds = AclRule {
+                    kinds: None,
+                    ..rule.clone()
+                };
+                if !only_kinds.has_scope_selectors() {
+                    return false;
+                }
+            } else {
+                allowed = true;
+            }
+        }
+        allowed
     }
 
     /// Whether this identity holds any allow in namespace `namespace`: the
@@ -920,7 +1156,9 @@ impl AclIdentity {
         let mut globs: Vec<String> = self
             .rules
             .iter()
-            .filter(|rule| !rule.is_deny() && rule_covers(rule, resource, action))
+            .filter(|rule| {
+                !rule.is_deny() && !rule.is_via_objects() && rule_covers(rule, resource, action)
+            })
             .filter_map(|rule| rule.namespaces.clone())
             .flatten()
             .collect();
@@ -949,6 +1187,94 @@ mod acl_rules_test {
 
     fn rules(json: &str) -> Vec<AclRule> {
         parse_rules(json).expect("rules should parse")
+    }
+
+    /// `object` is namespaced with a `kinds` selector over `<app>/<Kind>`
+    /// (docs/app-objects.md); a cluster kind's objects carry namespace `*`,
+    /// which only `namespaces = ["*"]` reaches, and a `kinds` rule grants
+    /// nothing to a request that is not about an object.
+    #[test]
+    fn object_rules_scope_by_namespace_and_kind() {
+        let held = rules(
+            r#"[{"resources": ["object"], "actions": ["read", "write"], "namespaces": ["team-a"], "kinds": ["gitops/*"]}]"#,
+        );
+        let repo = |ns: &str| AclScope::object("gitops/Repo", ns, "web", true);
+        assert!(evaluate(
+            &held,
+            AclResource::Object,
+            AclAction::Write,
+            &repo("team-a")
+        ));
+        assert!(!evaluate(
+            &held,
+            AclResource::Object,
+            AclAction::Write,
+            &repo("team-b")
+        ));
+        assert!(!evaluate(
+            &held,
+            AclResource::Object,
+            AclAction::Write,
+            &AclScope::object("certs/Certificate", "team-a", "web", true)
+        ));
+        // A cluster kind's object: namespace `*`, reached only by `*`.
+        assert!(!evaluate(
+            &held,
+            AclResource::Object,
+            AclAction::Write,
+            &repo("")
+        ));
+        let everywhere = rules(
+            r#"[{"resources": ["object"], "actions": ["write"], "namespaces": ["*"], "kinds": ["gitops/*"]}]"#,
+        );
+        assert!(evaluate(
+            &everywhere,
+            AclResource::Object,
+            AclAction::Write,
+            &repo("")
+        ));
+        // ... and `*` still skips the reserved namespaces.
+        assert!(!evaluate(
+            &everywhere,
+            AclResource::Object,
+            AclAction::Write,
+            &repo("legion-system")
+        ));
+        assert!(parse_rules(r#"[{"resources": ["object"], "actions": ["read"]}]"#).is_err());
+        // `kinds` narrows a rule on a resource a kind maps onto.
+        let scale = rules(
+            r#"[{"resources": ["scale"], "actions": ["write"], "namespaces": ["*"], "kinds": ["autoscaler/*"]}]"#,
+        );
+        assert!(evaluate(
+            &scale,
+            AclResource::Scale,
+            AclAction::Write,
+            &AclScope::object("autoscaler/ScalingPolicy", "media", "render", true)
+        ));
+        assert!(!evaluate(
+            &scale,
+            AclResource::Scale,
+            AclAction::Write,
+            &AclScope::job("media/render")
+        ));
+        // The per-kind listing gate honors `kinds` and blanket denies.
+        let identity = |rules: Vec<AclRule>| AclIdentity {
+            rules,
+            is_management: false,
+            ..AclIdentity::acl_disabled()
+        };
+        let reader = identity(held.clone());
+        assert!(reader.allows_kind_somewhere(AclResource::Object, AclAction::Read, "gitops/Repo"));
+        assert!(!reader.allows_kind_somewhere(AclResource::Object, AclAction::Read, "certs/X"));
+        let mut denied = held;
+        denied.extend(rules(
+            r#"[{"resources": ["object"], "actions": ["read"], "effect": "deny", "kinds": ["gitops/Repo"]}]"#,
+        ));
+        assert!(!identity(denied).allows_kind_somewhere(
+            AclResource::Object,
+            AclAction::Read,
+            "gitops/Repo"
+        ));
     }
 
     /// `app` is cluster-scoped with a `names` selector (docs/apps.md):
@@ -1864,8 +2190,107 @@ mod acl_rules_test {
             source: AclSource::Anonymous,
             expires_at: None,
             audit_only: true,
+            acting_for: None,
         };
         assert!(ident.allows(AclResource::Job, AclAction::Write, &AclScope::any()));
         assert!(!ident.would_allow(AclResource::Job, AclAction::Write, &AclScope::any()));
+    }
+
+    /// A `via = "objects"` rule is inert on every identity that holds it:
+    /// no scope, no list gate, no namespace reach, no hint, no kind gate.
+    /// It parses only on an allow rule, and only as `objects`.
+    #[test]
+    fn via_objects_rules_grant_nothing_to_a_plain_identity_test() {
+        let held = rules(
+            r#"[{"resources": ["job"], "actions": ["read"], "namespaces": ["team-a"]},
+                {"resources": ["job", "object"], "actions": ["write"], "namespaces": ["*"], "via": "objects"}]"#,
+        );
+        let ident = AclIdentity {
+            rules: held,
+            is_management: false,
+            ..AclIdentity::acl_disabled()
+        };
+        let web = AclScope::job("team-a/web");
+        assert!(ident.allows(AclResource::Job, AclAction::Read, &web));
+        assert!(!ident.allows(AclResource::Job, AclAction::Write, &web));
+        assert!(!ident.allows(AclResource::Job, AclAction::Write, &AclScope::any()));
+        assert!(!ident.reaches_namespace("team-b"));
+        assert!(ident
+            .namespaces_granting(AclResource::Job, AclAction::Write)
+            .is_empty());
+        assert!(!ident.allows_kind_somewhere(AclResource::Object, AclAction::Write, "gitops/Repo"));
+        // The same rule without `via` is an ordinary grant.
+        let plain = AclIdentity {
+            rules: ident
+                .rules
+                .iter()
+                .map(|rule| AclRule {
+                    via: None,
+                    ..rule.clone()
+                })
+                .collect(),
+            ..ident.clone()
+        };
+        assert!(plain.allows(AclResource::Job, AclAction::Write, &web));
+
+        let refused = parse_rules(
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["*"], "via": "viewers"}]"#,
+        )
+        .unwrap_err();
+        assert!(refused.contains("unknown `via`"), "{refused}");
+        let refused = parse_rules(
+            r#"[{"resources": ["job"], "actions": ["write"], "effect": "deny", "via": "objects"}]"#,
+        )
+        .unwrap_err();
+        assert!(refused.contains("deny rule cannot say `via`"), "{refused}");
+    }
+
+    /// The `legion-for-object` value: four parts (an empty namespace for a
+    /// cluster kind), a positive uid, a generation; it round-trips, and
+    /// names its principal and stamp.
+    #[test]
+    fn acting_for_references_parse_and_print_test() {
+        let repo = ActingFor::parse("gitops/Repo/team-a/storefront#17@3").expect("parses");
+        assert_eq!(
+            repo,
+            ActingFor {
+                app: "gitops".into(),
+                kind: "Repo".into(),
+                namespace: "team-a".into(),
+                name: "storefront".into(),
+                uid: 17,
+                generation: 3,
+            }
+        );
+        assert_eq!(repo.header_value(), "gitops/Repo/team-a/storefront#17@3");
+        assert_eq!(repo.object_ref(), "gitops/Repo/team-a/storefront#17");
+        assert_eq!(repo.principal(), "gitops for Repo team-a/storefront");
+        assert_eq!(
+            object_stamp_label(&repo.object_ref()),
+            "gitops for Repo team-a/storefront"
+        );
+        let group = ActingFor::parse(" autoscaler/NodeGroup//workers#9@1 ").expect("cluster");
+        assert_eq!(group.namespace, "");
+        assert_eq!(group.principal(), "autoscaler for NodeGroup workers");
+        assert_eq!(group.header_value(), "autoscaler/NodeGroup//workers#9@1");
+        for bad in [
+            "",
+            "gitops/Repo/team-a/storefront#17",
+            "gitops/Repo/team-a/storefront@3",
+            "gitops/Repo/storefront#17@3",
+            "gitops/Repo/team-a/storefront/x#17@3",
+            "gitops/Repo/team-a/storefront#0@3",
+            "gitops/Repo/team-a/storefront#x@3",
+            "gitops/Repo/team-a/storefront#17@-1",
+            "/Repo/team-a/storefront#17@3",
+            "gitops/Repo/team-a/#17@3",
+        ] {
+            assert!(ActingFor::parse(bad).is_err(), "{bad:?} parsed");
+        }
+        // A stamp that does not parse labels as itself.
+        assert_eq!(object_stamp_label("not a stamp"), "not a stamp");
+        assert!(AclSource::ForObject.is_acting() && AclSource::Delegated.is_acting());
+        assert!(!AclSource::Token.is_acting());
+        assert_eq!(AclSource::ForObject.as_str(), "for-object");
     }
 }

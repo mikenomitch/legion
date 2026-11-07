@@ -49,16 +49,25 @@ pub const LEGION_SOURCE: &str = crate::autoscaler::defaults::LEGION_SOURCE;
 /// The bundled autoscaler app, whose config installs the scaling plugins.
 pub const AUTOSCALER_APP: &str = "autoscaler";
 
-/// The key a standalone policy's history, pauses and status live under in
-/// the tables task targets use (`job_id`, with empty group and task):
-/// `policy:<id>`, which no job id can be.
-pub fn policy_target_key(id: &str) -> String {
-    format!("policy:{id}")
+/// The key one of the autoscaler's objects (an `autoscaler/ScalingPolicy`
+/// or `autoscaler/NodeGroup`) keeps its history, pause, action row, and
+/// status-board entry under in the tables task targets use (`job_id`, with
+/// empty group and task): `object:<uid>`, which no job id can be. Keyed by
+/// the never-reused uid, so `NodeGroup workers` and `ScalingPolicy
+/// default/workers` never share state, and a deleted and recreated object
+/// inherits nothing (app-object-kinds plan §8 O2).
+pub fn object_target_key(uid: u64) -> String {
+    format!("{OBJECT_TARGET_PREFIX}{uid}")
 }
 
-/// The standalone policy id a target key names, if it names one.
-pub fn policy_of_target_key(job_id: &str) -> Option<&str> {
-    job_id.strip_prefix("policy:")
+/// What every object target key starts with.
+pub const OBJECT_TARGET_PREFIX: &str = "object:";
+
+/// The object uid a target key names, if it names one.
+pub fn object_uid_of_target_key(job_id: &str) -> Option<u64> {
+    job_id
+        .strip_prefix(OBJECT_TARGET_PREFIX)
+        .and_then(|uid| uid.parse().ok())
 }
 
 /// The `legion` source's fixed vocabulary (docs/autoscaling.md, "Checks").
@@ -119,6 +128,55 @@ impl AutoscaleLayers {
                 .collect(),
             plugins: None,
         })
+    }
+
+    /// The layers as WatchScalingPolicies sends them to the autoscaler (its
+    /// `context`, without the pause), so the app
+    /// resolves its `autoscaler/ScalingPolicy` objects as the manager
+    /// resolves a task's `autoscale`.
+    pub fn to_proto(&self) -> crate::structs::ScalingAppContext {
+        crate::structs::ScalingAppContext {
+            paused_all: None,
+            cluster_json: self
+                .cluster
+                .as_ref()
+                .and_then(|record| serde_json::to_string(record).ok())
+                .unwrap_or_else(|| "{}".to_string()),
+            cluster_version: self.cluster_version,
+            policies: self.policies.iter().filter_map(layer_policy).collect(),
+        }
+    }
+
+    /// The layers from their proto (the app's side of [`Self::to_proto`]),
+    /// without plugins: the caller adds its own catalog. Also takes
+    /// GetScalingDefaults' `cluster_json` and `governing`, built into one.
+    pub fn from_proto(layers: &crate::structs::ScalingAppContext) -> R<Self> {
+        let mut policies = Vec::new();
+        for policy in &layers.policies {
+            let record: AutoscaleRecord = serde_json::from_str(&policy.autoscale_json)
+                .with_context(|| format!("namespace policy {}'s autoscale", policy.name))?;
+            policies.push(NamespacePolicy {
+                name: policy.name.clone(),
+                namespaces: policy.namespaces.clone(),
+                autoscale: Some(record),
+                ..Default::default()
+            });
+        }
+        Self::from_parts(
+            Some(layers.cluster_json.as_str()).filter(|json| !json.trim().is_empty()),
+            layers.cluster_version,
+            policies,
+        )
+    }
+
+    /// The governing namespace policies of `namespace`, as GetScalingDefaults
+    /// returns them.
+    pub fn governing_proto(&self, namespace: &str) -> Vec<crate::structs::ScalingLayerPolicy> {
+        self.policies
+            .iter()
+            .filter(|policy| policy.matches(namespace))
+            .filter_map(layer_policy)
+            .collect()
     }
 
     /// With the installed plugins checked on every resolution.
@@ -234,7 +292,7 @@ impl AutoscaleLayers {
     /// `min` standing in for the `count` a task would have (both bounds are
     /// replica counts), then every plugin it names checked.
     pub fn resolve_standalone(&self, policy: &ExternalPolicy) -> Result<ResolvedPolicy, String> {
-        let label = crate::autoscaler::policy::policy_id(&policy.namespace, &policy.name);
+        let label = crate::autoscaler::policy::object_label(&policy.namespace, &policy.name);
         let count = match policy.record.min {
             Some(CountBound::Replicas(min)) => min,
             _ => 0,
@@ -273,6 +331,16 @@ impl AutoscaleLayers {
             .map(|defaults| defaults.policy)
             .collect()
     }
+}
+
+/// One namespace policy's `autoscale` layer, for the wire.
+fn layer_policy(policy: &NamespacePolicy) -> Option<crate::structs::ScalingLayerPolicy> {
+    let record = policy.autoscale.as_ref()?;
+    Some(crate::structs::ScalingLayerPolicy {
+        name: policy.name.clone(),
+        namespaces: policy.namespaces.clone(),
+        autoscale_json: serde_json::to_string(record).ok()?,
+    })
 }
 
 /// The plugins installed in the autoscaler's app config. No app record (a

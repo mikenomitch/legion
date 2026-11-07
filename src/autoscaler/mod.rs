@@ -17,7 +17,7 @@
 //! | [`pipeline`] | [`evaluate`]: the fixed safeguard pipeline, from an [`Observation`] and the per-policy [`PolicyState`] to a [`Decision`] whose stage notes explain it. |
 //! | [`simulate`] | [`simulate()`](simulate::simulate) over rows or a CSV series, and [`simulate_with`] over a load model. |
 //! | [`plugins`] | The plugins installed in the autoscaler's app config ([`PluginCatalog`](plugins::PluginCatalog)) and who may use them: a policy names a plugin, never a command or a URL. |
-//! | [`policy`] | Standalone policies (`legion scaling apply`): an external target's record, or a node group's. |
+//! | [`policy`] | The autoscaler's object kinds, `autoscaler/ScalingPolicy` (an external target's record) and `autoscaler/NodeGroup`: parsing a stored spec, the kinds' schemas. |
 //! | [`signals`] | How raw inputs become an observation: the warmup count and the averaging windows, shared by the live engine and the simulator. |
 //! | [`shard`] | Which of the 64 shards a policy hashes to (FNV-1a of its key), which the policy watch filters by and autoscaler replicas split between them. |
 //! | [`nodes`] | Node-group autoscaling (§6.11): the [`NodeGroupPolicy`] spec, the least-waste [`expand`]er, [`decide`] (scale-up from pending work, join timeouts, scale-in victims, never-victim rules, budget) and the drain state machine [`step_drain`]. |

@@ -341,6 +341,11 @@ computed* moves.
 
 ## 8. Node-group and external-target policies are stored objects, not manager config or app-local files
 
+*Superseded in part by entry 103 (app-object-kinds Phase O2): they are
+still stored objects, now of the autoscaler's own kinds in the generic
+object store, written with `legion object apply`; `legion scaling
+apply|list` and the `scaling_policy` table are gone.*
+
 **Call.** `legion scaling apply nodes.ncl` stores a versioned
 `ScalingPolicy` on the Control lane, gated by ACL. Jobspec `autoscale` blocks
 compile to the same internal type. One `scaling list` shows both.
@@ -2193,6 +2198,10 @@ capacity, which is what makes a node underutilized.
 
 ## 91. A node group shares the bare-name space with `default`'s policies, and is read with `node:read`
 
+*Superseded by entry 103 (app-object-kinds Phase O2): objects are named by
+kind and name, and their state is keyed by uid, so a node group and a
+policy may share a name.*
+
 *Implementation, Phase 5b (`ManagerDaemonService::find_policy`,
 `gate_policy_ref`).*
 
@@ -2466,6 +2475,20 @@ doubles, but both pay for the evaluation).
 stopped scaling because a KV call failed would turn a lease problem into
 an autoscaling outage. The leases decide who does the work, never whether
 a write is safe.
+
+## 103. Standalone policies and node groups are the autoscaler's own object kinds
+
+*Implementation, app-object-kinds Phase O2.* **Call.** External-target
+policies and node groups are `autoscaler/ScalingPolicy` and
+`autoscaler/NodeGroup` objects the bundled app declares, written with
+`legion object apply|delete`, read by the app over `WatchObjects`, and
+reported in object status; their history, pause, and action intents are
+keyed by the object's uid. The decisions, with their alternatives and
+trade-offs, are [app-object-kinds-plan_calls.md](app-object-kinds-plan_calls.md)
+entries 32-43; the behavior changes for the autoscaler are there:
+uid-keyed state (32), cross-field checks moving to the app until CEL
+rules (33), the app resolving its policies against layers the policy watch
+sends (34), and a deleted node group retiring through scale-in (36).
 
 ## Ledger: what stands from the superseded plan's calls
 
