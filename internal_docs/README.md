@@ -27,6 +27,10 @@ architecture and behavior docs are public.
 - [architecture-audit-2026-10-09.md](architecture-audit-2026-10-09.md) — the
   2026-10-09 whole-codebase review for design-level errors, with per-finding
   fix status.
+- [architecture-review-2026-11-07.md](architecture-review-2026-11-07.md) —
+  the 2026-11-07 review against best-in-class designs: networking and mesh,
+  scheduler, state store, plugin seams, and AI readiness, with each finding
+  filed in TODO.md.
 - [differentiators.md](differentiators.md) — the running list of what makes
   Legion different from K8s and Nomad (part idea list, part roadmap).
 - [stateful-vs-nomad-k8s.md](stateful-vs-nomad-k8s.md) — honest gap analysis of
