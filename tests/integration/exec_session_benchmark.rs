@@ -207,6 +207,9 @@ fn exec_session_benchmark() {
         "telemetry": { "enabled": false },
         "workloadIdentity": { "enabled": true },
         "taskResourceDefaults": { "cpu": 0, "memory": 0, "allocations": 100 },
+        // No system worker: it would bind a worker port nobody reserved,
+        // and the benchmark's own worker is the one measured.
+        "systemWorker": { "enabled": false },
     });
     let config_path = dir.path().join("manager.json");
     std::fs::write(&config_path, config.to_string()).expect("config");

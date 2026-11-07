@@ -219,6 +219,9 @@ fn an_idle_apple_container_sandbox_suspends_and_resumes_cold_on_its_volume() {
             // port + 1 and telemetry port + 2, which nobody reserved).
             "telemetry": { "enabled": false },
             "exec": { "enabled": false },
+            // No system worker: it would bind a worker port nobody
+            // reserved, and the test's own worker is the one under test.
+            "systemWorker": { "enabled": false },
             "suspend": { "idleSweep": "5s" },
         })
         .to_string(),

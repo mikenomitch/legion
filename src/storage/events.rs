@@ -157,6 +157,26 @@ impl Store {
     }
 }
 
+/// One of the autoscaler's objects, as scaling events name it: its
+/// qualified kind, `namespace/name` (or `name` for a node group), and uid.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectTarget<'a> {
+    pub kind: &'a str,
+    pub id: &'a str,
+    pub uid: u64,
+}
+
+impl ObjectTarget<'_> {
+    /// `ScalingPolicy media/render-farm`.
+    pub fn label(&self) -> String {
+        let bare = self
+            .kind
+            .split_once('/')
+            .map_or(self.kind, |(_, bare)| bare);
+        format!("{bare} {}", self.id)
+    }
+}
+
 /// Pure constructors for every scheduler event kind Legion emits.
 ///
 /// This module is the authoritative catalog of the stream's kinds — the
@@ -1160,6 +1180,204 @@ pub mod drafts {
         }))
     }
 
+    /// `scale.pinned` — a person pinned an autoscaled task's count, floor,
+    /// or ceiling for a while (`legion job scale --for`), or released the
+    /// pin (`--release`, `until_ms` = None) (docs/autoscaling.md).
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_pinned(
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        min: Option<u32>,
+        max: Option<u32>,
+        until_ms: Option<i64>,
+        by: &str,
+        reason: &str,
+    ) -> EventDraft {
+        let what = match (min, max, until_ms) {
+            (_, _, None) => "pin released".to_string(),
+            (Some(min), Some(max), Some(_)) if min == max => format!("pinned at {min}"),
+            (min, max, Some(_)) => format!(
+                "pinned to {}..{}",
+                min.map_or("-".to_string(), |n| n.to_string()),
+                max.map_or("-".to_string(), |n| n.to_string())
+            ),
+        };
+        EventDraft::info(
+            "scale.pinned",
+            format!("Job {job_id} task {task_group}/{task_name} {what} by {by}"),
+        )
+        .job(job_id)
+        .meta(json!({
+            "group": task_group,
+            "task": task_name,
+            "min": min,
+            "max": max,
+            "untilMs": until_ms,
+            "by": by,
+            "reason": reason,
+        }))
+    }
+
+    /// `scale.paused` / `scale.resumed` — autoscaling was paused or resumed
+    /// for a task, a job, or the cluster (`legion scaling pause|resume`).
+    pub fn scale_paused(
+        scope: &str,
+        target: &str,
+        paused: bool,
+        until_ms: Option<i64>,
+        by: &str,
+        reason: &str,
+    ) -> EventDraft {
+        let (kind, verb) = if paused {
+            ("scale.paused", "paused")
+        } else {
+            ("scale.resumed", "resumed")
+        };
+        let draft = EventDraft::info(kind, format!("Autoscaling {verb} for {target} by {by}"));
+        let draft = if scope == "all" || scope == "object" {
+            draft
+        } else {
+            draft.job(target.split_once('/').map_or(target, |(job, _)| job))
+        };
+        draft.meta(json!({
+            "scope": scope,
+            "target": target,
+            "untilMs": until_ms,
+            "by": by,
+            "reason": reason,
+        }))
+    }
+
+    /// `scale.limited`, `scale.flapping`, `scale.check_failed` — state
+    /// changes the autoscaler reports (`ReportScalingStatus`), one per
+    /// episode, never per tick.
+    pub fn scale_flag(
+        kind: &str,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        message: &str,
+    ) -> Option<EventDraft> {
+        let (kind, level) = match kind {
+            "limited" => ("scale.limited", "info"),
+            "flapping" => ("scale.flapping", "warn"),
+            "check_failed" => ("scale.check_failed", "warn"),
+            _ => return None,
+        };
+        let text = format!("Job {job_id} task {task_group}/{task_name}: {message}");
+        let draft = if level == "warn" {
+            EventDraft::warn(kind, text)
+        } else {
+            EventDraft::info(kind, text)
+        };
+        Some(draft.job(job_id).meta(json!({
+            "group": task_group,
+            "task": task_name,
+            "message": message,
+            "source": "autoscaler",
+        })))
+    }
+
+    /// `scale.limited`, `scale.flapping`, `scale.check_failed` for one of
+    /// the autoscaler's objects (a ScalingPolicy or a NodeGroup): the same
+    /// state changes, named by the object instead of a job.
+    pub fn scale_policy_flag(
+        kind: &str,
+        object: &ObjectTarget<'_>,
+        message: &str,
+    ) -> Option<EventDraft> {
+        let (kind, level) = match kind {
+            "limited" => ("scale.limited", "info"),
+            "flapping" => ("scale.flapping", "warn"),
+            "check_failed" => ("scale.check_failed", "warn"),
+            _ => return None,
+        };
+        let text = format!("{}: {message}", object.label());
+        let draft = if level == "warn" {
+            EventDraft::warn(kind, text)
+        } else {
+            EventDraft::info(kind, text)
+        };
+        Some(draft.meta(json!({
+            "kind": object.kind,
+            "object": object.id,
+            "uid": object.uid,
+            "message": message,
+            "source": "autoscaler",
+        })))
+    }
+
+    /// `nodegroup.pending`, `nodegroup.join_timeout`, or `nodegroup.scale_in`
+    /// for a node group, as its autoscaler reported it (`outcome`:
+    /// `completed` or `aborted`, for a scale-in).
+    pub fn nodegroup_flag(
+        kind: &str,
+        object: &ObjectTarget<'_>,
+        message: &str,
+        outcome: &str,
+    ) -> Option<EventDraft> {
+        let group = object.id;
+        let (kind, warn, text) = match kind {
+            "pending" => (
+                "nodegroup.pending",
+                false,
+                format!("Node group {group}: {message}"),
+            ),
+            "join_timeout" => (
+                "nodegroup.join_timeout",
+                true,
+                format!("Node group {group}: {message}"),
+            ),
+            "scale_in" => (
+                "nodegroup.scale_in",
+                outcome == "aborted",
+                format!("Node group {group}: scale-in {outcome}: {message}"),
+            ),
+            _ => return None,
+        };
+        let draft = if warn {
+            EventDraft::warn(kind, text)
+        } else {
+            EventDraft::info(kind, text)
+        };
+        let mut meta = json!({
+            "group": group,
+            "kind": object.kind,
+            "object": object.id,
+            "uid": object.uid,
+            "message": message,
+            "source": "autoscaler",
+        });
+        if !outcome.is_empty() {
+            meta["outcome"] = json!(outcome);
+        }
+        Some(draft.meta(meta))
+    }
+
+    /// `scale.applied` for a standalone scaling policy: the autoscaler is
+    /// about to move its target from `previous` to `count`.
+    pub fn scale_policy_applied(
+        object: &ObjectTarget<'_>,
+        previous: u32,
+        count: u32,
+        reason: &str,
+    ) -> EventDraft {
+        EventDraft::info(
+            "scale.applied",
+            format!("{} scaled {previous} -> {count}", object.label()),
+        )
+        .meta(json!({
+            "kind": object.kind,
+            "object": object.id,
+            "uid": object.uid,
+            "previous": previous,
+            "count": count,
+            "source": "autoscaler",
+            "reason": reason,
+        }))
+    }
+
     /// `scale.reset` — an override was dropped: explicit
     /// `legion job scale --reset`, or a resubmit that changed the spec
     /// count reclaimed ownership (docs/autoscaling.md).
@@ -1427,6 +1645,284 @@ pub mod drafts {
         };
         EventDraft::info(kind, format!("Namespace {name} {verb}"))
             .meta(json!({ "namespace": name }))
+    }
+
+    /// `app.installed` — an app was installed, or a bundled app seeded
+    /// (docs/apps.md). Scoped to the app's job, so whoever may read
+    /// `legion-system/<app>` sees its app events.
+    pub fn app_installed(name: &str, version: &str, source: &str, by: &str) -> EventDraft {
+        EventDraft::info(
+            "app.installed",
+            format!("App {name} {version} installed from {source} by {by}"),
+        )
+        .job(&crate::structs::app::app_job_id(name))
+        .meta(json!({ "app": name, "version": version, "source": source, "by": by }))
+    }
+
+    /// `app.upgraded` — an app's manifest was replaced: by `legion app
+    /// upgrade`, or, for a bundled app, by the manifest of the build its
+    /// nodes moved to.
+    pub fn app_upgraded(
+        name: &str,
+        from: &str,
+        to: &str,
+        added: usize,
+        removed: usize,
+        by: &str,
+    ) -> EventDraft {
+        let permissions = match (added, removed) {
+            (0, 0) => "permissions unchanged".to_string(),
+            (added, removed) => format!("{added} permission(s) added, {removed} removed"),
+        };
+        EventDraft::info(
+            "app.upgraded",
+            format!("App {name} upgraded {from} → {to} by {by}; {permissions}"),
+        )
+        .job(&crate::structs::app::app_job_id(name))
+        .meta(json!({
+            "app": name,
+            "from": from,
+            "to": to,
+            "permissionsAdded": added,
+            "permissionsRemoved": removed,
+            "by": by,
+        }))
+    }
+
+    /// `app.uninstalled` — an app was uninstalled: its job stopped and its
+    /// grants revoked.
+    pub fn app_uninstalled(name: &str, by: &str, revoked_grants: u64) -> EventDraft {
+        EventDraft::info(
+            "app.uninstalled",
+            format!("App {name} uninstalled by {by}; its job was stopped and {revoked_grants} grant(s) revoked"),
+        )
+        .job(&crate::structs::app::app_job_id(name))
+        .meta(json!({ "app": name, "by": by, "revokedGrants": revoked_grants }))
+    }
+
+    /// `app.enabled` / `app.disabled` — an app was enabled or disabled.
+    pub fn app_enabled(name: &str, enabled: bool, by: &str) -> EventDraft {
+        let (kind, verb) = if enabled {
+            ("app.enabled", "enabled")
+        } else {
+            ("app.disabled", "disabled")
+        };
+        EventDraft::info(kind, format!("App {name} {verb} by {by}"))
+            .job(&crate::structs::app::app_job_id(name))
+            .meta(json!({ "app": name, "by": by }))
+    }
+
+    /// `app.config_changed` — an app's config was replaced. `codeFields`
+    /// lists the code fields it touched (the caller's grant was checked).
+    pub fn app_config_changed(name: &str, by: &str, code_fields: &[String]) -> EventDraft {
+        let message = if code_fields.is_empty() {
+            format!("App {name} config changed by {by}")
+        } else {
+            format!(
+                "App {name} config changed by {by}, including code fields {}",
+                code_fields.join(", ")
+            )
+        };
+        EventDraft::info("app.config_changed", message)
+            .job(&crate::structs::app::app_job_id(name))
+            .meta(json!({ "app": name, "by": by, "codeFields": code_fields }))
+    }
+
+    /// `app.reconciled` — the app reconciler changed an app's job:
+    /// `created the job`, `config changed`, `reverted a direct edit by
+    /// userpass:alice`, `stopped (app disabled)`.
+    pub fn app_reconciled(name: &str, action: &str, digest: &str, detail: &str) -> EventDraft {
+        let message = if detail.is_empty() {
+            format!("App {name}: {action}")
+        } else {
+            format!("App {name}: {action} ({detail})")
+        };
+        EventDraft::info("app.reconciled", message)
+            .job(&crate::structs::app::app_job_id(name))
+            .meta(json!({ "app": name, "action": action, "digest": digest, "detail": detail }))
+    }
+
+    /// `app.reconcile_failed` — the app reconciler could not bring an app's
+    /// job in line with its record. `refused` is a submit the manager
+    /// refused (validation, grant, quota), which waits for the next change
+    /// instead of retrying; otherwise it retries with backoff, and this
+    /// event repeats at most every 10 minutes.
+    pub fn app_reconcile_failed(name: &str, error: &str, refused: bool) -> EventDraft {
+        let what = if refused {
+            "refused; waiting for a change to the app or the cluster"
+        } else {
+            "failing; retrying with backoff"
+        };
+        EventDraft::warn(
+            "app.reconcile_failed",
+            format!("App {name}: reconcile {what}: {error}"),
+        )
+        .job(&crate::structs::app::app_job_id(name))
+        .meta(json!({ "app": name, "error": error, "refused": refused }))
+    }
+
+    /// `app.action` — someone pressed an app's action (docs/apps.md, "Views
+    /// and actions"): who, which action, where (the context), and the
+    /// outcome: `ok`, `failed` (the app or the forward failed), or `denied`
+    /// (the caller lacks the action's permission there; the app saw no
+    /// request). Scoped to the app's job, like every app event; the
+    /// context's job is in `meta.context`.
+    pub fn app_action(
+        name: &str,
+        action: &str,
+        by: &str,
+        context: &crate::structs::app_ui::ViewContext,
+        outcome: &str,
+        detail: &str,
+    ) -> EventDraft {
+        let target = match (context.job_id(), context.node.as_str()) {
+            (Some(job), _) if !context.task.is_empty() => format!("{job} task {}", context.task),
+            (Some(job), _) => job,
+            (None, node) if !node.is_empty() => format!("node {node}"),
+            _ => context.slot.clone(),
+        };
+        let message = if detail.is_empty() {
+            format!("App {name}: {by} ran {action} on {target}: {outcome}")
+        } else {
+            format!("App {name}: {by} ran {action} on {target}: {outcome} ({detail})")
+        };
+        let draft = if outcome == "ok" {
+            EventDraft::info("app.action", message)
+        } else {
+            EventDraft::warn("app.action", message)
+        };
+        draft
+            .job(&crate::structs::app::app_job_id(name))
+            .meta(json!({
+                "app": name,
+                "action": action,
+                "by": by,
+                "context": context,
+                "outcome": outcome,
+                "detail": detail,
+            }))
+    }
+
+    /// The object an `object.*` event is about: enough to name it and to
+    /// decide who may see the event (docs/app-objects.md, "Events"). Events
+    /// never carry a spec, status fields, or a redacted value.
+    pub struct ObjectEventRef<'a> {
+        pub app: &'a str,
+        pub kind: &'a str,
+        /// Empty for a cluster-scoped kind.
+        pub namespace: &'a str,
+        pub name: &'a str,
+        pub uid: u64,
+        /// The ACL resource governing the kind's objects (`object`, `job`,
+        /// `scale`, `node`): a tenant's feed shows the event only to a
+        /// caller who may read the kind on the object's scope.
+        pub access: &'a str,
+    }
+
+    fn object_meta(object: &ObjectEventRef<'_>) -> (Value, String) {
+        let qualified = crate::structs::app_object::qualified_kind(object.app, object.kind);
+        let id = crate::structs::app_object::object_id(object.namespace, object.name);
+        let mut meta = json!({
+            "app": object.app,
+            "kind": object.kind,
+            "qualifiedKind": qualified,
+            "name": object.name,
+            "uid": object.uid,
+            "access": object.access,
+        });
+        if !object.namespace.is_empty() {
+            meta["namespace"] = json!(object.namespace);
+        }
+        (meta, format!("{qualified} {id}"))
+    }
+
+    /// `object.applied`: an object was created, or its spec, labels, or
+    /// authority changed.
+    pub fn object_applied(
+        object: &ObjectEventRef<'_>,
+        generation: u64,
+        created: bool,
+        by: &str,
+    ) -> EventDraft {
+        let (mut meta, label) = object_meta(object);
+        meta["generation"] = json!(generation);
+        meta["created"] = json!(created);
+        meta["by"] = json!(by);
+        let verb = if created { "created" } else { "updated" };
+        EventDraft::info(
+            "object.applied",
+            format!("{label} {verb} by {by} (generation {generation})"),
+        )
+        .meta(meta)
+    }
+
+    /// `object.deleted`: an object was removed (by a delete, by its app's
+    /// release after a cleanup, or by a namespace cascade).
+    pub fn object_deleted(object: &ObjectEventRef<'_>, by: &str) -> EventDraft {
+        let (mut meta, label) = object_meta(object);
+        meta["by"] = json!(by);
+        EventDraft::info("object.deleted", format!("{label} deleted by {by}")).meta(meta)
+    }
+
+    /// `object.deleting`: a delete started the kind's bounded cleanup.
+    pub fn object_deleting(object: &ObjectEventRef<'_>, by: &str, deadline_ms: i64) -> EventDraft {
+        let (mut meta, label) = object_meta(object);
+        meta["by"] = json!(by);
+        meta["cleanupDeadlineUnixMs"] = json!(deadline_ms);
+        EventDraft::info(
+            "object.deleting",
+            format!(
+                "{label} deleted by {by}; its app has until the cleanup deadline to release it"
+            ),
+        )
+        .meta(meta)
+    }
+
+    /// `object.cleanup_abandoned`: a cleanup reached its deadline (or the
+    /// kind was orphaned) before the app released the object; it was
+    /// removed anyway.
+    pub fn object_cleanup_abandoned(object: &ObjectEventRef<'_>, why: &str) -> EventDraft {
+        let (mut meta, label) = object_meta(object);
+        meta["reason"] = json!(why);
+        EventDraft::warn(
+            "object.cleanup_abandoned",
+            format!("{label} removed without its app's release: {why}"),
+        )
+        .meta(meta)
+    }
+
+    /// `object.status_changed`: the owning app's `Ready` or `Accepted`
+    /// condition changed.
+    pub fn object_status_changed(
+        object: &ObjectEventRef<'_>,
+        condition: &str,
+        from: &str,
+        to: &str,
+        reason: &str,
+        observed_generation: u64,
+    ) -> EventDraft {
+        let (mut meta, label) = object_meta(object);
+        meta["condition"] = json!(condition);
+        meta["from"] = json!(from);
+        meta["to"] = json!(to);
+        meta["reason"] = json!(reason);
+        meta["observedGeneration"] = json!(observed_generation);
+        let level_warn = to == "false";
+        let text = format!(
+            "{label}: {condition} {} → {to}{} (observed generation {observed_generation})",
+            if from.is_empty() { "unset" } else { from },
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" ({reason})")
+            }
+        );
+        let draft = if level_warn {
+            EventDraft::warn("object.status_changed", text)
+        } else {
+            EventDraft::info("object.status_changed", text)
+        };
+        draft.meta(meta)
     }
 
     /// A namespace was deleted.
@@ -2517,6 +3013,80 @@ impl EventRecorder<'_> {
         self.emit(drafts::scale_reset(job_id, task_group, task_name, why));
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_pinned(
+        self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        min: Option<u32>,
+        max: Option<u32>,
+        until_ms: Option<i64>,
+        by: &str,
+        reason: &str,
+    ) {
+        self.emit(drafts::scale_pinned(
+            job_id, task_group, task_name, min, max, until_ms, by, reason,
+        ));
+    }
+
+    pub fn scale_paused(
+        self,
+        scope: &str,
+        target: &str,
+        paused: bool,
+        until_ms: Option<i64>,
+        by: &str,
+        reason: &str,
+    ) {
+        self.emit(drafts::scale_paused(
+            scope, target, paused, until_ms, by, reason,
+        ));
+    }
+
+    pub fn scale_flag(
+        self,
+        kind: &str,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        message: &str,
+    ) {
+        if let Some(draft) = drafts::scale_flag(kind, job_id, task_group, task_name, message) {
+            self.emit(draft);
+        }
+    }
+
+    pub fn scale_policy_flag(self, kind: &str, object: &ObjectTarget<'_>, message: &str) {
+        if let Some(draft) = drafts::scale_policy_flag(kind, object, message) {
+            self.emit(draft);
+        }
+    }
+
+    pub fn nodegroup_flag(
+        self,
+        kind: &str,
+        object: &ObjectTarget<'_>,
+        message: &str,
+        outcome: &str,
+    ) {
+        if let Some(draft) = drafts::nodegroup_flag(kind, object, message, outcome) {
+            self.emit(draft);
+        }
+    }
+
+    pub fn scale_policy_applied(
+        self,
+        object: &ObjectTarget<'_>,
+        previous: u32,
+        count: u32,
+        reason: &str,
+    ) {
+        self.emit(drafts::scale_policy_applied(
+            object, previous, count, reason,
+        ));
+    }
+
     pub fn rollout_event(
         self,
         rollout_id: i64,
@@ -2597,6 +3167,97 @@ impl EventRecorder<'_> {
 
     pub fn namespace_deleted(self, name: &str) {
         self.emit(drafts::namespace_deleted(name));
+    }
+
+    pub fn app_installed(self, name: &str, version: &str, source: &str, by: &str) {
+        self.emit(drafts::app_installed(name, version, source, by));
+    }
+
+    pub fn app_upgraded(
+        self,
+        name: &str,
+        from: &str,
+        to: &str,
+        added: usize,
+        removed: usize,
+        by: &str,
+    ) {
+        self.emit(drafts::app_upgraded(name, from, to, added, removed, by));
+    }
+
+    pub fn app_uninstalled(self, name: &str, by: &str, revoked_grants: u64) {
+        self.emit(drafts::app_uninstalled(name, by, revoked_grants));
+    }
+
+    pub fn app_enabled(self, name: &str, enabled: bool, by: &str) {
+        self.emit(drafts::app_enabled(name, enabled, by));
+    }
+
+    pub fn app_config_changed(self, name: &str, by: &str, code_fields: &[String]) {
+        self.emit(drafts::app_config_changed(name, by, code_fields));
+    }
+
+    pub fn app_reconciled(self, name: &str, action: &str, digest: &str, detail: &str) {
+        self.emit(drafts::app_reconciled(name, action, digest, detail));
+    }
+
+    pub fn app_reconcile_failed(self, name: &str, error: &str, refused: bool) {
+        self.emit(drafts::app_reconcile_failed(name, error, refused));
+    }
+
+    pub fn app_action(
+        self,
+        name: &str,
+        action: &str,
+        by: &str,
+        context: &crate::structs::app_ui::ViewContext,
+        outcome: &str,
+        detail: &str,
+    ) {
+        self.emit(drafts::app_action(
+            name, action, by, context, outcome, detail,
+        ));
+    }
+
+    pub fn object_applied(
+        self,
+        object: &drafts::ObjectEventRef<'_>,
+        generation: u64,
+        created: bool,
+        by: &str,
+    ) {
+        self.emit(drafts::object_applied(object, generation, created, by));
+    }
+
+    pub fn object_deleted(self, object: &drafts::ObjectEventRef<'_>, by: &str) {
+        self.emit(drafts::object_deleted(object, by));
+    }
+
+    pub fn object_deleting(self, object: &drafts::ObjectEventRef<'_>, by: &str, deadline_ms: i64) {
+        self.emit(drafts::object_deleting(object, by, deadline_ms));
+    }
+
+    pub fn object_cleanup_abandoned(self, object: &drafts::ObjectEventRef<'_>, why: &str) {
+        self.emit(drafts::object_cleanup_abandoned(object, why));
+    }
+
+    pub fn object_status_changed(
+        self,
+        object: &drafts::ObjectEventRef<'_>,
+        condition: &str,
+        from: &str,
+        to: &str,
+        reason: &str,
+        observed_generation: u64,
+    ) {
+        self.emit(drafts::object_status_changed(
+            object,
+            condition,
+            from,
+            to,
+            reason,
+            observed_generation,
+        ));
     }
 
     pub fn volume_mounted(self, volume: &crate::structs::Volume, node_id: &str, path: &str) {

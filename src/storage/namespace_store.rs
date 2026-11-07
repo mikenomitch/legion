@@ -13,7 +13,10 @@ use crate::prelude::*;
 use crate::storage::errors::StorageError;
 use crate::storage::store::Store;
 use crate::storage::Lane;
-use crate::structs::namespace::{validate_new_namespace_name, Namespace, DEFAULT_NAMESPACE};
+use crate::structs::namespace::{
+    is_reserved_namespace, validate_new_namespace_name, Namespace, DEFAULT_NAMESPACE,
+    SYSTEM_NAMESPACE,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -41,11 +44,18 @@ pub struct NamespaceContents {
     pub volumes: Vec<String>,
     /// Snapshot ids of a job in the namespace.
     pub snapshots: Vec<String>,
+    /// Objects of app-declared kinds in the namespace, as `<app>/<Kind>
+    /// <name>` (docs/app-objects.md). Objects whose bounded cleanup is
+    /// running are on their way out and do not count.
+    pub objects: Vec<String>,
 }
 
 impl NamespaceContents {
     pub fn is_empty(&self) -> bool {
-        self.jobs.is_empty() && self.volumes.is_empty() && self.snapshots.is_empty()
+        self.jobs.is_empty()
+            && self.volumes.is_empty()
+            && self.snapshots.is_empty()
+            && self.objects.is_empty()
     }
 
     /// `3 jobs, 1 volume`, for the refusal message.
@@ -55,6 +65,7 @@ impl NamespaceContents {
             (self.jobs.len(), "job", "jobs"),
             (self.volumes.len(), "volume", "volumes"),
             (self.snapshots.len(), "snapshot", "snapshots"),
+            (self.objects.len(), "object", "objects"),
         ] {
             if count > 0 {
                 parts.push(format!("{count} {}", if count == 1 { one } else { many }));
@@ -267,10 +278,86 @@ impl Store {
         })
     }
 
+    /// Create the reserved `legion-system` namespace, and the namespace
+    /// policy of the same name that sends its jobs to the managers' system
+    /// workers (`pools.default = "legion-system"`), when the namespace does
+    /// not exist yet. The control-lane leader runs this at startup and on
+    /// taking leadership; the namespace cannot be deleted, so after the first
+    /// leader of an empty store has run it, it changes nothing. Returns
+    /// whether it created them.
+    ///
+    /// It bypasses the reserved-prefix check that stops `legion namespace
+    /// apply` from creating a `legion-*` namespace. The policy is an
+    /// ordinary one: an operator may edit or delete it, and it is only
+    /// written together with the namespace, so a deleted policy stays
+    /// deleted.
+    #[instrument(err, skip_all)]
+    pub fn ensure_system_namespace(&self) -> R<bool> {
+        // Read first: every later leadership change then costs no write.
+        if self.get_namespace(SYSTEM_NAMESPACE)?.is_some() {
+            return Ok(false);
+        }
+        self.replicated(Lane::Control, "ensure_system_namespace", |s| {
+            s.ensure_system_namespace_apply()
+        })
+    }
+
+    fn ensure_system_namespace_apply(&self) -> R<bool> {
+        let conn = self.write_connection()?;
+        let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let created = conn.execute(
+            "INSERT INTO namespace (name, description, meta, created_at, updated_at)
+             VALUES (?1, ?2, '{}', ?3, ?3)
+             ON CONFLICT(name) DO NOTHING;",
+            params![
+                SYSTEM_NAMESPACE,
+                "Legion's own operational jobs, run on the managers' system workers",
+                now
+            ],
+        )? > 0;
+        if !created {
+            return Ok(false);
+        }
+        let mut policy = crate::structs::namespace_policy::NamespacePolicy {
+            name: SYSTEM_NAMESPACE.to_string(),
+            description: "Jobs in legion-system that name no pool run on the managers' system \
+                          workers, or on a --run-worker manager's worker"
+                .to_string(),
+            namespaces: vec![SYSTEM_NAMESPACE.to_string()],
+            // Both pools: the system workers' (`legion-system`) and the one a
+            // `--run-worker` manager's worker joins (`default`). The pool is
+            // not what keeps legion-system off ordinary workers; their
+            // `namespaces` is (a node with the default `["*"]` refuses it).
+            pools: Some(crate::structs::namespace_policy::PoolRule {
+                allowed: None,
+                default: Some(crate::structs::namespace_policy::PoolDefault::Many(vec![
+                    SYSTEM_NAMESPACE.to_string(),
+                    "default".to_string(),
+                ])),
+            }),
+            ..Default::default()
+        };
+        policy
+            .normalize()
+            .map_err(|message| anyhow::Error::new(StorageError::InvalidInput { message }))?;
+        conn.execute(
+            "INSERT INTO namespace_policy (name, object, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(name) DO NOTHING;",
+            params![policy.name, serde_json::to_string(&policy)?, now],
+        )?;
+        Ok(true)
+    }
+
     fn delete_namespace_apply(&self, name: &str) -> R<()> {
         if name == DEFAULT_NAMESPACE {
             return Err(anyhow::Error::new(StorageError::failed_precondition(
                 "the default namespace cannot be deleted",
+            )));
+        }
+        if is_reserved_namespace(name) {
+            return Err(anyhow::Error::new(StorageError::failed_precondition(
+                format!("namespace '{name}' is reserved for Legion and cannot be deleted"),
             )));
         }
         let conn = self.write_connection()?;
@@ -328,6 +415,14 @@ fn namespace_contents_on(conn: &Connection, name: &str) -> R<NamespaceContents> 
             "job_id",
             "AND state <> 'deleting'",
         )?,
+        objects: {
+            let mut stmt = conn.prepare(
+                "SELECT app || '/' || kind || ' ' || name FROM app_object
+                 WHERE namespace = ?1 AND deleting_since = 0 ORDER BY app, kind, name;",
+            )?;
+            let rows = stmt.query_map([name], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        },
     })
 }
 
@@ -449,6 +544,8 @@ mod namespace_store_test {
             rollout: None,
             rollout_by_group: Default::default(),
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 
@@ -512,6 +609,52 @@ mod namespace_store_test {
         assert!(store.get_namespace("default")?.is_some());
         let err = store.delete_namespace_if_empty("default").unwrap_err();
         assert!(format!("{err:#}").contains("cannot be deleted"), "{err:#}");
+        Ok(())
+    }
+
+    /// The first control leader of an empty store creates `legion-system`
+    /// and its policy; it can't be deleted, and a later run changes nothing,
+    /// so an operator's edit or delete of the policy sticks.
+    #[test]
+    fn system_namespace_is_created_once_and_cannot_be_deleted() -> R<()> {
+        let store = setup_store()?;
+        assert!(!store.namespace_exists(SYSTEM_NAMESPACE)?);
+        assert!(store.ensure_system_namespace()?);
+        assert!(store.namespace_exists(SYSTEM_NAMESPACE)?);
+        let policy = store
+            .get_namespace_policy(SYSTEM_NAMESPACE)?
+            .expect("the system namespace's policy")
+            .policy;
+        assert_eq!(policy.namespaces, vec![SYSTEM_NAMESPACE.to_string()]);
+        assert_eq!(
+            policy
+                .pools
+                .and_then(|pools| pools.default)
+                .map(|default| default.label()),
+            Some(format!("{SYSTEM_NAMESPACE}, default"))
+        );
+
+        let err = store
+            .delete_namespace_if_empty(SYSTEM_NAMESPACE)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("reserved for Legion"),
+            "{err:#}"
+        );
+
+        assert!(store.delete_namespace_policy(SYSTEM_NAMESPACE)?);
+        assert!(!store.ensure_system_namespace()?, "already there");
+        assert!(
+            store.get_namespace_policy(SYSTEM_NAMESPACE)?.is_none(),
+            "a deleted policy stays deleted"
+        );
+        // Still not creatable through the ordinary path, and a sibling is not.
+        assert!(store
+            .apply_namespace(Namespace {
+                name: "legion-other".into(),
+                ..Default::default()
+            })
+            .is_err());
         Ok(())
     }
 

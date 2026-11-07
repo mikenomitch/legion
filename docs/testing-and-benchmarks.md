@@ -79,6 +79,22 @@ in the system temp dir is never removed; at ~1.7 MB per store, a full run
 used to leave over a gigabyte behind. A run killed before it exits (Ctrl-C)
 still leaves its one `legion-tests-*` root in `$TMPDIR`.
 
+### Real clusters and their task processes
+
+A test that starts the real `legion` binary with a worker (the system
+worker included) starts real task processes, and a worker that stops
+leaves its tasks running on purpose: the next start re-adopts them. Such a
+test's teardown, after the manager has exited, calls
+`crate::support::kill_task_processes_under(dir)` for the cluster's
+directory, which kills every process whose `LEGION_ALLOC_DIR` is inside it
+(Linux; the scratch root's exit hook does the same as a backstop). A fresh
+cluster also seeds and runs the bundled autoscaler on its system worker,
+holding a port from the worker's range; a test that does not exercise it
+turns it off with `"apps": { "autoscaler": { "enabled": false } }` in the
+manager config. Every cluster in the binary hands out the same dynamic
+ports (from 20000), so a test that binds one, or runs a task that does,
+holds `crate::support::DYNAMIC_PORT_GATE`.
+
 ### Notable integration tests
 
 - `config_jobs`
@@ -96,6 +112,15 @@ still leaves its one `legion-tests-*` root in `$TMPDIR`.
   - eval ordering and eval-driven ledger reconciliation behavior.
 - `rollout_integration`
   - rollout progression behavior (auto/manual/create-first/destroy-first, etc).
+- `node_groups`
+  - a node group grows from zero for pending work through a scripted `exec`
+    provider, its machines join with the group's token, and empty members
+    are drained, terminated, and forgotten one `down.every` apart, never the
+    one a `legion-system` allocation protects.
+- `autoscaler_shards`
+  - several autoscaler replicas split the 64 shards and rebalance after one
+    dies; two forced to overlap land one `ScaleTask` and one `target/scale`
+    per decision; the policy watch sends deltas for the shards asked.
 
 ## Running Tests
 
@@ -121,6 +146,37 @@ ulimit -n 65536
 cargo test --all --locked
 ```
 
+### UI smoke tests
+
+The SPA has no unit-test runner. Its smoke tests drive the built UI in a
+real browser instead, against a fake manager that answers the SPA's
+gRPC-Web calls inside the browser (Playwright's request routing), so no
+Legion process is needed:
+
+```bash
+cd ui
+npm ci
+npm run build
+npm run test:smoke                 # every suite
+npm run test:smoke -- app-pages    # one suite
+```
+
+The runner (`ui/tests/smoke/run.cjs`) serves `ui/dist` with `vite preview`
+on port 4179 (`SMOKE_PORT` overrides it) and runs each suite in Chromium.
+It needs the `playwright` package and its Chromium, which the UI does not
+depend on: `npm install -g playwright && npx playwright install chromium`.
+The suites:
+
+| Suite | Covers |
+| --- | --- |
+| `app-views` | app views (tier 1): the sidebar's Apps entry, the block renderer on an app page and the `/testing` fixture, a mutating action's confirmation and inputs, hostile text staying text |
+| `app-pages` | sandboxed pages (tier 2): the iframe's sandbox and CSP, an allowlisted call as the viewer with the `legion-app-page` header, a refused RPC outside the allowlist, the confirmation of a mutating call (cancel and confirm), no storage, DOM, network, or forms from the page, messages from other windows ignored, `legion.navigate`, the bridge closing after the frame navigates |
+| `autoscaler-panel` | the autoscaler's job panel and sidebar page as the SPA draws them |
+
+A suite is a module exporting `async ({ browser, base, check }) => {}`, and
+`ui/tests/smoke/support.cjs` has the protobuf encoder and the fake manager.
+They are not in CI: they need a browser the CI image does not have.
+
 ## Benchmark Coverage
 
 Benchmark code lives under `benchmarks/`:
@@ -139,6 +195,7 @@ Benchmark targets:
 - `benchmarks/micro/scheduler_bench.rs` (Criterion)
 - `benchmarks/micro/eval_critical_path_bench.rs` (Criterion)
 - `benchmarks/micro/net_bench.rs` (Criterion)
+- `benchmarks/micro/scaling_rollup_bench.rs` (Criterion)
 - `tests/integration/scheduler_benchmark_slo.rs` (scenario runner + SLO gate, CI)
 - `tests/integration/scheduler_scale_benchmark.rs` (scenario × persistence-backend
   matrix, manual)
@@ -283,6 +340,27 @@ What they measure:
   Datapath changes in `src/worker/forwarder.rs`, `src/worker/netd/`, or
   `src/worker/balance.rs` should report before/after numbers from this
   target. Run it on Linux for anything that touches the copy path.
+- `scaling_rollup_bench`: the cost of each step of the
+  [scaling-input rollups](autoscaling.md#scaling-inputs), at the plan's
+  sizing of about 10,000 tasks on 3 nodes each (33,330 replicas):
+  - `edge_record`: folding one heartbeat's service-graph samples into the
+    pending map, the only work the rollups add to the heartbeat path.
+  - `rollup_build`: one manager's 10-second fold of its nodes' latest reports
+    into per-(node, task) rollups.
+  - `sender_sync`: building the delta for a steady fleet (the empty
+    confirming sync) and for one where every rollup changed.
+  - `leader_merge`: the status-lane leader applying one peer's full sync and
+    a steady delta, and its 10-second history pass.
+  - `totals_read`: one task's sum across its nodes, per `GetScalingInputs`
+    target.
+
+  ```console
+  $ cargo bench --bench scaling_rollup_bench
+  ```
+
+  Everything but `edge_record` runs once per 10 seconds per manager, off the
+  heartbeat path. Changes to `src/manager/scaling_inputs.rs` should report
+  before/after numbers from this target.
 - `plan_contention`: N concurrent single-allocation submits against one
   pool, processed by real eval workers. It measures conflict rejections,
   requeues, fallback binds, dropped evals, and time until everything is
@@ -312,6 +390,7 @@ Run commands:
 
 - `cargo bench --bench scheduler_bench`
 - `cargo bench --bench eval_critical_path_bench`
+- `cargo bench --bench scaling_rollup_bench`
 - `cargo test --test integration scheduler_benchmark_slo:: -- --ignored --nocapture`
 - `cargo test --test integration plan_contention:: -- --ignored --nocapture`
 - Full backend matrix (use a release build for recorded numbers):
@@ -335,6 +414,21 @@ LEGION_BENCH_BACKENDS=local_disk,raft1 LEGION_HEARTBEAT_NODES=1000,5000 \
 
   Knobs: `LEGION_HEARTBEAT_THREADS` (default 8) and
   `LEGION_HEARTBEAT_SECONDS` (measurement window per cell, default 3).
+
+- The autoscaler at 10,000 policies (`tests/integration/autoscaler_load.rs`):
+  10,000 autoscaled jobs on an in-process manager, usage heartbeats for every
+  allocation, and one autoscaler engine timed over six evaluation ticks
+  (reading inputs, deciding and writing, reporting), plus the first
+  `WatchScalingPolicies` set. `LEGION_AUTOSCALER_LOAD_POLICIES` changes the
+  count. The published numbers are in
+  [benchmarks.md](benchmarks.md#the-autoscaler-at-10000-policies):
+
+```bash
+cargo test --release --test integration autoscaler_load:: -- --ignored --nocapture
+```
+
+  Publish release-build numbers: a debug build spends about twice as long
+  in the manager's store reads.
 
 Recorded results live in `benchmarks/scheduler/README.md`, with the host
 and build profile noted alongside every table.

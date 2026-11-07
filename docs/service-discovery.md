@@ -597,7 +597,7 @@ curl "http://$(cargo run -q -- service resolve web --one)"
 pkill -f http.server; sleep 12
 cargo run -- service resolve web      # no healthy endpoints
 cargo run -- service doctor web       # names the failing layer
-# after on_unhealthy restarts it, it re-registers (with a fresh dynamic port).
+# after onUnhealthy restarts it, it re-registers (with a fresh dynamic port).
 ```
 
 ### ...and the connect path
@@ -614,7 +614,7 @@ cargo run -- service resolve web              # two healthy endpoints
 cargo run -- job logs connect-demo --tail     # client alternates between them
 
 # kill ONE backend's process (not via legion): the client keeps serving from the
-# survivor, and returns to alternating once on_unhealthy restarts the dead one.
+# survivor, and returns to alternating once onUnhealthy restarts the dead one.
 pkill -n -f http.server
 cargo run -- job logs connect-demo --tail
 ```

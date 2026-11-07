@@ -520,6 +520,7 @@ impl TaskPlugin for ExecTaskPlugin {
             .command
             .split_first()
             .context("exec task command must include at least one entry")?;
+        let program = &resolve_program(program)?;
 
         let mut linux_options = config.linux_options()?;
         // A gated allocation runs inside its own namespace
@@ -975,6 +976,26 @@ fn chown_tree(path: &Path, uid: u32, gid: u32) -> R<()> {
     Ok(())
 }
 
+/// The program an exec task's `command[0]` names. `legion:self` is the
+/// worker's own executable (docs/apps.md, "Bundled apps"; apps plan calls
+/// entry 12), so a bundled app is always the same build as the node that
+/// runs it, with nothing to download. Everything else is taken as written.
+pub(crate) fn resolve_program(program: &str) -> R<String> {
+    if program != crate::structs::app::SELF_COMMAND {
+        return Ok(program.to_string());
+    }
+    let exe = std::env::current_exe()
+        .context("cannot resolve `legion:self`: this worker cannot find its own executable")?;
+    // Linux names a running binary that was replaced on disk `<path>
+    // (deleted)`; the path itself now holds the replacement, which is what
+    // the node runs from here on.
+    let path = exe.display().to_string();
+    Ok(path
+        .strip_suffix(" (deleted)")
+        .map(str::to_string)
+        .unwrap_or(path))
+}
+
 #[cfg(unix)]
 fn lookup_user(value: &str) -> R<UserSpec> {
     let cstr = CString::new(value).context("exec task user must not contain null bytes")?;
@@ -987,6 +1008,20 @@ fn lookup_user(value: &str) -> R<UserSpec> {
         }
     };
     if passwd.is_null() {
+        // A bare uid needs no passwd entry: the kernel switches to any id.
+        // Its gid is the same number (an app's uid, docs/apps.md, "Trust
+        // model"), and it has no home or login shell.
+        if let Ok(uid) = value.parse::<u32>() {
+            return Ok(UserSpec {
+                uid,
+                gid: uid,
+                identity: TaskIdentity {
+                    name: value.to_string(),
+                    home: "/nonexistent".to_string(),
+                    shell: "/usr/sbin/nologin".to_string(),
+                },
+            });
+        }
         bail!("exec task user {value} not found");
     }
     // SAFETY: passwd has been checked as non-null.
@@ -1125,7 +1160,86 @@ mod tests {
         );
     }
 
+    /// A numeric uid with no passwd entry is a user of its own, with the
+    /// same gid: what an app's exec tasks run as (docs/apps.md, "Trust
+    /// model"). A name with no entry is still an error.
     #[cfg(unix)]
+    #[test]
+    fn a_bare_uid_needs_no_passwd_entry() -> R<()> {
+        let uid = crate::structs::app::APP_UID_BASE + 4242;
+        // SAFETY: getpwuid reads static storage; only the pointer is checked.
+        if !unsafe { libc::getpwuid(uid) }.is_null() {
+            return Ok(()); // this host has a user there; nothing to test
+        }
+        let user = lookup_user(&uid.to_string())?;
+        assert_eq!((user.uid, user.gid), (uid, uid));
+        assert_eq!(user.identity.name, uid.to_string());
+        assert!(lookup_user("no-such-user-legion-test").is_err());
+        Ok(())
+    }
+
+    /// Run as root, a task switched to one app's uid cannot read another's
+    /// owner-only `secrets/` (the files an allocation's tree is handed to its
+    /// task user with), and can read its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_app_uid_cannot_read_anothers_secrets() -> R<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        // SAFETY: a trivial libc getter.
+        if unsafe { libc::geteuid() } != 0 {
+            return Ok(()); // switching users takes root
+        }
+        let (mine, theirs) = (
+            crate::structs::app::APP_UID_BASE + 4300,
+            crate::structs::app::APP_UID_BASE + 4301,
+        );
+        let root = tempfile::TempDir::new()?;
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o711))?;
+        let mut secrets = Vec::new();
+        for (name, uid) in [("mine", mine), ("theirs", theirs)] {
+            let alloc = root.path().join(name);
+            std::fs::create_dir_all(alloc.join("secrets"))?;
+            std::fs::set_permissions(&alloc, std::fs::Permissions::from_mode(0o700))?;
+            let token = alloc.join("secrets/legion.token");
+            std::fs::write(&token, name)?;
+            std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o400))?;
+            chown_tree(&alloc, uid, uid)?;
+            secrets.push(token);
+        }
+        let read_as = |uid: u32, path: &std::path::Path| -> R<bool> {
+            let user = lookup_user(&uid.to_string())?;
+            let status = std::process::Command::new("cat")
+                .arg(path)
+                .uid(user.uid)
+                .gid(user.gid)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?;
+            Ok(status.success())
+        };
+        assert!(read_as(mine, &secrets[0])?, "an app reads its own token");
+        assert!(
+            !read_as(mine, &secrets[1])?,
+            "an app reads another app's token"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legion_self_resolves_to_the_running_executable() -> R<()> {
+        let resolved = resolve_program(crate::structs::app::SELF_COMMAND)?;
+        assert_eq!(
+            std::path::PathBuf::from(&resolved),
+            std::env::current_exe()?,
+            "legion:self is this process's own binary"
+        );
+        assert_eq!(resolve_program("/bin/echo")?, "/bin/echo");
+        assert_eq!(resolve_program("legion")?, "legion");
+        Ok(())
+    }
+
     #[test]
     fn chown_tree_walks_dirs_without_following_symlinks() -> R<()> {
         let temp_dir = tempfile::TempDir::new()?;
@@ -1171,6 +1285,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::from_secs(30),
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("drain", "exec")
         };
@@ -1248,6 +1363,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::from_secs(1),
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("stubborn", "exec")
         };

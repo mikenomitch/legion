@@ -395,6 +395,58 @@ it.
   policies (their tables are not read), and jobs in other namespaces keep
   their qualified ids, which an older manager treats as plain names.
 
+## Strict jobspec fields
+
+The release that made [unknown jobspec
+fields](jobs-tasks-and-scheduling.md#unknown-fields) errors changed this
+behavior on purpose:
+
+- **A spec carrying a stray or misspelled key now fails to submit.** Before,
+  the key was accepted and silently ignored. Run `legion job validate` over
+  your specs before upgrading the managers: each error names the key, its
+  path, and the closest known key. Fix the spec, or pass
+  `--allow-unknown-fields` to submit it as before while you do (keys on the
+  job, a task, a volume, a port, or a service are kept as pending, the rest
+  are dropped, and both are reported and recorded on the version).
+- **Blocks that were already strict now report every key the same way.**
+  `volumes`, `stateful`, `stateful.storage`, `stop`, `disruption`,
+  `actions`, `network.ports[].tls`, `connect.upstreams`, `speculativeStart`,
+  `snapshots`, `suspend`, and the session blocks used to fail on the first
+  unknown key with serde's message; they now report every unknown key with
+  its path and a suggestion, and the flag can drop (or, on a volume, keep)
+  them.
+- **Stored jobs are unaffected.** A stored config never carried an unknown
+  key (the old parser dropped them before storing), so reading, re-rendering,
+  and restarting existing jobs works unchanged.
+
+Under skew:
+
+- **A manager older than this release drops unknown keys silently**, as it
+  always did, and ignores `allow_unknown_fields`. Nothing records what it
+  dropped. Upgrade the managers before relying on the error.
+- **The CLI's `legion job validate` checks locally**, with the parser
+  compiled into the CLI binary, and asks the manager (`GetJobSchema`) which
+  keys installed apps add. An older CLI does not catch unknown keys; a
+  newer CLI catches them even against an older manager, but against a
+  manager that predates `GetJobSchema` it reports keys at extension points
+  as not checked.
+- **A newer CLI's `--allow-unknown-fields` against an older manager** is
+  harmless: the manager ignores the field and drops the keys, as before.
+- **Downgrading a manager** past this release ignores the task- and
+  job-level `pendingExtensions` maps and the recorded warnings (nothing acted
+  on them anyway), but an older manager cannot read a version whose volumes
+  carry pending keys: its volume parser refuses unknown keys. Resubmit those
+  jobs without `--allow-unknown-fields` before downgrading.
+- **Jobspec extension values** ([Apps: Jobspec
+  extensions](apps.md#jobspec-extensions)) live in the version's
+  `job_config.meta.extensions`. A manager from before they existed does not
+  read them: to it the version has no extension values, and in a
+  mixed-version cluster an older manager cannot apply a replicated submit
+  that carries them (its parser refuses the `extensions` key). Upgrade every
+  manager before installing an app that declares jobspec keys. Values an
+  earlier release kept as pending are adopted by the app that declares them
+  when it is installed, with no resubmit.
+
 ## Task-plugin ABI
 
 Task runtimes loaded from `plugins/tasks/<name>/` are **not** covered by

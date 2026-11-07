@@ -574,6 +574,8 @@ fn test_job(name: &str, count: u32) -> JobConfig {
         name: name.to_string(),
         tasks: vec![task],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -589,6 +591,8 @@ fn test_job_with_volume(name: &str, count: u32) -> JobConfig {
         params: None,
         path: Some("/data".to_string()),
         read_only: None,
+        pending_extensions: Default::default(),
+        unknown_fields: Default::default(),
     }];
     config
 }

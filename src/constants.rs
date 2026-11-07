@@ -206,9 +206,29 @@ pub const WORKER_HEARTBEAT_DURATION_SEC: u64 = 2;
 pub const WORKER_NODE_CHECK_DURATION_SEC: u64 = 30;
 pub const DEF_WORKER_SERVER_PORT: u64 = 4848;
 
-/// Directory holding one subdirectory per worker ID on this host.
+/// Directory holding one subdirectory per worker ID on this host:
+/// `<data dir>/workers`, or what [`set_worker_state_dir`] chose for this
+/// process.
 pub fn worker_state_dir() -> PathBuf {
-    data_dir().join("workers")
+    WORKER_STATE_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| data_dir().join("workers"))
+}
+
+/// Subdirectory of the data dir a manager's system worker keeps its state
+/// in. Apart from `workers/` so a standalone worker started from the same
+/// directory (`legion join` on a laptop running a manager) never finds the
+/// system worker's ID there and adopts it as its own.
+pub const SYSTEM_WORKER_STATE_SUBDIR: &str = "system-worker";
+
+static WORKER_STATE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Move this process's worker state out of `<data dir>/workers`. Called
+/// once, by a manager before it starts its system worker (the one worker a
+/// manager process hosts); a later call changes nothing.
+pub fn set_worker_state_dir(dir: PathBuf) {
+    let _ = WORKER_STATE_DIR.set(dir);
 }
 
 // === Local state ===

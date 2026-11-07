@@ -39,6 +39,10 @@ runs a manager, the cluster's. Run untrusted code in `container` or
 Required:
 
 - `command`: array of strings, first element is program, remainder are args.
+  A first element of `legion:self` runs the worker's own executable
+  (`command = ["legion:self", "app", "run", "autoscaler"]`), so the task runs
+  the same build as the node, with nothing to download. Legion's bundled
+  [apps](apps.md) run this way.
 
 Optional:
 

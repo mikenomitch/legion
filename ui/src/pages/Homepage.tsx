@@ -3,6 +3,7 @@ import { LoginGate } from '../components/AccessGate'
 import { For, Show, createMemo, createResource } from 'solid-js'
 import { Badge, EmptyState, LoadingRows, MonoBadge, Note, RelativeTime, SectionCard, StatCard, StatusBadge, TableShell, linkClass, tableClass, tdClass, thClass, theadClass, trHoverClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
+import { AppPanels } from '../components/apps/AppSlot'
 import { asDisplay, heartbeatFreshnessHint } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { statusTone, type Tone } from '../utils/status'
@@ -133,6 +134,8 @@ function HomepageContent() {
               tone={activeRollouts().length > 0 ? 'info' : 'neutral'}
             />
           </div>
+
+          <AppPanels slot="overview" />
 
           <Show when={activeRollouts().length > 0}>
             <SectionCard title="Active rollouts" flush actions={<A href="/rollouts" class={linkClass}>View all</A>}>

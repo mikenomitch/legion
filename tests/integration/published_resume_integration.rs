@@ -318,6 +318,7 @@ fn job(durability: &str) -> JobConfig {
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         suspend: Some(SuspendConfig {
             durability: Some(durability.into()),
@@ -332,6 +333,8 @@ fn job(durability: &str) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

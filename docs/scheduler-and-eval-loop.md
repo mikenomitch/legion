@@ -448,7 +448,7 @@ inserting it:
 
 - **Availability**: the node must still be `available`.
 - **Constraints and permits**: the task's constraint and permit sets must
-  still be satisfied.
+  still be satisfied, and the node must still accept the job's namespace.
 - **Resource totals**: the node's free pool is rebuilt inside the
   transaction, and every placement must still fit, with earlier placements
   in the same plan debited. The free pool is current capacity minus the
@@ -683,7 +683,12 @@ changeset.
 Per task, the candidate set is then built one of two ways:
 
 - **Scan** (the baseline): every available node is tested against the
-  task's constraints, permit, and volume-driver requirements.
+  task's constraints, permit, and volume-driver requirements, and against
+  the node's own `namespaces` restriction: a node whose worker type lists
+  namespaces is ineligible for a job outside them, whatever the permit says
+  ([namespaces.md](namespaces.md#nodes-that-accept-only-some-namespaces)).
+  The check is one attribute lookup per node, and it rides inside the permit
+  check, so the scan, the index walk, and the apply recheck all make it.
 - **Scheduling index** ([scheduling-indexes.md](scheduling-indexes.md)):
   when the fleet is at or above `schedulerSettings.index_min_nodes` and a
   declared index binds the task's equality constraints, candidates come
@@ -868,9 +873,14 @@ The key says what the eval waits for:
 | `escaped` | No schedulable node at all, so no class to wait on | Any capacity anywhere |
 
 The match is exact rather than by key string: the wake pass re-runs the
-blocked task's own permit and constraint checks against the node whose
-capacity changed, so operators the key cannot spell (`>`, `matches`,
-`version_matches`, `contains`) still wake only on nodes that satisfy them.
+blocked task's own permit and constraint checks, and the node's namespace
+restriction against the task's job, on the node whose capacity changed, so
+operators the key cannot spell (`>`, `matches`, `version_matches`,
+`contains`) still wake only on nodes that satisfy them, and a node that
+accepts only other namespaces (a manager's system worker, say) wakes
+nothing in the job's pool. When the restriction is why a task cannot place,
+the blocked reason says so (`3 nodes accept only namespaces
+[legion-system]`).
 Whether the room is *enough* is not checked: the plan that runs next
 decides that, and blocks again if not.
 

@@ -1135,6 +1135,29 @@ impl WorkloadIdentityState {
         )
     }
 
+    /// A viewer assertion for app `app` (docs/apps.md, "The viewer
+    /// assertion"): `aud = app:<name>`, signed with the active key and
+    /// verified by the app's framework against the JWKS. The Legion claims
+    /// (`legion.io/viewer`) are the caller's.
+    pub fn issue_viewer_assertion(
+        &self,
+        app: &str,
+        jti: &str,
+        subject: &str,
+        claims: Map<String, Value>,
+        iat: u64,
+        exp: u64,
+    ) -> R<IssuedToken> {
+        self.read_issuer()?.issue_ticket(
+            &crate::structs::app_ui::assertion_audience(app),
+            jti,
+            subject,
+            claims,
+            iat,
+            exp,
+        )
+    }
+
     /// One pass of the rotation state machine, persisting every transition:
     /// rotate when the active key is older than `rotationAge`, then expire
     /// retiring keys past their overlap window. Returns true when a rotation
@@ -1334,6 +1357,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: "/var/run/legion/identity/aws/token".into(),
                 mode: Some("0400".into()),
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         }
@@ -1537,6 +1561,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: "/var/run/legion/identity/legion/token".into(),
                 mode: None,
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         };
@@ -1667,6 +1692,8 @@ mod tests {
             name: "claims-job".into(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -1719,6 +1746,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -2268,6 +2296,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: "/run/legion/token".into(),
                 mode: None,
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         };

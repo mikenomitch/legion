@@ -607,6 +607,8 @@ fn job_alpha() -> JobConfig {
             json!([{ "key": "tier", "value": "gold", "multiplier": 2 }]),
         )],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -624,6 +626,8 @@ fn job_bravo() -> JobConfig {
             json!([{ "key": "tier", "value": "gold", "multiplier": 2 }]),
         )],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -641,6 +645,8 @@ fn job_charlie() -> JobConfig {
             json!([{ "key": "tier", "value": "gold", "multiplier": 2 }]),
         )],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -658,6 +664,8 @@ fn job_delta() -> JobConfig {
             json!([{ "key": "rack", "value": "rack-d", "multiplier": 3 }]),
         )],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -675,6 +683,8 @@ fn job_echo() -> JobConfig {
             json!([{ "key": "tier", "value": "silver", "multiplier": 2 }]),
         )],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -692,6 +702,8 @@ fn job_foxtrot() -> JobConfig {
             json!({}),
         )],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -712,6 +724,8 @@ fn job_golf() -> JobConfig {
             json!({}),
         )],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -729,6 +743,8 @@ fn job_hotel() -> JobConfig {
             json!({}),
         )],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -746,6 +762,8 @@ fn job_india() -> JobConfig {
             json!({}),
         )],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -763,6 +781,8 @@ fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
             ..TaskConfig::new("resubmit-task", "service")
         }],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -780,6 +800,8 @@ fn job_score_load() -> JobConfig {
             json!({}),
         )],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -797,6 +819,8 @@ fn job_score_target() -> JobConfig {
             json!({}),
         )],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -999,6 +1023,8 @@ fn scheduler_count_per_attribute_reschedules_by_group() -> R<()> {
             ..TaskConfig::new("region-task", "service")
         }],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
 
     cluster.submit_job(job)?;
@@ -1065,6 +1091,8 @@ fn scheduler_count_per_id_scales_with_node_changes() -> R<()> {
             ..TaskConfig::new("id-task", "service")
         }],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
 
     cluster.submit_job(job)?;
@@ -1144,6 +1172,8 @@ fn scheduler_multi_job_churn_constraints_and_count_per_reschedule() -> R<()> {
             ..TaskConfig::new("regional", "service")
         }],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
 
     let constrained_job = JobConfig {
@@ -1158,6 +1188,8 @@ fn scheduler_multi_job_churn_constraints_and_count_per_reschedule() -> R<()> {
             ..TaskConfig::new("east-only", "service")
         }],
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
 
     cluster.submit_job(regional_job)?;

@@ -185,17 +185,21 @@ fn stateful_job(name: &str, count: u32, driver: &str, params: Option<Value>) -> 
                     params,
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "exec")
         }],
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -330,6 +334,8 @@ fn a_dry_run_plan_never_reads_another_jobs_volume_pins() -> R<()> {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let scheduler = Scheduler::new(&cluster.store)?;
     let preview = scheduler.plan_for_config(&web, PlanMode::Fresh, None)?;
@@ -570,6 +576,8 @@ fn task_volume_claims_are_shared_and_outlive_instance_churn() -> R<()> {
         params: None,
         path: Some("/models".into()),
         read_only: Some(true),
+        pending_extensions: Default::default(),
+        unknown_fields: Default::default(),
     }];
     cluster.submit(job)?;
 
@@ -613,6 +621,8 @@ fn stateless_jobs_create_no_volumes() -> R<()> {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     })?;
     assert!(
         cluster.volumes()?.is_empty(),

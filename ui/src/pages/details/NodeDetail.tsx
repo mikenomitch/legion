@@ -2,6 +2,7 @@ import { useParams } from '@solidjs/router'
 import { AccessGate } from '../../components/AccessGate'
 import { createMemo, createResource } from 'solid-js'
 import NodeDeepView from '../../components/NodeDeepView'
+import { AppPanels } from '../../components/apps/AppSlot'
 import { managerClient } from '../../grpcClient'
 import { retainOnError, usePoll } from '../../utils/polling'
 
@@ -35,14 +36,17 @@ function NodeDetailContent() {
   )
 
   return (
-    <NodeDeepView
-      nodes={nodes}
-      ledger={ledger}
-      onChanged={() => {
-        void refetchNode()
-        void refetchLedger()
-      }}
-    />
+    <div class="space-y-4">
+      <NodeDeepView
+        nodes={nodes}
+        ledger={ledger}
+        onChanged={() => {
+          void refetchNode()
+          void refetchLedger()
+        }}
+      />
+      <AppPanels slot="node" node={nodeId()} />
+    </div>
   )
 }
 

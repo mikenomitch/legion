@@ -161,11 +161,13 @@ fn job() -> JobConfig {
                 params: None,
                 retain_on_scale_in: None,
                 retain_on_stop: None,
+                unknown_fields: Default::default(),
             }),
             envelope: None,
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         network: Some(NetworkConfig {
             ports: vec![PortConfig {
@@ -173,6 +175,8 @@ fn job() -> JobConfig {
                 static_port: None,
                 to: None,
                 tls: None,
+                pending_extensions: Default::default(),
+                unknown_fields: Default::default(),
             }],
             ..Default::default()
         }),
@@ -180,6 +184,7 @@ fn job() -> JobConfig {
             wake: Some(WakeConfig {
                 port: "http".into(),
                 timeout: Some("15s".into()),
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         }),
@@ -192,6 +197,8 @@ fn job() -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -310,6 +317,9 @@ impl Control for InProcess {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_resumes_a_suspended_instance_and_is_answered() -> R<()> {
+    // The instance's port is the first of the dynamic range, which another
+    // test's real cluster may be holding.
+    let _ports = crate::support::DYNAMIC_PORT_GATE.lock().await;
     let cluster = Arc::new(Cluster::new()?);
     cluster.add_node()?;
     cluster.submit(job())?;

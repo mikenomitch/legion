@@ -9,6 +9,19 @@
     # then `<namespace>/<name>` (bare in `default`).
     namespace = "default",
     version = 1,
+    # Jobspec extensions (docs/apps.md, "Jobspec extensions"): keys that
+    # installed apps add at the job, a group (written on one of its tasks),
+    # a task, a volume, a port, or a service. They are commented out here
+    # because each needs its app installed (`legion app extensions` lists
+    # this cluster's keys), and this file must submit on a bare cluster. The
+    # one at the job level, for an app that declares `uptime` on jobs:
+    #
+    #   uptime = { url = "https://maximal.acme.dev/healthz", alert = "#oncall" },
+    #
+    # Every key also has a qualified spelling, `apps.<app>`, that no core
+    # field can ever take:
+    #
+    #   apps = { uptime = { url = "https://maximal.acme.dev/healthz" } },
     # How important this job is, relative to everything else on the cluster
     # (docs/preemption-and-eviction.md). One of, most important first:
     #
@@ -151,6 +164,10 @@
                     retainOnStop = true,
                 },
             },
+            # An extension key on a task, or on its group (written on one
+            # task of the group, applying to the whole group), for an
+            # installed app that declares it (docs/apps.md):
+            #   tier = { level = "gold" },
             # Claims on storage that exists independently of any instance —
             # an operator's host path, an NFS export, scratch space (see
             # docs/volumes.md). Unlike stateful.storage these are shared, are
@@ -165,6 +182,9 @@
                     params = { name = "models" },
                     path = "/models",
                     readOnly = true,
+                    # An extension key on a volume, for an installed app that
+                    # declares `backup` on volumes (docs/apps.md):
+                    #   backup = { schedule = "0 3 * * *", keep = 14 },
                 },
             ],
             config = {
@@ -190,6 +210,9 @@
                     # 8080 inside the task's namespace. Host: dynamic host
                     # port (macOS publishes it to 8080).
                     { name = "http", to = 8080 },
+                    # An extension key on a port, for an installed app that
+                    # declares `dns` on ports:
+                    #   { name = "http", to = 8080, dns = { hostname = "maximal.acme.dev" } },
                     { name = "metrics", static = 9090 },  # fixed host port
                     # TLS the node terminates on this port with a certificate
                     # that is not the mesh's (docs/network-handlers.md, "TLS
@@ -287,6 +310,9 @@
                 # with mesh = true also at the receiving node, against the
                 # verified caller's job (Legion-Denied-By: service/allow).
                 allow = ["gateway", "maximal-demo", "checkout-*/api"],
+                # An extension key on a service, for an installed app that
+                # declares `probe` on services:
+                #   probe = { path = "/healthz" },
             },
             # Services this task dials, each through the node's forwarder,
             # which load-balances across the upstream's healthy endpoints.
@@ -421,13 +447,38 @@
                 {
                     # Reserved control-plane identity: authenticates back to
                     # Legion itself. Omit `audience` — the manager owns it and
-                    # stamps aud = the cluster issuer.
+                    # stamps aud = the cluster issuer. Declaring it also gives
+                    # the allocation a local API socket and ambient env
+                    # (LEGION_ADDR=unix://$LEGION_SECRETS_DIR/legion.sock,
+                    # LEGION_IDENTITY_TOKEN_FILE), so `legion ...` inside the
+                    # task needs no setup. `file` is optional here: without
+                    # it the token is written to
+                    # $LEGION_SECRETS_DIR/legion.token.
                     name = "legion",
                     file = {
                         path = "/var/run/legion/identity/legion/token",
                         mode = "0400",
                     },
                     changeMode = "noop",
+                    # What the job may do as itself: inline ACL rules, in the
+                    # shape `legion acl policy apply` takes. Granted at submit
+                    # only if the submitting token holds every one of them
+                    # (docs/workload-identity.md, "Permissions"); listed and
+                    # revoked with `legion acl grants`.
+                    permissions = [
+                        { resources = ["kv"], actions = ["read"], paths = ["maximal/*"] },
+                        {
+                            resources = ["job"],
+                            actions = ["read"],
+                            namespaces = ["default"],
+                            names = ["maximal-*"],
+                        },
+                    ],
+                    # Names of existing ACL policies to grant as well, under
+                    # the same check. Commented out because a named policy
+                    # must exist when the job is submitted, and this file
+                    # must submit on a bare cluster.
+                    # policies = ["cert-writer"],
                 },
                 {
                     # Injection only: no env or file, because the "billing"
@@ -512,7 +563,7 @@
                     port = "http",  # port label -> resolved to the assigned host port
                     every = "5s",
                     timeout = "2s",
-                    unhealthy_after_count = 1,
+                    unhealthyAfterCount = 1,
                 },
                 {
                     type = "health",
@@ -521,18 +572,18 @@
                     port = "http",  # port label -> resolved to the assigned host port
                     every = "10s",
                     timeout = "2s",
-                    unhealthy_after_count = 1,
+                    unhealthyAfterCount = 1,
                 },
             ],
-            on_unhealthy = {
-                restart_count = 3,
-                restart_period = "30m",
-                restart_delay = "30s",
-                move_count = 3,
-                move_period = "30m",
+            onUnhealthy = {
+                restartCount = 3,
+                restartPeriod = "30m",
+                restartDelay = "30s",
+                moveCount = 3,
+                movePeriod = "30m",
                 # The first reschedule's wait. It doubles for each earlier
-                # move within move_period, capped at 30m.
-                move_delay = "30s",
+                # move within movePeriod, capped at 30m.
+                moveDelay = "30s",
             },
             # What happens when the task PROCESS exits, as opposed to a health
             # check failing (see docs/task-supervision.md). Both paths spend
@@ -543,7 +594,7 @@
                 # service/sidecar, "onFailure" for batch.
                 policy = "always",
                 # Wait before relaunching. Defaults to
-                # on_unhealthy.restart_delay when omitted.
+                # onUnhealthy.restartDelay when omitted.
                 delay = "5s",
                 # Exit codes counted as success. Default [0].
                 successExitCodes = [0],
@@ -1174,6 +1225,12 @@
             name = "container",
             count = 1,
             runtime = "container",
+            # Task autoscaling (docs/autoscaling.md). `true` takes the
+            # effective defaults: the built-ins (min = count, max = 4 x
+            # count, CPU held at 70% of the reservation, fast up, slow down)
+            # as the cluster's scaling defaults and namespace policies
+            # override them. `legion job plan` prints the expansion.
+            autoscale = true,
             config = {
                 image = "alpine:latest",
                 command = ["echo", "hello", "from", "container"],
@@ -1271,7 +1328,7 @@
                 #             members together once they fit;
                 #   "fail"    fails the job and stops every member.
                 # A loss that leaves the quorum running is always replaced
-                # alone. Restarts after a failure spend on_unhealthy's move
+                # alone. Restarts after a failure spend onUnhealthy's move
                 # budget; once it is spent the job fails.
                 onMemberLoss = "restart",
             },
@@ -1293,6 +1350,47 @@
             },
             affinities = {
                 region = "us-west",
+            },
+            # Every autoscale field (docs/autoscaling.md, "The full policy
+            # surface"); each one left out takes its effective default. On a
+            # gang, `min` must hold the quorum (gang.min).
+            autoscale = {
+                min = 4,                # a count, or a multiple of count ("1x")
+                max = "2x",
+                cpu = 0.65,             # hold CPU at 65% of the reservation
+                memory = 0.8,           # and memory at 80%
+                # Explicit checks; the largest desired count wins. `source`
+                # is `legion` (Legion's own measurements) or a source the
+                # operator installed in the autoscaler's app config
+                # (prometheus, http, a plugin: docs/autoscaling.md,
+                # "Sources"); a strategy `name` that is not built in names
+                # an installed strategy plugin.
+                checks = [
+                    {
+                        name = "backlog",
+                        source = "legion",
+                        query = "task.unplaced",
+                        window = "2m",
+                        strategy = { name = "threshold", steps = [{ above = 0, add = 1 }] },
+                        scaleIn = false,  # may push up, never pull down
+                        # With min = 0: above this reading the task wakes
+                        # from zero; at or below it on every activation
+                        # check, it may sleep ("Scale to zero").
+                        activation = 0,
+                    },
+                ],
+                up = { stabilize = "30s", step = { replicas = 2 }, every = "1m" },
+                down = { stabilize = "10m", step = { percent = 10, replicas = 1 }, every = "2m" },
+                headroom = 0,
+                warmup = "45s",
+                tolerance = 0.1,
+                window = "2m",
+                # Raise the floor on weekday mornings, New York time.
+                schedule = [
+                    { cron = "0 8 * * 1-5", for = "10h", min = 6, timezone = "America/New_York" },
+                ],
+                onMissing = "hold",     # hold (default) | ignore
+                mode = "dry-run",       # enforce (default) | dry-run
             },
         },
     ],

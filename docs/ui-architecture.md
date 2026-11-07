@@ -75,6 +75,9 @@ Routes in `App.tsx`:
 - `/raft`, `/events`, `/kv`, `/access`, `/api`, `/state-explorer`,
   `/observability` (shown only when the manager reports o11y enabled),
   `/testing` (unlisted component fixtures, see below)
+- `/apps/:app/:view` (an installed app's page; no index, see
+  [App extensions](#app-extensions)) and `/apps/:app/pages/:page` (an app's
+  sandboxed page, see [Sandboxed pages](#sandboxed-pages))
 - anything else renders a not-found card naming the path
 
 A shared layout provides the grouped sidebar nav, a slim topbar
@@ -242,9 +245,18 @@ the Access page reports it instead.
     the spec count, the override with its source and age, the effective count
     and any pending scale-in. It also has a Desired field with Scale / Reset,
     backed by the same `ScaleTask` RPC as `legion job scale`
-    ([Scaling Jobs](autoscaling.md)). The card is gated by `scale:write`.
+    ([Autoscaling](autoscaling.md)). The card is gated by `scale:write`.
     Keyed stateful tasks are read-only, with the reason in the tooltip. The
     whole card is hidden when `GetJobScaleStatus` is denied.
+  - has a **Request vs usage** card (`components/UsageInputsPanel.tsx`), the
+    `GetScalingInputs` reply `legion job info` prints. Per task, it shows
+    ready/placed replicas with the desired count, an unplaced badge and a
+    rollout badge, measured CPU and memory against the reservation with a
+    utilization meter, requests per second, error ratio, and mean latency
+    into the service the task backs, and the data state (`current` with its
+    age, `missing`, `resyncing`). It is cluster-wide whichever manager the UI
+    talks to, polled with the page, and hidden when `scale:read` is denied
+    ([Scaling inputs](autoscaling.md#scaling-inputs)).
   - marks stateful tasks with a "stateful · slot/keyed" badge (plus storage
     path). For jobs with stateful tasks or live `ListInstances` rows, it
     renders a polled Instances panel (`components/InstancesTable.tsx`: id,
@@ -708,6 +720,113 @@ Two rules keep restricted identities from breaking the app:
 
 All of this is cosmetic. The manager is the only enforcement point.
 
+## App extensions
+
+Installed apps add to the UI without shipping code into it
+([Apps: Views and actions](apps.md#views-and-actions)). An app registers
+**slots** in its manifest, and answers each with a **declarative view**: a
+`legion-view/1` JSON document built from a closed set of blocks, which the
+SPA draws with its own components. No app code runs in the SPA's origin,
+where the operator's token lives.
+
+| Slot | Outlet | Component |
+| --- | --- | --- |
+| `nav` | an item in the sidebar's **Apps** section, opening `/apps/:app/:view` | `pages/AppPage.tsx` |
+| `overview` | a card on the overview, under the stat cards | `AppPanels slot="overview"` |
+| `job` | a panel on the job page, under the scale panel | `AppPanels slot="job"` |
+| `task` | a badge on each task tile of the job page, and a panel on the task page's overview tab | `AppTaskBadges`, `AppPanels slot="task"` |
+| `node` | a panel on the node page | `AppPanels slot="node"` |
+
+The pieces, in `ui/src`:
+
+- `utils/appViews.ts`: the view types, link checks, and the **registry**:
+  `ListUiExtensions` without a context, fetched once per login (and again
+  when the stored token changes). The sidebar and the overview read it.
+- `components/apps/AppSlot.tsx`: the outlets. A job, task, or node outlet
+  asks `ListUiExtensions` again **with the page's context**, which the
+  manager filters by each entry's declared permission as the viewer, so a
+  panel appears only to viewers who may see it there. Each entry then
+  fetches `GetAppView` and re-fetches at the app's `ui.refresh` (at least
+  5 seconds; `usePoll`, so it pauses in a hidden tab). A view the app marks
+  `hidden` draws nothing; a denied one draws nothing in a panel and says so
+  on a page.
+- `components/apps/ViewBlocks.tsx`: the block renderer: stat tiles, an SVG
+  line chart (four lines, a dashed right axis), tables with in-app and
+  external links, a timeline, key-values, notices, markdown, and action
+  buttons.
+- `components/apps/SafeMarkdown.tsx`: a CommonMark subset (headings,
+  paragraphs, lists, quotes, code, emphasis, links) drawn as DOM nodes,
+  never `innerHTML`.
+
+**Links.** An in-app `route` (one leading slash) becomes a router link; an
+`http(s)` `href` opens in a new tab with `noopener noreferrer`; anything
+else renders as text. The manager already refuses other schemes, raw HTML,
+and images; the renderer would not draw them either.
+
+**Actions.** A button names an action the manifest declares. `GetAppView`
+returns each referenced action's title, confirmation (context filled in),
+typed inputs, and whether the viewer holds its permission here: a button the
+viewer may not press is disabled, titled with the permission it needs. A
+`write` action always opens an inline confirmation, with fields for the
+inputs the button does not preset (text, number, duration, a select for an
+enum, a checkbox for a boolean). It runs through `InvokeAppAction` with a
+fresh idempotency key per press. The app's message shows above the view,
+and a view it returns replaces the drawn one; the panel then re-fetches.
+
+The browser never talks to an app: every view and action is a gRPC-Web call
+to the manager, which authorizes as the viewer, forwards with a signed viewer
+assertion, and validates the answer.
+
+The bundled autoscaler's UI is built this way, with no page of its own in
+the SPA: its sidebar page, job panel, task badges, and node-group panel are
+its views ([autoscaling.md, "In the UI"](autoscaling.md#in-the-ui)).
+
+### Sandboxed pages
+
+An app's sandboxed page (tier 2, `ui.pages`;
+[Apps: Sandboxed pages](apps.md#sandboxed-pages)) is the one place app code
+runs in the browser, and it runs outside the SPA's origin.
+
+| Piece | Where |
+| --- | --- |
+| the sidebar item (a `nav` entry with `page` set) and the route `/apps/:app/pages/:page` | `App.tsx`, `pages/AppSandboxPage.tsx` |
+| the frame, the bridge's message handling, and the confirmation dialog | `components/apps/SandboxedPage.tsx` |
+| the CSP, the sandbox flags, the bridge script, and the request helpers | `utils/appBridge.ts` |
+
+- **Fetch.** `GetAppPage` (authorized as the viewer like a view) returns the
+  bundle and the page's RPC allowlist, each RPC marked read or write.
+- **Mount.** `<iframe sandbox="allow-scripts" srcdoc=… referrerpolicy=
+  "no-referrer">`. The `srcdoc` is the bundle with the CSP `<meta>` and the
+  bridge `<script>` inserted first (after a leading doctype):
+  `default-src 'none'; script-src 'unsafe-inline'; style-src
+  'unsafe-inline'; img-src data:; connect-src 'none'; form-action 'none';
+  base-uri 'none'`. The opaque origin keeps the page away from
+  `localStorage`, where the token lives, and from the SPA's DOM.
+- **Bridge.** The page posts `{ legion: "legion-bridge/1", id, op, ... }` to
+  its parent; the SPA answers `{ legion, id, ok, result | error }` and posts
+  `{ legion, event: "theme", theme }` when the theme changes. A message is
+  heard only if its `source` is the page's own frame window and its origin is
+  `"null"` (opaque), and only while the frame holds its first document: the
+  frame's second `load` (the page navigated away) closes the bridge for good.
+  At most 16 calls run at once, and 4 confirmations wait.
+- **Calls.** `call` is refused unless the RPC is in the allowlist and unary,
+  and refused (`invalid_argument`) when the request spells a field both
+  ways (`nodeId` and `node_id`, `aliasedField`), since the decoder would
+  keep only one of them. The request is parsed from proto3 JSON with the generated message type
+  (`Manager.methods`), a write waits for the dialog, and the call goes out
+  through `managerClient` (so it carries the viewer's token) with the
+  `legion-app-page: <app>/<page>` header, which the manager checks against
+  the page's current manifest. The reply goes back as proto3 JSON. `view` and
+  `action` use `GetAppView` and `InvokeAppAction` for the page's own app;
+  every action is confirmed. `navigate` takes in-app routes only.
+- **Confirmation.** A modal the SPA draws over everything, outside the frame,
+  naming the app, the RPC (or action), and the target taken from the
+  **decoded** request (`message.toJson()`: `job`, `name`, `nodeId`, `path`,
+  ...), with that message below, so it names what will be sent. One shows
+  at a time; **Run as me** is disabled for `CONFIRM_ARM_MS` (500 ms) after
+  each appears, and Cancel has the focus, so a double-click cannot approve
+  the next one.
+
 ## Namespaces
 
 [Namespaces](namespaces.md) reach the UI three ways, all in
@@ -867,5 +986,8 @@ without touching the transport.
 - `npm run typecheck`: `tsc --noEmit`. `npm run build` typechecks and
   bundles.
 - `npm run gen`: regenerate `src/gen` from `proto/legion.proto`.
+- `npm run test:smoke` (after `npm run build`): the Playwright smoke tests
+  in `ui/tests/smoke`, against a fake manager in the browser
+  ([Testing: UI smoke tests](testing-and-benchmarks.md#ui-smoke-tests)).
 - CI (`.github/workflows/ci.yml`, job `ui-build`) runs the drift check, the
   typecheck and the build whenever `ui/**` or the proto changes.

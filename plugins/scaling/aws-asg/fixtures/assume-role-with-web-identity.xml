@@ -1,0 +1,21 @@
+<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleWithWebIdentityResult>
+    <SubjectFromWebIdentityToken>legion:legion-system/autoscaler</SubjectFromWebIdentityToken>
+    <Audience>sts.amazonaws.com</Audience>
+    <AssumedRoleUser>
+      <Arn>arn:aws:sts::123456789012:assumed-role/legion-autoscaler/legion-aws-asg</Arn>
+      <AssumedRoleId>AROACLKWSDQRAOEXAMPLE:legion-aws-asg</AssumedRoleId>
+    </AssumedRoleUser>
+    <Credentials>
+      <SessionToken>FwoGZXIvYXdzEXAMPLE</SessionToken>
+      <SecretAccessKey>wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY</SecretAccessKey>
+      <Expiration>2026-10-28T13:00:00Z</Expiration>
+      <AccessKeyId>ASIAEXAMPLEKEYID</AccessKeyId>
+    </Credentials>
+    <SourceIdentity>legion</SourceIdentity>
+    <Provider>https://legion.example.com</Provider>
+  </AssumeRoleWithWebIdentityResult>
+  <ResponseMetadata>
+    <RequestId>ad4156e9-bce1-11e2-82e6-6b6efEXAMPLE</RequestId>
+  </ResponseMetadata>
+</AssumeRoleWithWebIdentityResponse>

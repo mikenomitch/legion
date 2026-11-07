@@ -104,23 +104,67 @@ impl ConstraintSet {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
+
+    /// The first rule that fails on `node`, in words (`region = "eu"`), for
+    /// diagnostics such as `GetCapacityDemand`'s refusals. `distinct` is
+    /// judged as [`Self::is_satisfied`] judges it without a tracker (the
+    /// key must be present). `None` when every rule holds.
+    pub fn unsatisfied_rule(&self, node: &Node) -> Option<String> {
+        self.rules
+            .iter()
+            .find(|rule| !rule.matches(node, None))
+            .map(Rule::describe)
+    }
 }
 
+/// The node config attribute holding the namespaces a node accepts (its
+/// worker type's `namespaces`): a JSON array of names and `*`-globs. Absent
+/// means every namespace. See [`accepts_namespace`].
+pub const NODE_NAMESPACES_ATTR: &str = "namespaces";
+
+/// What a task brings to a node's restrictions: its permit, and the
+/// namespace of its job.
+///
+/// A node restricts who may land on it two ways. Its pool (plus any
+/// `restriction` block) is a taint the task's permit must tolerate. Its
+/// `namespaces` list is a restriction no permit can speak to: only a task
+/// whose job lives in an accepted namespace passes, so a job cannot opt
+/// itself onto a node reserved for another namespace (docs/namespaces.md,
+/// "Nodes that accept only some namespaces").
 #[derive(Debug, Clone, Default)]
 pub struct PermitSet {
     rules: Vec<Rule>,
+    namespace: String,
 }
 
 impl PermitSet {
-    pub fn new(value: &Value) -> R<Self> {
+    /// The permit of a task whose job lives in `namespace`.
+    pub fn new(value: &Value, namespace: &str) -> R<Self> {
         let mut rules = parse_rules(value, false)?;
         if !rules.iter().any(|rule| rule.key == "pool") {
             rules.push(simple_rule("pool", Value::String("default".into())));
         }
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            namespace: namespace.to_string(),
+        })
     }
 
+    /// The namespace this permit's task belongs to.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Whether the task may land on `node`: its permit tolerates the node's
+    /// pool and restrictions, and the node accepts its job's namespace.
     pub fn is_permitted(&self, node: &Node) -> bool {
+        self.permits_restrictions(node) && accepts_namespace(node, &self.namespace)
+    }
+
+    /// [`Self::is_permitted`] without the namespace check: what the permit
+    /// alone says. For the diagnostic that names nodes only the namespace
+    /// restriction turned away.
+    pub fn permits_restrictions(&self, node: &Node) -> bool {
         // A node's restrictions are its pool plus whatever its `restriction`
         // config block declares. Almost no node declares one, and for those
         // the restriction map would hold exactly one entry — so build no map
@@ -183,6 +227,53 @@ impl PermitSet {
             .iter()
             .find(|rule| rule.key == "pool" && rule.operator == Operator::Eq)
             .and_then(|rule| rule.value.as_ref())
+    }
+}
+
+/// [`PermitSet::pool_binding`] straight from a permit, for callers that name
+/// a task's pool but never test a node (blocked-eval keys).
+pub fn permit_pool_binding(permit: &Value) -> Option<Value> {
+    PermitSet::new(permit, "")
+        .ok()
+        .and_then(|permit| permit.pool_binding().cloned())
+}
+
+/// The namespaces `node` accepts, when its worker type restricts them: the
+/// patterns of its [`NODE_NAMESPACES_ATTR`] attribute. `None` for a node
+/// that accepts every namespace (the attribute absent or empty).
+pub fn node_namespaces(node: &Node) -> Option<Vec<&str>> {
+    let patterns: Vec<&str> = match node.config_attrs.as_object()?.get(NODE_NAMESPACES_ATTR)? {
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        Value::String(one) => vec![one.as_str()],
+        _ => return None,
+    };
+    (!patterns.is_empty()).then_some(patterns)
+}
+
+/// Whether `node` accepts jobs from `namespace`. A node without a
+/// `namespaces` list accepts every namespace. A node with one accepts the
+/// namespaces its patterns match under the reserved-prefix rule
+/// ([`crate::structs::acl::namespace_glob_match`]): `["*"]` accepts every
+/// tenant namespace but not `legion-system`, which takes a pattern starting
+/// `legion-`.
+pub fn accepts_namespace(node: &Node, namespace: &str) -> bool {
+    // The common node declares no list: one map lookup, no allocation.
+    let Some(declared) = node
+        .config_attrs
+        .as_object()
+        .and_then(|attrs| attrs.get(NODE_NAMESPACES_ATTR))
+    else {
+        return true;
+    };
+    let matches = |pattern: &Value| {
+        pattern
+            .as_str()
+            .is_some_and(|pattern| crate::structs::acl::namespace_glob_match(pattern, namespace))
+    };
+    match declared {
+        Value::Array(items) if !items.is_empty() => items.iter().any(matches),
+        Value::String(_) => matches(declared),
+        _ => true,
     }
 }
 
@@ -286,6 +377,28 @@ pub fn with_permit_pool(permit: &Value, pool: &str) -> Value {
         }
         _ => serde_json::json!({ "pool": pool }),
     }
+}
+
+/// `permit` with a rule admitting any of `pools` added (`pool matches
+/// ^(a|b)$`). An object-shaped permit becomes the equivalent list, since the
+/// object shorthand only states equality.
+pub fn with_permit_pools(permit: &Value, pools: &[&str]) -> Value {
+    let alternatives: Vec<String> = pools.iter().map(|pool| regex::escape(pool)).collect();
+    let rule = serde_json::json!({
+        "key": "pool",
+        "operator": "matches",
+        "value": format!("^({})$", alternatives.join("|")),
+    });
+    let mut items = match permit {
+        Value::Array(items) => items.clone(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+            .collect(),
+        _ => Vec::new(),
+    };
+    items.push(rule);
+    Value::Array(items)
 }
 
 fn parse_rules(value: &Value, allow_multiplier: bool) -> R<Vec<Rule>> {
@@ -398,6 +511,29 @@ fn parse_operator(value: &Value) -> R<Operator> {
 }
 
 impl Rule {
+    /// The rule as written: `key operator value`.
+    fn describe(&self) -> String {
+        let operator = match self.operator {
+            Operator::Eq => "=",
+            Operator::NotEq => "!=",
+            Operator::Gt => ">",
+            Operator::Gte => ">=",
+            Operator::Lt => "<",
+            Operator::Lte => "<=",
+            Operator::Distinct => "distinct",
+            Operator::Matches => "matches",
+            Operator::VersionMatches => "version_matches",
+            Operator::Contains => "contains",
+            Operator::ContainsAny => "contains_any",
+            Operator::IsSet => "is_set",
+            Operator::IsNotSet => "is_not_set",
+        };
+        match &self.value {
+            Some(value) => format!("{} {operator} {value}", self.key),
+            None => format!("{} {operator}", self.key),
+        }
+    }
+
     fn matches(&self, node: &Node, distinct: Option<&DistinctTracker>) -> bool {
         self.matches_attr(node_attr(node, &self.key), distinct)
     }
@@ -678,7 +814,7 @@ mod tests {
         ];
         let pools = ["default", "gpu", "batch"];
         for permit in &permits {
-            let permit_set = PermitSet::new(permit)?;
+            let permit_set = PermitSet::new(permit, "default")?;
             for pool in pools {
                 let mut bare = make_node(json!({ "tier": "web" }));
                 bare.pool = pool.into();
@@ -716,5 +852,47 @@ mod tests {
         assert!(score > -1.0);
 
         Ok(())
+    }
+
+    /// A namespace-restricted node turns away other namespaces whatever the
+    /// permit says: the restriction is the node's, and a job cannot opt in.
+    #[test]
+    fn namespace_restricted_nodes_refuse_other_namespaces_regardless_of_permit() -> R<()> {
+        let mut system = make_node(json!({ "namespaces": ["legion-system"] }));
+        system.pool = "legion-system".into();
+        let permits_pool = json!({ "pool": "legion-system" });
+        assert!(PermitSet::new(&permits_pool, "legion-system")?.is_permitted(&system));
+        let tenant = PermitSet::new(&permits_pool, "default")?;
+        assert!(
+            tenant.permits_restrictions(&system),
+            "the pool alone admits it"
+        );
+        assert!(!tenant.is_permitted(&system), "the namespace does not");
+        // A job in legion-system still needs a permit for the node's pool.
+        assert!(!PermitSet::new(&json!({}), "legion-system")?.is_permitted(&system));
+
+        // An unrestricted node accepts every namespace, legion-system too.
+        let open = make_node(json!({}));
+        assert!(PermitSet::new(&json!({}), "legion-system")?.is_permitted(&open));
+        assert!(accepts_namespace(&open, "payments"));
+        assert_eq!(node_namespaces(&open), None);
+        Ok(())
+    }
+
+    /// Node-side lists follow the reserved rule: `["*"]` accepts every
+    /// tenant namespace but not `legion-system`.
+    #[test]
+    fn star_node_lists_do_not_accept_reserved_namespaces() {
+        let star = make_node(json!({ "namespaces": ["*"] }));
+        assert!(accepts_namespace(&star, "default"));
+        assert!(accepts_namespace(&star, "payments-prod"));
+        assert!(!accepts_namespace(&star, "legion-system"));
+        let both = make_node(json!({ "namespaces": ["*", "legion-*"] }));
+        assert!(accepts_namespace(&both, "legion-system"));
+        assert!(accepts_namespace(&both, "default"));
+        let ci = make_node(json!({ "namespaces": ["ci-*"] }));
+        assert!(accepts_namespace(&ci, "ci-main"));
+        assert!(!accepts_namespace(&ci, "default"));
+        assert_eq!(node_namespaces(&ci), Some(vec!["ci-*"]));
     }
 }

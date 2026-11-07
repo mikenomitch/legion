@@ -14,6 +14,13 @@ This page lists the conventions used across the Legion codebase.
   descriptions, guest memory, the WASI preview1 shim, and module fetching.
   An embedder (the datapath's proxy-wasm host in `src/worker/netd/plugins/`)
   brings its own ABI on top.
+- Apps ([apps.md](apps.md)) are split by side: the manifest, record,
+  render, and build-marker logic are pure functions in
+  `src/structs/app.rs`; the records in `src/storage/app_store.rs`; the
+  reconciler in `src/manager/apps.rs` and the RPCs in
+  `src/manager/server/app_rpcs.rs`; the bundled manifests and the in-task
+  framework behind `legion app run` in `src/apps/` (a bundled app is one
+  entry in `apps::BUNDLED`).
 - Plugin crates live under `plugins/<kind>/<name>/`.
 
 ## Naming and Style

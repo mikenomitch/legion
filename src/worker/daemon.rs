@@ -187,6 +187,9 @@ struct RegistrationPayload {
     /// Worker capabilities advertised at registration
     /// (`WorkerRegisterRequest.capabilities`).
     capabilities: Vec<String>,
+    /// Per-host attributes from `--attr`
+    /// (`WorkerRegisterRequest.join_attributes`).
+    join_attributes: HashMap<String, String>,
 }
 
 /// What this worker advertises at registration: it always takes
@@ -233,6 +236,48 @@ pub struct WorkerJoin {
     /// stops and returns rather than exiting the process under the
     /// manager's own drain.
     pub in_process: bool,
+    /// What the manager imposes on its in-process worker over its worker
+    /// type's stored config. `None` for every standalone worker.
+    pub local: Option<LocalWorkerSettings>,
+    /// Per-host node attributes from `--attr k=v`, sent with every
+    /// registration (`WorkerRegisterRequest.join_attributes`).
+    pub join_attributes: HashMap<String, String>,
+}
+
+/// What a manager imposes on its in-process worker over the config its
+/// worker type stores: the system worker's namespaces, lend, cgroup parent
+/// and port (docs/architecture-managers-workers.md, "The system worker"),
+/// or `--run-worker`'s wider namespaces. Worker types are cluster-wide and
+/// these are each manager's own, so they ride here rather than in the
+/// stored type.
+#[derive(Debug, Clone, Default)]
+pub struct LocalWorkerSettings {
+    /// Replaces the type's `namespaces`.
+    pub namespaces: Option<Vec<String>>,
+    /// Added to the type's `attributes` (`legion.role = "manager"`).
+    pub attributes: HashMap<String, String>,
+    /// The lend: advertised as the node's whole capacity (the `capacity`
+    /// attribute), and, where the node enforces, written as its cgroup
+    /// parent's `cpu.max` and `memory.max`.
+    pub lend: Option<crate::structs::SystemWorkerResources>,
+    /// Replaces the type's `resourceEnforcement.cgroupParent`, so the
+    /// worker's allocations, and the ceiling above them, live apart from a
+    /// standalone worker's on the same host.
+    pub cgroup_parent: Option<String>,
+    /// The worker plane port, instead of `LEGION_WORKER_PORT` or 4848.
+    pub port: Option<u16>,
+}
+
+impl LocalWorkerSettings {
+    /// Apply the settings that live in the pre-registration config.
+    fn apply_to(&self, config: &mut WorkerConfig) {
+        if let Some(namespaces) = &self.namespaces {
+            config.namespaces = namespaces.clone();
+        }
+        for (key, value) in &self.attributes {
+            config.attributes.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 #[instrument(err, skip_all)]
@@ -240,6 +285,7 @@ pub async fn run_worker(
     token: &str,
     name_override: Option<&str>,
     advertise_addr: Option<&str>,
+    join_attributes: HashMap<String, String>,
 ) -> R<()> {
     let join_token = JoinToken::decode(token)?;
     info!(worker_type = %join_token.worker_type, "Decoded join token");
@@ -251,6 +297,8 @@ pub async fn run_worker(
             ca_pin: Some(join_token.ca_hash),
             advertise_addr: advertise_addr.map(str::to_string),
             in_process: false,
+            local: None,
+            join_attributes,
         },
         name_override,
     )
@@ -285,8 +333,14 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         ca_pin,
         advertise_addr,
         in_process,
+        local,
+        join_attributes,
     } = join;
-    let server_port = worker_server_port();
+    let server_port = local
+        .as_ref()
+        .and_then(|local| local.port)
+        .map(u64::from)
+        .unwrap_or_else(worker_server_port);
     let bind = crate::worker::plane::bind_address(server_port)?;
     let advertised = crate::worker::plane::advertise_address(
         &manager_addr,
@@ -354,7 +408,10 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // cluster). Heartbeats keep it current.
     crate::worker::boot_ticket::cluster_issuer()
         .learn(&pre_register_reply.workload_identity_issuer);
-    let config = pre_register_reply.config.context("No config found")?;
+    let mut config = pre_register_reply.config.context("No config found")?;
+    if let Some(local) = &local {
+        local.apply_to(&mut config);
+    }
 
     let name = resolve_worker_name(name_override, config.name_prefix.clone())?;
     let state_path = WorkerStateStore::path_for_worker(&name);
@@ -450,8 +507,11 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // Task runtimes run in-process as dylibs and take no config of their own,
     // so cross-cutting worker settings reach them through the environment —
     // the same channel `sandbox` uses for LEGION_SANDBOX_KERNEL.
-    let enforcement_config =
-        usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
+    let mut enforcement_config = parse_resource_enforcement(&config.resource_enforcement);
+    if let Some(parent) = local.as_ref().and_then(|local| local.cgroup_parent.clone()) {
+        enforcement_config.cgroup_parent = parent;
+    }
+    let enforcement_config = usable_resource_enforcement(enforcement_config);
     apply_resource_enforcement_env(&enforcement_config);
     // The kernel classifier (mesh interfaces plan §6.A) where the node can
     // run it: the host guard, host-mode egress chains, and DNS capture, in
@@ -508,6 +568,9 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         // set, so enforcement never turned on. The governor logs whether it
         // really enforces (and why not, when it cannot).
         manager.configure_resource_enforcement(&enforcement_config);
+        if let Some(lend) = local.as_ref().and_then(|local| local.lend) {
+            cap_to_lend(&mut manager, lend, &enforcement_config.cgroup_parent);
+        }
         manager.load_builtin_plugins();
         manager.configure_volumes(&name, host_volumes);
         // Before `configure_artifacts`, which hands the store to the stager.
@@ -530,12 +593,32 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         })
     };
     // Workload-identity delivery/refresh: tokens are requested from the
-    // manager under this worker's node id.
-    let identity_manager = Arc::new(WorkerIdentityManager::new(Arc::new(ManagerTokenIssuer {
-        client: client.clone(),
-        node_id: name.clone(),
-        credentials: credentials.clone(),
-    })));
+    // manager under this worker's node id. Allocations that declare the
+    // `legion` identity also get an API socket proxied over the same
+    // manager channel (docs/workload-identity.md, "The API socket"). Its
+    // peer check uses cgroup leaves where every task is guaranteed one: the
+    // resource governor enforces, or the kernel host guard runs.
+    let leaves_guaranteed = task_manager
+        .lock()
+        .expect("task manager")
+        .resource_enforcement_enabled()
+        || kernel_guard == crate::worker::netd::kernel_guard::Availability::Active;
+    let api_sockets = crate::worker::api_socket::ApiSocketContext {
+        channel: managers.channel(),
+        managers: Some(managers.clone()),
+        peer_check: crate::worker::api_socket::PeerCheck::for_node(
+            leaves_guaranteed,
+            &enforcement_config.cgroup_parent,
+        ),
+    };
+    let identity_manager = Arc::new(
+        WorkerIdentityManager::new(Arc::new(ManagerTokenIssuer {
+            client: client.clone(),
+            node_id: name.clone(),
+            credentials: credentials.clone(),
+        }))
+        .with_api_sockets(api_sockets),
+    );
     for (allocation, task) in restored_allocations {
         // Restored allocations were issued tokens by a previous worker
         // process; seed their refresh loops with an already-expired token so
@@ -546,13 +629,16 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             let delivery_base = task_manager
                 .lock()
                 .expect("task manager")
-                .file_delivery_base(allocation.id, &task.name, &task.runtime)
-                .map(
-                    |(in_task_root, host_task_dir)| crate::worker::identity::FileDeliveryBase {
-                        in_task_root,
-                        host_task_dir,
-                    },
-                );
+                .file_delivery_base(allocation.id, &task.name, &task.runtime);
+            // The previous process's socket died with it; serve a new one
+            // at the same path, which its first re-issue gives a token.
+            if task
+                .identities
+                .iter()
+                .any(|identity| identity.is_control_plane())
+            {
+                identity_manager.serve_api_socket(allocation.id, delivery_base.as_ref(), None);
+            }
             let prepared = task
                 .identities
                 .iter()
@@ -668,6 +754,22 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     for (key, value) in config.attributes {
         config_attrs.insert(key, Value::String(value));
     }
+    // The namespaces this node accepts: the scheduler refuses every other
+    // namespace's jobs here, whatever their permit says.
+    if !config.namespaces.is_empty() {
+        config_attrs.insert(
+            crate::constraints::NODE_NAMESPACES_ATTR.into(),
+            json!(config.namespaces),
+        );
+    }
+    // A system worker offers its manager's lend, not the host. No `cores`:
+    // the lend is a share of the host's CPUs, not whole ones to pin.
+    if let Some(lend) = local.as_ref().and_then(|local| local.lend) {
+        config_attrs.insert(
+            crate::resources::CAPACITY_ATTR.into(),
+            json!({ "cpu": lend.cpu, "memory": lend.memory, "cores": 0 }),
+        );
+    }
     let resources = serde_json::from_str(&config.resources).unwrap_or_else(|_| json!({}));
     let reserved_resources =
         serde_json::from_str(&config.reserved_resources).unwrap_or_else(|_| json!({}));
@@ -747,7 +849,15 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 .is_some(),
             edge_boot_config.accept_claims,
         ),
+        join_attributes,
     };
+    // The build id hashes this executable (hundreds of MB for a debug
+    // build): computed once, off the runtime, before the first registration
+    // reports it.
+    let build_id = tokio::task::spawn_blocking(crate::util::build_id)
+        .await
+        .unwrap_or("unknown");
+    debug!(build_id, "Computed this worker's build id");
     let reported_managers = register_self(client.clone(), &registration, &credentials).await?;
     managers.learn(&reported_managers);
     info!(worker_name = %name, "Worker registered with manager");
@@ -1293,7 +1403,7 @@ fn build_jwks_verifier(
     if issuer.get().is_empty() {
         warn!(
             "The manager reported no workload-identity issuer (is workloadIdentity.enabled \
-             false?); boot, session, and exec tickets are refused until one does"
+             set to false?); boot, session, and exec tickets are refused until one does"
         );
     }
     // The JWKS rides the same pinned TLS as every other manager call: keys
@@ -1432,7 +1542,9 @@ fn open_kernel_classifier(
     match KernelNet::open(KernelSettings {
         cgroup_root: root.to_path_buf(),
         cgroup_parent: cgroup_parent.to_string(),
-        pin_dir: bpffs.then(|| std::path::PathBuf::from("/sys/fs/bpf/legion")),
+        // Named after the cgroup parent, so a manager's system worker and a
+        // standalone worker on one host keep separate pins.
+        pin_dir: bpffs.then(|| crate::worker::netd::kernel_guard::bpf_pin_dir(cgroup_parent)),
     }) {
         Ok(net) => {
             info!("Kernel classifier active: host-mode egress chains are enforced at connect()");
@@ -1653,6 +1765,37 @@ fn parse_resource_enforcement(raw: &str) -> crate::structs::WorkerResourceEnforc
             warn!(error = ?err, "Invalid worker resourceEnforcement config; using the defaults");
             crate::structs::WorkerResourceEnforcementConfig::default()
         }
+    }
+}
+
+/// Cap a manager's system worker at the manager's lend, on its cgroup
+/// parent, and say what happened: the ceiling the kernel now holds it to,
+/// or that the lend is only the capacity it advertises (macOS, no cgroup
+/// v2, enforcement off or refused).
+fn cap_to_lend(
+    manager: &mut WorkerTaskManager,
+    lend: crate::structs::SystemWorkerResources,
+    cgroup_parent: &str,
+) {
+    let limits = crate::worker::resources::ParentLimits {
+        cpu_mhz: lend.cpu,
+        memory_mib: lend.memory,
+    };
+    match manager.cap_cgroup_parent(limits) {
+        Ok((cpu_max, memory_max)) => info!(
+            cgroup_parent,
+            cpu_max = %cpu_max,
+            memory_max = %memory_max,
+            "System worker capped at the manager's lend: its allocations together use at most \
+             this much of the host"
+        ),
+        Err(err) => warn!(
+            reason = %format!("{err:#}"),
+            cpu_mhz = lend.cpu,
+            memory_mib = lend.memory,
+            "System worker's lend is advertised capacity only: the scheduler places no more \
+             than it here, but nothing in the kernel caps what its allocations use"
+        ),
     }
 }
 
@@ -2862,13 +3005,20 @@ async fn heartbeat_tick(
                     allocation.allocation_id,
                     &allocation.task_name,
                     &allocation.task_runtime,
-                )
-                .map(
-                    |(in_task_root, host_task_dir)| crate::worker::identity::FileDeliveryBase {
-                        in_task_root,
-                        host_task_dir,
-                    },
                 );
+            // An app's config file is named relative to its task
+            // directory; the task gets the path in its own view.
+            if let Err(err) = crate::worker::identity::resolve_app_config_env(
+                &mut allocation.task_config,
+                delivery_base.as_ref(),
+            ) {
+                failed_prepare.push(allocation.allocation_id);
+                task_manager
+                    .lock()
+                    .expect("task manager")
+                    .record_failure(allocation.allocation_id, format!("{err:#}"));
+                continue;
+            }
             match identity_manager
                 .prepare_task_allocation(allocation, delivery_base)
                 .await
@@ -3100,7 +3250,9 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
             (running, (base, task_dir))
         };
         let (delivery, task_dir) = base;
-        let (in_task_root, host_task_dir) = delivery.unwrap_or((None, task_dir));
+        let (in_task_root, host_task_dir) = delivery
+            .map(|base| (base.in_task_root, base.host_task_dir))
+            .unwrap_or((None, task_dir));
         let mut env: std::collections::BTreeMap<String, String> = network
             .as_ref()
             .map(|n| n.env_pairs().into_iter().collect())
@@ -3651,6 +3803,8 @@ async fn register_self(
         build_version: build_version.to_string(),
         protocol_version: PROTOCOL_VERSION,
         capabilities: registration.capabilities.clone(),
+        build_id: crate::util::build_id().to_string(),
+        join_attributes: registration.join_attributes.clone(),
     };
 
     let response = if credentials.has_node_token() {
@@ -3957,6 +4111,7 @@ mod tests {
                 fingerprint_attrs: "{}".into(),
                 health_checks: "[]".into(),
                 capabilities: worker_capabilities(false, false),
+                join_attributes: HashMap::new(),
             },
             Arc::new(Netd::new(
                 Arc::new(UpstreamForwarder::new()),
@@ -4041,6 +4196,7 @@ mod tests {
             fingerprint_attrs: "{}".into(),
             health_checks: "[]".into(),
             capabilities: Vec::new(),
+            join_attributes: HashMap::new(),
         };
 
         // First join: the join token mints a node token, persisted at once.
@@ -4267,6 +4423,8 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,

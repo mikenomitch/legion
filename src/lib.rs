@@ -7,7 +7,9 @@
 // `double_must_use` flags on Rust 1.99+. The attribute comes from the macro.
 #![allow(clippy::double_must_use)]
 
+pub mod apps;
 pub mod artifacts;
+pub mod autoscaler;
 pub mod certs;
 pub mod checkpoint_chunks;
 pub mod checkpoint_seal;
