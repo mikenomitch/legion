@@ -2125,19 +2125,47 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       while network plugins keep wasmi, calls entries 1 and 4). Phase 0
       (measurements on the AWS rig) comes first. The embedding layer in
       [`src/wasm/`](../src/wasm/mod.rs) stays the plugins'.
-- [ ] **Child sessions** ([plan](plans/child-sessions-plan.md) ·
-      [calls](calls/child-sessions-plan_calls.md), PLANNED 2026-10-28): a
-      session that starts and owns sessions of a sibling task
-      (`stateful.children`), with no credential, ended with its parent,
-      charged to its own envelope, attributed by `parent_id`, and reached
-      through its parent (the front-door rule). The isolate runtime's burst
-      (its Phase 5) needs Phase 1.
+- [ ] **Child sessions and ownership** ([plan](plans/child-sessions-plan.md) ·
+      [calls](calls/child-sessions-plan_calls.md), PLANNED; ownership
+      generalized 2026-11-07): a unit that owns sessions or keyed instances
+      of a sibling task (top-level `children`), with no credential, ended
+      with its owner's terminal state, charged to its own envelope, and
+      reached through its owner (the front-door rule). The owner reference
+      is typed and stored with the child, so session, instance, and
+      allocation owners share one model; promotion carries ownership. The
+      isolate runtime's burst (its Phase 5) needs Phase 1. Until Phase 2,
+      promoting a session that owns children is refused.
 - [ ] **Resize: in-place vertical scaling for every unit**
       ([plan](plans/resize-plan.md) · [calls](calls/resize-plan_calls.md),
       PLANNED 2026-10-28): change a running allocation's, session's, or
       isolate's `memory`, `memoryMax`, or `cpu` as an override over the spec,
       node-local inside an envelope, one compare-and-set otherwise. The
       actuator for the autoscaler's deferred vertical strategies.
+- [ ] **Session runs** ([plan](plans/session-runs-plan.md) ·
+      [calls](calls/session-runs-plan_calls.md), PLANNED 2026-11-07):
+      `legion session run` / `RunSession`, one call that runs once in a
+      fresh single-use session of any session task and returns its output;
+      replaces start-exec-stop wrappers and the isolate plan's `RunIsolate`.
+- [ ] **Derived content** ([plan](plans/derived-content-plan.md) ·
+      [calls](calls/derived-content-plan_calls.md), PLANNED 2026-11-07): a
+      `derived` class of the node content store for root disk bases,
+      compiled Wasm, pre-initialized images, and prepared-VM base snapshots.
+      Phase 1 moves `rootfs_cache.rs` onto it and replaces
+      `LEGION_SANDBOX_ROOTFS_CACHE` with `content.budgets.derived`.
+- [ ] **Runtime disable** ([plan](plans/runtime-disable-plan.md) ·
+      [calls](calls/runtime-disable-plan_calls.md), PLANNED 2026-11-07): a
+      cluster-wide switch that refuses new starts of a runtime, for the
+      next runc, VMM, or wasmtime escape.
+- [ ] **Idle-time reclaim for every runtime.** The memory pressure
+      response's `reclaim` step gives memory back only under pressure. The
+      isolate plan (§6.7) calls the same runtime hook when an isolate goes
+      idle; `exec`, `container` (`memory.reclaim`), and `sandbox` (the
+      balloon) could adopt the idle trigger through that hook. Not planned.
+- [ ] **A restore-hygiene conformance test**
+      (`tests/integration/restore_hygiene.rs`): two units made from one
+      snapshot (a VM fork, a prepared VM, an isolate from a pre-initialized
+      image) never share RNG output, identity tokens, or instance ids.
+      Planned in the isolate plan §12; the VM cases can land before it.
 - [ ] A **`converge`** runtime — idempotent host resources (package, file,
       template, directory, user, service, mount) with per-resource
       `unchanged | changed | failed` reporting, i.e. the Chef-replacement shape —

@@ -5,10 +5,11 @@ Decisions made while designing
 **Entries are ordered by project impact, highest first, and an entry's
 number is its rank.** These are design-time calls; implementation inserts
 its own at their rank. The research behind them (2026-10-28) is cited in
-the plan's §2 and §6. Entries 5 and 15 revise the first draft after review
-the same day, and say what they replaced; entries 6 and 7 rest on the
-companion plans' calls, [child sessions](child-sessions-plan_calls.md) and
-[resize](resize-plan_calls.md).
+the plan's §2 and §6. Entries 5 and 17 revise the first draft after review
+the same day, and entry 8 records what moved into shared plans on
+2026-11-07; each says what it replaced. Entries 6 to 8 rest on the
+companion plans' calls: [child sessions](child-sessions-plan_calls.md),
+[resize](resize-plan_calls.md), and [session runs](session-runs-plan_calls.md).
 
 ## 1. The engine is wasmtime; JS and Python run as interpreters inside Wasm, not on V8
 
@@ -40,7 +41,7 @@ if the trigger below is met.
 **Why (performance at the density end, simplicity, security).**
 - **Start:** 5 µs to a fresh Wasm instance against 0.7 to 5 ms for a V8
   isolate from a snapshot. That is what makes an instance per request
-  affordable, and so what makes the safe lifetime the default (entry 12).
+  affordable, and so what makes the safe lifetime the default (entry 14).
 - **Density:** an idle instance costs only the pages it wrote; a V8
   isolate's floor is megabytes before user code, and V8's 4 GB shared cage
   caps the process. Lifting the cage (IsolateGroups) is unsupported
@@ -126,9 +127,9 @@ $ legion isolate stats code-runner -j
   sessions, so `instance list` shows them.
 
 **Trade-off.** No cluster-wide list of isolates (their child VMs are sandbox
-sessions and are listed like any, with `parent_id`); `legion isolate get <id>`
+sessions and are listed like any, with their owner reference); `legion isolate get <id>`
 asks the node the id names. A node that dies loses its `local` sessions'
-hibernation files, as for any `local` session.
+checkpoints, as for any `local` session.
 
 **Why (simplicity, performance).** Session mode was built for "a tool
 execution ... or a function invocation" and already has envelopes, routing
@@ -177,7 +178,7 @@ mitigation for an engine CVE) wants the host upgradeable on its own.
 
 ## 5. One run, one place: the tier is chosen before a run starts, and Legion never re-runs one (revised)
 
-**Call.** Every run happens in exactly one place. `RunIsolate.tier` is
+**Call.** Every run happens in exactly one place. A session run's `tier` is
 `isolate`, `vm`, or `auto` (the default), and `auto` decides *before*
 anything runs, from a pre-flight import check and a per-node memo of code
 that needed a VM; a caller that kept a previous reply's `nextTier` asks
@@ -187,7 +188,7 @@ unsupported call or a limit stays stopped; its reply carries `nextTier =
 reply says `ranTwice`.
 
 ```console
-$ legion isolate run code-runner --file transcode.py -j
+$ legion session run code-runner --task run --file transcode.py -j
 {"ok":true,"data":{"tier":"isolate","stopped":{"reason":"unsupported",
  "detail":"subprocess.run: processes are not available in an isolate", ...},"nextTier":"vm", ...}}
 ```
@@ -219,15 +220,15 @@ who knows whether the code is safe to run twice, makes it.
 ## 6. Burst is composed from child sessions and a declared VM task, not from burst machinery or vertical scaling
 
 **Call.** The VM is an ordinary sibling session task the job declares
-(`runtime = "sandbox"`), listed in `stateful.children`. A VM run takes a
-single-use session of it; an isolate that wants to drive a machine starts
+(`runtime = "sandbox"`), listed in the isolate task's `children`. A VM run is a
+session run on it; an isolate that wants to drive a machine starts
 one as a [child session](child-sessions-plan_calls.md) with `vm.acquire()`.
 Growing either is a [resize](resize-plan_calls.md). Nothing is generated,
 and there is no `burst` block.
 
 ```nickel
 config = { image = "python", vm = { task = "machine" } },
-stateful = { mode = "session", envelope = { ... }, children = { tasks = ["machine"] } },
+children = { tasks = ["machine"] },
 ```
 
 **Alternatives.** (a) The first draft: a `burst` block from which submit
@@ -262,14 +263,55 @@ the memory across nodes. Bulk streams get connection handoff later
 (tens of microseconds), and a network hop when the VM is on another node.
 
 **Why (simplicity).** The full argument is
-[child-sessions calls entry 3](child-sessions-plan_calls.md#3-the-parents-id-is-the-only-address-children-are-reached-through-it):
+[child-sessions calls entry 4](child-sessions-plan_calls.md#4-the-owners-id-is-the-only-address-children-are-reached-through-it):
 re-pointing needs a mutable mapping, two kinds of address, an in-flight
 window, and a VM's wake time on every request, while the isolate costs
 almost nothing to keep in front.
 
 ---
 
-## 8. Waiting holds nothing: a host-driven event loop on the stackless callback ABI, fibers as the fallback
+## 8. What is not isolate-specific is planned as shared primitives (revised)
+
+*Revised 2026-11-07.*
+
+**Call.** Six things the first draft built inside the isolate runtime now
+live in plans of their own, usable by every runtime, and the isolate plan
+uses them:
+
+| Was in the isolate plan | Now |
+| --- | --- |
+| `RunIsolate`, a one-shot run with a structured reply | `RunSession` ([session-runs plan](../plans/session-runs-plan.md)) on any session task; the isolate adds `tier` |
+| `legion operator isolate disable` | `legion operator runtime disable <runtime>` ([runtime-disable plan](../plans/runtime-disable-plan.md)) |
+| A compiled-module cache and pre-initialization caches | the node content store's `derived` class ([derived-content plan](../plans/derived-content-plan.md)), with the root disk cache |
+| Hibernation files under `<state>/isolates/` with their own budget | session checkpoints in the node content store, as for any suspended session |
+| A new "hibernate isolates" memory-pressure step | the pressure response's existing `reclaim` and `suspend` steps, through a runtime reclaim hook |
+| The isolate host's own channel to the worker | the apps plan's workload channel, with one attribution rule |
+
+The stopped-run rule (a run stopped by a limit is data, not an error) was
+this doc's entry 19; it moved with runs and is
+[session-runs calls entry 4](session-runs-plan_calls.md#4-a-stopped-run-is-data-error-envelopes-are-for-runs-that-never-ran).
+
+**Alternatives.** (a) Keep them isolate-specific until a second runtime
+asks. (b) Generalize more: the shard executor, cordons, and per-session
+reporting as jobspec knobs.
+
+**Trade-off.** More plans to keep in step, and the isolate plan depends on
+four of them before its later phases ship.
+
+**Why (simplicity, extensibility).** Each of the six already had a second
+user or a near-duplicate in the code: sandbox users write
+start-exec-stop wrappers; runc and VMM CVEs need the same kill switch;
+`rootfs_cache.rs` is a derived-content cache; sessions already checkpoint
+into the content store; the pressure response already reclaims; and the
+apps plan already designs the socket. Building them twice is the expensive
+path. Against (b): the shard executor, cordons, and an `aggregate`
+reporting knob have no second user, so they stay inside the isolate
+runtime (the reporting level is a runtime property, not a jobspec field)
+until one appears.
+
+---
+
+## 9. Waiting holds nothing: a host-driven event loop on the stackless callback ABI, fibers as the fallback
 
 **Call.** The host drives each guest's event loop. Guests on the WASI 0.3
 Component Model async callback ABI run a turn, return to the host when
@@ -287,19 +329,46 @@ pooled).
 stack in `component-model-async` was fixed on 2026-10-02
 ([CVE-2026-115384](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-32h6-97mm-8q3c)).
 The compiler process validating every component with the newest
-`wasmparser` (entry 11) is the published mitigation and is applied to all
+`wasmparser` (entry 13) is the published mitigation and is applied to all
 modules. Two async paths to test and support.
 
 **Why (performance at density).** With fibers, an isolate awaiting a 20 s
 LLM call pins a slot and a stack, and 10^5 suspended fibers are about 12.5
 GiB of stack address space. With callbacks the isolate is data between
-turns, which is also what lets it hibernate *while it waits* (entry 13).
+turns, which is also what lets it hibernate *while it waits* (entry 15).
 (b) is a Phase 3 proposal with no tiered wasmtime support; (c) costs code
 size and speed on every call.
 
 ---
 
-## 9. A new runtime, `isolate`, that bursts to `sandbox`, not a mode of the `sandbox` runtime
+## 10. Isolate sessions are never promoted to keyed instances
+
+**Call.** `legion instance promote` on an isolate session answers
+`FAILED_PRECONDITION`. A durable, named isolate uses what session
+durability already gives: an id derived from an idempotency key, and
+`suspend.durability = "store"`, which publishes its checkpoints with a
+manifest so it survives its node.
+
+```text
+FAILED_PRECONDITION: isolate sessions cannot be promoted (a keyed instance is an allocation each); give the session a stable id with an idempotency key and use suspend.durability = "store" to keep it across nodes
+```
+
+**Alternatives.** Allow promotion as for other sessions, making the isolate
+a keyed instance with an allocation and a raft row.
+
+**Trade-off.** No `instance list`, raft-backed rename, or keyed guarantees
+for isolates; a platform that wants those for an agent runs it on a
+`sandbox` or `exec` task.
+
+**Why (performance).** A keyed instance is an allocation each, placed by
+the scheduler lane, which would turn an isolate's microsecond start into a
+raft write and undo the density the tier exists for. Session durability
+gives the property callers usually want from promotion (a stable id that
+survives the node) without either.
+
+---
+
+## 11. A new runtime, `isolate`, that bursts to `sandbox`, not a mode of the `sandbox` runtime
 
 **Call.** The request was "a sandbox runtime with two modes". The plan
 ships it as two runtimes that act as one product: `runtime = "isolate"`,
@@ -327,7 +396,7 @@ reverse.
 
 ---
 
-## 10. Slots use guard pages by default; MPK striping is Phase 6; the layout belongs to the cordon, not the job
+## 12. Slots use guard pages by default; MPK striping is Phase 6; the layout belongs to the cordon, not the job
 
 **Call.** The pooling allocator uses wasmtime's default guard-page layout
 (about 16,000 to 32,000 slots per process); a cordon that needs more runs
@@ -358,7 +427,7 @@ not a per-job dial nobody can audit.
 
 ---
 
-## 11. Code is compiled by a node-local compiler process with Cranelift only, x86-64 first; user `.cwasm` is never loaded
+## 13. Code is compiled by a node-local compiler process with Cranelift only, x86-64 first; user `.cwasm` is never loaded
 
 **Call.** `legion-isolate compile` runs as a short-lived, confined process
 on the node and writes artifacts into the local content store, keyed by
@@ -385,7 +454,7 @@ aarch64 had both April 2026 critical escapes and no continuous fuzzing.
 
 ---
 
-## 12. The default lifetime is one instance per request
+## 14. The default lifetime is one instance per request
 
 **Call.** `lifetime = "request"` by default: a fresh instance per
 invocation, destroyed after. `"tenant"` (reused per tenant key while warm)
@@ -406,11 +475,12 @@ instance the safe default costs almost nothing.
 
 ---
 
-## 13. Idle memory leaves in four tiers, and hibernation happens at turn boundaries
+## 15. Idle memory leaves in four tiers, and hibernation happens at turn boundaries
 
 **Call.** Hot, then paged out (`MADV_PAGEOUT` to zswap/zram/swap) after
 `pageOutAfter`, then hibernated (private pages diffed against the image,
-plus host-side state, compressed to a file; slot freed) after
+plus host-side state, compressed into a session checkpoint in the node
+content store; slot freed) after
 `suspend.idle.after` or under slot or memory pressure, then evicted or
 published per `suspend.keepFor` and `durability`. Host-held sockets stay
 open across hibernation.
@@ -420,17 +490,18 @@ next request start fresh.
 
 **Trade-off.** The paged-out tier depends on the node having compressed
 swap or swap; without it, `MADV_PAGEOUT` does nothing for anonymous memory
-and the tier collapses into hot. Hibernation files cost disk.
+and the tier collapses into hot. Checkpoints cost disk, from the
+`snapshots` budget.
 
 **Why (performance at density).** Eviction is fine for stateless
 handlers, which already get `request` lifetime. For a million resident
 agents it throws away exactly the state the platform persona wants kept.
 Reusing session sleep's vocabulary (`idle.after`, `keepFor`, `durability`)
-keeps one model for both tiers.
+and its checkpoints keeps one model for both tiers (entry 8).
 
 ---
 
-## 14. Preemption by epoch, yielding at the end of a slice; fuel only on request
+## 16. Preemption by epoch, yielding at the end of a slice; fuel only on request
 
 **Call.** A ticker advances the engine epoch every millisecond; a turn
 that exceeds its 5 ms slice yields to its shard instead of trapping, and
@@ -449,7 +520,7 @@ tenant from starving a shard.
 
 ---
 
-## 15. Isolates use `resources.memory` and `memoryMax`, not their own cap and charge (revised)
+## 17. Isolates use `resources.memory` and `memoryMax`, not their own cap and charge (revised)
 
 **Call.** An isolate's reservation is `resources.memory` (what the node
 admits against the envelope: its expected private memory) and its ceiling
@@ -479,7 +550,7 @@ a ceiling nearly no isolate reaches.
 
 ---
 
-## 16. Each host runs one shard per core, shared nothing
+## 18. Each host runs one shard per core, shared nothing
 
 **Call.** A host's isolates are partitioned across pinned shard threads,
 each a single-threaded executor; an isolate runs only on its shard and
@@ -495,7 +566,7 @@ throughput running wasmtime on Seastar's reactor threads.
 
 ---
 
-## 17. The default `js` image is StarlingMonkey; QuickJS is a candidate `js-small`
+## 19. The default `js` image is StarlingMonkey; QuickJS is a candidate `js-small`
 
 **Call.** `image = "js"` is SpiderMonkey compiled to Wasm with weval AOT.
 QuickJS ships as `js-small` only if Phase 0 shows a several-times smaller
@@ -513,7 +584,7 @@ Spin run in production; and weval closes much of the interpreter gap.
 
 ---
 
-## 18. Python is CPython for WASI; heavy packages run in a VM
+## 20. Python is CPython for WASI; heavy packages run in a VM
 
 **Call.** `image = "python"` is CPython built for WASI (componentize-py),
 pre-initialized with the standard library. Native-extension packages are
@@ -532,29 +603,7 @@ instantiates like any other.
 
 ---
 
-## 19. A stopped run is data, not an error
-
-**Call.** A run that an unsupported call or a limit stopped answers
-`ok: true` with `stopped { reason, limit, detail, hint }` and `nextTier`,
-as a run whose code exits non-zero answers `ok: true` with its `exit`.
-Error envelopes are for requests that did not run: no room, no
-permission, an invalid request. The CLI exits non-zero for both.
-
-**Alternatives.** Typed errors (`isolate_unsupported`, `isolate_limit`) in
-the standard error envelope, with `nextTier` added to it.
-
-**Trade-off.** An agent must look at `data.stopped`, not only at `ok`, to
-know the code did not finish.
-
-**Why (agent-readiness).** The standard envelope's error carries only
-`code`, `message`, `hint`, and `retryable`, and adding a field to it for one
-command would make it non-standard. A stop is also the run's outcome, with
-stdout, stderr, and CPU time an agent needs, which an error envelope would
-drop.
-
----
-
-## 20. Default limits: `memoryMax` 128 MiB (4 GiB at most), 1 MiB output; CPU and wall required
+## 21. Default limits: `memoryMax` 128 MiB (4 GiB at most), 1 MiB output; CPU and wall required
 
 **Call.** `resources.memoryMax` defaults to 128 MiB with a worker-wide
 maximum of 4 GiB, and `limits.output` to 1 MiB. `limits.cpu` and

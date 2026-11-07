@@ -7,6 +7,11 @@ injection, the `ensure_image_base` seam, and shared tag resolution for queued
 pulls). Phase 2 (artifacts on the cached path) and Phase 3 (the `container`
 runtime) are planned. Real-KVM boot of a cloned disk is not yet verified.
 
+*2026-11-07:* [derived-content-plan.md](derived-content-plan.md) plans
+moving this cache onto a `derived` class of the node content store, with
+`content.budgets.derived` in place of `LEGION_SANDBOX_ROOTFS_CACHE`; this
+plan's mechanics carry over unchanged.
+
 ## Problem
 
 Every microVM sandbox boots from a root disk the worker builds at start:

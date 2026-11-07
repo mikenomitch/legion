@@ -857,6 +857,23 @@ binary (calls entry 17).
   then they fall back to the token file plus `LEGION_ADDR` set to a
   reachable manager.
 
+*Amended 2026-11-07* (calls entry 18): this socket is one instance of the
+**workload channel**, the one way a workload reaches its node's worker, and
+other plans use it rather than adding their own:
+
+- **Calls the worker answers itself.** Besides proxying the Legion API to
+  the managers, the worker serves node-local calls on the same socket:
+  starting a child session or instance ([child-sessions-plan.md](child-sessions-plan.md))
+  and a one-shot run ([session-runs-plan.md](session-runs-plan.md)). They
+  need no manager and no token.
+- **One attribution rule for every caller.** A per-allocation socket acts
+  only for its allocation, proven by cgroup as above. A process that serves
+  many workloads, the [isolate runtime](isolate-runtime-plan.md)'s host,
+  names the workload on each call, and the worker accepts a name only if it
+  belongs to an envelope that host serves. An escaped host can therefore
+  impersonate tenants of its own cordon, which already share its process,
+  and nothing beyond it.
+
 ### 6.5 UI extensions
 
 **Tier 1: declarative views** (calls entry 8). An app declares **slots** in

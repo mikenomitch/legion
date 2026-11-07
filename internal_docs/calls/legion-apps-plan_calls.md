@@ -736,3 +736,29 @@ more than this grant: it *is* the manager. An operator who doesn't want the
 autoscaler seeds it disabled (`apps = { autoscaler = { enabled = false } }`)
 or runs `legion app disable`.
 
+---
+
+## 18. The API socket is the workload channel, with one attribution rule for every caller
+
+*Added 2026-11-07, from the isolate runtime and child-sessions plans.*
+
+**Call.** The per-allocation socket (entry 9) is generalized as the
+**workload channel**: the worker also answers node-local calls on it
+(starting a child, a one-shot run), and a process that serves many
+workloads (the isolate host) may name the workload on each call, limited to
+workloads of the envelopes that process serves.
+
+**Alternatives.** (a) A separate socket per feature: one for the Legion API,
+one for child starts, one for the isolate host's I/O. (b) Let a
+multiplexing host name any workload, trusting it as part of Legion.
+
+**Trade-off.** One socket carries more kinds of call, and the worker's
+handler grows a routing table. An escaped isolate host can act as any
+tenant of its own cordon.
+
+**Why (security, simplicity).** Every new way into the worker is another
+place attribution can be got wrong; one channel states the rule once. (b)
+would turn an engine escape into impersonation of any workload on the node.
+Limiting a host to the envelopes it serves bounds an escape to tenants that
+already share its process, which is the cordon's stated trust boundary.
+

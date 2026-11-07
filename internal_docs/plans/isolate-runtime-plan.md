@@ -6,7 +6,9 @@
 after review: each run happens in one place, chosen before it starts; a
 session's address is always its isolate; the VM is a declared sibling task
 reached as a child session; isolates use `memory`/`memoryMax` like every
-runtime. See calls entries 5 to 7 and 15). Nothing here is built.
+runtime. See calls entries 5 to 7 and 17. On 2026-11-07, everything that was
+not isolate-specific moved into shared plans, calls entry 8). Nothing here
+is built.
 
 This plan adds a second, much lighter tier to Legion's sandboxing. Code runs
 first as an **isolate**: a WebAssembly instance inside a shared,
@@ -35,11 +37,20 @@ isolates in the managers' session index, wasm threads, and GPU access from
 either tier. Dropped on review: Legion re-running a stopped run in a VM on
 its own (calls entry 5).
 
-Companion plans: burst and growth are built from two primitives that are
-not isolate-specific, [child sessions](child-sessions-plan.md) (a session
-that owns sessions of a sibling task, reached through it) and
-[resize](resize-plan.md) (in-place vertical scaling for any unit). §6.14
-shows how they compose.
+Companion plans: what this runtime needs that is not isolate-specific is
+planned as shared primitives, and §6.14 shows how they compose:
+
+- [child-sessions-plan.md](child-sessions-plan.md): a unit that owns
+  sessions or instances of a sibling task, reached through it;
+- [resize-plan.md](resize-plan.md): in-place vertical scaling for any unit;
+- [session-runs-plan.md](session-runs-plan.md): one-shot runs on any session
+  task, which replace this plan's first `RunIsolate`;
+- [derived-content-plan.md](derived-content-plan.md): one node cache for
+  everything Legion builds (compiled modules, pre-initialized images);
+- [runtime-disable-plan.md](runtime-disable-plan.md): the cluster-wide kill
+  switch, for any runtime;
+- [legion-apps-plan.md](legion-apps-plan.md) §6.4: the workload channel the
+  isolate host uses to reach the worker.
 
 Relationship to other plans: this executes, and replaces the shape of,
 [sandbox-scaling-plan.md](sandbox-scaling-plan.md) §6.10's Phase 9 ("Tier
@@ -257,8 +268,9 @@ hardware and definition of "started"; read them as orders of magnitude.
   start when a Durable Object calls `ctx.container.start()`. Modal picks
   gVisor or a VM per sandbox (`runtime = "vm"`); Vercel and Deno start a
   sandbox from an SDK call. Cloudflare's Sandbox SDK and Deno Sandbox
-  both keep credentials outside the sandbox and add them on egress.  - **Take:** an explicit, application-visible escalation (`vm.acquire`),
-    files as the handoff, credentials added on egress, and the parent as
+  both keep credentials outside the sandbox and add them on egress.
+  - **Take:** an explicit, application-visible escalation (`vm.acquire`),
+    files as the handoff, credentials added on egress, and the owner as
     the address (Cloudflare's Durable Object in front of its container).
     Legion adds choosing the tier before a run from a pre-flight check
     (§6.12).
@@ -273,7 +285,8 @@ hardware and definition of "started"; read them as orders of magnitude.
   and the Zeroboot prototype forks a Firecracker snapshot into a new KVM
   VM in 0.79 ms p50 at about 265 KB private each (one vCPU, no network,
   [repo](https://github.com/zerobootdev/zeroboot)). Lambda SnapStart
-  records and preloads each function's working set.  - **Take:** a per-node pool of prepared, unassigned, single-use VMs restored
+  records and preloads each function's working set.
+  - **Take:** a per-node pool of prepared, unassigned, single-use VMs restored
     from a base snapshot, with the guest agent's existing resume handler
     refreshing identity, RNG, and clock on assignment (§6.12).
 - **Hyperlight** ([2024](https://opensource.microsoft.com/blog/2024/11/07/introducing-hyperlight-virtual-machine-based-security-for-functions-at-scale/),
@@ -325,14 +338,16 @@ executes code on behalf of its own users or of a model)
 - When my handler calls a paid API, I want the key injected on the way
   out, as it is for my containers today, so the key is never in my code
   or my isolate's memory.
-- When my code fails, I want to know whether it hit a limit, called  something isolates cannot do, or crashed, in one line, so I know whether
+- When my code fails, I want to know whether it hit a limit, called
+  something isolates cannot do, or crashed, in one line, so I know whether
   to fix code, raise a limit, or send it to a VM.
 
 **Cluster operator**
 - When I give the cluster to isolates, I want to know how many fit on a
   node and see the host processes as ordinary, bounded things I can drain,
   so isolates do not become a second, invisible fleet.
-- When an engine CVE is announced, I want to turn the isolate tier off  (runs go to VMs or fail cleanly) in one command and turn it back on
+- When an engine CVE is announced, I want to turn the isolate tier off
+  (runs go to VMs or fail cleanly) in one command and turn it back on
   after upgrading, so the response is minutes, not a migration.
 
 **Security / platform admin**
@@ -344,7 +359,8 @@ executes code on behalf of its own users or of a model)
   filesystem, and no other cordon, so the engine is not the only wall.
 
 **Autonomous agent** (driving Legion directly)
-- When I need to run code as a step of a task, I want one call that  returns stdout, stderr, the result, which tier ran it and why, and which
+- When I need to run code as a step of a task, I want one call that
+  returns stdout, stderr, the result, which tier ran it and why, and which
   tier to use next time, as structured data, so I can act on the outcome without parsing text.
 - When I retry after a timeout, I want the retry not to run my code twice,
   so non-idempotent snippets are safe to retry.
@@ -358,7 +374,7 @@ not individually inspectable in the UI, in this plan).
 
 1. **The code-interpreter tool.** An agent platform submits one job,
    `code-runner`, with an isolate task on the `python` image and a sibling
-   `machine` task on `python:3.13-slim`. Its backend calls `RunIsolate`
+   `machine` task on `python:3.13-slim`. Its backend calls `RunSession`
    with each snippet and `tier = "auto"`. 99% of calls finish in the
    isolate in 2 to 20 ms. A snippet that imports `torch` is sent to a fresh
    `machine` VM by the pre-flight check before it starts. One that shells
@@ -371,7 +387,8 @@ not individually inspectable in the UI, in this plan).
    isolate session (`lifetime = "session"`) holding their agent loop's
    state. While the loop awaits the model, the isolate holds no stack and
    no thread. After 10 seconds idle it is paged out; after 2 minutes it is
-   hibernated to the node's disk and its slot is freed. A message for the   user rehydrates it in about a millisecond on the node its id names.
+   hibernated to the node's disk and its slot is freed. A message for the
+   user rehydrates it in about a millisecond on the node its id names.
    When the agent needs to build something, its isolate calls
    `vm.acquire()` and gets a child VM on the same node; requests still go
    to the user's isolate id, which forwards what needs the machine.
@@ -438,6 +455,9 @@ target Phase 0 shows to be wrong is rewritten here with a calls entry.
   pool envelope is an open question (§14).
 - **Isolate sessions in the managers' index, and per-isolate UI.** Nodes
   answer for their own isolates; the UI shows aggregates.
+- **Promoting an isolate session to a keyed instance.** A keyed instance is
+  an allocation each; durable named isolates use derived ids and
+  `durability = "store"` instead (§8, calls entry 10).
 - **Wasm threads and shared memory.** They are a high-resolution timer and
   a scheduling hazard (§6.10).
 - **GPU access** from either tier.
@@ -551,7 +571,8 @@ cloud-hypervisor or Firecracker microVM. What burst reuses unchanged:
   namespace off the isolate tier, or on it only.
 - A shipped helper binary has a precedent: `legion-guest`, found beside
   the worker or through `LEGION_GUEST_BINARY`
-  ([sandbox doc](../../docs/task-runtime-sandbox.md#the-guest-agent)).  `legion-isolate` is found the same way.
+  ([sandbox doc](../../docs/task-runtime-sandbox.md#the-guest-agent)).
+  `legion-isolate` is found the same way.
 
 ### 5.6 Sizing and scaling today
 
@@ -647,7 +668,8 @@ Three rules follow:
 2. **What an image cannot do, it says so, by name.** Python's
    `subprocess`, `ctypes`, and socket modules, and JS's `child_process` and
    `node:` builtins outside the supported set, are stubs that raise
-   `IsolateUnsupported("<what>")` and report it to the host, so a snippet   that needs a machine is stopped with a reason the caller and the memo
+   `IsolateUnsupported("<what>")` and report it to the host, so a snippet
+   that needs a machine is stopped with a reason the caller and the memo
    can act on (§6.12).
 3. **No package installer in an isolate.** Packages are in an image or
    bundled into the author's component. `pip install` is a VM's job.
@@ -766,7 +788,7 @@ fastest first:
 | --- | --- | --- |
 | **Warm instance reuse** | A turn on an existing instance: < 1 µs | `lifetime = "tenant"` or `"session"`, the instance is resident |
 | **Fresh instance from a cached artifact** | A pool slot, a CoW map of the memory image, `InstancePre` (imports resolved ahead): 5 to 30 µs (SpiderMonkey.wasm in 5 µs, [Fallin 2022](https://bytecodealliance.org/articles/wasmtime-10-performance); Lucet 30 µs) | `lifetime = "request"`, every call |
-| **Fresh instance plus dynamic source** | The above from a pre-initialized language image, then the image parses the snippet: hundreds of µs to a few ms | `RunIsolate` with `source` |
+| **Fresh instance plus dynamic source** | The above from a pre-initialized language image, then the image parses the snippet: hundreds of µs to a few ms | a session run with `source` |
 | **Wake from page-out / hibernation** | Page faults, or a slot plus a diff read: §6.7 | A session isolate after idling |
 | **Compile, then instantiate** | Cranelift: tens to hundreds of ms per MB of Wasm | First use of a module on a node, or dynamic Wasm |
 
@@ -782,11 +804,14 @@ twice:
    pre-initialized with the engine booted and the standard library loaded.
 2. **Entries** (once per job config per node, at stage time): when a task
    names `entry`, the stager runs the image with the author's script under
-   Wizer and caches the result as the task's own artifact. Initialization
+   Wizer and caches the result as derived content
+   ([derived-content plan](derived-content-plan.md)). Initialization
    runs with no I/O imports linked, so a script that fetches at top level
    fails at stage with a named error rather than baking a response into the
    snapshot. Every instance then reseeds randomness and re-reads the clock
-   at its first turn, the isolate version of a VM fork's identity refresh.
+   at its first turn, the isolate version of a VM fork's identity refresh,
+   and the shared restore-hygiene test (§12) holds it to the same rule as
+   VM forks and prepared VMs.
 
 **Where compilation runs.** wasmtime splits cleanly: a runtime-only build
 that loads precompiled `.cwasm` artifacts adds 1.2 to 2.1 MB; Cranelift is
@@ -797,7 +822,7 @@ arbitrary code execution, so the artifact is a trust boundary.
 
 | Option | For | Against | Verdict |
 | --- | --- | --- | --- |
-| **A short-lived compiler process on the node** (`legion-isolate compile`), artifacts kept node-local in the content store | The artifact never crosses a trust boundary; the host process never compiles; a compile that blows up dies alone with its own seccomp and memory limit; every component is validated by the latest `wasmparser` first, which alone would have stopped CVE-2026-115384 | Every node compiles each module once | **Take** |
+| **A short-lived compiler process on the node** (`legion-isolate compile`), artifacts kept as node-local derived content ([derived-content plan](derived-content-plan.md)) | The artifact never crosses a trust boundary; the host process never compiles; a compile that blows up dies alone with its own seccomp and memory limit; every component is validated by the latest `wasmparser` first, which alone would have stopped CVE-2026-115384 | Every node compiles each module once | **Take** |
 | Compile on the manager (or a `legion-system` app), signed artifacts distributed through the content store | One compile per cluster per module; workers could be runtime-only | Signature verification becomes the only thing between a bucket writer and code execution on every node; a dynamic module pays a network round trip | Defer, as an optimization for large fleets with few modules |
 | Compile inside the host process | No IPC | A compiler in the multi-tenant process, and a compile on a shard thread stalls its isolates | Reject |
 | Accept user-supplied `.cwasm` | Zero compile | Arbitrary code execution by design | Reject outright |
@@ -866,7 +891,7 @@ how long the isolate has been idle (or waiting):
 | --- | --- | --- | --- |
 | **Hot** | A slot, its private pages resident | none | running, or idle < `pageOutAfter` (default 2 s) |
 | **Paged out** | A slot; its private pages pushed to the kernel's compressed swap (zswap/zram) or swap with `MADV_PAGEOUT` | Page faults: ~µs per page, typically ≤ 200 µs for a small isolate | idle ≥ `pageOutAfter`, or node memory pressure |
-| **Hibernated** | No slot. Its private pages (diffed against the artifact's image), globals, table state, and the host-side resource table, compressed in a file under the node's state dir | A slot, the CoW image, the diff read back: ≤ 2 ms | idle ≥ `suspend.idle.after`, slot pressure, or memory pressure; only between turns |
+| **Hibernated** | No slot. A session checkpoint in the node content store: its private pages (diffed against the artifact's image), globals, table state, and the host-side resource table, compressed | A slot, the CoW image, the diff read back: ≤ 2 ms | idle ≥ `suspend.idle.after`, slot pressure, or memory pressure; only between turns |
 | **Evicted / published** | Nothing on the node (`local`), or a manifest and parts in the content store (`store`) | As for a session resume | `suspend.keepFor` passes; `durability = "store"` publishes at hibernation |
 
 - **Hibernation needs a turn boundary.** A stackless isolate is at one
@@ -878,10 +903,18 @@ how long the isolate has been idle (or waiting):
   timers belong to the host (the guest holds handles). A hibernated session
   isolate's WebSocket stays open, and a message wakes it, which is
   Cloudflare's WebSocket hibernation for Durable Objects.
-- **Memory pressure learns one step.** The worker's named pressure steps
-  (`src/worker/pressure.rs`) gain "hibernate isolates", ordered before
-  stopping anything: the cordon pages out, then hibernates, its least
-  recently used isolates.
+- **Nothing here is a new store or a new pressure step.** A hibernated
+  isolate is a suspended session: its checkpoint lives in the node content
+  store like any session's, pinned, charged to the `snapshots` budget,
+  evicted by `suspend.keepFor`, and published with a session manifest under
+  `durability = "store"`. The worker's pressure response
+  (`src/worker/pressure.rs`) already has the two steps this needs: its
+  `reclaim` step calls a runtime's reclaim hook, which for isolates pages
+  out idle isolates (as `memory.reclaim` and the balloon do for other
+  runtimes), and its `suspend` step hibernates them, least recently used
+  first. The isolate host also calls the same reclaim hook on its own when
+  an isolate passes `pageOutAfter`; other runtimes can adopt idle-time
+  reclaim through that hook later (TODO), with no isolate code involved.
 - **Paging needs the node to have somewhere to page.** Without zswap,
   zram, or swap, `MADV_PAGEOUT` does nothing for anonymous pages and the
   paged-out tier collapses into hot. The public doc says so and the worker
@@ -910,10 +943,10 @@ The world in §7.4. What is in it, and what is deliberately not:
 | Inbound HTTP | `wasi:http/incoming-handler`, dispatched from node ingress with no TCP hop | Raw listeners |
 | Outbound HTTP | `wasi:http/outgoing-handler`, carried to the worker's egress datapath | Raw sockets, DNS |
 | Files | `wasi:filesystem` over an in-memory scratch tree, counted in `memoryMax`, gone at the end of the instance | A persistent or host filesystem |
-| State | `legion:isolate/state`: bytes scoped to the tenant or session, kept in the hibernation file and the session manifest | Cluster KV writes (KV is raft-replicated; the hot path must not touch it) |
+| State | `legion:isolate/state`: bytes scoped to the tenant or session, kept in the isolate's checkpoint and the session manifest | Cluster KV writes (KV is raft-replicated; the hot path must not touch it) |
 | Config | Env from the jobspec; KV-rendered env at stage, as for other runtimes | Secrets: credentials are injected on egress, never handed in |
 | Clocks | Wall clock at 1 ms; both clocks frozen within a turn | High-resolution timers, `SharedArrayBuffer`, threads |
-| Logs | stdout/stderr to the task's log stream with an `isolate` field, and into `RunIsolate`'s reply | A log file per isolate |
+| Logs | stdout/stderr to the task's log stream with an `isolate` field, and into a run's reply | A log file per isolate |
 | A VM | `legion:isolate/vm` (§6.12) | Processes in the isolate |
 
 **I/O goes through the worker, attributed per isolate.** The host process
@@ -1003,8 +1036,9 @@ of the shared process altogether.
     invocations; Legion's judges running ones too, and treats long-lived
     connections as a co-location risk.
 11. **Patch speed.** `legion-isolate` is its own binary, upgradeable
-    without the worker, and `legion operator isolate disable` (§13) turns
-    the tier off cluster-wide while an advisory is open. Cloudflare's V8
+    without the worker, and `legion operator runtime disable isolate`
+    ([runtime-disable plan](runtime-disable-plan.md), §13) turns the tier off
+    cluster-wide while an advisory is open. Cloudflare's V8
     patch gap is under 24 hours; that is the target.
 
 **What this design does not claim:** that tenants in one cordon are safe
@@ -1016,7 +1050,7 @@ those words.
 ### 6.11 Limits and accounting
 
 **Memory is the same two numbers as every other runtime.** An isolate does
-not get a parallel pair of fields (calls entry 15):
+not get a parallel pair of fields (calls entry 17):
 
 | Field | For an isolate | For a sandbox, for comparison |
 | --- | --- | --- |
@@ -1038,7 +1072,7 @@ not get a parallel pair of fields (calls entry 15):
 - **Per invocation, time and output:** `config.limits.cpu` (turn CPU summed,
   checked at every yield), `limits.wall`, and `limits.output`. These are
   budgets, not reservations, so they live in `config`. `cpu` and `wall`
-  are required (calls entry 20). A run stopped by one is reported in its
+  are required (calls entry 21). A run stopped by one is reported in its
   reply (`stopped.reason = "limits"`, naming the limit), with
   `nextTier = "vm"` when the task has a VM task.
 - **Per job on a node:** the envelope. `resources.cpu` is the isolate's
@@ -1067,7 +1101,7 @@ An elastic VM envelope that fills grows by its existing rule: one raft
 entry per envelope resize, not per burst. Bursts draw only from the VM
 task's envelope, so a storm of them cannot starve isolates; a full one
 refuses with `RESOURCE_EXHAUSTED` (retryable) while it grows or the router
-tries another node. The VM's session report carries `parent_id` and the
+tries another node. The VM's session report carries its owner reference and the
 isolate's tenant label, so a platform bills one user for both.
 
 ### 6.12 Burst: one run, one place
@@ -1088,11 +1122,12 @@ Pythons, and the invocation's size changed mid-flight.
 | **B. A child VM the isolate owns** | The isolate starts a microVM as a [child session](child-sessions-plan.md) and drives it; requests keep addressing the isolate | **Take** |
 | C. Legion replays a failed run in a VM | Automatic, but code runs twice and the outcome depends on what ran first | **Reject**; a caller may rerun (`--fallback vm`), knowingly |
 | D. Continuation migration | Resume the same instance inside a VM-hosted host | **Defer** to Phase 8; nobody ships it |
-| E. Re-point the session's address at its VM | Requests go straight to the VM after a burst | **Reject** (child-sessions calls entry 3) |
+| E. Re-point the session's address at its VM | Requests go straight to the VM after a burst | **Reject** (child-sessions calls entry 4) |
 
 #### Path 1: the tier, picked before the run
 
-`RunIsolate.tier` is `"isolate"`, `"vm"`, or `"auto"` (the default). A
+A run is a [session run](session-runs-plan.md) on the isolate task, with
+one more field: `tier` is `"isolate"`, `"vm"`, or `"auto"` (the default). A
 caller that kept a previous reply's `nextTier` for this code simply asks
 for that tier. `auto` decides before anything runs, from:
 
@@ -1102,21 +1137,20 @@ for that tier. `auto` decides before anything runs, from:
 2. **the node's memo:** code hashes of this job that needed a VM, kept for
    `config.vm.memoFor` (default 1 h).
 
-A `vm` run takes a VM session of the task's VM task (`config.vm.task`),
-writes the source, the input, and any files the caller sent under
-`/legion/run/`, execs `config.vm.command` (by default `python3
-/legion/run/main.py` for `python`, `node /legion/run/main.mjs` for `js`),
-and returns the same reply shape with `tier = "vm"` and `tierReason`. The
-VM is **single-use**: it serves one run and ends, because the next run may
-be another tenant's code. A component task (`module`) has no default
-command; `tier = "vm"` on one needs `config.vm.command`.
+A `vm` run is a session run on the VM task (`config.vm.task`): the
+isolate task hands over the source as `/legion/run/main.py` or
+`main.mjs`, named for its image, with the input and any files, and the VM
+task's own `run.command` executes it. The reply keeps the same shape, with
+`tier = "vm"` and `tierReason`. Like every session run, it is
+**single-use**: the VM serves one run and ends, because the next run may be
+another tenant's code.
 
 An isolate run stopped by an unsupported call or a limit stays stopped.
 Its reply says why (`stopped.reason` is `unsupported` or `limits`) and
-carries `nextTier = "vm"`, and the node records the code hash in its
-memo. A caller who wants the rerun asks for it: `--fallback vm` on the CLI, `fallback` on the MCP tool and the client
-library, each documented as "runs your code a second time, in a VM". The
-server never does it.
+carries `nextTier = "vm"`, and the node records the code hash in its memo.
+A caller who wants the rerun asks for it: `--fallback vm` on the CLI, and
+`fallback` on the MCP tool and the client library, each documented as
+"runs your code a second time, in a VM". The server never does it.
 
 #### Path 2: a child VM the isolate owns
 
@@ -1129,7 +1163,7 @@ returns a handle: `exec`, `put` and `get` files, `fetch` a port, `resize`,
 - **The handle is state.** A session isolate keeps the child's id in its
   state, so it survives hibernation and, with `durability = "store"`, a
   move. After either, the isolate re-attaches by id.
-- **Children end with their parent:** with the request for a `request`
+- **Children end with their owner:** with the request for a `request`
   isolate, with the session for a session isolate. In between, the child
   follows its own task's `suspend.idle`.
 - **When the child is gone** (stopped, evicted, its node lost), the next
@@ -1157,21 +1191,20 @@ client ──► gateway / router ──► isolate session "user-42"   (the add
 
 - **Bulk bytes** (a large upload, a long-lived stream to the VM) should not
   pass through the isolate. Connection handoff
-  ([child-sessions plan](child-sessions-plan.md) §6.7, its Phase 3) lets the
+  ([child-sessions plan](child-sessions-plan.md) §6.8, its Phase 4) lets the
   isolate decide and the worker splice the client's connection to the
   child's port. Until then such traffic goes through the isolate.
 
 #### What the VM is
 
 An ordinary session task the job declares next to the isolate task, on the
-`sandbox` runtime, with its own image, resources, envelope, `connect`,
-`network`, and `suspend`. Nothing is generated. Listing it in the isolate task's
-`stateful.children` is what grants both uses, single-use VM runs and child
-VMs, so one line of the spec names every machine the task's code can
-reach. A child runs under its own
-task's policy, not the isolate's (child-sessions calls entry 2); to give
-both tasks the same upstreams and credentials, bind them once in Nickel
-(§7.1).
+`sandbox` runtime, with its own image, resources, envelope, `run` block,
+`connect`, `network`, and `suspend`. Nothing is generated. Listing it in
+the isolate task's `children` is what grants both uses, single-use VM runs
+and child VMs, so one line of the spec names every machine the task's code
+can reach. A child runs under its own task's policy, not the isolate's
+(child-sessions calls entry 3); to give both tasks the same upstreams and
+credentials, bind them once in Nickel (§7.1).
 
 #### How fast it gets there
 
@@ -1232,17 +1265,31 @@ isolate-specific:
 | Reservation and ceiling | `resources.memory` and `resources.memoryMax` | exists for every runtime; isolates adopt it (§6.11) |
 | Resize | change a unit's reservation, ceiling, or CPU in place | exists only for envelopes; [resize-plan.md](resize-plan.md) generalizes it |
 | Move | suspend and resume elsewhere | exists for `store` sessions and keyed instances |
-| Child session | a session that owns sessions of a sibling task, which end with it and are attributed to it | [child-sessions-plan.md](child-sessions-plan.md) |
-| Front door | one address per logical session, bound to its root | the rule in child-sessions §6.6 |
+| Ownership (child sessions) | a unit that owns sessions or instances of a sibling task, which end with it and are attributed to it | [child-sessions-plan.md](child-sessions-plan.md) |
+| Front door | one address per logical unit, bound to its root | the rule in child-sessions §6.7 |
+| Session run | one call: a fresh single-use session, files and input in, output and result out | [session-runs-plan.md](session-runs-plan.md) |
+| Checkpoints | a suspended unit's state in the node content store, pinned, budgeted, published with a manifest | exists for sessions and instances; isolates use it (§6.7) |
+| Reclaim hook | a runtime gives memory back without stopping (`memory.reclaim`, a balloon, isolate page-out) | exists in the pressure response; isolates add an idle trigger (§6.7) |
+| Derived content | node-local artifacts built from verified inputs (root disks, compiled modules, pre-initialized images) | [derived-content-plan.md](derived-content-plan.md) generalizes the root disk cache |
+| Runtime disable | a cluster-wide switch that refuses new starts of a runtime | [runtime-disable-plan.md](runtime-disable-plan.md) |
+| Workload channel | the one way a workload reaches its worker, with one attribution rule | legion-apps-plan §6.4, amended |
 
 | Feature | Composed from |
 | --- | --- |
-| A VM run (`tier = "vm"`) | a single-use session of the VM task, from its envelope |
+| A VM run (`tier = "vm"`) | a session run on the VM task |
+| A hibernated isolate | a checkpoint, written by the pressure response's `suspend` step or an idle policy |
+| A CVE response | runtime disable, plus the isolate's divert to its VM task |
 | An isolate driving a VM | child session + front door + the VM task's envelope |
 | A session that needs more memory | resize, else move |
 | The autoscaler's vertical scaling | a policy that calls resize |
-| An agent spawning tool sandboxes, from any runtime | child sessions |
+| An agent spawning tool sandboxes, from any runtime | child sessions over the workload channel |
 | Continuation migration (Phase 8) | move, across runtimes |
+
+**What stays isolate-specific:** the Wasm engine and the guest's world,
+the shard executor and its per-tenant fairness, the slot layout, cordons,
+the pre-flight check, and the compiler itself (its outputs are derived
+content; the compiler is not shared). Each waits for a second user before
+it is generalized.
 
 **What this plan deliberately does not build:** a tier change as a resize,
 an isolate that "grows into" a VM past a size threshold. Burst is mostly
@@ -1256,10 +1303,12 @@ nothing else builds on (resize calls entry 6).
 ### 7.1 The jobspec
 
 An isolate task is a session task on the `isolate` runtime. Its VM, when it
-has one, is a sibling session task on the `sandbox` runtime. Everything
-under the isolate's `config` is new; `stateful`, `resources`, `connect`,
-`network`, and `suspend` mean what they mean today, and
-`stateful.children` comes from the [child-sessions plan](child-sessions-plan.md).
+has one, is a sibling session task on the `sandbox` runtime that takes
+[session runs](session-runs-plan.md). Everything under the isolate's
+`config` is new; `stateful`, `resources`, `connect`, `network`, and
+`suspend` mean what they mean today; `children` comes from the
+[child-sessions plan](child-sessions-plan.md) and `run` from the
+session-runs plan.
 
 ```nickel
 let net = {
@@ -1280,7 +1329,7 @@ let net = {
         # What runs: a built-in image ("js", "python") or a component.
         image = "python",
         # entry = "main.py",            # pre-initialized at stage time; omit
-        #                                # for dynamic code (RunIsolate)
+        #                                # for dynamic code (session runs)
         # module = { source = "oci://ghcr.io/acme/handler:1.4", sha256 = "..." },
         lifetime = "request",            # "request" (default) | "tenant" | "session"
         limits = {
@@ -1290,8 +1339,7 @@ let net = {
         },
         cordon = "namespace",            # "namespace" (default) | "job" | "shared"
         vm = {
-          task = "machine",              # default: the only entry in stateful.children.tasks
-          # command = ["python3", "/legion/run/main.py"],   # default for image "python"
+          task = "machine",              # default: the only entry in children.tasks
           memoFor = "1h",                # route a code hash that needed a VM straight to one
         },
       },
@@ -1302,8 +1350,8 @@ let net = {
       stateful = {
         mode = "session",
         envelope = { resources = { cpu = 16000, memory = 32768 } },
-        children = { tasks = ["machine"], max = 1 },
       },
+      children = { tasks = ["machine"], max = 1 },
       connect = net,
     },
     {
@@ -1316,6 +1364,9 @@ let net = {
         envelope = { resources = { cpu = 8000, memory = 16384 },
                      max = { cpu = 32000, memory = 65536 } },
       },
+      # What a VM run executes (session-runs plan). The isolate task hands
+      # its source over as /legion/run/main.py, named for its image.
+      run = { command = ["python3", "/legion/run/main.py"], wall = "5m" },
       suspend = { idle = { after = "2m" } },
       connect = net,
     },
@@ -1330,8 +1381,8 @@ What submit checks, with the errors it gives:
 [isolate] code-runner/run: config.limits.cpu and config.limits.wall are required (budgets differ by orders of magnitude between a webhook and an agent loop; there is no default)
 [isolate] code-runner/run: resources.memoryMax 8192 MiB is above this cluster's isolate maximum 4096 MiB (worker isolate.maxMemory); run it with tier = "vm" for more
 [isolate] code-runner/run: resources.memoryMax 16 MiB is below image "js"'s initial linear memory (24 MiB)
-[isolate] code-runner/run: config.vm.task "machine" is not in stateful.children.tasks; add it there, which is what lets this task's isolates start it
-[isolate] code-runner/run: config.vm has no command and image is a component (module); set config.vm.command, or leave config.vm out
+[isolate] code-runner/run: config.vm.task "machine" is not in children.tasks; add it there, which is what lets this task's isolates start it
+[isolate] code-runner/machine: config.vm.task of code-runner/run names machine, which has no run block; add run.command so tier = "vm" runs know what to execute
 [isolate] code-runner/run: config.cordon = "shared" is refused by namespace policy 'tenants' (isolateCordons = ["namespace", "job"])
 ```
 
@@ -1344,81 +1395,65 @@ network = { ports = [{ name = "http" }] },
 
 ### 7.2 The CLI
 
+Runs use the [session-runs plan](session-runs-plan.md)'s verb; the isolate
+task adds `--tier`, and the reply adds `tier`, `tierReason`, and `nextTier`.
+
 ```console
-$ legion isolate run code-runner --file snippet.py -j
-{"ok":true,"data":{"tier":"isolate","tierReason":"auto: no imports outside the image",
+$ legion session run code-runner --task run --file snippet.py -j
+{"ok":true,"data":{"task":"run","tier":"isolate","tierReason":"auto: no imports outside the image",
  "node":"w-17","exit":0,"stdout":"42\n","stderr":"","cpuMs":3.1,"wallMs":4.0,
  "nextTier":null,"deduplicated":false}}
 
-$ legion isolate run code-runner --file train.py -j
-{"ok":true,"data":{"tier":"vm","tierReason":"auto: import torch is not in image python",
- "node":"w-17","exit":0,"stdout":"done\n","cpuMs":0,"wallMs":1890,"vmMs":231,
+$ legion session run code-runner --task run --file train.py -j
+{"ok":true,"data":{"task":"machine","tier":"vm","tierReason":"auto: import torch is not in image python",
+ "node":"w-17","exit":0,"stdout":"done\n","wallMs":1890,"vmMs":231,
  "nextTier":"vm","deduplicated":false}}
 
-$ legion isolate run code-runner --file transcode.py -j
-{"ok":true,"data":{"tier":"isolate","node":"w-17","exit":null,
+$ legion session run code-runner --task run --file transcode.py -j
+{"ok":true,"data":{"task":"run","tier":"isolate","node":"w-17","exit":null,
  "stopped":{"reason":"unsupported","detail":"subprocess.run: processes are not available in an isolate",
             "hint":"rerun with --tier vm (this code's next run on w-17 goes to a VM on its own for the next hour), or pass --fallback vm to rerun it once automatically"},
  "nextTier":"vm","stdout":"","stderr":"","cpuMs":1.2,"wallMs":3.0,"deduplicated":false}}
 
-$ legion isolate run code-runner --file transcode.py --fallback vm -j
+$ legion session run code-runner --task run --file transcode.py --fallback vm -j
 {"ok":true,"data":{"tier":"vm","tierReason":"fallback: stopped in the isolate, unsupported (subprocess.run)",
  "ranTwice":true, ...}}
 
-$ legion isolate run code-runner --file loop.py -j
-{"ok":true,"data":{"tier":"isolate","node":"w-17","exit":null,
+$ legion session run code-runner --task run --file loop.py -j
+{"ok":true,"data":{"task":"run","tier":"isolate","node":"w-17","exit":null,
  "stopped":{"reason":"limits","limit":"cpu","detail":"exceeded its 100ms CPU limit (100.4ms)",
             "hint":"raise config.limits.cpu, or rerun with --tier vm"},
  "nextTier":"vm","cpuMs":100.4,"wallMs":101.0,"deduplicated":false}}
 
-$ legion isolate run code-runner --file snippet.py -j     # every isolate envelope on the router's nodes is full
-{"ok":false,"error":{"code":"RESOURCE_EXHAUSTED","message":"no node has room in code-runner/run's envelope",
- "hint":"retry; the envelopes are growing","retryable":true}}
+$ legion session run code-runner --task run --file snippet.py --dry-run -j   # the pre-flight check only
+{"ok":true,"data":{"tier":"isolate","imports":["json","csv"],"node":"w-17","room":true}}
 
 $ legion isolate stats code-runner -j
 {"ok":true,"data":{"task":"run","nodes":[
   {"node":"w-17","resident":48213,"active":312,"pagedOut":20114,"hibernated":391022,
    "invocationsPerSec":8410,"cpuSecondsPerSec":11.2,"vmRunsPerMin":14,"childVms":37,
    "cordon":"default","hostRssBytes":21474836480}]}}
-
-$ legion isolate validate code-runner --file snippet.py -j   # pre-flight only
-{"ok":true,"data":{"tier":"isolate","imports":["json","csv"],"reason":null}}
 ```
 
 A stopped run is `ok: true`: the code ran and was stopped, which is the
-run's outcome, as a non-zero `exit` is (calls entry 18). The CLI exits
-non-zero for both. Error envelopes are for requests that did not run at
-all: no room, no permission, an invalid request.
-
-`run` also takes `--source -` (stdin), `--input` (JSON handed to the
-entry point), `--files dir/` (copied into the run's scratch tree, or under
-`/legion/run/` for a VM run), `--tier auto|isolate|vm`, `--fallback vm`,
-`--node` with `--ticket` for an edge call, and `--session <id>` to run in
-an existing session isolate. `validate` runs only the pre-flight check and
-never executes code. Child VMs are sessions of the VM task, so
-`legion session get <isolate session>` lists them and `legion session
-exec <child>` reaches one, both from the [child-sessions plan](child-sessions-plan.md).
+run's outcome, as a non-zero `exit` is (session-runs calls entry 4). Error
+envelopes are for requests that did not run at all. `--fallback vm` is the
+client's second request, never the server's. Child VMs are sessions of the
+VM task, so `legion session get <isolate session>` lists them and `legion
+session exec <child>` reaches one.
 
 ### 7.3 The RPCs
 
-- **`Manager.RunIsolate`** (`job:write` on the job). The manager's session
-  router picks a node with envelope room, exactly as for an unnamed
-  session create, and forwards. Nothing is written.
-- **`Worker.RunIsolate`** on the worker-plane port with a session ticket,
-  for edge callers with no manager on the path (the edge start's shape).
+- **`Manager.RunSession` and `Worker.RunSession`** from the
+  [session-runs plan](session-runs-plan.md), which an isolate task answers
+  natively. The isolate adds `tier` (`auto` by default) to the request and
+  `tier`, `tier_reason`, `next_tier`, and `vm_ms` to the reply. There is no
+  server-side fallback field: a rerun is a second request.
 - **`Worker.GetIsolateStats`** and the heartbeat's per-task aggregates
   behind `legion isolate stats`.
-- **`Manager.SetIsolateTier`** (`operator:write`), the kill switch (§13).
-
-`RunIsolateRequest`: `job_id`, `task_name`, `source` or `input`, `files`,
-`tier` (`auto` default), `session_id`, `idempotency_key`, `wait_timeout`.
-There is no server-side fallback field: a rerun is a second request.
-`RunIsolateResponse`: `tier`, `tier_reason`, `node_id`, `exit`, `stdout`,
-`stderr` (bounded by `limits.output`, with `truncated`), `result` (JSON the
-entry returned), `cpu_ms`, `wall_ms`, `vm_ms`, `next_tier`,
-`deduplicated`, and for a stopped run `stopped { reason, limit, detail,
-hint }`. Idempotency is per node, as for edge session starts: the key
-derives an invocation id, and the node keeps the reply for 10 minutes.
+- The kill switch is the [runtime-disable plan](runtime-disable-plan.md)'s
+  `legion operator runtime disable isolate`; an isolate task reacts to it as
+  §13 describes.
 
 ### 7.4 The guest's world
 
@@ -1472,16 +1507,13 @@ stackless ABI) once the toolchains it needs support it (§6.6).
 
 ### 7.5 Agents
 
-- An MCP tool `isolate_run` (`mutates: true`, so behind `--allow-write`),
-  with `tier` and `fallback` parameters (the fallback is the tool's second
-  request, reported as `ranTwice`), and `isolate_validate` (read-only).
-- `catalog()` entries in `src/cmd/capabilities.rs` for `isolate run`
-  (`mutates: true`, `read_only_safe: false`), `isolate validate`,
-  `isolate stats`, and `operator isolate disable|enable` (`mutates: true`).
-  The kill switch is deliberately not an MCP tool.
-- `docs/agent-readiness.md` gains the isolate surface, including the
-  per-node idempotency rule and `nextTier` as the hint an agent should
-  carry forward.
+- Runs are the session-runs plan's MCP tool `session_run`, with the
+  isolate's `tier` and a `fallback` parameter (the tool's own second
+  request, reported as `ranTwice`).
+- `catalog()` gains `isolate stats`; `session run` and `operator runtime`
+  come from their plans.
+- `docs/agent-readiness.md` gains the isolate fields, including `nextTier`
+  as the hint an agent should carry forward.
 
 ## 8. The control plane (kept small on purpose)
 
@@ -1492,60 +1524,69 @@ Isolates add no placement model. An `isolate` task is a session task:
    nothing; the cordon host is node infrastructure, started by the worker
    when the first envelope that needs it lands, and its cgroup's
    `memory.max` and `cpu.weight` are the sum of the envelopes it serves.
-   The VM task is an ordinary sibling session task with its own envelope;
-   nothing is generated for burst.
-2. **Routing is the session router's.** `RunIsolate` and HTTP ingress go
-   to any node with envelope room, picked by `stateful.placement`. A
-   session isolate's id carries its node tag, so a later call goes
-   straight to its node, through the router, the gateway, or an edge
-   caller. The isolate stays the address after it starts a child VM.
+   When a cordon runs several host processes (§6.3), the worker splits each
+   job's envelope between them and moves room between them with the same
+   grow-and-shrink rule elastic envelopes use; that split stays inside the
+   worker. The VM task is an ordinary sibling session task with its own
+   envelope; nothing is generated for burst.
+2. **Routing is the session router's.** Runs and HTTP ingress go to any node
+   with envelope room, picked by `stateful.placement`. A session isolate's
+   id carries its node tag, so a later call goes straight to its node,
+   through the router, the gateway, or an edge caller. The isolate stays the
+   address after it starts a child VM.
 3. **Starting an isolate takes no launch slot.** The launch pool bounds VM
    boots. An isolate start is admitted against the envelope by the host
-   itself, and the host's own concurrency limits apply (§6.11). A VM, for
-   a VM run or as a child, takes a launch slot like any sandbox session.
+   itself, and the host's own concurrency limits apply (§6.11). A VM, for a
+   VM run or as a child, takes a launch slot like any sandbox session.
 4. **Nothing per isolate leaves the node.** The heartbeat carries one
    aggregate per isolate task (`resident`, `active`, `paged_out`,
-   `hibernated`, invocation and CPU counters, VM runs, child VMs,
-   refusals), folded by the manager like usage. A session isolate is not in
-   the managers' session index; `legion isolate get <id>` asks the node its
-   tag names. Its child VMs are sandbox sessions and are reported like any,
-   with `parent_id`.
-5. **Hibernated session isolates follow session sleep rules.**
-   `suspend.durability = "local"` keeps the hibernation file on the node;
-   `"store"` publishes it and writes a session manifest, so the session can
-   wake on another node and re-attach its child by id.
+   `hibernated`, invocation and CPU counters, VM runs, child VMs, refusals),
+   folded by the manager like usage. This is not a special case in the
+   session code: a runtime declares the reporting level its sessions get
+   (`indexed`, as every runtime has today, or `aggregate`), and the isolate
+   runtime declares `aggregate`. A jobspec knob for it waits for a second
+   runtime that wants one. `legion isolate get <id>` asks the node the id's
+   tag names. Child VMs are sandbox sessions and are reported like any,
+   with their owner reference.
+5. **Hibernated session isolates are suspended sessions.** Their
+   checkpoints live in the node content store like any session's, pinned,
+   charged to the `snapshots` budget, and evicted by `suspend.keepFor`;
+   `durability = "store"` publishes them with a session manifest, so the
+   session can wake on another node and re-attach its child by id.
+6. **Isolate sessions are never promoted to keyed instances.** A keyed
+   instance is an allocation each, which would undo the density the tier
+   exists for. A durable, named isolate uses what session durability
+   already provides: an id derived from an idempotency key, and
+   `durability = "store"`. `legion instance promote` on an isolate session
+   answers `FAILED_PRECONDITION` saying so.
 
 What the managers never see: an isolate's start, end, invocation,
 page-out, or hibernation.
 
 ## 9. Proto, struct, config, and persistence changes
 
-- **Proto.** `Manager.RunIsolate`, `Worker.RunIsolate`,
-  `Worker.GetIsolateStats`, `Manager.SetIsolateTier` (the kill switch,
-  `operator:write`), `IsolateTaskStats` on the heartbeat's usage report,
-  and the request and response messages in §7.3 (`tier`, `tier_reason`,
-  `next_tier`, `stopped`), each with full public proto comments. Child VM
-  fields (`parent_id`) come from the child-sessions plan; resize RPCs from
-  the resize plan.
+- **Proto.** The isolate's fields on `RunSessionRequest` (`tier`) and
+  `RunSessionResponse` (`tier`, `tier_reason`, `next_tier`, `vm_ms`),
+  `Worker.GetIsolateStats`, and `IsolateTaskStats` on the heartbeat's usage
+  report, each with full public proto comments. Runs, owner references,
+  resize, and the runtime disable come from their own plans.
 - **Job config.** `config` for the `isolate` runtime (§7.1): `image`,
   `entry`, `module`, `lifetime`, `limits.{cpu, wall, output}`, `cordon`,
-  and `vm.{task, command, memoFor}`, validated by the runtime's schema;
-  `resources.memory` and `memoryMax` with the isolate meanings of §6.11;
-  `stateful.children` from the child-sessions plan. New fields go into
+  and `vm.{task, memoFor}`, validated by the runtime's schema;
+  `resources.memory` and `memoryMax` with the isolate meanings of §6.11.
+  `children` and `run` come from their plans. New fields go into
   `configs/jobs/maximal.ncl` with the runtime.
 - **Namespace policy.** `isolateCordons` (allowed cordon kinds) next to
   `runtimes`.
 - **Worker config.** An `isolate` block: `binary` (default: beside the
   worker, then `LEGION_ISOLATE_BINARY`), `maxMemory` (per isolate, default
   4 GiB), `slotsPerHost`, `shards` (default: cores in the host's cpuset),
-  `epoch` (default `1ms`), `slice` (default `5ms`), `pageOutAfter`
-  (default `2s`),
-  `hibernation = { dir, budget }`, `cordonBoundary = "process" | "vm"`.
-- **Persistence.** None in the store. On the node: the compiled-module
-  cache under the content store (keyed by module digest, engine version,
-  and CPU feature set), and hibernation files under
-  `<worker state dir>/isolates/`. Session isolates in `store` durability
-  reuse session manifests.
+  `epoch` (default `1ms`), `slice` (default `5ms`), `pageOutAfter` (default
+  `2s`), and `cordonBoundary = "process" | "vm"`.
+- **Persistence.** None in the store. On the node: compiled modules and
+  pre-initialized images and entries as derived content
+  ([derived-content plan](derived-content-plan.md)), and hibernated
+  isolates as session checkpoints in the node content store.
 - **Struct.** `IsolateTaskConfig`, `IsolateLimits`, `IsolateVmConfig`,
   `IsolateStats` in `src/structs/`.
 
@@ -1587,26 +1628,32 @@ Each phase ships on its own and is useful on its own.
   shard model, pooling allocator with copy-on-write images, epoch
   preemption, limits, `wasi:cli/run` commands and `wasi:http` handlers
   from precompiled components, request lifetime, logs, egress through the
-  worker datapath with PROXY v2 attribution, ingress dispatch, `isolate
-  run`/`validate`/`stats`, the RPCs, catalog and MCP entries, and the
-  public page `docs/task-runtime-isolate.md`. Closes the TODO "WASM
-  runtime" item.
+  worker datapath with PROXY v2 attribution, ingress dispatch, session
+  runs on isolate tasks (with [session runs](session-runs-plan.md) Phase
+  1), compiled modules as derived content (with
+  [derived content](derived-content-plan.md) Phase 2), `isolate stats` and
+  `GetIsolateStats`, catalog entries, and the public page
+  `docs/task-runtime-isolate.md`. Closes the TODO "WASM runtime" item.
 - **Phase 2: shared hosts and cordons.** Many jobs per host by cordon
   policy, per-job admission and per-tenant fair scheduling inside a host,
   the host's seccomp allowlist, Landlock, empty network namespace, and
-  user namespace, namespace policy `isolateCordons`, and the kill switch
-  (§13).
+  user namespace, namespace policy `isolateCordons`, and the isolate's
+  reaction to `operator runtime disable` (§13; the switch itself is the
+  [runtime-disable plan](runtime-disable-plan.md)'s Phase 1).
 - **Phase 3: images and dynamic code.** The `js` and `python` images,
-  stage-time pre-initialization of `entry`, dynamic snippets through  `RunIsolate`, the compile cache for dynamic Wasm, and the pre-flight
+  stage-time pre-initialization of `entry` as derived content, dynamic
+  snippets through session runs, compiled dynamic Wasm, and the pre-flight
   import check.
 - **Phase 4: session isolates and memory tiers.** `lifetime = "tenant" |
-  "session"`, the stackless async world, page-out and hibernation,  host-held connections, gateway wake, `durability = "store"` through
-  session manifests, the memory-pressure step, and resizing a session
+  "session"`, the stackless async world, page-out and hibernation,
+  host-held connections, gateway wake, `durability = "store"` through
+  session manifests, hibernation as content-store checkpoints, the
+  reclaim hook for page-out, and resizing a session
   isolate's `memory` and `memoryMax` once [resize](resize-plan.md) Phase 1
   lands.
 - **Phase 5: burst.** Needs [child sessions](child-sessions-plan.md)
-  Phase 1. `config.vm` and its validation; `tier = "vm"` runs on single-use
-  sessions of the VM task; `tier = "auto"` with the pre-flight check, the
+  Phase 1 and [session runs](session-runs-plan.md) Phase 1 (sandbox). `config.vm`
+  and its validation; `tier = "vm"` runs as session runs on the VM task; `tier = "auto"` with the pre-flight check, the
   per-node memo, and `nextTier`; `legion:isolate/vm` (acquire, attach,
   exec, files, fetch, release) for child VMs; the client-side `--fallback
   vm`; `machine.resize` once [resize](resize-plan.md) Phase 1 lands; and
@@ -1618,25 +1665,33 @@ Each phase ships on its own and is useful on its own.
 - **Phase 7 (conditional): a V8 engine** for JS tenants, built only when
   Phase 3's telemetry shows the trigger in calls entry 1.
 - **Phase 8 (research): continuation migration**, resuming a hibernated
-  isolate inside a VM-hosted `legion-isolate` with the full filesystem and  process capabilities (§6.12, model D).
+  isolate inside a VM-hosted `legion-isolate` with the full filesystem and
+  process capabilities (§6.12, model D).
 
 ## 12. Testing plan
 
 - **Unit (Phase 1+).** Limits arithmetic and trap classification
   (`describe_failure`'s successor for wasmtime traps, epoch deadlines,
-  memory refusals); admission against an envelope with the cap and the
-  charge distinct; the shard scheduler's fairness (deficit round robin
+  memory refusals); admission against an envelope with the reservation
+  and the ceiling distinct; the shard scheduler's fairness (deficit round robin
   across tenants under a synthetic load, asserting CPU shares within 5%);
   idempotent invocation ids; the egress attribution header round trip.
 - **Integration (`tests/integration/isolate.rs`, one module of the shared
   binary).** A component answers HTTP through ingress; a component's
   outbound request reaches an upstream with an injected credential the
-  guest never sees; CPU, wall, memory, and output limits each produce
-  their error envelope; a host process killed mid-invocation fails its
+  guest never sees; CPU, wall, memory, and output limits each produce a
+  `stopped` reply; a host process killed mid-invocation fails its
   in-flight runs with a retryable error and the worker restarts it; a job
-  in one cordon cannot be scheduled into another's host; `RunIsolate`
-  through the manager and at the edge with a ticket; the ACL table entry
-  for every new Manager RPC in `tests/integration/acl_endpoints.rs`.
+  in one cordon cannot be scheduled into another's host; a session run on
+  an isolate task through the manager and at the edge with a ticket;
+  `instance promote` on an isolate session refused; the ACL table entry for
+  every new Manager RPC in `tests/integration/acl_endpoints.rs`.
+- **Restore hygiene (shared).** One conformance test,
+  `tests/integration/restore_hygiene.rs`, for every way a unit is made from
+  a snapshot: a VM fork, a prepared VM, and an isolate from a
+  pre-initialized image. Two units from one snapshot never share RNG
+  output, identity tokens, or instance ids. Isolates add their case to it;
+  they do not get a test of their own.
 - **Confinement (Phase 2).** A test build of the host with a hook that
   attempts each forbidden syscall (`socket`, `openat` outside the cache,
   `execve`, `ptrace`, anonymous `PROT_EXEC`) and asserts the kill; the
@@ -1660,7 +1715,8 @@ Each phase ships on its own and is useful on its own.
   reruns it once with `ranTwice`; a VM run's VM is never reused for another
   run; `vm.acquire` and exec; a session isolate keeps its child across
   hibernation and re-attaches by id; stopping the isolate ends its child;
-  `child_gone` after the child is stopped.
+  `child_gone` after the child is stopped; promoting an owner with a
+  child is refused until child sessions Phase 2.
 
 ## 13. Rollout and backward compatibility
 
@@ -1672,15 +1728,17 @@ Each phase ships on its own and is useful on its own.
   binary does not advertise the `isolates` capability, so envelopes are
   not placed there. A namespace policy keeps namespaces off the tier
   (`runtimes`) or limits cordon kinds (`isolateCordons`).
-- **The kill switch.** `legion operator isolate disable [--namespace N]`
-  sets a replicated flag that workers read on the heartbeat: new  invocations are refused with `isolate_disabled` (retryable), except that
-  a `tier = "auto"` run of a task with a VM task runs in a VM instead
-  (decided before it starts, like any tier choice), and running hosts drain
-  within `limits.wall`. `enable` reverses it. This is the CVE response.
+- **The kill switch** is `legion operator runtime disable isolate
+  [--namespace N]` ([runtime-disable plan](runtime-disable-plan.md)): new
+  isolate starts are refused with `runtime_disabled` (retryable), and
+  `--drain` hibernates session isolates and lets request isolates finish
+  within `limits.wall`. The isolate runtime adds one reaction of its own: a
+  `tier = "auto"` run of a task with a VM task runs in the VM instead,
+  decided before it starts like any tier choice. This is the CVE response.
 - **Engine upgrades.** The compiled-module cache is keyed by engine
   version, so a new `legion-isolate` recompiles on first use per node;
   Phase 1 adds a prefetch that compiles a job's module for the new version
-  before the old host drains. Hibernation files record the engine version
+  before the old host drains. Isolate checkpoints record the engine version
   and image digest; a mismatch wakes the isolate fresh with an `onResume`
   notice rather than restoring incompatible memory.
 - **Breaking changes.** None; there is no installed base of isolates.
@@ -1719,7 +1777,8 @@ Each phase ships on its own and is useful on its own.
    aarch64-only or Winch-only (October's hit every architecture), and
    OSS-Fuzz has no aarch64 runners. Lean:
    x86-64 only until continuous fuzzing covers aarch64 Cranelift and
-   Phase 0's numbers hold on Graviton; aarch64 hosts meanwhile run the   isolate tier only with `cordon = "job"`, or not at all.
+   Phase 0's numbers hold on Graviton; aarch64 hosts meanwhile run the
+   isolate tier only with `cordon = "job"`, or not at all.
 9. **Should `tier = "vm"` runs ever reuse a VM?** A single-use VM per run
    is what keeps one tenant's code from running in a VM another tenant's
    code just used. Lean: never across tenant keys; reuse within one tenant
@@ -1727,7 +1786,7 @@ Each phase ships on its own and is useful on its own.
    reuse mode.
 10. **Should a VM task inherit the isolate task's `connect`?** Lean: no.
     Children run under their own task's policy (child-sessions calls entry
-    2), and a Nickel binding shares the block in one line (§7.1); the
+    3), and a Nickel binding shares the block in one line (§7.1); the
     public doc shows the binding.
 11. **Should the pre-flight check run on the router instead of the node?**
     It would let `auto` pick a node that has VM room for code that needs a
@@ -1737,16 +1796,18 @@ Each phase ships on its own and is useful on its own.
 
 - **Phase 0:** a findings doc with the measurements listed in §11, and §4
   and §10 rewritten to them, with a calls entry for any target dropped.
-- **Phase 1:** `legion isolate run` of a Rust component returns in under
-  2 ms end to end on one node; `isolate_bench` shows instantiation at or
-  under the Phase 0 target; an outbound request carries an injected
-  credential the guest never read; every limit has its error envelope;
+- **Phase 1:** `legion session run` on a Rust component task returns in
+  under 2 ms end to end on one node; `isolate_bench` shows instantiation at
+  or under the Phase 0 target; an outbound request carries an injected
+  credential the guest never read; every limit produces its `stopped`
+  reply;
   `docs/task-runtime-isolate.md` exists and stands alone.
 - **Phase 2:** two jobs in the same namespace share one host process and
   two namespaces do not; the confinement test kills the host on each
-  forbidden syscall; `isolate disable` refuses new runs within one
-  heartbeat.
-- **Phase 3:** `isolate run --file x.js` and `--file x.py` meet the §10
+  forbidden syscall; `legion operator runtime disable isolate` refuses new
+  isolate runs within one heartbeat, and a `tier = "auto"` run of a task
+  with a VM task runs in the VM instead.
+- **Phase 3:** `session run --file x.js` and `--file x.py` meet the §10
   start targets; a dynamic Wasm module runs on its first call after one
   Cranelift compile, and later calls reuse the cached artifact.
 - **Phase 4:** a node holds the §10 resident and hibernated counts in the
@@ -1757,7 +1818,7 @@ Each phase ships on its own and is useful on its own.
   on its first call with `tierReason` naming the import; a snippet calling a
   subprocess is stopped in the isolate with `nextTier = "vm"` and is not
   re-run unless the caller asks; `vm.acquire` returns a machine that runs
-  `exec`, attributed to the isolate (`parent_id`); requests for a session
+  `exec`, attributed to the isolate by its owner reference; requests for a session
   isolate keep reaching it after it starts a child; a VM given the same
   `connect` binding reaches the same upstream with the same injected
   credential.
