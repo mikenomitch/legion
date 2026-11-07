@@ -18,7 +18,7 @@ use crate::identity::GuestUpstream;
 
 const USAGE: &str = "\
 usage: legion-guest guest-agent [--proxy-port PORT] [--dns-port PORT] [--host-cid CID]
-                                [--no-relay] [--exec-port PORT]
+                                [--no-relay] [--exec-port PORT] [--park]
                                 [--ingress-port PORT]... [--upstream PORT[@VSOCK][=VIP:PORT]]...
                                 [--resume-watch [--identity DEVICE] [--poll-ms MS]]
        legion-guest guest-resume [--identity DEVICE] [--poll-ms MS]
@@ -51,6 +51,10 @@ pub struct AgentArgs {
     /// memory checkpoints), so a restore can close the relays and exec
     /// sessions it holds.
     pub resume_watch: Option<ResumeArgs>,
+    /// Serve the park socket (`--park`, a task with `suspend.park`): the
+    /// guest's `/legion/park.sock`, relayed to host vsock port 1090
+    /// (docs/park.md). Independent of `--no-relay`.
+    pub park: bool,
 }
 
 impl Default for AgentArgs {
@@ -64,6 +68,7 @@ impl Default for AgentArgs {
             ingress_ports: Vec::new(),
             upstreams: Vec::new(),
             resume_watch: None,
+            park: false,
         }
     }
 }
@@ -137,6 +142,7 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
                     "--dns-port" => parsed.dns_port = number(flag, value(flag, &mut rest)?)?,
                     "--host-cid" => parsed.host_cid = number(flag, value(flag, &mut rest)?)?,
                     "--no-relay" => parsed.relay = false,
+                    "--park" => parsed.park = true,
                     "--exec-port" => parsed.exec_port = number(flag, value(flag, &mut rest)?)?,
                     "--ingress-port" => {
                         let port: u16 = number(flag, value(flag, &mut rest)?)?;
@@ -257,11 +263,41 @@ fn run_agent(args: &AgentArgs) -> Result<()> {
     } else {
         None
     };
+    // A park socket that cannot be served costs the workload its parks, not
+    // the agent its exec listener and relays: log it and carry on.
+    let park_relays = if args.park {
+        let relays = std::sync::Arc::new(agent::Relays::default());
+        match agent::serve_park(
+            std::path::Path::new(agent::PARK_SOCKET),
+            Arc::new(VsockDial { cid: args.host_cid }),
+            agent::PARK_PORT,
+            relays.clone(),
+        ) {
+            Ok(()) => {
+                eprintln!(
+                    "legion-guest-agent: park socket {} -> host vsock port {}",
+                    agent::PARK_SOCKET,
+                    agent::PARK_PORT
+                );
+                Some(relays)
+            }
+            Err(err) => {
+                eprintln!(
+                    "legion-guest-agent: cannot serve the park socket {}: {err}",
+                    agent::PARK_SOCKET
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     if let Some(watch) = args.resume_watch.as_ref() {
         return run_agent_watch(watch, &|identity: &crate::identity::ResumeIdentity| {
             let restored = started.as_ref().map(|started| started.restored(identity));
-            let closed =
-                restored.as_ref().map_or(0, |restored| restored.closed) + crate::exec::close_all();
+            let closed = restored.as_ref().map_or(0, |restored| restored.closed)
+                + park_relays.as_ref().map_or(0, |relays| relays.close_all())
+                + crate::exec::close_all();
             if closed > 0 {
                 eprintln!(
                     "legion-guest-agent: restored; closed {closed} connection(s) the capture left \
@@ -401,6 +437,15 @@ mod tests {
             })
         );
         assert_eq!(parse(&[]).unwrap(), Invocation::Help);
+        // A TAP sandbox with `suspend.park`: no relays, but the park socket.
+        assert_eq!(
+            parse(&args(&["guest-agent", "--no-relay", "--park"])).unwrap(),
+            Invocation::Agent(AgentArgs {
+                relay: false,
+                park: true,
+                ..AgentArgs::default()
+            })
+        );
         // A gated sandbox launched for checkpoints: one process.
         assert_eq!(
             parse(&args(&[

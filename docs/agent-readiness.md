@@ -881,6 +881,26 @@ They are for people: `legion app view <app>` lists them, and
 tool, because an agent cannot run a page. Everything a page does is an
 ordinary Manager RPC an agent can call itself.
 
+## 6e. Parking itself (`$LEGION_PARK_SOCKET`)
+
+The surfaces above are for an agent driving Legion from outside. An agent
+running *inside* a sandbox has one too: a task whose `suspend` block sets
+`park` gets `$LEGION_PARK_SOCKET`, a unix socket only its own processes can
+reach ([park.md](park.md)). One line in, one JSON envelope line out:
+
+```bash
+printf 'park ci-4821 after=10s checkpoint=disk\n' | nc -U "$LEGION_PARK_SOCKET"
+# → {"ok":true,"data":{"state":"parked","label":"ci-4821","after":"10s","checkpoint":"disk","suspendsAt":"..."}}
+```
+
+`park` suspends the instance from its node once `after` passes, `unpark`
+cancels, `busy` holds the idle policy off through a quiet model call, and
+`status` reports without changing anything. Refusals use the standard
+error envelope (`InvalidArgument`, `FailedPrecondition`, with a `hint`).
+The suspend shows up as `suspend_reason = "park"`, and the instance wakes
+the usual ways (`legion instance start`, the gateway). Needs no token: the
+socket can only suspend the instance it belongs to.
+
 ## 7. State store introspection + saved query library
 
 The SQL state store is the agent's main introspection tool. It is read-only by

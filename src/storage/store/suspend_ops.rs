@@ -16,8 +16,20 @@ use super::*;
 use crate::structs::snapshot::{SnapshotPurpose, SnapshotRecord, SnapshotState};
 use crate::structs::suspend::{
     ArchiveMode, InstanceColdBoot, InstanceSuspendState, OnRestoreFailure, ResolvedSuspend,
-    PENDING_RESUME, PENDING_SUSPEND, SUSPEND_REASON_MANUAL, SUSPEND_REASON_PRESSURE,
+    PENDING_RESUME, PENDING_SUSPEND, SUSPEND_REASON_MANUAL, SUSPEND_REASON_PARK,
+    SUSPEND_REASON_PRESSURE,
 };
+
+/// The `suspend_reason` a local suspension records: `park` when the node
+/// says the workload parked itself, `pressure` for anything else, which is
+/// what every local suspension meant before parks existed.
+pub(crate) fn local_suspension_reason(reported: &str) -> &'static str {
+    if reported == SUSPEND_REASON_PARK {
+        SUSPEND_REASON_PARK
+    } else {
+        SUSPEND_REASON_PRESSURE
+    }
+}
 
 const SUSPEND_COLUMNS: &str = "checkpoint_id, suspend_reason, suspended_at, pending_op, \
      restored_from_snapshot_id, last_suspend_ms, last_restore_ms, resume_requested_at, \
@@ -540,14 +552,16 @@ impl Store {
         })
     }
 
-    /// A local suspension (the node's `suspend` pressure step, plan §6.6):
-    /// the node checkpointed and stopped an allocation on its own and
-    /// reported a capture for a snapshot id it minted, which has no row yet.
-    /// Inside `apply_snapshot_report`'s transaction.
+    /// A local suspension (the node's `suspend` pressure step, plan §6.6,
+    /// or a park whose deadline passed, docs/park.md): the node
+    /// checkpointed and stopped an allocation on its own and reported a
+    /// capture for a snapshot id it minted, which has no row yet. Inside
+    /// `apply_snapshot_report`'s transaction.
     ///
     /// When the instance is still `active` on that allocation, insert the
     /// row as a `purpose = suspend` capture and apply the same transaction a
-    /// SuspendInstance capture does, with `suspend_reason = pressure`. A
+    /// SuspendInstance capture does, with the report's reason (`pressure`
+    /// or `park`, [`local_suspension_reason`]) as `suspend_reason`. A
     /// SuspendInstance capture still outstanding for it can never finish (the
     /// node already stopped the allocation), so its row is discarded and the
     /// local one wins.
@@ -642,7 +656,11 @@ impl Store {
         tx.execute(
             "UPDATE instance SET pending_op = ?2, suspend_reason = ?3, lifecycle_error = NULL \
              WHERE instance_id = ?1;",
-            params![instance_id, PENDING_SUSPEND, SUSPEND_REASON_PRESSURE],
+            params![
+                instance_id,
+                PENDING_SUSPEND,
+                local_suspension_reason(&report.local_suspension_reason)
+            ],
         )?;
         let snapshot =
             Self::get_snapshot_on(tx, &report.snapshot_id)?.context("snapshot row vanished")?;
@@ -1386,5 +1404,24 @@ impl Store {
             )?
             .query_row(params![job_id, group, task_name], |row| row.get(0))?;
         Ok(count.max(0) as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A park says so; anything else a node reports for a local suspension,
+    /// an empty reason included, is the pressure step it always was.
+    #[test]
+    fn a_local_suspension_records_park_or_pressure_test() {
+        assert_eq!(local_suspension_reason("park"), SUSPEND_REASON_PARK);
+        for other in ["", "pressure", "idle", "manual", "PARK"] {
+            assert_eq!(
+                local_suspension_reason(other),
+                SUSPEND_REASON_PRESSURE,
+                "{other:?}"
+            );
+        }
     }
 }
