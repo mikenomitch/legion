@@ -1199,7 +1199,11 @@ mod tests {
 
     /// One request through `address`: what the node listener answered.
     fn ask(address: &SocketAddr) -> io::Result<String> {
-        let mut workload = TcpStream::connect(address)?;
+        ask_on(&mut TcpStream::connect(address)?)
+    }
+
+    /// One request on an open connection, which stays open.
+    fn ask_on(workload: &mut TcpStream) -> io::Result<String> {
         workload.set_read_timeout(Some(Duration::from_secs(5)))?;
         workload.write_all(b"select 1\n")?;
         let mut answer = [0u8; 10];
@@ -1241,11 +1245,20 @@ mod tests {
         assert_eq!(upstreams.addresses(), expected);
         assert_eq!(upstreams.target(port), Some(u32::from(port)));
 
+        // Held open, every relay is tracked, and a restore closes them all.
+        // A connection dropped first could finish its relay before the
+        // count is read.
+        let mut open = Vec::new();
         for address in &expected {
-            assert_eq!(ask(address)?, "aSELECT 1\n", "through {address}");
-            wait_until("the relay is tracked", || relays.open_count() >= 1);
+            let mut workload = TcpStream::connect(address)?;
+            assert_eq!(ask_on(&mut workload)?, "aSELECT 1\n", "through {address}");
+            open.push(workload);
         }
-        assert!(relays.close_all() >= 1);
+        wait_until("the relays are tracked", || {
+            relays.open_count() == expected.len()
+        });
+        assert_eq!(relays.close_all(), expected.len());
+        drop(open);
 
         // Restored into an allocation whose local port for it is another,
         // with another VIP: the workload's port stays, every listener
