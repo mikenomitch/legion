@@ -122,12 +122,16 @@ pub const PARK_RUNTIMES: [&str; 3] = ["exec", "container", "sandbox"];
 /// (`$LEGION_PARK_SOCKET`) on which the workload says when it is waiting
 /// (docs/park.md).
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ParkConfig {
     /// How long a park waits before it suspends, unless the `park` request
     /// names its own `after`. Default `"10s"`; `"0s"` suspends at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// [`ParkConfig`] with defaults applied.
@@ -1268,6 +1272,7 @@ crate::structs::spec_fields::spec_block!(
         "idle",
         "onPressure",
         "wake",
+        "park",
         "keepFor",
         "checkpointEvery",
         "onWorkerStop"
@@ -1275,9 +1280,11 @@ crate::structs::spec_fields::spec_block!(
     |this, walk| {
         walk.opt("idle", this.idle.as_mut());
         walk.opt("wake", this.wake.as_mut());
+        walk.opt("park", this.park.as_mut());
     }
 );
 crate::structs::spec_fields::spec_block!(WakeConfig, ["port", "timeout"]);
+crate::structs::spec_fields::spec_block!(ParkConfig, ["after"]);
 crate::structs::spec_fields::spec_block!(IdleConfig, ["after", "signals", "cpuBelow"]);
 
 #[cfg(test)]
@@ -1379,6 +1386,7 @@ mod tests {
 
         let now = ParkConfig {
             after: Some("0s".into()),
+            ..Default::default()
         }
         .resolve()
         .unwrap();
@@ -1386,6 +1394,7 @@ mod tests {
 
         let err = ParkConfig {
             after: Some("soon".into()),
+            ..Default::default()
         }
         .resolve()
         .unwrap_err();
@@ -1396,6 +1405,7 @@ mod tests {
         assert!(SuspendConfig::default().resolve().unwrap().park.is_none());
         let err = ParkConfig {
             after: Some("2d".into()),
+            ..Default::default()
         }
         .resolve()
         .unwrap_err();
@@ -1418,10 +1428,26 @@ mod tests {
              can hand a park socket to\nHint: suspend.park works on the exec, container, sandbox \
              runtimes"
         );
-        // A misspelled field is refused when the spec parses, not ignored.
+        // A misspelled field is refused at a strict submit, with the fix.
+        let err = crate::structs::JobConfig::parse_submitted(
+            serde_json::json!({
+                "name": "agents",
+                "task": {
+                    "name": "agent",
+                    "runtime": "exec",
+                    "config": { "command": ["sleep", "1"] },
+                    "stateful": { "mode": "keyed" },
+                    "suspend": { "park": { "aftr": "1s" } },
+                },
+            }),
+            crate::structs::spec_fields::UnknownFieldMode::Reject,
+        )
+        .map(|_| ())
+        .unwrap_err();
         assert!(
-            serde_json::from_value::<ParkConfig>(serde_json::json!({ "afterwards": "1s" }))
-                .is_err()
+            format!("{err:#}")
+                .contains("unknown field `suspend.park.aftr` (did you mean `suspend.park.after`?)"),
+            "{err:#}"
         );
     }
 

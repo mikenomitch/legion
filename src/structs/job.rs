@@ -6430,6 +6430,7 @@ mod unknown_fields_test {
                     cover(suspend, "suspend", &mut seen);
                     cover_opt(suspend.idle.as_ref(), "suspend.idle", &mut seen);
                     cover_opt(suspend.wake.as_ref(), "suspend.wake", &mut seen);
+                    cover_opt(suspend.park.as_ref(), "suspend.park", &mut seen);
                 }
             }
         }
