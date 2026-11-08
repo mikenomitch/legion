@@ -484,6 +484,12 @@ mod mcp_tools_test {
                 .find(|(name, _)| *name == tool.name)
                 .map(|(_, rpc)| *rpc)
                 .unwrap();
+            // Gated on `app:read` plus the action's own declared permission,
+            // which may be a write: an action can change state.
+            if rpc == "InvokeAppAction" {
+                assert!(tool.mutates);
+                continue;
+            }
             if let Some(access) = crate::manager::rpc_access::access_of(rpc) {
                 assert_eq!(
                     tool.mutates,
