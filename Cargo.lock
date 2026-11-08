@@ -2293,6 +2293,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "legion-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "serde",
+ "serde_json",
+ "tabled",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "legion-rs"
 version = "0.1.0"
 dependencies = [
@@ -2326,6 +2338,7 @@ dependencies = [
  "landlock",
  "lazy_static",
  "legion-guest",
+ "legion-proto",
  "libc",
  "libloading",
  "nickel-lang-core",
@@ -2367,7 +2380,6 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "tonic",
- "tonic-build",
  "tonic-web",
  "tower 0.4.13",
  "tower-http 0.5.2",

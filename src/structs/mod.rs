@@ -1,8 +1,6 @@
-// The generated protobuf code (included below) carries doc comments whose
-// list formatting newer clippy flags; we don't hand-maintain generated output.
-#![allow(clippy::doc_overindented_list_items)]
-
-tonic::include_proto!("legion");
+// The generated protobuf types and gRPC stubs live in the `legion-proto`
+// crate (`proto/`); Legion's code names them through this module.
+pub use legion_proto::*;
 
 pub mod acl;
 pub mod app;
@@ -49,6 +47,7 @@ pub use artifact::*;
 pub use band::*;
 pub use config::*;
 pub use edge_boot::*;
+pub use eval::EvalExt;
 pub use instance::*;
 pub use job::*;
 pub use ledger::*;

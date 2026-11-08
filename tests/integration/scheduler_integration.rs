@@ -1,3 +1,4 @@
+use legion::structs::EvalExt;
 use std::collections::{HashMap, HashSet};
 
 use legion::prelude::{json, Context, R};

@@ -334,7 +334,7 @@ mod tests {
     /// buffering one would hang until the client closes its stream.
     #[test]
     fn streaming_rpcs_match_the_proto() {
-        let proto = include_str!("../../proto/legion.proto");
+        let proto = legion_proto::PROTO_SOURCE;
         let manager = proto
             .split("service Manager {")
             .nth(1)

@@ -16,6 +16,7 @@ use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;
 use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
+use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::TaskConfig, job::TaskCount, Band, Eval,
     HeartbeatRequest, Node, NodeMsg, PressureAction, StopCause, Submission,

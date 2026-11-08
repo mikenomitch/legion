@@ -9,6 +9,7 @@
 //! test thread so every step is observable. The last test runs the same
 //! story across a scheduler-lane failover on a 3-manager raft cluster.
 
+use legion::structs::EvalExt;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 

@@ -17,6 +17,7 @@ use legion::storage::events::SchedulerEventFilter;
 use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
 use legion::structs::snapshot::SnapshotsConfig;
+use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::StatefulConfig, job::StatefulStorageConfig,
     job::TaskConfig, CreateSnapshotRequest, DeleteSnapshotRequest, GetInstanceRequest,

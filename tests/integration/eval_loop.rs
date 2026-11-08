@@ -1,5 +1,6 @@
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
+use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::TaskConfig, job::TaskCount,
     ledger::LedgerEntry, Eval, Submission,

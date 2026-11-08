@@ -1,0 +1,26 @@
+[package]
+name = "legion-proto"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Legion's wire types: the protobuf messages and gRPC service stubs generated from legion.proto"
+repository = "https://github.com/mikenomitch/legion"
+
+# The generated code for `legion.proto` — every message, enum, and the tonic
+# client and server stubs — as its own crate, so the main crate stops
+# recompiling ~640 serde-derived types on every edit and rustc never holds
+# them in the same process as the rest of Legion
+# (internal_docs/plans/workspace-crate-split-plan.md, phase 1). Nothing but
+# generated code and the few impls the orphan rule pins to these types
+# belongs here.
+[dependencies]
+prost = "0.13.3"
+serde = { version = "1.0", features = ["derive"] }
+tabled = "0.16.0"
+tonic = "0.12.3"
+
+[dev-dependencies]
+serde_json = "1.0"
+
+[build-dependencies]
+tonic-build = "0.12.3"

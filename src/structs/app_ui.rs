@@ -2726,7 +2726,7 @@ mod tests {
 
     #[test]
     fn page_rpcs_are_unary_manager_rpcs() {
-        let proto = include_str!("../../proto/legion.proto");
+        let proto = legion_proto::PROTO_SOURCE;
         let manager = proto
             .split("service Manager {")
             .nth(1)

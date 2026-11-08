@@ -4159,8 +4159,15 @@ fn validate_template_source(scope: &str, source: &KvTemplateSource) -> R<()> {
     }
 }
 
-impl Submission {
-    pub fn hash(&self) -> String {
+/// Content hashing for a [`Submission`], a generated wire type
+/// (`legion-proto`): the orphan rule keeps the method off an inherent impl.
+pub trait SubmissionExt {
+    /// The hex SHA-256 of the submitted source.
+    fn hash(&self) -> String;
+}
+
+impl SubmissionExt for Submission {
+    fn hash(&self) -> String {
         let hash = Sha256::digest(self.content.as_bytes());
         format!("{:x}", hash)
     }

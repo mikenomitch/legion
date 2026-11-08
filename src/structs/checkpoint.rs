@@ -333,36 +333,9 @@ impl SnapshotManifest {
 /// the `legion-guest` crate the guest binary is built from.
 pub use legion_guest::identity::{GuestAddr, GuestTokenFile, ResumeIdentity};
 
-/// Never prints the key bytes (build.rs turns off the generated Debug).
-impl fmt::Debug for crate::structs::CheckpointPartKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CheckpointPartKey")
-            .field("digest", &self.digest)
-            .field("key_id", &self.key_id)
-            .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
-            .finish()
-    }
-}
-
-/// Never prints the key bytes (build.rs turns off the generated Debug).
-impl fmt::Debug for crate::structs::SessionSealKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SessionSealKey")
-            .field("key_id", &self.key_id)
-            .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
-            .finish()
-    }
-}
-
-/// Never prints the key bytes (build.rs turns off the generated Debug).
-impl fmt::Debug for crate::structs::CheckpointChunkKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CheckpointChunkKey")
-            .field("key_id", &self.key_id)
-            .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
-            .finish()
-    }
-}
+// The redacting `Debug` for `CheckpointPartKey`, `SessionSealKey`, and
+// `CheckpointChunkKey` lives beside the generated types in `legion-proto`
+// (proto/src/redacted.rs): the orphan rule puts it in their crate.
 
 /// Why a node cannot restore a checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]

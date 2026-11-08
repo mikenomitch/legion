@@ -13,6 +13,7 @@
 // Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
 #![allow(clippy::result_large_err)]
 
+use legion::structs::EvalExt;
 use std::collections::HashSet;
 
 use legion::manager::server::ManagerDaemonService;

@@ -6,6 +6,7 @@
 
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
+use legion::structs::EvalExt;
 use legion::structs::{config::ManagerConfigFull, job::JobConfig, Node, NodeMsg, Submission};
 use serde_json::Value;
 

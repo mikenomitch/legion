@@ -11,6 +11,7 @@
 // Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
 #![allow(clippy::result_large_err)]
 
+use legion::structs::EvalExt;
 use std::sync::Arc;
 use std::time::Duration;
 

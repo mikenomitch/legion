@@ -17,6 +17,7 @@ use legion::manager::cadence::{
 use legion::manager::daemon::liveness_snapshot;
 use legion::prelude::R;
 use legion::storage::store::Store;
+use legion::structs::EvalExt;
 use legion::structs::{
     HeartbeatConfigFull, LivenessConfigFull, ManagerConfigFull, NodeMsg, PersistenceConfigFull,
 };

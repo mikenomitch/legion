@@ -1,7 +1,7 @@
 use crate::cmd::helpers::{connect_manager_client, json_flag};
 use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
-use crate::structs::{Allocation, GetLedgerRequest, LedgerEntry, Node};
+use crate::structs::{Allocation, GetLedgerRequest, LedgerEntry, LedgerNodeExt, Node};
 use serde::Serialize;
 use serde_json::Value;
 

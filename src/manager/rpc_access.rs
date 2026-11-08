@@ -260,7 +260,7 @@ pub fn access_of(rpc: &str) -> Option<Access> {
 
 /// The Manager RPC names in `proto/legion.proto`, in proto order.
 pub fn proto_manager_rpcs() -> Vec<&'static str> {
-    let proto = include_str!("../../proto/legion.proto");
+    let proto = legion_proto::PROTO_SOURCE;
     let service = proto
         .split("service Manager {")
         .nth(1)

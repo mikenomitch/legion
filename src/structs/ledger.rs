@@ -83,8 +83,16 @@ impl From<LedgerEntry> for LedgerNode {
     }
 }
 
-impl LedgerNode {
-    pub fn into_entry(self) -> R<LedgerEntry> {
+/// Decoding a ledger node off the wire. `LedgerNode` and `LedgerAllocation`
+/// are generated wire types (`legion-proto`), so the conversions are traits:
+/// the orphan rule forbids an inherent impl on another crate's type.
+pub trait LedgerNodeExt {
+    /// The node and its allocations, with their JSON columns parsed.
+    fn into_entry(self) -> R<LedgerEntry>;
+}
+
+impl LedgerNodeExt for LedgerNode {
+    fn into_entry(self) -> R<LedgerEntry> {
         let node_msg = self.node.context("Ledger node missing node information")?;
         let node: Node = node_msg.into();
 
@@ -137,8 +145,14 @@ impl From<Allocation> for LedgerAllocation {
     }
 }
 
-impl LedgerAllocation {
-    pub fn into_allocation(self) -> R<Allocation> {
+/// Decoding one allocation of a [`LedgerNode`] off the wire.
+pub trait LedgerAllocationExt {
+    /// The allocation, with its `resources` and `network` JSON parsed.
+    fn into_allocation(self) -> R<Allocation>;
+}
+
+impl LedgerAllocationExt for LedgerAllocation {
+    fn into_allocation(self) -> R<Allocation> {
         let LedgerAllocation {
             id,
             status,

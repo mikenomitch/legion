@@ -22,6 +22,7 @@ use legion::prelude::{Context, R};
 use legion::storage::store::Store;
 use legion::structs::config::ManagerConfigFull;
 use legion::structs::job::{JobConfig, TaskConfig, TaskCount};
+use legion::structs::EvalExt;
 use legion::structs::{Node, NodeMsg, Submission};
 use serde_json::json;
 

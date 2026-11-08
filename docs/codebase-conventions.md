@@ -8,6 +8,15 @@ This page lists the conventions used across the Legion codebase.
 - Worker runtime code is under `src/worker/`.
 - Persistence code is under `src/storage/`.
 - Shared structs and schema-facing types live under `src/structs/`.
+- The types generated from `proto/legion.proto` are their own workspace
+  crate, `legion-proto` (the `proto/` directory: `build.rs` runs
+  `tonic-build`, `src/lib.rs` includes the output). `legion::structs`
+  re-exports all of it, so Legion code names them as `crate::structs::Job`
+  like any other struct. Because they belong to another crate, behavior on a
+  generated type that needs the rest of Legion is an extension trait next to
+  the code that uses it (`EvalExt` in `src/structs/eval.rs`,
+  `SubmissionExt`, `LedgerNodeExt`), and a foreign trait impl on one (the
+  redacting `Debug` for key-carrying messages) lives in `proto/src/`.
 - CLI surface is under `src/cmd/`.
 - Task runtime implementations are under `src/task_plugins/`.
 - Embedding WASM is under `src/wasm/`: the engine, limits, failure

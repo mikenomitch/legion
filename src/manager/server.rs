@@ -15520,6 +15520,7 @@ mod tests {
     use super::*;
     use crate::structs::config::ManagerConfigFull;
     use crate::structs::worker_server::Worker;
+    use crate::structs::EvalExt;
     use crate::structs::{
         AllocationHealth, Eval, GetAllocationLogsRequest, JobConfig, ListRolloutEventsRequest,
         MaterialRef, NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest, RestartWorkerReply,

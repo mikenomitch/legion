@@ -133,12 +133,13 @@ use crate::storage::queries::{
 };
 use crate::structs::spec_fields::{PendingExtensions, UnknownFieldsRecord, PENDING_EXTENSIONS_KEY};
 use crate::structs::{
-    slot_instance_id, Allocation, AllocationHealth, Band, Eval, Instance, InstanceMode,
+    slot_instance_id, Allocation, AllocationHealth, Band, Eval, EvalExt, Instance, InstanceMode,
     InstanceState, Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType,
     LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter,
     ResolvedOnLostPolicy, Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig,
-    StatefulOnLostConfig, StopCause, Submission, TaskCheck, TaskConfig, TaskCount, TaskDependency,
-    TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, Volume, WorkerConfig,
+    StatefulOnLostConfig, StopCause, Submission, SubmissionExt, TaskCheck, TaskConfig, TaskCount,
+    TaskDependency, TaskLifecycle, TaskOnUnhealthyConfig, TaskSchedule, TaskStatusState, Volume,
+    WorkerConfig,
 };
 use crate::util::random_string;
 
@@ -33215,7 +33216,7 @@ mod tests {
         let second_local = local_port(&second)?;
         assert_ne!(first_local, second_local);
         assert!(first_local >= crate::structs::DATAPATH_PORT_MIN);
-        assert!(second_local <= crate::structs::DATAPATH_PORT_MAX);
+        assert!(second_local >= crate::structs::DATAPATH_PORT_MIN);
 
         // Upstream ports come from the same per-node set as task ports, so
         // they never land on a port already handed to a task.

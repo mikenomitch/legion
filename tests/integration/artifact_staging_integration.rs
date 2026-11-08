@@ -3,6 +3,7 @@
 //! failure path through `record_failure`, the `artifact_states` heartbeat
 //! flow, and manager admission (normalization, pinning, regression guards).
 
+use legion::structs::EvalExt;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;

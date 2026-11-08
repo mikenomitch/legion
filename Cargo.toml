@@ -14,7 +14,6 @@ categories = ["command-line-utilities", "virtualization"]
 # benchmarks, and the example plugins stay in the repo.
 include = [
     "/src/**",
-    "/proto/**",
     "/build.rs",
     "/Cargo.toml",
     "/Cargo.lock",
@@ -27,6 +26,7 @@ include = [
 
 # The workspace is this crate plus `guest/`, the in-guest agent that ships as
 # its own static binary (docs/task-runtime-sandbox.md, "The guest agent"),
+# `proto/`, the generated wire types (`legion-proto`),
 # and the scaling-plugin SDK (`legion-scaling-plugin`,
 # docs/autoscaling-plugins.md), so `cargo test --all` builds and tests it.
 # The example plugins under `plugins/` are separate crates built by build.rs
@@ -35,13 +35,16 @@ include = [
 # Not ".": the root package is a member of its own workspace anyway, and
 # listing it makes every path under the root an explicit member, which
 # overrides `exclude` and breaks every plugin build.
-members = ["guest", "examples/scaling-plugins/rust"]
+members = ["guest", "proto", "examples/scaling-plugins/rust"]
 exclude = ["plugins"]
 
 [dependencies]
 # The guest agent, resume handler, and identity disk format, shared with the
 # static `legion-guest` binary built from the same crate.
 legion-guest = { path = "guest", version = "0.1.0" }
+# The generated protobuf types and gRPC stubs, re-exported from
+# `legion::structs` (internal_docs/plans/workspace-crate-split-plan.md).
+legion-proto = { path = "proto", version = "0.1.0" }
 clap = { version = "4.5.48", features = ["cargo", "derive"] }
 futures = "0.3"
 # Persistent (HAMT) maps for the scheduler's read model: a plan's capacity
@@ -194,9 +197,6 @@ aya = "0.14.0"
 
 [dev-dependencies]
 criterion = "0.5.1"
-
-[build-dependencies]
-tonic-build = "0.12.3"
 
 # Benchmarks all live under `benchmarks/` — the Criterion targets below in
 # `benchmarks/micro/`, alongside the scenario-driven scheduler harness

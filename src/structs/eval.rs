@@ -36,8 +36,49 @@ fn observe_phase(kind: &str, phase: &str, elapsed: Duration) {
         .observe(&[kind, phase], elapsed.as_secs_f64());
 }
 
-impl Eval {
-    pub fn handle(&self, store: &Store) -> R<String> {
+/// The eval loop's behavior on an [`Eval`]. `Eval` is a generated wire type
+/// (`legion-proto`), and the orphan rule forbids an inherent impl on another
+/// crate's type, so it reaches the type through this trait.
+pub trait EvalExt {
+    /// Run this eval against `store`: plan, apply, and dispatch whatever it
+    /// asks for. Returns a one-line summary for the eval's event.
+    fn handle(&self, store: &Store) -> R<String>;
+
+    /// Whether `error` is a plan conflict (`StorageError::Conflict`), the
+    /// transient class an eval is requeued for instead of failed.
+    fn error_is_plan_conflict(error: &anyhow::Error) -> bool;
+
+    /// The jittered requeue delay for a conflict-exhausted eval.
+    fn plan_conflict_requeue_delay(store: &Store) -> Duration;
+}
+
+impl EvalExt for Eval {
+    fn handle(&self, store: &Store) -> R<String> {
+        EvalRun(self).handle(store)
+    }
+
+    fn error_is_plan_conflict(error: &anyhow::Error) -> bool {
+        EvalRun::error_is_plan_conflict(error)
+    }
+
+    fn plan_conflict_requeue_delay(store: &Store) -> Duration {
+        EvalRun::plan_conflict_requeue_delay(store)
+    }
+}
+
+/// One eval being handled: the implementation behind [`EvalExt`].
+struct EvalRun<'a>(&'a Eval);
+
+impl std::ops::Deref for EvalRun<'_> {
+    type Target = Eval;
+
+    fn deref(&self) -> &Eval {
+        self.0
+    }
+}
+
+impl EvalRun<'_> {
+    fn handle(&self, store: &Store) -> R<String> {
         match self.kind.as_str() {
             "node_join" => self.handle_node_join(store),
             "node_drop" => self.handle_node_drop(store),
@@ -875,7 +916,7 @@ mod tests {
     #[test]
     fn max_plan_conflict_retries_defaults_to_three() -> R<()> {
         let store = setup_store()?;
-        assert_eq!(Eval::max_plan_conflict_retries(&store), 3);
+        assert_eq!(EvalRun::max_plan_conflict_retries(&store), 3);
         Ok(())
     }
 
@@ -897,7 +938,7 @@ mod tests {
 
         let store = Store::start_storage(&store_config)?;
         store.reset_all_tables()?;
-        assert_eq!(Eval::max_plan_conflict_retries(&store), 9);
+        assert_eq!(EvalRun::max_plan_conflict_retries(&store), 9);
 
         Ok(())
     }
@@ -905,7 +946,7 @@ mod tests {
     #[test]
     fn plan_conflict_backoff_settings_use_defaults() -> R<()> {
         let store = setup_store()?;
-        let settings = Eval::plan_conflict_backoff_settings(&store);
+        let settings = EvalRun::plan_conflict_backoff_settings(&store);
         assert_eq!(settings.base_delay_ms, 25);
         assert_eq!(settings.max_delay_ms, 500);
         assert_eq!(settings.jitter_ms, 35);
@@ -919,7 +960,7 @@ mod tests {
             max_delay_ms: 80,
             jitter_ms: 0,
         };
-        let delay = Eval::adaptive_retry_delay(settings, 6, 6);
+        let delay = EvalRun::adaptive_retry_delay(settings, 6, 6);
         assert_eq!(delay, Duration::from_millis(80));
     }
 
@@ -931,23 +972,23 @@ mod tests {
             message: "plan submission rejected".into(),
         })
         .context("plan submission failed after 3 attempts");
-        assert!(Eval::error_is_plan_conflict(&wrapped));
+        assert!(EvalRun::error_is_plan_conflict(&wrapped));
 
         let unrelated = anyhow::anyhow!("no available nodes matching constraints");
-        assert!(!Eval::error_is_plan_conflict(&unrelated));
+        assert!(!EvalRun::error_is_plan_conflict(&unrelated));
 
         let not_found = anyhow::Error::new(StorageError::NotFound {
             entity: "job",
             id: "x".into(),
         });
-        assert!(!Eval::error_is_plan_conflict(&not_found));
+        assert!(!EvalRun::error_is_plan_conflict(&not_found));
     }
 
     #[test]
     fn plan_conflict_requeue_delay_is_jittered_within_bounds() -> R<()> {
         let store = setup_store()?;
         for _ in 0..10 {
-            let delay = Eval::plan_conflict_requeue_delay(&store);
+            let delay = EvalRun::plan_conflict_requeue_delay(&store);
             assert!(delay >= Duration::from_millis(1_000), "delay {delay:?}");
             assert!(delay <= Duration::from_millis(2_000), "delay {delay:?}");
         }
@@ -973,7 +1014,7 @@ mod tests {
         store.reset_all_tables()?;
 
         for _ in 0..10 {
-            let delay = Eval::plan_conflict_requeue_delay(&store);
+            let delay = EvalRun::plan_conflict_requeue_delay(&store);
             assert!(delay >= Duration::from_millis(100), "delay {delay:?}");
             assert!(delay <= Duration::from_millis(200), "delay {delay:?}");
         }

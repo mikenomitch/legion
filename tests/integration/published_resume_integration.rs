@@ -20,6 +20,7 @@ use legion::storage::events::SchedulerEventFilter;
 use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
 use legion::structs::suspend::SuspendConfig;
+use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::StatefulConfig, job::TaskConfig,
     CheckpointPartKey, CheckpointRequest, ContentLocation, ContentLocationReport,
