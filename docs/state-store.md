@@ -144,7 +144,10 @@ Main tables (see migrations):
 - `eval`
 - `manager_config`
 - `kv_entry`, `kv_lock`, `job_kv_reference`
-- `allocation_epoch`, `plan_submission`
+- `allocation_epoch`
+- `plan_submission`, a bounded record of rejected and staged plans (about the
+  last 1,000); applied plans write no row
+  (see [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#plan-records)).
 - `node_alloc_usage`, a cache rather than a source of truth. It holds one
   row per node with the aggregated resource usage of that node's
   allocations. Each row also stores a fingerprint of the rows it was derived

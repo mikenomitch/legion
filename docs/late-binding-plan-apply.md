@@ -206,13 +206,15 @@ scheduler.
 
 ## Rollout and version compatibility
 
-Candidate-carrying plans are stored in a new submission format (format 2)
-in the replicated `plan_submission` row. Older formats still parse, so
-upgrading needs no migration. An older manager cannot parse format-2 rows,
-though. Under raft, follow the standard same-version upgrade order
-([upgrades.md](upgrades.md)). If you must run a mixed-version manager fleet
-beyond an upgrade window, set `plan_candidates = 0` until every manager is
-on the same version. That stops format-2 rows from being written at all.
+Candidate-carrying plans use a submission format (format 2) that only
+reaches the replicated `plan_submission` table when a plan is rejected or
+staged: an applied plan writes no row
+([plan records](scheduler-and-eval-loop.md#plan-records)). Older formats still
+parse. An older manager cannot parse format-2 rows, though. Under raft,
+follow the standard same-version upgrade order ([upgrades.md](upgrades.md)).
+If you must run a mixed-version manager fleet beyond an upgrade window, set
+`plan_candidates = 0` until every manager is on the same version. That stops
+format-2 rows from being written at all.
 
 `plan_candidates = 0` also restores single-node submissions. It does not
 turn off the two-pass bind: a single-candidate plan whose node was touched

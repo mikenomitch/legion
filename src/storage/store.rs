@@ -30,6 +30,10 @@ mod read_model_check;
 mod blocked_evals;
 pub use blocked_evals::{BlockedEval, CAPACITY_REPLAY_WINDOW};
 mod eval_claims;
+// What `plan_submission` keeps: rejections and staged plans, id-windowed.
+mod plan_records;
+use plan_records::PlanRecord;
+pub use plan_records::PLAN_SUBMISSION_RETAINED;
 mod fork_ops;
 mod group_commit;
 mod session_ops;
@@ -834,7 +838,11 @@ pub(crate) type PlanCapacityParts = (
 
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
-    pub id: i64,
+    /// The `plan_submission` row that records this plan, if one is kept: a
+    /// staged plan's row, or a rejected plan's record. `None` for a plan
+    /// the fused submit-and-apply op applied, which keeps no row
+    /// (`store/plan_records.rs`).
+    pub id: Option<i64>,
     pub job_config_id: String,
     pub expected_versions: BTreeMap<String, i64>,
 }
@@ -1225,7 +1233,31 @@ enum PlanPlacements {
     Candidates(Vec<PlanSubmissionPlacement>),
 }
 
+/// What a plan's apply walk consumes, wherever it came from: the fused
+/// request in memory, or a staged row read back
+/// (`store/plan_records.rs`).
+struct PlanBody<'a> {
+    mode: &'a str,
+    placements: &'a [PlanSubmissionPlacement],
+    evictions: &'a [PlanEviction],
+    /// Set only by a ratification (docs/edge-boot.md).
+    target_instance: Option<&'a str>,
+}
+
 impl PlanPlacements {
+    /// Format-1 `(node, task)` pairs as the walk's singleton candidate
+    /// lists: exact-CAS semantics, one node per placement.
+    fn singleton_candidates(pairs: &[(String, i64)]) -> Vec<PlanSubmissionPlacement> {
+        pairs
+            .iter()
+            .map(|(node_id, task_id)| PlanSubmissionPlacement {
+                task_id: *task_id,
+                candidates: vec![node_id.clone()],
+                instance_id: None,
+            })
+            .collect()
+    }
+
     /// The `plan_submission.placements` JSON for this shape.
     fn to_json(&self) -> R<String> {
         match self {
@@ -5060,6 +5092,10 @@ impl Store {
         )
     }
 
+    /// The staged path's insert: a `queued` row the matching
+    /// [`Self::apply_plan_submission`] consumes (deleting it when the plan
+    /// applies). The fused path writes no row up front
+    /// (`store/plan_records.rs`).
     fn insert_plan_submission_apply(
         &self,
         job_config_id: &str,
@@ -5070,7 +5106,7 @@ impl Store {
         target_instance: &str,
     ) -> R<PlanSubmission> {
         let conn = self.write_connection()?;
-        self.insert_plan_submission_on(
+        let id = Self::insert_plan_record_on(
             &conn,
             job_config_id,
             mode,
@@ -5078,48 +5114,10 @@ impl Store {
             expected_versions,
             evictions,
             target_instance,
-        )
-    }
-
-    /// [`Self::insert_plan_submission_apply`] on a caller-supplied
-    /// connection, so the row can join the transaction the plan itself
-    /// applies in (the fused op, and every plan inside a group commit).
-    fn insert_plan_submission_on(
-        &self,
-        conn: &Connection,
-        job_config_id: &str,
-        mode: &str,
-        placements_json: &str,
-        expected_versions: &BTreeMap<String, i64>,
-        evictions: &[PlanEviction],
-        target_instance: &str,
-    ) -> R<PlanSubmission> {
-        let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
-        let evictions_json = serde_json::to_string(evictions)?;
-        let expected_vector_json = serde_json::to_string(expected_versions)?;
-        let expected_job_epoch = *expected_versions
-            .get(&Self::scope_vector_key("job_config", job_config_id))
-            .unwrap_or(&0);
-        let id = conn
-            .prepare_cached(
-                "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at, evictions, target_instance) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8) RETURNING id;",
-            )?
-            .query_row(
-                params![
-                    job_config_id,
-                    mode,
-                    placements_json,
-                    expected_job_epoch,
-                    expected_vector_json,
-                    created_at,
-                    evictions_json,
-                    target_instance
-                ],
-                |row| row.get(0),
-            )?;
-
+            None,
+        )?;
         Ok(PlanSubmission {
-            id,
+            id: Some(id),
             job_config_id: job_config_id.to_string(),
             expected_versions: expected_versions.clone(),
         })
@@ -5277,27 +5275,44 @@ impl Store {
         Ok(reply)
     }
 
-    /// One plan of either format, applied on `tx`: insert the submission
-    /// row and run the candidate walk, returning the side effects the
+    /// One plan of either format, applied on `tx`: run the candidate walk
+    /// over the request's own placements, returning the side effects the
     /// caller must emit once `tx` commits. Format 1 and format 2 share
-    /// this body — the submission's serialized shape is what differs, not
-    /// the walk (docs/late-binding-plan-apply.md).
+    /// this body (docs/late-binding-plan-apply.md).
+    ///
+    /// Nothing is written to `plan_submission` up front, and the walk never
+    /// reads the plan back: the placements are already here, in the
+    /// request. Serializing them to JSON, inserting them, selecting them
+    /// back, and parsing them again cost the serialized commit work that
+    /// grew with every placement's candidate list (review SCH5). A
+    /// rejected plan still leaves its record (`store/plan_records.rs`).
     fn submit_and_apply_plan_on(
         &self,
         tx: &Connection,
         request: &PlanApplyRequest,
     ) -> R<(PlanApplyReply, PlanApplyEffects)> {
-        let placements_json = request.placements.to_json()?;
-        let submission = self.insert_plan_submission_on(
-            tx,
-            &request.job_config_id,
-            &request.mode,
-            &placements_json,
-            &request.expected_versions,
-            &request.evictions,
-            &request.target_instance,
-        )?;
-        let (outcome, mut effects) = self.apply_plan_submission_on(tx, &submission)?;
+        let mut submission = PlanSubmission {
+            id: None,
+            job_config_id: request.job_config_id.clone(),
+            expected_versions: request.expected_versions.clone(),
+        };
+        let singletons;
+        let placements: &[PlanSubmissionPlacement] = match &request.placements {
+            PlanPlacements::Candidates(placements) => placements,
+            PlanPlacements::Nodes(pairs) => {
+                singletons = PlanPlacements::singleton_candidates(pairs);
+                &singletons
+            }
+        };
+        let body = PlanBody {
+            mode: &request.mode,
+            placements,
+            evictions: &request.evictions,
+            target_instance: Some(request.target_instance.as_str()).filter(|id| !id.is_empty()),
+        };
+        let (outcome, mut effects, record_id) =
+            self.apply_plan_walk_on(tx, &submission, body, PlanRecord::Unwritten(request))?;
+        submission.id = record_id;
         if let (Some(settle), PlanApplyOutcome::Applied(_)) = (&request.settle, &outcome) {
             // The plan placed everything its eval wanted: the job's blocked
             // eval, if any, waits for nothing.
@@ -5772,16 +5787,61 @@ impl Store {
 
     /// [`Self::apply_plan_submission_apply`] on a caller-supplied
     /// transaction, returning the side effects to emit once that
-    /// transaction commits. The group commit runs this once per plan
-    /// inside the batch's single transaction.
+    /// transaction commits: the staged path, which reads its plan back from
+    /// the `queued` row [`Self::insert_plan_submission`] wrote (it was
+    /// persisted across two ops), then runs the shared walk.
     fn apply_plan_submission_on(
         &self,
         tx: &Connection,
         submission: &PlanSubmission,
     ) -> R<(PlanApplyOutcome, PlanApplyEffects)> {
+        let id = submission
+            .id
+            .context("a staged plan submission carries the id of its row")?;
+        let row: Option<(String, String, String, Option<String>)> = tx
+            .prepare_cached(
+                "SELECT placements, mode, evictions, target_instance FROM plan_submission \
+                 WHERE id = ?1;",
+            )?
+            .query_row([id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .optional()?;
+        let Some((placements_json, mode, evictions_json, target_instance)) = row else {
+            bail!(
+                "plan submission {id} no longer exists: it was applied already, or it fell out \
+                 of the {PLAN_SUBMISSION_RETAINED}-record window before it was applied"
+            );
+        };
+        let placements = Self::parse_plan_submission_placements(&placements_json)?;
+        let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
+        let body = PlanBody {
+            mode: &mode,
+            placements: &placements,
+            evictions: &evictions,
+            target_instance: target_instance.as_deref().filter(|id| !id.is_empty()),
+        };
+        let (outcome, effects, _) =
+            self.apply_plan_walk_on(tx, submission, body, PlanRecord::Staged(id))?;
+        Ok((outcome, effects))
+    }
+
+    /// The apply walk both paths share: bind every placement of `body`
+    /// (see [`Self::apply_plan_submission_apply`] for the rules), and keep
+    /// `record` the way `store/plan_records.rs` says — an applied plan
+    /// leaves no row, a rejected one leaves its reason. Returns the side
+    /// effects to emit once `tx` commits, and the id of the record kept,
+    /// if any.
+    fn apply_plan_walk_on(
+        &self,
+        tx: &Connection,
+        submission: &PlanSubmission,
+        body: PlanBody<'_>,
+        record: PlanRecord<'_>,
+    ) -> R<(PlanApplyOutcome, PlanApplyEffects, Option<i64>)> {
         let tx_started = Instant::now();
         debug!(
-            submission_id = submission.id,
+            submission_id = ?submission.id,
             job_config_id = %submission.job_config_id,
             expected_scope_count = submission.expected_versions.len(),
             "Applying plan submission"
@@ -5798,21 +5858,24 @@ impl Store {
         let reject = |tx: &Connection,
                       reason: String,
                       reverted: Option<usize>|
-         -> R<(PlanApplyOutcome, PlanApplyEffects)> {
+         -> R<(PlanApplyOutcome, PlanApplyEffects, Option<i64>)> {
             if reverted.is_some() {
                 tx.execute_batch("ROLLBACK TO legion_plan_body; RELEASE legion_plan_body;")?;
             }
-            tx.prepare_cached(
-                "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
-            )?
-            .execute(params![reason, submission.id])?;
+            let record_id = Self::record_rejected_plan_on(
+                tx,
+                &record,
+                &submission.job_config_id,
+                &submission.expected_versions,
+                &reason,
+            )?;
             let latest_versions = self.scope_vector_epochs_tx(tx, &submission.expected_versions)?;
             let rejected_event = self.stage_event_locked(
                 tx,
                 drafts::plan_rejected(&submission.job_config_id, &reason),
             );
             warn!(
-                submission_id = submission.id,
+                submission_id = record_id,
                 job_config_id = %submission.job_config_id,
                 reverted_writes = reverted.unwrap_or_default(),
                 duration_ms = tx_started.elapsed().as_millis() as u64,
@@ -5836,26 +5899,14 @@ impl Store {
                     events: rejected_event.into_iter().collect(),
                     ..PlanApplyEffects::default()
                 },
+                Some(record_id),
             ))
         };
 
-        let (placements_json, plan_mode, evictions_json, target_instance): (
-            String,
-            String,
-            String,
-            Option<String>,
-        ) = tx
-            .prepare_cached(
-                "SELECT placements, mode, evictions, target_instance FROM plan_submission \
-                 WHERE id = ?1;",
-            )?
-            .query_row([submission.id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?;
         // Only a ratification sets this, and it always carries exactly one
         // placement (docs/edge-boot.md): "bind this sandbox on this node, or
         // tell me who beat me to it".
-        let target_instance = target_instance.filter(|id| !id.is_empty());
+        let target_instance = body.target_instance;
         // A ratification compares no epochs, job-config or node. It never
         // planned against a snapshot, so a moved epoch says nothing about
         // it. Its one candidate is re-validated against committed rows in
@@ -5895,8 +5946,9 @@ impl Store {
             return reject(tx, format!("{PLAN_NOT_WANTED_PREFIX}{reason}"), None);
         }
 
-        let placements = Self::parse_plan_submission_placements(&placements_json)?;
-        let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
+        let placements = body.placements;
+        let evictions = body.evictions;
+        let plan_mode = body.mode;
 
         // ---- Preemption: victims leave before the placements they paid for
         // arrive, inside this same transaction.
@@ -5928,7 +5980,7 @@ impl Store {
         // the walk's fence asks "did anything ELSE change this node since I
         // planned", and our own evictions are not something else.
         let mut pre_eviction_node_epochs: HashMap<String, i64> = HashMap::new();
-        for eviction in &evictions {
+        for eviction in evictions {
             if let Entry::Vacant(entry) = pre_eviction_node_epochs.entry(eviction.node_id.clone()) {
                 let epoch = self.scope_epoch_tx(tx, "node", &eviction.node_id)?;
                 entry.insert(epoch);
@@ -5945,7 +5997,7 @@ impl Store {
         if body_savepoint {
             tx.execute_batch("SAVEPOINT legion_plan_body;")?;
         }
-        let preempted = self.apply_plan_evictions_tx(tx, submission, &evictions)?;
+        let preempted = self.apply_plan_evictions_tx(tx, submission, evictions)?;
 
         // Node rows load LAZILY, per candidate actually attempted, memoized
         // for the plan. The walk usually binds rank 0, so eagerly loading
@@ -6015,7 +6067,7 @@ impl Store {
         // Pass 1 avoids stacking a task's replicas; pass 2 relaxes it (see
         // the walk below).
         let mut plan_binds: HashSet<(i64, String)> = HashSet::new();
-        for placement in &placements {
+        for placement in placements {
             let task_id = placement.task_id;
             let state = match task_states.entry(task_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
@@ -6235,10 +6287,7 @@ impl Store {
 
                 // A restore placed for one instance binds that instance:
                 // its node was chosen for that instance's pin or `compat`.
-                let bind_instance = placement
-                    .instance_id
-                    .as_deref()
-                    .or(target_instance.as_deref());
+                let bind_instance = placement.instance_id.as_deref().or(target_instance);
                 let allocation = self.insert_allocation_with_data(
                     tx,
                     node_id,
@@ -6303,10 +6352,7 @@ impl Store {
             tx.execute_batch("RELEASE legion_plan_body;")?;
         }
 
-        tx.prepare_cached(
-            "UPDATE plan_submission SET status = 'applied', rejection_reason = NULL WHERE id = ?1;",
-        )?
-        .execute([submission.id])?;
+        Self::finish_applied_plan_on(tx, &record)?;
         let placed_event =
             drafts::allocations_placed(&submission.job_config_id, &allocations, &candidate_ranks)
                 .and_then(|draft| self.stage_event_locked(tx, draft));
@@ -6320,8 +6366,8 @@ impl Store {
         effects.touch_evicted(&preempted.victims);
         effects.touch_placed(&allocations);
         let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
-        info!(
-            submission_id = submission.id,
+        debug!(
+            submission_id = ?submission.id,
             job_config_id = %submission.job_config_id,
             placement_count = placements.len(),
             applied_allocations = allocations.len(),
@@ -6376,6 +6422,7 @@ impl Store {
                 candidate_ranks,
             }),
             effects,
+            submission.id,
         ))
     }
 

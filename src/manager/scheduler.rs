@@ -2348,7 +2348,7 @@ impl<'a> Scheduler<'a> {
                 timings.observe();
                 warn!(
                     %job_config_id,
-                    submission_id = submission.id,
+                    submission_id = ?submission.id,
                     mode = mode.as_str(),
                     apply_plan_submission_ms = apply_started.elapsed().as_millis() as u64,
                     "Scheduler plan submission rejected: {reason}"
@@ -10955,28 +10955,111 @@ mod tests {
         Ok(())
     }
 
-    fn latest_placements_json(store: &Store) -> R<String> {
+    fn plan_records(store: &Store) -> R<Vec<(String, String)>> {
         let conn = store.read_connection()?;
-        Ok(conn.query_row(
-            "SELECT placements FROM plan_submission ORDER BY id DESC LIMIT 1;",
-            [],
-            |row| row.get(0),
-        )?)
+        let mut stmt =
+            conn.prepare("SELECT status, placements FROM plan_submission ORDER BY id;")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// An applied plan leaves nothing in `plan_submission` (review SCH2),
+    /// whichever submission format the kill switch picks.
     #[test]
-    fn plan_candidates_zero_emits_format1_rows() -> R<()> {
-        let store = setup_store_with_scheduler("bin_pack", Some(json!({ "plan_candidates": 0 })))?;
-        insert_test_nodes(&store)?;
-        let job_config_id = submit_job(&store, "kill-switch", vec![task_config("api")])?;
-        let scheduler = Scheduler::new(&store)?;
-        scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+    fn applied_plans_leave_no_plan_record() -> R<()> {
+        for settings in [None, Some(json!({ "plan_candidates": 0 }))] {
+            let store = setup_store_with_scheduler("bin_pack", settings)?;
+            insert_test_nodes(&store)?;
+            let job_config_id = submit_job(&store, "no-record", vec![task_config("api")])?;
+            let outcome =
+                Scheduler::new(&store)?.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+            assert_eq!(outcome.allocations.len(), 1);
+            assert!(
+                plan_records(&store)?.is_empty(),
+                "an applied plan keeps no row"
+            );
+        }
+        Ok(())
+    }
 
-        let placements_json = latest_placements_json(&store)?;
-        let value: Value = serde_json::from_str(&placements_json)?;
+    /// A rejected plan keeps one record, in the shape its submission had:
+    /// `plan_candidates: 0` still emits the pre-candidate array, so the
+    /// kill switch keeps format-2 JSON off the log in a mixed-version window.
+    #[test]
+    fn rejected_plans_keep_a_record_in_their_submission_format() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_config_id = submit_job(&store, "rejected", vec![task_config("api")])?;
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+        let node_id = store.get_nodes()?[0].id.clone();
+        // An epoch from the future: the compare-and-set rejects.
+        let stale = std::collections::BTreeMap::from([(format!("job_config:{job_config_id}"), 99)]);
+
+        let (submission, outcome) = store.submit_and_apply_plan(
+            &job_config_id,
+            "fresh",
+            &[(node_id.clone(), task_id)],
+            &stale,
+            &[],
+        )?;
+        assert!(matches!(outcome, PlanApplyOutcome::Rejected { .. }));
+        assert!(submission.id.is_some(), "the rejection names its record");
+        let (submission, outcome) = store.submit_and_apply_plan_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec![node_id],
+                instance_id: None,
+            }],
+            &stale,
+            &[],
+        )?;
+        assert!(matches!(outcome, PlanApplyOutcome::Rejected { .. }));
+        assert!(submission.id.is_some());
+
+        let records = plan_records(&store)?;
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|(status, _)| status == "rejected"));
+        let format1: Value = serde_json::from_str(&records[0].1)?;
+        assert!(format1.is_array(), "format 1 stays an array: {format1}");
+        let format2: Value = serde_json::from_str(&records[1].1)?;
+        assert_eq!(format2["format"], 2, "{format2}");
+        Ok(())
+    }
+
+    /// A staged plan is a `queued` row until the apply that consumes it,
+    /// which deletes it in the same transaction; applying it twice is an
+    /// error, not a second placement.
+    #[test]
+    fn staged_plans_are_deleted_by_the_apply_that_consumes_them() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_config_id = submit_job(&store, "staged", vec![task_config("api")])?;
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+        let node_id = store.get_nodes()?[0].id.clone();
+        let epochs =
+            store.allocation_version_vector_for_candidates(&job_config_id, &[node_id.as_str()])?;
+        let staged = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[(node_id, task_id)],
+            &epochs,
+        )?;
+        assert_eq!(plan_records(&store)?.len(), 1);
+        assert_eq!(plan_records(&store)?[0].0, "queued");
+
+        assert!(matches!(
+            store.apply_plan_submission(&staged)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+        assert!(plan_records(&store)?.is_empty(), "consumed with the apply");
+        let again = store
+            .apply_plan_submission(&staged)
+            .expect_err("a consumed plan cannot apply twice");
         assert!(
-            value.is_array(),
-            "plan_candidates: 0 must emit the pre-candidate array shape, got: {placements_json}"
+            format!("{again:#}").contains("no longer exists"),
+            "{again:#}"
         );
         Ok(())
     }
@@ -11172,24 +11255,6 @@ mod tests {
             store.allocs_for_node("node-a")?.len(),
             2,
             "the victim is still running: evictions cannot outlive the placement they paid for"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn plan_candidates_default_emits_format2_rows() -> R<()> {
-        let store = setup_store()?;
-        insert_test_nodes(&store)?;
-        let job_config_id = submit_job(&store, "format-two", vec![task_config("api")])?;
-        let scheduler = Scheduler::new(&store)?;
-        scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
-
-        let placements_json = latest_placements_json(&store)?;
-        let value: Value = serde_json::from_str(&placements_json)?;
-        assert_eq!(
-            value.get("format").and_then(Value::as_i64),
-            Some(2),
-            "candidates on must emit format-2 rows, got: {placements_json}"
         );
         Ok(())
     }

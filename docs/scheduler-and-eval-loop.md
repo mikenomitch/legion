@@ -254,7 +254,7 @@ Placement apply uses optimistic concurrency with partitioned epochs.
 Legion maintains an epoch per `job_config_id` in `allocation_epoch_partition`.
 
 1. Scheduler reads the current epoch for the target job config.
-2. Scheduler writes `plan_submission.expected_epoch` with that value.
+2. Scheduler carries that value in the plan's expected version vector.
 3. Apply path re-reads the current epoch for that same job config in-transaction.
 4. Apply proceeds only when epochs still match.
 5. On successful allocation changes, only that job config epoch is bumped.
@@ -286,7 +286,30 @@ the v2 rollout finished, is a no-op instead of placing the full count.
 The plan submission and its apply run as **one replicated store op**
 (`Store::submit_and_apply_plan` / `submit_and_apply_plan_with_candidates`).
 That means one write-transaction boundary, and on raft one
-propose→quorum-commit→apply instead of two.
+propose→quorum-commit→apply instead of two. The apply walks the plan's
+placements as the planner handed them over; the plan is not written to the
+store and read back first.
+
+### Plan records
+
+`plan_submission` is a short record of plans a person might want to look at,
+not a log of every plan:
+
+| Plan | Row in `plan_submission` |
+| --- | --- |
+| Applied (every scheduler plan and edge-boot ratification) | none |
+| Rejected at apply | one row, `status = 'rejected'`, with `rejection_reason`, the placements, and the evictions |
+| Staged through the two-step `insert_plan_submission` / `apply_plan_submission` API (tests and benchmarks) | a `queued` row until its apply deletes it, or marks it rejected |
+
+The table keeps about the last 1,000 rows: each new row deletes the ones more
+than 1,000 ids older, in the same write. The scheduler-lane leader also sweeps
+it on startup and whenever it gains leadership, which removes rows outside
+that window and staged rows that were never applied within ten minutes. A
+staged plan that falls out of the window before it is applied cannot be
+applied; its apply fails with `plan submission N no longer exists`.
+
+Before this, every plan left a row carrying all of its candidate lists, in the
+raft log and in every snapshot, and nothing deleted them.
 
 ### Candidate lists (late-binding apply)
 
