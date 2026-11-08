@@ -926,6 +926,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 )
             }),
             classifier,
+        )
+        .with_guard_counter_interval(
+            serde_json::from_str::<crate::structs::WorkerSecurityConfig>(&config.security)
+                .ok()
+                .and_then(|security| security.host_guard)
+                .map(|guard| guard.counter_interval())
+                .unwrap_or(crate::structs::host_guard::DEFAULT_COUNTER_INTERVAL),
         ),
     );
     // Where the kernel classifier redirects host-mode flows only netd can
@@ -2690,6 +2697,9 @@ async fn heartbeat_tick(
             (allocations, allocation_health.clone(), allocation_health)
         };
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
+            // What the node holds of its endpoint feed, so the reply carries
+            // only what changed (mesh-control-path plan §6.1).
+            endpoint_feed: Some(netd.feed_report()),
             work_stream: work_stream.clone(),
             content_locations: content_report
                 .as_ref()
@@ -2906,13 +2916,13 @@ async fn heartbeat_tick(
         // endpoint feed, and the policy assignments.
         netd.send(NetdInput::Desired(DesiredNetwork {
             desired: reply.desired_allocations.clone(),
-            upstream_endpoints: reply.upstream_endpoints.clone(),
+            endpoint_feed: reply.endpoint_feed.take(),
             net_policies: reply.net_policies.clone(),
         }))
         .await;
         // Config-file templates, rendered from the same feed; written before
         // any launch below so a task starts with its files in place.
-        apply_templates(task_manager, &reply).await;
+        apply_templates(task_manager, netd, &reply).await;
         // KV files marked `onChange = "update"`, rewritten under running
         // allocations whose rendered content moved.
         apply_live_kv_files(task_manager, &reply);
@@ -2923,6 +2933,13 @@ async fn heartbeat_tick(
             credentials,
             manager_addr,
             &reply.cluster_ca_pins,
+            name,
+            reply
+                .next_interval_seconds
+                .map(|seconds| Duration::from_secs(u64::from(seconds)))
+                .unwrap_or(Duration::from_secs(
+                    crate::constants::WORKER_HEARTBEAT_DURATION_SEC,
+                )),
         )
         .await;
         // Policy bodies by hash, KV-held ingress certificates, and upstream
@@ -3211,7 +3228,11 @@ static TEMPLATES: LazyLock<crate::worker::templates::TemplateEngine> =
 /// endpoint feed: the first time before the task launches, then on every
 /// heartbeat that changes a file, applying `changeMode` after `coalesce`
 /// and `splay`.
-async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &HeartbeatReply) {
+async fn apply_templates(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    netd: &Netd,
+    reply: &HeartbeatReply,
+) {
     use crate::worker::templates::{ChangeAction, TemplateContext};
     let live: std::collections::HashSet<i64> = reply
         .desired_allocations
@@ -3236,17 +3257,8 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
         } else {
             serde_json::from_str(&allocation.network).ok()
         };
-        let endpoints: std::collections::BTreeMap<String, Vec<Endpoint>> = reply
-            .upstream_endpoints
-            .iter()
-            .filter(|u| u.allocation_id == allocation.allocation_id && !u.for_handler)
-            .map(|u| {
-                (
-                    u.service.clone(),
-                    crate::worker::netd::specs::dialable_endpoints(u),
-                )
-            })
-            .collect();
+        let endpoints: std::collections::BTreeMap<String, Vec<Endpoint>> =
+            netd.template_endpoints(allocation.allocation_id);
         let (running, base) = {
             let mut manager = task_manager.lock().expect("task manager");
             let running = manager.has_allocation(allocation.allocation_id);
@@ -3318,12 +3330,16 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
 }
 
 /// Keep the node certificate current: re-issued after a third of its
-/// lifetime, or at once when the manager's trust bundle differs from the
-/// node's (a CA rotation, or a CA added to or removed from the bundle). The
-/// same identity serves the worker plane listener (hot-swapped, no restart)
-/// and the mesh. Fail-static: a failed
-/// issuance keeps the certificate the node has, and a node without one
-/// refuses mesh flows rather than sending them in the clear.
+/// lifetime, or when the manager's trust bundle differs from the node's (a
+/// CA rotation, or a CA added to or removed from the bundle). A bundle
+/// change waits out the node's rotation splay first (mesh-control-path plan
+/// §6.7), so a rotation does not land every node's CSR on the signer in one
+/// beat; it is at once when the CA the node's certificate chains to left
+/// the bundle. The same identity serves the worker plane listener
+/// (hot-swapped, no restart) and the mesh. Fail-static: a failed issuance
+/// keeps the certificate the node has, and a node without one refuses mesh
+/// flows rather than sending them in the clear.
+#[allow(clippy::too_many_arguments)]
 async fn refresh_node_identity(
     node_identity: &crate::worker::plane::NodeIdentity,
     netd: &Netd,
@@ -3331,12 +3347,40 @@ async fn refresh_node_identity(
     credentials: &Arc<WorkerCredentials>,
     manager_addr: &str,
     manager_ca_pins: &[String],
+    node_id: &str,
+    interval: Duration,
 ) {
-    if !node_identity.needs_refresh(Some(manager_ca_pins)) {
-        return;
+    use crate::worker::plane::RefreshNeed;
+    let now = std::time::Instant::now();
+    match node_identity.refresh_need(Some(manager_ca_pins)) {
+        None => {
+            *ROTATION_DUE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return;
+        }
+        Some(RefreshNeed::BundleChanged { issuer_left: false }) => {
+            let mut pending = ROTATION_DUE.lock().unwrap_or_else(|p| p.into_inner());
+            let due = match pending.as_ref() {
+                Some((pins, due)) if pins.as_slice() == manager_ca_pins => *due,
+                _ => {
+                    let splay = crate::worker::plane::rotation_splay(node_id, interval);
+                    info!(
+                        splay_ms = splay.as_millis() as u64,
+                        "The cluster's trust bundle changed; re-issuing the node certificate after the rotation splay"
+                    );
+                    let due = now + splay;
+                    *pending = Some((manager_ca_pins.to_vec(), due));
+                    due
+                }
+            };
+            if now < due {
+                return;
+            }
+        }
+        Some(_) => {}
     }
     match node_identity.issue(client, credentials, manager_addr).await {
         Ok(()) => {
+            *ROTATION_DUE.lock().unwrap_or_else(|p| p.into_inner()) = None;
             if let Some(mesh) = node_identity.mesh_identity() {
                 netd.send(NetdInput::MeshIdentity(mesh)).await;
             }
@@ -3514,6 +3558,11 @@ static CONTENT_ADVERTISER: std::sync::LazyLock<
     Mutex<crate::worker::content_report::ContentAdvertiser>,
 > = std::sync::LazyLock::new(|| Mutex::new(Default::default()));
 
+/// The trust bundle (pins) a pending CA-rotation re-issue is for, and when
+/// it is due (`refresh_node_identity`, mesh-control-path plan §6.7).
+static ROTATION_DUE: std::sync::LazyLock<Mutex<Option<(Vec<String>, std::time::Instant)>>> =
+    std::sync::LazyLock::new(Default::default);
+
 /// Capability a worker that streams its work advertises at registration.
 pub const WORK_STREAM_CAPABILITY: &str = "work-stream";
 
@@ -3559,6 +3608,13 @@ fn launch_streamed_work(
 ) {
     if applied.reconcile {
         HEARTBEAT_WAKE.notify_one();
+    }
+    // Endpoint sets the manager pushed: applied to the listeners now, not at
+    // the next beat (mesh-control-path plan §6.1).
+    if let (Some(feed), Some(netd)) = (applied.endpoint_feed, launcher.netd.clone()) {
+        tokio::spawn(async move {
+            netd.send(NetdInput::Endpoints(feed)).await;
+        });
     }
     // Checkpoint work starts the moment it is pushed, deduplicated against
     // what this node already has in flight or finished, exactly as when a

@@ -3677,24 +3677,25 @@ has open:
       `StreamEvents`, would let it follow the catalog; xDS stays out of scope
       ([swappable seams plan](plans/swappable-seams-plan.md) §1).
 
-- [ ] **The endpoint feed is rebuilt from scratch on every heartbeat**
-      ([review NET1](architecture-review-2026-11-07.md)). `build_upstream_endpoints` re-parses each allocation's
-      `task_connect`, queries per (service, consumer job), parses three JSON
-      values per catalog row, and clones per allocation; the worker replaces
-      lists wholesale. Convergence follows heartbeat cadence (~8 s at 10k
-      nodes, ~16 s at 20k). Push per-service versioned sets on the work
-      stream, deduplicated per node (delta xDS, EndpointSlices). The mesh
-      plan's "push endpoint deltas … already shipped" row was wrong and is
-      corrected.
-- [ ] **Policy assignments are recomputed on every heartbeat**
-      ([review NET2](architecture-review-2026-11-07.md)): `build_net_policies` lists every stored policy and
-      merges per allocation, O(policies × allocations) per node per beat.
-      Memoize the effective hash on (policy generation, selector facts,
-      task network hash).
-- [ ] **A node caps at 255 allocations with upstreams** ([review NET9](architecture-review-2026-11-07.md)):
-      `VIP_BLOCK_MAX = 255` in `structs/network.rs`, and upstream and
-      ingress-twin ports share 20000–32000 with task ports. Dense sandbox
-      nodes can reach both.
+- [ ] **Configurable node port ranges.** Task ports (`20000–32000`) and the
+      datapath's own ports (`61000–65535`) are constants placement applies
+      on the manager; a host that widened `ip_local_port_range` past 61000,
+      or runs a service there, can collide. Making them node attributes
+      placement reads is the fix ([mesh-control-path calls
+      #7](calls/mesh-control-path-plan_calls.md)).
+- [ ] **Endpoint pushes reach only streaming workers, and templates wait
+      for the next beat.** A worker off `StreamWork` converges on the
+      heartbeat's delta (still no per-beat catalog work), and a config-file
+      template re-renders on the heartbeat after a push, not at the push
+      ([service-discovery.md](../docs/service-discovery.md#how-endpoints-reach-a-node)).
+- [ ] **The endpoint index's `local_disk` health path is a store hook, not
+      the projection.** `local_disk` mode projects only the read-model
+      tables (`storage/raft/capture.rs` `READ_MODEL_TABLES`), so the health
+      upsert marks the index itself; any other write that changes a
+      catalog input outside those tables is caught only by the 30 s
+      re-read ([mesh-control-path calls
+      #1](calls/mesh-control-path-plan_calls.md)). Projecting
+      `allocation_health` in `local_disk` mode would close it.
 
 ## Networking
 
@@ -3980,9 +3981,12 @@ Datapath performance). Deferred, by name:
       fallback; about 20% of bulk throughput by Tensorlake's numbers
       (plan §6.6, [calls #3](calls/datapath-performance-plan_calls.md)).
 - [ ] **Multiplexed node-to-node tunnels for L4 mesh traffic.** Each L4
-      connection to a mesh endpoint still pays its own mTLS handshake;
-      ztunnel avoids that with pooled HTTP/2 CONNECT (HBONE) tunnels. A
-      wire-format change for the mesh, so it needs its own plan (plan §6.7).
+      connection to a mesh endpoint is still its own TLS connection (now a
+      resumed one, see Done, Mesh control path); ztunnel pools HTTP/2
+      CONNECT (HBONE) tunnels instead. A wire-format change for the mesh,
+      so it needs its own plan (plan §6.7; [review
+      NET3](architecture-review-2026-11-07.md), [mesh-control-path calls
+      #4](calls/mesh-control-path-plan_calls.md)).
 - [ ] **HTTP/2 between nodes in HTTP mode**, so one pooled connection
       carries concurrent requests (Linkerd's transparent upgrade). Pooling
       today reuses HTTP/1.1 connections one request at a time.
@@ -3993,29 +3997,21 @@ Datapath performance). Deferred, by name:
       ([calls #6](calls/datapath-performance-plan_calls.md)).
 
 
-- [ ] **Keep TLS session resumption across mesh config rebuilds**
-      ([review NET3](architecture-review-2026-11-07.md)): the forwarder rebuilds its rustls `ClientConfig` on every
-      identity change, dropping the resumption cache, so each 8 h refresh and
-      CA rotation is a full-handshake burst. Separate from, and cheaper than,
-      the kTLS and tunnel items above.
-- [ ] **HTTP mode buffers request bodies with no cap** ([review NET4](architecture-review-2026-11-07.md)):
-      with no body hop, `http.rs` runs `body.collect()` unbounded. Stream
-      when no retry or body hop needs replay; otherwise cap and answer `413`.
-- [ ] **IPv6 endpoints and binds** ([review NET5](architecture-review-2026-11-07.md)): endpoints are formatted
-      `"{}:{}"` without brackets (`specs.rs`), `worker_address_host`
-      splits on the last `:`, and ingress binds `0.0.0.0`. Use `SocketAddr`
-      end to end and bind dual-stack.
-- [ ] **The nftables guard fallback** ([review NET6](architecture-review-2026-11-07.md)): no
-      `ct state established` short-circuit, so every egress packet walks one
-      rule per allocation, and counters fork `nft -j list table` every beat.
-      Moot if the "drop nftables" decision above goes that way.
-- [ ] **Splay node-certificate reissue on CA rotation** ([review NET7](architecture-review-2026-11-07.md)):
-      `refresh_node_identity` reissues as soon as the bundle changes, so ~10k
-      CSRs land within one beat on an `exec` or Vault signer.
-- [ ] **Per-connection global mutex and allocations** ([review NET8](architecture-review-2026-11-07.md)):
-      `EdgeLedger` is one node-wide `Mutex<HashMap>`, and the in-flight map
-      allocates a `String` key per connection. Interned ids and sharded
-      counters before 50k connections/s per node matters.
+- [ ] **The nftables guard still forks `nft` to read its counters**, now
+      at most every `hostGuard.counterInterval` (10 s) instead of every
+      beat. Reading them over netlink goes with the "drop nftables" decision
+      above ([review NET6](architecture-review-2026-11-07.md), [mesh-control-path calls
+      #10](calls/mesh-control-path-plan_calls.md)).
+- [ ] **The forwarder clones the picked `Endpoint` per dial** (its address,
+      node id, and tags). Interning endpoints (`Arc<str>` addresses through
+      `balance::Endpoint`) removes the last per-connection allocations on
+      the dial path ([review NET8](architecture-review-2026-11-07.md), [mesh-control-path calls
+      #12](calls/mesh-control-path-plan_calls.md)).
+- [ ] **A fail-open body hop refuses an oversized body with `413`.** With
+      `onError = "allow"`, a body over `maxBytes` is answered `413` rather
+      than let through unread; decide whether "allow" should mean stream it
+      through unchecked ([mesh-control-path calls
+      #13](calls/mesh-control-path-plan_calls.md)).
 
 ### macOS gated networking
 
@@ -6415,6 +6411,48 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       Note `service list -j` / `resolve -j` now emit the standard `{ok, data}`
       envelope instead of a bare array (`jq '.[0]'` -> `jq '.data[0]'`, or use
       `--one`, which needs no `jq`).
+
+## Mesh control path
+
+[plan](plans/mesh-control-path-plan.md) · [calls](calls/mesh-control-path-plan_calls.md)
+· docs: [service-discovery.md](../docs/service-discovery.md#how-endpoints-reach-a-node),
+[network-handlers.md](../docs/network-handlers.md#sessions),
+[cluster-ca.md](../docs/cluster-ca.md#how-workers-learn),
+[architecture-managers-workers.md](../docs/architecture-managers-workers.md)
+
+- [x] **Endpoint deltas per service** ([review NET1](architecture-review-2026-11-07.md)):
+      a versioned endpoint set per service on each manager, invalidated from
+      committed changesets on every replica; the heartbeat ships only the
+      (service, consumer) sets and bindings whose digest changed; streaming
+      workers get changed sets pushed on `StreamWork` (push-only messages);
+      the worker swaps one listener's list at a time. Corrects the mesh
+      plan's §2 row, which claimed this had shipped.
+- [x] **Memoized policy assignments** ([review NET2](architecture-review-2026-11-07.md)):
+      policies listed once per generation, each distinct input merged once,
+      inputs verified on every hit.
+- [x] **Mesh TLS sessions survive certificate refreshes** ([review NET3](architecture-review-2026-11-07.md)):
+      swappable certificate resolvers, one client and one server config per
+      trust bundle, a node-wide server session store, every session dropped
+      on a bundle change, and resumed identities bounded by certificate
+      expiry. Pooled tunnels and kTLS stay open under Networking.
+- [x] **Bounded HTTP request bodies** ([review NET4](architecture-review-2026-11-07.md)):
+      streamed unless a body hop or a retry needs them;
+      `http.retries.maxBodyBytes` (default `1Mi`) caps the replay copy.
+- [x] **IPv6** ([review NET5](architecture-review-2026-11-07.md)):
+      `structs::hostport` joins and splits addresses everywhere a host
+      meets a port; ingress binds dual-stack and canonicalizes mapped peers.
+- [x] **nftables guard** ([review NET6](architecture-review-2026-11-07.md)):
+      established flows accepted first, one verdict-map dispatch per
+      cgroup level, counters read every `hostGuard.counterInterval`.
+- [x] **CA-rotation splay** ([review NET7](architecture-review-2026-11-07.md)):
+      a deterministic per-node offset, 25 served intervals capped at 10
+      minutes; at once when the issuer left the bundle.
+- [x] **Per-connection costs** ([review NET8](architecture-review-2026-11-07.md)):
+      a sharded edge ledger with borrowed-key lookups, atomic in-flight
+      counts held by the connection, pooled copy buffers.
+- [x] **VIP blocks and datapath ports** ([review NET9](architecture-review-2026-11-07.md)):
+      16,384 VIP blocks per node in `127.64.0.0/10`; datapath ports from
+      `61000–65535`, apart from task ports.
 
 ## Datapath performance
 

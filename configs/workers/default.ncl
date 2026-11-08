@@ -226,6 +226,9 @@
     #     allow = ["10.0.1.7:9100"],
     #     # Extra destinations to refuse like metadata: IPs or CIDRs.
     #     deny = ["10.0.0.2/32"],
+    #     # How often the nftables guard's drop counters are read for
+    #     # net.denied events (each read runs `nft -j list table`).
+    #     counterInterval = "10s",
     # },
     # Direct exec (docs/exec-and-actions.md, "Direct exec"): admit exec
     # tickets on this node's worker plane, so `legion exec --direct` and

@@ -1078,7 +1078,7 @@ connection:
 $ legion net ca rotate
 Rotated the cluster CA. The new CA (pin sha256:...) signs every certificate from now on.
 The previous CA stays trusted until 2026-11-03T18:05:11Z, so no worker-plane or mesh connection breaks;
-nodes re-issue their certificates within one heartbeat. Join tokens minted before
+nodes re-issue their certificates within their rotation splay (at most 10 minutes). Join tokens minted before
 the rotation work until then; mint new ones after.
 ```
 
@@ -1087,16 +1087,20 @@ the rotation work until then; mint new ones after.
    holder that still trusts only the old CA keeps verifying.
 2. The old CA stays in every trust bundle for one certificate lifetime (24
    hours). Every node sees the new CA's pin on its next heartbeat reply and
-   re-issues at once.
+   re-issues after its rotation splay, a per-node offset of at most 10
+   minutes that spreads the CSRs ([The Cluster
+   CA](cluster-ca.md#how-workers-learn)).
 3. After the overlap, the old CA leaves the bundle. Join tokens that pin it
    stop working; mint new ones. A worker that was offline for the whole
    overlap must re-join.
 
 A CA from a `file` or `exec` provider rotates outside Legion, and
 `legion net ca rotate` refuses with `FailedPrecondition` and the procedure:
-add the new CA to the trust bundle, wait a heartbeat, switch the signing CA,
-and remove the old CA a day later. Each step reaches every worker within one
-heartbeat, because heartbeat replies name the manager's whole trust bundle.
+add the new CA to the trust bundle, wait out the rotation splay (at most 10
+minutes), switch the signing CA, and remove the old CA a day later. Each step
+reaches every worker within one heartbeat, because heartbeat replies name the
+manager's whole trust bundle, and every worker has re-issued within its
+splay.
 See [The Cluster CA](cluster-ca.md#rotation).
 
 ### TLS

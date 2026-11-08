@@ -5,9 +5,19 @@ use serde_json::{Map, Value};
 
 use crate::prelude::{anyhow, bail, R};
 
-/// Inclusive dynamic port range used when a port has no `static` value.
+/// Inclusive dynamic port range used when a task's port has no `static`
+/// value.
 pub const DYNAMIC_PORT_MIN: u16 = 20000;
 pub const DYNAMIC_PORT_MAX: u16 = 32000;
+
+/// Inclusive range the datapath's own node ports come from: upstream
+/// loopback ports, ingress twin (private) ports on the host, the canonical
+/// port of a service nobody has declared yet, and a confined egress proxy.
+/// Apart from task ports, so neither crowds the other out on a dense node
+/// (mesh-control-path plan §6.9), and above Linux's default ephemeral range
+/// (32768–60999), so an outbound connection does not take one first.
+pub const DATAPATH_PORT_MIN: u16 = 61000;
+pub const DATAPATH_PORT_MAX: u16 = 65535;
 
 /// Loopback address every upstream forwarder binds. Upstreams are a pure
 /// userspace TCP hop on the node the task runs on, so the address is fixed and
@@ -22,14 +32,20 @@ pub const DEFAULT_BALANCE: &str = "least_latency";
 /// The DNS zone a task's upstreams are reachable under: `<key>.svc.legion`.
 pub const SVC_ZONE: &str = "svc.legion";
 
-/// Second octet of every allocation VIP block: `127.<VIP_SECOND_OCTET>.b`.
-/// Fixed so a stray `127.0.x.x` listener (or `127.0.0.1` itself) can never
-/// collide with an assigned block; `b` is the per-node counter (0..=255).
-pub const VIP_SECOND_OCTET: u8 = 42;
+/// The loopback range every allocation VIP block comes from. Block `i` is
+/// the /24 `127.<64 + i / 256>.<i % 256>`, so block 0 is `127.64.0` and the
+/// last is `127.127.255`. Clear of `127.0.x.x` (and `127.0.0.1`, and
+/// systemd-resolved's `127.0.0.53`), so a stray listener can never collide
+/// with an assigned block. The kernel classifier and the `nftables` guard
+/// match this range (mesh-control-path plan §6.9).
+pub const VIP_RANGE: &str = "127.64.0.0/10";
 
-/// Highest per-node VIP block index; 256 allocations with upstreams per
-/// node before assignment fails loudly.
-pub const VIP_BLOCK_MAX: u8 = 255;
+/// Second octet of the first VIP block.
+pub const VIP_FIRST_SECOND_OCTET: u8 = 64;
+
+/// VIP blocks per node: allocations with upstreams a node can hold before
+/// assignment fails loudly.
+pub const VIP_BLOCKS: u32 = 16_384;
 
 /// The first host octet used for upstream VIPs (`.1` is the resolver).
 pub const VIP_FIRST_HOST: u8 = 2;
@@ -574,23 +590,51 @@ pub fn assign_confined_proxy(
     taken.extend(ports.iter().map(|port| port.host_port));
     taken.extend(ports.iter().filter_map(|port| port.private_port));
     taken.extend(upstreams.iter().filter_map(|upstream| upstream.local_port));
-    let mut cursor = DYNAMIC_PORT_MIN;
-    let port = next_dynamic_port(&mut cursor, &mut taken, "a confined egress proxy")?;
+    let mut cursor = DATAPATH_PORT_MIN;
+    let port = next_datapath_port(&mut cursor, &mut taken, "a confined egress proxy")?;
     Ok(format!("{GATED_PROXY_ADDR}:{port}"))
 }
 
-/// Pick the next free VIP block (`127.42.<b>`) on a node.
-pub fn next_vip_block(used_blocks: &HashSet<String>) -> R<String> {
-    for b in 0..=VIP_BLOCK_MAX {
-        let block = format!("127.{VIP_SECOND_OCTET}.{b}");
-        if !used_blocks.contains(&block) {
-            return Ok(block);
-        }
-    }
-    bail!(
-        "no free VIP block on this node ({} allocations with upstreams already placed)",
-        u16::from(VIP_BLOCK_MAX) + 1
+/// VIP block `index` (`127.64.0` for 0); see [`VIP_RANGE`].
+pub fn vip_block(index: u32) -> String {
+    format!(
+        "127.{}.{}",
+        u32::from(VIP_FIRST_SECOND_OCTET) + index / 256,
+        index % 256
     )
+}
+
+/// The index of a VIP block, or `None` for a block outside [`VIP_RANGE`].
+pub fn vip_block_index(block: &str) -> Option<u32> {
+    let mut octets = block.split('.');
+    if octets.next()? != "127" {
+        return None;
+    }
+    let second: u32 = octets.next()?.parse().ok()?;
+    let third: u32 = octets.next()?.parse().ok()?;
+    if octets.next().is_some() || third > 255 {
+        return None;
+    }
+    let index = second
+        .checked_sub(u32::from(VIP_FIRST_SECOND_OCTET))?
+        .checked_mul(256)?
+        + third;
+    (index < VIP_BLOCKS).then_some(index)
+}
+
+/// Pick the next free VIP block on a node: the lowest index no allocation
+/// holds, so assignment is deterministic.
+pub fn next_vip_block(used_blocks: &HashSet<String>) -> R<String> {
+    let used: HashSet<u32> = used_blocks
+        .iter()
+        .filter_map(|block| vip_block_index(block))
+        .collect();
+    match (0..VIP_BLOCKS).find(|index| !used.contains(index)) {
+        Some(index) => Ok(vip_block(index)),
+        None => bail!(
+            "no free VIP block on this node ({VIP_BLOCKS} allocations with upstreams already placed)"
+        ),
+    }
 }
 
 /// Canonicalize a user-written strategy name: trim, lowercase, and treat `-`
@@ -1394,10 +1438,35 @@ pub struct RetryConfig {
     /// Only these methods are retried (default: idempotent methods).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<String>,
+    /// The largest request body kept so a request can be retried (`1Mi`,
+    /// the default; at most `64Mi`). A larger body is streamed to the
+    /// upstream as it arrives and the request is not retried
+    /// (docs/network-handlers.md, "Request bodies").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<Value>,
     /// Keys this block did not recognize, captured for the submit's
     /// unknown-field check (`structs::spec_fields`); empty once it ran.
     #[serde(flatten)]
     pub unknown_fields: crate::structs::spec_fields::UnknownFields,
+}
+
+/// Default `retries.maxBodyBytes`: the body kept for a retry.
+pub const DEFAULT_RETRY_BODY_BYTES: u64 = 1024 * 1024;
+
+/// The most `retries.maxBodyBytes` may be.
+pub const MAX_RETRY_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
+impl RetryConfig {
+    /// `maxBodyBytes`, or the default. Validated at submit, so an
+    /// unparseable value here (a hand-edited row) falls back to the default.
+    pub fn max_body_bytes(&self) -> u64 {
+        self.max_body_bytes
+            .as_ref()
+            .and_then(|value| crate::structs::netpolicy::parse_bytes(value).ok())
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| bytes.min(MAX_RETRY_BODY_BYTES))
+            .unwrap_or(DEFAULT_RETRY_BODY_BYTES)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -1424,8 +1493,9 @@ pub struct UpstreamTarget {
 }
 
 impl UpstreamTarget {
+    /// `host:port`, with an IPv6 host in brackets.
     pub fn addr(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        crate::structs::hostport::join(&self.host, self.port)
     }
 }
 
@@ -1554,7 +1624,10 @@ impl AllocUpstream {
     /// `<vip>:<canonical port>` when a VIP was assigned — what
     /// `<key>.svc.legion` resolves to.
     pub fn vip_address(&self) -> Option<String> {
-        Some(format!("{}:{}", self.vip.as_ref()?, self.canonical_port?))
+        Some(crate::structs::hostport::join(
+            self.vip.as_ref()?,
+            self.canonical_port?,
+        ))
     }
 }
 
@@ -1889,20 +1962,42 @@ impl std::fmt::Display for StaticPortInUse {
 
 impl std::error::Error for StaticPortInUse {}
 
-/// Take the next free port from the dynamic range, advancing the shared
+/// Take the next free port from the task range, advancing the shared
 /// cursor. `what` names the offending entry in the exhaustion error.
 fn next_dynamic_port(cursor: &mut u16, taken: &mut HashSet<u16>, what: &str) -> R<u16> {
-    while *cursor <= DYNAMIC_PORT_MAX && taken.contains(cursor) {
-        *cursor += 1;
+    next_port_in(cursor, taken, what, DYNAMIC_PORT_MIN, DYNAMIC_PORT_MAX)
+}
+
+/// Take the next free port from the datapath's range ([`DATAPATH_PORT_MIN`]).
+fn next_datapath_port(cursor: &mut u16, taken: &mut HashSet<u16>, what: &str) -> R<u16> {
+    next_port_in(cursor, taken, what, DATAPATH_PORT_MIN, DATAPATH_PORT_MAX)
+}
+
+fn next_port_in(
+    cursor: &mut u16,
+    taken: &mut HashSet<u16>,
+    what: &str,
+    min: u16,
+    max: u16,
+) -> R<u16> {
+    let mut port = (*cursor).max(min);
+    loop {
+        if port > max {
+            bail!(
+                "no free dynamic port available for {what} (range {min}-{max} exhausted on this node)"
+            );
+        }
+        if taken.insert(port) {
+            *cursor = port.saturating_add(1);
+            return Ok(port);
+        }
+        if port == u16::MAX {
+            bail!(
+                "no free dynamic port available for {what} (range {min}-{max} exhausted on this node)"
+            );
+        }
+        port += 1;
     }
-    if *cursor > DYNAMIC_PORT_MAX {
-        bail!(
-            "no free dynamic port available for {what} (range {DYNAMIC_PORT_MIN}-{DYNAMIC_PORT_MAX} exhausted on this node)"
-        );
-    }
-    let port = *cursor;
-    taken.insert(port);
-    Ok(port)
 }
 
 /// Assign every node-local port one allocation needs — task host ports and
@@ -2008,6 +2103,8 @@ pub fn assign_allocation_ports_full(
     }
 
     let mut cursor = DYNAMIC_PORT_MIN;
+    // The datapath's own ports come from their own range.
+    let mut datapath_cursor = DATAPATH_PORT_MIN;
     for port in ports {
         if port.static_port.is_some() {
             continue;
@@ -2029,8 +2126,8 @@ pub fn assign_allocation_ports_full(
             continue;
         }
         let local_port = if loopback {
-            Some(next_dynamic_port(
-                &mut cursor,
+            Some(next_datapath_port(
+                &mut datapath_cursor,
                 &mut taken,
                 &format!("upstream '{}' local port", upstream.key()),
             )?)
@@ -2057,8 +2154,8 @@ pub fn assign_allocation_ports_full(
             let private = if gated {
                 port.to.unwrap_or(port.host_port)
             } else {
-                next_dynamic_port(
-                    &mut cursor,
+                next_datapath_port(
+                    &mut datapath_cursor,
                     &mut taken,
                     &format!("port '{}' private (ingress) port", port.name),
                 )?
@@ -2093,8 +2190,8 @@ pub fn assign_allocation_ports_full(
             // allocation on the node will be handed.
             let canonical_port = match known {
                 Some(port) => port,
-                None => next_dynamic_port(
-                    &mut cursor,
+                None => next_datapath_port(
+                    &mut datapath_cursor,
                     &mut taken,
                     &format!("upstream '{key}' canonical port"),
                 )?,
@@ -2543,6 +2640,13 @@ fn validate_upstream_http(task_name: &str, key: &str, http: &UpstreamHttpConfig)
                 bail!("{what}.retries.budget must be at most 100%");
             }
         }
+        if let Some(max) = retries.max_body_bytes.as_ref() {
+            let bytes = crate::structs::netpolicy::parse_bytes(max)
+                .map_err(|err| anyhow::anyhow!("{what}.retries.maxBodyBytes: {err}"))?;
+            if bytes == 0 || bytes > MAX_RETRY_BODY_BYTES {
+                bail!("{what}.retries.maxBodyBytes must be more than 0 and at most 64Mi");
+            }
+        }
     }
     let mut total = 0u32;
     let mut tags: HashSet<&str> = HashSet::new();
@@ -2643,7 +2747,10 @@ spec_block!(
         walk.list("split", &mut this.split);
     }
 );
-spec_block!(RetryConfig, ["attempts", "on", "budget", "methods"]);
+spec_block!(
+    RetryConfig,
+    ["attempts", "on", "budget", "methods", "maxBodyBytes"]
+);
 spec_block!(SplitConfig, ["tag", "weight"]);
 spec_block!(UpstreamCredential, ["header", "prefix", "from"]);
 
@@ -3343,9 +3450,10 @@ mod tests {
         assert_eq!(ports[0].host_port, 9090);
         assert_eq!(ports[1].host_port, DYNAMIC_PORT_MIN + 1);
         assert_eq!(upstreams[0].key, "db");
-        assert_eq!(upstreams[0].local_port, Some(DYNAMIC_PORT_MIN + 2));
+        // Upstream loopback ports come from the datapath's own range.
+        assert_eq!(upstreams[0].local_port, Some(DATAPATH_PORT_MIN));
         assert_eq!(upstreams[0].balance, DEFAULT_BALANCE);
-        assert_eq!(upstreams[1].local_port, Some(DYNAMIC_PORT_MIN + 3));
+        assert_eq!(upstreams[1].local_port, Some(DATAPATH_PORT_MIN + 1));
 
         let all: HashSet<u16> = ports
             .iter()
@@ -3366,7 +3474,7 @@ mod tests {
         let upstreams = assign_upstream_ports(&connect_config, &HashSet::new())?;
         assert_eq!(upstreams[0].key, "cache");
         assert_eq!(upstreams[0].local_port, Some(6379));
-        assert_eq!(upstreams[1].local_port, Some(DYNAMIC_PORT_MIN));
+        assert_eq!(upstreams[1].local_port, Some(DATAPATH_PORT_MIN));
 
         let taken: HashSet<u16> = [6379].into();
         let err = assign_upstream_ports(&connect_config, &taken).unwrap_err();
@@ -3835,13 +3943,26 @@ mod tests {
     #[test]
     fn vip_blocks_and_canonical_ports() {
         let mut used_blocks = HashSet::new();
-        assert_eq!(next_vip_block(&used_blocks).unwrap(), "127.42.0");
-        used_blocks.insert("127.42.0".to_string());
-        assert_eq!(next_vip_block(&used_blocks).unwrap(), "127.42.1");
-        for b in 0..=255u16 {
-            used_blocks.insert(format!("127.42.{b}"));
+        assert_eq!(next_vip_block(&used_blocks).unwrap(), "127.64.0");
+        used_blocks.insert("127.64.0".to_string());
+        assert_eq!(next_vip_block(&used_blocks).unwrap(), "127.64.1");
+        // A block outside the range (an old `127.42.b`) holds nothing in it.
+        used_blocks.insert("127.42.1".to_string());
+        assert_eq!(next_vip_block(&used_blocks).unwrap(), "127.64.1");
+        // Past the first 256 blocks the second octet moves on (the old
+        // `127.42.b` scheme stopped here).
+        for index in 0..256 {
+            used_blocks.insert(vip_block(index));
+        }
+        assert_eq!(next_vip_block(&used_blocks).unwrap(), "127.65.0");
+        for index in 0..VIP_BLOCKS {
+            used_blocks.insert(vip_block(index));
         }
         assert!(next_vip_block(&used_blocks).is_err());
+        assert_eq!(vip_block(VIP_BLOCKS - 1), "127.127.255");
+        assert_eq!(vip_block_index("127.127.255"), Some(VIP_BLOCKS - 1));
+        assert_eq!(vip_block_index("127.42.7"), None, "outside the range");
+        assert_eq!(vip_block_index("127.128.0"), None);
 
         let connect = connect(json!([
             { "to": "db" },
@@ -3878,8 +3999,8 @@ mod tests {
         );
         let unknown = by_key("unknown");
         assert!(
-            unknown.canonical_port >= Some(DYNAMIC_PORT_MIN),
-            "falls back to a port from the dynamic range"
+            unknown.canonical_port >= Some(DATAPATH_PORT_MIN),
+            "falls back to a port from the datapath's range"
         );
         // With a VIP block only a pinned port is bound on loopback.
         assert_eq!(by_key("db").local_port, None);

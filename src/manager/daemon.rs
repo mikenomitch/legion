@@ -434,6 +434,12 @@ pub async fn run_manager_with(
         );
     }
 
+    // Endpoint sets (mesh-control-path plan §6.1): re-read the consumed
+    // services the projection marked dirty and push them on the consuming
+    // nodes' work streams. Every manager, leader or not: a worker may
+    // stream from any of them, and each serves from its own replica.
+    tokio::spawn(crate::manager::server::endpoint_feed::run_endpoint_refresher(store.clone()));
+
     // Idempotency records only need to outlive a client's retry window;
     // without this the table grows by one row per keyed mutation forever.
     // Control-lane leader only (always true outside raft mode): the delete

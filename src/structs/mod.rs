@@ -21,6 +21,7 @@ pub mod fork;
 pub mod grant;
 pub mod hops;
 pub mod host_guard;
+pub mod hostport;
 pub mod instance;
 pub mod job;
 pub mod job_schema;

@@ -1559,7 +1559,7 @@ pub fn catalog() -> Vec<Capability> {
             grpc: Some("Manager/RotateMeshCa"),
             summary: "Rotate the built-in cluster CA in two steps: the new CA, cross-signed by \
                  the old one, signs at once and the old one stays trusted for 24h, so no \
-                 connection breaks. Nodes re-issue within one heartbeat. `file` and `exec` \
+                 connection breaks. Nodes re-issue within a 10-minute splay. `file` and `exec` \
                  CAs rotate outside Legion; this refuses with the procedure.",
             mutates: true,
             read_only_safe: false,

@@ -131,12 +131,14 @@ mod app_ui_rpcs;
 mod autoscale_rpcs;
 mod checkpoint_support;
 mod delegation;
+pub mod endpoint_feed;
 mod extension_rpcs;
 mod fork_rpcs;
 mod make_room;
 mod material_rpcs;
 mod namespace_policy_rpcs;
 mod namespace_rpcs;
+mod net_policy_memo;
 mod node_content_rpcs;
 mod node_group_rpcs;
 mod object_rpcs;
@@ -2115,6 +2117,10 @@ pub struct ManagerDaemonService {
     /// re-read at most every `NET_POLICY_GENERATION_TTL`, so a cluster with
     /// no policies pays a mutex read per heartbeat rather than a query.
     net_policy_generation: Arc<Mutex<Option<(std::time::Instant, u64)>>>,
+    /// Effective-policy assignments by their inputs, per policy generation
+    /// (mesh-control-path plan §6.2), so a heartbeat neither lists policies
+    /// nor merges for an allocation whose inputs it has seen.
+    net_policy_memo: Arc<net_policy_memo::NetPolicyMemo>,
     /// The service graph: per (caller job, caller task, service, tag), the
     /// last 15 minutes of per-minute buckets folded from every node's
     /// `net_edges` heartbeat samples. In memory: a failover loses at most the
@@ -2204,6 +2210,7 @@ impl ManagerDaemonService {
             heartbeat: crate::structs::HeartbeatConfigFull::default(),
             net_policy_cache: Arc::new(Mutex::new(HashMap::new())),
             net_policy_generation: Arc::new(Mutex::new(None)),
+            net_policy_memo: Arc::default(),
             net_status: Arc::new(Mutex::new(HashMap::new())),
             net_plugin_status: Arc::new(Mutex::new(HashMap::new())),
             net_edges: Arc::new(Mutex::new(HashMap::new())),
@@ -8956,17 +8963,23 @@ impl Manager for ManagerDaemonService {
                 .map_err(|e| map_store_error("Error building desired allocations", e))?;
             (desired.clone(), desired)
         };
-        // Endpoint feed for the node-local upstream forwarders. Costs nothing
-        // (no store access at all) when no desired allocation uses connect, and
-        // is infallible by construction: a connect-layer problem must never
-        // stop this node from reconciling its allocations.
-        let mut upstream_endpoints = build_upstream_endpoints(&self.store, &feed_allocations);
         // Effective network policy per desired allocation, as content hashes.
-        // Same contract as the endpoint feed: no store access when no policy
-        // exists and no task declares one; never fails the heartbeat.
+        // No store access when no policy exists and no task declares one;
+        // never fails the heartbeat.
         let net_policies = self.build_net_policies(&id, &feed_allocations);
-        // `proxy` handler targets ride the same feed, flagged `for_handler`.
-        upstream_endpoints.extend(self.build_handler_endpoints(&feed_allocations, &net_policies));
+        // Endpoint feed for the node-local upstream forwarders and `proxy`
+        // handler targets, as a delta against what the worker holds
+        // (mesh-control-path plan §6.1). Costs nothing (no store access at
+        // all) when no desired allocation uses connect, reads the catalog
+        // only for sets the endpoint index holds stale, and is infallible by
+        // construction: a connect-layer problem must never stop this node
+        // from reconciling its allocations.
+        let endpoint_feed = self.node_endpoint_feed(
+            &id,
+            &feed_allocations,
+            &net_policies,
+            req.endpoint_feed.as_ref(),
+        );
         // Denials the node's datapath recorded, turned into events so "which
         // rule blocked it" is answerable without node access.
         for denial in &req.net_denials {
@@ -9138,7 +9151,7 @@ impl Manager for ManagerDaemonService {
             net_policies,
             message: "ack".into(),
             desired_allocations,
-            upstream_endpoints,
+            endpoint_feed: Some(endpoint_feed),
             volume_destroy,
             stop_notices,
             claim_verdicts,
@@ -14274,17 +14287,6 @@ fn derive_node_health(value: &Value) -> Option<bool> {
     }
 }
 
-/// The workload identity subject of a desired allocation, as the endpoint
-/// feed matches `service.allow` against it.
-fn allocation_subject(allocation: &crate::structs::TaskAllocation) -> String {
-    let group = if allocation.task_group.is_empty() {
-        crate::structs::default_task_group()
-    } else {
-        allocation.task_group.clone()
-    };
-    crate::structs::workload_subject(&allocation.job_id, &group, &allocation.task_name)
-}
-
 fn build_desired_allocations(
     store: &Store,
     node_id: &str,
@@ -14370,34 +14372,9 @@ pub(crate) fn desired_payload(
     Ok(payload)
 }
 
-/// Resolve the current endpoint set for every upstream declared by this node's
-/// desired allocations — the service-discovery feed the worker's loopback
-/// forwarders are driven from.
-///
-/// Fast path: allocations carry their `connect` block on the wire, so when no
-/// desired allocation declares upstreams this returns an empty vector without
-/// touching the store. Nodes running only plain jobs therefore pay zero extra
-/// queries per heartbeat (heartbeats run every
-/// `WORKER_HEARTBEAT_DURATION_SEC`, so this is the hot path).
-///
-/// Otherwise each *distinct* `(upstream service, consuming job)` pair is
-/// resolved once and memoized: the store lookup is an indexed seek over just
-/// that service's rows (see [`Store::service_endpoints`]), and the resulting
-/// wire list is shared by every allocation of the same job — a node running
-/// `count: 40` of one client task would otherwise rebuild the identical list 40
-/// times, every 2s. Endpoints are filtered to healthy ones and gated by the
-/// target service's `service.allow` intentions against the *consuming*
-/// allocation's job id; a denied consumer gets an empty list rather than an
-/// error.
-///
-/// The feed is **additive and never fatal** — which is why it returns a plain
-/// `Vec` and not an `R<_>`. A store failure (or an unparseable stored payload)
-/// omits that upstream's entry instead of failing the heartbeat: the worker only
-/// calls `set_endpoints` for entries actually present in the reply, so an
-/// omitted upstream keeps its last known good endpoints — the same fail-static
-/// property, without taking the node's whole allocation reconciliation (and,
-/// after each stateful task's fence window, its running allocations) down with
-/// it.
+/// Network policy on the heartbeat: assignments per allocation (memoized,
+/// `net_policy_memo`), and the queries `TestNetPolicy` and `net doctor` run.
+/// The endpoint feed lives in `endpoint_feed`.
 impl ManagerDaemonService {
     /// Effective network policy for every desired allocation, as content
     /// hashes. Zero store access when the cluster has no policy (cached
@@ -14407,98 +14384,10 @@ impl ManagerDaemonService {
         node_id: &str,
         desired: &[crate::structs::TaskAllocation],
     ) -> Vec<AllocNetPolicy> {
-        use crate::structs::netpolicy::NetSelectorFacts;
-        // Gated by placement, which can resolve `auto` with no `network`
-        // block on the task at all (a default sandbox, gated plan Phase 2):
-        // the allocation's own network records it.
-        let placed_gated = |allocation: &crate::structs::TaskAllocation| {
-            allocation
-                .network
-                .contains(crate::structs::netpolicy::MODE_GATED)
-                && serde_json::from_str::<crate::structs::AllocNetwork>(&allocation.network)
-                    .is_ok_and(|placed| placed.is_gated())
-        };
-        let any_inline = desired
-            .iter()
-            .any(|allocation| !allocation.task_network.trim().is_empty());
-        if self.net_policy_generation_cached() == 0
-            && !any_inline
-            && !desired.iter().any(placed_gated)
-        {
-            return Vec::new();
-        }
-        // Stored policies once per heartbeat; the node's pool once, and only
-        // when a policy could select on it.
-        let stored: Vec<crate::structs::netpolicy::NetPolicyObject> = match self
-            .store
-            .list_net_policies()
-        {
-            Ok(records) => records.into_iter().map(|record| record.object).collect(),
-            Err(err) => {
-                warn!(node_id = %node_id, error = ?err, "Skipping net policies; listing failed");
-                return Vec::new();
-            }
-        };
-        let needs_pool = stored.iter().any(|p| !p.selector.node_pools.is_empty());
-        let node_pool = if needs_pool {
-            self.store.get_node(node_id).ok().map(|node| node.pool)
-        } else {
-            None
-        };
-        let mut out = Vec::new();
-        for allocation in desired {
-            let network: Option<crate::structs::NetworkConfig> =
-                if allocation.task_network.trim().is_empty() {
-                    None
-                } else {
-                    match serde_json::from_str(&allocation.task_network) {
-                        Ok(network) => Some(network),
-                        Err(err) => {
-                            warn!(
-                                allocation_id = allocation.allocation_id,
-                                error = ?err,
-                                "Skipping net policy; invalid task network payload"
-                            );
-                            continue;
-                        }
-                    }
-                };
-            let facts = NetSelectorFacts {
-                node_pool: node_pool.clone(),
-                runtime: allocation.task_runtime.clone(),
-                job: allocation.job_id.clone(),
-                labels: network
-                    .as_ref()
-                    .map(|n| n.labels.clone())
-                    .unwrap_or_default(),
-            };
-            let service: Option<crate::structs::ServiceConfig> =
-                (!allocation.task_service.trim().is_empty())
-                    .then(|| serde_json::from_str(&allocation.task_service).ok())
-                    .flatten();
-            let (effective, _) =
-                merge_net_policies(&stored, &facts, network.as_ref(), service.as_ref());
-            // A gated allocation is told about an *empty* policy too, so the
-            // node can tell "known: nothing covers it" (`gated-default`) from
-            // "pending" (`policy-pending`). Gated by its declaration, by a
-            // `require` policy, or by placement resolving `auto` (a default
-            // sandbox, gated plan Phase 2), which the allocation's own
-            // network records.
-            let gated = placed_gated(allocation)
-                || network
-                    .as_ref()
-                    .is_some_and(|n| n.mode == crate::structs::netpolicy::MODE_GATED)
-                || effective.mode.as_deref() == Some(crate::structs::netpolicy::MODE_GATED);
-            if effective.is_empty() && !gated {
-                continue;
-            }
-            self.remember_net_policy(&effective);
-            out.push(AllocNetPolicy {
-                allocation_id: allocation.allocation_id,
-                policy_hash: effective.hash.clone(),
-            });
-        }
-        out
+        // Memoized per input and policy generation (mesh-control-path plan
+        // §6.2): a beat whose inputs did not change lists nothing, parses
+        // nothing, and merges nothing.
+        self.memoized_net_policies(node_id, desired)
     }
 
     /// The effective policy for one task, given selector facts. Returns the
@@ -14574,118 +14463,6 @@ impl ManagerDaemonService {
                 .unwrap_or_default(),
         };
         Ok((task, facts))
-    }
-
-    /// The datapath status nodes last reported for this task's running
-    /// allocations, as JSON, for `net doctor` and the UI.
-    /// Endpoint lists for every `proxy` handler target (`service` or `node`)
-    /// on the desired allocations' effective chains and upstreams, so the
-    /// datapath can hand a flow to an external proxy without a listener of
-    /// its own. Empty on nodes with no handler anywhere — the common case
-    /// costs one pass over the policy hashes.
-    fn build_handler_endpoints(
-        &self,
-        desired: &[crate::structs::TaskAllocation],
-        policies: &[crate::structs::AllocNetPolicy],
-    ) -> Vec<crate::structs::UpstreamEndpoints> {
-        let mut wanted: Vec<(i64, String, String)> = Vec::new();
-        let by_alloc: HashMap<i64, &str> = policies
-            .iter()
-            .map(|p| (p.allocation_id, p.policy_hash.as_str()))
-            .collect();
-        for allocation in desired {
-            let mut services: Vec<String> = Vec::new();
-            if let Some(hash) = by_alloc.get(&allocation.allocation_id) {
-                let cached = {
-                    let cache = self
-                        .net_policy_cache
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    cache.get(*hash).cloned()
-                };
-                if let Some(policy) = cached {
-                    for chain in [policy.egress.as_ref(), policy.ingress.as_ref()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        for hop in &chain.handlers {
-                            if let Some(service) = hop.handler.kind.endpoint_need() {
-                                services.push(service.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            if !allocation.task_connect.trim().is_empty() {
-                if let Ok(connect) =
-                    serde_json::from_str::<crate::structs::ConnectConfig>(&allocation.task_connect)
-                {
-                    for upstream in &connect.upstreams {
-                        for hop in &upstream.handlers {
-                            if let Some(service) = hop.kind.endpoint_need() {
-                                services.push(service.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            services.sort();
-            services.dedup();
-            let caller = allocation_subject(allocation);
-            for service in services {
-                wanted.push((allocation.allocation_id, service, caller.clone()));
-            }
-        }
-        if wanted.is_empty() {
-            return Vec::new();
-        }
-        let mut resolved: HashMap<String, Vec<crate::structs::ServiceEndpointRow>> = HashMap::new();
-        let mut out = Vec::new();
-        for (allocation_id, service, job_id) in wanted {
-            // A handler's `service` resolves like an upstream: in the
-            // allocation's own namespace unless it is qualified.
-            let target = crate::structs::namespace::qualify_in(
-                crate::structs::namespace::job_namespace(&job_id),
-                &service,
-            );
-            if !resolved.contains_key(&target) {
-                let rows = self
-                    .store
-                    .service_endpoints(Some(&target))
-                    .unwrap_or_default();
-                resolved.insert(target.clone(), rows);
-            }
-            let endpoints = resolved[&target]
-                .iter()
-                .filter(|row| {
-                    row.healthy && crate::structs::allow_permits(&row.allow, &row.job_id, &job_id)
-                })
-                .map(|row| ServiceEndpoint {
-                    namespace: crate::structs::namespace::job_namespace(&row.job_id).to_string(),
-                    service: row.service.clone(),
-                    job_id: row.job_id.clone(),
-                    task_name: row.task_name.clone(),
-                    allocation_id: row.allocation_id,
-                    node_id: row.node_id.clone(),
-                    address: row.address.clone().unwrap_or_default(),
-                    public_address: row.public_address.clone().unwrap_or_default(),
-                    port: u32::from(row.port.unwrap_or(0)),
-                    healthy: row.healthy,
-                    health_status: row.health_status.clone(),
-                    tags: row.tags.clone(),
-                    meta: row.meta.clone().into_iter().collect(),
-                    port_label: row.port_label.clone().unwrap_or_default(),
-                    mesh_tls: row.mesh_tls,
-                })
-                .collect();
-            out.push(crate::structs::UpstreamEndpoints {
-                allocation_id,
-                service,
-                endpoints,
-                for_handler: true,
-            });
-        }
-        out
     }
 
     /// Fold one node's edge samples into the graph windows.
@@ -15268,127 +15045,13 @@ fn parse_test_target(
             return (Some(parsed.host), ip, parsed.port, path);
         }
     }
-    let (host, port) = match target.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => {
-            (host.to_string(), port.parse().unwrap_or(0))
-        }
-        _ => (target.to_string(), 0),
+    let (host, port) = match crate::structs::hostport::split(target) {
+        Some((host, port)) => (host.to_string(), port),
+        // A bare name or IP, IPv6 included, with no port.
+        None => (crate::structs::hostport::host_of(target).to_string(), 0),
     };
     let ip = host.parse().ok();
     (Some(host.to_ascii_lowercase()), ip, port, None)
-}
-
-fn build_upstream_endpoints(
-    store: &Store,
-    desired: &[crate::structs::TaskAllocation],
-) -> Vec<crate::structs::UpstreamEndpoints> {
-    if desired
-        .iter()
-        .all(|allocation| allocation.task_connect.trim().is_empty())
-    {
-        return Vec::new();
-    }
-
-    // Keyed by (service, consuming job id) because intentions are per consumer:
-    // the same service yields a different list to a permitted and a denied job.
-    let mut resolved: HashMap<(String, String), Vec<ServiceEndpoint>> = HashMap::new();
-    let mut upstreams = Vec::new();
-
-    for allocation in desired {
-        if allocation.task_connect.trim().is_empty() {
-            continue;
-        }
-        // A payload we wrote ourselves failing to parse is a manager bug, and
-        // retrying cannot fix it — skip this allocation's upstreams rather than
-        // fail the heartbeat and stall reconciliation for the whole node.
-        let connect: crate::structs::ConnectConfig =
-            match serde_json::from_str(&allocation.task_connect) {
-                Ok(connect) => connect,
-                Err(err) => {
-                    warn!(
-                        allocation_id = allocation.allocation_id,
-                        error = ?err,
-                        "Skipping upstream endpoints; invalid connect payload"
-                    );
-                    continue;
-                }
-            };
-        for upstream in &connect.upstreams {
-            // The service lives in the consumer's own namespace unless the
-            // upstream names another (docs/namespaces.md): a bare name never
-            // resolves across a namespace boundary. External upstreams dial a
-            // fixed destination and need no endpoint feed.
-            let Some(target) = upstream.service_ref(&allocation.job_id) else {
-                continue;
-            };
-            let key = (target.clone(), allocation.job_id.clone());
-            if !resolved.contains_key(&key) {
-                let rows = match store.service_endpoints(Some(&target)) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        // Same reasoning as the corrupt-payload arm above:
-                        // omitting this upstream leaves the forwarder on its
-                        // last known good endpoints, while failing here would
-                        // stall this node's reconciliation entirely.
-                        warn!(
-                            allocation_id = allocation.allocation_id,
-                            service = %target,
-                            error = ?err,
-                            "Skipping upstream endpoints; service lookup failed"
-                        );
-                        continue;
-                    }
-                };
-                let endpoints = rows
-                    .into_iter()
-                    .filter(|row| {
-                        row.healthy
-                            && crate::structs::allow_permits(
-                                &row.allow,
-                                &row.job_id,
-                                &allocation.job_id,
-                            )
-                    })
-                    .map(|row| ServiceEndpoint {
-                        namespace: crate::structs::namespace::job_namespace(&row.job_id)
-                            .to_string(),
-                        service: row.service,
-                        job_id: row.job_id,
-                        task_name: row.task_name,
-                        allocation_id: row.allocation_id,
-                        node_id: row.node_id,
-                        address: row.address.unwrap_or_default(),
-                        public_address: row.public_address.unwrap_or_default(),
-                        port: u32::from(row.port.unwrap_or(0)),
-                        healthy: row.healthy,
-                        health_status: row.health_status,
-                        tags: row.tags,
-                        meta: row.meta.into_iter().collect(),
-                        port_label: row.port_label.unwrap_or_default(),
-                        mesh_tls: row.mesh_tls,
-                    })
-                    .collect::<Vec<_>>();
-                resolved.insert(key.clone(), endpoints);
-            }
-            let endpoints = resolved.get(&key).cloned().unwrap_or_default();
-            debug!(
-                allocation_id = allocation.allocation_id,
-                service = %target,
-                endpoints = endpoints.len(),
-                "Resolved upstream endpoints"
-            );
-            // The worker keys its listeners by the upstream's key (the alias,
-            // or `service.namespace` for a crossing), not the catalog name.
-            upstreams.push(crate::structs::UpstreamEndpoints {
-                allocation_id: allocation.allocation_id,
-                service: upstream.key(),
-                endpoints,
-                for_handler: false,
-            });
-        }
-    }
-
-    upstreams
 }
 
 /// Apply the volume operation outcomes a worker reported.
@@ -16126,6 +15789,64 @@ mod tests {
         assert_eq!(assignments.len(), 1, "{assignments:?}");
         assert_eq!(assignments[0].allocation_id, 7);
         assert!(!assignments[0].policy_hash.is_empty());
+        Ok(())
+    }
+
+    /// Mesh-control-path plan §6.2: assignments are memoized on their
+    /// inputs. Allocations of one task share one merge, a repeated beat
+    /// merges nothing, and a changed task network or a policy write (a new
+    /// generation) merges again.
+    #[test]
+    fn net_policy_assignments_are_memoized_until_an_input_changes() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let allocation = |allocation_id: i64, network: Value| crate::structs::TaskAllocation {
+            allocation_id,
+            job_id: "web".into(),
+            task_runtime: "exec".into(),
+            task_network: network.to_string(),
+            ..Default::default()
+        };
+        let network = json!({ "mode": "gated", "egress": { "allow": ["pypi.org"] } });
+        let desired = vec![allocation(1, network.clone()), allocation(2, network)];
+        let first = manager.build_net_policies("node-1", &desired);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].policy_hash, first[1].policy_hash);
+        assert_eq!(manager.net_policy_memo.merges(), 1, "one merge per task");
+
+        let again = manager.build_net_policies("node-1", &desired);
+        assert_eq!(again, first);
+        assert_eq!(
+            manager.net_policy_memo.merges(),
+            1,
+            "a steady beat merges nothing"
+        );
+
+        // A changed task network is a new input.
+        let changed = vec![allocation(
+            1,
+            json!({ "mode": "gated", "egress": { "allow": ["crates.io"] } }),
+        )];
+        let other = manager.build_net_policies("node-1", &changed);
+        assert_eq!(other.len(), 1);
+        assert_eq!(manager.net_policy_memo.merges(), 2, "merged again");
+
+        // A policy write moves the generation: everything merges again, and
+        // the stored policy now applies.
+        store.upsert_net_policy(serde_json::from_value(json!({
+            "name": "everyone", "enforcement": "require", "priority": 1,
+            "egress": { "allow": ["example.com"] }
+        }))?)?;
+        manager.bump_net_policy_generation();
+        let after = manager.build_net_policies("node-1", &desired);
+        assert_eq!(manager.net_policy_memo.merges(), 3);
+        assert_ne!(after[0].policy_hash, first[0].policy_hash);
+        // Every body a beat assigns is servable.
+        let cache = manager
+            .net_policy_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(cache.contains_key(&after[0].policy_hash));
         Ok(())
     }
 
@@ -20859,6 +20580,58 @@ mod tests {
         }
     }
 
+    /// The feed a node holding `held` gets for `desired`, with no policy
+    /// handlers.
+    fn feed_for(
+        store: &Store,
+        desired: &[crate::structs::TaskAllocation],
+        held: Option<&crate::structs::EndpointFeedState>,
+    ) -> crate::structs::EndpointFeed {
+        let bindings = endpoint_feed::endpoint_bindings(desired, |_| Arc::default());
+        endpoint_feed::build_endpoint_feed(store, "node-test", bindings, held)
+    }
+
+    /// A feed flattened per binding, the way the worker applies it to its
+    /// listeners. A binding whose set the feed left out is left out too.
+    fn flattened(feed: &crate::structs::EndpointFeed) -> Vec<crate::structs::UpstreamEndpoints> {
+        feed.bindings
+            .iter()
+            .filter_map(|binding| {
+                let set = feed.sets.iter().find(|set| {
+                    set.service == binding.service && set.consumer == binding.consumer
+                })?;
+                Some(crate::structs::UpstreamEndpoints {
+                    allocation_id: binding.allocation_id,
+                    service: binding.upstream.clone(),
+                    endpoints: set.endpoints.clone(),
+                    for_handler: binding.for_handler,
+                })
+            })
+            .collect()
+    }
+
+    /// What a worker that applied `feed` reports holding.
+    fn held_after(feed: &crate::structs::EndpointFeed) -> crate::structs::EndpointFeedState {
+        crate::structs::EndpointFeedState {
+            bindings_digest: feed.bindings_digest.clone(),
+            sets: feed
+                .sets
+                .iter()
+                .map(|set| crate::structs::EndpointSetVersion {
+                    service: set.service.clone(),
+                    consumer: set.consumer.clone(),
+                    epoch: feed.epoch,
+                    version: set.version,
+                    digest: set.digest,
+                })
+                .collect(),
+        }
+    }
+
+    fn backend_of(store: &Store, service: &str) -> R<i64> {
+        Ok(store.service_endpoints(Some(service))?[0].allocation_id)
+    }
+
     #[test]
     fn upstream_endpoints_fast_path_never_touches_the_store() -> R<()> {
         // Heartbeats run every 2s on every node, so jobs that declare no
@@ -20875,8 +20648,8 @@ mod tests {
             ..Default::default()
         };
         let reads_before = store.read_index.load(std::sync::atomic::Ordering::Relaxed);
-        let endpoints = build_upstream_endpoints(&store, std::slice::from_ref(&plain));
-        assert!(endpoints.is_empty());
+        let feed = feed_for(&store, std::slice::from_ref(&plain), None);
+        assert!(feed.sets.is_empty() && feed.bindings.is_empty());
         assert_eq!(
             store.read_index.load(std::sync::atomic::Ordering::Relaxed),
             reads_before,
@@ -20884,8 +20657,8 @@ mod tests {
         );
 
         // An empty desired set is the same story.
-        let endpoints = build_upstream_endpoints(&store, &[]);
-        assert!(endpoints.is_empty());
+        let feed = feed_for(&store, &[], None);
+        assert!(feed.sets.is_empty() && feed.bindings.is_empty());
         assert_eq!(
             store.read_index.load(std::sync::atomic::Ordering::Relaxed),
             reads_before
@@ -20893,7 +20666,7 @@ mod tests {
 
         // …but one allocation with upstreams does put the store to work.
         let consumer = consumer_allocation(2, "consumer", "web");
-        let endpoints = build_upstream_endpoints(&store, &[plain, consumer]);
+        let endpoints = flattened(&feed_for(&store, &[plain, consumer], None));
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].allocation_id, 2);
         assert_eq!(endpoints[0].service, "web");
@@ -20906,47 +20679,50 @@ mod tests {
     }
 
     #[test]
-    fn upstream_endpoints_are_healthy_only_and_memoized_per_service_and_consumer() -> R<()> {
+    fn upstream_endpoints_are_healthy_only_and_read_once_per_service() -> R<()> {
         let store = setup_store()?;
         insert_node(&store, "node-a")?;
         seed_upstream_service(&store, "web", 18081, &[], true)?;
         seed_upstream_service(&store, "starting", 18082, &[], false)?;
 
-        // A node running `count: N` of one client task asks for the same
-        // (service, job) pair N times per heartbeat; it must be resolved once.
+        // A node running `count: N` of one client task binds the same
+        // (service, job) set N times; the node gets it once.
         let desired = vec![
             consumer_allocation(1, "consumer", "web"),
             consumer_allocation(2, "consumer", "web"),
             consumer_allocation(3, "consumer", "starting"),
         ];
         let reads_before = store.read_index.load(std::sync::atomic::Ordering::Relaxed);
-        let endpoints = build_upstream_endpoints(&store, &desired);
+        let feed = feed_for(&store, &desired, None);
         let reads = store.read_index.load(std::sync::atomic::Ordering::Relaxed) - reads_before;
-
+        assert_eq!(feed.bindings.len(), 3);
+        assert_eq!(feed.sets.len(), 2, "one set per (service, consumer)");
+        let endpoints = flattened(&feed);
         assert_eq!(endpoints.len(), 3);
         assert_eq!(endpoints[0].endpoints.len(), 1);
         assert_eq!(endpoints[1].endpoints.len(), 1);
         // No health snapshot yet => not healthy => not dialable.
         assert!(endpoints[2].endpoints.is_empty());
-        assert_eq!(reads, 2, "each distinct upstream service is resolved once");
+        assert_eq!(reads, 2, "each distinct upstream service is read once");
 
         let endpoint = &endpoints[0].endpoints[0];
         assert_eq!(endpoint.service, "web");
         assert_eq!(endpoint.port, 18081);
         assert!(endpoint.healthy);
 
-        // Two *different* consuming jobs cannot share a memo entry: intentions
-        // are evaluated per consumer, so each gets its own lookup.
+        // Other consumers and later beats share the index: no read at all
+        // until something marks a service dirty.
         let desired = vec![
             consumer_allocation(1, "consumer-a", "web"),
             consumer_allocation(2, "consumer-a", "web"),
             consumer_allocation(3, "consumer-b", "web"),
         ];
         let reads_before = store.read_index.load(std::sync::atomic::Ordering::Relaxed);
-        let endpoints = build_upstream_endpoints(&store, &desired);
+        let feed = feed_for(&store, &desired, None);
         let reads = store.read_index.load(std::sync::atomic::Ordering::Relaxed) - reads_before;
-        assert_eq!(endpoints.len(), 3);
-        assert_eq!(reads, 2, "one lookup per (service, consuming job) pair");
+        assert_eq!(feed.sets.len(), 2, "intentions are per consumer");
+        assert_eq!(flattened(&feed).len(), 3);
+        assert_eq!(reads, 0, "a fresh set is not read again");
         Ok(())
     }
 
@@ -20963,7 +20739,7 @@ mod tests {
 
         let visible = |job_id: &str, service: &str| -> R<usize> {
             let desired = vec![consumer_allocation(1, job_id, service)];
-            let endpoints = build_upstream_endpoints(&store, &desired);
+            let endpoints = flattened(&feed_for(&store, &desired, None));
             assert_eq!(endpoints.len(), 1, "one entry per declared upstream");
             Ok(endpoints[0].endpoints.len())
         };
@@ -20992,7 +20768,7 @@ mod tests {
             ..Default::default()
         };
         let healthy = consumer_allocation(2, "consumer", "web");
-        let endpoints = build_upstream_endpoints(&store, &[corrupt, healthy]);
+        let endpoints = flattened(&feed_for(&store, &[corrupt, healthy], None));
 
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].allocation_id, 2);
@@ -21005,9 +20781,9 @@ mod tests {
         // A store-level failure is the other half of the additive contract: if
         // it propagated, `heartbeat` would return Internal and the node would
         // stop starting, stopping and health-reporting allocations entirely —
-        // over a connect-only problem. Omitting the entry instead leaves the
-        // forwarder on its last known good endpoints (the worker only applies
-        // upstreams present in the reply).
+        // over a connect-only problem. Omitting the set instead leaves the
+        // forwarder on its last known good endpoints (the worker keeps a set
+        // the feed leaves out).
         let store = setup_store()?;
         insert_node(&store, "node-a")?;
         seed_upstream_service(&store, "broken", 18096, &[], true)?;
@@ -21032,12 +20808,132 @@ mod tests {
             consumer_allocation(1, "consumer", "broken"),
             consumer_allocation(2, "consumer", "fine"),
         ];
-        let endpoints = build_upstream_endpoints(&store, &desired);
-
-        assert_eq!(endpoints.len(), 1, "the failing upstream is omitted");
+        let feed = feed_for(&store, &desired, None);
+        assert_eq!(
+            feed.bindings.len(),
+            2,
+            "bindings do not depend on the catalog"
+        );
+        let endpoints = flattened(&feed);
+        assert_eq!(endpoints.len(), 1, "the failing set is omitted");
         assert_eq!(endpoints[0].allocation_id, 2);
         assert_eq!(endpoints[0].service, "fine");
         assert_eq!(endpoints[0].endpoints.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_steady_beat_ships_no_endpoints_and_a_change_ships_only_its_set() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        seed_upstream_service(&store, "web", 18100, &[], true)?;
+        seed_upstream_service(&store, "db", 18101, &[], true)?;
+        let desired = vec![
+            consumer_allocation(1, "consumer", "web"),
+            consumer_allocation(2, "consumer", "db"),
+            consumer_allocation(3, "consumer", "web"),
+        ];
+        let first = feed_for(&store, &desired, None);
+        assert!(!first.bindings_unchanged);
+        assert_eq!(first.bindings.len(), 3);
+        assert_eq!(first.sets.len(), 2);
+        let held = held_after(&first);
+        let web_version = first
+            .sets
+            .iter()
+            .find(|set| set.service == "web")
+            .expect("web")
+            .version;
+
+        // A steady beat: nothing read, nothing shipped.
+        let reads_before = store.read_index.load(std::sync::atomic::Ordering::Relaxed);
+        let steady = feed_for(&store, &desired, Some(&held));
+        assert!(steady.bindings_unchanged);
+        assert!(steady.bindings.is_empty());
+        assert!(steady.sets.is_empty());
+        assert_eq!(
+            store.read_index.load(std::sync::atomic::Ordering::Relaxed),
+            reads_before,
+            "a steady beat reads nothing"
+        );
+
+        // web's backend fails its health check: only web's set moves.
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: backend_of(&store, "web")?,
+                healthy: false,
+                status: "failing".into(),
+                artifact_states: None,
+            }],
+        )?;
+        let changed = feed_for(&store, &desired, Some(&held));
+        assert!(changed.bindings_unchanged);
+        assert_eq!(changed.sets.len(), 1, "only the changed set");
+        assert_eq!(changed.sets[0].service, "web");
+        assert!(changed.sets[0].endpoints.is_empty());
+        assert!(changed.sets[0].version > web_version, "versions advance");
+
+        // The db consumer leaves the node: the bindings move, no set does.
+        let held = held_after(&changed);
+        let held = crate::structs::EndpointFeedState {
+            sets: first
+                .sets
+                .iter()
+                .filter(|set| set.service == "db")
+                .map(|set| crate::structs::EndpointSetVersion {
+                    service: set.service.clone(),
+                    consumer: set.consumer.clone(),
+                    epoch: first.epoch,
+                    version: set.version,
+                    digest: set.digest,
+                })
+                .chain(held.sets)
+                .collect(),
+            ..held
+        };
+        let fewer = feed_for(
+            &store,
+            &[desired[0].clone(), desired[2].clone()],
+            Some(&held),
+        );
+        assert!(!fewer.bindings_unchanged);
+        assert_eq!(fewer.bindings.len(), 2);
+        assert!(fewer.sets.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_stopped_backend_leaves_the_set_and_is_pushed_to_consuming_nodes() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        seed_upstream_service(&store, "web", 18102, &[], true)?;
+        seed_upstream_service(&store, "db", 18103, &[], true)?;
+        let web_consumer = [consumer_allocation(1, "consumer", "web")];
+        let db_consumer = [consumer_allocation(2, "consumer", "db")];
+        let bindings = endpoint_feed::endpoint_bindings(&web_consumer, |_| Arc::default());
+        let first = endpoint_feed::build_endpoint_feed(&store, "node-web", bindings, None);
+        assert_eq!(first.sets[0].endpoints.len(), 1);
+        let bindings = endpoint_feed::endpoint_bindings(&db_consumer, |_| Arc::default());
+        endpoint_feed::build_endpoint_feed(&store, "node-db", bindings, None);
+        assert!(endpoint_feed::endpoint_push(&store, "node-web").is_none());
+
+        store.remove_allocation_by_id(backend_of(&store, "web")?)?;
+        // The refresher's pass: re-read what the projection marked dirty.
+        assert_eq!(store.refresh_endpoint_sets(), 1, "only web was marked");
+        let push = endpoint_feed::endpoint_push(&store, "node-web").expect("web moved");
+        assert!(push.push_only);
+        let feed = push.endpoint_feed.expect("a push carries the feed");
+        assert!(feed.bindings_unchanged, "a push never carries bindings");
+        assert_eq!(feed.sets.len(), 1);
+        assert_eq!(feed.sets[0].service, "web");
+        assert!(feed.sets[0].endpoints.is_empty(), "the removal propagates");
+        assert!(feed.sets[0].version > first.sets[0].version);
+        assert!(
+            endpoint_feed::endpoint_push(&store, "node-db").is_none(),
+            "node-db does not consume web"
+        );
+        assert!(endpoint_feed::endpoint_push(&store, "node-web").is_none());
         Ok(())
     }
 

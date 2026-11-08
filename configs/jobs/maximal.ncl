@@ -347,12 +347,15 @@
                     # a per-request deadline, bounded retries (idempotent
                     # methods only by default), and a canary split by service
                     # tag. An endpoint that answers 5xx five times in a row is
-                    # ejected for 30s, with no setting.
+                    # ejected for 30s, with no setting. A request body up to
+                    # `maxBodyBytes` (default 1Mi, at most 64Mi) is kept so
+                    # a retry can resend it; a larger one streams once and
+                    # is not retried ("Request bodies").
                     {
                         to = "http://api",
                         http = {
                             timeout = "3s",
-                            retries = { attempts = 2, on = ["5xx", "connect-failure"], budget = "20%" },
+                            retries = { attempts = 2, on = ["5xx", "connect-failure"], budget = "20%", maxBodyBytes = "1Mi" },
                             split = [{ tag = "canary", weight = 10 }],
                         },
                     },

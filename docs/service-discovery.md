@@ -186,15 +186,17 @@ renders the same address.
 
 | Node | `LEGION_UPSTREAM_DB` |
 | --- | --- |
-| Linux | `127.42.7.2:5432`: the upstream's VIP on its canonical port ([Name-is-config](network-handlers.md#name-is-config-keysvclegion)) |
-| macOS, or a node with no VIP block left | `127.0.0.1:20003`: a loopback port from the dynamic range |
+| Linux | `127.64.7.2:5432`: the upstream's VIP on its canonical port ([Name-is-config](network-handlers.md#name-is-config-keysvclegion)) |
+| macOS, or a node with no VIP block left | `127.0.0.1:61003`: a loopback port from the datapath's range |
 
 On Linux an upstream takes no port from the node's range: its VIP is unique to
 the allocation. `port` pins the canonical port and also binds
 `127.0.0.1:<port>`, for a client config that wants a literal loopback address
 such as `127.0.0.1:6379`. A sandbox's upstreams also get a loopback port,
-because the guest's relay is keyed by it. A loopback port never collides with
-a host port on that node. `balance` overrides the strategy for that one
+because the guest's relay is keyed by it. Loopback ports come from the
+datapath's own range, `61000–65535`, apart from the `20000–32000` range task
+ports come from, so neither crowds the other out on a dense node, and a
+loopback port never collides with a host port on that node. `balance` overrides the strategy for that one
 upstream.
 
 Upstream addresses are per allocation, like host ports. A `count = 3` client
@@ -307,12 +309,14 @@ needs no proto change and no migration.
    Linux, a loopback port elsewhere (and for a pinned `port`).
 2. **Listeners.** The worker runs one TCP listener per
    `(allocation, upstream)` on that address.
-3. **Endpoint feed.** On every heartbeat (the worker type's
-   `heartbeatSeconds`, 2s by default), the manager sends the current endpoint set for each upstream this
-   node's allocations declare. The set holds healthy endpoints only, already
-   filtered by intentions. That interval is how quickly a client sees a backend
-   come up, go unhealthy, or move. Nodes running no `connect` jobs pay nothing,
-   because the manager skips the catalog work entirely.
+3. **Endpoint feed.** The manager keeps one versioned endpoint set per
+   service and sends each node only the sets its listeners use that changed
+   ([How endpoints reach a node](#how-endpoints-reach-a-node)). A set holds
+   healthy endpoints only, already filtered by intentions. A node that
+   streams its work gets a changed set pushed within a fraction of a second
+   of the change; the heartbeat carries the rest. Nodes running no
+   `connect` jobs pay nothing, because the manager skips the catalog work
+   entirely.
 4. **Per connection.** The worker asks the strategy for an endpoint and dials
    it with a 2s timeout. On refusal or timeout it drops that candidate and
    picks again, up to 3 endpoints. Then it splices the two sockets together.
@@ -326,10 +330,44 @@ needs no proto change and no migration.
 Only the first hop is loopback. The forwarder dials the endpoint's advertised
 node address, so cross-node traffic goes over the regular network as plain TCP.
 
-**Fail-static.** Endpoints are replaced only after a successful heartbeat. A
-manager outage leaves the last known good set in place, and existing clients
-keep working. An explicit empty list is authoritative, so a killed backend
-stops receiving traffic.
+**Fail-static.** Endpoints are replaced only from a manager's answer: a
+successful heartbeat or a push on the work stream. A manager outage leaves
+the last known good set in place, and existing clients keep working. An
+explicit empty list is authoritative, so a killed backend stops receiving
+traffic.
+
+### How endpoints reach a node
+
+Each manager holds, per service, the service's catalog rows and a
+**version** that moves only when they change. The catalog is derived from
+committed state, and every manager follows that state as it commits, so a
+follower serves the same sets as the leader:
+
+- **A change marks the service.** Placing, moving, or removing one of its
+  allocations, a health change, its node going lost or coming back or
+  changing its advertised address, or a change to its task config marks the
+  service's set stale. A refresher re-reads a stale service once, for every
+  node, with one indexed query, and bumps the version only if the content
+  changed. Every set is also re-read at least every 30 seconds, as a
+  backstop.
+- **A node gets only what changed.** The node's listeners each use a set,
+  named by service and consumer: 40 allocations of one job using `db` share
+  one `db` set. The heartbeat says which sets the node holds (by digest),
+  and the reply carries only those that differ, plus the bindings from
+  listener to set when those changed. A beat on which nothing changed reads
+  nothing from the catalog and carries no endpoints.
+- **Changes are pushed.** A node that streams its work gets a changed set
+  on its work stream as soon as the refresher sees the change, so failover
+  does not wait for the next heartbeat, which slows as the fleet grows
+  (about 8 s at 10,000 nodes,
+  [Heartbeat cadence](heartbeat-cadence-and-scale.md)). A push is a hint:
+  it is not replayed, and the next heartbeat corrects a lost one.
+- **The worker swaps one list at a time.** A set is applied only when it is
+  newer than the one the node holds, and only the listeners that use it get
+  the new list. Every other listener keeps its list untouched.
+
+Templates re-render from the same sets on the next heartbeat after a push.
+
 
 **Never fatal.** If an upstream port won't bind because something else on the
 node holds it, the worker logs one warning and retries on the next heartbeat.
@@ -630,10 +668,21 @@ Upstream names and VIPs need the whole `127.0.0.0/8` range routed to
 loopback. Linux does this by default, and macOS only has `127.0.0.1`. So on
 macOS an allocation gets no VIP block: no `LEGION_DNS`, and
 `LEGION_UPSTREAM_<KEY>` and `{{ service }}` are `127.0.0.1:<local port>`. On
-Linux, if a node runs out of VIP blocks, the allocation still places and its
-upstreams get loopback ports instead. macOS has no network-namespace isolation, so all tasks share
-the host port space. Dynamic ports (both task ports and upstream ports) avoid
-collisions. Static ports are first come, first served per node.
+Linux a node has 16,384 VIP blocks (`127.64.0.0/10`); if it runs out, the
+allocation still places and its upstreams get loopback ports instead. macOS
+has no network-namespace isolation, so all tasks share the host port space.
+Dynamic ports (task ports from `20000–32000`, the datapath's own from
+`61000–65535`) avoid collisions. Static ports are first come, first served
+per node.
+
+**IPv6.** A node or endpoint with an IPv6 address works end to end:
+endpoint addresses are written `[fd00::7]:5432` wherever an address meets a
+port (`LEGION_UPSTREAM_*`, `legion service resolve`, templates' `{{
+service }}`), a node's `workerAddress` may be `http://[fd00::5]:4848`, and an
+ingress port with no explicit bind listens on IPv4 and IPv6 on one socket
+(IPv4 only on a host without IPv6). In a template range, `.address` is the
+bare host, so a template that writes `{{ .address }}:{{ .port }}` itself
+must bracket an IPv6 address.
 
 ## Beyond discovery
 

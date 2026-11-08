@@ -10,6 +10,11 @@
 //! the result. A message also pushes the node's checkpoint work that became
 //! outstanding since the last one (checkpoints-on-stream plan), built by the
 //! same `build_checkpoint_requests` the heartbeat reply uses.
+//!
+//! Endpoint sets that changed for a service the node consumes go out as
+//! separate push-only messages (mesh-control-path plan §6.1,
+//! [`super::endpoint_feed::endpoint_push`]), woken by the endpoint index
+//! rather than the work log, outside the node's sequence.
 
 use super::*;
 use crate::storage::work_log::{NodeWorkLog, PendingWork, WorkLog};
@@ -154,6 +159,7 @@ impl ManagerDaemonService {
             "Work stream attached"
         );
 
+        let endpoint_wake = store.endpoint_index().node_wake(&node_id);
         tokio::spawn(async move {
             let log = attached.log;
             let session = attached.session;
@@ -170,6 +176,25 @@ impl ManagerDaemonService {
                 if !WorkLog::is_current(&log, session) {
                     // A newer stream for the node took over.
                     break;
+                }
+                // Changed endpoint sets first (mesh-control-path plan §6.1):
+                // a backend that went away should leave the node's lists
+                // before anything else is built. Push-only, outside the
+                // sequence, never replayed.
+                if store.endpoint_index().has_pending(&node_id) {
+                    let pushed = {
+                        let store = store.clone();
+                        let node_id = node_id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            super::endpoint_feed::endpoint_push(&store, &node_id)
+                        })
+                        .await
+                    };
+                    if let Ok(Some(push)) = pushed {
+                        if tx.send(Ok(push)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
                 // Send everything pending before waiting again. A change that
                 // lands while a message is being built re-arms the wake, so
@@ -208,6 +233,7 @@ impl ManagerDaemonService {
                 }
                 tokio::select! {
                     _ = log.wake.notified() => {}
+                    _ = endpoint_wake.notified() => {}
                     frame = inbound.message() => match frame {
                         Ok(Some(StreamWorkRequest {
                             frame: Some(stream_work_request::Frame::Ack(ack)),

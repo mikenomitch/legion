@@ -85,6 +85,12 @@ impl MeshIdentity {
         key_from_pem(self.key_pem.as_bytes())
     }
 
+    /// The node's private key, for the mesh's swappable certificate
+    /// (`super::mesh_tls`). Never logged or persisted by the datapath.
+    pub(crate) fn private_key(&self) -> R<PrivateKeyDer<'static>> {
+        self.key()
+    }
+
     pub fn roots(&self) -> RootCertStore {
         let mut roots = RootCertStore::empty();
         for cert in &self.ca {

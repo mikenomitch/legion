@@ -226,12 +226,19 @@ pub fn gated_namespace_ids(desired: &[TaskAllocation], alloc_root: &Path) -> Vec
 /// `mesh_tls` comes through as the manager set it: a mesh endpoint refuses a
 /// plaintext dial at the handshake.
 pub fn dialable_endpoints(update: &UpstreamEndpoints) -> Vec<Endpoint> {
-    update
-        .endpoints
+    dialable(&update.endpoints)
+}
+
+/// [`dialable_endpoints`] over a bare endpoint list (an `EndpointSet`'s).
+pub fn dialable(endpoints: &[crate::structs::ServiceEndpoint]) -> Vec<Endpoint> {
+    endpoints
         .iter()
         .filter(|endpoint| !endpoint.address.trim().is_empty() && endpoint.port != 0)
-        .map(|endpoint| Endpoint {
-            addr: format!("{}:{}", endpoint.address, endpoint.port),
+        .filter_map(|endpoint| Some((endpoint, u16::try_from(endpoint.port).ok()?)))
+        .map(|(endpoint, port)| Endpoint {
+            // An IPv6 address is bracketed, so `addr` parses as a
+            // `SocketAddr` and dials (mesh-control-path plan §6.5).
+            addr: crate::structs::hostport::join(&endpoint.address, port),
             allocation_id: endpoint.allocation_id,
             node_id: endpoint.node_id.clone(),
             tags: endpoint.tags.clone(),

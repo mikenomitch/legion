@@ -445,8 +445,57 @@ mod linux {
 
     /// How one direction is moving bytes right now.
     enum Mode {
-        Copy(Vec<u8>),
+        Copy(CopyBuf),
         Splice(Pipe),
+    }
+
+    /// Copy buffers kept per thread for reuse, so a short connection does
+    /// not allocate (mesh-control-path plan §6.8, review NET8).
+    const POOLED_PER_THREAD: usize = 64;
+
+    thread_local! {
+        static FREE: std::cell::RefCell<Vec<Box<[u8]>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A [`COPY_BUF`]-sized buffer from this thread's free list, returned to
+    /// whichever thread drops it. Only `buf[..n]` after a read of `n` is
+    /// ever written out, so a reused buffer's old bytes never leave.
+    struct CopyBuf(Option<Box<[u8]>>);
+
+    impl CopyBuf {
+        fn take() -> Self {
+            let reused = FREE.try_with(|free| free.borrow_mut().pop()).ok().flatten();
+            CopyBuf(Some(
+                reused.unwrap_or_else(|| vec![0u8; COPY_BUF].into_boxed_slice()),
+            ))
+        }
+    }
+
+    impl std::ops::Deref for CopyBuf {
+        type Target = [u8];
+        fn deref(&self) -> &[u8] {
+            self.0.as_deref().expect("held until dropped")
+        }
+    }
+
+    impl std::ops::DerefMut for CopyBuf {
+        fn deref_mut(&mut self) -> &mut [u8] {
+            self.0.as_deref_mut().expect("held until dropped")
+        }
+    }
+
+    impl Drop for CopyBuf {
+        fn drop(&mut self) {
+            if let Some(buf) = self.0.take() {
+                let _ = FREE.try_with(|free| {
+                    let mut free = free.borrow_mut();
+                    if free.len() < POOLED_PER_THREAD {
+                        free.push(buf);
+                    }
+                });
+            }
+        }
     }
 
     /// One direction until EOF, then half-close. Copies until a read fills
@@ -462,7 +511,7 @@ mod linux {
         first: &(dyn Fn() + Sync),
         moved: &(dyn Fn(usize) + Sync),
     ) -> io::Result<()> {
-        let mut mode = Mode::Copy(vec![0u8; COPY_BUF]);
+        let mut mode = Mode::Copy(CopyBuf::take());
         let mut may_splice = available();
         loop {
             let n = match &mut mode {

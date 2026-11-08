@@ -161,8 +161,9 @@ struct UpstreamShared {
     /// shared as an `Arc` so the accept path never copies the list.
     endpoints: Arc<Mutex<Arc<Vec<Endpoint>>>>,
     /// Live connection count per endpoint address, for load-aware strategies.
-    /// Entries are removed at zero so the map stays bounded by live endpoints.
-    inflight: Arc<Mutex<HashMap<String, usize>>>,
+    /// Pruned to the endpoint list when it changes
+    /// (`balance::prune_inflight`).
+    inflight: Arc<Mutex<crate::worker::balance::InflightCounts>>,
     /// Parsed external destination, when this upstream has one.
     target: Option<UpstreamTarget>,
     /// Policy, denial ledger, and TLS shared by every listener.
@@ -185,7 +186,7 @@ struct UpstreamShared {
 }
 
 /// `proxy` handler targets by (allocation, service).
-type HandlerEndpoints = HashMap<(i64, String), Vec<Endpoint>>;
+type HandlerEndpoints = HashMap<(i64, String), Arc<Vec<Endpoint>>>;
 /// Ingress TLS configs by (allocation, port label): the fingerprint of what
 /// built each, and the result.
 /// Client configs for external upstreams that pin a `ca`, by (allocation,
@@ -297,7 +298,15 @@ pub struct ForwarderContext {
     /// The node's network plugins (docs/network-plugins.md).
     plugins: Arc<crate::worker::netd::plugins::PluginHost>,
     /// The node's mesh credential and the client config built from it.
-    mesh: RwLock<Option<(Arc<MeshIdentity>, Arc<rustls::ClientConfig>)>>,
+    /// The node's mesh certificate and the TLS configs built for its trust
+    /// bundle, which keep their sessions across certificate refreshes
+    /// (`netd::mesh_tls`).
+    mesh: RwLock<
+        Option<(
+            Arc<MeshIdentity>,
+            Arc<crate::worker::netd::mesh_tls::MeshTls>,
+        )>,
+    >,
     /// Whether anything on this node needs a mesh certificate.
     mesh_wanted: AtomicBool,
     /// Ingress TLS configs per (allocation, port label): the fingerprint of
@@ -349,6 +358,9 @@ pub struct KernelGuardRuntime {
     kernel_status: HashMap<i64, crate::structs::NetKernelStatus>,
     /// Whether the node-wide guard maps hold `base` and these addresses.
     applied: Option<Vec<std::net::IpAddr>>,
+    /// How often the `nftables` guard's counters are read
+    /// (`hostGuard.counterInterval`).
+    counter_interval: Duration,
 }
 
 /// The kernel classifier a Linux worker hands [`ForwarderContext::with_kernel`];
@@ -511,7 +523,17 @@ impl ForwarderContext {
             backend,
             kernel_status: HashMap::new(),
             applied: None,
+            counter_interval: crate::structs::host_guard::DEFAULT_COUNTER_INTERVAL,
         }));
+        self
+    }
+
+    /// Read the `nftables` guard's drop counters at most this often
+    /// (`hostGuard.counterInterval`). No effect without a kernel guard.
+    pub fn with_guard_counter_interval(self, interval: Duration) -> Self {
+        if let Some(runtime) = &self.kernel_guard {
+            lock(runtime).counter_interval = interval;
+        }
         self
     }
 
@@ -557,6 +579,12 @@ impl ForwarderContext {
                         warn!(error = %format!("{err:#}"), "Failed to load the kernel host guard; retrying on the next heartbeat");
                         return;
                     }
+                }
+                // Reading forks `nft`: at most every `counterInterval`, not
+                // every beat (mesh-control-path plan §6.6). Drops in
+                // between are counted by the kernel and reported later.
+                if !guard.counters_due(std::time::Instant::now(), runtime.counter_interval) {
+                    return;
                 }
                 let counters = match crate::worker::netd::kernel_guard::read_counters(&name) {
                     Ok(counters) => counters,
@@ -947,13 +975,31 @@ impl ForwarderContext {
         service: &str,
         endpoints: Vec<Endpoint>,
     ) {
-        lock(&self.handler_endpoints).insert((allocation_id, service.to_string()), endpoints);
+        self.set_handler_endpoints_shared(allocation_id, service, Arc::new(endpoints));
+    }
+
+    /// [`Self::set_handler_endpoints`] with a list shared with other
+    /// listeners of the same endpoint set (mesh-control-path plan §6.1).
+    pub fn set_handler_endpoints_shared(
+        &self,
+        allocation_id: i64,
+        service: &str,
+        endpoints: Arc<Vec<Endpoint>>,
+    ) {
+        let mut handlers = lock(&self.handler_endpoints);
+        match handlers.get_mut(&(allocation_id, service.to_string())) {
+            Some(held) if Arc::ptr_eq(held, &endpoints) => {}
+            Some(held) => *held = endpoints,
+            None => {
+                handlers.insert((allocation_id, service.to_string()), endpoints);
+            }
+        }
     }
 
     pub fn handler_endpoints_for(&self, allocation_id: i64, service: &str) -> Vec<Endpoint> {
         lock(&self.handler_endpoints)
             .get(&(allocation_id, service.to_string()))
-            .cloned()
+            .map(|endpoints| endpoints.as_ref().clone())
             .unwrap_or_default()
     }
 
@@ -1280,11 +1326,29 @@ impl ForwarderContext {
         self.mesh_wanted.load(Ordering::Relaxed)
     }
 
+    /// Install a newly issued node certificate. Under the same trust bundle
+    /// the certificate is swapped into the existing mesh configs, so every
+    /// session survives the refresh; under a new bundle (a CA rotation, a CA
+    /// added or removed) new configs with empty session stores replace them,
+    /// so nothing established under the old bundle resumes
+    /// (mesh-control-path plan §6.3).
     pub fn set_mesh_identity(&self, identity: MeshIdentity) -> R<()> {
-        let client = identity.client_config()?;
-        *self.mesh.write().unwrap_or_else(|p| p.into_inner()) = Some((Arc::new(identity), client));
-        // Ingress configs built from the previous certificate are stale.
-        lock(&self.ingress_tls).clear();
+        use crate::worker::netd::mesh_tls::MeshTls;
+        let mut mesh = self.mesh.write().unwrap_or_else(|p| p.into_inner());
+        let tls = match mesh.as_ref() {
+            Some((_, tls)) if tls.same_bundle(&identity) => {
+                tls.refresh(&identity)?;
+                debug!("Mesh certificate refreshed; sessions kept");
+                Arc::clone(tls)
+            }
+            held => {
+                if held.is_some() {
+                    info!("Mesh trust bundle changed; new TLS configs, every session dropped");
+                }
+                Arc::new(MeshTls::new(&identity)?)
+            }
+        };
+        *mesh = Some((Arc::new(identity), tls));
         Ok(())
     }
 
@@ -1302,7 +1366,16 @@ impl ForwarderContext {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .map(|(_, client)| tokio_rustls::TlsConnector::from(client.clone()))
+            .map(|(_, tls)| tokio_rustls::TlsConnector::from(tls.client_config()))
+    }
+
+    /// The mesh's server config, shared by every mesh port on the node.
+    pub fn mesh_server_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.mesh
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|(_, tls)| tls.server_config())
     }
 
     /// The server config for an ingress port that terminates TLS, built
@@ -1316,7 +1389,13 @@ impl ForwarderContext {
         termination: &PortTermination,
     ) -> Result<Arc<rustls::ServerConfig>, String> {
         use crate::structs::source::{MATERIAL_CLIENT_CA, MATERIAL_PORT_CERT};
-        let mesh = self.mesh_identity();
+        // The mesh's config is node-wide, built per trust bundle, with its
+        // session store (`netd::mesh_tls`): never cached per port.
+        if *termination == PortTermination::Mesh {
+            return self
+                .mesh_server_config()
+                .ok_or_else(|| "mesh certificate not issued yet".to_string());
+        }
         let (cert_state, ca_state) = match termination {
             PortTermination::Mesh => (None, None),
             PortTermination::Own(tls) => (
@@ -1337,12 +1416,11 @@ impl ForwarderContext {
                 .unwrap_or(0)
         };
         let fingerprint = format!(
-            "{}|{}|{}|{}",
+            "{}|{}|{}",
             match termination {
                 PortTermination::Mesh => "mesh".to_string(),
                 PortTermination::Own(tls) => serde_json::to_string(tls).unwrap_or_default(),
             },
-            mesh.as_ref().map(|m| m.expires_at).unwrap_or(0),
             version(&cert_state),
             version(&ca_state),
         );
@@ -1356,12 +1434,7 @@ impl ForwarderContext {
             }
         }
         let result = match termination {
-            PortTermination::Mesh => match mesh {
-                Some(identity) => identity
-                    .server_config(true)
-                    .map_err(|err| format!("mesh server config: {err:#}")),
-                None => Err("mesh certificate not issued yet".to_string()),
-            },
+            PortTermination::Mesh => Err("mesh ports use the node-wide config".to_string()),
             PortTermination::Own(tls) => {
                 port_server_config(tls, cert_state.as_ref(), ca_state.as_ref())
             }
@@ -1759,7 +1832,7 @@ impl UpstreamShared {
     }
 
     fn inflight(&self) -> HashMap<String, usize> {
-        lock(&self.inflight).clone()
+        crate::worker::balance::inflight_snapshot(&lock(&self.inflight))
     }
 }
 
@@ -1935,13 +2008,26 @@ impl UpstreamForwarder {
 
     /// Replace the endpoint set one listener balances across.
     ///
-    /// Called once per `HeartbeatReply.upstream_endpoints` entry, after a
-    /// heartbeat that actually succeeded — that is what makes the datapath
-    /// fail-static. An empty list is authoritative: the listener keeps
-    /// accepting but closes each connection immediately, which is how a
-    /// scaled-to-zero, unhealthy, or intention-denied service stops receiving
-    /// traffic. Updates for an unknown listener are ignored.
+    /// Called for every listener the endpoint feed binds, after a heartbeat
+    /// that actually succeeded or a work-stream push — that is what makes
+    /// the datapath fail-static. An empty list is authoritative: the
+    /// listener keeps accepting but closes each connection immediately,
+    /// which is how a scaled-to-zero, unhealthy, or intention-denied service
+    /// stops receiving traffic. Updates for an unknown listener are ignored.
     pub fn set_endpoints(&self, allocation_id: i64, service: &str, endpoints: Vec<Endpoint>) {
+        self.set_endpoints_shared(allocation_id, service, Arc::new(endpoints));
+    }
+
+    /// [`Self::set_endpoints`] with a list shared with the other listeners
+    /// of the same endpoint set. The same list again is no change: nothing
+    /// is swapped and nothing is logged, so a steady beat costs the
+    /// listener nothing (mesh-control-path plan §6.1).
+    pub fn set_endpoints_shared(
+        &self,
+        allocation_id: i64,
+        service: &str,
+        endpoints: Arc<Vec<Endpoint>>,
+    ) {
         let shared = {
             let listeners = lock(&self.listeners);
             listeners
@@ -1955,13 +2041,18 @@ impl UpstreamForwarder {
             );
             return;
         };
+        let mut held = lock(&shared.endpoints);
+        if Arc::ptr_eq(&held, &endpoints) {
+            return;
+        }
         debug!(
             allocation_id,
             service,
             endpoints = endpoints.len(),
             "Updated upstream endpoints"
         );
-        *lock(&shared.endpoints) = Arc::new(endpoints);
+        crate::worker::balance::prune_inflight(&shared.inflight, &endpoints);
+        *held = endpoints;
     }
 
     /// The upstreams whose listener is currently bound. Diagnostics: an
@@ -2656,6 +2747,17 @@ where
         }
     };
     match tokio::time::timeout(DIAL_TIMEOUT, connector.connect(server_name, upstream)).await {
+        Ok(Ok(tls))
+            if crate::worker::netd::mesh_tls::resumed_with_expired_peer(tls.get_ref().1) =>
+        {
+            debug!(
+                endpoint = %endpoint.addr,
+                "Refusing a resumed mesh session whose peer certificate expired"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            None
+        }
         Ok(Ok(mut tls)) => {
             let header =
                 handlers::proxy_header(&shared.context, facts, peer, endpoint.addr.parse().ok());
@@ -2734,31 +2836,13 @@ where
 
 /// Keeps one endpoint's in-flight count accurate for the lifetime of a
 /// connection attempt, however it ends (dial error, timeout, copy error, or a
-/// clean close).
-struct InflightGuard {
-    shared: Arc<UpstreamShared>,
-    addr: String,
-}
+/// clean close). Holds the count itself, not the address, so a connection
+/// allocates nothing for it (`balance::acquire_inflight`).
+struct InflightGuard;
 
 impl InflightGuard {
-    fn acquire(shared: &Arc<UpstreamShared>, addr: &str) -> Self {
-        *lock(&shared.inflight).entry(addr.to_string()).or_insert(0) += 1;
-        InflightGuard {
-            shared: shared.clone(),
-            addr: addr.to_string(),
-        }
-    }
-}
-
-impl Drop for InflightGuard {
-    fn drop(&mut self) {
-        let mut inflight = lock(&self.shared.inflight);
-        if let Some(count) = inflight.get_mut(&self.addr) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                inflight.remove(&self.addr);
-            }
-        }
+    fn acquire(shared: &Arc<UpstreamShared>, addr: &str) -> crate::worker::balance::InflightGuard {
+        crate::worker::balance::acquire_inflight(&shared.inflight, addr)
     }
 }
 

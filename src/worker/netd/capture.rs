@@ -410,6 +410,7 @@ mod capture_kernel_test {
             &crate::structs::host_guard::HostGuardConfig {
                 allow: vec![format!("{ip}:{origin_port}")],
                 deny: vec![],
+                ..Default::default()
             },
         )?;
         let names = Names(
@@ -537,6 +538,7 @@ print(send('{allowed}'), send('{liar}'), send('{raw}'))
             &crate::structs::host_guard::HostGuardConfig {
                 allow: vec![format!("{ip}:{origin_port}")],
                 deny: vec![],
+                ..Default::default()
             },
         )?;
         let context = Arc::new(

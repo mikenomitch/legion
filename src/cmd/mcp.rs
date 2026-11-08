@@ -1047,7 +1047,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_net_ca_rotate",
-            description: "Rotate the built-in cluster CA in two steps: the new CA (cross-signed by the old one) signs at once, the old one stays trusted for 24 hours, and nodes re-issue within one heartbeat. No connection breaks. Fails with FailedPrecondition, naming the procedure, when the CA comes from a `file` or `exec` provider, which rotate outside Legion. Mutating.",
+            description: "Rotate the built-in cluster CA in two steps: the new CA (cross-signed by the old one) signs at once, the old one stays trusted for 24 hours, and nodes re-issue within their rotation splay (at most 10 minutes). No connection breaks. Fails with FailedPrecondition, naming the procedure, when the CA comes from a `file` or `exec` provider, which rotate outside Legion. Mutating.",
             input_schema: empty_schema,
             mutates: true,
         },
