@@ -3144,11 +3144,10 @@ impl Store {
     /// through (plan §2, JC-1/JC-12/JC-13):
     ///
     /// - `local_disk`/`streaming` mode: run `f(self)` on this thread under
-    ///   `capture::local_projected_mutation`. It commits all or nothing
-    ///   (its own savepoint, rolled back when `f` fails), and the read
-    ///   model is projected from the changeset it committed, the same way
-    ///   raft replicas project theirs (read-model-coherence plan § 5.4).
-    ///   Nested calls compose into the outer body.
+    ///   `capture::local_projected_mutation`. It commits as it always did,
+    ///   and the read model is projected from the changeset it committed,
+    ///   the same way raft replicas project theirs (read-model-coherence
+    ///   plan § 5.4). Nested calls compose into the outer body.
     /// - Inside an active capture on this thread: run `f(self)` inline, so
     ///   nested public-method calls compose into the outer capture and a
     ///   composite operation produces ONE atomic raft entry (JC-13).

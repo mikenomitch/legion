@@ -901,6 +901,13 @@ Each removes code but needs a decision:
 
 Plans: [multi-raft](plans/multi-raft-persistence-plan.md), [durability-and-ops](plans/durability-and-ops-execution-plan.md), [manager-workload-identity](plans/manager-workload-identity-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
+- [ ] **A failed `local_disk` mutation keeps the writes it made before it
+      failed**; raft rolls the whole entry back (per-op savepoint), so the two
+      modes disagree. A savepoint around each local body is not enough: bodies
+      publish events (`publish_staged`) and wake evals right after their
+      `write_tx` commit, which would then precede the real commit. Defer those
+      to the outer release first (`capture::local_projected_mutation`;
+      `local_plan_batch_broadcasts_no_event_before_it_commits` pins the order).
 - [ ] **Lost nodes are never garbage-collected**; `legion node forget` is manual. Add
       `node.gcAfter` (default off; [autoscaler-v2-plan.md](plans/autoscaler-v2-plan.md) §11).
 - [ ] **A manager with no raft leader holds a read instead of failing it.** Not
@@ -1610,23 +1617,22 @@ Fixes for the open bug and security items; judgement calls in
 
 - **Security**
   - **HTTP `proxy` hand-offs go over the mesh** to a mesh endpoint; a remote plain endpoint is refused with `502` rather than sent in plaintext ([calls #1](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/network-handlers.md)).
-  - **The manager's `resolve = "pin"` lookups are judged by a host guard** (built-in classes plus its own addresses) ([calls #6](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/artifacts.md#what-the-host-guard-checks)).
+  - **The manager's `resolve = "pin"` lookups are judged by a host guard** (built-in classes plus its own addresses) ([calls #5](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/artifacts.md#what-the-host-guard-checks)).
   - **A runtime's own image pull is judged by the worker's host guard**, like a staged `oci://` artifact ([docs](../docs/artifacts.md#what-the-host-guard-checks)).
   - **`local-dir` volumes guard themselves**: `<state dir>/local-volumes/` is traverse-only and each volume a `0700` guard, handed to an `exec` task's `user` ([calls #2](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/volumes.md)).
-  - **Linux container ids are node-scoped** (`legion-<node>-<alloc>`), and stale cleanup deletes only a container built from this allocation's bundle ([calls #7](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/task-runtime-container.md)).
-  - **The template collision guard no longer confirms a job exists** to a caller who cannot read it ([calls #10](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/job-templates.md)).
+  - **Linux container ids are node-scoped** (`legion-<node>-<alloc>`), and stale cleanup deletes only a container built from this allocation's bundle ([calls #6](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/task-runtime-container.md)).
+  - **The template collision guard no longer confirms a job exists** to a caller who cannot read it ([calls #9](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/job-templates.md)).
   - **A follower's audit records are forwarded to a lane leader** (`ForwardableLaneWrite::AppendAudit`) instead of only being logged ([docs](../docs/audit-journal.md)).
   - **The UI's ACL mirror matches the engine**, checked by shared parity cases (`tests/fixtures/acl_parity_cases.json`, Rust and `npm run test:unit`) ([docs](../docs/ui-architecture.md)).
 - **Correctness**
-  - **`local_disk` mutations are all or nothing**: a body that fails or panics part way commits none of its writes, as a raft entry does ([calls #3](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/state-store.md)).
-  - **`deduplicated` tells the loser of a concurrent idempotency-key race that it lost**, on every keyed RPC, with the winner's reply where it can ([calls #4](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/agent-readiness.md)).
-  - **`StopRollout` with `revert` always ends the rollout**; a failed re-placement queues a `job_reschedule` retry ([calls #9](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/rollouts.md)).
+  - **`deduplicated` tells the loser of a concurrent idempotency-key race that it lost**, on every keyed RPC, with the winner's reply where it can ([calls #3](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/agent-readiness.md)).
+  - **`StopRollout` with `revert` always ends the rollout**; a failed re-placement queues a `job_reschedule` retry ([calls #8](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/rollouts.md)).
   - **A rollout's replacement honors the previous version's reschedule backoff** ([docs](../docs/rollouts.md)).
-  - **A stale eval worker cannot settle an eval a newer claim holds** (claim-epoch fence) ([calls #11](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/scheduler-and-eval-loop.md)).
+  - **A stale eval worker cannot settle an eval a newer claim holds** (claim-epoch fence) ([calls #10](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/scheduler-and-eval-loop.md)).
   - **The preemption floor counts the task's allocations across the fleet**, not just the loaded candidates ([docs](../docs/preemption-and-eviction.md)).
-  - **`onChange = "none"` no longer becomes a rollout**: the allocations move to the new config in place ([calls #5](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/kv-store.md)).
-  - **A fail-open body hop streams an oversized body through** instead of answering `413` ([calls #8](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/network-handlers.md)).
-  - **`UpsertNetPlugin` re-checks running jobs that use the plugin** ([calls #12](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/network-plugins.md)).
+  - **`onChange = "none"` no longer becomes a rollout**: the allocations move to the new config in place ([calls #4](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/kv-store.md)).
+  - **A fail-open body hop streams an oversized body through** instead of answering `413` ([calls #7](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/network-handlers.md)).
+  - **`UpsertNetPlugin` re-checks running jobs that use the plugin** ([calls #11](calls/todo-bug-sweep-2026-11-08_calls.md) · [docs](../docs/network-plugins.md)).
   - **The task-config cache's read-through can't resurrect a destroyed list**, and the scrub covers task configs ([docs](../docs/state-store.md)).
   - **A failed changeset projection wakes blocked evals** (a `recovered` capacity event per available node) ([docs](../docs/state-store.md)).
   - **Single-node mode heals a crash mid-reschedule** at startup (missing-rollout reconcile and eval regeneration) ([docs](../docs/scheduler-and-eval-loop.md)).

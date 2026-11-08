@@ -50,24 +50,7 @@ directory isn't already the user's (Kubernetes `OnRootMismatch`).
   non-root image user (nginx, postgres) keeps the read access it has today.
   [docs](../../docs/volumes.md)
 
-## 3. A `local_disk` mutation commits all or nothing
-
-`Store::replicated` in `local_disk` and `streaming` mode now runs its body inside
-`SAVEPOINT legion_local`. The savepoint is released when the body returns `Ok`
-and rolled back when it errors or panics. Before, each statement committed as it
-ran, so a body that failed part way left its first writes behind, but only on a
-single manager: raft's per-op savepoint already rolled them back.
-
-- **Alternative:** keep autocommit and add savepoints only where a caller needs
-  rollback. That was the idempotency fix's first shape (`claimed_body`).
-- **Trade-off:** any body that relied on a write surviving its own error now
-  loses that write. None can rely on it under raft, and the full suite passes.
-  A body now runs as one deferred transaction, so its writes become durable at
-  release rather than statement by statement.
-- **Why:** one contract in every mode is simpler, and the ACL work found the gap
-  only because it needed the rollback. [docs](../../docs/state-store.md)
-
-## 4. What the loser of an idempotency-key race is handed depends on the operation
+## 3. What the loser of an idempotency-key race is handed depends on the operation
 
 `deduplicated: true` now reaches the loser of a concurrent race on every keyed
 RPC (`src/manager/server/idempotency.rs`). What the loser is told depends on the
@@ -91,7 +74,7 @@ kind of operation:
 - **Why:** an agent retrying with a key needs the truth about what ran, and that
   differs by operation. [docs](../../docs/agent-readiness.md)
 
-## 5. `onChange = "none"` moves allocations in place
+## 4. `onChange = "none"` moves allocations in place
 
 A watched KV put with `none` (or a `watch = false` edge) now moves the running
 allocations to the new config in place. It doesn't rewrite their files or
@@ -105,7 +88,7 @@ replace anything. A failed job is not moved.
 - **Why:** in-place moves already exist and are tested for `update`, so this was
   the simplest option. [docs](../../docs/kv-store.md)
 
-## 6. The manager's pin guard has no allow list
+## 5. The manager's pin guard has no allow list
 
 `resolve = "pin"` lookups use the built-in host-guard classes plus the manager's
 own interface addresses. Private ranges are not refused, matching the worker's
@@ -118,7 +101,7 @@ defaults.
 - **Why:** an allow list is a new config surface and needs a plan. The refusal
   names the two workarounds. [docs](../../docs/artifacts.md#what-the-host-guard-checks)
 
-## 7. Container ownership is proven by the bundle path, and the cgroup leaf stays `legion-<alloc>`
+## 6. Container ownership is proven by the bundle path, and the cgroup leaf stays `legion-<alloc>`
 
 Linux OCI ids are now `legion-<node>-<alloc>`, capped at 63 bytes because the id
 is also the hostname; only the node part is cut. Stale cleanup deletes a
@@ -134,7 +117,7 @@ container only when `runc state` reports this allocation's own bundle.
   API socket, the kernel guard, and the orphan sweep. Simplicity won.
   [docs](../../docs/task-runtime-container.md)
 
-## 8. A fail-open body hop streams an oversized body through
+## 7. A fail-open body hop streams an oversized body through
 
 When every body hop on a route has `onError = "allow"`, a body over the largest
 `maxBytes` is sent through unread: the part already read, then the rest. If any
@@ -148,7 +131,7 @@ mid-body now gets `400`, not `413`.
 - **Why:** "allow" on error lets the request through for every other hop error,
   so it should mean the same here. [docs](../../docs/network-handlers.md)
 
-## 9. A revert whose re-placement fails still returns success
+## 8. A revert whose re-placement fails still returns success
 
 `StopRollout` with `revert` now cancels the rollout and removes the new version
 in one write, then re-places the old version. If the re-placement fails, the stop
@@ -165,7 +148,7 @@ Rollout stopped and reverted; the new version is removed, but re-placing the pre
   would invite a pointless retry while the real one is already queued.
   [docs](../../docs/rollouts.md)
 
-## 10. A collision a caller can't read is answered `PERMISSION_DENIED`
+## 9. A collision a caller can't read is answered `PERMISSION_DENIED`
 
 A template submit that collides with an existing job gets `FAILED_PRECONDITION …
 already exists` only if the caller can read that job. Anyone else gets a
@@ -178,7 +161,7 @@ already exists` only if the caller can read that job. Anyone else gets a
 - **Why:** the denial looks like any other ACL refusal, so it tells the caller
   nothing new. [docs](../../docs/job-templates.md)
 
-## 11. Stale settles are fenced by a claim epoch, and there is no periodic re-sweep
+## 10. Stale settles are fenced by a claim epoch, and there is no periodic re-sweep
 
 Claims live in the leader's memory, and eval rows stay `pending` while they are
 claimed, so the TODO's `status = 'in_flight'` guard would check nothing. Instead,
@@ -192,7 +175,7 @@ the outcomes still claimed in its own epoch.
   stated bound on how long a handler can run, and none can be stated today.
   [docs](../../docs/scheduler-and-eval-loop.md)
 
-## 12. A plugin write scans running jobs
+## 11. A plugin write scans running jobs
 
 `UpsertNetPlugin` now checks the latest config of every job that isn't stopped,
 for each hop that uses the plugin, and refuses with `FAILED_PRECONDITION`. Dry
@@ -206,7 +189,7 @@ runs are checked too. The error names the job only when the caller has `job:read
   invalid config is worse than a slow write. Correctness won over performance on
   a cold path. [docs](../../docs/network-plugins.md)
 
-## 13. Smaller calls
+## 12. Smaller calls
 
 - **A no-op `rollout_tick` re-runs its own eval quietly** instead of writing a
   completion with no event. That costs one write instead of two, and it touches

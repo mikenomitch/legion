@@ -109,11 +109,10 @@ the write's own code:
 - **`local_disk` and `streaming`**: each mutation runs with a SQLite session
   attached to the cache's tables (`node`, `node_health`, `allocation`,
   `task_config`, `allocation_epoch_partition`). When the mutation returns, the
-  cache is projected from what it committed, including rows removed by
-  `ON DELETE CASCADE`. Each mutation runs inside its own savepoint, so one
-  that fails (or panics) part way commits nothing, which is the same
-  all-or-nothing contract a raft entry has. Mutations run one at a time on a
-  process-wide lock, so projections apply in commit order.
+  cache is projected from what it committed. That includes rows removed by
+  `ON DELETE CASCADE` and rows a mutation committed before it failed.
+  Mutations run one at a time on a process-wide lock, so projections apply in
+  commit order.
 
 In either mode a projection that fails part way never fails the write: the
 rows are committed. The manager logs `Failed projecting a committed
