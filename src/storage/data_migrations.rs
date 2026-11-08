@@ -160,13 +160,15 @@ pub(crate) fn run_pending_on(conn: &Connection) -> R<Vec<&'static str>> {
 }
 
 /// Record every data step as done without running it: a brand-new database
-/// has no rows to migrate (module docs).
+/// has no rows to migrate (module docs). `applied_at = 0` marks "recorded
+/// at creation, nothing ran", and keeps independently created databases
+/// byte-identical in this table (a wall-clock stamp would differ per node
+/// until a snapshot install replaced it).
 pub(crate) fn mark_all_done(conn: &Connection) -> R<()> {
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     for step in DATA_MIGRATIONS {
         conn.execute(
-            "INSERT OR IGNORE INTO data_migration (id, applied_at) VALUES (?1, ?2);",
-            params![step.id, now],
+            "INSERT OR IGNORE INTO data_migration (id, applied_at) VALUES (?1, 0);",
+            params![step.id],
         )?;
     }
     Ok(())

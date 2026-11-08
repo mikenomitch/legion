@@ -244,6 +244,14 @@ and log truncation: in raft a new term always begins with a blank entry,
 and a leader's own log is append-only within its term, so its proposals
 arrive in proposal order or not at all.
 
+**A failed proposal undoes its batch at once** (`undo_outstanding`, under
+the capture mutex): a deposed leader must not serve uncommitted rows for as
+long as a partition lasts. That is safe even if the entry commits later
+under another leader — the ledger no longer knows it, so the state machine
+applies it normally onto the state without it — because this node captures
+again only as leader of a later term, after `ensure_linearizable` has
+applied everything before that term's blank entry.
+
 **Before capturing**, the pipeline requires the ledger to be empty (it
 always is after a successful `client_write`, which resolves only after the
 apply). After a failed proposal it forces `ensure_linearizable` again (a
@@ -251,9 +259,10 @@ new term's blank entry undoes what a leadership change left). If a batch
 is still outstanding after that — its proposal never reached the log — the
 pipeline proposes an empty `speculation_flush` entry: anything this leader
 appended earlier applies first and matches, and the empty entry undoes the
-rest. It never stacks new writes on rows that may vanish, and it never
-undoes a batch on its own (a batch it undid could still commit later, and
-the next capture would then have been taken against the wrong state).
+rest. It never stacks new writes on rows that may vanish. It does not undo
+such a batch on its own while it may still be leader: if the entry was
+appended but not yet committed, the next capture would be taken against
+state without it, and that capture's entry would then apply after it.
 
 **Startup.** `Store::start_storage` undoes every leftover undo record
 (newest first per lane) before openraft reads `applied_state`, so a crash
@@ -435,3 +444,24 @@ place.
    test in §9 passes.
 5. A data step's effect lands on every replica at one log index and runs
    once.
+
+## 13. Results (2026-11-08)
+
+`tests/integration/raft_perf_smoke.rs`, single-node `single` topology, debug
+build, on a shared 4-vCPU VM whose other cores were compiling (load
+average ~4) — so ranges, not points. Before is the base commit (one run);
+after is three runs.
+
+| Workload | Before | After |
+| --- | --- | --- |
+| Sequential `put_kv`, p50 | 3.74 ms | 2.90–3.93 ms |
+| Sequential, throughput | 258 ops/s | 185–268 ops/s |
+| Burst (8 × 100), p50 / p99 | 27.2 / 36.2 ms | 3.4–11.8 / 15.4–27.8 ms |
+| Burst, throughput | 289 ops/s | 666–1570 ops/s |
+| Burst, ops per entry | 1 | 4.5–5.7 |
+
+`raft_write_path::concurrent_writes_share_entries_*`: 320 concurrent writes
+in 51 entries (`single`) and 54 (`lanes`). The lone sequential writer is
+unchanged within noise, as expected (§6.2.4: no overlap). Not measured: a
+three-voter cluster on real disks, where the removed state-DB fsync per
+entry and the shared quorum round should show more (TODO).

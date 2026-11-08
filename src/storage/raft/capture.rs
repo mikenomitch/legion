@@ -227,6 +227,10 @@ const CAPTURE_ROLLBACK_SQL: &str = "ROLLBACK TO legion_capture; RELEASE legion_c
 /// this function's own locking); `f` locks and unlocks the write connection
 /// freely, and its `Store::write_tx` savepoints nest inside the capture
 /// savepoint.
+///
+/// The pipeline captures through [`capture_batch`]; this single-op form is
+/// what the capture/apply tests use to produce changesets.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn capture_mutation<T>(
     store: &Store,
     lane: Lane,

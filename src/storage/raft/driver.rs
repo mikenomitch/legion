@@ -2329,10 +2329,26 @@ fn execute_batch(
         Err(err) => {
             // Every op of the batch fails with the proposal: their effects
             // were one entry (and an op whose own changeset was empty may
-            // have read what the others wrote). A speculative batch stays
-            // outstanding until an apply resolves it; force the next batch
-            // to re-confirm leadership first.
+            // have read what the others wrote). Force the next batch to
+            // re-confirm leadership first.
             *caught_up_term = None;
+            // A speculative batch is undone now rather than whenever another
+            // leader's entry reaches this node: a deposed leader must not
+            // serve rows that may never commit for as long as a partition
+            // lasts. Safe even if the entry commits after all (`speculation::
+            // undo_outstanding`). If the undo itself fails, the batch stays
+            // outstanding and the next apply or the flush resolves it.
+            if let (true, Some(ledger)) = (committed, ctx.speculation.as_deref()) {
+                if let Err(undo) = crate::storage::raft::speculation::undo_outstanding(
+                    &ctx.store, ledger, ctx.group,
+                ) {
+                    error!(
+                        group = metric_lane,
+                        error = ?undo,
+                        "failed undoing a speculative batch after its proposal failed"
+                    );
+                }
+            }
             for (&(_, op), result) in names.iter().zip(results.iter_mut()) {
                 telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
                 if result.is_ok() {

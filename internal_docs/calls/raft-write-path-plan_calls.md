@@ -34,7 +34,9 @@ at startup, and a scrub of every database copy (snapshot images, backups).
 A dirty-read window: between the local commit and the apply, direct SQL
 reads on the leader (the read pool) can see the batch; the read model and
 the event and worker streams cannot, because they are still projected at
-apply. `lanes` keeps paying the double execution.
+apply. A deposed leader undoes its batch as soon as the proposal fails, so
+the window does not stretch across a partition (waiting for the next
+foreign entry would have). `lanes` keeps paying the double execution.
 
 **Why.** The leader's second execution and second mutex hold are the cost
 the review named; removing them is pure **performance** on the critical

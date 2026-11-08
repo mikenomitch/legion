@@ -2379,6 +2379,37 @@ mod tests {
         Ok(())
     }
 
+    /// Leadership lost with the entry in flight: the deposed leader undoes
+    /// its batch as soon as the proposal fails, so it stops serving the
+    /// rows; and if the new leader commits the entry after all (it was
+    /// replicated before the leadership change), the state machine applies
+    /// it normally onto the state without the batch — once, and correctly.
+    #[tokio::test]
+    async fn a_failed_proposal_undoes_now_and_a_later_commit_still_applies() -> R<()> {
+        let store = setup_store()?;
+        let (mut sm, ledger) = speculating_machine(&store);
+        let (seq, changeset) = speculate_put_kv(&store, &ledger, "spec/flight", "v")?;
+        assert_eq!(
+            speculation::undo_outstanding(&store, &ledger, Lane::Control)?,
+            1
+        );
+        assert_eq!(kv_value(&store, "spec/flight")?, None);
+        assert_eq!(undo_records(&store)?, 0);
+        assert!(ledger.is_empty(Lane::Control));
+        // Nothing left to undo the second time.
+        assert_eq!(
+            speculation::undo_outstanding(&store, &ledger, Lane::Control)?,
+            0
+        );
+
+        // The new leader committed the entry: it applies like any entry.
+        sm.apply([normal_entry(2, 1, changeset, Some(seq))])
+            .await
+            .unwrap();
+        assert_eq!(kv_value(&store, "spec/flight")?.as_deref(), Some("v"));
+        Ok(())
+    }
+
     /// Crash between the speculative commit and the apply: reopening the
     /// store undoes the leftover batch before anything reads the state, and
     /// if the entry did commit, re-applying it from the log (the restarted

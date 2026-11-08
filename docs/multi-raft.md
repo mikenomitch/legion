@@ -424,10 +424,13 @@ proposes a batch, the leader commits it to its own state DB together with
 an undo record (the batch's inverse changeset, in the node-local
 `raft_speculative` table). When the entry comes back committed, the
 leader's state machine recognizes its own batch and only advances the
-applied index; followers apply the changeset as always. If the log goes
-another way instead — leadership is lost with the entry in flight, another
-leader's entry replaces it, or a new term begins — the leader first undoes
-every outstanding batch, newest first, and then applies what the log says.
+applied index; followers apply the changeset as always. If the proposal
+fails (leadership was lost with the entry in flight), the leader undoes the
+batch at once; should the entry commit anyway under the new leader, it is
+applied like any other entry. If the log goes another way while a batch is
+outstanding — another leader's entry replaces it, or a new term begins —
+the leader first undoes every outstanding batch, newest first, and then
+applies what the log says.
 A manager that crashes between committing a batch and applying its entry
 undoes the batch at startup; if the entry did commit, the log replays it.
 Snapshots and `legion state backup` copy the database and revert any
@@ -634,6 +637,29 @@ pileups), and is not a tuned benchmark target. Latencies include everything
 the caller experiences: the capture savepoint and changeset extraction, the
 sync→async bridge to `client_write`, local log append and fsync, and
 changeset apply with read-model and event projection.
+
+### Group commit and single execution (2026-11-08)
+
+The same smoke, before and after the write-path change (group commit, the
+leader executing each write once, one fsync per entry). Debug build on a
+shared 4-vCPU Linux VM whose other cores were compiling (load average ~4),
+so the absolute numbers are noisy; the after column is the range over
+three runs:
+
+| Workload | Before | After |
+| --- | --- | --- |
+| Sequential `put_kv`, p50 | 3.74 ms | 2.90–3.93 ms |
+| Sequential `put_kv`, throughput | 258 ops/s | 185–268 ops/s |
+| Burst (8 threads × 100), p50 | 27.2 ms | 3.4–11.8 ms |
+| Burst, p99 | 36.2 ms | 15.4–27.8 ms |
+| Burst, throughput | 289 ops/s | 666–1570 ops/s |
+| Burst, ops per raft entry | 1 | 4.5–5.7 |
+
+A lone sequential writer gains nothing from batching — it waits for one
+round trip per write either way — and its p99 is dominated by the host's
+other load in these runs. Concurrent writers are where group commit pays:
+2.3–5.4× the throughput, because the ops that queue behind one entry share
+the next one's quorum round, log fsync and apply.
 
 For comparison, the `local_disk` scheduler SLO gate
 (`cargo test --test integration scheduler_benchmark_slo:: --locked -- --ignored --nocapture`)

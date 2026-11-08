@@ -217,6 +217,42 @@ pub(crate) fn undo_on(conn: &Connection, lane: Option<Lane>) -> R<Vec<Vec<u8>>> 
     Ok(undone)
 }
 
+/// Undo `lane`'s outstanding batches right away: the pipeline calls this
+/// when a proposal fails (the leader lost its leadership mid-flight), so a
+/// deposed leader does not keep serving rows that may never commit — for
+/// as long as a partition lasts — until another leader's entry reaches it.
+///
+/// Safe whether or not the entry commits later: once undone, the ledger no
+/// longer knows the batch, so if its entry does commit, the state machine
+/// applies its changeset normally onto the state without it. And no capture
+/// can be taken on top of the undone state before that entry applies: this
+/// node captures again only as leader of a later term, after
+/// `ensure_linearizable` has applied everything that term's blank entry
+/// follows. Takes the capture mutex, so it serializes with an apply that
+/// may be matching the same batch (whichever runs first wins; both
+/// outcomes are correct). Returns how many batches were undone.
+pub(crate) fn undo_outstanding(store: &Store, ledger: &SpeculationLedger, lane: Lane) -> R<usize> {
+    let undone = {
+        let _captures = crate::storage::raft::capture::capture_exclusion()?;
+        if ledger.is_empty(lane) {
+            return Ok(0);
+        }
+        let undone = crate::storage::raft::capture::apply_tx_locked(store, |conn| {
+            undo_on(conn, Some(lane))
+        })?;
+        ledger.clear(lane);
+        undone
+    };
+    crate::manager::telemetry::metrics()
+        .raft_speculation_total
+        .inc_by(&[lane.wire_name(), "undone"], undone.len() as u64);
+    // A cache that loaded a speculative row in the window is corrected.
+    for changeset in &undone {
+        store.project_changeset_side_effects(changeset);
+    }
+    Ok(undone.len())
+}
+
 /// Undo every leftover speculative batch in the state DB — the startup half
 /// of the crash story. A crash between a batch's local commit and its
 /// apply leaves the rows and their undo record; this reverts both, so the
