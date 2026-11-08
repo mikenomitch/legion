@@ -5963,7 +5963,13 @@ async fn every_write_rpc_is_journaled() -> R<()> {
             unjournaled_writes.push(method);
         }
         let always = legion::manager::governance::ALWAYS_AUDITED.contains(&method);
-        if matches!(plane, Plane::Protected(gate) if gate.contains(":read")) && !always {
+        // Gated first on a read, but a write too: restoring an instance from
+        // a snapshot also needs job:write (docs/auth-and-acls.md).
+        let read_gated_write = matches!(method, "RestoreInstance");
+        if matches!(plane, Plane::Protected(gate) if gate.contains(":read"))
+            && !always
+            && !read_gated_write
+        {
             if let Some(record) = records.iter().find(|r| r.kind == "write") {
                 journaled_reads.push(format!("{method} ({}:{})", record.resource, record.action));
             }
