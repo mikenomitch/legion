@@ -357,6 +357,9 @@ pub struct KernelGuardRuntime {
     kernel_status: HashMap<i64, crate::structs::NetKernelStatus>,
     /// Whether the node-wide guard maps hold `base` and these addresses.
     applied: Option<Vec<std::net::IpAddr>>,
+    /// How often the `nftables` guard's counters are read
+    /// (`hostGuard.counterInterval`).
+    counter_interval: Duration,
 }
 
 /// The kernel classifier a Linux worker hands [`ForwarderContext::with_kernel`];
@@ -519,7 +522,17 @@ impl ForwarderContext {
             backend,
             kernel_status: HashMap::new(),
             applied: None,
+            counter_interval: crate::structs::host_guard::DEFAULT_COUNTER_INTERVAL,
         }));
+        self
+    }
+
+    /// Read the `nftables` guard's drop counters at most this often
+    /// (`hostGuard.counterInterval`). No effect without a kernel guard.
+    pub fn with_guard_counter_interval(self, interval: Duration) -> Self {
+        if let Some(runtime) = &self.kernel_guard {
+            lock(runtime).counter_interval = interval;
+        }
         self
     }
 
@@ -565,6 +578,12 @@ impl ForwarderContext {
                         warn!(error = %format!("{err:#}"), "Failed to load the kernel host guard; retrying on the next heartbeat");
                         return;
                     }
+                }
+                // Reading forks `nft`: at most every `counterInterval`, not
+                // every beat (mesh-control-path plan §6.6). Drops in
+                // between are counted by the kernel and reported later.
+                if !guard.counters_due(std::time::Instant::now(), runtime.counter_interval) {
+                    return;
                 }
                 let counters = match crate::worker::netd::kernel_guard::read_counters(&name) {
                     Ok(counters) => counters,

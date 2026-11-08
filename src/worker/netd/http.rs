@@ -2360,6 +2360,7 @@ mod integration {
             &crate::structs::host_guard::HostGuardConfig {
                 allow: vec![format!("127.0.0.1:{origin}")],
                 deny: vec![],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2492,6 +2493,7 @@ mod integration {
             &crate::structs::host_guard::HostGuardConfig {
                 allow: vec![format!("127.0.0.1:{origin}")],
                 deny: vec![],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2588,6 +2590,7 @@ mod integration {
             &crate::structs::host_guard::HostGuardConfig {
                 allow: vec![format!("127.0.0.1:{origin}")],
                 deny: vec![],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2860,6 +2863,7 @@ mod integration {
             &crate::structs::host_guard::HostGuardConfig {
                 allow: vec![format!("127.0.0.1:{origin}")],
                 deny: vec![],
+                ..Default::default()
             },
         )
         .unwrap();

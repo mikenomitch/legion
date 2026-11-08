@@ -1519,6 +1519,7 @@ mod tests {
                 &crate::structs::host_guard::HostGuardConfig {
                     allow,
                     deny: vec![],
+                    ..Default::default()
                 },
             )
             .expect("guard"),

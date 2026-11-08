@@ -47,6 +47,26 @@ pub struct HostGuardConfig {
     /// Extra destinations to deny like cloud metadata: IPs or CIDRs.
     #[serde(default)]
     pub deny: Vec<String>,
+    /// How often the `nftables` guard's drop counters are read for
+    /// `net.denied` (`10s`, the default). Each read runs `nft -j list
+    /// table`, so the floor keeps it off the heartbeat path on a busy node.
+    /// The eBPF classifier reads its counters from maps and ignores this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_interval: Option<String>,
+}
+
+/// Default `hostGuard.counterInterval`.
+pub const DEFAULT_COUNTER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl HostGuardConfig {
+    /// `counterInterval`, or the default when absent or unparseable.
+    pub fn counter_interval(&self) -> std::time::Duration {
+        self.counter_interval
+            .as_deref()
+            .and_then(|text| crate::structs::netpolicy::parse_duration(text).ok())
+            .filter(|interval| !interval.is_zero())
+            .unwrap_or(DEFAULT_COUNTER_INTERVAL)
+    }
 }
 
 /// Why the guard refused an address.
@@ -367,6 +387,7 @@ mod host_guard_test {
         let guard = HostGuard::new(&HostGuardConfig {
             allow: vec!["10.0.1.7:9100".into(), "[::1]:7000".into()],
             deny: vec![],
+            ..Default::default()
         })?;
         guard.set_node_addrs(vec![ip("10.0.1.7")]);
         assert!(guard.judge(ip("10.0.1.7"), 9100).is_ok());
@@ -403,6 +424,7 @@ mod host_guard_test {
         let guard = HostGuard::new(&HostGuardConfig {
             allow: vec![],
             deny: vec!["192.0.2.10/32".into()],
+            ..Default::default()
         })?;
         assert_eq!(
             guard.judge(ip("192.0.2.10"), 80).expect_err("denied").class,

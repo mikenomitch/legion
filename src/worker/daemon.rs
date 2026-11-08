@@ -926,6 +926,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 )
             }),
             classifier,
+        )
+        .with_guard_counter_interval(
+            serde_json::from_str::<crate::structs::WorkerSecurityConfig>(&config.security)
+                .ok()
+                .and_then(|security| security.host_guard)
+                .map(|guard| guard.counter_interval())
+                .unwrap_or(crate::structs::host_guard::DEFAULT_COUNTER_INTERVAL),
         ),
     );
     // Where the kernel classifier redirects host-mode flows only netd can
