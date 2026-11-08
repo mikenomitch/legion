@@ -138,6 +138,7 @@ mod make_room;
 mod material_rpcs;
 mod namespace_policy_rpcs;
 mod namespace_rpcs;
+mod net_policy_memo;
 mod node_content_rpcs;
 mod node_group_rpcs;
 mod object_rpcs;
@@ -2116,6 +2117,10 @@ pub struct ManagerDaemonService {
     /// re-read at most every `NET_POLICY_GENERATION_TTL`, so a cluster with
     /// no policies pays a mutex read per heartbeat rather than a query.
     net_policy_generation: Arc<Mutex<Option<(std::time::Instant, u64)>>>,
+    /// Effective-policy assignments by their inputs, per policy generation
+    /// (mesh-control-path plan §6.2), so a heartbeat neither lists policies
+    /// nor merges for an allocation whose inputs it has seen.
+    net_policy_memo: Arc<net_policy_memo::NetPolicyMemo>,
     /// The service graph: per (caller job, caller task, service, tag), the
     /// last 15 minutes of per-minute buckets folded from every node's
     /// `net_edges` heartbeat samples. In memory: a failover loses at most the
@@ -2205,6 +2210,7 @@ impl ManagerDaemonService {
             heartbeat: crate::structs::HeartbeatConfigFull::default(),
             net_policy_cache: Arc::new(Mutex::new(HashMap::new())),
             net_policy_generation: Arc::new(Mutex::new(None)),
+            net_policy_memo: Arc::default(),
             net_status: Arc::new(Mutex::new(HashMap::new())),
             net_plugin_status: Arc::new(Mutex::new(HashMap::new())),
             net_edges: Arc::new(Mutex::new(HashMap::new())),
@@ -14366,34 +14372,9 @@ pub(crate) fn desired_payload(
     Ok(payload)
 }
 
-/// Resolve the current endpoint set for every upstream declared by this node's
-/// desired allocations — the service-discovery feed the worker's loopback
-/// forwarders are driven from.
-///
-/// Fast path: allocations carry their `connect` block on the wire, so when no
-/// desired allocation declares upstreams this returns an empty vector without
-/// touching the store. Nodes running only plain jobs therefore pay zero extra
-/// queries per heartbeat (heartbeats run every
-/// `WORKER_HEARTBEAT_DURATION_SEC`, so this is the hot path).
-///
-/// Otherwise each *distinct* `(upstream service, consuming job)` pair is
-/// resolved once and memoized: the store lookup is an indexed seek over just
-/// that service's rows (see [`Store::service_endpoints`]), and the resulting
-/// wire list is shared by every allocation of the same job — a node running
-/// `count: 40` of one client task would otherwise rebuild the identical list 40
-/// times, every 2s. Endpoints are filtered to healthy ones and gated by the
-/// target service's `service.allow` intentions against the *consuming*
-/// allocation's job id; a denied consumer gets an empty list rather than an
-/// error.
-///
-/// The feed is **additive and never fatal** — which is why it returns a plain
-/// `Vec` and not an `R<_>`. A store failure (or an unparseable stored payload)
-/// omits that upstream's entry instead of failing the heartbeat: the worker only
-/// calls `set_endpoints` for entries actually present in the reply, so an
-/// omitted upstream keeps its last known good endpoints — the same fail-static
-/// property, without taking the node's whole allocation reconciliation (and,
-/// after each stateful task's fence window, its running allocations) down with
-/// it.
+/// Network policy on the heartbeat: assignments per allocation (memoized,
+/// `net_policy_memo`), and the queries `TestNetPolicy` and `net doctor` run.
+/// The endpoint feed lives in `endpoint_feed`.
 impl ManagerDaemonService {
     /// Effective network policy for every desired allocation, as content
     /// hashes. Zero store access when the cluster has no policy (cached
@@ -14403,98 +14384,10 @@ impl ManagerDaemonService {
         node_id: &str,
         desired: &[crate::structs::TaskAllocation],
     ) -> Vec<AllocNetPolicy> {
-        use crate::structs::netpolicy::NetSelectorFacts;
-        // Gated by placement, which can resolve `auto` with no `network`
-        // block on the task at all (a default sandbox, gated plan Phase 2):
-        // the allocation's own network records it.
-        let placed_gated = |allocation: &crate::structs::TaskAllocation| {
-            allocation
-                .network
-                .contains(crate::structs::netpolicy::MODE_GATED)
-                && serde_json::from_str::<crate::structs::AllocNetwork>(&allocation.network)
-                    .is_ok_and(|placed| placed.is_gated())
-        };
-        let any_inline = desired
-            .iter()
-            .any(|allocation| !allocation.task_network.trim().is_empty());
-        if self.net_policy_generation_cached() == 0
-            && !any_inline
-            && !desired.iter().any(placed_gated)
-        {
-            return Vec::new();
-        }
-        // Stored policies once per heartbeat; the node's pool once, and only
-        // when a policy could select on it.
-        let stored: Vec<crate::structs::netpolicy::NetPolicyObject> = match self
-            .store
-            .list_net_policies()
-        {
-            Ok(records) => records.into_iter().map(|record| record.object).collect(),
-            Err(err) => {
-                warn!(node_id = %node_id, error = ?err, "Skipping net policies; listing failed");
-                return Vec::new();
-            }
-        };
-        let needs_pool = stored.iter().any(|p| !p.selector.node_pools.is_empty());
-        let node_pool = if needs_pool {
-            self.store.get_node(node_id).ok().map(|node| node.pool)
-        } else {
-            None
-        };
-        let mut out = Vec::new();
-        for allocation in desired {
-            let network: Option<crate::structs::NetworkConfig> =
-                if allocation.task_network.trim().is_empty() {
-                    None
-                } else {
-                    match serde_json::from_str(&allocation.task_network) {
-                        Ok(network) => Some(network),
-                        Err(err) => {
-                            warn!(
-                                allocation_id = allocation.allocation_id,
-                                error = ?err,
-                                "Skipping net policy; invalid task network payload"
-                            );
-                            continue;
-                        }
-                    }
-                };
-            let facts = NetSelectorFacts {
-                node_pool: node_pool.clone(),
-                runtime: allocation.task_runtime.clone(),
-                job: allocation.job_id.clone(),
-                labels: network
-                    .as_ref()
-                    .map(|n| n.labels.clone())
-                    .unwrap_or_default(),
-            };
-            let service: Option<crate::structs::ServiceConfig> =
-                (!allocation.task_service.trim().is_empty())
-                    .then(|| serde_json::from_str(&allocation.task_service).ok())
-                    .flatten();
-            let (effective, _) =
-                merge_net_policies(&stored, &facts, network.as_ref(), service.as_ref());
-            // A gated allocation is told about an *empty* policy too, so the
-            // node can tell "known: nothing covers it" (`gated-default`) from
-            // "pending" (`policy-pending`). Gated by its declaration, by a
-            // `require` policy, or by placement resolving `auto` (a default
-            // sandbox, gated plan Phase 2), which the allocation's own
-            // network records.
-            let gated = placed_gated(allocation)
-                || network
-                    .as_ref()
-                    .is_some_and(|n| n.mode == crate::structs::netpolicy::MODE_GATED)
-                || effective.mode.as_deref() == Some(crate::structs::netpolicy::MODE_GATED);
-            if effective.is_empty() && !gated {
-                continue;
-            }
-            self.remember_net_policy(&effective);
-            out.push(AllocNetPolicy {
-                allocation_id: allocation.allocation_id,
-                policy_hash: effective.hash.clone(),
-            });
-        }
-        out
+        // Memoized per input and policy generation (mesh-control-path plan
+        // §6.2): a beat whose inputs did not change lists nothing, parses
+        // nothing, and merges nothing.
+        self.memoized_net_policies(node_id, desired)
     }
 
     /// The effective policy for one task, given selector facts. Returns the
@@ -15897,6 +15790,64 @@ mod tests {
         assert_eq!(assignments.len(), 1, "{assignments:?}");
         assert_eq!(assignments[0].allocation_id, 7);
         assert!(!assignments[0].policy_hash.is_empty());
+        Ok(())
+    }
+
+    /// Mesh-control-path plan §6.2: assignments are memoized on their
+    /// inputs. Allocations of one task share one merge, a repeated beat
+    /// merges nothing, and a changed task network or a policy write (a new
+    /// generation) merges again.
+    #[test]
+    fn net_policy_assignments_are_memoized_until_an_input_changes() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let allocation = |allocation_id: i64, network: Value| crate::structs::TaskAllocation {
+            allocation_id,
+            job_id: "web".into(),
+            task_runtime: "exec".into(),
+            task_network: network.to_string(),
+            ..Default::default()
+        };
+        let network = json!({ "mode": "gated", "egress": { "allow": ["pypi.org"] } });
+        let desired = vec![allocation(1, network.clone()), allocation(2, network)];
+        let first = manager.build_net_policies("node-1", &desired);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].policy_hash, first[1].policy_hash);
+        assert_eq!(manager.net_policy_memo.merges(), 1, "one merge per task");
+
+        let again = manager.build_net_policies("node-1", &desired);
+        assert_eq!(again, first);
+        assert_eq!(
+            manager.net_policy_memo.merges(),
+            1,
+            "a steady beat merges nothing"
+        );
+
+        // A changed task network is a new input.
+        let changed = vec![allocation(
+            1,
+            json!({ "mode": "gated", "egress": { "allow": ["crates.io"] } }),
+        )];
+        let other = manager.build_net_policies("node-1", &changed);
+        assert_eq!(other.len(), 1);
+        assert_eq!(manager.net_policy_memo.merges(), 2, "merged again");
+
+        // A policy write moves the generation: everything merges again, and
+        // the stored policy now applies.
+        store.upsert_net_policy(serde_json::from_value(json!({
+            "name": "everyone", "enforcement": "require", "priority": 1,
+            "egress": { "allow": ["example.com"] }
+        }))?)?;
+        manager.bump_net_policy_generation();
+        let after = manager.build_net_policies("node-1", &desired);
+        assert_eq!(manager.net_policy_memo.merges(), 3);
+        assert_ne!(after[0].policy_hash, first[0].policy_hash);
+        // Every body a beat assigns is servable.
+        let cache = manager
+            .net_policy_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(cache.contains_key(&after[0].policy_hash));
         Ok(())
     }
 
