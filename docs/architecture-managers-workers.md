@@ -670,6 +670,14 @@ whatever the heartbeat cadence:
   node's outstanding checkpoint work on every beat, so a lost push costs one
   heartbeat interval, and a new stream is pushed everything still
   outstanding. See [How it works](suspend-and-resume.md#how-it-works).
+- **Endpoint sets.** When a service an upstream on the node uses changes
+  (a backend placed, removed, unhealthy, or its node lost), the manager
+  sends a **push-only** message (`push_only`, `endpoint_feed`) carrying the
+  changed sets. It has no place in the sequence: the worker neither moves
+  its position nor acknowledges it, and it is never replayed. The
+  heartbeat's endpoint feed stays the record, so a lost push costs one
+  heartbeat interval. See
+  [How endpoints reach a node](service-discovery.md#how-endpoints-reach-a-node).
 
 A worker on the stream sends a heartbeat of a few dozen bytes and gets a
 reply of a few bytes, however many allocations it runs; the manager builds

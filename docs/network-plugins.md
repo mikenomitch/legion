@@ -565,9 +565,12 @@ may be referenced.
   `file://`.** `oci://` modules (a WASM module published as an OCI artifact)
   are not supported yet, because the node content store caches single files
   only.
-- **Request bodies are buffered, not streamed.** The `body` stage sees the
-  whole body (up to `maxBodyBytes`) in one callback, with
-  `end_of_stream = true`. Response bodies stream.
+- **Request bodies are buffered, not streamed, when a `body` stage runs.**
+  The `body` stage sees the whole body (up to `maxBodyBytes`) in one
+  callback, with `end_of_stream = true`; a larger body is refused unread
+  (`403`, or `413` with `onError = "allow"`). A route with no body stage
+  streams request bodies ([Request
+  bodies](network-handlers.md#request-bodies)). Response bodies stream.
 - **A plugin cannot change where a request goes.** It may rewrite `:path`
   and headers, but a change to `:method`, `:authority`, or `:scheme` is
   ignored: those are the flow's facts, already judged by policy. A

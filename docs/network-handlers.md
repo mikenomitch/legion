@@ -106,6 +106,8 @@ running tasks a new policy would do it to.
    a client (such as an agent in a sandbox) can read why it was denied
    instead of retrying.
 2. `dlp` handlers buffer the body up to `maxBytes` and reject a match.
+   Otherwise the body is streamed, or kept only as far as a retry needs it
+   ([Request bodies](#request-bodies)).
 3. The upstream's `http` block applies traffic management:
    - a per-request `timeout`
    - `retries` on connect failures and 5xx, for idempotent methods only (by
@@ -151,7 +153,33 @@ task behind an HTTP-mode ingress chain.
 - **Not pooled.** A request handed to a [`proxy` handler](#proxy--bring-your-own-proxy).
 
 L4 flows are not pooled. Each connection the task opens is one connection
-upstream, and on a mesh endpoint, one mTLS handshake.
+upstream, and on a mesh endpoint, one mTLS handshake, which resumes a TLS
+session when the node has one for that peer ([Sessions](#sessions)).
+
+### Request bodies
+
+HTTP mode never holds an unbounded request body in memory. What happens to a
+body depends on whether something has to read it whole or send it twice:
+
+| The request | Its body |
+| --- | --- |
+| A body hop applies (`dlp`, a plugin's `body` stage) | Read whole, up to the hop's `maxBytes`. Over it, a hop that fails closed (the default) denies with `403`; one with `onError = "allow"` answers `413 Payload Too Large`, naming the cap |
+| The method may be retried (`http.retries`) | Kept up to `retries.maxBodyBytes` (default `1Mi`, at most `64Mi`) so a retry can send it again. A larger body is streamed to the upstream as it arrives and the request is **not retried** |
+| Anything else | Streamed to the upstream as it arrives |
+
+```nickel
+connect.upstreams = [{
+    name = "storage",
+    to = "https://storage.internal",
+    http = { retries = { attempts = 2, methods = ["PUT"], maxBodyBytes = "8Mi" } },
+}]
+```
+
+A streamed upload is not delayed until it is complete, and the worker's
+memory stays flat however large it is. The pooled-connection resend above
+still applies to a streamed request that never left the node. Access logs
+and the service graph count a streamed body's bytes as they pass, so a line
+written before the upload ends reports what had arrived.
 
 ### What the datapath costs
 
@@ -186,8 +214,11 @@ What this means in practice:
   that keeps its connections open avoids this.
 - **Mesh mTLS adds a handshake per new L4 connection.** That is one extra
   network round trip plus the handshake's CPU, and it is not in the table.
-  HTTP mode pools its upstream connections, so a task making many requests
-  pays the handshake once per pooled connection, not once per request.
+  Most of those handshakes resume a TLS session instead of verifying
+  certificates again ([Sessions](#sessions)), including across the 8-hour
+  certificate refresh. HTTP mode pools its upstream connections, so a task
+  making many requests pays the handshake once per pooled connection, not
+  once per request.
 - **HTTP mode parses every request and response.** On loopback, a request
   through HTTP mode on a reused upstream connection measured within about
   20 µs of a direct one. That figure is noisy: a direct HTTP request in the
@@ -556,8 +587,10 @@ memory, so never in its memory checkpoints, forks, or published snapshots.
 ## Name-is-config: `<key>.svc.legion`
 
 On a Linux node, every allocation that declares upstreams gets its own
-loopback /24 at placement (`127.42.<b>`, unique per node). All of 127/8 is
-loopback on Linux with no configuration. Placement goes by the node's `os`
+loopback /24 at placement, from `127.64.0.0/10`: the first is `127.64.0`,
+the 257th `127.65.0`, and the last `127.127.255`, so a node holds 16,384 of
+them. Blocks are handed out lowest first and are unique per node. All of
+127/8 is loopback on Linux with no configuration. Placement goes by the node's `os`
 fingerprint, so a manager on macOS assigns blocks to its Linux nodes and none
 to its macOS ones. In that block:
 
@@ -588,7 +621,7 @@ keyed by it.
 
 | Env var | Value |
 | --- | --- |
-| `LEGION_DNS` | `127.42.<b>.1`, the allocation's resolver (`127.0.0.53` for a gated allocation with no upstreams) |
+| `LEGION_DNS` | `127.<a>.<b>.1`, the allocation's resolver (`127.0.0.53` for a gated allocation with no upstreams) |
 | `LEGION_UPSTREAM_<KEY>` | `<vip>:<canonical port>` |
 | `LEGION_UPSTREAM_HOST_<KEY>` | `<vip>` |
 | `LEGION_UPSTREAM_PORT_<KEY>` | `<canonical port>` |
@@ -664,8 +697,10 @@ show` prints both for every hop.
 
 Every hop has a `timeout` (default `2s`) and an `onError` (default `deny`).
 If a hop cannot be reached (a webhook that times out, a proxy with no
-endpoint) or a `dlp` body is larger than `maxBytes`, the flow fails
-**closed** unless the hop sets `onError = "allow"`. `onError` belongs to the
+endpoint), the flow fails **closed** unless the hop sets `onError =
+"allow"`. A request body larger than a body hop's `maxBytes` is never let
+through unread: the request is denied (`403`), or answered `413` when the
+hop sets `onError = "allow"` ([Request bodies](#request-bodies)). `onError` belongs to the
 hop: a chain has no `onError` of its own, and a chain that sets one is
 refused at submit.
 
@@ -852,8 +887,9 @@ its own key, sends a CSR (`IssueNodeCertificate`, authorized by its node
 token) right after registration, and the manager has it signed with the SANs
 `<node>.node.legion` and `legion://node/<node id>`, valid for 24 hours. The
 manager picks those names itself and checks what an external CA returns
-before handing it out. The worker refreshes it after 8 hours, or within one
-heartbeat when the cluster's trust bundle changes. The same certificate
+before handing it out. The worker refreshes it after 8 hours, or when the
+cluster's trust bundle changes, after its rotation splay
+([The Cluster CA](cluster-ca.md#how-workers-learn)). The same certificate
 serves the node's worker plane
 ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)), and the key and
 certificate persist under `<state-dir>/identity/` (mode `0600`) so a
@@ -865,11 +901,39 @@ provider supplies it, and where a rotation stands. `legion net ca rotate`
 rotates the built-in CA in two steps that break no mesh connection: the new
 CA, cross-signed by the old one, signs at once, and the old one stays in
 every trust bundle for one certificate lifetime (24 hours). Every node
-re-issues on its next heartbeat. A `file` or `exec` CA rotates outside
+re-issues within its rotation splay, at most 10 minutes. A `file` or `exec` CA rotates outside
 Legion with the same add-switch-remove steps
 ([The Cluster CA](cluster-ca.md#rotation)). Peers never fall back to
 plaintext ([Rotating the cluster
 CA](auth-and-acls.md#rotating-the-cluster-ca)).
+
+### Sessions
+
+Mesh hops are TLS 1.3, and both ends keep sessions so a new connection to a
+peer the node has talked to recently resumes instead of doing a full
+handshake.
+
+- **One client and one server configuration per trust bundle.** The node's
+  certificate is swapped into them in place when it is re-issued, so the
+  8-hour refresh keeps every session. The server keeps sessions in one
+  node-wide store (4,096 sessions, stateful single-use tickets) shared by
+  every mesh port; the client keeps up to 8 tickets per peer node.
+- **A trust-bundle change drops every session.** A CA rotation, or a CA
+  added to or removed from the bundle, builds new configurations with empty
+  stores on both ends, so nothing established under the old bundle resumes.
+  The first connection to each peer after it is a full handshake.
+- **A resumed session is only as good as the certificates that started
+  it.** Resuming reuses the original handshake's authentication, and each
+  resumption issues new tickets with the same identity. The client drops a
+  ticket whose chain may carry one of its own certificates that expires
+  within 30 minutes, and both ends refuse a resumed session whose peer
+  certificate has expired. A node that stops being re-issued therefore
+  loses mesh access when its certificate expires, as it would without
+  resumption.
+
+Each L4 connection is still its own TLS connection: there are no pooled,
+multiplexed tunnels between nodes yet (see
+[Current scope and limitations](#current-scope-and-limitations)).
 
 ## TLS on ports
 
@@ -1032,7 +1096,7 @@ With `mode = "gated"`, the worker creates an empty network namespace for the
 allocation before it starts: `/var/run/netns/legion-<allocation>`, with
 loopback up, no other interface, and no route. It binds every datapath
 listener inside that namespace: the upstream loopback ports, the VIPs, the
-allocation's resolver (at `127.42.<b>.1:53` with a VIP block, else at
+allocation's resolver (at `127.<a>.<b>.1:53` with a VIP block, else at
 `127.0.0.53:53`), an **ingress listener** for every declared port, and an
 **egress proxy** at `127.0.0.1:1080`. A `container` joins the namespace by path (an OCI
 `network` namespace entry). An `exec` task enters it with `setns` before
@@ -1447,6 +1511,8 @@ hostGuard = {
   allow = ["10.0.1.7:9100"],
   # Extra destinations to treat like metadata.
   deny = ["192.0.2.10/32"],
+  # How often the nftables guard's drop counters are read (default 10s).
+  counterInterval = "10s",
 },
 ```
 
@@ -1490,13 +1556,23 @@ in the output hook and drops:
 | `169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`, `100.100.100.200` | the cloud metadata service |
 | `hostGuard.deny` entries | operator additions |
 | Legion's ports on any local address: the worker plane, and the manager's API, exec, and telemetry ports when the manager shares the node | the node's control plane |
-| `127.42.0.0/16` and every allocation's upstream loopback ports | other allocations' datapath listeners |
+| `127.64.0.0/10` (every VIP block) and every allocation's upstream loopback ports | other allocations' datapath listeners |
 
 An allocation keeps its own VIP block and upstream ports, and
 `hostGuard.allow` entries are accepted first. A dropped `connect()` fails at
-once with `EPERM` ("Operation not permitted"), not a timeout. Each allocation
-has its own chain with its own counters. The worker reads them every
-heartbeat and reports new drops as `net.denied` events with source
+once with `EPERM` ("Operation not permitted"), not a timeout.
+
+The guard judges a connection once. Packets of an established flow are
+accepted before anything else is walked (`ct state established,related
+accept`), and a socket reaches its allocation's chain through one verdict-map
+lookup on its cgroup leaf, not one rule per allocation, so the cost per
+packet does not grow with the allocations on the node. A flow that was
+allowed keeps going after a later policy change; the change applies to the
+next `connect()`.
+
+Each allocation has its own chain with its own counters. The worker reads
+them at most every `hostGuard.counterInterval` (default `10s`; each read
+runs `nft -j list table`) and reports new drops as `net.denied` events with source
 `host-guard`, the class as the destination (`cloud metadata`, `a Legion
 control port`, `another allocation's datapath`), and `dropped in the kernel`
 in the reason, so `legion net doctor` and the event stream name the cause.
@@ -1727,10 +1803,13 @@ network = {
 
 - **The datapath owns the advertised port.** The node's datapath binds
   `LEGION_PORT_HTTP` as consumers see it (the port in the catalog and in
-  `LEGION_UPSTREAM_*` feeds) on the host. The task gets a **private twin**
+  `LEGION_UPSTREAM_*` feeds) on the host, on every address of both families
+  (one `[::]` socket that also takes IPv4, or `0.0.0.0` on a host without
+  IPv6). The task gets a **private twin**
   as its own `LEGION_PORT_HTTP` (a container's port publish uses the twin
   too), so nothing in the task changes. On the host the twin comes from the
-  same dynamic range. Inside a gated namespace, which has its own ports, the
+  datapath's port range, `61000–65535`, apart from task ports
+  (`20000–32000`). Inside a gated namespace, which has its own ports, the
   twin is the port's `to`, or the advertised port number itself when `to` is
   unset, so an image that listens on a fixed port (`{ name = "pg", to =
   5432 }`) needs no change. The task cannot take the advertised port back, because the bind
@@ -2051,9 +2130,11 @@ This section lists what that covers and what it does not.
   The bundled [cert manager](cert-manager.md) issues and renews certificates
   into KV (Let's Encrypt, a private CA, or self-signed); a renewal job of
   your own, or any ACME client, can write them there instead. The mesh is node-to-node mTLS with attributed
-  workload identity, never per-workload certificates. There is no kTLS fast
-  path (a TLS connection, mesh hops included, is copied in user space rather
-  than spliced), no revocation
+  workload identity, never per-workload certificates. Mesh hops resume TLS
+  sessions ([Sessions](#sessions)) but are not pooled: each L4 connection is
+  its own TLS connection, with no multiplexed node-to-node tunnels. There is
+  no kTLS fast path (a TLS connection, mesh hops included, is copied in user
+  space rather than spliced), no revocation
   beyond the 24-hour lifetime, and an ingress `proxy` hop cannot reach a
   gated task's private port or a port inside a sandbox guest.
 - **No HTTP/2 or HTTP/3** (`protocol = "h2"` is rejected with that reason),
