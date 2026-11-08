@@ -3429,6 +3429,110 @@ service Manager {
   // nothing and the ticket is unspent, so the caller sends the same request
   // to the leader.
   rpc RatifyClaim (RatifyClaimRequest) returns (RatifyClaimReply);
+
+  // === Agent governance (internal_docs/plans/agent-governance-plan.md) ===
+  //
+  // The audit journal, child tokens, approval gates, the caller-aware
+  // catalog, and usage accounting. Public docs: docs/audit-journal.md,
+  // docs/approvals-and-rate-limits.md, docs/usage-accounting.md,
+  // docs/auth-and-acls.md ("Child tokens").
+  //
+  // Two typed failures can come back from ANY mutating RPC once the
+  // governance layer is in front of it (every manager's gRPC listener):
+  //
+  // - `FAILED_PRECONDITION` with metadata `legion-error-code:
+  //   APPROVAL_REQUIRED` when a `governance.approvals` rule gates the write.
+  //   Metadata `legion-error-details` carries JSON
+  //   `{"approvalId", "requestDigest", "rule", "expiresAt"}`. Nothing was
+  //   changed. Retry the identical request with metadata
+  //   `legion-approval-id: <approvalId>` once an approver has approved it
+  //   (`DecideApproval`). `APPROVAL_INVALID` (same code) means the presented
+  //   approval cannot be used: not approved yet, denied, expired, already
+  //   used, for a different request digest, or requested by another caller.
+  // - `RESOURCE_EXHAUSTED` with `legion-error-code: RATE_LIMITED` when the
+  //   caller's token-bucket write limit (`governance.rateLimit`, or the
+  //   token's own `write_rate`) is exhausted. `legion-error-details` carries
+  //   `{"retryAfterMs", "limitPerSecond", "burst"}`. Nothing was changed;
+  //   retrying after `retryAfterMs` is safe.
+
+  // Lists the durable audit journal: one record per mutating RPC, per ACL
+  // denial, and per always-audited RPC (`Login`, token minting, approval
+  // decisions), newest first.
+  //
+  // Requires `audit:read` (cluster-scoped). Records never carry request
+  // bodies or secrets: the request is identified by its digest, the caller
+  // by its accessor ID and principal. Every manager serves the journal; a
+  // record is written asynchronously by the manager that handled the
+  // request, typically within 250 ms of the reply (see
+  // docs/audit-journal.md, "Durability").
+  rpc ListAuditEvents (ListAuditEventsRequest) returns (ListAuditEventsReply);
+
+  // Mints a child token: a client token whose policies are a subset of the
+  // caller's own, that expires no later than the caller's token and no later
+  // than `acl.childTokenMaxTtl`, and that is revoked when its parent is.
+  //
+  // ACL: any caller presenting a Legion ACL token (no `acl:write` needed —
+  // this is how an agent hands a sub-agent a narrower credential).
+  // Anonymous, JWT-bearer, delegated (`legion-on-behalf-of`) and
+  // acting-for-object callers are refused. A child token is evaluated at
+  // request time as its own policies plus every deny rule of its root
+  // ancestor's policies, and every ancestor must still exist and be
+  // unexpired, so it is never wider than its parent even after policies
+  // are edited. With ACLs disabled the RPC fails with FAILED_PRECONDITION.
+  //
+  // Not idempotent by design: the secret is returned exactly once and never
+  // stored, so a replay cannot return it; a retried call mints a second
+  // child, and the unused one expires on its own.
+  rpc CreateChildToken (CreateChildTokenRequest) returns (CreateChildTokenReply);
+
+  // Lists approval requests filed by `governance.approvals` gates, newest
+  // first.
+  //
+  // Requires `approval:read` to see every request; any authenticated caller
+  // may list its own (`mine = true`), which is how an agent polls for the
+  // decision on the request it filed.
+  rpc ListApprovals (ListApprovalsRequest) returns (ListApprovalsReply);
+
+  // Returns one approval request. Requires `approval:read`, or being the
+  // caller that filed it. Check-before-fetch: a caller without
+  // `approval:read` gets NOT_FOUND for any request it did not file.
+  rpc GetApproval (GetApprovalRequest) returns (GetApprovalReply);
+
+  // Approves or denies a pending approval request.
+  //
+  // Requires `approval:write`. The approver may not be the requester, nor a
+  // token in the requester's lineage (its parent, children, or siblings
+  // under the same root): a caller cannot approve its own request. Only a
+  // pending, unexpired request can be decided. An approval is usable once,
+  // by the requester, for the exact request it was filed for (same
+  // operation and request digest), until `governance.approvals.ttl` after
+  // the decision. Never gated itself. Accepts `idempotency_key`.
+  rpc DecideApproval (DecideApprovalRequest) returns (DecideApprovalReply);
+
+  // The caller-aware capability catalog: for every Manager RPC, the
+  // permission it needs and whether the caller holds it everywhere
+  // (`allowed`), in some namespaces or targets only (`partial`, with the
+  // namespaces when the resource is namespaced), or not at all (`denied`).
+  // Open and worker-plane RPCs are marked as such. `legion capabilities
+  // --mine` and the MCP `legion_capabilities` tool merge this into the
+  // catalog.
+  //
+  // ACL: open endpoint. It reports only on the presented credential, which
+  // `WhoAmI` already exposes; anonymous callers see the anonymous policy's
+  // reach.
+  rpc GetCallerCapabilities (GetCallerCapabilitiesRequest) returns (GetCallerCapabilitiesReply);
+
+  // Time-integrated usage: reserved CPU, memory, cores, allocations and
+  // every other numeric resource dimension, integrated over time into hourly
+  // buckets per namespace, job and submitter (docs/usage-accounting.md).
+  //
+  // ACL: `namespace:read` on each namespace in the reply; rows for
+  // namespaces the caller cannot read are left out (a caller that reaches
+  // none gets PERMISSION_DENIED). Grouping by job or submitter additionally
+  // needs `job:read` on each job. Usage integrates reservations, not
+  // measured consumption, and is accumulated by the status-lane leader
+  // every `governance.usage.interval`; the current hour is partial.
+  rpc GetUsage (GetUsageRequest) returns (GetUsageReply);
 }
 
 // Request payload for WorkerPreRegister.
@@ -14624,6 +14728,11 @@ message AclTokenInfo {
 
   // RFC3339 expiry. Omitted when the token never expires.
   optional string expires_at = 6;
+
+  // The accessor ID of the token this child token was minted from
+  // (CreateChildToken). Omitted for tokens minted by CreateAclToken, Login,
+  // or the manager itself.
+  optional string parent_accessor_id = 7;
 }
 
 // A named ACL policy.
@@ -14739,7 +14848,11 @@ message CreateAclTokenRequest {
 
   // Optional lifetime (humantime format, for example "720h").
   //
-  // Default when omitted: the token never expires.
+  // Default when omitted: `acl.tokenDefaultTtl` (720h, 30 days), for client
+  // and management tokens alike. Client tokens may not exceed
+  // `acl.tokenMaxTtl` (default 2160h). `"never"` creates a non-expiring
+  // token and is accepted for management tokens, and for client tokens only
+  // when `acl.tokenMaxTtl = "none"`.
   optional string ttl = 4;
 }
 
@@ -18286,4 +18399,370 @@ message DeleteNamespacePolicyReply {
   // True when this reply was replayed from an earlier request with the same
   // `idempotency_key`.
   bool deduplicated = 2;
+}
+
+// === Agent governance messages (internal_docs/plans/agent-governance-plan.md) ===
+
+// One audit journal record (docs/audit-journal.md).
+message AuditEvent {
+  // Random 128-bit hex ID, unique across managers.
+  string id = 1;
+
+  // RFC3339 time the RPC completed on the handling manager.
+  string time = 2;
+
+  // The same instant in unix milliseconds (the journal's sort key).
+  int64 ts_ms = 3;
+
+  // Raft node ID of the manager that handled the request; empty outside
+  // raft mode.
+  string manager = 4;
+
+  // The Manager RPC name, for example `DestroyJob`.
+  string operation = 5;
+
+  // `write` (a write permission was checked), `denied` (the request failed
+  // authentication or authorization), or `audited` (an always-audited RPC
+  // that checks no write permission, such as `Login`).
+  string kind = 6;
+
+  // Accessor ID of the presented ACL token; empty for JWT-bearer,
+  // anonymous, and ACL-disabled callers. Never the secret.
+  string accessor_id = 7;
+
+  // The caller's principal: token name, `<method>:<subject>` for JWTs,
+  // `anonymous`, or `acl-disabled`.
+  string principal = 8;
+
+  // How the caller authenticated: `token`, `jwt`, `anonymous`, `disabled`,
+  // `delegated`, or `for-object`.
+  string source = 9;
+
+  // The on-behalf-of chain when an app acted for a viewer
+  // (`alice via app autoscaler`) or for an object
+  // (`for gitops/Repo team/web`); empty otherwise.
+  string on_behalf_of = 10;
+
+  // For a child token, its parent's accessor ID.
+  string parent_accessor_id = 11;
+
+  // The ACL resource and action of the decisive check (`job`, `write`).
+  string resource = 12;
+  string action = 13;
+
+  // The target the check was scoped to: `job:prod/web`, `kv:team/db`,
+  // `node:pool/gpu`, `acl`, ... Empty when the request failed before any
+  // check.
+  string target = 14;
+
+  // The target's namespace, when it has one.
+  string namespace = 15;
+
+  // SHA-256 of the canonical request message (hex). Two requests with the
+  // same arguments have the same digest; approvals are bound to it. Empty
+  // for client-streaming RPCs.
+  string request_digest = 16;
+
+  // The request's idempotency key, when it carried one.
+  string idempotency_key = 17;
+
+  // The approval consumed by this request, when a gate required one.
+  string approval_id = 18;
+
+  // `ok`, a typed Legion code (`APPROVAL_REQUIRED`, `RATE_LIMITED`, ...),
+  // or the gRPC code name (`PermissionDenied`, `NotFound`, ...).
+  string outcome = 19;
+
+  // The error message, truncated to 512 bytes; empty on success.
+  string message = 20;
+
+  // Operation-specific JSON (for example the minted token's accessor ID on
+  // `CreateAclToken`); empty when there is none.
+  string detail_json = 21;
+
+  // Handler time in milliseconds.
+  int64 duration_ms = 22;
+}
+
+// Request payload for ListAuditEvents. Empty string fields do not filter.
+message ListAuditEventsRequest {
+  // Exact accessor ID.
+  string accessor_id = 1;
+
+  // Exact principal.
+  string principal = 2;
+
+  // Exact RPC name.
+  string operation = 3;
+
+  // Prefix of `target`, for example `job:prod/`.
+  string target_prefix = 4;
+
+  // Exact namespace.
+  string namespace = 5;
+
+  // Exact outcome (`ok`, `PermissionDenied`, `APPROVAL_REQUIRED`, ...).
+  string outcome = 6;
+
+  // Exact kind (`write`, `denied`, `audited`).
+  string kind = 7;
+
+  // Lower time bound: RFC3339, or a duration back from now (`1h`, `7d`).
+  string since = 8;
+
+  // Upper time bound (exclusive), same forms. Default: no bound.
+  string until = 9;
+
+  // Maximum records to return. Default 100, at most 1000.
+  uint32 limit = 10;
+
+  // Continue a newest-first listing: the `next_page_token` of the previous
+  // reply.
+  string page_token = 11;
+
+  // Follow mode: return records NEWER than this cursor, oldest first (the
+  // `last_cursor` of a previous reply). How `legion audit list --follow`
+  // polls.
+  string after_cursor = 12;
+}
+
+// Reply payload for ListAuditEvents.
+message ListAuditEventsReply {
+  repeated AuditEvent events = 1;
+
+  // Pass as `page_token` for the next (older) page; empty when this page
+  // was not full.
+  string next_page_token = 2;
+
+  // Cursor of the newest record in this reply (or the request's
+  // `after_cursor` when it is empty); pass as `after_cursor` to follow.
+  string last_cursor = 3;
+}
+
+// Request payload for CreateChildToken.
+message CreateChildTokenRequest {
+  // Human-readable name for the child token (shown in the audit journal).
+  string name = 1;
+
+  // Policies to attach: a subset of the caller's own. Empty means all of
+  // the caller's policies. A child of a management token must name at
+  // least one existing policy (it is a client token).
+  repeated string policies = 2;
+
+  // Lifetime (humantime, for example "30m"). Default
+  // `acl.childTokenDefaultTtl` (1h); capped at `acl.childTokenMaxTtl`
+  // (24h) and at the parent's remaining lifetime.
+  optional string ttl = 3;
+
+  // Optional write rate limit for the child, as on CreateAclToken. It may
+  // not exceed the parent's own token limit when the parent has one.
+  optional string write_rate = 4;
+}
+
+// Reply payload for CreateChildToken.
+message CreateChildTokenReply {
+  // The child token's metadata; `parent_accessor_id` names the caller's
+  // token.
+  AclTokenInfo token = 1;
+
+  // The child's secret. Returned exactly once; only its hash is stored.
+  string secret = 2;
+}
+
+// One approval request (docs/approvals-and-rate-limits.md).
+message Approval {
+  // `apr_` + 32 hex characters.
+  string id = 1;
+
+  // `pending`, `approved`, `denied`, `consumed`, or `expired`.
+  string status = 2;
+
+  // The gated RPC.
+  string operation = 3;
+
+  // The write that matched, `resource:action`.
+  string permission = 4;
+
+  // The target, as in `AuditEvent.target`.
+  string target = 5;
+
+  // The target's namespace, when it has one.
+  string namespace = 6;
+
+  // The `governance.approvals.rules[].name` that matched.
+  string rule = 7;
+
+  // Digest of the gated request; the retry must carry the same.
+  string request_digest = 8;
+
+  // Who asked: principal, accessor ID, and on-behalf-of chain.
+  string requester_principal = 9;
+  string requester_accessor = 10;
+  string on_behalf_of = 11;
+
+  // RFC3339 times. `expires_at` is when a pending request lapses, or, once
+  // approved, until when the approval may be used.
+  string created_at = 12;
+  string expires_at = 13;
+
+  // The approver's principal, the decision time, and their reason.
+  string decided_by = 14;
+  string decided_at = 15;
+  string reason = 16;
+
+  // When the approval was used; empty until then.
+  string consumed_at = 17;
+}
+
+// Request payload for ListApprovals.
+message ListApprovalsRequest {
+  // Only requests in this status (`pending`, `approved`, `denied`,
+  // `consumed`, `expired`). Empty for all.
+  string status = 1;
+
+  // Only the caller's own requests. Implicitly true for callers without
+  // `approval:read`.
+  bool mine = 2;
+
+  // Maximum to return. Default 100, at most 1000.
+  uint32 limit = 3;
+}
+
+// Reply payload for ListApprovals.
+message ListApprovalsReply {
+  repeated Approval approvals = 1;
+}
+
+// Request payload for GetApproval.
+message GetApprovalRequest {
+  string id = 1;
+}
+
+// Reply payload for GetApproval.
+message GetApprovalReply {
+  Approval approval = 1;
+}
+
+// Request payload for DecideApproval.
+message DecideApprovalRequest {
+  // The approval request ID.
+  string id = 1;
+
+  // True approves, false denies.
+  bool approve = 2;
+
+  // Optional reason, recorded on the request and in the journal.
+  string reason = 3;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 4;
+}
+
+// Reply payload for DecideApproval.
+message DecideApprovalReply {
+  // The request after the decision.
+  Approval approval = 1;
+
+  // True when this reply was replayed from an earlier request with the same
+  // `idempotency_key`.
+  bool deduplicated = 2;
+}
+
+// Request payload for GetCallerCapabilities.
+message GetCallerCapabilitiesRequest {
+}
+
+// One Manager RPC as the caller can use it.
+message RpcAccess {
+  // The RPC name, for example `RunJob`.
+  string rpc = 1;
+
+  // The permission it needs, `resource:action`; empty for open,
+  // worker-plane and app-plane RPCs.
+  string permission = 2;
+
+  // `allowed` (holds the permission everywhere), `partial` (in some
+  // namespaces or targets only), `denied`, `open` (needs no permission),
+  // `worker` (worker plane), or `app` (app plane).
+  string access = 3;
+
+  // For `partial` on a namespaced resource: the namespaces where it holds.
+  repeated string namespaces = 4;
+
+  // True when the RPC needs a write permission.
+  bool mutates = 5;
+}
+
+// Reply payload for GetCallerCapabilities.
+message GetCallerCapabilitiesReply {
+  // The caller, as WhoAmI reports it.
+  string principal = 1;
+  optional string accessor_id = 2;
+  string source = 3;
+  bool is_management = 4;
+  bool acl_enabled = 5;
+
+  // Every Manager RPC this manager classifies, sorted by name.
+  repeated RpcAccess rpcs = 6;
+}
+
+// Request payload for GetUsage.
+message GetUsageRequest {
+  // Namespaces (names or `*`-globs). Empty means every namespace the caller
+  // can read.
+  repeated string namespaces = 1;
+
+  // Only this job (qualified `ns/name` or a bare name in `default`).
+  string job = 2;
+
+  // Only jobs whose last submit was by this accessor ID or principal.
+  string submitter = 3;
+
+  // Lower bound: RFC3339 or a duration back from now. Default `24h`.
+  string since = 4;
+
+  // Upper bound (exclusive): RFC3339 or a duration back from now. Default:
+  // now.
+  string until = 5;
+
+  // `namespace` (default), `job`, `submitter`, or `hour` (one row per
+  // hourly bucket and namespace).
+  string group_by = 6;
+}
+
+// One usage row.
+message UsageSummary {
+  // The grouping key's fields; unset ones are empty.
+  string namespace = 1;
+  string job = 2;
+  string submitter = 3;
+
+  // RFC3339 start of the hourly bucket, for `group_by = "hour"`.
+  string bucket_start = 4;
+
+  // Reserved CPU, in core-hours (MHz-hours / 1000) and MHz-hours.
+  double cpu_core_hours = 5;
+  double cpu_mhz_hours = 6;
+
+  // Reserved memory, in GiB-hours.
+  double memory_gib_hours = 7;
+
+  // Reserved exclusive cores, in core-hours.
+  double cores_hours = 8;
+
+  // Allocation-hours (one allocation held for one hour = 1).
+  double allocation_hours = 9;
+
+  // Every other numeric resource dimension, in unit-hours, keyed by name
+  // (custom resources; devices once modeled).
+  map<string, double> other_hours = 10;
+}
+
+// Reply payload for GetUsage.
+message GetUsageReply {
+  repeated UsageSummary rows = 1;
+
+  // The resolved window, RFC3339.
+  string since = 2;
+  string until = 3;
 }

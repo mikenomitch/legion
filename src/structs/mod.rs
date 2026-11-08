@@ -18,6 +18,7 @@ pub mod eval;
 pub mod exec_ticket;
 pub mod extensions;
 pub mod fork;
+pub mod governance;
 pub mod grant;
 pub mod hops;
 pub mod host_guard;

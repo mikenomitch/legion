@@ -133,6 +133,7 @@ mod checkpoint_support;
 mod delegation;
 mod extension_rpcs;
 mod fork_rpcs;
+mod governance_rpcs;
 mod make_room;
 mod material_rpcs;
 mod namespace_policy_rpcs;
@@ -170,7 +171,7 @@ fn signing_error_status(err: anyhow::Error, message: &str) -> Status {
     Status::internal(message.to_string())
 }
 
-fn map_store_error(action: &str, err: anyhow::Error) -> Status {
+pub(crate) fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     let status = store_error_status(action, &err);
     // Log by what the error means for the server. A refused or missing-thing
     // answer (NotFound, FailedPrecondition, a non-leader redirect, ...) is
@@ -2382,7 +2383,11 @@ impl ManagerDaemonService {
     /// falls back to the app's own identity (`delegation.rs`).
     fn authenticate_acl<T>(&self, request: &Request<T>) -> Result<AclIdentity, Status> {
         let caller = self.auth.authenticate(request.metadata(), &self.store)?;
-        self.with_delegation(caller, request.metadata())
+        let identity = self.with_delegation(caller, request.metadata())?;
+        // The audit journal records who called, and for whom
+        // (`crate::manager::governance`).
+        crate::manager::governance::note_identity(&identity);
+        Ok(identity)
     }
 
     /// Every manager a worker may dial (`HeartbeatReply.manager_addresses`,
@@ -6565,6 +6570,58 @@ impl Manager for ManagerDaemonService {
             .collect();
 
         Ok(Response::new(ListJobSpecHistoryReply { items }))
+    }
+
+    // === AGENT GOVERNANCE (internal_docs/plans/agent-governance-plan.md) ===
+    // The handlers live in `governance_rpcs`; each enforces its own ACLs.
+
+    async fn list_audit_events(
+        &self,
+        request: Request<crate::structs::ListAuditEventsRequest>,
+    ) -> Result<Response<crate::structs::ListAuditEventsReply>, Status> {
+        self.list_audit_events_rpc(request).await
+    }
+
+    async fn create_child_token(
+        &self,
+        request: Request<crate::structs::CreateChildTokenRequest>,
+    ) -> Result<Response<crate::structs::CreateChildTokenReply>, Status> {
+        self.create_child_token_rpc(request).await
+    }
+
+    async fn list_approvals(
+        &self,
+        request: Request<crate::structs::ListApprovalsRequest>,
+    ) -> Result<Response<crate::structs::ListApprovalsReply>, Status> {
+        self.list_approvals_rpc(request).await
+    }
+
+    async fn get_approval(
+        &self,
+        request: Request<crate::structs::GetApprovalRequest>,
+    ) -> Result<Response<crate::structs::GetApprovalReply>, Status> {
+        self.get_approval_rpc(request).await
+    }
+
+    async fn decide_approval(
+        &self,
+        request: Request<crate::structs::DecideApprovalRequest>,
+    ) -> Result<Response<crate::structs::DecideApprovalReply>, Status> {
+        self.decide_approval_rpc(request).await
+    }
+
+    async fn get_caller_capabilities(
+        &self,
+        request: Request<crate::structs::GetCallerCapabilitiesRequest>,
+    ) -> Result<Response<crate::structs::GetCallerCapabilitiesReply>, Status> {
+        self.get_caller_capabilities_rpc(request).await
+    }
+
+    async fn get_usage(
+        &self,
+        request: Request<crate::structs::GetUsageRequest>,
+    ) -> Result<Response<crate::structs::GetUsageReply>, Status> {
+        self.get_usage_rpc(request).await
     }
 
     // === NAMESPACES (docs/namespaces.md) ===
@@ -12181,39 +12238,19 @@ impl Manager for ManagerDaemonService {
             }
         }
 
-        let ttl: Option<Duration> = req
-            .ttl
-            .as_deref()
-            .map(|raw| {
-                raw.parse::<humantime::Duration>()
-                    .map(Into::into)
-                    .map_err(|e| Status::invalid_argument(format!("invalid ttl `{raw}`: {e}")))
-            })
-            .transpose()?;
-        // Server-enforced lifetime bounds: when acl.tokenMaxTtl is set,
-        // client tokens must expire within it (management tokens are exempt).
-        if token_type == "client" {
-            if let Some(max) = self.auth.token_max_ttl {
-                match ttl {
-                    None => {
-                        return Err(Status::invalid_argument(format!(
-                            "client tokens must set a ttl of at most {} (acl.tokenMaxTtl)",
-                            humantime::format_duration(max)
-                        )))
-                    }
-                    Some(requested) if requested > max => {
-                        return Err(Status::invalid_argument(format!(
-                            "requested ttl exceeds acl.tokenMaxTtl ({})",
-                            humantime::format_duration(max)
-                        )))
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
+        // Every token expires unless asked otherwise (`acl.tokenDefaultTtl`,
+        // bounded by `acl.tokenMaxTtl` for client tokens; docs/auth-and-acls.md,
+        // "Token lifetimes").
+        let ttl = self
+            .auth
+            .create_token_ttl(&token_type, req.ttl.as_deref())?;
         let (token, secret) =
             self.auth
                 .mint_token(&self.store, &req.name, &token_type, &req.policies, ttl)?;
+        crate::manager::governance::note_detail(
+            "mintedAccessorId",
+            Value::String(token.accessor_id.clone()),
+        );
         info!(accessor_id = %token.accessor_id, name = %token.name, "ACL token created");
         Ok(Response::new(CreateAclTokenReply {
             token: Some(token),
@@ -12232,12 +12269,20 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             AclScope::none(),
         )?;
+        let parents = self
+            .store
+            .token_parents()
+            .map_err(|e| map_store_error("Error listing ACL tokens", e))?;
         let tokens = self
             .store
             .list_acl_tokens()
             .map_err(|e| map_store_error("Error listing ACL tokens", e))?
             .iter()
-            .map(|record| record.to_info())
+            .map(|record| {
+                let mut info = record.to_info();
+                info.parent_accessor_id = parents.get(&record.accessor_id).cloned();
+                info
+            })
             .collect();
         Ok(Response::new(ListAclTokensReply { tokens }))
     }
@@ -13214,6 +13259,7 @@ fn scoped_idempotency_key(
     if key.is_empty() {
         return String::new();
     }
+    crate::manager::governance::note_idempotency_key(key);
     // Who the caller is, by how it authenticated and then its accessor (a
     // token) or its principal: a JWT subject spelled like a delegated
     // identity (`alice via app autoscaler`), or like an accessor, is

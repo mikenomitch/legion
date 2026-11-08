@@ -5,6 +5,7 @@ pub(crate) mod coalesce;
 pub mod content_index;
 pub mod errors;
 pub mod events;
+pub mod governance_store;
 pub mod keyring;
 pub mod liveness;
 pub mod migrations;

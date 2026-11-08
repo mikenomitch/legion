@@ -56,6 +56,9 @@ pub const TOKEN_PREFIX: &str = "lgn_";
 /// Policy name applied to requests that present no credential.
 pub const ANONYMOUS_POLICY: &str = "anonymous";
 
+/// Deepest a child-token lineage may go (root = depth 0).
+pub const MAX_CHILD_TOKEN_DEPTH: i64 = 8;
+
 const DEFAULT_LOGIN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Hashes a token secret for at-rest storage and lookup.
@@ -104,8 +107,15 @@ pub struct Authenticator {
     pub audit_only: bool,
     pub login_ttl: Duration,
     /// Upper bound for client-token TTLs (CreateAclToken and Login).
-    /// `None` means unbounded; management tokens are always exempt.
+    /// `None` means unbounded (`acl.tokenMaxTtl = "none"`); management
+    /// tokens are always exempt.
     pub token_max_ttl: Option<Duration>,
+    /// Lifetime of a CreateAclToken token that asks for none
+    /// (`acl.tokenDefaultTtl`).
+    pub token_default_ttl: Duration,
+    /// Default and maximum lifetime of a child token (CreateChildToken).
+    pub child_token_default_ttl: Duration,
+    pub child_token_max_ttl: Duration,
     pub jwks_refresh_interval: Duration,
     methods: Vec<Box<dyn AuthMethod>>,
 }
@@ -128,6 +138,9 @@ impl Authenticator {
             audit_only: false,
             login_ttl: DEFAULT_LOGIN_TTL,
             token_max_ttl: None,
+            token_default_ttl: Duration::from_secs(30 * 24 * 3600),
+            child_token_default_ttl: Duration::from_secs(3600),
+            child_token_max_ttl: Duration::from_secs(24 * 3600),
             jwks_refresh_interval: Duration::from_secs(300),
             methods: vec![Box::new(UserpassMethod::new(DEFAULT_LOGIN_TTL))],
         }
@@ -138,9 +151,16 @@ impl Authenticator {
         let token_max_ttl = config
             .token_max_ttl
             .as_deref()
+            .filter(|raw| !matches!(raw.trim(), "none" | "never" | ""))
             .map(parse_ttl)
             .transpose()
             .context("invalid acl.tokenMaxTtl")?;
+        let token_default_ttl =
+            parse_ttl(&config.token_default_ttl).context("invalid acl.tokenDefaultTtl")?;
+        let child_token_default_ttl = parse_ttl(&config.child_token_default_ttl)
+            .context("invalid acl.childTokenDefaultTtl")?;
+        let child_token_max_ttl =
+            parse_ttl(&config.child_token_max_ttl).context("invalid acl.childTokenMaxTtl")?;
         let jwks_refresh_interval =
             parse_ttl(&config.jwks_refresh_interval).context("invalid acl.jwksRefreshInterval")?;
         let mut authenticator = Authenticator {
@@ -148,6 +168,9 @@ impl Authenticator {
             audit_only: config.audit_only,
             login_ttl,
             token_max_ttl,
+            token_default_ttl,
+            child_token_default_ttl,
+            child_token_max_ttl,
             jwks_refresh_interval,
             methods: Vec::new(),
         };
@@ -283,13 +306,18 @@ impl Authenticator {
             )));
         }
 
-        let rules = if record.is_management() {
+        let mut rules = if record.is_management() {
             Vec::new()
         } else {
             store
                 .resolve_acl_rules(&record.policies)
                 .map_err(internal_acl_error)?
         };
+        // A child token (CreateChildToken) is never wider than its parent:
+        // its own policies are a subset of its root's, every ancestor must
+        // still exist and be unexpired, and every deny rule of the root's
+        // policies applies to it too (docs/auth-and-acls.md, "Child tokens").
+        rules.extend(self.lineage_denies(&record, store)?);
 
         Ok(AclIdentity {
             principal: record.name.clone(),
@@ -373,6 +401,258 @@ impl Authenticator {
             .insert_acl_token(&record)
             .map_err(internal_acl_error)?;
         Ok((record.to_info(), secret))
+    }
+
+    /// The lifetime of a token CreateAclToken mints: the requested `ttl`, or
+    /// `acl.tokenDefaultTtl`; client tokens are bounded by
+    /// `acl.tokenMaxTtl`. `"never"` is accepted for management tokens, and
+    /// for client tokens only when the bound is off (`tokenMaxTtl =
+    /// "none"`). `Ok(None)` means the token never expires.
+    pub fn create_token_ttl(
+        &self,
+        token_type: &str,
+        requested: Option<&str>,
+    ) -> Result<Option<Duration>, Status> {
+        let requested = requested.map(str::trim).filter(|raw| !raw.is_empty());
+        let never = requested.is_some_and(|raw| matches!(raw, "never" | "none"));
+        let parsed = match requested {
+            Some(raw) if !never => Some(
+                parse_ttl(raw)
+                    .map_err(|e| Status::invalid_argument(format!("invalid ttl `{raw}`: {e:#}")))?,
+            ),
+            _ => None,
+        };
+        if token_type == "management" {
+            return Ok(if never {
+                None
+            } else {
+                Some(parsed.unwrap_or(self.token_default_ttl))
+            });
+        }
+        match (never, self.token_max_ttl) {
+            (true, None) => Ok(None),
+            (true, Some(max)) => Err(Status::invalid_argument(format!(
+                "client tokens must expire within {} (acl.tokenMaxTtl); a non-expiring client \
+                 token needs acl.tokenMaxTtl = \"none\"",
+                humantime::format_duration(max)
+            ))),
+            (false, max) => {
+                if let (Some(requested), Some(max)) = (parsed, max) {
+                    if requested > max {
+                        return Err(Status::invalid_argument(format!(
+                            "requested ttl exceeds acl.tokenMaxTtl ({})",
+                            humantime::format_duration(max)
+                        )));
+                    }
+                }
+                let ttl = parsed.unwrap_or(self.token_default_ttl);
+                Ok(Some(match max {
+                    Some(max) => ttl.min(max),
+                    None => ttl,
+                }))
+            }
+        }
+    }
+
+    /// The deny rules a child token inherits: every deny rule of its root
+    /// ancestor's policies. Walking the lineage also proves every ancestor
+    /// still exists and is unexpired; a revoked or expired ancestor makes the
+    /// child unusable. Empty for tokens that are not children.
+    fn lineage_denies(
+        &self,
+        record: &AclTokenRecord,
+        store: &Store,
+    ) -> Result<Vec<crate::structs::acl::AclRule>, Status> {
+        let Some(meta) = store
+            .get_token_meta(&record.accessor_id)
+            .map_err(internal_acl_error)?
+        else {
+            return Ok(Vec::new());
+        };
+        if meta.parent_accessor_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = OffsetDateTime::now_utc();
+        let mut current = meta.parent_accessor_id;
+        for _ in 0..=MAX_CHILD_TOKEN_DEPTH {
+            let parent = store
+                .get_acl_token_by_accessor(&current)
+                .map_err(internal_acl_error)?
+                .ok_or_else(|| {
+                    Status::unauthenticated(format!(
+                        "ACL token `{}` is a child of a token that has been revoked",
+                        record.name
+                    ))
+                })?;
+            if parent.is_expired(now) {
+                return Err(Status::unauthenticated(format!(
+                    "ACL token `{}` is a child of a token that has expired",
+                    record.name
+                )));
+            }
+            let grandparent = store
+                .get_token_meta(&parent.accessor_id)
+                .map_err(internal_acl_error)?
+                .map(|meta| meta.parent_accessor_id)
+                .filter(|parent| !parent.is_empty());
+            match grandparent {
+                Some(next) => current = next,
+                None if parent.is_management() => return Ok(Vec::new()),
+                None => {
+                    return Ok(store
+                        .resolve_acl_rules(&parent.policies)
+                        .map_err(internal_acl_error)?
+                        .into_iter()
+                        .filter(|rule| rule.is_deny())
+                        .collect())
+                }
+            }
+        }
+        Err(Status::unauthenticated(format!(
+            "ACL token `{}` has a lineage deeper than {MAX_CHILD_TOKEN_DEPTH}",
+            record.name
+        )))
+    }
+
+    /// Mints a child of the caller's token (CreateChildToken): policies a
+    /// subset of the parent's, lifetime within the parent's and
+    /// `acl.childTokenMaxTtl`, lineage recorded so revoking the parent
+    /// revokes it. `write_rate` is `(per second, burst)`.
+    pub fn mint_child_token(
+        &self,
+        store: &Store,
+        parent: &AclIdentity,
+        name: &str,
+        policies: &[String],
+        ttl: Option<&str>,
+        write_rate: Option<(f64, u32)>,
+    ) -> Result<(AclTokenInfo, String), Status> {
+        if !self.enabled {
+            return Err(Status::failed_precondition(
+                "ACLs are disabled on this cluster, so there are no tokens to narrow",
+            ));
+        }
+        let Some(parent_accessor) = parent
+            .accessor_id
+            .as_deref()
+            .filter(|_| parent.source == AclSource::Token && !parent.is_worker)
+        else {
+            return Err(Status::permission_denied(
+                "a child token is minted from a Legion ACL token; present one (a JWT, an \
+                 anonymous caller, an app acting for a viewer or an object, and a node token \
+                 cannot mint children)\nHint: `legion login` exchanges a JWT for an ACL token",
+            ));
+        };
+        let parent_record = store
+            .get_acl_token_by_accessor(parent_accessor)
+            .map_err(internal_acl_error)?
+            .ok_or_else(|| Status::unauthenticated("the presented token no longer exists"))?;
+        let parent_meta = store
+            .get_token_meta(parent_accessor)
+            .map_err(internal_acl_error)?
+            .unwrap_or_default();
+        let depth = parent_meta.depth + 1;
+        if depth > MAX_CHILD_TOKEN_DEPTH {
+            return Err(Status::failed_precondition(format!(
+                "a token lineage may be at most {MAX_CHILD_TOKEN_DEPTH} deep"
+            )));
+        }
+
+        let policies: Vec<String> = if policies.is_empty() {
+            parent_record.policies.clone()
+        } else {
+            policies.to_vec()
+        };
+        if policies.is_empty() {
+            return Err(Status::invalid_argument(
+                "a child of a management token must name the policies it holds",
+            ));
+        }
+        if parent_record.is_management() {
+            let missing = store
+                .missing_acl_policies(&policies)
+                .map_err(internal_acl_error)?;
+            if !missing.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "unknown ACL policies: {}",
+                    missing.join(", ")
+                )));
+            }
+        } else if let Some(extra) = policies
+            .iter()
+            .find(|policy| !parent_record.policies.contains(policy))
+        {
+            return Err(Status::permission_denied(format!(
+                "a child token may hold only policies its parent holds; `{extra}` is not one of \
+                 {}",
+                parent_record.policies.join(", ")
+            )));
+        }
+
+        let requested = match ttl.map(str::trim).filter(|raw| !raw.is_empty()) {
+            Some(raw) => parse_ttl(raw)
+                .map_err(|e| Status::invalid_argument(format!("invalid ttl `{raw}`: {e:#}")))?,
+            None => self.child_token_default_ttl,
+        };
+        if requested > self.child_token_max_ttl {
+            return Err(Status::invalid_argument(format!(
+                "requested ttl exceeds acl.childTokenMaxTtl ({})",
+                humantime::format_duration(self.child_token_max_ttl)
+            )));
+        }
+        let mut ttl = requested;
+        if parent_record.expires_at.is_some() {
+            ttl = ttl.min(remaining_lifetime(parent_record.expires_at.as_deref())?);
+        }
+
+        let parent_limit = (parent_meta.write_rate > 0.0).then(|| {
+            (
+                parent_meta.write_rate,
+                parent_meta.write_burst.max(1) as u32,
+            )
+        });
+        let write_rate = match (write_rate, parent_limit) {
+            (Some((rate, burst)), Some((parent_rate, parent_burst)))
+                if rate > parent_rate || burst > parent_burst =>
+            {
+                return Err(Status::invalid_argument(format!(
+                    "a child token's write rate may not exceed its parent's \
+                     ({parent_rate}/s, burst {parent_burst})"
+                )));
+            }
+            (Some(limit), _) => Some(limit),
+            (None, inherited) => inherited,
+        };
+
+        let (record, secret) = build_token_record(name, "client", &policies, Some(ttl), None)
+            .map_err(|e| Status::internal(format!("failed to build token: {e:#}")))?;
+        let meta = crate::storage::governance_store::TokenMeta {
+            accessor_id: record.accessor_id.clone(),
+            parent_accessor_id: parent_accessor.to_string(),
+            root_accessor_id: if parent_meta.root_accessor_id.is_empty() {
+                parent_accessor.to_string()
+            } else {
+                parent_meta.root_accessor_id.clone()
+            },
+            depth,
+            write_rate: write_rate.map(|(rate, _)| rate).unwrap_or(0.0),
+            write_burst: write_rate.map(|(_, burst)| i64::from(burst)).unwrap_or(0),
+            created_by: parent.principal.clone(),
+        };
+        let stored = record.clone();
+        store
+            .replicated(
+                crate::storage::Lane::Control,
+                "mint_child_token",
+                move |s| {
+                    s.insert_acl_token(&stored)?;
+                    s.upsert_token_meta(&meta)
+                },
+            )
+            .map_err(|e| crate::manager::server::map_store_error("Error minting child token", e))?;
+        let mut info = record.to_info();
+        info.parent_accessor_id = Some(parent_accessor.to_string());
+        Ok((info, secret))
     }
 
     /// Handles Login: dispatches to the named auth method and mints an ACL
@@ -860,7 +1140,18 @@ pub fn enforce(
     action: AclAction,
     scope: &AclScope,
 ) -> Result<(), Status> {
-    if identity.would_allow(resource, action, scope) {
+    let allowed = identity.would_allow(resource, action, scope);
+    // The governance context (journal, rate limit, approval gate; see
+    // `crate::manager::governance`): records the check, and once a write
+    // is allowed may still refuse it with a typed status.
+    crate::manager::governance::on_enforce(
+        identity,
+        resource,
+        action,
+        scope,
+        allowed || identity.audit_only,
+    )?;
+    if allowed {
         return Ok(());
     }
 

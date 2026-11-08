@@ -85,10 +85,17 @@ pub(crate) const OWNERSHIP_GUARD_ENFORCES: bool = true;
 ///   order-dependent hazard; the capture-time guard cannot catch that, so
 ///   it is called out here.
 ///
+/// - **`audit_event`** (agent-governance plan) — PK is 128 bits from the OS
+///   RNG, minted by the writer but independent of any replicated state, so
+///   two lanes capturing from the same base state cannot mint the same id
+///   (collision odds ~2^-64 at a billion rows). Rows are never updated; the
+///   only DELETE is local retention pruning.
+///
 /// This constant exists so the audit has a name the map can point at; it is
 /// the list of commutative tables in audit order.
 #[cfg_attr(not(test), allow(dead_code))] // consumed by the coverage test below
-pub(crate) const COMMUTATIVE_PK_AUDIT: &[&str] = &["scheduler_event", "idempotency_record"];
+pub(crate) const COMMUTATIVE_PK_AUDIT: &[&str] =
+    &["scheduler_event", "idempotency_record", "audit_event"];
 
 /// Audit of the [`Owner::LocalOnly`] class — tables deliberately EXEMPT from
 /// replication (JC-41).
@@ -363,9 +370,18 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // the status-lane leader. Status churn stays off the Control lane, as
     // node liveness does.
     ("app_object_status", Owner::Lane(Lane::Status)),
+    // Agent governance (agent-governance plan): approvals and token
+    // lineage are operator intent (control); usage rollups are periodic
+    // status writes by the status-lane leader.
+    ("approval_request", Owner::Lane(Lane::Control)),
+    ("acl_token_meta", Owner::Lane(Lane::Control)),
+    ("usage_rollup", Owner::Lane(Lane::Status)),
     // ── commutative class (JC-28) ────────────────────────────────────────
     ("scheduler_event", Owner::Commutative),
     ("idempotency_record", Owner::Commutative),
+    // The audit journal: random 128-bit ids, inserted by whichever lane the
+    // handling manager leads, pruned locally (COMMUTATIVE_PK_AUDIT).
+    ("audit_event", Owner::Commutative),
     // ── local-only: EMPTY (JC-41 moved `eval` back onto the scheduler
     //    lane; see LOCAL_ONLY_AUDIT) ───────────────────────────────────────
     // ── raft-internal bookkeeping ────────────────────────────────────────

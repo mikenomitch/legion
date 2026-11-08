@@ -960,6 +960,10 @@ pub struct Metrics {
     /// `legion_leader_forwards_total{lane,op,outcome}` (docs/metrics.md,
     /// "Raft")
     pub leader_forwards_total: Arc<CounterVec>,
+    /// `legion_governance_events_total{event}` (docs/metrics.md,
+    /// "Governance"): audit records written/dropped/unjournaled, rate-limit
+    /// refusals, approval gates.
+    pub governance_events_total: Arc<CounterVec>,
     /// `legion_read_model_drift_repaired_total{source}`
     pub read_model_drift_repaired_total: Arc<CounterVec>,
     /// `legion_read_model_external_writes_total`
@@ -1834,6 +1838,17 @@ impl Metrics {
             series: Series::new(),
         });
 
+        // Agent governance (docs/audit-journal.md,
+        // docs/approvals-and-rate-limits.md).
+        let governance_events_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_governance_events_total",
+                help: "Agent-governance events on this manager, by event: 'audit_written' (records journaled), 'audit_dropped' (records lost to a full queue), 'audit_unjournaled' (records this manager could not write because it leads no raft lane; logged to the `audit` tracing target instead), 'rate_limited' (writes refused with RATE_LIMITED), 'approval_required' (writes refused with APPROVAL_REQUIRED), 'approval_invalid', and 'approval_used'.",
+                labels: &["event"],
+            },
+            series: Series::new(),
+        });
+
         // Read-model coherence (docs/state-store.md).
         let read_model_drift_repaired_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -1934,6 +1949,7 @@ impl Metrics {
             Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_recovered_total) as Arc<dyn RenderMetric>,
             Arc::clone(&leader_forwards_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&governance_events_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_drift_repaired_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_external_writes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
@@ -2145,6 +2161,7 @@ impl Metrics {
             nodes_marked_lost_total,
             nodes_recovered_total,
             leader_forwards_total,
+            governance_events_total,
             read_model_drift_repaired_total,
             read_model_external_writes_total,
             liveness_tracked_nodes,

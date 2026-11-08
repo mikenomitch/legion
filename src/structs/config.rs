@@ -109,6 +109,11 @@ pub struct ManagerConfig {
     pub workload_identity: Option<WorkloadIdentityConfig>,
     #[serde(default)]
     pub acl: Option<AclConfig>,
+    /// Agent governance: the audit journal, approval gates, per-token rate
+    /// limits and usage accounting (docs/audit-journal.md,
+    /// docs/approvals-and-rate-limits.md, docs/usage-accounting.md).
+    #[serde(default)]
+    pub governance: Option<crate::structs::governance::GovernanceConfig>,
     pub artifacts: Option<ArtifactsManagerConfig>,
     /// Exec/actions settings (see docs/exec-and-actions.md).
     #[serde(default)]
@@ -1600,9 +1605,21 @@ pub struct AclConfig {
     /// TTL applied to tokens minted via Login when the request omits one.
     pub login_ttl: Option<String>,
     /// Upper bound on the TTL of client tokens minted via CreateAclToken and
-    /// Login. When set, client tokens must expire and may not outlive this
-    /// bound; management tokens are exempt. Default: unbounded.
+    /// Login; management tokens are exempt. Default `2160h` (90 days).
+    /// `"none"` removes the bound (client tokens may then ask for
+    /// `ttl = "never"`).
     pub token_max_ttl: Option<String>,
+    /// Lifetime of a token created through CreateAclToken without a `ttl`
+    /// (client and management alike). Default `720h` (30 days). The
+    /// bootstrap management token is exempt: it never expires
+    /// (docs/auth-and-acls.md, "Token lifetimes").
+    pub token_default_ttl: Option<String>,
+    /// Lifetime of a child token (CreateChildToken) that asks for none.
+    /// Default `1h`.
+    pub child_token_default_ttl: Option<String>,
+    /// Upper bound on a child token's lifetime; it is also bounded by its
+    /// parent's expiry. Default `24h`.
+    pub child_token_max_ttl: Option<String>,
     /// JWT/OIDC auth methods that convert external identities into policies.
     #[serde(default)]
     pub auth_methods: Option<Vec<AclAuthMethodConfig>>,
@@ -1689,8 +1706,33 @@ pub struct AclConfigFull {
     pub audit_only: bool,
     pub login_ttl: String,
     pub token_max_ttl: Option<String>,
+    #[serde(default = "default_token_ttl")]
+    pub token_default_ttl: String,
+    #[serde(default = "default_child_token_ttl")]
+    pub child_token_default_ttl: String,
+    #[serde(default = "default_child_token_max_ttl")]
+    pub child_token_max_ttl: String,
     pub auth_methods: Vec<AclAuthMethodConfig>,
     pub jwks_refresh_interval: String,
+}
+
+/// Default lifetime of a token created without a `ttl` (30 days).
+pub const DEF_ACL_TOKEN_TTL: &str = "720h";
+/// Default upper bound on a client token's lifetime (90 days).
+pub const DEF_ACL_TOKEN_MAX_TTL: &str = "2160h";
+/// Default lifetime of a child token created without a `ttl`.
+pub const DEF_ACL_CHILD_TOKEN_TTL: &str = "1h";
+/// Default upper bound on a child token's lifetime.
+pub const DEF_ACL_CHILD_TOKEN_MAX_TTL: &str = "24h";
+
+fn default_token_ttl() -> String {
+    DEF_ACL_TOKEN_TTL.into()
+}
+fn default_child_token_ttl() -> String {
+    DEF_ACL_CHILD_TOKEN_TTL.into()
+}
+fn default_child_token_max_ttl() -> String {
+    DEF_ACL_CHILD_TOKEN_MAX_TTL.into()
 }
 
 impl Default for AclConfigFull {
@@ -1700,7 +1742,10 @@ impl Default for AclConfigFull {
             bootstrap_secret_file: None,
             audit_only: false,
             login_ttl: DEF_ACL_LOGIN_TTL.into(),
-            token_max_ttl: None,
+            token_max_ttl: Some(DEF_ACL_TOKEN_MAX_TTL.into()),
+            token_default_ttl: DEF_ACL_TOKEN_TTL.into(),
+            child_token_default_ttl: DEF_ACL_CHILD_TOKEN_TTL.into(),
+            child_token_max_ttl: DEF_ACL_CHILD_TOKEN_MAX_TTL.into(),
             auth_methods: Vec::new(),
             jwks_refresh_interval: DEF_ACL_JWKS_REFRESH.into(),
         }
@@ -1797,6 +1842,9 @@ impl From<AclConfigFull> for AclConfig {
             audit_only: Some(val.audit_only),
             login_ttl: Some(val.login_ttl),
             token_max_ttl: val.token_max_ttl,
+            token_default_ttl: Some(val.token_default_ttl),
+            child_token_default_ttl: Some(val.child_token_default_ttl),
+            child_token_max_ttl: Some(val.child_token_max_ttl),
             auth_methods: Some(val.auth_methods),
             jwks_refresh_interval: Some(val.jwks_refresh_interval),
         }
@@ -1824,7 +1872,19 @@ impl AclConfig {
             bootstrap_secret_file: self.bootstrap_secret_file.clone(),
             audit_only: self.audit_only.unwrap_or(d.audit_only),
             login_ttl: self.login_ttl.clone().unwrap_or(d.login_ttl),
-            token_max_ttl: self.token_max_ttl.clone(),
+            token_max_ttl: self.token_max_ttl.clone().or(d.token_max_ttl),
+            token_default_ttl: self
+                .token_default_ttl
+                .clone()
+                .unwrap_or(d.token_default_ttl),
+            child_token_default_ttl: self
+                .child_token_default_ttl
+                .clone()
+                .unwrap_or(d.child_token_default_ttl),
+            child_token_max_ttl: self
+                .child_token_max_ttl
+                .clone()
+                .unwrap_or(d.child_token_max_ttl),
             auth_methods: self.auth_methods.clone().unwrap_or(d.auth_methods),
             jwks_refresh_interval: self
                 .jwks_refresh_interval
@@ -2336,6 +2396,8 @@ pub struct ManagerConfigFull {
     pub workload_identity: WorkloadIdentityConfigFull,
     #[serde(default)]
     pub acl: AclConfigFull,
+    #[serde(default)]
+    pub governance: crate::structs::governance::GovernanceConfig,
     pub artifacts: ArtifactsManagerConfigFull,
     #[serde(default)]
     pub exec: ExecConfigFull,
@@ -2543,6 +2605,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             persistence: Some(val.persistence.into()),
             workload_identity: Some(val.workload_identity.into()),
             acl: Some(val.acl.into()),
+            governance: Some(val.governance),
             artifacts: Some(val.artifacts.into()),
             exec: Some(ExecConfig {
                 enabled: Some(val.exec.enabled),
@@ -2616,6 +2679,7 @@ impl ManagerConfig {
                 .as_ref()
                 .map(AclConfig::with_defaults)
                 .unwrap_or_default(),
+            governance: self.governance.clone().unwrap_or_default(),
             artifacts: self
                 .artifacts
                 .as_ref()
@@ -2689,6 +2753,7 @@ impl Default for ManagerConfigFull {
             persistence: PersistenceConfigFull::default(),
             workload_identity: WorkloadIdentityConfigFull::default(),
             acl: AclConfigFull::default(),
+            governance: Default::default(),
             artifacts: ArtifactsManagerConfigFull::default(),
             exec: ExecConfigFull::default(),
             telemetry: TelemetryConfigFull::default(),

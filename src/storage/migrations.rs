@@ -2481,6 +2481,86 @@ fn migration_list() -> Vec<M<'static>> {
         DELETE FROM scaling_counter WHERE name = 'scaling_policy';",
         )
         .down(""),
+        // Agent governance (internal_docs/plans/agent-governance-plan.md):
+        // the audit journal (commutative: random ids, pruned locally),
+        // approval requests and token lineage/limits (control lane), and
+        // hourly usage rollups (status lane).
+        M::up(
+            "CREATE TABLE IF NOT EXISTS audit_event (
+            id TEXT PRIMARY KEY,
+            ts_ms INTEGER NOT NULL,
+            manager TEXT NOT NULL DEFAULT '',
+            operation TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            accessor_id TEXT NOT NULL DEFAULT '',
+            principal TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            on_behalf_of TEXT NOT NULL DEFAULT '',
+            parent_accessor_id TEXT NOT NULL DEFAULT '',
+            resource TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL DEFAULT '',
+            target TEXT NOT NULL DEFAULT '',
+            namespace TEXT NOT NULL DEFAULT '',
+            request_digest TEXT NOT NULL DEFAULT '',
+            idempotency_key TEXT NOT NULL DEFAULT '',
+            approval_id TEXT NOT NULL DEFAULT '',
+            outcome TEXT NOT NULL,
+            message TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '',
+            duration_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_event_ts ON audit_event(ts_ms);
+        CREATE INDEX IF NOT EXISTS idx_audit_event_accessor ON audit_event(accessor_id, ts_ms);
+        CREATE TABLE IF NOT EXISTS approval_request (
+            id TEXT PRIMARY KEY,
+            created_ms INTEGER NOT NULL,
+            expires_ms INTEGER NOT NULL,
+            ttl_secs INTEGER NOT NULL,
+            rule TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            permission TEXT NOT NULL DEFAULT '',
+            target TEXT NOT NULL DEFAULT '',
+            namespace TEXT NOT NULL DEFAULT '',
+            request_digest TEXT NOT NULL,
+            requester_principal TEXT NOT NULL,
+            requester_accessor TEXT NOT NULL DEFAULT '',
+            requester_root TEXT NOT NULL DEFAULT '',
+            requester_source TEXT NOT NULL DEFAULT '',
+            on_behalf_of TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            decided_by TEXT NOT NULL DEFAULT '',
+            decided_ms INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            consumed_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_request_status ON approval_request(status, created_ms);
+        CREATE TABLE IF NOT EXISTS acl_token_meta (
+            accessor_id TEXT PRIMARY KEY,
+            parent_accessor_id TEXT NOT NULL DEFAULT '',
+            root_accessor_id TEXT NOT NULL DEFAULT '',
+            depth INTEGER NOT NULL DEFAULT 0,
+            write_rate REAL NOT NULL DEFAULT 0,
+            write_burst INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_acl_token_meta_parent ON acl_token_meta(parent_accessor_id);
+        CREATE TABLE IF NOT EXISTS usage_rollup (
+            bucket_ms INTEGER NOT NULL,
+            namespace TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            submitter TEXT NOT NULL DEFAULT '',
+            dimension TEXT NOT NULL,
+            amount REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (bucket_ms, namespace, job_id, submitter, dimension)
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_rollup_namespace ON usage_rollup(namespace, bucket_ms);",
+        )
+        .down(
+            "DROP TABLE IF EXISTS usage_rollup;
+        DROP TABLE IF EXISTS acl_token_meta;
+        DROP TABLE IF EXISTS approval_request;
+        DROP TABLE IF EXISTS audit_event;",
+        ),
     ]
 }
 
