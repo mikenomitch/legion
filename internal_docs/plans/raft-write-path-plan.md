@@ -246,9 +246,14 @@ arrive in proposal order or not at all.
 
 **Before capturing**, the pipeline requires the ledger to be empty (it
 always is after a successful `client_write`, which resolves only after the
-apply). After a failed proposal it forces `ensure_linearizable` again; a
-batch whose fate is still unknown blocks new captures with a retryable
-error rather than stacking new writes on rows that may vanish.
+apply). After a failed proposal it forces `ensure_linearizable` again (a
+new term's blank entry undoes what a leadership change left). If a batch
+is still outstanding after that — its proposal never reached the log — the
+pipeline proposes an empty `speculation_flush` entry: anything this leader
+appended earlier applies first and matches, and the empty entry undoes the
+rest. It never stacks new writes on rows that may vanish, and it never
+undoes a batch on its own (a batch it undid could still commit later, and
+the next capture would then have been taken against the wrong state).
 
 **Startup.** `Store::start_storage` undoes every leftover undo record
 (newest first per lane) before openraft reads `applied_state`, so a crash
@@ -325,6 +330,14 @@ once cluster-wide even across failovers.
   voter advertises at least this build's schema version
   (`voters_missing_schema_version`). It stops once nothing is pending.
 - **`local_disk`:** `start_storage` runs pending steps inline.
+- **A brand-new database** records every step as done when it is created:
+  it has no rows to migrate, and every replica descends from the bootstrap
+  node's database through its seed snapshot (calls #10).
+
+The existing steps were rewritten to be correct when run late, after the
+new build has written rows of its own (calls #11): the app uid backfill
+assigns the lowest free uid, and the scaling cleanup keeps `object:`-keyed
+actions.
 
 `StoreCommand` also carries the `schema_version` it was captured under, for
 diagnostics (the apply-side shape check stays the authority).
@@ -340,10 +353,11 @@ are recorded as a deferred call (calls #8) with a TODO.
 
 openraft's own purge is disabled (`max_in_snapshot_log_to_keep = u64::MAX`)
 and a driver task per group purges instead: after each new snapshot it walks
-the log newest-first from the snapshot index and purges everything behind
-the newest `raft.logRetainBytes` bytes (default 256 MiB), via
-`raft.trigger().purge_log(upto)` (so the purge barrier of 6.1 applies).
-Entries not yet in a snapshot are never purged. The log records each
+the log newest first and purges everything behind the newest
+`raft.logRetainBytes` bytes (default 256 MiB), capped at the snapshot
+index, via `raft.trigger().purge_log(upto)` (so the purge barrier of 6.1
+applies). Entries not yet in a snapshot are never purged. The scan runs on
+its own read-only connection to the log, on the blocking pool. The log records each
 entry's append time, and `legion_raft_log_retained_seconds{lane}` reports
 how far back the retained log reaches — how long a follower can be down and
 still catch up by replay.
@@ -359,8 +373,9 @@ still catch up by replay.
   and `data_migration(id, applied_at)` (control lane).
 - **Metrics:** `legion_raft_entry_ops{lane}` (ops per entry),
   `legion_raft_log_retained_seconds{lane}`,
-  `legion_raft_state_syncs_total{lane}`,
-  `legion_raft_speculation_undone_total{lane}`.
+  `legion_raft_state_syncs_total{lane,outcome}`,
+  `legion_raft_speculation_total{lane,outcome}` (`committed`, `matched`,
+  `undone`).
 - No proto changes.
 
 ## 8. Implementation phases

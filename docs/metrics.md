@@ -762,8 +762,9 @@ these families can tell you which is the case.
   the lane, else `0`. Summed across managers, each lane should be exactly 1.
   A flapping series shows leadership churn.
 - **`legion_raft_capture_seconds{lane}`** (histogram): the local capture
-  phase of a replicated op: run the mutation, collect its changeset, roll
-  back. This is purely local store work.
+  phase of one raft entry: run every op of the batch, collect and combine
+  their changesets, and roll back (or, under `single`, commit locally with
+  an undo record). This is purely local store work.
 - **`legion_raft_propose_apply_seconds{lane}`** (histogram): the
   propose → quorum-commit → local-apply round-trip of a replicated op.
   Use it to find the bottleneck by comparing against
@@ -772,14 +773,17 @@ these families can tell you which is the case.
   replication pipeline (network, fsync, follower lag).
 - **`legion_raft_ops_total{lane,op,outcome}`** (counter): replicated store
   ops by outcome:
-  - `applied`.
-  - `empty`: the mutation touched no rows and skipped the raft entry.
+  - `applied`: the op's rows rode a committed raft entry.
+  - `empty`: the mutation touched no rows (its batch may still have
+    produced an entry for other ops).
   - `not_leader`: proposal rejected before capture. This is normal on
     followers under divergent lane leadership.
   - `error`.
 
-  `op` is the operation name, so you can see which ops keep a lane busy. A
-  lane's `applied` count is its quorum-round count, so
+  `op` is the operation name, so you can see which ops keep a lane busy.
+  Ops that queue together share one raft entry (group commit), so a lane's
+  quorum-round count is `legion_raft_entry_ops_count`, not the `applied`
+  count; still,
   `topk(10, sum by (lane, op) (rate(legion_raft_ops_total{outcome="applied"}[1m])))`
   is the list to shorten when a lane is the limit.
 
@@ -802,7 +806,31 @@ these families can tell you which is the case.
   constraint.
 - **`legion_raft_pipeline_depth{lane}`** (gauge): ops queued to a lane's
   pipeline thread and not yet started. Sustained depth above 1 means writes
-  on that lane are waiting in line behind each other.
+  on that lane are waiting in line behind each other (and will share the
+  next entry).
+- **`legion_raft_entry_ops{lane}`** (histogram): ops committed per raft
+  entry. The pipeline takes everything queued (up to 64 ops, or until the
+  changesets reach 128 KiB) into one entry, so ops waiting behind an
+  in-flight entry share its successor's capture, quorum round trip, log
+  fsync, and apply. Mostly 1 on a quiet lane; larger under bursts.
+  `_count` is the lane's raft-entry count.
+- **`legion_raft_speculation_total{lane,outcome}`** (counter, `single`
+  topology): batches the leader committed locally before their entry
+  applied (`committed`), resolved by their own entry without re-running
+  (`matched`), and reverted because the log went another way (`undone`:
+  leadership lost or the entry truncated). `undone` should be rare and
+  track leadership changes; see
+  [multi-raft.md](multi-raft.md#the-write-path-group-commit-and-single-execution).
+- **`legion_raft_state_syncs_total{lane,outcome}`** (counter): state-DB
+  fsyncs run as the purge barrier before a raft log purge, `ok` or
+  `error`. The state DB runs `synchronous=NORMAL`; this barrier is what keeps
+  its applied index durable past the log's purge horizon. An `error` fails
+  the purge (the log is kept) and is worth paging on: it usually means the
+  disk is failing.
+- **`legion_raft_log_retained_seconds{lane}`** (gauge): age of the oldest
+  entry still in the lane's raft log: how long a manager can be down and
+  still catch up by log replay rather than a full snapshot install. Sized
+  by `raft.logRetainBytes`; it shrinks as the write rate grows.
 - **`legion_leader_forwards_total{lane,op,outcome}`** (counter): store
   writes this manager forwarded to the lane's leader because it does not
   lead the lane, by `outcome`: `ok` (the leader executed it) or `failed` (no

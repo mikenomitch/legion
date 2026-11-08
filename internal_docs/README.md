@@ -136,6 +136,7 @@ When one is required and what goes in it:
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | shipped (graceful stop, six priority bands, plan-atomic preemption) |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
+| [raft-write-path-plan.md](plans/raft-write-path-plan.md) | in execution (2026-11-08, review SCH1/ST1/ST4): group commit, the leader executing each write once under `single` (speculative commit with undo records), one state-DB fsync per log purge instead of per entry, the log tail retained by bytes (`raft.logRetainBytes`), and data migrations as replicated control-lane entries. Deferred: a capture mutex per lane (per-lane DB files), speculation under `lanes`, overlapping capture with the quorum wait, logical commands |
 | [multi-eval-plans-plan.md](plans/multi-eval-plans-plan.md) | in execution: Phase 2 shipped (the fused settle in every placing handler whose plan is its last write, and no second settle write). Phase 1, one running eval per job, was built and measured and left out until a lane-bound rig run shows a gain. Phase 3 deferred behind it |
 | [namespaces-plan.md](plans/namespaces-plan.md) | shipped 2026-10-19 (all four phases; public page [docs/namespaces.md](../docs/namespaces.md)): canonical `namespace/name` job ids (bare in `default`), explicit `namespaces` on ACL rules, services and instance keys namespaced with jobs, cross-namespace upstreams, tenant events, namespace metrics, the UI switcher and Namespaces pages, and namespace policies (aggregate per-band quota, counts, pools, runtimes, host volumes); hierarchy, rename/move and namespaced KV deliberately out |
 | [read-model-coherence-plan.md](plans/read-model-coherence-plan.md) | in execution (all five phases built; raft shadow check deferred) |
@@ -284,6 +285,7 @@ by project impact. The full template and a worked example:
 - [mesh-interfaces-plan_calls.md](calls/mesh-interfaces-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
+- [raft-write-path-plan_calls.md](calls/raft-write-path-plan_calls.md)
 - [multi-eval-plans-plan_calls.md](calls/multi-eval-plans-plan_calls.md)
 - [namespaces-plan_calls.md](calls/namespaces-plan_calls.md)
 - [network-handlers-plan_calls.md](calls/network-handlers-plan_calls.md)

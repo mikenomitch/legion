@@ -598,6 +598,40 @@ If an upgraded manager takes leadership while an older one is still
 running, writes that need the new schema fail with the error above until
 you finish the upgrade. Nothing diverges in the meantime.
 
+### Data migrations run once, through the log, after the upgrade
+
+A release can carry two kinds of migration
+([state-store.md](state-store.md#schema-and-data-migrations)). **Schema
+steps** (new tables, new columns) run on each manager as it starts, as
+above. **Data steps** — rewriting existing rows, such as filling a new
+column for rows written before it existed — do not: run locally, two
+managers that start at different points in the log would rewrite different
+sets of rows and silently disagree. Instead:
+
+1. Each manager adds the new columns at startup (schema steps).
+2. Once **every voter** advertises the new release's schema version, the
+   control-lane leader runs every pending data step as one replicated
+   write. Every manager applies the rewritten rows at the same log index.
+3. Each step is recorded in the replicated `data_migration` table in that
+   same entry, so it runs exactly once, even if leadership moves.
+
+Until the last manager is upgraded, data steps wait (the leader logs which
+managers it is waiting for, once). Code that reads a column a data step
+fills already copes with the unfilled value, so nothing breaks in the
+meantime; the column is just not backfilled yet. There is nothing to run by
+hand. A single `local_disk` manager runs its pending data steps at startup.
+
+### The raft log format changed (2026-11)
+
+The raft log, the snapshot images and the state DB of a cluster from
+before the 2026-11 write-path change cannot be resumed by this release: a
+raft entry now carries a batch of writes (`StoreCommand` gained `ops`,
+`proposal` and `schema_version`), the log records each entry's append time,
+and the state DB has two new tables. There is no rolling upgrade across
+this change. Take a `legion state backup` on the old release, start a
+fresh cluster on the new one with `--restore-from`, and re-join the other
+managers. `local_disk` stores migrate in place.
+
 ## Raft persistence upgrades
 
 ### Enabling raft on an existing manager (local_disk → raft)

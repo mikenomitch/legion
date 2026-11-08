@@ -1128,11 +1128,33 @@ How to use it:
         read the read pool or the read model, which do not see an
         in-flight entry (`stop_keyed_instance_apply` reads its instance
         through `get_instance`), and on a three-voter measurement.
-  - [ ] **One fsync per entry, not two** (plan §6.3): the state DB runs
-        `synchronous = FULL` in raft mode only to keep the applied marker
-        ahead of the log's purge horizon. `NORMAL` plus a startup restore
-        from the local snapshot would drop one fsync per entry. Needs a
-        Linux fsync measurement and a power-cut test.
+        **Group commit shipped instead (2026-11-08)**: ops queued behind an
+        in-flight entry now share the next one, and under `single` the
+        leader keeps its captured batch (speculation), so N+1 *could*
+        capture on top of N's committed rows. What still blocks overlap:
+        apply-time projection re-reads committed rows, so applying N while
+        N+1's rows are in the database would push N+1's uncommitted rows
+        into the read model and the worker stream. Needs projection from the
+        changeset's own values first
+        ([raft-write-path plan §6.2.4](plans/raft-write-path-plan.md) ·
+        [calls #5](calls/raft-write-path-plan_calls.md)).
+  - [x] **One fsync per entry, not two** (plan §6.3; shipped 2026-11-08 by
+        the raft-write-path plan): the state DB runs `synchronous = NORMAL`
+        in every mode, and the raft log store fsyncs it (a purge barrier)
+        before every log purge, so the applied marker is durable before the
+        log stops holding the entries above it — one state-DB fsync per
+        purge instead of one per entry, and no startup snapshot-restore path
+        ([plan §6.1](plans/raft-write-path-plan.md) ·
+        [calls #2](calls/raft-write-path-plan_calls.md) ·
+        [docs](../docs/multi-raft.md#snapshots-compaction-and-catch-up)).
+        The power-cut test is still open (below).
+  - [ ] **Power-cut test of the purge barrier.** The barrier's ordering is
+        unit-tested (`purge_runs_the_barrier_before_deleting`) and the fsync
+        cost was not measured on Linux hardware; a test that cuts power to a
+        node right after a purge (a VM with an unsynced block device, or
+        `dm-flakey`) is what would prove the applied marker never regresses
+        below the purge horizon
+        ([plan §6.1](plans/raft-write-path-plan.md)).
   - [ ] **A keyed bind still visits every live instance of the task**
         (plan §11), two index lookups each, so a task with tens of
         thousands of running instances pays milliseconds per placement.
@@ -2010,11 +2032,34 @@ How to use it:
 - [ ] **One capture mutex serializes every lane, and every write runs
       twice** ([review SCH1](architecture-review-2026-11-07.md)). `CAPTURE_MUTEX` (`raft/capture.rs`) and one
       SQLite write connection are shared by all lanes, so `lanes` overlaps
-      only quorum waits; the leader executes, rolls back, then applies the
-      changeset. A mutex and connection per lane, and keeping the leader's
-      captured writes, compound with "Pipeline the lane" above. Park's keyed
-      suspend and wake are scheduler-lane entries too, so this lane now
-      carries more than plans.
+      only quorum waits. Park's keyed suspend and wake are scheduler-lane
+      entries too, so this lane now carries more than plans.
+      **Partly done (2026-11-08, [raft-write-path plan](plans/raft-write-path-plan.md)):**
+  - [x] Group commit: queued ops share one capture, one entry, one quorum
+        round and one apply ([plan §6.2](plans/raft-write-path-plan.md) ·
+        [docs](../docs/multi-raft.md#the-write-path-group-commit-and-single-execution)).
+  - [x] The leader executes each write once under `single`: it commits the
+        captured batch with an undo record and skips the re-apply when its
+        entry comes back ([plan §6.3](plans/raft-write-path-plan.md) ·
+        [calls #1](calls/raft-write-path-plan_calls.md)).
+  - [ ] **The leader still executes twice under `lanes`.** Speculation is
+        off there because one lane's capture could read another lane's
+        in-flight rows and commit a decision a leadership loss later undoes
+        ([plan §6.3.6](plans/raft-write-path-plan.md)). Unblocked by the
+        per-lane files below.
+  - [ ] **A database file per lane**, so lanes get independent WAL write
+        locks and their own capture mutex: each lane's owned tables in
+        `lane-<name>.sqlite`, attached to every connection, commutative
+        tables split per lane, snapshots and backups as file sets. A
+        per-lane mutex over the one shared write connection is unsound (a
+        capture holds a savepoint open across many statements). Needs its
+        own plan; design sketch in
+        [raft-write-path plan §6.4](plans/raft-write-path-plan.md) ·
+        [calls #6](calls/raft-write-path-plan_calls.md).
+  - [ ] **Measure group commit on three voters** and revisit the 64-op /
+        128 KiB batch bounds, which were set from the append-entries
+        deadline, not from a measurement
+        ([calls #4](calls/raft-write-path-plan_calls.md)).
 - [ ] **Scheduling plugins can only pick a node** ([review SCH6](architecture-review-2026-11-07.md)). One
       `select_node` method over eligible nodes, one policy cluster-wide, no
       free resources in the context, no candidate fast path (hard-coded to
@@ -4317,11 +4362,20 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       (`content_publish::tests::publish_throughput`;
       [swappable seams calls #17](calls/swappable-seams-plan_calls.md)).
 
-- [ ] **Data migrations run outside the raft log** ([review ST1](architecture-review-2026-11-07.md)): backfills in
-      `migrations.rs` run locally at startup, so replicas that migrate at
-      different applied indexes could backfill different values (inferred).
-      Apply data migrations as replicated barrier entries at one index, and
-      tag entries with a schema version.
+- [ ] **The raft log format is still the SQLite schema** (review ST1,
+      deferred half): changesets bind columns by position, so every
+      migration is a log-format change and table rebuilds must keep column
+      order. Logical commands (Nomad's FSM messages) or rows encoded by
+      column name would decouple them; either replaces the replication model
+      (JC-1). Data migrations themselves now run through the log (Done)
+      ([calls #8](calls/raft-write-path-plan_calls.md)).
+- [ ] **Data steps can only touch control-lane tables.** The
+      `data_migration` record is control-owned and `run_data_migrations` is
+      a control-lane op; a future backfill of a scheduler or status table
+      needs a record per lane (a commutative record would not survive a
+      sibling-lane snapshot install)
+      ([calls #9](calls/raft-write-path-plan_calls.md) ·
+      `src/storage/data_migrations.rs`).
 - [ ] **No revision, watch, or blocking query for core objects**
       ([review ST2](architecture-review-2026-11-07.md)). Reads carry no index, event IDs can go backwards after a
       failover, the journal keeps 10k rows, follower-forwarded writes don't
@@ -4334,9 +4388,6 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       StreamWork positions hang off a random per-process epoch
       (`work_log.rs`), so a failover at 10k–50k nodes rebuilds every desired
       set at once. Base positions on replicated row versions.
-- [ ] **Retain the raft log tail by bytes or time** ([review ST4](architecture-review-2026-11-07.md)): it is
-      `.clamp(1, 1000)` entries (`driver.rs`), so at a high write rate any
-      follower restart is a full snapshot install under the capture mutex.
 - [ ] **The heartbeat handler still runs blocking store work inline**
       ([review ST5](architecture-review-2026-11-07.md)): `handle_failed_allocations`,
       `handle_terminated_allocations`, and
@@ -6758,6 +6809,40 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       Identity (open under Persistence & cluster operations)
 - [x] Raft control plane: leader election, failover controls, membership,
       observability, CLI and UI operations
+- [x] **The replicated write path: group commit, one execution, one fsync**
+      (2026-11-08, review SCH1). Ops queued behind an in-flight entry share
+      one capture (each in its own savepoint, guards per op), one raft entry
+      and one apply; under `single` the leader commits its batch with an
+      undo record and skips the re-apply, undoing on leadership loss,
+      truncation or a crash; the state DB runs `synchronous = NORMAL` with a
+      state-DB fsync before every log purge. New metrics
+      `legion_raft_entry_ops`, `legion_raft_speculation_total`,
+      `legion_raft_state_syncs_total`. The raft log format changed. Open:
+      lanes still execute twice, the shared capture mutex, overlap, and a
+      power-cut test (under Scheduling & placement)
+      ([plan](plans/raft-write-path-plan.md) ·
+      [calls](calls/raft-write-path-plan_calls.md) ·
+      [docs](../docs/multi-raft.md#the-write-path-group-commit-and-single-execution))
+- [x] **Retain the raft log tail by bytes** (2026-11-08, review ST4): the
+      `.clamp(1, 1000)`-entry tail is gone; `raft.logRetainBytes` (256 MiB
+      per group) is purged behind each snapshot by a driver task, and
+      `legion_raft_log_retained_seconds` reports how long that lets a
+      follower be down and still catch up by replay
+      ([plan §6.6](plans/raft-write-path-plan.md) ·
+      [calls #7](calls/raft-write-path-plan_calls.md) ·
+      [docs](../docs/raft-operations.md#operational-notes))
+- [x] **Data migrations run through the raft log** (2026-11-08, review ST1):
+      `migrations.rs` holds schema steps only (a test rejects `UPDATE`/
+      `DELETE` there); the job `updated_at` backfill, the app uid backfill
+      and the scaling-policy cleanup are data steps in
+      `storage/data_migrations.rs`, run once cluster-wide as one
+      control-lane entry by the leader once every voter runs the new schema,
+      and recorded in the replicated `data_migration` table. Raft entries
+      carry the schema version they were captured under. Deferred: logical
+      commands (open under Persistence & cluster operations)
+      ([plan §6.5](plans/raft-write-path-plan.md) ·
+      [calls](calls/raft-write-path-plan_calls.md) ·
+      [docs](../docs/upgrades.md#data-migrations-run-once-through-the-log-after-the-upgrade))
 - [x] `LEGION_DATA_DIR` moves every `.legion/*` default (store, raft, worker
       state, identity tokens) for one process, so a second cluster can run
       from the same checkout. The store default became the data dir itself,
