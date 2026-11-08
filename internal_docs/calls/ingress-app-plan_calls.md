@@ -133,9 +133,14 @@ order, the HTTP-01 challenge, finalize, and download.
   CAs.
 - **Trade-off.** Legion owns the protocol code. Edge cases a library has
   already met are ours to meet: a CA's quirky `Retry-After`, an
-  `orderNotReady` race, ARI. It is tested against Pebble, Let's Encrypt's
-  own test CA, but only when a Pebble binary is present, which CI does not
-  have.
+  `orderNotReady` race, ARI. CI runs the whole issuance against an
+  in-process CA written for the test
+  (`ingress::orders_a_certificate_from_an_acme_ca_test`). That CA verifies
+  every JWS, nonce, and URL, refuses one nonce, fetches the HTTP-01 answer
+  from the ingress, and signs the CSR. But it is our reading of RFC 8555
+  checking our reading of RFC 8555. The test against Pebble, Let's
+  Encrypt's own test CA, runs only where a Pebble binary is present, which
+  neither CI nor the session that built this had.
 - **Why (performance of the build, simplicity of the tree).** The library
   would pull a second `rcgen` and a second `x509-parser` major unless its
   features are trimmed. With them trimmed, it still needs a hand-written
@@ -199,7 +204,30 @@ most 16 at a time.
   backend. A per-request proxy also lets clients speak HTTP/2 to the edge
   while backends keep HTTP/1.1, and backend connections are pooled.
 
-## 9. Backends get HTTP/1.1 only
+## 9. Only a request that never reached a service is retried
+
+A dial that fails, or a pooled connection that the service closed before the
+request went out (hyper hands the request back), moves the request to
+another endpoint, up to three. Nothing else is retried: not a `5xx`, not a
+connection reset mid-response, and not an idempotent `GET` that failed after
+it was sent.
+
+- **Alternatives.** Retry idempotent methods on any failure and on `502`,
+  `503`, or `504` from the service, under a budget. The datapath's HTTP mode
+  does this for a task's upstreams (`docs/network-handlers.md`, "HTTP
+  mode").
+- **Trade-off.** A `GET` that a dying instance accepted and then dropped
+  fails to the client with `502` instead of being re-sent. A service that
+  answers `503` while it drains passes that `503` on.
+- **Why (simplicity, safety).** An unsent request is the only case where a
+  retry cannot run a handler twice, whatever the method. That covers what
+  actually happens during deploys: a replaced instance refuses connections,
+  and its pooled connections close. Retrying sent requests needs bodies
+  buffered for replay, which costs memory on every request, and a retry
+  budget, which is a policy surface of its own. Passive ejection keeps a dead
+  endpoint from taking new requests in the meantime.
+
+## 10. Backends get HTTP/1.1 only
 
 - **Alternatives.** Speak h2c to backends that declare
   `meta.protocol = "h2c"` or `"grpc"`.
@@ -210,7 +238,7 @@ most 16 at a time.
   default, and the pool and upgrade paths are simpler with one protocol.
   This is in Phase 3.
 
-## 10. The first claim on a host and path wins; a conflicting submit is refused
+## 11. The first claim on a host and path wins; a conflicting submit is refused
 
 The key sets `validate = true`. The running app refuses a value whose
 `(host, path)` another service holds. If two values still conflict (the app
@@ -229,7 +257,7 @@ winner: the lower `(job, task, service)`. The loser is shown in the view.
   are a policy surface of their own. First-claim-wins is the one rule that
   cannot take a working site away.
 
-## 11. The key is called `ingress`, beside the unrelated `network.ingress` chain
+## 12. The key is called `ingress`, beside the unrelated `network.ingress` chain
 
 - **Alternatives.** `expose`, `public`, `route`, `http`, `domain`.
 - **Trade-off.** One jobspec now holds `network.ingress`, the datapath
@@ -240,7 +268,7 @@ winner: the lower `(job, task, service)`. The loser is shown in the view.
   what every operator calls this. The two sit on different blocks, and the
   docs cross-reference them.
 
-## 12. `host` takes a string or a list
+## 13. `host` takes a string or a list
 
 ```nickel
 ingress = { host = "shop.example.com" }
@@ -256,7 +284,7 @@ ingress = { host = ["example.com", "www.example.com"] }
   one record per service, so it has to fit in the same field.
   `service.port` already takes a label, a number, or `"dynamic"`.
 
-## 13. One certificate per hostname
+## 14. One certificate per hostname
 
 - **Alternatives.** One certificate per route, carrying all of its hosts
   as SANs.
@@ -268,7 +296,7 @@ ingress = { host = ["example.com", "www.example.com"] }
   removals are per name. Nothing has to be re-ordered when a route gains or
   loses a host.
 
-## 14. Routes to `mesh = true` services are reported, not served
+## 15. Routes to `mesh = true` services are reported, not served
 
 - **Alternatives.** Give the app a node certificate so it can originate
   mesh mTLS with a PROXY v2 TLV, as the datapath does.
@@ -277,3 +305,18 @@ ingress = { host = ["example.com", "www.example.com"] }
 - **Why (security).** The node certificate is the node's identity. Handing
   it to an app process would let that app speak as the node to every mesh
   service. The view and the route's problems name the cause.
+
+## 16. The ingress's own errors are the JSON envelope, not HTML pages
+
+`404 no_route`, `503 no_endpoint`, `502`, and `504` come back as
+`{ "ok": false, "error": { code, message, hint, retryable } }` with a
+`Legion-Ingress-Error` header, like the gateway's.
+
+- **Alternatives.** HTML error pages for browsers, chosen by `Accept`, the
+  way nginx and Caddy answer.
+- **Trade-off.** A person who opens a misrouted URL in a browser sees JSON.
+- **Why (simplicity, agent-friendliness).** One shape, which scripts, load
+  balancers, and agents can read without guessing, and which names the code
+  and the next step. Every Legion surface already speaks it. A service that
+  wants its own error pages serves them itself, behind a route.
+

@@ -29,6 +29,7 @@ pub mod autoscaler;
 pub mod autoscaler_ui;
 pub mod certs;
 pub mod gitops;
+pub mod ingress;
 pub mod objects;
 pub mod ui;
 
@@ -66,29 +67,45 @@ pub struct BundledApp {
     /// Fills in what the manifest leaves to the app's Rust types (its
     /// kinds' schemas), on the evaluated manifest before it is parsed.
     pub generated: Option<fn(&mut Value)>,
+    /// Whether a new cluster seeds the app enabled. The manager config's
+    /// `apps.<name>.enabled` overrides it at seed time.
+    pub seed_enabled: bool,
 }
 
 /// Every bundled app. The first Control leader seeds a record for each
-/// (enabled unless the manager config's `apps` block says otherwise), with
-/// its manifest's permissions granted by `legion:bootstrap`.
+/// (enabled as its `seed_enabled` says, unless the manager config's `apps`
+/// block says otherwise), with its manifest's permissions granted by
+/// `legion:bootstrap`.
 pub const BUNDLED: &[BundledApp] = &[
     BundledApp {
         name: "autoscaler",
         manifest_source: include_str!("bundled/autoscaler.ncl"),
         body: autoscaler::run,
         generated: Some(autoscaler::objects::fill_manifest),
+        seed_enabled: true,
     },
     BundledApp {
         name: "certs",
         manifest_source: include_str!("bundled/certs.ncl"),
         body: certs::run,
         generated: None,
+        seed_enabled: true,
     },
     BundledApp {
         name: "gitops",
         manifest_source: include_str!("bundled/gitops.ncl"),
         body: gitops::run,
         generated: None,
+        seed_enabled: true,
+    },
+    // Seeded off: it takes ports 80 and 443 on the nodes it runs on, which
+    // no cluster should do until someone asks (ingress plan calls entry 3).
+    BundledApp {
+        name: "ingress",
+        manifest_source: include_str!("bundled/ingress.ncl"),
+        body: ingress::run,
+        generated: None,
+        seed_enabled: false,
     },
 ];
 
@@ -149,6 +166,36 @@ pub fn bundled_manifest(name: &str) -> Option<&'static AppManifest> {
 /// Whether `name` is a bundled app's (installed apps may not take it).
 pub fn is_bundled(name: &str) -> bool {
     BUNDLED.iter().any(|app| app.name == name)
+}
+
+/// The jobspec keys the bundled apps declare (the ingress's `ingress` on
+/// services), as every cluster registers them by seeding. Parsing a jobspec
+/// against it checks those keys without a manager: what the shipped example
+/// jobs are tested with.
+pub fn bundled_extension_registry() -> &'static crate::structs::extensions::ExtensionRegistry {
+    static REGISTRY: OnceLock<crate::structs::extensions::ExtensionRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let records: Vec<crate::structs::app::AppRecord> = bundled_manifests()
+            .unwrap_or_default()
+            .iter()
+            .map(|manifest| crate::manager::apps::seed_record(manifest, None))
+            .collect();
+        let (registry, problems) =
+            crate::structs::extensions::ExtensionRegistry::from_records(&records);
+        for problem in problems {
+            warn!("bundled jobspec keys: {problem}");
+        }
+        registry
+    })
+}
+
+/// Whether bundled app `name` is seeded enabled on a new cluster (`true`
+/// for a name that is not bundled, which is never seeded).
+pub fn seeds_enabled(name: &str) -> bool {
+    BUNDLED
+        .iter()
+        .find(|app| app.name == name)
+        .is_none_or(|app| app.seed_enabled)
 }
 
 /// The health an app reports on `/healthz`.
@@ -698,6 +745,65 @@ mod tests {
         assert!(is_bundled("autoscaler"));
         assert!(is_bundled("gitops"));
         assert!(!is_bundled("deployer"));
+    }
+
+    /// The ingress asks for what it calls: the catalog in every tenant
+    /// namespace (`job:read`) and its own reserved KV. It is seeded off,
+    /// binds 80 and 443 with the one capability exec tasks may keep, and
+    /// declares `ingress` on services, checked by its validate call.
+    #[test]
+    fn the_ingress_manifest_asks_for_what_it_calls() {
+        let manifest = bundled_manifest("ingress").expect("bundled");
+        assert_eq!(
+            serde_json::to_value(&manifest.permissions).expect("rules"),
+            json!([
+                { "resources": ["job"], "actions": ["read"], "namespaces": ["*"] },
+                { "resources": ["kv"], "actions": ["read", "write"], "paths": ["legion/apps/ingress/*"] },
+            ])
+        );
+        assert!(!seeds_enabled("ingress"));
+        assert!(seeds_enabled("autoscaler"));
+        assert_eq!(manifest.placement, crate::structs::app::Placement::Managers);
+        let task = &manifest.job["task"];
+        assert_eq!(
+            task["config"]["hardening"]["capabilities"]["add"],
+            json!(["net_bind_service"])
+        );
+        let ports: Vec<(String, Option<u64>)> = task["network"]["ports"]
+            .as_array()
+            .expect("ports")
+            .iter()
+            .map(|port| {
+                (
+                    port["name"].as_str().unwrap_or_default().to_string(),
+                    port["static"].as_u64(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                ("http".to_string(), Some(80)),
+                ("https".to_string(), Some(443)),
+                ("api".to_string(), None),
+            ]
+        );
+        let extensions = serde_json::to_value(&manifest.extensions).expect("extensions");
+        assert_eq!(extensions[0]["point"], "service");
+        assert_eq!(extensions[0]["key"], "ingress");
+        assert_eq!(extensions[0]["validate"], true);
+        let ui = manifest.ui_spec().expect("the ui block parses");
+        assert_eq!(
+            ui.slots(),
+            vec![
+                crate::structs::app_ui::Slot::Nav,
+                crate::structs::app_ui::Slot::Job
+            ]
+        );
+        // The default config reads as the app reads it.
+        let config = crate::apps::ingress::IngressConfig::from_value(&manifest.default_config())
+            .expect("the default config");
+        assert!(config.acme.enabled);
     }
 
     #[test]

@@ -177,8 +177,11 @@ portable-pty = "0.8.1"
 # does not enable HTTP upgrades, so exec-over-WS needs its own hyper listener).
 tokio-tungstenite = "0.24"
 hyper-tungstenite = "0.15"
-hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1"] }
+# `http2` and `server-auto`/`server-graceful`: the bundled ingress serves
+# HTTP/1.1 and HTTP/2 to clients on one listener and drains on stop
+# (src/apps/ingress/proxy.rs). `h2` is already in the tree through tonic.
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1", "http2", "server-auto", "server-graceful"] }
 # CLI interactive terminal: raw mode + window size for `legion exec -it`.
 crossterm = "0.28"
 

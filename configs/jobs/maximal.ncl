@@ -313,6 +313,16 @@
                 # An extension key on a service, for an installed app that
                 # declares `probe` on services:
                 #   probe = { path = "/healthz" },
+                # The bundled ingress's key (docs/ingress.md): route these
+                # public hostnames, under `path`, to this service, with
+                # automatic HTTPS. The ingress speaks plain HTTP to the
+                # service, so it reports a `mesh = true` service like this
+                # one as unroutable; route a service without `mesh`.
+                ingress = {
+                    host = ["maximal.acme.dev", "www.maximal.acme.dev"],
+                    path = "/",          # a prefix, on segment boundaries
+                    stripPath = false,   # true: /api/users reaches the service as /users
+                },
             },
             # Services this task dials, each through the node's forwarder,
             # which load-balances across the upstream's healthy endpoints.
@@ -788,7 +798,16 @@
                     # Bounding-set drops. ["all"] drops everything; named
                     # capabilities work with or without the CAP_ prefix.
                     # Needs CAP_SETPCAP on the worker.
-                    capabilities = { drop = ["all"] },
+                    #
+                    # `add` keeps a capability across the switch to `user`,
+                    # as an ambient capability the program inherits. Only
+                    # net_bind_service may be named (bind ports below 1024
+                    # without root; the bundled ingress uses it), and never
+                    # together with a drop that removes it.
+                    capabilities = {
+                        drop = ["net_raw", "sys_ptrace"],
+                        add = ["net_bind_service"],
+                    },
                     # Octal file-mode creation mask.
                     umask = "0027",
                     # Scheduling niceness, -20..=19.

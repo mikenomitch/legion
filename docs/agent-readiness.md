@@ -863,7 +863,31 @@ Every refusal uses the standard error envelope, with `retryable` and a
 `manager_unavailable`). `legion instance get -j` shows the task's `wake`
 block and, while the instance runs, its `endpoints`.
 
-## 6d. Reading what an app's panel shows (`legion app view`)
+## 6d. Putting a service on a public hostname (the ingress)
+
+An agent that deploys a web service for someone makes it reachable by
+adding one key to the service block, `ingress = { host = "shop.example.com"
+}` ([ingress.md](ingress.md)), and submitting. Everything it needs to check
+is structured:
+
+- **At submit** (`legion job validate` with a manager, `legion job run`,
+  `PlanJob`), a malformed value is an error naming the field, and the
+  running ingress refuses a host and path another job serves. A warning
+  says when a name gets no automatic certificate, or when the ingress is
+  disabled and so did not check (`legion app enable ingress`, an `app:write`
+  call, turns it on).
+- **After deploy**, `legion app view ingress job <job> -j` returns the job's
+  routes: each URL, its service's healthy and total endpoints, its
+  certificate's state (`acme, 89d left`, `ordering`, `ordering failed`,
+  `HTTP only`), and any problem. `legion app view ingress nav -j` is the
+  whole page.
+- **Its own errors** use the standard envelope with a `Legion-Ingress-Error`
+  header (`no_route`, `no_endpoint`, `bad_gateway`, `upstream_timeout`), and
+  `retryable` with `Retry-After` where waiting helps. An agent polling for a
+  new site should treat `no_endpoint` as "not healthy yet" and `no_route` as
+  "the route has not reached the ingress yet, or was refused".
+
+## 6e. Reading what an app's panel shows (`legion app view`)
 
 Apps add panels to the UI as declarative views, never as code
 ([Apps: Views and actions](apps.md#views-and-actions)). The same views are
@@ -912,7 +936,7 @@ They are for people: `legion app view <app>` lists them, and
 tool, because an agent cannot run a page. Everything a page does is an
 ordinary Manager RPC an agent can call itself.
 
-## 6e. Parking itself (`$LEGION_PARK_SOCKET`)
+## 6f. Parking itself (`$LEGION_PARK_SOCKET`)
 
 The surfaces above are for an agent driving Legion from outside. An agent
 running *inside* a sandbox has one too: a task whose `suspend` block sets

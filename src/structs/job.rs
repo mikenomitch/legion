@@ -6316,8 +6316,16 @@ mod unknown_fields_test {
             };
             let rendered = crate::config_lang::eval_file_with_vars(&path, vars)
                 .unwrap_or_else(|err| panic!("{} should evaluate: {err:#}", path.display()));
-            let config: JobConfig = serde_json::from_str(&rendered)
-                .unwrap_or_else(|err| panic!("{} should parse: {err}", path.display()));
+            // As a cluster parses it: the bundled apps' keys (the
+            // ingress's `service.ingress`) are known there.
+            let (config, _) = JobConfig::parse_submitted_str(
+                &rendered,
+                crate::structs::spec_fields::UnknownFieldMode::Reject,
+                crate::structs::spec_fields::ExtensionCheck::Installed(
+                    crate::apps::bundled_extension_registry(),
+                ),
+            )
+            .unwrap_or_else(|err| panic!("{} should parse: {err:#}", path.display()));
 
             cover_opt(config.rollout.as_ref(), "rollout", &mut seen);
             if let Some(slots) = config.rollout.as_ref().and_then(|r| r.slots.as_ref()) {

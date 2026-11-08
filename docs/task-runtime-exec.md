@@ -70,7 +70,10 @@ Optional:
   - `read_only_paths`
   - `read_write_paths`
 - `hardening` (linux): `noNewPrivileges`, `privateTmp`,
-  `capabilities = { drop = [...] }`, `umask`, `nice`. See
+  `capabilities = { drop = [...], add = ["net_bind_service"] }`, `umask`,
+  `nice`. `add` keeps `CAP_NET_BIND_SERVICE` across the switch to `user`, so
+  a task that is not root can bind ports below 1024; it is the only
+  capability `add` takes. See
   [Task Supervision](task-supervision.md#process-hardening).
 
 ## Runtime Behavior

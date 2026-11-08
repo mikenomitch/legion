@@ -61,6 +61,7 @@ mod gitops;
 mod grants;
 mod heartbeat_scale_benchmark;
 mod index_truncation_spread;
+mod ingress;
 mod instance_scale_measure;
 mod join_tokens;
 mod kv_encryption;

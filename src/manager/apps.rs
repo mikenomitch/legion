@@ -360,8 +360,9 @@ pub fn derive_status(
     }
 }
 
-/// The record a bundled app is seeded with: its manifest's defaults, the
-/// manager config's `apps.<name>` overrides, and its permissions granted by
+/// The record a bundled app is seeded with: its manifest's defaults, enabled
+/// as its [`crate::apps::BundledApp::seed_enabled`] says, the manager
+/// config's `apps.<name>` overrides, and its permissions granted by
 /// `legion:bootstrap` (calls entry 17).
 pub fn seed_record(
     manifest: &crate::structs::app::AppManifest,
@@ -370,9 +371,12 @@ pub fn seed_record(
     let now = now_rfc3339();
     let mut settings = AppSettings::from_manifest(manifest);
     let mut config = manifest.default_config();
-    let mut enabled = true;
+    // A bundled app says whether it starts on: the autoscaler does, the
+    // ingress (which takes ports 80 and 443) waits for `legion app enable`.
+    let default_enabled = crate::apps::seeds_enabled(&manifest.name);
+    let mut enabled = default_enabled;
     if let Some(seed) = seed {
-        enabled = seed.enabled.unwrap_or(true);
+        enabled = seed.enabled.unwrap_or(default_enabled);
         if let Some(placement) = &seed.placement {
             match Placement::parse(placement) {
                 Ok(placement) => settings.placement = placement,

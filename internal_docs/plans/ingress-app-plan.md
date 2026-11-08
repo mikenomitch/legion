@@ -4,6 +4,10 @@
 
 **Status: IN EXECUTION** (written 2026-11-07). Phases 1 and 2 are built in
 the same change as this plan. Phase 3 is planned and nothing in it is built.
+Where the build differs from this text, the calls doc says how and why. The
+Phase 2 acceptance check against Pebble (§12) has not been run: CI covers
+issuance against an in-process ACME CA instead (calls entry 5).
+
 Deliberately deferred:
 
 - a catalog watch stream (endpoints are polled)
@@ -250,8 +254,8 @@ and unknown fields at submit. Because the key sets `validate = true`, the
 running app also refuses a `(host, path)` another service already holds:
 
 ```text
-Error: shop: task web: service web: ingress: shop.example.com/ is already routed to default/storefront (task web, service web)
-Hint: pick another host or path, or remove the route from default/storefront first
+shop: task web: service web: ingress (ingress app): shop.example.com/ is already routed to storefront (task web, service web)
+Hint: the app refused these values; fix them and submit again
 ```
 
 When the app is disabled, the manager's generic warning says the value was
@@ -263,11 +267,11 @@ ingress`.
 ```console
 $ legion app enable ingress
 $ legion app status ingress
-NAME     VERSION  SOURCE   STATUS   PLACEMENT  REPLICAS  UI  DETAIL
-ingress  -        bundled  running  managers   1/1       1   on legion-system-x8f2k1qz
+NAME     VERSION  SOURCE   STATUS   PLACEMENT  REPLICAS  UI        DETAIL
+ingress  0.1.0    bundled  running  managers   1/1       nav, job  on legion-system-x8f2k1qz
 $ legion app set ingress --replicas 3          # one per manager (static ports)
-$ legion app view ingress routes               # every route, backends, certificate
-$ legion app config set ingress --file ingress.json
+$ legion app view ingress nav                  # every route, backends, certificate
+$ legion app config set ingress -f ingress.json
 ```
 
 The app's config. Every field is optional:
@@ -493,8 +497,9 @@ balancer or with `acme.enabled = false`)**
   - a real in-process manager: the bundled app is seeded disabled, its key
     validates at submit, and its values reach the app's identity over
     `WatchAppExtensions`;
-  - ACME against Pebble when `LEGION_TEST_PEBBLE` names a binary (skipped
-    otherwise; CI has none).
+  - ACME end to end against an in-process CA that verifies every JWS and
+    validates HTTP-01 against the ingress (runs in CI), and against Pebble
+    when `LEGION_TEST_PEBBLE_DIR` holds its binaries (skipped otherwise).
 - **Existing tests that assert the seeded list is exactly `["autoscaler"]`**
   are updated to include the ingress.
 

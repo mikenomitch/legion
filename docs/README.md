@@ -82,6 +82,10 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Park](park.md): `suspend.park` and `$LEGION_PARK_SOCKET`, where the
   workload says when it is waiting (`park`) or working (`busy`) and its node
   suspends it at the park's deadline, with the checkpoint it chose.
+- [Ingress](ingress.md): the bundled ingress app. `service.ingress = { host
+  }` routes a public hostname (and a path prefix) to a service on ports 80
+  and 443, with HTTP/2, WebSockets, balancing, and automatic HTTPS from
+  Let's Encrypt or any ACME CA; `legion app enable ingress` turns it on.
 - [Gateway: Wake on Request](gateway.md): `legion start gateway`, a stateless
   front door that routes requests to keyed instances by host, header, or
   `CONNECT`, resumes a suspended one on a request, and holds the request

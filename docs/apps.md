@@ -1,7 +1,7 @@
 # Apps
 
-An **app** is one of Legion's add-ons: the autoscaler, and whatever you
-install from a manifest. It is three things:
+An **app** is one of Legion's add-ons: the autoscaler, the ingress, and
+whatever you install from a manifest. It is three things:
 
 1. a **job** in the reserved `legion-system` namespace;
 2. a **grant**: what that job's `legion` identity may do in Legion
@@ -26,8 +26,9 @@ makes it an app is around the job.
 
 ```console
 $ legion app list
-NAME        VERSION  SOURCE   STATUS   PLACEMENT  REPLICAS  UI   DETAIL
-autoscaler  0.1.0    bundled  running  managers   1/1       -    on legion-system-x8f2k1qz
+NAME        VERSION  SOURCE   STATUS   PLACEMENT  REPLICAS  UI                    DETAIL
+autoscaler  0.1.0    bundled  running  managers   1/1       nav, job, task, node  on legion-system-x8f2k1qz
+ingress     0.1.0    bundled  stopped  managers   0/0       nav, job              disabled
 
 $ legion app status autoscaler
 $ legion app logs autoscaler -f
@@ -40,10 +41,13 @@ $ legion app install ./deployer.ncl
 ## Bundled and installed apps
 
 **Bundled apps** are compiled into the `legion` binary. Today there are
-three: `autoscaler`, `certs`, and `gitops`. The first manager to lead a new cluster's control plane
-**seeds** a record for each bundled app, enabled, with its manifest's
+four, `autoscaler`, `certs`, `gitops`, and `ingress`. The first manager to
+lead a new cluster's control plane **seeds** a record for each bundled app, with its manifest's
 permissions granted by `legion:bootstrap`, and the app starts with nothing
-configured. A bundled app runs the node's own binary: its job's command is
+configured. The autoscaler, certs, and gitops are seeded enabled. The ingress is seeded
+disabled, because it takes ports 80 and 443 on the nodes it runs on:
+`legion app enable ingress` turns it on, or `apps.ingress.enabled = true`
+in the manager config seeds it on ([Seeding](#seeding-and-the-manager-config)). A bundled app runs the node's own binary: its job's command is
 `legion:self app run <name>` (see [Inside an app](#inside-an-app)), so it is
 always the same build as the node that runs it, with nothing to download.
 
@@ -111,6 +115,22 @@ Certificates page in the sidebar and a card on the cluster overview.
 `legion cert renew` re-issues a certificate now, and `legion cert http01`
 is the stateless HTTP-01 responder it pairs with.
 
+The **ingress** routes public hostnames to services
+([ingress.md](ingress.md)). Its manifest declares one jobspec key,
+`ingress` on a task's `service` block (`{ host, path, stripPath }`), with
+`validate = true` so the running app refuses a host and path another job
+already serves. It reads the values over `WatchAppExtensions`, resolves each
+routed service's endpoints, and proxies on ports 80 and 443. Its task keeps
+`CAP_NET_BIND_SERVICE` through `hardening.capabilities.add`, so it binds
+those ports as its own uid. It orders certificates from an ACME CA (Let's
+Encrypt by default) over HTTP-01, one issuer per cluster by a KV lock, and
+keeps them, its ACME account, and the challenge answers under its reserved
+`legion/apps/ingress/`. Its grant is `job:read` in every namespace (the
+catalog) and `kv` read and write under `legion/apps/ingress/`. Its config
+takes `acme` (`enabled`, `directory`, `email`, `trustRoots`; `directory`
+and `trustRoots` are code fields) and `redirectHttps`. Its UI is an Ingress
+page in the sidebar and a panel on the page of each job it routes.
+
 **Installed apps** come from a manifest file or URL (`legion app install`).
 They carry their own `version`, run their own code (an artifact or an image,
 like any job), and can be upgraded and uninstalled.
@@ -125,6 +145,9 @@ apps = {
   autoscaler = { enabled = false },   # also: placement, replicas, config
 },
 ```
+
+`enabled` defaults to the app's own seed default: `true` for the
+autoscaler, certs, and gitops, `false` for the ingress.
 
 The block is read **only when a bundled app's record is first seeded**.
 Managers can disagree about their config, and the record is the single

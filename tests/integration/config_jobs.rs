@@ -2,6 +2,19 @@ use legion::config_lang;
 use legion::manager::rollout_strategy::validate_rollout_strategy_name;
 use legion::plugin_runtime::plugin_paths;
 use legion::structs::JobConfig;
+
+/// Parse a shipped jobspec as a cluster does: strictly, with the bundled
+/// apps' keys (the ingress's `service.ingress`) known and checked.
+fn parse_shipped(rendered: &str) -> anyhow::Result<JobConfig> {
+    let (config, _) = JobConfig::parse_submitted_str(
+        rendered,
+        legion::structs::spec_fields::UnknownFieldMode::Reject,
+        legion::structs::spec_fields::ExtensionCheck::Installed(
+            legion::apps::bundled_extension_registry(),
+        ),
+    )?;
+    Ok(config)
+}
 use legion::task_plugins::{validate_job_config, TaskPluginRegistry};
 use legion::util::plugin_root_dir;
 use serde_json::Value;
@@ -58,8 +71,8 @@ fn config_jobs_parse() {
 
         let path_str = path.to_string_lossy();
         let rendered = render_job_spec(&path_str, &default_vars());
-        let config: JobConfig = serde_json::from_str(&rendered)
-            .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
+        let config: JobConfig = parse_shipped(&rendered)
+            .unwrap_or_else(|e| panic!("failed to parse {}: {:#}", path_str, e));
 
         assert!(
             !config.name.is_empty(),
@@ -130,8 +143,8 @@ fn config_jobs_pass_full_validation() {
 
         let path_str = path.to_string_lossy();
         let rendered = render_job_spec(&path_str, &default_vars());
-        let config: JobConfig = serde_json::from_str(&rendered)
-            .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
+        let config: JobConfig = parse_shipped(&rendered)
+            .unwrap_or_else(|e| panic!("failed to parse {}: {:#}", path_str, e));
 
         if let Some(reason) = unbuilt_plugin_dependency(&config) {
             eprintln!("skipping validation of {}: {}", path_str, reason);
@@ -159,8 +172,8 @@ fn maximal_job_spec_passes_full_validation() {
         .join("maximal.ncl");
     let path_str = path.to_string_lossy();
     let rendered = render_job_spec(&path_str, &default_vars());
-    let config: JobConfig = serde_json::from_str(&rendered)
-        .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
+    let config: JobConfig = parse_shipped(&rendered)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {:#}", path_str, e));
 
     validate_job_config(&config)
         .unwrap_or_else(|e| panic!("maximal.ncl failed full validation: {:#}", e));
@@ -174,8 +187,8 @@ fn maximal_job_spec_parse() {
         .join("maximal.ncl");
     let path_str = path.to_string_lossy();
     let rendered = render_job_spec(&path_str, &default_vars());
-    let config: JobConfig = serde_json::from_str(&rendered)
-        .unwrap_or_else(|e| panic!("failed to parse {}: {}", path_str, e));
+    let config: JobConfig = parse_shipped(&rendered)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {:#}", path_str, e));
 
     assert_eq!(config.name, "maximal-demo");
     assert_eq!(config.version, Some(1));

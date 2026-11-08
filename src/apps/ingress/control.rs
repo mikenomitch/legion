@@ -1,0 +1,214 @@
+//! What the ingress asks of Legion, behind one trait: its routes
+//! (`WatchAppExtensions`), each routed service's endpoints
+//! (`ResolveService`), and its own KV and issuer lock. [`GrpcControl`] is
+//! the real one, over the app's `legion` identity; tests drive the proxy
+//! with a fake.
+
+use std::time::Duration;
+
+use futures::stream::BoxStream;
+use futures::StreamExt;
+
+use super::backend::CatalogEndpoint;
+use super::certs::KvVersion;
+use crate::prelude::*;
+use crate::structs::{
+    AcquireKvLockRequest, AppExtensionEvent, DeleteKvRequest, GetKvRequest, KvValueType,
+    ListKvRequest, PutKvRequest, ReleaseKvLockRequest, ResolveServiceRequest,
+    WatchAppExtensionsRequest,
+};
+
+/// Everything the ingress needs from Legion.
+#[async_trait::async_trait]
+pub trait Control: Send + Sync + 'static {
+    /// Open the route watch: a snapshot, then upserts and deletes.
+    async fn watch_routes(&self) -> R<BoxStream<'static, R<AppExtensionEvent>>>;
+    /// Every endpoint the catalog lists for `service` (`name` or
+    /// `namespace/name`), healthy or not.
+    async fn resolve(&self, service: &str) -> R<Vec<(String, CatalogEndpoint)>>;
+    /// Every key under `prefix`, with its version.
+    async fn kv_list(&self, prefix: &str) -> R<Vec<KvVersion>>;
+    /// A key's value and version.
+    async fn kv_get(&self, key: &str) -> R<Option<(String, i64)>>;
+    async fn kv_put(&self, key: &str, value: &str) -> R<()>;
+    async fn kv_delete(&self, key: &str) -> R<()>;
+    /// Take or renew lock `key` as `lock_id`. `Ok(false)` when another
+    /// holder has it.
+    async fn lock(&self, key: &str, lock_id: &str, owner: &str, ttl: Duration) -> R<bool>;
+    async fn unlock(&self, key: &str, lock_id: &str);
+}
+
+/// [`Control`] over the app's Legion client.
+#[derive(Clone)]
+pub struct GrpcControl {
+    client: crate::cmd::helpers::AuthedManagerClient,
+}
+
+impl GrpcControl {
+    pub fn new(client: crate::cmd::helpers::AuthedManagerClient) -> GrpcControl {
+        GrpcControl { client }
+    }
+}
+
+fn status_error(what: &str, status: tonic::Status) -> anyhow::Error {
+    anyhow!("{what}: {}", status.message())
+}
+
+#[async_trait::async_trait]
+impl Control for GrpcControl {
+    async fn watch_routes(&self) -> R<BoxStream<'static, R<AppExtensionEvent>>> {
+        let stream = self
+            .client
+            .clone()
+            .watch_app_extensions(WatchAppExtensionsRequest::default())
+            .await
+            .map_err(|status| status_error("watching the app's routes", status))?
+            .into_inner();
+        Ok(stream
+            .map(|event| event.map_err(|status| status_error("the route watch", status)))
+            .boxed())
+    }
+
+    async fn resolve(&self, service: &str) -> R<Vec<(String, CatalogEndpoint)>> {
+        let reply = self
+            .client
+            .clone()
+            .resolve_service(ResolveServiceRequest {
+                service: service.to_string(),
+                include_unhealthy: true,
+            })
+            .await
+            .map_err(|status| status_error(&format!("resolving {service}"), status))?
+            .into_inner();
+        Ok(reply
+            .endpoints
+            .into_iter()
+            .map(|endpoint| {
+                (
+                    format!("{}\u{0}{}", endpoint.job_id, endpoint.task_name),
+                    CatalogEndpoint {
+                        host: endpoint.address,
+                        port: u16::try_from(endpoint.port).unwrap_or(0),
+                        allocation_id: endpoint.allocation_id,
+                        node_id: endpoint.node_id,
+                        healthy: endpoint.healthy,
+                        mesh_tls: endpoint.mesh_tls,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    async fn kv_list(&self, prefix: &str) -> R<Vec<KvVersion>> {
+        let reply = self
+            .client
+            .clone()
+            .list_kv(ListKvRequest {
+                prefix: prefix.to_string(),
+                include_values: false,
+                include_locks: false,
+            })
+            .await
+            .map_err(|status| status_error("listing the app's KV", status))?
+            .into_inner();
+        Ok(reply
+            .entries
+            .into_iter()
+            .map(|entry| KvVersion {
+                key: entry.key,
+                version: entry.version,
+            })
+            .collect())
+    }
+
+    async fn kv_get(&self, key: &str) -> R<Option<(String, i64)>> {
+        match self
+            .client
+            .clone()
+            .get_kv(GetKvRequest {
+                key: key.to_string(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(reply) => Ok(reply
+                .into_inner()
+                .entry
+                .map(|entry| (entry.value, entry.version))),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(status_error(&format!("reading {key}"), status)),
+        }
+    }
+
+    async fn kv_put(&self, key: &str, value: &str) -> R<()> {
+        self.client
+            .clone()
+            .put_kv(PutKvRequest {
+                key: key.to_string(),
+                value: value.to_string(),
+                value_type: KvValueType::String as i32,
+                ..Default::default()
+            })
+            .await
+            .map_err(|status| status_error(&format!("writing {key}"), status))?;
+        Ok(())
+    }
+
+    async fn kv_delete(&self, key: &str) -> R<()> {
+        match self
+            .client
+            .clone()
+            .delete_kv(DeleteKvRequest {
+                key: key.to_string(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(()),
+            Err(status) => Err(status_error(&format!("deleting {key}"), status)),
+        }
+    }
+
+    async fn lock(&self, key: &str, lock_id: &str, owner: &str, ttl: Duration) -> R<bool> {
+        match self
+            .client
+            .clone()
+            .acquire_kv_lock(AcquireKvLockRequest {
+                key: key.to_string(),
+                lock_id: Some(lock_id.to_string()),
+                owner: Some(owner.to_string()),
+                ttl_seconds: ttl.as_secs().max(1) as i64,
+                force: false,
+            })
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::AlreadyExists
+                        | tonic::Code::FailedPrecondition
+                        | tonic::Code::Aborted
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(status) => Err(status_error("taking the issuer lock", status)),
+        }
+    }
+
+    async fn unlock(&self, key: &str, lock_id: &str) {
+        if let Err(status) = self
+            .client
+            .clone()
+            .release_kv_lock(ReleaseKvLockRequest {
+                key: key.to_string(),
+                lock_id: lock_id.to_string(),
+            })
+            .await
+        {
+            debug!(key, "Releasing the issuer lock: {}", status.message());
+        }
+    }
+}

@@ -57,6 +57,11 @@ still be happy with at fifty thousand nodes.
   a KV key gets a Let's Encrypt (or private-CA) certificate there and renews
   it before it expires; a port's `tls.cert = { kv }` serves it, and a renewal
   swaps in without a restart ([Cert Manager](docs/cert-manager.md)).
+- **An ingress, built in.** One line on a service,
+  `ingress = { host = "shop.example.com" }`, puts it on the internet: the
+  bundled ingress routes the hostname to the service's healthy instances on
+  ports 80 and 443, has the cert manager get and renew its certificate, and
+  tells you which addresses to point DNS at ([Ingress](docs/ingress.md)).
 - **Readable job specs.** [Nickel](docs/configuration-language.md) gives you
   types, imports, and functions for DRY specs. You don't need YAML or Helm
   charts.
@@ -467,6 +472,7 @@ start:
   [Running Redis](docs/guides/redis.md) ·
   [Serving TLS Certificates from KV](docs/guides/tls-certificates.md)
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
+  [Ingress](docs/ingress.md) ·
   [Network Handlers](docs/network-handlers.md) ·
   [Network Plugins](docs/network-plugins.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md) · [The Cluster CA](docs/cluster-ca.md) ·

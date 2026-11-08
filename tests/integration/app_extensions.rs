@@ -1805,3 +1805,175 @@ async fn an_upgrade_that_drops_a_used_point_needs_force_test() -> R<()> {
     assert_eq!(find(&info.extensions, "task", "slaTier")?.state, "orphaned");
     Ok(())
 }
+
+/// The bundled ingress's key (docs/ingress.md): seeding registers it on
+/// every cluster, so `service.ingress` is checked against its schema at
+/// submit even while the app is disabled (with a warning that the app was
+/// not asked), and its values reach the ingress's own identity over
+/// `WatchAppExtensions`. The app's grant covers everything it calls: the
+/// catalog, its own KV, and its issuer lock, and no one else's KV.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bundled_ingress_routes_reach_its_identity_test() -> R<()> {
+    let fx = fixture().await?;
+    let reconciler = AppReconciler::new(
+        fx.svc.clone(),
+        ReconcilerSettings {
+            seed: BTreeMap::new(),
+            own_build: BuildMarker {
+                version: "0.1.0".into(),
+                build_id: "a".into(),
+            },
+        },
+    );
+    assert!(reconciler.seed()?.contains(&"ingress".to_string()));
+    let shop = json!({
+        "name": "shop",
+        "tasks": [{
+            "name": "web",
+            "runtime": "exec",
+            "config": { "command": ["sleep", "3600"] },
+            "resources": { "cpu": 100, "memory": 64 },
+            "network": { "ports": [{ "name": "http" }] },
+            "service": {
+                "port": "http",
+                "ingress": { "host": ["shop.example.com", "www.shop.example.com"], "path": "/store" },
+            },
+        }],
+    });
+    let reply = fx.run(&shop).await?;
+    assert!(
+        reply
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not checked by the ingress app (disabled)")),
+        "{:?}",
+        reply.warnings
+    );
+
+    // The schema still decides, app or no app.
+    for (name, ingress, expect) in [
+        ("bad-host", json!({ "host": "not a host" }), "ingress"),
+        ("no-host", json!({ "path": "/" }), "host"),
+        (
+            "bad-path",
+            json!({ "host": "a.example.com", "path": "api" }),
+            "path",
+        ),
+        (
+            "extra",
+            json!({ "host": "a.example.com", "tls": true }),
+            "tls",
+        ),
+    ] {
+        let mut bad = shop.clone();
+        bad["name"] = json!(name);
+        bad["tasks"][0]["service"]["ingress"] = ingress;
+        let err = fx.run(&bad).await.expect_err(name);
+        assert!(err.message().contains(expect), "{name}: {}", err.message());
+    }
+
+    fx.svc
+        .set_app_enabled(req(
+            SetAppEnabledRequest {
+                name: "ingress".into(),
+                enabled: true,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    // A bundled app runs the node's own binary, so it waits for a node that
+    // reports the build it was rendered for.
+    let mut manager = node(MGR_NODE, "legion-system", true);
+    manager.dynamic_attrs =
+        json!({ "capabilities": [], "buildVersion": "0.1.0", "buildId": "a" }).to_string();
+    fx.store.insert_node(manager)?;
+    fx.start_app("ingress").await?;
+    let token = fx.app_token("ingress")?;
+    let mut stream = fx
+        .svc
+        .watch_app_extensions(req(WatchAppExtensionsRequest::default(), &token))
+        .await?
+        .into_inner();
+    let first = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await?
+        .context("a first message")??;
+    assert!(first.snapshot);
+    assert_eq!(first.upserts.len(), 1, "{:#?}", first.upserts);
+    let value = &first.upserts[0];
+    assert_eq!(
+        (
+            value.job_id.as_str(),
+            value.point.as_str(),
+            value.key.as_str()
+        ),
+        ("shop", "service", "ingress")
+    );
+    let path = value.path.clone().unwrap_or_default();
+    assert_eq!((path.task.as_str(), path.service.as_str()), ("web", "web"));
+    assert_eq!(
+        parsed(&value.effective_json),
+        json!({ "host": ["shop.example.com", "www.shop.example.com"], "path": "/store", "stripPath": false })
+    );
+    let spec = legion::apps::ingress::spec_of(value);
+    assert!(spec.active, "{spec:?}");
+    assert_eq!(spec.target.service_ref(), "web");
+
+    // What the app calls, with its own grant.
+    fx.svc
+        .resolve_service(req(
+            ResolveServiceRequest {
+                service: "web".into(),
+                include_unhealthy: true,
+            },
+            &token,
+        ))
+        .await?;
+    fx.svc
+        .put_kv(req(
+            PutKvRequest {
+                key: "legion/apps/ingress/replicas/1".into(),
+                value: "{}".into(),
+                value_type: KvValueType::String as i32,
+                ..Default::default()
+            },
+            &token,
+        ))
+        .await?;
+    fx.svc
+        .list_kv(req(
+            ListKvRequest {
+                prefix: "legion/apps/ingress/".into(),
+                ..Default::default()
+            },
+            &token,
+        ))
+        .await?;
+    fx.svc
+        .acquire_kv_lock(req(
+            AcquireKvLockRequest {
+                key: legion::apps::ingress::issuer::LOCK_KEY.into(),
+                lock_id: Some("a".repeat(32)),
+                owner: Some("test".into()),
+                ttl_seconds: 60,
+                force: false,
+            },
+            &token,
+        ))
+        .await?;
+    let denied = fx
+        .svc
+        .put_kv(req(
+            PutKvRequest {
+                key: "legion/apps/autoscaler/x".into(),
+                value: "{}".into(),
+                value_type: KvValueType::String as i32,
+                ..Default::default()
+            },
+            &token,
+        ))
+        .await
+        .expect_err("another app's KV");
+    assert_eq!(denied.code(), Code::PermissionDenied);
+    Ok(())
+}
