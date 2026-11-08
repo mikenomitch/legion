@@ -579,6 +579,9 @@
                 restartCount = 3,
                 restartPeriod = "30m",
                 restartDelay = "30s",
+                # Moves inside movePeriod before the job fails. A keyed
+                # instance counts its own, and spending them stops just
+                # that instance.
                 moveCount = 3,
                 movePeriod = "30m",
                 # The first reschedule's wait. It doubles for each earlier

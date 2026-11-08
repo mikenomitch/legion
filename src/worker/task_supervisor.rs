@@ -7,7 +7,8 @@
 //! placement. See `internal_docs/plans/host-process-supervision-plan.md`.
 //!
 //! Failures leave through the existing `record_failure` path — the manager
-//! already knows how to reschedule those. Terminal *successes* leave through
+//! already knows how to reschedule those. Terminal outcomes (a success, or
+//! any exit of a `restart.policy = "never"` task) leave through
 //! `record_termination`, which the heartbeat reports separately.
 
 use crate::prelude::*;
@@ -26,7 +27,11 @@ pub enum ExitDecision {
     Restart,
     /// Terminal, and the task said this exit status is a success.
     TerminalSuccess,
-    /// Terminal failure: hand it to the manager's reschedule/move machinery.
+    /// Terminal, and the exit was not a success, but the task's policy is
+    /// `never`: it asked to run once, so the allocation completes as failed
+    /// (`TerminatedAllocation.success = false`) instead of being moved.
+    TerminalFailure,
+    /// Failure: hand it to the manager's reschedule/move machinery.
     Fail,
 }
 
@@ -38,7 +43,8 @@ pub enum ExitDecision {
 /// restarts spend from too.
 pub fn decide(task: &TaskConfig, exit: &TaskExit, budget_available: bool) -> ExitDecision {
     let success = task.exit_code_is_success(exit.exit_code);
-    let wants_restart = match task.restart_policy() {
+    let policy = task.restart_policy();
+    let wants_restart = match policy {
         RestartPolicy::Always => true,
         RestartPolicy::OnFailure => !success,
         RestartPolicy::Never => false,
@@ -49,8 +55,15 @@ pub fn decide(task: &TaskConfig, exit: &TaskExit, budget_available: bool) -> Exi
     }
     // A restart the budget refuses is a failure even when the exit itself was
     // clean: the task asked to keep running and we are out of attempts.
-    if success && !wants_restart {
+    if wants_restart {
+        return ExitDecision::Fail;
+    }
+    if success {
         ExitDecision::TerminalSuccess
+    } else if policy == RestartPolicy::Never {
+        // `never` means run once: an unsuccessful exit ends the allocation
+        // as failed rather than moving it to run again elsewhere.
+        ExitDecision::TerminalFailure
     } else {
         ExitDecision::Fail
     }
@@ -186,6 +199,16 @@ pub async fn handle_exit(task_manager: &Arc<Mutex<WorkerTaskManager>>, exit: Tas
             let mut manager = task_manager.lock().expect("task manager");
             manager.record_termination(exit.allocation_id, &exit, true);
         }
+        ExitDecision::TerminalFailure => {
+            warn!(
+                allocation_id = exit.allocation_id,
+                task_name = %exit.task_name,
+                status = %exit.describe(),
+                "Task failed; restart policy `never`, so it is not moved"
+            );
+            let mut manager = task_manager.lock().expect("task manager");
+            manager.record_termination(exit.allocation_id, &exit, false);
+        }
         ExitDecision::Fail => {
             warn!(
                 allocation_id = exit.allocation_id,
@@ -261,7 +284,21 @@ mod task_supervisor_test {
             decide(&task, &exit(Some(0)), true),
             ExitDecision::TerminalSuccess
         );
-        assert_eq!(decide(&task, &exit(Some(1)), true), ExitDecision::Fail);
+        assert_eq!(
+            decide(&task, &exit(Some(1)), true),
+            ExitDecision::TerminalFailure
+        );
+        // The budget is irrelevant: `never` asks for no restart to spend it on.
+        assert_eq!(
+            decide(&task, &exit(Some(1)), false),
+            ExitDecision::TerminalFailure
+        );
+    }
+
+    #[test]
+    fn on_failure_still_moves_a_failure_once_the_budget_is_spent() {
+        let task = task(TaskLifecycle::Batch, None);
+        assert_eq!(decide(&task, &exit(Some(1)), false), ExitDecision::Fail);
     }
 
     #[test]
@@ -292,7 +329,7 @@ mod task_supervisor_test {
                 ..Default::default()
             }),
         );
-        assert_eq!(decide(&task, &killed, true), ExitDecision::Fail);
+        assert_eq!(decide(&task, &killed, true), ExitDecision::TerminalFailure);
         assert_eq!(killed.describe(), "killed by signal 9");
     }
 

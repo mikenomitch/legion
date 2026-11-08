@@ -161,6 +161,7 @@ When one is required and what goes in it:
 | [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md) | **shipped** 2026-08-03 (D8: heartbeats leave raft — leader-memory liveness, transitions-only replication, failover grace, digest, display checkpoint); phase 1's AWS measurement is not run |
 | [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | in execution (cross-system campaign rerun 2026-10-14 with every store on NVMe, results in [docs/benchmarks.md](../docs/benchmarks.md)) |
 | [worker-simulation-plan.md](plans/worker-simulation-plan.md) | shipped (2026-07-30) |
+| [launch-blockers-and-security-gaps-plan.md](plans/launch-blockers-and-security-gaps-plan.md) | shipped (2026-11-08): Tier 1 spot-check bugs and four security gaps; deferrals in §9, AWS re-run pending |
 | [launch-spot-check-fixes-plan.md](plans/launch-spot-check-fixes-plan.md) | in execution (every 2026-10-11 spot-check finding fixed in #17, open; P1-5 in part; deferrals in §8.7; AWS re-run pending) |
 | [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) | in execution: Phases 0 to 8 built; hardware verification open (launch blocker: workers on other hosts lose exec, logs, and the mesh. Also owns local workload isolation: ACLs on by default, the host guard, gated containers by default, the container privilege floor, and the `host` grant for host-level jobs. Carries the sandbox-exec plan's ticket caller class) |
 | [scheduler-diagnosis-tooling-plan.md](plans/scheduler-diagnosis-tooling-plan.md) | planned (`legion scheduler diagnose` + the metric gaps that blocked the 2026-08-04 diagnosis) |
@@ -273,6 +274,7 @@ by project impact. The full template and a worked example:
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [kv-cert-delivery-plan_calls.md](calls/kv-cert-delivery-plan_calls.md)
 - [join-token-file-and-cli-timeouts_calls.md](calls/join-token-file-and-cli-timeouts_calls.md)
+- [launch-blockers-and-security-gaps-plan_calls.md](calls/launch-blockers-and-security-gaps-plan_calls.md)
 - [launch-spot-check-fixes-plan_calls.md](calls/launch-spot-check-fixes-plan_calls.md)
 - [lazy-memory-restore-plan_calls.md](calls/lazy-memory-restore-plan_calls.md)
 - [liveness-off-the-raft-path-plan_calls.md](calls/liveness-off-the-raft-path-plan_calls.md)

@@ -276,14 +276,23 @@ elsewhere). Two settings decide whether that works under systemd:
   fixed `LEGION_DATA_DIR` (or `WorkingDirectory=`) and a fixed `--name`. A
   worker started from another directory finds no state, registers as a
   different node, and cannot see the tasks the previous process left
-  running; the worker logs the state directory it uses at startup.
+  running; the worker logs the state directory it uses at startup. A worker
+  started under a new `--name` in the same data dir warns when another
+  identity there left tasks running (`Worker identity <name> in this data
+  dir left N task(s) running that this worker does not manage`); start it
+  under the old name to re-adopt them, or stop them. It does not stop them
+  itself, because another worker may be running under that name.
 - **`KillMode=process`.** systemd's default (`control-group`) kills every
   task with the worker on `systemctl stop` or `restart`, so nothing is left
   to re-adopt and every restart restarts every task. `KillMode=process`
   stops only the worker; systemd then reports `Unit process N remains
   running after unit stopped` for each task, which is expected. Choose
   `control-group` (or `mixed`) instead when you prefer a worker restart to
-  restart its tasks too.
+  restart its tasks too. With resource enforcement on (the Linux default),
+  each task runs in its own cgroup under the worker's cgroup parent
+  (`/sys/fs/cgroup/legion/` by default), outside the unit's cgroup, so
+  systemd's `KillMode` does not reach it either way; a restarted worker
+  re-adopts it, or stops it when it cannot.
 - **The join token in a file.** A token passed as an argument stays in the
   worker's command line for the life of the process, where any local user
   can read it with `ps` or `/proc/<pid>/cmdline`, and every restart needs it

@@ -70,6 +70,93 @@ pub struct PersistedAllocation {
     /// for running work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopping: Option<PersistedStop>,
+    /// Set once the task's process has exited for good and its restart
+    /// policy made that the end of it (docs/task-supervision.md): the
+    /// outcome the worker owes the manager, and whether a manager has
+    /// recorded it yet.
+    ///
+    /// Persisted because the process is gone (`pid` is `None`) and the exit
+    /// status cannot be read again. Before this, a worker restarted between
+    /// a batch exit and the heartbeat that reported it forgot the
+    /// allocation, the manager still listed it, and the finished step ran a
+    /// second time. A restarted worker keeps the allocation as terminated,
+    /// never relaunches it, and re-sends the report if it was not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<PersistedTermination>,
+}
+
+/// The worker state file, record by record ([`WorkerStateStore::load_records`]).
+#[derive(Debug, Default)]
+pub struct LoadedState {
+    pub records: Vec<PersistedAllocation>,
+    pub unreadable: Vec<UnreadableRecord>,
+}
+
+/// A persisted record this build cannot read in full: what could be read of
+/// it, which is enough to stop the process it describes.
+#[derive(Debug, Clone)]
+pub struct UnreadableRecord {
+    pub allocation_id: Option<i64>,
+    pub pid: Option<u32>,
+    pub pid_start_time: Option<u64>,
+    pub resource_assignment: Option<crate::task_plugins::ResourceAssignment>,
+    /// Why the full record did not parse.
+    pub error: String,
+}
+
+impl UnreadableRecord {
+    fn from_value(value: &serde_json::Value, err: &serde_json::Error) -> Self {
+        Self {
+            allocation_id: value
+                .get("allocation")
+                .and_then(|allocation| allocation.get("id"))
+                .and_then(serde_json::Value::as_i64),
+            pid: value
+                .get("pid")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok()),
+            pid_start_time: value
+                .get("pidStartTime")
+                .and_then(serde_json::Value::as_u64),
+            resource_assignment: value
+                .get("resourceAssignment")
+                .and_then(|assignment| serde_json::from_value(assignment.clone()).ok()),
+            error: err.to_string(),
+        }
+    }
+}
+
+/// A terminal outcome persisted with its allocation; see
+/// [`PersistedAllocation::terminal`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedTermination {
+    /// The exit counted as a success (`restart.successExitCodes`).
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// Human-readable, e.g. `exited with status 0`.
+    pub message: String,
+    /// A manager accepted the report (it was not handed back in
+    /// `HeartbeatReply.retry_terminated_allocations`). A restarted worker
+    /// re-sends only reports that are not recorded yet.
+    #[serde(default)]
+    pub recorded: bool,
+}
+
+impl PersistedTermination {
+    /// A just-decided outcome, not yet recorded by any manager.
+    pub fn owed(report: &crate::worker::task_manager::TerminatedAllocationReport) -> Self {
+        Self {
+            success: report.success,
+            exit_code: report.exit_code,
+            signal: report.signal,
+            message: report.message.clone(),
+            recorded: false,
+        }
+    }
 }
 
 /// Where a stopping allocation was in the stop ladder when it was persisted.
@@ -164,16 +251,78 @@ impl WorkerStateStore {
         self.logs_base_dir().join(allocation_id.to_string())
     }
 
+    /// The records this build can read; see [`Self::load_records`] for the
+    /// ones it cannot.
     pub fn load(&self) -> R<Vec<PersistedAllocation>> {
+        Ok(self.load_records()?.records)
+    }
+
+    /// Read the state file one record at a time.
+    ///
+    /// The file used to be parsed in one piece, so a single record this
+    /// build could not read (a field another release wrote or dropped)
+    /// failed the whole load. The restore gave up, the worker started with
+    /// no record of the tasks still running, its next save overwrote the
+    /// file, and the manager's desired set started a second copy of each
+    /// beside the first (spot check P1-5). Now every readable record is
+    /// returned, and every other one comes back as an
+    /// [`UnreadableRecord`] carrying what is needed to stop its process.
+    pub fn load_records(&self) -> R<LoadedState> {
         if !self.path.exists() {
-            return Ok(Vec::new());
+            return Ok(LoadedState::default());
         }
         let contents = fs::read_to_string(&self.path)?;
         if contents.trim().is_empty() {
-            return Ok(Vec::new());
+            return Ok(LoadedState::default());
         }
-        let allocations = serde_json::from_str(&contents)?;
-        Ok(allocations)
+        let values: Vec<serde_json::Value> = match serde_json::from_str(&contents) {
+            Ok(values) => values,
+            Err(err) => {
+                // Not even a list: nothing in it can be told apart.
+                return Ok(LoadedState {
+                    records: Vec::new(),
+                    unreadable: vec![UnreadableRecord {
+                        allocation_id: None,
+                        pid: None,
+                        pid_start_time: None,
+                        resource_assignment: None,
+                        error: format!("the state file is not a list of records: {err}"),
+                    }],
+                });
+            }
+        };
+        let mut loaded = LoadedState::default();
+        for value in values {
+            match serde_json::from_value::<PersistedAllocation>(value.clone()) {
+                Ok(record) => loaded.records.push(record),
+                Err(err) => loaded
+                    .unreadable
+                    .push(UnreadableRecord::from_value(&value, &err)),
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// Keep a copy of a state file that held unreadable records beside it
+    /// (`worker_state.json.unreadable-<unix seconds>`, owner-only), before
+    /// the next save replaces it, so what the previous worker wrote can
+    /// still be inspected. Returns the copy's path.
+    pub fn preserve_unreadable_copy(&self) -> R<PathBuf> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("worker_state.json");
+        let copy = self
+            .path
+            .with_file_name(format!("{file_name}.unreadable-{stamp}"));
+        let contents = fs::read(&self.path)?;
+        write_owner_only(&copy, &contents, true)?;
+        Ok(copy)
     }
 
     pub fn save(&self, allocations: &[PersistedAllocation]) -> R<()> {
@@ -418,6 +567,57 @@ pub fn kill_orphaned_task_group(pid: u32) -> bool {
     }
 }
 
+/// Other worker identities in the same data dir (`<workers dir>/<name>/`)
+/// whose state still names running processes: the task's own process, by
+/// pid and start time. Returns each identity with how many.
+///
+/// A worker started under a new `--name` (a re-join after the manager
+/// refused the old name, say) reads only its own state, so the tasks the old
+/// identity left running are managed by nobody while the manager places
+/// their work again. Nothing here stops them: another worker may be running
+/// under that name. The caller says so instead.
+pub fn other_identities_with_live_tasks(workers_dir: &Path, current: &str) -> Vec<(String, usize)> {
+    let Ok(entries) = fs::read_dir(workers_dir) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name == current || !entry.path().is_dir() {
+            continue;
+        }
+        let store = WorkerStateStore::new(entry.path().join("worker_state.json"));
+        let Ok(loaded) = store.load_records() else {
+            continue;
+        };
+        let live = loaded
+            .records
+            .iter()
+            .filter_map(|record| Some((record.pid?, record.pid_start_time)))
+            .chain(
+                loaded
+                    .unreadable
+                    .iter()
+                    .filter_map(|record| Some((record.pid?, record.pid_start_time))),
+            )
+            .filter(
+                |(pid, recorded)| match (process_start_time(*pid), recorded) {
+                    (Some(started), Some(recorded)) => started == *recorded,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                },
+            )
+            .count();
+        if live > 0 {
+            found.push((name, live));
+        }
+    }
+    found.sort();
+    found
+}
+
 /// Whether `pid` names a live (non-zombie) process.
 ///
 /// Called once per restored allocation per supervisor tick, under the
@@ -512,6 +712,94 @@ fn ensure_dir(path: &Path) -> R<()> {
 mod tests {
     use super::*;
     use sysinfo::{Pid, System};
+
+    fn record(id: i64, pid: u32, pid_start_time: Option<u64>) -> serde_json::Value {
+        let record = PersistedAllocation {
+            allocation: Allocation {
+                id,
+                status: "running".into(),
+                resources: serde_json::json!({}),
+                node_id: "node-1".into(),
+                job_config_id: "job-1".into(),
+                task_config_id: 1,
+                job_id: "job".into(),
+                instance_id: None,
+                network: None,
+            },
+            task: TaskConfig::new("task", "exec"),
+            pid: Some(pid),
+            pid_start_time,
+            self_terminate_after_secs: None,
+            volumes: Vec::new(),
+            external_id: None,
+            in_envelope: false,
+            resource_assignment: None,
+            stopping: None,
+            terminal: None,
+        };
+        serde_json::to_value(record).expect("record")
+    }
+
+    /// One record this build cannot read no longer hides the others, and
+    /// what can be read of it (the pid) comes back to stop it with.
+    #[test]
+    fn load_records_reads_around_an_unreadable_record_test() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let store = WorkerStateStore::new(dir.path().join("worker_state.json"));
+        let mut broken = record(2, 4242, Some(7));
+        broken["task"] = serde_json::json!("not a task");
+        fs::write(
+            store.path(),
+            serde_json::to_string(&vec![record(1, 4141, None), broken])?,
+        )?;
+        let loaded = store.load_records()?;
+        assert_eq!(
+            loaded
+                .records
+                .iter()
+                .map(|r| r.allocation.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(loaded.unreadable.len(), 1);
+        assert_eq!(loaded.unreadable[0].allocation_id, Some(2));
+        assert_eq!(loaded.unreadable[0].pid, Some(4242));
+        assert_eq!(loaded.unreadable[0].pid_start_time, Some(7));
+        assert_eq!(store.load()?.len(), 1);
+        Ok(())
+    }
+
+    /// A sibling identity whose state names this very process (alive, same
+    /// start time) is reported; this identity, a dead pid, and a recycled
+    /// one are not.
+    #[test]
+    fn other_identities_with_live_tasks_counts_only_their_live_processes_test() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let pid = std::process::id();
+        let started = process_start_time(pid).context("start time")?;
+        let write = |name: &str, records: Vec<serde_json::Value>| -> R<()> {
+            fs::create_dir_all(dir.path().join(name))?;
+            fs::write(
+                dir.path().join(name).join("worker_state.json"),
+                serde_json::to_string(&records)?,
+            )?;
+            Ok(())
+        };
+        write(
+            "old",
+            vec![
+                record(1, pid, Some(started)),
+                record(2, pid, Some(started - 60)),
+            ],
+        )?;
+        write("current", vec![record(3, pid, Some(started))])?;
+        write("gone", vec![record(4, u32::MAX - 1, None)])?;
+        assert_eq!(
+            other_identities_with_live_tasks(dir.path(), "current"),
+            vec![("old".to_string(), 1)]
+        );
+        Ok(())
+    }
 
     /// The /proc reading agrees with `sysinfo`, so a start time recorded
     /// before the switch still identifies its process.
@@ -759,6 +1047,7 @@ mod persist_cost_probe {
                     in_envelope: false,
                     resource_assignment: None,
                     stopping: None,
+                    terminal: None,
                 })
                 .collect();
             let bytes = serde_json::to_string_pretty(&records)?.len();

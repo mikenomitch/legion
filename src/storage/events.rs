@@ -745,13 +745,20 @@ pub mod drafts {
         move_count: u32,
         move_period_secs: u64,
         reason: &str,
+        stopped_instance: Option<&str>,
     ) -> EventDraft {
+        let outcome = match stopped_instance {
+            Some(instance_id) => {
+                format!("stopping keyed instance {instance_id}; the rest of the job keeps running")
+            }
+            None => format!("marking job {} failed", allocation.job_id),
+        };
         EventDraft::error(
             "allocation.reschedule_exhausted",
             format!(
                 "Allocation {} of task {task_name} failed after {moves} moves in {}s \
-                 (move_count {move_count}); marking job {} failed: {reason}",
-                allocation.id, move_period_secs, allocation.job_id
+                 (move_count {move_count}); {outcome}: {reason}",
+                allocation.id, move_period_secs
             ),
         )
         .job(&allocation.job_id)
@@ -766,6 +773,7 @@ pub mod drafts {
             "moveCount": move_count,
             "movePeriodSecs": move_period_secs,
             "reason": reason,
+            "instanceStopped": stopped_instance.is_some(),
         }))
     }
 
@@ -2894,6 +2902,7 @@ impl EventRecorder<'_> {
         move_count: u32,
         move_period_secs: u64,
         reason: &str,
+        stopped_instance: Option<&str>,
     ) {
         self.emit(drafts::allocation_reschedule_exhausted(
             allocation,
@@ -2902,6 +2911,7 @@ impl EventRecorder<'_> {
             move_count,
             move_period_secs,
             reason,
+            stopped_instance,
         ));
     }
 

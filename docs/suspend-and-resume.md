@@ -841,9 +841,11 @@ From then on:
   AWS credentials when `auth` is omitted), because the part URL sits under
   that node's `contentStore.url`. Cluster `artifacts.auth` matchers do not
   apply to parts. So every node that may restore the instance needs the same
-  `contentStore` url and auth as the node that published it. A node whose
-  `contentStore` points elsewhere has no credential for the part and fails
-  the restore saying so (see
+  `contentStore` url and auth as the node that published it. Placement
+  prefers such a node (see [Where a restore can run](#where-a-restore-can-run)).
+  A node whose `contentStore` points elsewhere, picked because no node
+  that holds the parts could take the instance, has no credential for the
+  part and fails the restore saying so (see
   [Which credential a reading node uses](artifacts.md#publishing-content)).
   The allocation shows
   `fetching snapshot` meanwhile. This includes the node that took the
@@ -1391,9 +1393,15 @@ pins its instance. When the node is down or full, the instance waits in
 `pending` and the placement error says why.
 
 A `published` snapshot has no pin. Every candidate node is checked against
-its `compat` block, the [`locality` score](artifacts.md#content-locality)
-prefers nodes holding its parts, and the chosen node fetches what it lacks
-before restoring. The same rule applies to every instance that restores from
+its `compat` block. Among the nodes that pass, those whose own
+`contentStore.url` holds every published part come first: they are the
+nodes that read the parts with a credential (see [Which credential a
+reading node uses](artifacts.md#publishing-content)). Each worker advertises
+its store's URL, never its `auth`, as the `contentStore` node attribute.
+When no candidate's store holds the parts, every candidate stays, and the
+restore fetches anonymously, which works only against a public store. Then
+the [`locality` score](artifacts.md#content-locality) prefers nodes holding
+the parts, and the chosen node fetches what it lacks before restoring. The same rule applies to every instance that restores from
 a snapshot, however it came to restore.
 
 A memory snapshot also records the VMM and CPU it was taken on. A node whose
@@ -1916,9 +1924,14 @@ The snapshot must be a `local` or `published`, `manual` snapshot of the same
 job and task. A suspend checkpoint belongs to its instance, and a fork
 checkpoint to its forks, so neither can seed new instances. A memory snapshot
 seeds only a task with the same network shape: a gated snapshot into a gated
-task, a TAP or loopback one into a task without gated networking. The other
-way round fails each restore by name (`restore needs gated networking: ...`),
-and `onRestoreFailure` decides. One call creates at most 64 instances.
+task, a TAP or loopback one into a task without gated networking. The shape
+is the task's `network.mode`, not its devices: every microVM guest has a
+vsock for `exec`, gated or not. The other way round fails each restore by
+name (`restore needs gated networking: ...` or `restore needs the guest's
+network layout: ...`), and `onRestoreFailure` decides. A memory snapshot
+taken before this rule recorded every microVM guest as gated, so restoring
+one into a task that is not gated is refused the same way; restart such an
+instance cold. One call creates at most 64 instances.
 
 ### Named snapshots
 

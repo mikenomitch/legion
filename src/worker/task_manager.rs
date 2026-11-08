@@ -16,7 +16,8 @@ use crate::worker::logs::{read_allocation_logs, CapturedStream};
 use crate::worker::resources::NodeResourceGovernor;
 use crate::worker::start_timing::{stage as start_stage, StartTimings};
 use crate::worker::state::{
-    pid_is_running, process_start_time, PersistedAllocation, PersistedStop, WorkerStateStore,
+    pid_is_running, process_start_time, PersistedAllocation, PersistedStop, PersistedTermination,
+    WorkerStateStore,
 };
 use crate::worker::task_health::{spawn_health_monitor, HealthMonitorHandle};
 use crate::worker::volumes::{volume_env, WorkerVolumeManager};
@@ -791,6 +792,12 @@ pub struct WorkerTaskManager {
     /// as this node's (the manager must not re-dispatch a finished allocation
     /// onto us), but the supervisor never polls them again.
     terminated: HashMap<i64, TaskExit>,
+    /// The terminal outcome of every allocation in `terminated` whose exit
+    /// was final (not one waiting on a restart), keyed like `terminated`,
+    /// with whether a manager has recorded it. Persisted with the allocation
+    /// ([`crate::worker::state::PersistedAllocation::terminal`]) so a worker
+    /// restart neither forgets a finished batch step nor runs it again.
+    terminal_outcomes: HashMap<i64, crate::worker::state::PersistedTermination>,
     /// Local restart attempts per allocation, shared by *both* restart paths:
     /// health-check failures and process exits. One budget, so a flapping task
     /// gets `on_unhealthy.restart_count` restarts in total rather than that
@@ -1039,6 +1046,7 @@ impl WorkerTaskManager {
             failed: Vec::new(),
             terminated_reports: Vec::new(),
             terminated: HashMap::new(),
+            terminal_outcomes: HashMap::new(),
             restart_history: HashMap::new(),
             stderr_marks: HashMap::new(),
             self_fence_windows: HashMap::new(),
@@ -2295,13 +2303,16 @@ impl WorkerTaskManager {
         }
         self.terminated.insert(allocation_id, exit.clone());
         self.set_allocation_health(allocation_id, success, exit.describe());
-        self.terminated_reports.push(TerminatedAllocationReport {
+        let report = TerminatedAllocationReport {
             allocation_id,
             success,
             exit_code: exit.exit_code,
             signal: exit.signal,
             message: exit.describe(),
-        });
+        };
+        self.terminal_outcomes
+            .insert(allocation_id, PersistedTermination::owed(&report));
+        self.terminated_reports.push(report);
         self.persist_state();
     }
 
@@ -2322,13 +2333,16 @@ impl WorkerTaskManager {
             },
         );
         self.set_allocation_health(allocation_id, true, message.clone());
-        self.terminated_reports.push(TerminatedAllocationReport {
+        let report = TerminatedAllocationReport {
             allocation_id,
             success: true,
             exit_code: None,
             signal: None,
             message,
-        });
+        };
+        self.terminal_outcomes
+            .insert(allocation_id, PersistedTermination::owed(&report));
+        self.terminated_reports.push(report);
     }
 
     /// Terminal outcomes owed to the manager, addressed by the ids it knows.
@@ -2371,6 +2385,21 @@ impl WorkerTaskManager {
         sent: Vec<TerminatedAllocationReport>,
         retry: &[i64],
     ) {
+        // Every report the manager did not hand back is recorded: a restart
+        // from here on keeps the allocation terminated but does not re-send.
+        let mut newly_recorded = false;
+        for report in sent.iter().filter(|r| !retry.contains(&r.allocation_id)) {
+            let local = self.local_key(report.allocation_id);
+            if let Some(outcome) = self.terminal_outcomes.get_mut(&local) {
+                if !outcome.recorded {
+                    outcome.recorded = true;
+                    newly_recorded = true;
+                }
+            }
+        }
+        if newly_recorded {
+            self.persist_state();
+        }
         if retry.is_empty() {
             return;
         }
@@ -2652,6 +2681,7 @@ impl WorkerTaskManager {
         self.self_fence_windows.remove(&allocation_id);
         self.envelope_sizes.remove(&allocation_id);
         self.terminated.remove(&allocation_id);
+        self.terminal_outcomes.remove(&allocation_id);
         self.terminating.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
         self.stderr_marks.remove(&allocation_id);
@@ -2997,6 +3027,7 @@ impl WorkerTaskManager {
         self.self_fence_windows.remove(&allocation_id);
         self.envelope_sizes.remove(&allocation_id);
         self.terminated.remove(&allocation_id);
+        self.terminal_outcomes.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
         self.artifact_status.remove(allocation_id);
         // A staging thread still fetching sees this and starts nothing.
@@ -5429,6 +5460,7 @@ impl WorkerTaskManager {
         // A relaunched process is a live process again: drop the terminal flag
         // so the supervisor resumes watching this allocation.
         self.terminated.remove(&allocation_id);
+        self.terminal_outcomes.remove(&allocation_id);
         self.set_allocation_health(allocation_id, false, "restarting");
         self.persist_state();
         if let Some(instance) = self.instances.get_mut(&allocation_id) {
@@ -5465,14 +5497,112 @@ impl WorkerTaskManager {
         self.health_monitors.insert(allocation_id, handle);
     }
 
+    /// Re-adopt an allocation whose task finished before the worker
+    /// restarted (see [`crate::worker::state::PersistedAllocation::terminal`]).
+    ///
+    /// It goes back into the live maps exactly as a finished allocation sits
+    /// there before a restart: in `instances` with no process, marked in
+    /// `terminated`, so the reconcile neither relaunches it nor stops it until
+    /// the manager drops it from the desired set. An outcome no manager
+    /// recorded is queued for the next heartbeat.
+    fn restore_terminated(&mut self, record: &PersistedAllocation, outcome: PersistedTermination) {
+        let allocation_id = record.allocation.id;
+        let alloc_dir = self.alloc_dir(allocation_id);
+        let task_dir = alloc_dir.join(&record.task.name);
+        let instance = TaskInstance {
+            pid: None,
+            log_dir: Some(self.state_store.allocation_log_dir(allocation_id)),
+            alloc_dir: Some(alloc_dir),
+            device_link_root: Some(self.device_link_root.clone()),
+            task_dir: Some(task_dir),
+            ..TaskInstance::default()
+        };
+        self.instances.insert(allocation_id, instance);
+        self.allocations
+            .insert(allocation_id, record.allocation.clone());
+        self.task_configs.insert(allocation_id, record.task.clone());
+        self.volume_specs
+            .insert(allocation_id, record.volumes.clone());
+        self.terminated.insert(
+            allocation_id,
+            TaskExit {
+                allocation_id,
+                task_name: record.task.name.clone(),
+                exit_code: outcome.exit_code,
+                signal: outcome.signal,
+                oom_killed_at_bytes: None,
+                stderr_tail: None,
+            },
+        );
+        self.set_allocation_health(allocation_id, outcome.success, outcome.message.clone());
+        info!(
+            allocation_id,
+            task_name = %record.task.name,
+            success = outcome.success,
+            recorded = outcome.recorded,
+            "Restored an allocation that finished before the worker restarted"
+        );
+        if !outcome.recorded {
+            self.terminated_reports.push(TerminatedAllocationReport {
+                allocation_id,
+                success: outcome.success,
+                exit_code: outcome.exit_code,
+                signal: outcome.signal,
+                message: outcome.message.clone(),
+            });
+        }
+        self.terminal_outcomes.insert(allocation_id, outcome);
+    }
+
     pub fn restore_allocations(&mut self) -> R<Vec<(Allocation, TaskConfig)>> {
-        let persisted = self.state_store.load()?;
+        let loaded = self.state_store.load_records()?;
+        if !loaded.unreadable.is_empty() {
+            // What a previous worker wrote in a shape this build cannot read
+            // is still running work nobody manages any more, and the manager
+            // will place it again. Stop it before anything else starts, and
+            // keep the file before the save below replaces it.
+            match self.state_store.preserve_unreadable_copy() {
+                Ok(copy) => warn!(
+                    unreadable = loaded.unreadable.len(),
+                    copy = %copy.display(),
+                    "The worker state file holds records this build cannot read; \
+                     stopping their processes"
+                ),
+                Err(err) => warn!(
+                    unreadable = loaded.unreadable.len(),
+                    error = ?err,
+                    "The worker state file holds records this build cannot read, and \
+                     a copy could not be kept; stopping their processes"
+                ),
+            }
+            for record in &loaded.unreadable {
+                stop_unreadable_record(record);
+            }
+        }
+        let persisted = loaded.records;
         let mut active = Vec::new();
         let mut restored = Vec::new();
         let mut restored_claims: Vec<(i64, i64, TaskConfig, String, bool)> = Vec::new();
         let mut resumed_stops = Vec::new();
 
         for mut record in persisted {
+            if let Some(terminal) = record.terminal.clone() {
+                // Finished before the restart: keep it as this node's
+                // terminated allocation, never relaunch it, and re-send its
+                // outcome if no manager recorded it.
+                if let Some(external_id) = record.external_id {
+                    restored_claims.push((
+                        record.allocation.id,
+                        external_id,
+                        record.task.clone(),
+                        record.allocation.job_id.clone(),
+                        record.in_envelope,
+                    ));
+                }
+                self.restore_terminated(&record, terminal);
+                active.push(record);
+                continue;
+            }
             let Some(pid) = record.pid else {
                 warn!(
                     allocation_id = record.allocation.id,
@@ -5487,7 +5617,13 @@ impl WorkerTaskManager {
                     // The tracked leader is gone, but its children may not
                     // be: kill the rest of the task's process group so
                     // nothing unmanaged keeps its ports (spot-check P1-5).
-                    let killed = crate::worker::state::kill_orphaned_task_group(pid);
+                    // The cgroup leaf also holds what left the group (a
+                    // `setsid` daemon, a container's init under runc).
+                    let killed = crate::worker::state::kill_orphaned_task_group(pid)
+                        | record
+                            .resource_assignment
+                            .as_ref()
+                            .is_some_and(crate::worker::resources::kill_cgroup);
                     warn!(
                         allocation_id = record.allocation.id,
                         task_name = %record.task.name,
@@ -5498,6 +5634,12 @@ impl WorkerTaskManager {
                     continue;
                 }
                 PersistedProcess::Recycled => {
+                    // The pid is someone else's now and is never signalled,
+                    // but this allocation's cgroup leaf is still its own:
+                    // anything left in it is the task's.
+                    if let Some(assignment) = record.resource_assignment.as_ref() {
+                        crate::worker::resources::kill_cgroup(assignment);
+                    }
                     warn!(
                         allocation_id = record.allocation.id,
                         task_name = %record.task.name,
@@ -5938,6 +6080,7 @@ impl WorkerTaskManager {
                     external_id: None,
                     in_envelope: true,
                     stopping: None,
+                    terminal: None,
                 })
             })
             .flatten();
@@ -6035,7 +6178,11 @@ impl WorkerTaskManager {
                 .instances
                 .get(allocation_id)
                 .and_then(|instance| instance.pid);
-            if pid.is_none() {
+            // A finished allocation has no process left, but it is persisted
+            // all the same: its outcome is what a restarted worker reports
+            // (or has reported) instead of running the task again.
+            let terminal = self.terminal_outcomes.get(allocation_id).cloned();
+            if pid.is_none() && terminal.is_none() {
                 // Allocations mid-staging have no pid yet by design; anything
                 // else without a pid is worth a warning.
                 if self.artifact_status.snapshot(*allocation_id).is_none()
@@ -6077,6 +6224,7 @@ impl WorkerTaskManager {
                     .by_local_key(*allocation_id)
                     .is_some_and(|claim| claim.is_session()),
                 stopping: None,
+                terminal,
             });
         }
 
@@ -6128,6 +6276,7 @@ impl WorkerTaskManager {
                 external_id: None,
                 in_envelope: false,
                 stopping: Some(stop),
+                terminal: None,
             });
         }
 
@@ -6204,6 +6353,50 @@ fn load_builtin_plugins_into(registry: &mut TaskPluginRegistry) {
 }
 
 /// What a persisted pid names today.
+/// SIGKILL one process (for a task that does not lead its own group).
+fn kill_pid(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid <= 1 || pid > i32::MAX as u32 {
+            return false;
+        }
+        // SAFETY: a plain libc call with a validated positive pid.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Stop what an unreadable persisted record describes
+/// ([`crate::worker::state::UnreadableRecord`]): everything in its cgroup
+/// leaf, and its process group when the pid is still the one it recorded
+/// (same start time; a record from before start times were persisted is
+/// taken on liveness alone, as a restore adopts it).
+fn stop_unreadable_record(record: &crate::worker::state::UnreadableRecord) {
+    let by_cgroup = record
+        .resource_assignment
+        .as_ref()
+        .is_some_and(crate::worker::resources::kill_cgroup);
+    let by_group = record.pid.is_some_and(|pid| {
+        let ours = match (process_start_time(pid), record.pid_start_time) {
+            (None, _) => false,
+            (Some(started), Some(recorded)) => started == recorded,
+            (Some(_), None) => true,
+        };
+        ours && (crate::worker::state::kill_orphaned_task_group(pid) || kill_pid(pid))
+    });
+    warn!(
+        allocation_id = ?record.allocation_id,
+        pid = ?record.pid,
+        stopped = by_cgroup || by_group,
+        error = %record.error,
+        "Stopped the process of a persisted allocation this build cannot read"
+    );
+}
+
 enum PersistedProcess {
     /// The task's own process, still running; `started` is its start time.
     Live { started: u64 },
@@ -9960,6 +10153,80 @@ mod tests {
         Ok(())
     }
 
+    /// Regression (TODO "Terminal batch reports are not persisted"): a worker
+    /// restarted between a batch exit and the heartbeat that reports it used
+    /// to forget the allocation, so the manager's next desired set made it
+    /// run the finished step again. The outcome is persisted with the
+    /// allocation: the restarted worker re-sends it, keeps the allocation
+    /// out of the pending set, and stops re-sending once it is recorded.
+    #[test]
+    fn a_terminal_outcome_survives_a_worker_restart_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({"command": ["sh", "-c", "exit 0"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        let mut exits = Vec::new();
+        for _ in 0..100 {
+            exits = manager.poll_task_exits();
+            if !exits.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let exit = exits.pop().expect("the task exits");
+        manager.record_termination(alloc().id, &exit, true);
+        // The worker dies here, before any heartbeat carried the report.
+        drop(manager);
+
+        let desired = TaskAllocation {
+            allocation_id: alloc().id,
+            task_name: "exec-task".into(),
+            ..provisional_payload(alloc().id)
+        };
+        let mut restarted = manager_in(&temp_dir);
+        assert!(
+            restarted.restore_allocations()?.is_empty(),
+            "a finished allocation has no process to monitor"
+        );
+        assert!(restarted.has_allocation(alloc().id));
+        assert!(
+            restarted
+                .reconcile_allocations(std::slice::from_ref(&desired))
+                .is_empty(),
+            "a finished allocation the manager still lists is not started again"
+        );
+        let owed = restarted.drain_terminations();
+        assert_eq!(owed.len(), 1);
+        assert_eq!(owed[0].allocation_id, alloc().id);
+        assert!(owed[0].success);
+        assert_eq!(owed[0].exit_code, Some(0));
+
+        // A manager records it (nothing handed back for a retry).
+        restarted.requeue_unrecorded_terminations(owed, &[]);
+        drop(restarted);
+
+        let mut again = manager_in(&temp_dir);
+        again.restore_allocations()?;
+        assert!(again.has_allocation(alloc().id));
+        assert!(again.reconcile_allocations(&[desired]).is_empty());
+        assert!(
+            again.drain_terminations().is_empty(),
+            "a recorded outcome is not sent again"
+        );
+        // Once the manager stops listing it, it is torn down and forgotten.
+        again.reconcile_allocations(&[]);
+        while again.has_terminating() || again.has_draining() {
+            thread::sleep(Duration::from_millis(20));
+            again.reap_terminating();
+        }
+        assert!(!again.has_allocation(alloc().id));
+        assert!(again.state_store.load()?.is_empty());
+        Ok(())
+    }
+
     /// A running process is not an exit, and a runtime that tracks no process
     /// is never polled at all.
     #[test]
@@ -11699,6 +11966,7 @@ mod tests {
             in_envelope: false,
             resource_assignment: None,
             stopping: None,
+            terminal: None,
         };
         let store = WorkerStateStore::new(state_path.clone());
         store.save(&[
@@ -11723,6 +11991,73 @@ mod tests {
             .load()?
             .iter()
             .all(|record| record.pid_start_time == Some(started)));
+        Ok(())
+    }
+
+    /// Regression (spot check P1-5): one record a restarted worker could not
+    /// read failed the whole restore. The worker came up with no record of
+    /// any running task, overwrote the file, and the manager's desired set
+    /// started a second copy of each. Now the readable records are restored,
+    /// the unreadable one's process is stopped, and the file is kept.
+    #[test]
+    fn restore_stops_tasks_whose_record_cannot_be_read_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_path = temp_dir.path().join("worker_state.json");
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({"command": ["sleep", "30"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        manager.run_allocation(&Allocation { id: 1, ..alloc() }, &task)?;
+        manager.run_allocation(&Allocation { id: 2, ..alloc() }, &task)?;
+        let unreadable_pid = manager.allocation_pid(1).expect("pid");
+        let readable_pid = manager.allocation_pid(2).expect("pid");
+
+        // Another release wrote record 1 in a shape this build cannot read.
+        let mut records: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&state_path)?)?;
+        for record in &mut records {
+            if record["allocation"]["id"] == json!(1) {
+                record["allocation"]["status"] = json!({ "unexpected": "shape" });
+            }
+        }
+        std::fs::write(&state_path, serde_json::to_string(&records)?)?;
+
+        let mut restarted = manager_in(&temp_dir);
+        let restored = restarted
+            .restore_allocations()?
+            .into_iter()
+            .map(|(allocation, _)| allocation.id)
+            .collect::<Vec<_>>();
+        assert_eq!(restored, vec![2], "the readable record is still restored");
+
+        // `manager` is still the killed process's parent: reap it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pid_is_running(unreadable_pid) && std::time::Instant::now() < deadline {
+            manager.poll_task_exits();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !pid_is_running(unreadable_pid),
+            "the unreadable record's process is stopped, not left to run twice"
+        );
+        assert!(
+            pid_is_running(readable_pid),
+            "the restored task keeps running"
+        );
+        let kept = std::fs::read_dir(temp_dir.path())?
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("worker_state.json.unreadable-")
+            })
+            .count();
+        assert_eq!(kept, 1, "the file the previous worker wrote is kept");
+
+        restarted.stop_allocation(2)?;
+        manager.stop_allocation(2)?;
         Ok(())
     }
 

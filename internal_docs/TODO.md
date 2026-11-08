@@ -128,11 +128,13 @@ How to use it:
         (`LEGION_OCI_RUNTIME=crun cargo test --lib oci_runtime_security -- --ignored`).
         Only runc 1.5 was available when it was built, so crun is
         supported on trust (calls 40).
-  - [ ] `container: pass` readiness means the runtime is an installed runc
-        or crun, but not that it is new enough. A runc older than 1.2
-        advertises it and fails every default (`userNamespace = true`)
-        start. Consider a separate readiness key for idmapped-mount support
-        so the scheduler can avoid such nodes (calls 40).
+  - [x] `container: pass` readiness means the runtime is an installed runc
+        or crun, but not that it is new enough (fixed 2026-11-08). A worker on
+        runc before 1.2 advertises `container.idmappedMounts = "unsupported"`,
+        and a user-namespaced container task carries the implicit constraint
+        `container.idmappedMounts is_not_set`, so it is not placed there
+        ([plan](plans/launch-blockers-and-security-gaps-plan.md) · [calls #11](calls/launch-blockers-and-security-gaps-plan_calls.md) ·
+        [docs](../docs/installation.md)).
   - [ ] An `exec` task with a `user` still can't reach a `local-dir`
         volume's host path (`<state dir>/volumes/…` is owner-only, as the
         whole state dir was before). Volume data dirs are created
@@ -167,12 +169,28 @@ How to use it:
         host guard and pinned to the judged addresses (2026-10-17;
         [calls #6](calls/security-gap-closure-plan_calls.md),
         [docs](../docs/artifacts.md#what-the-host-guard-checks)).
-  - [ ] Git and OCI artifact fetches, `authz` webhooks, and the worker's own
-        calls are still not judged (calls entry 23 here). Git shells out and
-        `oci-client` builds its own HTTP client, so neither takes a pinned
-        resolver; an `s3://` `endpoint` is judged before the fetch but the
-        S3 client resolves it again. Revisit if `authz` ever returns data to
-        the task.
+  - [x] Git, OCI, and S3 artifact fetches are judged by the host guard
+        (2026-11-08). Git is pinned (`http.curloptResolve`, no redirects, ssh
+        `HostName`), refuses `git://`, and skips LFS smudge; an OCI registry
+        and an S3 endpoint (the query's or the KV credential's) are judged
+        before any request, and S3 regions are validated
+        ([plan](plans/launch-blockers-and-security-gaps-plan.md) · [calls #8](calls/launch-blockers-and-security-gaps-plan_calls.md) ·
+        [docs](../docs/artifacts.md#what-the-host-guard-checks)).
+  - [ ] OCI and S3 fetches are judged but not pinned: oci-client and
+        object_store resolve the host again and follow redirects (a blob's
+        CDN, the token `realm`, an S3 `302`) unjudged. An S3 endpoint that
+        passes the check can redirect to a guarded address and the response
+        lands in the task directory. Needs a worker-local guarded forward
+        proxy (CONNECT and absolute-form HTTP) or object_store 0.12's
+        connector hook, which is tied to rustyriver's object_store version
+        ([plan §9](plans/launch-blockers-and-security-gaps-plan.md)).
+  - [ ] The manager's own `resolve = "pin"` lookups at submit (`git
+        ls-remote`, the OCI tag `HEAD`) go to hosts the job chose and are
+        not judged: the manager has no host guard
+        (`src/manager/server.rs`, `FetchLimits::default()`).
+  - [ ] `authz` webhooks and the worker's own calls are still not judged
+        (calls entry 23 here). Revisit if `authz` ever returns data to the
+        task.
   - [ ] `legion net policy test` judges only the host guard's built-in
         classes, not a node's own addresses or its `hostGuard` entries
         (calls entry 27).
@@ -192,10 +210,13 @@ How to use it:
           and `set_task_status` (status lane) records it. Both forward from a
           follower (`SetTaskStatus` is a new forwardable op). Covered by
           `tests/integration/raft_ownership_guard.rs` and `tests/integration/raft_follower_writes.rs`.
-    - [ ] In the `lanes` topology the dependency eval can run before the
+    - [x] In the `lanes` topology the dependency eval can run before the
           scheduler leader applies the status-lane write, and then nothing
-          re-evaluates the job (`docs/multi-raft.md`, "Non-leader write
-          redirects and forwarding"). `single` is not affected.
+          re-evaluated the job (fixed 2026-11-08). The scheduler now also
+          reads the finished replicas' rows on its own lane
+          (`Store::batch_outcomes_for_job_config`), which raft orders before
+          the eval ([plan](plans/launch-blockers-and-security-gaps-plan.md) · [calls #5](calls/launch-blockers-and-security-gaps-plan_calls.md) ·
+          [docs](../docs/multi-raft.md)).
     - [x] A terminal report the manager can't record (row not applied yet,
           forward to the lane leader failed) is handed back in
           `HeartbeatReply.retry_terminated_allocations` and re-sent, instead
@@ -210,8 +231,13 @@ How to use it:
           is handed back in `HeartbeatReply.retry_failed_allocations` and
           re-sent, instead of being logged and lost
           (`handle_failed_allocations`, `docs/task-supervision.md`).
-    - [ ] Explain the missing sidecar: the plan placed `fetch` and
-          `progress`, but only `fetch` has an allocation row.
+    - [x] Explain the missing sidecar: the plan placed `fetch` and
+          `progress`, but only `fetch` had an allocation row (fixed
+          2026-11-08). The resubmit's rollout retired `progress` (a sidecar)
+          while the batch retire window kept the running `fetch` beside it.
+          A sidecar now waits with a held batch step of its group on its node
+          ([plan](plans/launch-blockers-and-security-gaps-plan.md) ·
+          [docs](../docs/rollouts.md#lifecycle-specific-behavior)).
     - [ ] Rerun `05-dag.ncl` on the 3-manager rig to confirm.
   - [ ] **A resubmitted DAG job's rollout never progresses (2026-10-12
         rerun).** `05-dag.ncl --var run=<new>` started a rollout that logged
@@ -233,7 +259,7 @@ How to use it:
           window froze it. Once the resubmit superseded that version, the
           scheduler and `queue_dependency_progress` skip it by design, and
           the new version's `serve` replaces it.
-    - [ ] A config under rollout releases its held dependents through a
+    - [x] A config under rollout releases its held dependents through a
           `rollout_tick`, so a rollout that is paused, waiting for a manual
           advance, or stuck on anything else freezes the DAG along with it.
           Decide whether a dependency release should place through the
@@ -278,33 +304,60 @@ How to use it:
           ([calls](calls/gated-restore-datapath-wait_calls.md),
           [docs](../docs/suspend-and-resume.md)). Unit-tested, not yet
           re-run on the rig.
-    - [ ] Every microVM sandbox has a vsock (for exec), so every checkpoint
-          records `network = gated` and every restore sets
+    - [x] Every microVM sandbox has a vsock (for exec), so every checkpoint
+          recorded `network = gated` and every restore set
           `RestoreTarget.vsock`.
       - [x] A non-gated (TAP or loopback-only) sandbox waited the full 5s
             `DATAPATH_WAIT` and warned on every restore. The wait now keys
             off `RestoreTarget.gated`, the allocation's network mode
             ([calls #2](calls/gated-restore-datapath-wait_calls.md)).
-      - [ ] The gated-vs-TAP refusal in `check_restorable` still never
-            fires, because the checkpoint's recorded `network` and
-            `RestoreTarget::network` still key off the vsock device. Derive
-            both from the allocation's network mode. The Firecracker
-            vsock-move refusal (`gated_memory_checkpoint_refusal`) keys off
-            the same field and really is about the device, so split the two
-            meanings rather than renaming one.
+      - [x] The gated-vs-TAP refusal in `check_restorable` never fired,
+            because the checkpoint's recorded `network` and
+            `RestoreTarget::network` keyed off the vsock device (fixed
+            2026-11-08). Both now come from the allocation's network mode;
+            the checkpoint records the vsock as its own `vsock` field, which
+            the Firecracker vsock-move refusal keys off. Checkpoints taken
+            before the change read as gated
+            ([plan](plans/launch-blockers-and-security-gaps-plan.md) · [calls #10](calls/launch-blockers-and-security-gaps-plan_calls.md) ·
+            [docs](../docs/suspend-and-resume.md)).
     - [ ] Rerun the store suspend and cross-node resume on the rig.
-    - [ ] Placement ignores which `contentStore` a node has, so a resume can
-          land on a node pointed at another bucket and fail. Prefer or
-          require nodes whose `contentStore.url` covers the part URLs.
+    - [x] Placement ignored which `contentStore` a node has, so a resume
+          could land on a node pointed at another bucket and fail (fixed
+          2026-11-08). Workers advertise their store URL (`contentStore`
+          node attribute), and a published restore prefers nodes whose store
+          covers every part URL, falling back to the rest when none is
+          eligible ([plan](plans/launch-blockers-and-security-gaps-plan.md) · [calls #9](calls/launch-blockers-and-security-gaps-plan_calls.md) ·
+          [docs](../docs/suspend-and-resume.md#where-a-restore-can-run)).
     - [ ] A node has no way to read a store other than its own (no per-store
           read credentials, and cluster `artifacts.auth` never reaches part
           URLs). Decide whether cross-store restores are worth a surface.
-  - [ ] **Tasks orphaned after a worker re-join (P1-5)** are only partly
-        fixed: a restore kills a task's leftover process group and the
-        systemd guidance is documented, but the root cause was never
-        reproduced ([plan §8.4](plans/launch-spot-check-fixes-plan.md)).
+  - [ ] **Tasks orphaned after a worker re-join (P1-5)** ([plan §8.4](plans/launch-spot-check-fixes-plan.md)).
         Every other P0, P1, and P2 from this run is fixed (Done, "Pre-launch
         spot check (2026-10-11)").
+    - [x] The likely root cause, found by reading the code (2026-11-08): the
+          worker state file was parsed in one piece, so one record a new
+          build could not read failed the whole restore; the worker came up
+          with no record of its running tasks, overwrote the file, and the
+          manager started second copies. It is now read record by record; an
+          unreadable record's process is stopped (cgroup leaf, then process
+          group) and the file kept as `worker_state.json.unreadable-<ts>`
+          ([plan](plans/launch-blockers-and-security-gaps-plan.md) · [calls #6](calls/launch-blockers-and-security-gaps-plan_calls.md) ·
+          [docs](../docs/upgrades.md)).
+    - [x] A dead or recycled record now also kills its allocation's cgroup
+          leaf, which holds what left the process group (a `setsid` daemon,
+          a runc container's init).
+    - [x] The systemd guidance said `KillMode=control-group` kills tasks;
+          with enforcement on they sit outside the unit's cgroup. Corrected
+          ([docs](../docs/architecture-managers-workers.md)).
+    - [ ] A worker started under a new `--name` in the same data dir only
+          warns that another identity left tasks running
+          (`other_identities_with_live_tasks`); it does not stop them,
+          because another worker may run under that name. A per-identity
+          lock would let it ([calls #7](calls/launch-blockers-and-security-gaps-plan_calls.md)).
+    - [ ] Unratified provisional claims are never persisted, so a worker
+          crash leaves them running with nothing to stop them.
+    - [ ] Reproduce on the rig, re-running `install.sh` over a worker with
+          running tasks.
 
 - [ ] **Pre-launch spot check findings (2026-10-11), from reading the code
       while preparing the AWS run.** Each is verified in source unless marked
@@ -356,14 +409,14 @@ How to use it:
         Smoke-test edge-boot speculative dispatch in particular: the
         dispatcher read `protocolVersion` from the wrong attribute map, so
         it had never fired for a real worker before #17.
-  - [ ] **`move_count` is counted per task, even for keyed tasks.** The
-        reschedule backoff runs per instance (2026-10-12 re-run fixes, in
-        Done), but the job-failing budget still counts every move of the
-        task inside `move_period`, so with `move_count` set, a few
-        unrelated sandboxes failing fails the whole keyed job. A per-instance
-        budget that fails (or stops) just the instance is the likely shape
-        (`Store::remove_failed_allocation` in
-        `src/storage/store/reschedule_holds.rs`).
+  - [x] **`move_count` is counted per task, even for keyed tasks** (fixed
+        2026-11-08). A keyed instance now counts its own moves, and spending
+        its budget stops just that instance (`MoveVerdict::InstanceStopped`,
+        `instanceStopped` on `allocation.reschedule_exhausted`); `legion
+        instance start` retries it with a fresh budget. Slot instances and
+        stateless tasks keep the task's budget ([plan](plans/launch-blockers-and-security-gaps-plan.md) ·
+        [calls #3](calls/launch-blockers-and-security-gaps-plan_calls.md) ·
+        [docs](../docs/jobs-tasks-and-scheduling.md#manager-side-move-logic)).
   - [x] **A worker-reported failure leaves no `last_stop` on the
         instance** (fixed 2026-10-19). The failure path now stops with a new
         `failed` cause and records `Failed on node <node>: <reason>` as the
@@ -427,16 +480,26 @@ How to use it:
         write forwarding (calls 3). Shipped 2026-10-19 as
         `legion_leader_forwards_total{lane,op,outcome}`
         ([metrics.md](../docs/metrics.md#raft)).
-  - [ ] **Terminal batch reports are not persisted.** A worker restarted
-        between a batch exit and the heartbeat that reports it cannot know
-        the exit status, so the completed step is rescheduled and runs again.
-  - [ ] **`TerminatedAllocation.success = false` is never sent**: every
-        unsuccessful terminal exit takes the failure (reschedule) path,
-        including `restart.policy = "never"`. Route `never` through it or
-        drop the field.
-  - [ ] **`legion exec` into a gated `exec` task runs in the host network
-        namespace** (`ExecOptions` has no namespace field), and a pushed
-        gated task's datapath listeners bind only at the next heartbeat.
+  - [x] **Terminal batch reports are not persisted** (fixed 2026-11-08). A
+        worker restarted between a batch exit and the heartbeat that reported
+        it forgot the allocation, and the completed step ran again. The
+        outcome is now persisted with the allocation (`terminal`, with
+        whether a manager recorded it); a restarted worker keeps it
+        terminated and re-sends an unrecorded outcome
+        ([plan](plans/launch-blockers-and-security-gaps-plan.md) ·
+        [docs](../docs/task-supervision.md#batch-tasks-and-real-completion)).
+  - [x] **`TerminatedAllocation.success = false` is never sent** (fixed
+        2026-11-08). `restart.policy = "never"` now routes an unsuccessful
+        exit through it: the allocation ends `failed` and is not moved
+        ([plan](plans/launch-blockers-and-security-gaps-plan.md) · [calls #2](calls/launch-blockers-and-security-gaps-plan_calls.md) ·
+        [docs](../docs/task-supervision.md#the-restart-block)).
+  - [x] **`legion exec` into a gated `exec` task runs in the host network
+        namespace** (fixed 2026-11-08). `ExecOptions.netns` starts the
+        session in the task's namespace, and a session into a gated task
+        whose namespace is gone fails ([plan](plans/launch-blockers-and-security-gaps-plan.md) ·
+        [docs](../docs/exec-and-actions.md)).
+  - [ ] **A pushed gated task's datapath listeners bind only at the next
+        heartbeat.** Split from the item above, which is fixed.
   - [ ] **Removed-allocation history and worker log retention disagree**:
         the manager forgets a removed allocation after 24h, the worker keeps
         its logs 7 days. Add a `--node` override or a configurable retention.
@@ -4443,20 +4506,6 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
         prefix to `sessions/_fence/`
         ([call 11](calls/namespaces-plan_calls.md)). No installed base needs
         a reader for the old paths today; add one if that changes.
-- [ ] **Node caches serve private images to jobs without credentials for
-      them.** A digest the node already holds is served "with no registry
-      request". A tag whose registry lookup fails, auth failures included,
-      falls back to the node's last-resolved digest
-      (`src/artifacts/fetchers/oci.rs:611-621, :701`). So a job that can't
-      pull a private image runs it anyway if another job pulled it to the
-      same node. This is the problem Kubernetes' `AlwaysPullImages` admission
-      plugin exists for. It becomes tenant-to-tenant once namespaces ship,
-      and [namespaces-plan.md § 8.6](plans/namespaces-plan.md) lists it as a
-      known limitation until fixed. Likely fix: check the task's own
-      credentials against the registry (one manifest `HEAD`) before serving a
-      cached private image, and fall back on registry *unavailability* only,
-      never on an auth failure. Found during namespace recon (inferred from
-      the code, not yet reproduced).
 - [ ] **The template collision guard reveals whether a job exists.**
       `enforce_template_collision_guard` (`src/manager/server.rs:2574-2607`)
       answers "job '…' already exists" to a template-only submitter who may
@@ -7981,6 +8030,38 @@ Found on the live AWS rig (3 raft managers, 2 workers).
       [docs](../docs/cluster-ca.md)
 - [x] **VIP blocks follow the node's OS.** Placement asked the manager's own
       OS, so a macOS manager gave its Linux nodes no VIP blocks.
+
+## Launch blockers and security gaps (2026-11-08)
+
+[plan](plans/launch-blockers-and-security-gaps-plan.md) ·
+[calls](calls/launch-blockers-and-security-gaps-plan_calls.md). The Tier 1
+spot-check bugs and four security gaps; each fix has a regression test, none
+has run on the rig yet. The items that sit under a still-open parent are
+checked off in place above.
+
+- [x] **Node caches no longer serve private images to jobs without
+      credentials for them.** The node content store records which
+      repository each image was verified from and whether it was public
+      there (`image_source`). A pull is served from the cache only for that
+      repository, and only when public or the registry accepts the job's
+      credential (a 10-minute grant, or one manifest `HEAD` by digest); a
+      refusal fails the pull, and only registry *unavailability* falls back
+      to a cached tag ([calls #1](calls/launch-blockers-and-security-gaps-plan_calls.md),
+      [docs](../docs/artifacts.md#who-a-cached-image-is-served-to)). Closes
+      the limitation in [namespaces-plan.md § 8.6](plans/namespaces-plan.md).
+- [x] **The lanes dependency stall, the rollout DAG freeze, the missing
+      sidecar, and the fractional-step deadlock** (under "Launch blockers
+      from the AWS spot check" above).
+- [x] **Worker state is read record by record; finished batch outcomes
+      survive a restart; `never` ends a failed task** (under "Launch
+      blockers" and "Follow-ups from the 2026-10-11 spot-check fixes").
+- [x] **Keyed instances spend their own move budget**, **published
+      restores prefer a node whose `contentStore` holds their parts**, and
+      **the gated-vs-TAP restore refusal fires** (same places).
+- [x] **Git, OCI, and S3 artifact fetches are judged by the host guard**,
+      **`legion exec` joins a gated task's namespace**, and **old runc is
+      kept out of user-namespaced placements** (under "Launch blocker:
+      workers on another host ...").
 
 ## Security gap closure (2026-10-17)
 

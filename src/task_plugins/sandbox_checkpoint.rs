@@ -170,6 +170,14 @@ pub(crate) struct SandboxCheckpointState {
     /// ever checkpointed before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<GuestNetwork>,
+    /// Whether the guest has a vsock device. Every microVM sandbox does
+    /// (exec dials it), gated or not, so this is not the network shape: it
+    /// is what a restore must move to the restoring allocation's socket,
+    /// which an old Firecracker cannot do. Absent on checkpoints taken
+    /// before the two were recorded apart, which read it from
+    /// [`Self::network`] ([`Self::has_vsock`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vsock: Option<bool>,
     /// The address a TAP guest held from its bridge's pool, so a resume
     /// asks for it again first (docs/task-runtime-sandbox.md, "Addressing").
     /// Absent for gated and loopback-only guests, and on checkpoints taken
@@ -285,6 +293,7 @@ pub(crate) fn write_guest_ports_record(scratch: &Path, ports: &[(&str, u16)]) ->
     write_boot_record(
         scratch,
         &SandboxCheckpointState {
+            vsock: None,
             vmm: "firecracker".into(),
             link_key: "sbx-test".into(),
             link_dir: None,
@@ -310,6 +319,7 @@ pub(crate) fn write_guest_upstreams_record(scratch: &Path, upstreams: &[(&str, u
     write_boot_record(
         scratch,
         &SandboxCheckpointState {
+            vsock: None,
             vmm: "firecracker".into(),
             link_key: "sbx-test".into(),
             link_dir: None,
@@ -336,6 +346,13 @@ impl SandboxCheckpointState {
         } else {
             GuestNetwork::None
         })
+    }
+
+    /// Whether the guest has a vsock device a restore must move. Older
+    /// checkpoints recorded it as the network shape, `gated` for every
+    /// guest with a vsock.
+    pub(crate) fn has_vsock(&self) -> bool {
+        self.vsock.unwrap_or(self.network() == GuestNetwork::Gated)
     }
 }
 
@@ -582,13 +599,18 @@ pub(crate) fn prepare_checkpoint_launch(
         vcpus: spec.vcpus,
         memory_mib: spec.memory_mib,
         tap: spec.tap.as_ref().map(|tap| tap.device.clone()),
-        network: Some(if spec.vsock.is_some() {
-            GuestNetwork::Gated
-        } else if spec.tap.is_some() {
-            GuestNetwork::Tap
-        } else {
-            GuestNetwork::None
-        }),
+        // The shape the allocation's network mode gives the guest, not its
+        // devices: every microVM guest has a vsock for exec, so keying this
+        // off the vsock recorded every checkpoint as gated, and the
+        // gated-vs-TAP refusal in `check_restorable` never fired.
+        network: Some(guest_network(
+            allocation
+                .network
+                .as_ref()
+                .is_some_and(crate::structs::AllocNetwork::is_gated),
+            spec.tap.is_some(),
+        )),
+        vsock: Some(spec.vsock.is_some()),
         guest_address: crate::task_plugins::sandbox_addr::read_lease(scratch)
             .map(|lease| lease.address.to_string()),
         guest_ports: boot_guest_ports(allocation.network.as_ref()),
@@ -682,7 +704,9 @@ pub(crate) fn checkpoint_microvm(
     // old Firecracker cannot do. Refused before the pause, so the guest
     // never stops for a checkpoint that could not be restored. The manager
     // refuses the same thing first; this covers the node's own suspends.
-    if state.network() == GuestNetwork::Gated {
+    // Keyed off the device, not the network shape: a guest that is not
+    // gated still has a vsock for exec, and its restore moves it too.
+    if state.has_vsock() {
         if let Some(refusal) = crate::structs::fork::gated_memory_checkpoint_refusal(
             &format!("sandbox allocation {}", allocation.id),
             &allocation.node_id,
@@ -1578,15 +1602,23 @@ pub(crate) struct RestoreTarget<'a> {
 }
 
 impl RestoreTarget<'_> {
-    /// The network shape the task's current config gives a guest.
+    /// The network shape the task's current config gives a guest: its
+    /// allocation's network mode, not whether it has a vsock (every
+    /// restore moves one, for exec).
     fn network(&self) -> GuestNetwork {
-        if self.vsock.is_some() {
-            GuestNetwork::Gated
-        } else if self.tap.is_some() {
-            GuestNetwork::Tap
-        } else {
-            GuestNetwork::None
-        }
+        guest_network(self.gated, self.tap.is_some())
+    }
+}
+
+/// The guest network shape for an allocation that is (or is not) gated and
+/// does (or does not) wire a TAP.
+fn guest_network(gated: bool, tap: bool) -> GuestNetwork {
+    if gated {
+        GuestNetwork::Gated
+    } else if tap {
+        GuestNetwork::Tap
+    } else {
+        GuestNetwork::None
     }
 }
 
@@ -1904,6 +1936,7 @@ pub(crate) fn restore_microvm(
     // from it per connection: the first ingress connection after the resume
     // must already reach the port the restored workload holds.
     let next = SandboxCheckpointState {
+        vsock: Some(state.has_vsock() || target.vsock.is_some()),
         link_dir: Some(links.dir().to_path_buf()),
         tap: moved_to.clone().or_else(|| state.tap.clone()),
         network: Some(state.network()),
@@ -2070,6 +2103,14 @@ mod tests {
         }
     }
 
+    /// [`alloc`] with a gated network.
+    fn gated_alloc(id: i64) -> Allocation {
+        Allocation {
+            network: Some(serde_json::from_value(json!({ "mode": "gated" })).expect("network")),
+            ..alloc(id)
+        }
+    }
+
     fn manifest_for(state: &SandboxCheckpointState, memory: MemoryParts) -> SnapshotManifest {
         SnapshotManifest {
             api_version: crate::structs::checkpoint::MANIFEST_API_VERSION,
@@ -2096,6 +2137,7 @@ mod tests {
     #[test]
     fn a_restored_guest_keeps_its_captured_ports_and_upstreams() {
         let state = SandboxCheckpointState {
+            vsock: None,
             vmm: "firecracker".into(),
             link_key: "sbx-k".into(),
             link_dir: None,
@@ -2139,6 +2181,7 @@ mod tests {
     #[test]
     fn restore_refuses_another_vmm_or_guest_shape() {
         let state = SandboxCheckpointState {
+            vsock: None,
             vmm: "firecracker".into(),
             link_key: "sbx-k".into(),
             link_dir: None,
@@ -2751,6 +2794,7 @@ mod tests {
         };
         let allocation = alloc(9);
         let state = |network: Option<GuestNetwork>, tap: Option<&str>| SandboxCheckpointState {
+            vsock: None,
             vmm: "firecracker".into(),
             link_key: "sbx-k".into(),
             link_dir: None,
@@ -2826,6 +2870,7 @@ mod tests {
         }))?;
         assert_eq!(old.network(), GuestNetwork::None);
         let gated = SandboxCheckpointState {
+            vsock: None,
             network: Some(GuestNetwork::Gated),
             ..old
         };
@@ -2873,7 +2918,7 @@ mod tests {
         };
         prepare_checkpoint_launch(
             backend,
-            &alloc(id),
+            &gated_alloc(id),
             "box",
             &instance,
             &scratch,
@@ -2881,6 +2926,84 @@ mod tests {
             &GuestTokens::default(),
         )?;
         Ok((instance, scratch, spec))
+    }
+
+    /// Regression (TODO "Every microVM sandbox has a vsock"): the network a
+    /// checkpoint records is the allocation's mode, not its devices. Every
+    /// microVM guest has a vsock for exec, so a TAP or loopback-only
+    /// sandbox used to record `gated`, and the gated-vs-TAP refusal never
+    /// fired. The vsock is recorded on its own, for the restore that must
+    /// move it.
+    #[test]
+    fn a_sandbox_that_is_not_gated_records_its_own_network_and_its_vsock() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let fc = Backend::Firecracker {
+            binary: "/usr/bin/true".into(),
+        };
+        let instance = TaskInstance {
+            alloc_dir: Some(tmp.path().join("allocs/5")),
+            checkpoint_launch: true,
+            ..TaskInstance::default()
+        };
+        let scratch = instance.alloc_dir.clone().unwrap().join(".sandbox");
+        std::fs::create_dir_all(&scratch)?;
+        std::fs::write(scratch.join("rootfs.img"), b"root")?;
+        let mut spec = VmSpec {
+            name: "legion-sbx-5".into(),
+            kernel: PathBuf::from("/vmlinux"),
+            extra_cmdline: None,
+            root_disk: scratch.join("rootfs.img"),
+            volume_disks: Vec::new(),
+            vcpus: 1,
+            memory_mib: 256,
+            tap: None,
+            api_socket: scratch.join("vmm.sock"),
+            vsock: Some(microvm::VsockSpec {
+                socket: scratch.join("vsock.sock"),
+            }),
+            identity_disk: None,
+            balloon: None,
+        };
+        let state = prepare_checkpoint_launch(
+            &fc,
+            &alloc(5),
+            "box",
+            &instance,
+            &scratch,
+            &mut spec,
+            &GuestTokens::default(),
+        )?;
+        assert_eq!(state.network(), GuestNetwork::None);
+        assert!(state.has_vsock(), "the exec vsock is still recorded");
+
+        let allocation = alloc(6);
+        let target = |gated: bool| RestoreTarget {
+            backend: &fc,
+            allocation: &allocation,
+            task_name: "box",
+            hostname: "legion-sbx-6".into(),
+            vcpus: 1,
+            memory_mib: 256,
+            scratch: PathBuf::from("/allocs/6/.sandbox"),
+            tap: None,
+            bridge: None,
+            // Every restore target has one, gated or not.
+            vsock: Some(PathBuf::from("/allocs/6/.sandbox/vsock.sock")),
+            gated,
+            datapath_wait: DATAPATH_WAIT,
+            memory_restore: MemoryRestore::Lazy,
+            userfaultfd: false,
+        };
+        let manifest = manifest_for(&state, MemoryParts::default());
+        assert!(check_restorable(&manifest, &target(false)).is_ok());
+        // Restored into a task that is now gated, it is refused by name.
+        let err = check_restorable(&manifest, &target(true)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("now gated (a vsock datapath and no NIC)"),
+            "{err}"
+        );
+        Ok(())
     }
 
     /// Gated plan §6.2 and §9, the device-link trap: fork one gated
@@ -3014,6 +3137,7 @@ mod tests {
             )?,
         )?;
         let state = SandboxCheckpointState {
+            vsock: None,
             vmm: "cloud-hypervisor".into(),
             link_key: "sbx-gated".into(),
             link_dir: None,
@@ -3133,6 +3257,7 @@ mod tests {
             )?,
         )?;
         let state = SandboxCheckpointState {
+            vsock: None,
             vmm: "cloud-hypervisor".into(),
             link_key: "sbx-gated".into(),
             link_dir: None,
@@ -3205,6 +3330,7 @@ mod tests {
             )?,
         )?;
         let state = SandboxCheckpointState {
+            vsock: Some(true),
             vmm: "cloud-hypervisor".into(),
             link_key: "sbx-ungated".into(),
             link_dir: None,
@@ -3212,7 +3338,9 @@ mod tests {
             vcpus: 1,
             memory_mib: 256,
             tap: None,
-            network: Some(GuestNetwork::Gated),
+            // What a sandbox that is not gated records: no network, and the
+            // exec vsock on its own.
+            network: Some(GuestNetwork::None),
             guest_address: None,
             guest_ports: BTreeMap::new(),
             guest_upstreams: BTreeMap::new(),
@@ -3303,7 +3431,7 @@ mod tests {
         };
         prepare_checkpoint_launch(
             backend,
-            &alloc(id),
+            &gated_alloc(id),
             "box",
             instance,
             &scratch,
@@ -4243,6 +4371,7 @@ mod tests {
         let out = CheckpointDir::create(dir.path().join("ckpt"))?;
         std::fs::write(out.part_path(parts::ROOTFS), b"root")?;
         let state = SandboxCheckpointState {
+            vsock: None,
             vmm: "firecracker".into(),
             link_key: "sbx-tap".into(),
             link_dir: None,
