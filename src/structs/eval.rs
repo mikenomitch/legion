@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use std::{cmp, thread};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::manager::dispatcher::dispatch_allocations;
 use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
@@ -183,7 +183,12 @@ impl Eval {
         }
         let outcome = self.schedule_job_allocations(store, PlanMode::Fresh)?;
         if !outcome.deltas.is_empty() {
-            info!(?outcome.deltas, "Job submit allocation deltas");
+            debug!(
+                job_id = %self.job_id,
+                affected_nodes = outcome.deltas.len(),
+                placed = outcome.allocations.len(),
+                "Job submit allocation deltas"
+            );
         }
 
         let finish_started = Instant::now();
@@ -269,7 +274,12 @@ impl Eval {
             }
         };
         if !outcome.deltas.is_empty() {
-            info!(?outcome.deltas, "Job update allocation deltas");
+            debug!(
+                job_id = %self.job_id,
+                affected_nodes = outcome.deltas.len(),
+                placed = outcome.allocations.len(),
+                "Job update allocation deltas"
+            );
         }
 
         let finish_started = Instant::now();
@@ -370,7 +380,12 @@ impl Eval {
         }
         let outcome = self.schedule_job_allocations(store, PlanMode::Reschedule)?;
         if !outcome.deltas.is_empty() {
-            info!(?outcome.deltas, "Job reschedule allocation deltas");
+            debug!(
+                job_id = %self.job_id,
+                affected_nodes = outcome.deltas.len(),
+                placed = outcome.allocations.len(),
+                "Job reschedule allocation deltas"
+            );
         }
 
         let finish_started = Instant::now();
@@ -422,7 +437,12 @@ impl Eval {
         }
         let outcome = self.schedule_job_allocations(store, PlanMode::Reschedule)?;
         if !outcome.deltas.is_empty() {
-            info!(?outcome.deltas, "Job scale allocation deltas");
+            debug!(
+                job_id = %self.job_id,
+                affected_nodes = outcome.deltas.len(),
+                placed = outcome.allocations.len(),
+                "Job scale allocation deltas"
+            );
         }
         if !retired.is_empty() {
             // Scale-in freed capacity: retry jobs waiting for room.

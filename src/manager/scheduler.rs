@@ -40,6 +40,11 @@ mod preemption;
 
 const RESCHEDULE_SCORE_JITTER_THRESHOLD: f64 = 0.01;
 
+/// A `plan_and_apply` slower than this logs one `info` line (every plan
+/// logs at `debug`). Plans take single-digit milliseconds when healthy, so a
+/// second is an outlier worth an operator's attention without being noise.
+const SLOW_PLAN_LOG_MS: u64 = 1_000;
+
 #[derive(Debug, Clone)]
 pub struct PlannedAllocation {
     pub node_id: String,
@@ -2003,7 +2008,7 @@ impl<'a> Scheduler<'a> {
     ) -> R<PlanOutcome> {
         let started = std::time::Instant::now();
         let mut timings = PlanTimings::default();
-        info!(%job_config_id, mode = mode.as_str(), target_override = task_targets.is_some(), "Starting scheduler plan_and_apply");
+        debug!(%job_config_id, mode = mode.as_str(), target_override = task_targets.is_some(), "Starting scheduler plan_and_apply");
         // Evals wait in a queue, and the job can be stopped or move on to a
         // newer config meanwhile. Planning for either would place the full
         // count of something nobody wants, so bail before doing the work.
@@ -2388,7 +2393,23 @@ impl<'a> Scheduler<'a> {
             held_tasks,
             backoff_held,
         };
-        info!(
+        // Per-plan lifecycle detail is debug (AGENTS.md tracing guidance):
+        // at a thousand plans a second an info line per plan is the
+        // noise that hides everything else. A plan slow enough to matter
+        // still says so at info, with the same fields.
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= SLOW_PLAN_LOG_MS {
+            info!(
+                %job_config_id,
+                mode = mode.as_str(),
+                applied_allocations = outcome.allocations.len(),
+                elapsed_ms,
+                apply_us = outcome.timings.apply_us,
+                build_plan_us = outcome.timings.build_plan_us,
+                "Slow scheduler plan_and_apply"
+            );
+        }
+        debug!(
             %job_config_id,
             mode = mode.as_str(),
             applied_allocations = outcome.allocations.len(),
