@@ -2281,6 +2281,22 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
                         report.task, report.placeable
                     );
                 }
+                if !report.topology_key.is_empty() && report.would_place {
+                    let key = &report.topology_key;
+                    let domains = report.topology_domains;
+                    if report.topology_domain.is_empty() {
+                        println!(
+                            "    across more than one {key}: none of the {domains} with eligible \
+                             nodes fits it alone (topology {})",
+                            report.topology_mode
+                        );
+                    } else {
+                        println!(
+                            "    in {key}={} ({domains} {key} domain(s) have eligible nodes)",
+                            report.topology_domain
+                        );
+                    }
+                }
                 if !report.reason.is_empty() && !report.would_place {
                     println!("    {}", report.reason);
                 }

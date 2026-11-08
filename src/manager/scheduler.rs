@@ -25,9 +25,8 @@ use crate::storage::store::{
 };
 use crate::structs::{
     Allocation, Band, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
-    TaskStatusState,
+    TaskStatusState, TopologyMode,
 };
-use policy::score_node_for_context;
 pub use policy::{
     load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy,
     DEF_SCHEDULER_LOCALITY_WEIGHT,
@@ -39,6 +38,7 @@ pub use preemption::{
 
 mod policy;
 mod preemption;
+mod topology;
 
 const RESCHEDULE_SCORE_JITTER_THRESHOLD: f64 = 0.01;
 
@@ -126,6 +126,17 @@ pub struct GangReport {
     /// When a waiting gang's `placementTimeout` runs out, unix seconds; 0
     /// when it has none, and in a dry run.
     pub deadline: i64,
+    /// The gang's `topology.key`, empty without one.
+    pub topology_key: String,
+    /// The gang's `topology.mode` (`required`, `preferred`), empty without
+    /// one.
+    pub topology_mode: String,
+    /// The domain (attribute value) the gang places in, or for a gang that
+    /// does not place, the domain that came closest. Empty without topology,
+    /// or when a `preferred` gang spans domains.
+    pub topology_domain: String,
+    /// Domains with at least one eligible node.
+    pub topology_domains: u32,
 }
 
 impl GangReport {
@@ -144,6 +155,10 @@ impl GangReport {
             "placementTimeoutSeconds": self.placement_timeout_secs,
             "waitingSince": self.waiting_since,
             "deadline": self.deadline,
+            "topologyKey": self.topology_key,
+            "topologyMode": self.topology_mode,
+            "topologyDomain": self.topology_domain,
+            "topologyDomains": self.topology_domains,
         })
     }
 
@@ -185,6 +200,10 @@ impl GangReport {
                 .and_then(Value::as_i64)
                 .unwrap_or(0),
             deadline: value.get("deadline").and_then(Value::as_i64).unwrap_or(0),
+            topology_key: text("topologyKey"),
+            topology_mode: text("topologyMode"),
+            topology_domain: text("topologyDomain"),
+            topology_domains: count("topologyDomains"),
         })
     }
 
@@ -203,6 +222,10 @@ impl GangReport {
             placement_timeout_seconds: self.placement_timeout_secs,
             waiting_since: self.waiting_since,
             deadline: self.deadline,
+            topology_key: self.topology_key.clone(),
+            topology_mode: self.topology_mode.clone(),
+            topology_domain: self.topology_domain.clone(),
+            topology_domains: self.topology_domains,
         }
     }
 
@@ -687,6 +710,9 @@ struct PreemptionSearch {
 ///   and together take eight;
 /// - the victim metadata is loaded once and only on demand, so a plan that
 ///   never needs preemption never touches the store for it.
+///
+/// Cloned only to undo a topology gang's try in one domain before the next.
+#[derive(Clone)]
 struct PreemptionPass {
     /// The band of the job being placed.
     preemptor_band: Band,
@@ -971,7 +997,7 @@ impl PreemptionPass {
 ///
 /// Lazy: a node's set is read from the snapshot the first time a static-port
 /// task asks about it, so a plan with no static ports pays nothing.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PortLedger {
     /// Ports in use per node: the snapshot's allocations, plus ports this
     /// plan already claimed. Built on first use per node.
@@ -1083,6 +1109,7 @@ struct ResourceLedger {
     pools: SharedNodePools,
 }
 
+#[derive(Clone)]
 struct TaskPlan<'a> {
     /// The task's hard filters (constraints, permit), parsed once per plan
     /// in `build_plan` and shared with the group-filter pass.
@@ -2482,6 +2509,75 @@ impl<'a> Scheduler<'a> {
         Ok(outcome)
     }
 
+    /// Placements of `task_id` among `placements`.
+    fn placed_for_task(placements: &[PlannedAllocation], task_id: i64) -> u32 {
+        placements
+            .iter()
+            .filter(|placement| placement.task_config_id == task_id)
+            .count() as u32
+    }
+
+    /// A gang placement's first missing replica and why, from what the
+    /// placement returned. A bail site that fails outright (disk, checkpoint
+    /// room) is a shortfall like any other when it is a placement block;
+    /// anything else is a broken job and fails the plan (`Err`).
+    fn gang_shortfall(
+        placed: R<()>,
+        gang_unplaced: Vec<UnplacedTask>,
+        task_id: i64,
+        task_name: &str,
+    ) -> R<Option<UnplacedTask>> {
+        match placed {
+            Ok(()) => Ok(gang_unplaced.into_iter().next()),
+            Err(error) => {
+                let Some(blocked) =
+                    crate::manager::blocked::PlacementBlocked::in_chain(&error).cloned()
+                else {
+                    return Err(error);
+                };
+                Ok(Some(UnplacedTask {
+                    task_config_id: task_id,
+                    task_name: task_name.to_string(),
+                    count: 0,
+                    reason: blocked.message.clone(),
+                    static_port: error
+                        .downcast_ref::<PlacementBlocked>()
+                        .and_then(PlacementBlocked::static_port),
+                    blocked,
+                }))
+            }
+        }
+    }
+
+    /// The topology domain most of a running gang's members occupy (ties to
+    /// the smallest token): where a top-up must stay. `None` when none of its
+    /// members runs on an available node that has the attribute.
+    fn running_topology_domain(
+        own_by_node: &OwnAllocationsByNode,
+        task_id: i64,
+        node_lookup: &AvailableNodes,
+        key: &str,
+    ) -> Option<String> {
+        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+        for (node_id, task_ids) in own_by_node {
+            let members = task_ids.iter().filter(|id| **id == task_id).count();
+            if members == 0 {
+                continue;
+            }
+            let Some(node) = node_lookup.get(node_id.as_str()) else {
+                continue;
+            };
+            if let Some(value) = node_attribute(node, key).filter(|value| !value.is_null()) {
+                *counts.entry(value_token(value)).or_default() += members;
+            }
+        }
+        let most = counts.values().copied().max()?;
+        counts
+            .into_iter()
+            .find(|(_, members)| *members == most)
+            .map(|(token, _)| token)
+    }
+
     /// Allocations of the planned config per task, from the plan's
     /// own-allocation index.
     fn existing_alloc_counts_by_task(own_by_node: &OwnAllocationsByNode) -> HashMap<i64, u32> {
@@ -2976,41 +3072,222 @@ impl<'a> Scheduler<'a> {
                 // it got. Submit validation keeps gangs out of multi-task
                 // groups (which place all or nothing on one node anyway) and
                 // away from `count.per`.
-                let gang = task_config.gang.filter(|_| group_key.is_none());
+                let gang = task_config.gang.clone().filter(|_| group_key.is_none());
                 let placed_before = placements.len();
                 let mut gang_unplaced: Vec<UnplacedTask> = Vec::new();
-                let placed = self.place_task_allocations(
-                    needed,
-                    task_id,
-                    &task_config,
-                    job_config_id,
-                    candidates_for_group,
-                    allocations_by_node,
-                    &own_by_node,
-                    &task_name_to_id,
-                    &task_id_to_group,
-                    &mut planned_task_allocations,
-                    &mut planned,
-                    &mut reschedule_rng,
-                    nodes_considered_setting.as_ref(),
-                    score_sample_setting.as_ref(),
-                    &mut nodes_considered_rng,
-                    node_lookup,
-                    &mut resource_ledger,
-                    &mut plan,
-                    &mut placements,
-                    weights,
-                    group_key.as_ref(),
-                    &mut group_assignments,
-                    candidates_setting,
-                    &mut preemption_pass,
-                    &mut port_ledger,
-                    if gang.is_some() {
-                        Some(&mut gang_unplaced)
-                    } else {
-                        applying.then_some(&mut unplaced)
-                    },
-                );
+                // The one placement call, over a candidate list and into an
+                // unplaced list, so topology can run it once per domain.
+                macro_rules! place_on {
+                    ($candidates:expr, $unplaced:expr) => {
+                        self.place_task_allocations(
+                            needed,
+                            task_id,
+                            &task_config,
+                            job_config_id,
+                            $candidates,
+                            allocations_by_node,
+                            &own_by_node,
+                            &task_name_to_id,
+                            &task_id_to_group,
+                            &mut planned_task_allocations,
+                            &mut planned,
+                            &mut reschedule_rng,
+                            nodes_considered_setting.as_ref(),
+                            score_sample_setting.as_ref(),
+                            &mut nodes_considered_rng,
+                            node_lookup,
+                            &mut resource_ledger,
+                            &mut plan,
+                            &mut placements,
+                            weights,
+                            group_key.as_ref(),
+                            &mut group_assignments,
+                            candidates_setting,
+                            &mut preemption_pass,
+                            &mut port_ledger,
+                            $unplaced,
+                        )
+                    };
+                }
+                let topology = gang.as_ref().and_then(|gang| gang.topology.clone());
+                let mut topology_outcome: Option<topology::TopologyOutcome> = None;
+                // A `required` topology gang that no domain could take: how
+                // many members the closest domain held, and its shortfall.
+                let mut topology_shortfall: Option<(u32, UnplacedTask)> = None;
+                let placed = match (gang.as_ref(), topology.as_ref()) {
+                    (Some(gang), Some(topology)) => {
+                        // Topology (docs/gang-scheduling.md, "Topology"):
+                        // place the whole gang inside one domain at a time,
+                        // keep the first that reaches the quorum, and undo
+                        // every other try.
+                        let running = running_by_task.get(&task_id).copied().unwrap_or(0);
+                        let quorum = gang.quorum(desired_count);
+                        let need_now = quorum.saturating_sub(running);
+                        let domains = topology::domains(
+                            candidates_for_group,
+                            &topology.key,
+                            &resource_ledger.pools,
+                            &plan.task_request,
+                            needed,
+                        );
+                        let pinned = Self::running_topology_domain(
+                            &own_by_node,
+                            task_id,
+                            node_lookup,
+                            &topology.key,
+                        );
+                        let order = topology::trial_order(
+                            &domains,
+                            needed,
+                            need_now,
+                            pinned.as_deref(),
+                            topology.mode,
+                        );
+                        let mut outcome = topology::TopologyOutcome {
+                            domain: String::new(),
+                            domains: domains.len() as u32,
+                        };
+                        let mut accepted: Option<R<()>> = None;
+                        let mut closest: Option<(u32, String, UnplacedTask)> = None;
+                        // `&[_]`: the element is the plan's `&'b Node`, so
+                        // the closure must not be generic over it.
+                        let mut try_on =
+                            |nodes: &[_],
+                             label: &str,
+                             closest: &mut Option<(u32, String, UnplacedTask)>|
+                             -> R<Option<(R<()>, Vec<UnplacedTask>)>> {
+                                let saved = (
+                                    resource_ledger.clone(),
+                                    planned.clone(),
+                                    planned_task_allocations.clone(),
+                                    plan.clone(),
+                                    port_ledger.clone(),
+                                    preemption_pass.clone(),
+                                );
+                                let mut trial_unplaced: Vec<UnplacedTask> = Vec::new();
+                                let attempt = place_on!(nodes, Some(&mut trial_unplaced));
+                                let placed_now =
+                                    Self::placed_for_task(&placements[placed_before..], task_id);
+                                if attempt.is_ok() && running + placed_now >= quorum {
+                                    return Ok(Some((attempt, trial_unplaced)));
+                                }
+                                if let Some(shortfall) = Self::gang_shortfall(
+                                    attempt,
+                                    trial_unplaced,
+                                    task_id,
+                                    &task_config.name,
+                                )? {
+                                    if closest
+                                        .as_ref()
+                                        .is_none_or(|(placed, _, _)| placed_now > *placed)
+                                    {
+                                        *closest = Some((placed_now, label.to_string(), shortfall));
+                                    }
+                                }
+                                placements.truncate(placed_before);
+                                (
+                                    resource_ledger,
+                                    planned,
+                                    planned_task_allocations,
+                                    plan,
+                                    port_ledger,
+                                    preemption_pass,
+                                ) = saved;
+                                Ok(None)
+                            };
+                        for index in order {
+                            let domain = &domains[index];
+                            if let Some((attempt, trial_unplaced)) =
+                                try_on(&domain.nodes, &domain.label, &mut closest)?
+                            {
+                                outcome.domain = domain.label.clone();
+                                gang_unplaced = trial_unplaced;
+                                accepted = Some(attempt);
+                                break;
+                            }
+                        }
+                        if accepted.is_none() && topology.mode == TopologyMode::Preferred {
+                            if let Some((nodes, _spanned)) =
+                                topology::fewest_domains(&domains, need_now)
+                            {
+                                let mut ignored = None;
+                                if let Some((attempt, trial_unplaced)) =
+                                    try_on(&nodes, "", &mut ignored)?
+                                {
+                                    gang_unplaced = trial_unplaced;
+                                    accepted = Some(attempt);
+                                }
+                            }
+                        }
+                        drop(try_on);
+                        let result = match accepted {
+                            Some(attempt) => attempt,
+                            // Preferred never waits for topology: anywhere.
+                            None if topology.mode == TopologyMode::Preferred => {
+                                place_on!(candidates_for_group, Some(&mut gang_unplaced))
+                            }
+                            None => {
+                                let key = &topology.key;
+                                let shortfall = match closest {
+                                    Some((placed, label, mut shortfall)) => {
+                                        shortfall.reason = format!(
+                                            "No single {key} fits the {need_now} member(s) the gang \
+                                             needs together (topology {key}, required); the \
+                                             closest, {key}={label}, fits {placed}. {}",
+                                            shortfall.reason
+                                        );
+                                        outcome.domain = label;
+                                        (placed, shortfall)
+                                    }
+                                    None => {
+                                        let reason = if domains.is_empty() {
+                                            format!(
+                                                "No eligible node has the topology attribute \
+                                                 {key} (topology {key}, required)"
+                                            )
+                                        } else {
+                                            format!(
+                                                "The {key} its running members occupy has no \
+                                                 eligible node left, and a top-up stays in its \
+                                                 domain (topology {key}, required)"
+                                            )
+                                        };
+                                        let blocked =
+                                            crate::manager::blocked::PlacementBlocked::for_task(
+                                                &task_config,
+                                                task_id,
+                                                None,
+                                                reason.clone(),
+                                            );
+                                        (
+                                            0,
+                                            UnplacedTask {
+                                                task_config_id: task_id,
+                                                task_name: task_config.name.clone(),
+                                                count: needed,
+                                                reason,
+                                                static_port: None,
+                                                blocked,
+                                            },
+                                        )
+                                    }
+                                };
+                                topology_shortfall = Some(shortfall);
+                                Ok(())
+                            }
+                        };
+                        topology_outcome = Some(outcome);
+                        result
+                    }
+                    _ => place_on!(
+                        candidates_for_group,
+                        if gang.is_some() {
+                            Some(&mut gang_unplaced)
+                        } else {
+                            applying.then_some(&mut unplaced)
+                        }
+                    ),
+                };
                 let Some(gang) = gang else {
                     placed?;
                     index_report.push(plan.index_usage.clone());
@@ -3021,31 +3298,15 @@ impl<'a> Scheduler<'a> {
                 // that fails outright (disk, checkpoint room) is a shortfall
                 // like any other when it is a placement block; anything else
                 // is a broken job and fails the plan.
-                let shortfall = match placed {
-                    Ok(()) => gang_unplaced.into_iter().next(),
-                    Err(error) => {
-                        let Some(blocked) =
-                            crate::manager::blocked::PlacementBlocked::in_chain(&error).cloned()
-                        else {
-                            return Err(error);
-                        };
-                        Some(UnplacedTask {
-                            task_config_id: task_id,
-                            task_name: task_config.name.clone(),
-                            count: 0,
-                            reason: blocked.message.clone(),
-                            static_port: error
-                                .downcast_ref::<PlacementBlocked>()
-                                .and_then(PlacementBlocked::static_port),
-                            blocked,
-                        })
-                    }
+                let (shortfall, placed_now) = match topology_shortfall {
+                    // Nothing placed: report how far the closest domain got.
+                    Some((closest, shortfall)) => (Some(shortfall), closest),
+                    None => (
+                        Self::gang_shortfall(placed, gang_unplaced, task_id, &task_config.name)?,
+                        Self::placed_for_task(&placements[placed_before..], task_id),
+                    ),
                 };
                 let running = running_by_task.get(&task_id).copied().unwrap_or(0);
-                let placed_now = placements[placed_before..]
-                    .iter()
-                    .filter(|placement| placement.task_config_id == task_id)
-                    .count() as u32;
                 let quorum = gang.quorum(desired_count);
                 let mut report = GangReport {
                     task_name: task_config.name.clone(),
@@ -3063,6 +3324,21 @@ impl<'a> Scheduler<'a> {
                         .unwrap_or(0),
                     waiting_since: 0,
                     deadline: 0,
+                    topology_key: topology
+                        .as_ref()
+                        .map(|topology| topology.key.clone())
+                        .unwrap_or_default(),
+                    topology_mode: topology
+                        .as_ref()
+                        .map(|topology| topology.mode.as_str().to_string())
+                        .unwrap_or_default(),
+                    topology_domain: topology_outcome
+                        .as_ref()
+                        .map(|outcome| outcome.domain.clone())
+                        .unwrap_or_default(),
+                    topology_domains: topology_outcome
+                        .as_ref()
+                        .map_or(0, |outcome| outcome.domains),
                 };
                 let Some(mut shortfall) = shortfall else {
                     gang_reports.push(report);
@@ -11285,6 +11561,196 @@ mod tests {
         crate::manager::blocked::PlacementBlocked::in_chain(error)
             .map(|blocked| blocked.detail["gang"].clone())
             .unwrap_or(Value::Null)
+    }
+
+    /// A 512 MiB node (two 256 MiB gang members) in `rack`.
+    fn rack_node(store: &Store, id: &str, rack: &str) -> R<()> {
+        store.insert_node(make_node_msg_with_sources(
+            id,
+            json!({ "rack": rack }),
+            json!({
+                "memory_total": "536870912",
+                "cpus": { "cpu-1": { "frequency": "1000" } }
+            }),
+            json!({}),
+        ))?;
+        Ok(())
+    }
+
+    fn topology_gang(mode: crate::structs::TopologyMode) -> Option<crate::structs::GangConfig> {
+        Some(crate::structs::GangConfig {
+            topology: Some(crate::structs::GangTopology {
+                key: "rack".into(),
+                mode,
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn racks_of(store: &Store, job: &str) -> R<Vec<String>> {
+        let nodes: HashMap<String, Node> = store
+            .get_nodes()?
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect();
+        let mut racks: Vec<String> = store
+            .get_allocs()?
+            .into_iter()
+            .filter(|allocation| allocation.job_id == job)
+            .filter_map(|allocation| {
+                nodes[&allocation.node_id].config_attrs["rack"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        racks.sort();
+        racks.dedup();
+        Ok(racks)
+    }
+
+    /// A `required` topology gang lands in one rack, and picks the
+    /// smallest rack that holds it (best fit), keeping the big rack whole.
+    #[test]
+    fn a_required_topology_gang_places_in_the_tightest_domain_that_fits() -> R<()> {
+        let store = setup_store()?;
+        for node in ["big-1", "big-2", "big-3"] {
+            rack_node(&store, node, "big")?;
+        }
+        for node in ["small-1", "small-2"] {
+            rack_node(&store, node, "small")?;
+        }
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                4,
+                topology_gang(crate::structs::TopologyMode::Required),
+            ),
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let preview = scheduler.plan_only_preview(&trainer, PlanMode::Fresh)?;
+        let report = &preview.gang_reports[0];
+        assert!(report.would_place);
+        assert_eq!(report.topology_key, "rack");
+        assert_eq!(report.topology_mode, "required");
+        assert_eq!(report.topology_domain, "small", "best fit: 4 of 4 slots");
+        assert_eq!(report.topology_domains, 2);
+
+        let outcome = scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 4);
+        assert_eq!(racks_of(&store, "trainer")?, vec!["small"]);
+        Ok(())
+    }
+
+    /// No single rack holds the quorum: a `required` gang waits, holding
+    /// nothing, and its report names the closest rack, though the cluster
+    /// as a whole has room.
+    #[test]
+    fn a_required_topology_gang_waits_when_no_domain_fits() -> R<()> {
+        let store = setup_store()?;
+        rack_node(&store, "a-1", "a")?;
+        rack_node(&store, "b-1", "b")?;
+        let scheduler = Scheduler::new(&store)?;
+
+        let plain = submit_config(&store, &gang_job("plain", Band::Normal, 3, whole_gang()))?;
+        assert_eq!(
+            scheduler
+                .plan_and_apply(&plain, PlanMode::Fresh)?
+                .allocations
+                .len(),
+            3,
+            "without topology the gang fits across racks"
+        );
+        store.remove_allocs_for_job("plain")?;
+
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                3,
+                topology_gang(crate::structs::TopologyMode::Required),
+            ),
+        )?;
+        let error = scheduler
+            .plan_and_apply(&trainer, PlanMode::Fresh)
+            .expect_err("no rack holds three");
+        let gang = gang_detail(&error);
+        assert_eq!(gang["wouldPlace"], false);
+        assert_eq!(gang["placeable"], 2, "the closest rack holds two");
+        assert_eq!(gang["topologyKey"], "rack");
+        assert_eq!(gang["topologyDomain"], "a");
+        assert_eq!(gang["topologyDomains"], 2);
+        let reason = gang["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("No single rack fits"), "{reason}");
+        assert!(
+            store.get_allocs()?.is_empty(),
+            "a waiting topology gang holds nothing, and every try was undone"
+        );
+        Ok(())
+    }
+
+    /// `preferred` never waits for topology: with no rack that holds the
+    /// gang, it spans the fewest racks that do.
+    #[test]
+    fn a_preferred_topology_gang_spans_domains_when_none_fits_alone() -> R<()> {
+        let store = setup_store()?;
+        rack_node(&store, "a-1", "a")?;
+        rack_node(&store, "b-1", "b")?;
+        rack_node(&store, "c-1", "c")?;
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                3,
+                topology_gang(crate::structs::TopologyMode::Preferred),
+            ),
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let preview = scheduler.plan_only_preview(&trainer, PlanMode::Fresh)?;
+        assert!(preview.gang_reports[0].would_place);
+        assert_eq!(
+            preview.gang_reports[0].topology_domain, "",
+            "it spans racks"
+        );
+        let outcome = scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 3);
+        assert_eq!(
+            racks_of(&store, "trainer")?.len(),
+            2,
+            "two racks, not three"
+        );
+        Ok(())
+    }
+
+    /// Nodes without the attribute are in no domain: a `required` gang with
+    /// no domain at all says so.
+    #[test]
+    fn a_required_topology_gang_without_the_attribute_anywhere_says_so() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                2,
+                topology_gang(crate::structs::TopologyMode::Required),
+            ),
+        )?;
+        let error = Scheduler::new(&store)?
+            .plan_and_apply(&trainer, PlanMode::Fresh)
+            .expect_err("no node has a rack");
+        let gang = gang_detail(&error);
+        assert_eq!(gang["topologyDomains"], 0);
+        let reason = gang["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("No eligible node has the topology attribute rack"),
+            "{reason}"
+        );
+        Ok(())
     }
 
     /// Room for two of three: without `gang` the plan places two (partial

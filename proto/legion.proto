@@ -4893,6 +4893,26 @@ message GangReport {
   // then, its job is failed and every allocation of it stops. 0 when the gang
   // has no placement timeout, and in a dry run.
   int64 deadline = 12;
+
+  // The gang's `topology.key`: the node attribute whose value every member
+  // shares (a rack, an NVLink domain). Empty when the gang sets no topology.
+  string topology_key = 13;
+
+  // The gang's `topology.mode`: `required` (every member in one domain, or
+  // the gang waits) or `preferred` (one domain when one fits, else the
+  // fewest domains that hold the quorum, else anywhere). Empty without a
+  // topology.
+  string topology_mode = 14;
+
+  // The domain (the attribute's value) the plan places the gang in. For a
+  // gang that does not place, the domain whose try placed the most members:
+  // where freeing room helps first. Empty without a topology, and when a
+  // `preferred` gang spans domains.
+  string topology_domain = 15;
+
+  // How many domains have at least one eligible node. 0 with a topology
+  // means no eligible node reports the attribute: check the key's spelling.
+  uint32 topology_domains = 16;
 }
 
 // One allocation a plan would displace.
