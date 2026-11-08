@@ -2616,7 +2616,7 @@ impl ManagerDaemonService {
 
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
-            Status::invalid_argument(format!("Error validating task configs: {e}"))
+            Status::invalid_argument(format!("Error validating task configs: {e:#}"))
         })?;
         // `autoscale` against the cluster's scaling defaults and namespace
         // policies, as they stand now (docs/autoscaling.md).
@@ -6222,7 +6222,7 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Namespace policy refused the job", e))?;
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
-            Status::invalid_argument(format!("Error validating task configs: {e}"))
+            Status::invalid_argument(format!("Error validating task configs: {e:#}"))
         })?;
         let autoscale_plans = self.validate_autoscale(&config)?;
         self.validate_identity_sub_templates(&config)?;

@@ -196,6 +196,9 @@ fn a_runtime_class_task_places_only_where_the_class_is() -> R<()> {
             json!({ "runtimeClass": "not a name" }),
         ))
         .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+    // The manager reports the whole context chain, so the runtime's reason
+    // (which names the field) reaches the caller, not just "config invalid".
     assert!(
         status.message().contains("runtimeClass"),
         "{}",

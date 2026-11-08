@@ -588,6 +588,9 @@ pub struct UnlockedLaunch {
     content_store: Option<Arc<ContentStore>>,
     /// When the restore began, for its record on the checkpoint channel.
     restore_started: Option<std::time::Instant>,
+    /// The node's device plugins: a task's assigned devices are allocated
+    /// here, with the lock released, before `prepare` (docs/devices.md).
+    devices: Arc<crate::devices::plugin::DeviceManager>,
 }
 
 impl UnlockedLaunch {
@@ -636,6 +639,16 @@ impl UnlockedLaunch {
                 .start_timings
                 .record(&runtime, start_stage::VOLUMES, started.elapsed());
         }
+        // Devices the scheduler assigned (docs/devices.md): the plugin's
+        // `allocate` runs before `prepare`, so a task never starts without
+        // the devices it was placed for. A failure fails the allocation.
+        // `task.resources` is the payload's `task_resources`, whose
+        // `devices` carry this allocation's assignment.
+        let device_grant = self.devices.grant(&self.task.resources).with_context(|| {
+            format!("failed to allocate the devices of task {}", self.task.name)
+        })?;
+        self.instance.extra_env.extend(device_grant.env);
+        self.instance.devices = device_grant.edits;
         let prepare_started = std::time::Instant::now();
         let staged = self.instance.staged_artifacts.clone();
         for artifact in &staged {
@@ -5214,6 +5227,7 @@ impl WorkerTaskManager {
             restore: self.checkpoints.restores.get(&allocation.id).cloned(),
             content_store: self.content_store.clone(),
             restore_started: None,
+            devices: self.devices.clone(),
         })
     }
 
