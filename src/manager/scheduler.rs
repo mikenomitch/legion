@@ -13,7 +13,9 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
-use crate::resources::{ResourcePolicy, ResourcePool, ResourceRequest, ResourceValue};
+use crate::resources::{
+    PoolCapacity, ResourcePolicy, ResourcePool, ResourceRequest, ResourceValue,
+};
 use crate::scheduling_index::{IndexMode, IndexQueryOutcome};
 pub use crate::storage::content_index::{ContentRef, LocalityScores};
 use crate::storage::errors::StorageError;
@@ -1122,11 +1124,31 @@ struct CommonResourceAvailability {
     cpu: f64,
     cores: f64,
     allocations: f64,
+    /// The node's schedulable capacity of the same four dims, the
+    /// denominator of [`Self::utilization_after`].
+    capacity: PoolCapacity,
 }
+
+/// How full a node would be after one more placement, in the resources the
+/// placement asks for (architecture review SCH4; docs/scheduler-and-eval-loop.md,
+/// "Scoring").
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Utilization {
+    /// The largest per-resource fraction in use: what decides whether the
+    /// next large task still fits.
+    dominant: f64,
+    /// `1 - (largest - smallest)` fraction: 1 when every resource fills
+    /// evenly, lower when one runs out ahead of the others.
+    balance: f64,
+}
+
+/// Weight of the balanced-allocation term inside the `bin_pack` and
+/// `spread` terms: a tie-break among nodes of similar fullness, never a
+/// reason to pick a much emptier (or fuller) node.
+const BALANCE_TIE_BREAK: f64 = 0.05;
 
 #[derive(Debug, Clone)]
 struct NodeScoringState {
-    assigned_count: usize,
     same_task_allocations: usize,
     same_group_allocations: usize,
     task_presence: HashSet<i64>,
@@ -1223,12 +1245,10 @@ impl PlanScoringCache {
         task_id: i64,
         task_config: &TaskConfig,
         affinity_set: &AffinitySet,
-        allocations_by_node: &SharedNodeAllocations,
         own_by_node: &OwnAllocationsByNode,
         task_name_to_id: &HashMap<String, i64>,
         task_id_to_group: &HashMap<i64, String>,
         planned_task_allocations: &HashMap<String, Vec<i64>>,
-        planned: &HashMap<String, usize>,
         resource_ledger: &ResourceLedger,
         task_request: &ResourceRequest,
     ) -> Self {
@@ -1248,11 +1268,6 @@ impl PlanScoringCache {
             NodeKeyIndex::with_capacity_and_hasher(candidates.len(), Default::default());
         for (position, node) in candidates.iter().enumerate() {
             let node_id = node.id.as_str();
-            let assigned_count = allocations_by_node
-                .get(node_id)
-                .map_or(0, |allocations| allocations.len())
-                + planned.get(node_id).copied().unwrap_or_default();
-
             // The planned config's allocations already on this node come
             // from the plan's own-allocation index — not from a walk of
             // every allocation the node holds, which made building this
@@ -1294,7 +1309,6 @@ impl PlanScoringCache {
 
             index.insert(NodeKey::of(node), position);
             states.push(NodeScoringState {
-                assigned_count,
                 same_task_allocations,
                 same_group_allocations,
                 task_presence,
@@ -1368,7 +1382,6 @@ impl PlanScoringCache {
             return;
         };
         let state = &mut self.states[position];
-        state.assigned_count += 1;
         state.same_task_allocations += 1;
         if self.group_name.as_ref().is_some_and(|group| {
             task_id_to_group
@@ -1461,7 +1474,10 @@ impl CommonResourceAvailability {
     /// scoring cache. A dim the pool lacks, or carries as items, reads as
     /// `0.0`, exactly as the lookups did.
     fn from_pool(pool: &ResourcePool) -> Self {
-        let mut availability = CommonResourceAvailability::default();
+        let mut availability = CommonResourceAvailability {
+            capacity: pool.capacity,
+            ..CommonResourceAvailability::default()
+        };
         for (name, value) in &pool.values {
             let ResourceValue::Amount(amount) = value else {
                 continue;
@@ -1475,6 +1491,43 @@ impl CommonResourceAvailability {
             }
         }
         availability
+    }
+
+    /// Utilization after placing `demand`, over the dims it asks for whose
+    /// capacity is finite and positive. Absolute, so a node scores the same
+    /// whichever other nodes are candidates. A node with no qualifying dim
+    /// (nothing requested it can measure) reads as empty and balanced.
+    fn utilization_after(&self, demand: &CommonResourceDemand) -> Utilization {
+        let dims = [
+            (self.memory, self.capacity.memory, demand.memory),
+            (self.cpu, self.capacity.cpu, demand.cpu),
+            (self.cores, self.capacity.cores, demand.cores),
+            (
+                self.allocations,
+                self.capacity.allocations,
+                demand.allocations,
+            ),
+        ];
+        let mut highest: Option<f64> = None;
+        let mut lowest: Option<f64> = None;
+        for (free, capacity, request) in dims {
+            if request <= 0.0 || !capacity.is_finite() || capacity <= 0.0 || !free.is_finite() {
+                continue;
+            }
+            let used = (1.0 - (free - request) / capacity).clamp(0.0, 1.0);
+            highest = Some(highest.map_or(used, |high: f64| high.max(used)));
+            lowest = Some(lowest.map_or(used, |low: f64| low.min(used)));
+        }
+        match (highest, lowest) {
+            (Some(high), Some(low)) => Utilization {
+                dominant: high,
+                balance: 1.0 - (high - low),
+            },
+            _ => Utilization {
+                dominant: 0.0,
+                balance: 1.0,
+            },
+        }
     }
 
     fn consume(&mut self, demand: &CommonResourceDemand) {
@@ -3623,12 +3676,10 @@ impl<'a> Scheduler<'a> {
             task_id,
             task_config,
             &plan.affinity_set,
-            allocations_by_node,
             own_by_node,
             task_name_to_id,
             task_id_to_group,
             planned_task_allocations,
-            planned,
             resource_ledger,
             &plan.task_request,
         );
@@ -3787,12 +3838,10 @@ impl<'a> Scheduler<'a> {
                     task_id,
                     task_config,
                     &plan.affinity_set,
-                    allocations_by_node,
                     own_by_node,
                     task_name_to_id,
                     task_id_to_group,
                     planned_task_allocations,
-                    planned,
                     resource_ledger,
                     &plan.task_request,
                 );
@@ -5360,44 +5409,30 @@ impl<'a> Scheduler<'a> {
         Ok(eligible.into_iter().take(limit).collect())
     }
 
+    /// A scheduling plugin's pick on a reschedule. Only plugins reach this
+    /// (the built-in policies score through the plan's scoring cache), and
+    /// a plugin exposes no scores to jitter over, so it picks as it would
+    /// on a fresh plan.
     fn select_policy_node_with_jitter<'b>(
         &self,
         ctx: &SchedulingContext<'b>,
-        rng: &mut StdRng,
+        _rng: &mut StdRng,
     ) -> Option<&'b Node> {
-        if !matches!(self.policy.name(), "bin_pack" | "spread") {
-            let fallback_ctx = SchedulingContext::new(
-                ctx.eligible_nodes.clone(),
-                ctx.task,
-                ctx.task_id,
-                ctx.affinity_set,
-                ctx.job_config_id,
-                ctx.allocations,
-                ctx.task_name_to_id,
-                ctx.task_id_to_group,
-                ctx.planned_task_allocations,
-                ctx.planned,
-                ctx.weights,
-            )
-            .with_locality(ctx.locality);
-            return self.policy.select_node(fallback_ctx);
-        }
-
-        let scored = score_nodes_for_context(ctx);
-        if scored.is_empty() {
-            return None;
-        }
-
-        let max_score = scored
-            .iter()
-            .fold(f64::NEG_INFINITY, |best, (_, score)| best.max(*score));
-        let mut top = scored
-            .into_iter()
-            .filter(|(_, score)| *score >= max_score - RESCHEDULE_SCORE_JITTER_THRESHOLD)
-            .map(|(node, _)| node)
-            .collect::<Vec<_>>();
-        top.shuffle(rng);
-        top.first().copied()
+        let fallback_ctx = SchedulingContext::new(
+            ctx.eligible_nodes.clone(),
+            ctx.task,
+            ctx.task_id,
+            ctx.affinity_set,
+            ctx.job_config_id,
+            ctx.allocations,
+            ctx.task_name_to_id,
+            ctx.task_id_to_group,
+            ctx.planned_task_allocations,
+            ctx.planned,
+            ctx.weights,
+        )
+        .with_locality(ctx.locality);
+        self.policy.select_node(fallback_ctx)
     }
 
     /// The per-placement hot loop: pick the best-scoring node, breaking
@@ -5415,12 +5450,11 @@ impl<'a> Scheduler<'a> {
         if eligible.is_empty() {
             return None;
         }
-        let bounds = cached_load_bounds(eligible, scoring_cache);
         let mut rng = rand::thread_rng();
         let mut best: Option<(&'b Node, f64)> = None;
         let mut tie_count = 0usize;
         for node in eligible.iter().copied() {
-            let score = score_node_with_cache(node, affinity_set, scoring_cache, weights, bounds);
+            let score = score_node_with_cache(node, affinity_set, scoring_cache, weights);
             match best {
                 None => {
                     best = Some((node, score));
@@ -6159,45 +6193,6 @@ fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, 
     grouped
 }
 
-fn score_nodes_for_context<'a>(ctx: &SchedulingContext<'a>) -> Vec<(&'a Node, f64)> {
-    if ctx.eligible_nodes.is_empty() {
-        return Vec::new();
-    }
-
-    let mut min_load: Option<usize> = None;
-    let mut max_load: Option<usize> = None;
-    let mut loads: HashMap<&'a str, usize> = HashMap::new();
-
-    for node in &ctx.eligible_nodes {
-        let load = ctx.total_assigned(&node.id);
-        loads.insert(node.id.as_str(), load);
-        min_load = Some(min_load.map_or(load, |min| min.min(load)));
-        max_load = Some(max_load.map_or(load, |max| max.max(load)));
-    }
-
-    let min_load = min_load.unwrap_or_default() as f64;
-    let max_load = max_load.unwrap_or_default() as f64;
-    let range = (max_load - min_load).max(0.0);
-
-    ctx.eligible_nodes
-        .iter()
-        .copied()
-        .map(|node| {
-            let score = score_node_for_context(ctx, node, &loads, min_load, range);
-            (node, score)
-        })
-        .collect()
-}
-
-/// Min/max assigned load over `eligible` plus the normalization range —
-/// the cheap first pass both the fused selector and the batch scorer share.
-#[derive(Debug, Clone, Copy)]
-struct CachedLoadBounds {
-    min_load: f64,
-    max_load: f64,
-    range: f64,
-}
-
 /// `legion_scheduler_locality_placements_total{outcome}`: how warm the chosen
 /// node was for placements that had a content set. `warm` held all of it,
 /// `partial` some, `cold` none. The hit ratio is warm over the total.
@@ -6214,44 +6209,33 @@ fn record_locality_placement(score: f64) {
         .inc(&[outcome]);
 }
 
-fn cached_load_bounds(eligible: &[&Node], scoring_cache: &PlanScoringCache) -> CachedLoadBounds {
-    let mut min_load: Option<usize> = None;
-    let mut max_load: Option<usize> = None;
-    for node in eligible {
-        let load = scoring_cache
-            .state_of(node)
-            .map(|state| state.assigned_count)
-            .unwrap_or_default();
-        min_load = Some(min_load.map_or(load, |min| min.min(load)));
-        max_load = Some(max_load.map_or(load, |max| max.max(load)));
-    }
-    let min_load = min_load.unwrap_or_default() as f64;
-    let max_load = max_load.unwrap_or_default() as f64;
-    CachedLoadBounds {
-        min_load,
-        max_load,
-        range: (max_load - min_load).max(0.0),
-    }
-}
-
 /// One node's score under the cached plan state — the body both the fused
 /// single-pass selector and the batch scorer run per candidate.
+///
+/// The policy terms score the node's resource utilization after this
+/// placement (SCH4): `bin_pack` the dominant fraction in use, `spread` the
+/// dominant fraction free, each plus a small balanced-allocation tie-break.
+/// Absolute per node, so the score does not depend on which other nodes
+/// made the candidate list.
 fn score_node_with_cache(
     node: &Node,
     affinity_set: &AffinitySet,
     scoring_cache: &PlanScoringCache,
     weights: SchedulerWeights,
-    bounds: CachedLoadBounds,
 ) -> f64 {
     let state = scoring_cache.state_of(node);
-    let load = state.map(|s| s.assigned_count).unwrap_or_default() as f64;
-    let (spread_score, bin_pack_score) = if bounds.range > 0.0 {
-        (
-            (bounds.max_load - load) / bounds.range,
-            (load - bounds.min_load) / bounds.range,
-        )
-    } else {
-        (0.0, 0.0)
+    let (spread_score, bin_pack_score) = match state {
+        Some(state) if weights.spread != 0.0 || weights.bin_pack != 0.0 => {
+            let utilization = state
+                .common_resources
+                .utilization_after(&scoring_cache.common_demand);
+            let balance = BALANCE_TIE_BREAK * utilization.balance;
+            (
+                1.0 - utilization.dominant + balance,
+                utilization.dominant + balance,
+            )
+        }
+        _ => (0.0, 0.0),
     };
     let affinity_score = state
         .map(|s| s.base_affinity + scoring_cache.affinity.colocation_score(s))
@@ -6288,14 +6272,13 @@ fn score_nodes_with_cache<'a>(
     if eligible.is_empty() {
         return Vec::new();
     }
-    let bounds = cached_load_bounds(eligible, scoring_cache);
     eligible
         .iter()
         .copied()
         .map(|node| {
             (
                 node,
-                score_node_with_cache(node, affinity_set, scoring_cache, weights, bounds),
+                score_node_with_cache(node, affinity_set, scoring_cache, weights),
             )
         })
         .collect()
@@ -6624,35 +6607,6 @@ mod tests {
         Ok(task.0)
     }
 
-    fn score_with_legacy_context<'a>(
-        eligible: Vec<&'a Node>,
-        task: &'a TaskConfig,
-        task_id: i64,
-        affinity_set: &'a AffinitySet,
-        job_config_id: &'a str,
-        allocations_by_node: &'a SharedNodeAllocations,
-        task_name_to_id: &'a HashMap<String, i64>,
-        task_id_to_group: &'a HashMap<i64, String>,
-        planned_task_allocations: &'a HashMap<String, Vec<i64>>,
-        planned: &'a HashMap<String, usize>,
-        weights: SchedulerWeights,
-    ) -> Vec<(&'a Node, f64)> {
-        let ctx = SchedulingContext::new(
-            eligible,
-            task,
-            task_id,
-            affinity_set,
-            job_config_id,
-            allocations_by_node,
-            task_name_to_id,
-            task_id_to_group,
-            planned_task_allocations,
-            planned,
-            weights,
-        );
-        score_nodes_for_context(&ctx)
-    }
-
     #[test]
     fn plans_fresh_allocations_and_deltas() -> R<()> {
         let store = setup_store()?;
@@ -6744,7 +6698,17 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
 
         assert_eq!(outcome.allocations.len(), 2);
-        assert_eq!(outcome.deltas.len(), 1);
+        // One delta per node the reschedule placed on. Resource scoring
+        // weighs two small replicas lightly against the automatic
+        // anti-affinity penalty, so they may land on one node or on two
+        // (docs/scheduler-and-eval-loop.md, "Scoring"); under count-based
+        // scoring they always stacked onto node-a.
+        let placed_on: HashSet<&str> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| alloc.node_id.as_str())
+            .collect();
+        assert_eq!(outcome.deltas.len(), placed_on.len());
 
         let node_a_added = outcome
             .allocations
@@ -7681,8 +7645,11 @@ mod tests {
         Ok(())
     }
 
+    /// Two identical, empty nodes score identically under the cached
+    /// scorer, and the scores are utilization (not min-max of counts, which
+    /// was 0 for every node when all were equal).
     #[test]
-    fn distinct_constraints_cache_selection_matches_legacy_scoring() -> R<()> {
+    fn distinct_constraints_cache_scores_identical_nodes_identically() -> R<()> {
         let nodes = vec![
             Node {
                 id: "node-a".into(),
@@ -7716,9 +7683,7 @@ mod tests {
             ..TaskConfig::new("api", "noop")
         };
         let task_id = 7_i64;
-        let allocations_by_node = SharedNodeAllocations::new();
         let planned_task_allocations: HashMap<String, Vec<i64>> = HashMap::new();
-        let planned: HashMap<String, usize> = HashMap::new();
         let task_name_to_id = HashMap::from([(task.name.clone(), task_id)]);
         let task_id_to_group = HashMap::new();
         let affinity_set = AffinitySet::new(&task.affinities)?;
@@ -7739,12 +7704,10 @@ mod tests {
             task_id,
             &task,
             &affinity_set,
-            &allocations_by_node,
             &own_by_node,
             &task_name_to_id,
             &task_id_to_group,
             &planned_task_allocations,
-            &planned,
             &resource_ledger,
             &request,
         );
@@ -7755,19 +7718,6 @@ mod tests {
             Some(&distinct_tracker),
             &scoring_cache,
         );
-        let legacy_scored = score_with_legacy_context(
-            eligible.clone(),
-            &task,
-            task_id,
-            &affinity_set,
-            "job-1",
-            &allocations_by_node,
-            &task_name_to_id,
-            &task_id_to_group,
-            &planned_task_allocations,
-            &planned,
-            SchedulerWeights::for_policy("bin_pack"),
-        );
         let cached_scored = score_nodes_with_cache(
             &eligible,
             &affinity_set,
@@ -7775,13 +7725,12 @@ mod tests {
             SchedulerWeights::for_policy("bin_pack"),
         );
 
-        assert_eq!(legacy_scored.len(), cached_scored.len());
-        for ((legacy_node, legacy_score), (cached_node, cached_score)) in
-            legacy_scored.iter().zip(cached_scored.iter())
-        {
-            assert_eq!(legacy_node.id, cached_node.id);
-            assert!((legacy_score - cached_score).abs() <= 1e-9);
-        }
+        assert_eq!(cached_scored.len(), 2);
+        assert!((cached_scored[0].1 - cached_scored[1].1).abs() <= 1e-9);
+        assert!(
+            cached_scored[0].1 > 0.0,
+            "a placement on an empty node still uses some of it: {cached_scored:?}"
+        );
 
         let chosen = eligible[0];
         distinct_tracker.insert_from_node(chosen);
@@ -8031,7 +7980,6 @@ mod tests {
         let mut ledger = ResourceLedger {
             pools: pools.into(),
         };
-        let allocations_by_node = SharedNodeAllocations::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
         let mut planned_task_allocations: HashMap<String, Vec<i64>> = HashMap::new();
         let task_name_to_id = HashMap::from([(task.name.clone(), task_id)]);
@@ -8043,12 +7991,10 @@ mod tests {
             task_id,
             &task,
             &affinity_set,
-            &allocations_by_node,
             &own_by_node,
             &task_name_to_id,
             &task_id_to_group,
             &planned_task_allocations,
-            &planned,
             &ledger,
             &request,
         );

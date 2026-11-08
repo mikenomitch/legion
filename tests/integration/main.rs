@@ -92,6 +92,7 @@ mod raft_snapshot_recovery;
 mod raft_topology_stamp;
 mod raft_upgrade_bootstrap;
 mod ratify_throughput_measure;
+mod resource_scoring;
 mod restore_placement_indexed;
 mod rollout_integration;
 mod sandbox_bridge_placement;

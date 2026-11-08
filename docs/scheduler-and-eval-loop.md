@@ -761,6 +761,63 @@ Selection policy:
 
 Resource fit is checked before a node can be selected.
 
+### Scoring
+
+`bin_pack` and `spread` score a node by how full it would be **after** the
+placement, measured in the resources the task asks for against what the node
+has:
+
+```text
+util_d   = (in use_d + request_d) / capacity_d    for each resource d the task requests
+                                                   whose capacity is finite:
+                                                   memory, cpu, cores, allocation slots
+dominant = the largest util_d                      (0 if no resource qualifies)
+balance  = 1 - (largest util_d - smallest util_d)
+
+bin_pack term = dominant       + 0.05 × balance    fullest node first
+spread term   = (1 - dominant) + 0.05 × balance    emptiest node first
+```
+
+Capacity is the node's schedulable capacity: its fingerprint, capped by
+`capacity`, less `reservedResources`, times any oversubscription ratio. A node
+that does not report a resource (no `maxAllocations`, say) has unlimited
+capacity of it, and that resource does not count.
+
+The score is the policy's term times its weight, plus the other terms:
+
+```text
+score = affinities × weights.affinities
+      + bin_pack term × weights.bin_pack            (1 under bin_pack, else 0)
+      + spread term × weights.spread                (1 under spread, else 0)
+      - same-task allocations on the node × weights.automatic_anti_affinity (0.2)
+      + content locality × weights.locality
+```
+
+Two properties follow:
+
+- **A large allocation weighs what it uses.** A node holding one 12 GiB
+  allocation is fuller than one holding three of 256 MiB. `bin_pack` tops off
+  the first and keeps the second whole for a large task; `spread` sends new
+  work to the second.
+- **A node's score does not depend on the other candidates.** Utilization is
+  absolute, so truncating the candidate list (scheduling indexes,
+  `nodes_considered`, `score_sample`) changes which nodes are scored, never
+  how any one of them scores.
+
+The balance term breaks near-ties toward the node whose resources fill
+evenly, so a node is less likely to be left with memory and no CPU, or the
+reverse.
+
+Because a small task moves a node's utilization by a few hundredths, the
+automatic anti-affinity penalty (0.2 per allocation of the same task already
+on the node) usually outweighs packing for replicas of one task. Under
+`bin_pack` a service's replicas therefore land on different busy nodes rather
+than on one. Set `schedulerSettings.weights.automatic_anti_affinity = 0` to
+stack them.
+
+Scheduling plugins are not affected: their context still carries allocation
+counts and no capacity ([plugin system](plugin-system.md)).
+
 Constraints, permit, and volume-driver support are applied once, when the
 task's candidate list is built. The per-placement passes (eligibility, load
 bounds, scoring) only re-test what changes between placements: remaining

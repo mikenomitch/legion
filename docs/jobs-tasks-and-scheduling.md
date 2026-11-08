@@ -443,11 +443,26 @@ Every candidate node's score is a weighted sum. Set the weights under
 
 ```
 score = affinities * affinity
-      + spread * (emptiness relative to the other candidates)
-      + bin_pack * (fullness relative to the other candidates)
+      + spread * (1 - utilization after placing)
+      + bin_pack * (utilization after placing)
       - automatic_anti_affinity * stacked allocations
       + locality * content locality
 ```
+
+**Utilization** is resource-based, not a count of allocations: the largest
+fraction, over the resources the task requests (memory, cpu, cores, allocation
+slots with a finite `maxAllocations`), of the node's schedulable capacity that
+would be in use once the task is placed. A small balanced-allocation term
+favors nodes whose resources fill evenly. It is absolute, so a node scores the
+same whichever other nodes are candidates. The exact formula is in
+[scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#scoring).
+
+So `bin_pack` puts a 2 GiB task on the node that is 75% full of one large
+allocation before the one that holds three small ones, keeping the emptier
+node whole for a large task, and `spread` does the reverse. Because one small
+task moves utilization by little, the automatic anti-affinity penalty
+usually keeps replicas of one task on different nodes even under `bin_pack`;
+set `automatic_anti_affinity = 0` to stack them.
 
 Weights must be non-negative numbers. Unknown keys are ignored. The highest
 score wins, with exact ties broken at random.
