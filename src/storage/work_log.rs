@@ -534,6 +534,7 @@ impl WorkLog {
             checkpoint_requests: Vec::new(),
             revision: state.revision.clone(),
             resumed_from: from,
+            ..Default::default()
         };
         state.unacked.push_back(message.clone());
         if state.unacked.len() > MAX_UNACKED {

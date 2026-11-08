@@ -152,6 +152,7 @@ fn a_backend_change_reaches_a_streaming_worker_without_a_heartbeat() -> R<()> {
             node_id: "w-web".into(),
             last_epoch: 0,
             last_seq: 0,
+            last_revision: String::new(),
         })),
     }))?;
     let mut inbound = rt

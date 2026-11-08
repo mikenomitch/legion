@@ -19167,6 +19167,7 @@ message GetUsageReply {
   // The resolved window, RFC3339.
   string since = 2;
   string until = 3;
+}
 
 // ── Revisions and watches (revisions-and-watches plan;
 //    docs/watches-and-blocking-queries.md) ─────────────────────────────────
