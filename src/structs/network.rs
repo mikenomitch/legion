@@ -1395,10 +1395,35 @@ pub struct RetryConfig {
     /// Only these methods are retried (default: idempotent methods).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<String>,
+    /// The largest request body kept so a request can be retried (`1Mi`,
+    /// the default; at most `64Mi`). A larger body is streamed to the
+    /// upstream as it arrives and the request is not retried
+    /// (docs/network-handlers.md, "Request bodies").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<Value>,
     /// Keys this block did not recognize, captured for the submit's
     /// unknown-field check (`structs::spec_fields`); empty once it ran.
     #[serde(flatten)]
     pub unknown_fields: crate::structs::spec_fields::UnknownFields,
+}
+
+/// Default `retries.maxBodyBytes`: the body kept for a retry.
+pub const DEFAULT_RETRY_BODY_BYTES: u64 = 1024 * 1024;
+
+/// The most `retries.maxBodyBytes` may be.
+pub const MAX_RETRY_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
+impl RetryConfig {
+    /// `maxBodyBytes`, or the default. Validated at submit, so an
+    /// unparseable value here (a hand-edited row) falls back to the default.
+    pub fn max_body_bytes(&self) -> u64 {
+        self.max_body_bytes
+            .as_ref()
+            .and_then(|value| crate::structs::netpolicy::parse_bytes(value).ok())
+            .filter(|bytes| *bytes > 0)
+            .map(|bytes| bytes.min(MAX_RETRY_BODY_BYTES))
+            .unwrap_or(DEFAULT_RETRY_BODY_BYTES)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -2541,6 +2566,13 @@ fn validate_upstream_http(task_name: &str, key: &str, http: &UpstreamHttpConfig)
                 bail!("{what}.retries.budget must be at most 100%");
             }
         }
+        if let Some(max) = retries.max_body_bytes.as_ref() {
+            let bytes = crate::structs::netpolicy::parse_bytes(max)
+                .map_err(|err| anyhow::anyhow!("{what}.retries.maxBodyBytes: {err}"))?;
+            if bytes == 0 || bytes > MAX_RETRY_BODY_BYTES {
+                bail!("{what}.retries.maxBodyBytes must be more than 0 and at most 64Mi");
+            }
+        }
     }
     let mut total = 0u32;
     let mut tags: HashSet<&str> = HashSet::new();
@@ -2641,7 +2673,10 @@ spec_block!(
         walk.list("split", &mut this.split);
     }
 );
-spec_block!(RetryConfig, ["attempts", "on", "budget", "methods"]);
+spec_block!(
+    RetryConfig,
+    ["attempts", "on", "budget", "methods", "maxBodyBytes"]
+);
 spec_block!(SplitConfig, ["tag", "weight"]);
 spec_block!(UpstreamCredential, ["header", "prefix", "from"]);
 
