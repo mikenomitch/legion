@@ -117,7 +117,8 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_template_list` | no | List job templates (name, latest version, variable count). |
 | `legion_template_get` | no | One template version: declared variables, source, version history. |
 | `legion_template_render` | no | Dry-run a template: validate variables and return the rendered jobspec without submitting. |
-| `legion_job_run` | **yes** | Submit/update a job from rendered JSON. `allow_unknown_fields` accepts keys Legion does not know, as `--allow-unknown-fields` does; the reply's `warnings` lists each one kept or dropped. |
+| `legion_job_run` | **yes** | Submit/update a job from rendered JSON. `allow_unknown_fields` accepts keys Legion does not know, as `--allow-unknown-fields` does; the reply's `warnings` lists each one kept or dropped. `expected_version` makes it a compare-and-set on the job's spec version (`0` = must not exist; a lost race is `Aborted` naming the current version, and writes nothing). `wait_seconds` (max 300) waits, with blocking reads, until the job's rollout finishes and its status reads running/complete/scheduled/idle, or failed/stopped; the reply's `wait` says which (`settled: false` on timeout). The reply carries the job's new `version` and the `revision`. |
+| `legion_watch` | no | Wait (bounded: `wait_seconds`, default 30, max 300) for the next changes to jobs, allocations, or KV keys (`kind`, with `job`/`namespace`/`node_id`/`prefix` filters) after `from_revision`, and return them with the `revision` to pass next time; empty `changes` on timeout. A `from_revision` older than the manager's journal is `ResyncRequired`: read again and watch from the read's revision ([watches-and-blocking-queries.md](watches-and-blocking-queries.md)). |
 | `legion_job_stop` | **yes** | Stop a job. |
 | `legion_job_scale` | **yes** | Change a task's count without a new job version or rollout ([autoscaling.md](autoscaling.md)). On an autoscaled task a count is a time-boxed pin and needs `for` (refused otherwise, with a hint); `min`/`max` with `for` pin a floor or ceiling; `release` ends a pin. Supports `idempotency_key`. |
 | `legion_job_scale_status` | no | Per-task spec vs override vs effective counts. The effective count is the one placement converges to: an override laid over a different spec count does not bind and is not reported. For an autoscaled task, also its policy in one line, its pin and pause, and the autoscaler's state. |
@@ -610,6 +611,33 @@ tracked `rolloutId`. A wait that doesn't converge exits non-zero.
 > to existing jobs. A brand-new job with no prior version has no rollout to
 > track and reports `status = "no_rollout"`. For deeper post-deploy inspection,
 > use rollout events and the state store (below).
+
+### Waiting without polling: revisions, blocking reads, and watches
+
+Every `legion job info --json` and `legion kv get --json` carries a
+`revision`. Pass it back to wait for the next change instead of looping:
+
+```bash
+rev=$(legion job info demo --json | jq -r .data.revision)
+legion job info demo --index "$rev" --wait 120 --json   # returns when demo changes
+legion job watch demo --json --timeout 300              # NDJSON, one line per change
+```
+
+The MCP equivalents are `legion_watch` (bounded: returns the next changes
+and the revision to continue from) and `legion_job_run` with `wait_seconds`
+(waits for a just-submitted job to come up or fail, a brand-new job
+included). A watch that resumes from a revision the manager no longer holds
+fails with `ResyncRequired`: read again and continue from the read's
+revision. See [Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md).
+
+### Editing a job another agent may also edit
+
+Read the job's `version` (`legion job info --json`), then submit with
+`--expected-version` (MCP: `expected_version`). If someone else's submit
+landed first, yours fails with `Aborted` and writes nothing; read again,
+reapply your change, and submit with the new version. `legion job plan` (MCP
+`legion_job_plan`) shows the field-by-field `diff` your submit would make
+first.
 
 Suspend and resume wait the same way: `legion instance suspend … --wait`
 blocks until the instance is `suspended` (non-zero with `SuspendFailed` and

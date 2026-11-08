@@ -200,6 +200,7 @@ When one is required and what goes in it:
 | [shared-alloc-dir-proposal.md](plans/shared-alloc-dir-proposal.md) | proposal |
 | [swappable-seams-plan.md](plans/swappable-seams-plan.md) | shipped (2026-10-14: one attachment type for the datapath, one listener and dialer, the typed worker ↔ `netd` boundary, one object-storage layer, DNS on hickory-proto, the egress proxy on hyper, and the VIP and mesh-TLS fixes; the `legion netd` process split, a `NetdInput` wire encoding, GCS/Azure, and a `Vmm` trait deferred) |
 | [data-dir-env-plan.md](plans/data-dir-env-plan.md) | shipped (`LEGION_DATA_DIR`; no config-file field, by design) |
+| [revisions-and-watches-plan.md](plans/revisions-and-watches-plan.md) | in execution: built (review ST2, ST3, ST5, AI5): revisions on job/allocation/KV reads and writes, blocking reads, `Manager.Watch` with resume and resync-required, failover-safe event ids, follower read-after-write, linearizable reads, `StreamWork` resume from a revision, the heartbeat offload, `RunJob` compare-and-set, plan diffs, and MCP `legion_watch`/`legion_job_run` wait; `WatchObjects` on the journal, a persisted modify revision, and watches on other kinds deferred |
 
 ## Judgement calls
 
@@ -240,6 +241,7 @@ by project impact. The full template and a worked example:
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gated-restore-datapath-wait_calls.md](calls/gated-restore-datapath-wait_calls.md): the 5 s datapath wait on every sandbox restore (no plan, a fix to the gated checkpoints plan's wait)
 - [gated-sandbox-checkpoints-plan_calls.md](calls/gated-sandbox-checkpoints-plan_calls.md)
+- [revisions-and-watches-plan_calls.md](calls/revisions-and-watches-plan_calls.md)
 - [rootfs-base-cache-plan_calls.md](calls/rootfs-base-cache-plan_calls.md)
 - [sandbox-boot-throughput-plan_calls.md](calls/sandbox-boot-throughput-plan_calls.md)
 - [sandbox-clean-stop_calls.md](calls/sandbox-clean-stop_calls.md)
