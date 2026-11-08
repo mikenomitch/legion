@@ -16,6 +16,7 @@ pub mod objects;
 pub mod persistence;
 pub mod queries;
 pub mod raft;
+pub mod revisions;
 pub mod session_index;
 pub mod snapshot_warm;
 pub mod store;

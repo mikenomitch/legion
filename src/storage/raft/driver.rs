@@ -1319,6 +1319,37 @@ impl MultiRaftDriver {
         self.not_leader_error(lane).leader_addr
     }
 
+    /// Linearizable-read barrier for the group carrying `lane`
+    /// (revisions-and-watches plan §6): on its leader, confirm leadership
+    /// with a quorum and wait until everything committed before the call has
+    /// applied here (openraft's read index); anywhere else, the typed
+    /// [`NotRaftLeader`] a rejected write carries, so the leader-forward
+    /// layer replays the read on the leader. Blocking.
+    pub(crate) fn read_barrier(&self, lane: Lane) -> R<()> {
+        let engine = self.engine()?;
+        let group = crate::storage::raft::physical_group(engine.lanes.len(), lane);
+        let Some(raft) = engine.lanes.get(&group).cloned() else {
+            return Err(anyhow::Error::new(self.not_leader_error(lane)));
+        };
+        if raft.metrics().borrow().state != ServerState::Leader {
+            return Err(anyhow::Error::new(self.not_leader_error(lane))
+                .context("a linearizable read must run on the leader"));
+        }
+        let outcome =
+            Self::block_on_engine(engine, async move { raft.ensure_linearizable().await })?;
+        match outcome {
+            Ok(_) => Ok(()),
+            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(_))) => {
+                Err(anyhow::Error::new(self.not_leader_error(lane))
+                    .context("a linearizable read must run on the leader"))
+            }
+            Err(err) => Err(anyhow!(
+                "this leader could not confirm its leadership for a linearizable read ({err}); \
+                 retry shortly"
+            )),
+        }
+    }
+
     /// A (lazily connected) channel to a peer manager's listener from the
     /// engine's shared pool. `None` before the engine starts or for a
     /// malformed address. Call inside a tokio runtime: building the channel

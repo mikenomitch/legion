@@ -523,15 +523,21 @@ fn assert_local_write_scope(op: &str, changeset: &[u8]) -> R<()> {
     Ok(())
 }
 
-/// Tables whose rows the read model holds or keys off: the only ones a
-/// `local_disk` projected mutation records. Everything else (events, evals,
-/// jobs) keeps its existing direct side effects in `local_disk` mode.
-const READ_MODEL_TABLES: [&str; 5] = [
+/// Tables whose rows the read model holds or keys off, plus the tables the
+/// revision journal watches (`job`, `job_config`, `task_status`,
+/// `kv_entry`; revisions-and-watches plan §1): the only ones a `local_disk`
+/// projected mutation records. Everything else (events, evals) keeps its
+/// existing direct side effects in `local_disk` mode.
+const READ_MODEL_TABLES: [&str; 9] = [
     "node",
     "node_health",
     "allocation",
     "task_config",
     "allocation_epoch_partition",
+    "job",
+    "job_config",
+    "task_status",
+    "kv_entry",
 ];
 
 /// RAII guard for the local-projection thread flag.

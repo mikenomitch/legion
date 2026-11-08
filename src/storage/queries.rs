@@ -245,11 +245,15 @@ id, name, status, created_at, updated_at
 // property of a spec version, and a resubmit can change it — so the job's
 // current band is its latest config's, resolved by correlated subquery rather
 // than duplicated onto the job row where it would immediately drift.
+// `version` is the latest config's version: what `RunJob`'s
+// `expected_version` compares against (revisions-and-watches plan §9).
 pub const JOB_SELECT_ATTRS: &str = r#"
 id, name, status, created_at, updated_at,
     (SELECT priority FROM job_config
      WHERE job_config.job_id = job.id
-     ORDER BY version DESC LIMIT 1) AS priority
+     ORDER BY version DESC LIMIT 1) AS priority,
+    (SELECT MAX(version) FROM job_config
+     WHERE job_config.job_id = job.id) AS version
 "#;
 
 // Upsert path only. `created_at` is deliberately absent: it is the job's
