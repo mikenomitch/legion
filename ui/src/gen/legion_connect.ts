@@ -3972,8 +3972,9 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Changes an app's settings (`legion app set`): replicas, placement, the
-     * pool for worker placement, and CPU and memory per task. The reconciler
+     * Changes an app's settings (`legion app set`): replicas (a count, or one
+     * per node with `per_node`), placement, the pool for worker placement,
+     * and CPU and memory per task. The reconciler
      * re-renders the job and rolls it. Requires `app:write`; a change of
      * placement or pool also requires `operator:write`, because it decides
      * which nodes hold the app's token and run its code with its grant. The
@@ -3983,8 +3984,9 @@ export const Manager = {
      * Retry-safe with `idempotency_key`.
      *
      * Errors:
-     * - InvalidArgument: replicas outside 1-32, an unknown placement, a pool
-     *   with `managers` placement, a zero resource.
+     * - InvalidArgument: replicas outside 1-32, `replicas` and `per_node`
+     *   both set, `per_node = false` without `replicas`, an unknown
+     *   placement, a pool with `managers` placement, a zero resource.
      * - PermissionDenied: the caller lacks `app:write`, or `operator:write`
      *   for a placement or pool change.
      *

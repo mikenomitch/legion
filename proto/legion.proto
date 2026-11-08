@@ -2832,8 +2832,9 @@ service Manager {
   // Retry-safe with `idempotency_key`.
   rpc SetAppEnabled (SetAppEnabledRequest) returns (SetAppEnabledReply);
 
-  // Changes an app's settings (`legion app set`): replicas, placement, the
-  // pool for worker placement, and CPU and memory per task. The reconciler
+  // Changes an app's settings (`legion app set`): replicas (a count, or one
+  // per node with `per_node`), placement, the pool for worker placement,
+  // and CPU and memory per task. The reconciler
   // re-renders the job and rolls it. Requires `app:write`; a change of
   // placement or pool also requires `operator:write`, because it decides
   // which nodes hold the app's token and run its code with its grant. The
@@ -2843,8 +2844,9 @@ service Manager {
   // Retry-safe with `idempotency_key`.
   //
   // Errors:
-  // - InvalidArgument: replicas outside 1-32, an unknown placement, a pool
-  //   with `managers` placement, a zero resource.
+  // - InvalidArgument: replicas outside 1-32, `replicas` and `per_node`
+  //   both set, `per_node = false` without `replicas`, an unknown
+  //   placement, a pool with `managers` placement, a zero resource.
   // - PermissionDenied: the caller lacks `app:write`, or `operator:write`
   //   for a placement or pool change.
   rpc UpdateAppSettings (UpdateAppSettingsRequest) returns (UpdateAppSettingsReply);
@@ -14941,7 +14943,7 @@ message ListAppsReply {
 
 // An app's settings (`legion app set`).
 message AppSettingsInfo {
-  // Copies of each task. 1-32.
+  // Copies of each task, 1-32. 0 when `per_node` is set.
   uint32 replicas = 1;
 
   // `managers`, `workers`, or `any` (docs/apps.md, "Placement").
@@ -14956,6 +14958,14 @@ message AppSettingsInfo {
 
   // The worker pool for `workers` and `any` placement. Unset is `default`.
   optional string pool = 5;
+
+  // One copy of each task on every node the placement and pool allow
+  // (`replicas = "per-node"` in a manifest, `legion app set --replicas
+  // per-node`), following nodes as they join and leave: the job's tasks get
+  // `count = { num = 1, per = "id" }`. `replicas` is 0 then, and the app's
+  // `desired` count is the allocations the scheduler placed (docs/apps.md,
+  // "Settings").
+  bool per_node = 6;
 }
 
 // What an app's `legion` identity was granted.
@@ -16011,6 +16021,8 @@ message SetAppEnabledReply {
 message UpdateAppSettingsRequest {
   string name = 1;
 
+  // A fixed number of copies of each task, 1-32. Setting it turns
+  // per-node off.
   optional uint32 replicas = 2;
 
   // `managers`, `workers`, or `any`.
@@ -16031,6 +16043,12 @@ message UpdateAppSettingsRequest {
   // Validate the change (and its `operator:write` check) and say what would
   // change, without changing it.
   bool dry_run = 8;
+
+  // `true` runs one copy of each task on every node the placement and pool
+  // allow (`legion app set --replicas per-node`). Set `replicas` instead to
+  // go back to a fixed number; `false` alone is refused, since it does not
+  // say how many.
+  optional bool per_node = 9;
 }
 
 // Reply payload for UpdateAppSettings.

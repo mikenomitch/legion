@@ -5153,10 +5153,12 @@ plan.
         only; a check from outside the cluster (or the CA's view) would
         catch split-horizon surprises
         ([calls 8](calls/ingress-app-plan_calls.md)).
-  - [ ] **Seed an app onto a named pool.** `apps.<name>` in the manager
-        config takes `placement` but no `pool`, so seeding the ingress onto
-        workers lands it in `default`; an edge pool needs `legion app set
-        --pool` afterwards ([docs](../docs/ingress.md#moving-it-to-worker-nodes)).
+  - [ ] **A per-node app's count misses nodes it could not place on.** Its
+        desired count is what the scheduler placed, so a node where a port
+        is taken reads as nothing missing in `legion app status`; only
+        `legion job info` shows the block
+        ([calls 3](calls/app-per-node-replicas-plan_calls.md)). Surfacing the
+        job's blocked placements in the app's status would close it.
   - [ ] **Check bundled apps' keys offline.** `legion job validate` without
         a manager reports `ingress` as not checked, though its schema is
         compiled into the binary.
@@ -6969,6 +6971,22 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         through it); `app_extensions::the_bundled_ingress_routes_reach_its_identity_test`
         (the key at submit, the watch, the app's grant on KV, its own
         service, Certificates, and its Issuer); the seeding tests.
+- [x] **Per-node replicas for apps; the ingress on every node it is placed
+      on** (2026-11-08, on the ingress PR
+      [#65](https://github.com/mikenomitch/legion/pull/65);
+      [plan](plans/app-per-node-replicas-plan.md) ·
+      [calls](calls/app-per-node-replicas-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md#replicas),
+      [ingress.md](../docs/ingress.md#where-it-runs)).
+  - [x] `replicas` takes a number or `"per-node"` in a manifest, `legion app
+        set --replicas`, and the seed config; per-node renders
+        `count = { num = 1, per = "id" }`; `UpdateAppSettings` and
+        `AppSettingsInfo` gain `per_node`; a per-node app's desired count is
+        what the scheduler placed for its latest version.
+  - [x] The seed config takes `pool` (`apps.ingress = { placement =
+        "workers", pool = "edge" }`).
+  - [x] The ingress defaults to per-node: every manager, or every node of
+        its edge pool.
 - [x] **Cert manager built in** (2026-11-07, merged in
       [#64](https://github.com/mikenomitch/legion/pull/64);
       [plan](plans/cert-manager-plan.md) ·

@@ -1816,7 +1816,10 @@ async fn a_record_that_does_not_decode_breaks_nothing_else_test() -> R<()> {
     // Only the removed record is seeded again; the other bundled apps
     // still have theirs.
     assert_eq!(reconciler.seed()?, vec!["autoscaler".to_string()]);
-    assert_eq!(fx.app("autoscaler")?.settings.replicas, 1);
+    assert_eq!(
+        fx.app("autoscaler")?.settings.replicas,
+        legion::structs::app::Replicas::Count(1)
+    );
     Ok(())
 }
 

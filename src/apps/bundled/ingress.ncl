@@ -16,7 +16,12 @@ let host_name = {
   name = "ingress",
   description = "Routes public hostnames to services, with automatic HTTPS.",
   placement = "managers",
-  replicas = 1,
+  # One on every node it may run on (per-node plan, calls entry 1): every
+  # manager, or every node of its pool after `legion app set ingress
+  # --placement workers --pool edge`. A node that joins gets one. Every
+  # replica is identical (certificates live in KV, HTTP-01 is stateless),
+  # and each node it runs on is a front door DNS can point at.
+  replicas = "per-node",
   job = {
     priority = "critical",
     task = {
@@ -31,8 +36,8 @@ let host_name = {
       resources = { cpu = 500, memory = 256 },
       network = {
         ports = [
-          # Static: the scheduler places at most one replica per node, so
-          # `legion app set ingress --replicas 3` spreads three nodes.
+          # Static: at most one replica fits on a node, and per-node
+          # replicas put one on each.
           { name = "http", static = 80 },
           { name = "https", static = 443 },
           # `/healthz` and the UI views. Not public.

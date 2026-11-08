@@ -13,7 +13,10 @@ delegation to the bundled cert manager (`certs`, cert-manager plan): the
 ingress keeps one `certs/Certificate` per routed host and answers HTTP-01
 from the Issuer's thumbprint (§6.7, calls entry 1). §6.7 wins where it and
 §6.2 or §6.5 disagree; those sections stay as written, marked. The same
-revision added where to point DNS (§6.8). Phase 2's Pebble check (§12) is
+revision added where to point DNS (§6.8). A later revision the same day made the
+ingress run one replica on every node it is placed on (`replicas =
+"per-node"`; [app-per-node-replicas-plan.md](app-per-node-replicas-plan.md)),
+which replaces §6.3's single replica and `--replicas N` advice. Phase 2's Pebble check (§12) is
 replaced by an end-to-end test against the cert manager and its fake ACME
 CA, which validates HTTP-01 through the ingress.
 

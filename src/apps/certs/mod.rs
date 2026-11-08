@@ -180,7 +180,7 @@ mod tests {
             ]
         );
         assert_eq!(manifest.placement, crate::structs::app::Placement::Managers);
-        assert_eq!(manifest.replicas, 1);
+        assert_eq!(manifest.replicas, crate::structs::app::Replicas::Count(1));
         assert!(crate::apps::is_bundled("certs"));
         let ui = manifest.ui_spec().expect("the ui block parses");
         assert_eq!(

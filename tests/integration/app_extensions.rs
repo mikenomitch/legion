@@ -2035,3 +2035,150 @@ async fn the_bundled_ingress_routes_reach_its_identity_test() -> R<()> {
     assert_eq!(denied.code(), Code::PermissionDenied, "{denied:?}");
     Ok(())
 }
+
+/// Per-node replicas (docs/apps.md, "Settings"; per-node plan §8): the
+/// bundled ingress seeds per-node and places one allocation on every
+/// manager and none on a worker; the app reads `running` once each is
+/// healthy; a fixed count switches it back; and the API refuses a request
+/// that sets both or says neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_per_node_app_runs_one_on_every_eligible_node_test() -> R<()> {
+    let fx = fixture().await?;
+    // Three managers on the build the app is rendered for.
+    for id in [MGR_NODE, "mgr-2", "mgr-3"] {
+        let mut manager = node(id, "legion-system", true);
+        manager.dynamic_attrs =
+            json!({ "capabilities": [], "buildVersion": "0.1.0", "buildId": "a" }).to_string();
+        fx.store.insert_node(manager)?;
+    }
+    let reconciler = AppReconciler::new(
+        fx.svc.clone(),
+        ReconcilerSettings {
+            seed: BTreeMap::new(),
+            own_build: BuildMarker {
+                version: "0.1.0".into(),
+                build_id: "a".into(),
+            },
+        },
+    );
+    assert!(reconciler.seed()?.contains(&"ingress".to_string()));
+    fx.svc
+        .set_app_enabled(req(
+            SetAppEnabledRequest {
+                name: "ingress".into(),
+                enabled: true,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    fx.start_app("ingress").await?;
+
+    let job = "legion-system/ingress";
+    let config_id = fx.store.get_job_config(job)?.id();
+    let tasks = fx.store.get_task_configs_for_job_config(&config_id)?;
+    let count = &tasks.first().context("a task")?.1.count;
+    assert_eq!((count.num, count.per.as_deref()), (1, Some("id")));
+    let allocations = fx.store.allocs_for_job(job)?;
+    let mut nodes: Vec<&str> = allocations.iter().map(|a| a.node_id.as_str()).collect();
+    nodes.sort();
+    assert_eq!(
+        nodes,
+        [MGR_NODE, "mgr-2", "mgr-3"],
+        "one per manager, none on {NODE}"
+    );
+
+    let app = |fx: &Fixture| {
+        let svc = fx.svc.clone();
+        let admin = fx.admin.clone();
+        async move {
+            svc.get_app(req(
+                GetAppRequest {
+                    name: "ingress".into(),
+                },
+                &admin,
+            ))
+            .await
+            .map(|reply| reply.into_inner().app.unwrap_or_default())
+        }
+    };
+    let before = app(&fx).await?;
+    assert_eq!(before.desired, 3, "{before:?}");
+    assert_ne!(before.status, "running", "nothing healthy yet");
+    let settings = before.settings.clone().unwrap_or_default();
+    assert!(settings.per_node);
+    assert_eq!(settings.replicas, 0);
+    for allocation in &allocations {
+        fx.store.upsert_allocation_health_snapshots(
+            &allocation.node_id,
+            &[AllocationHealth {
+                allocation_id: allocation.id,
+                healthy: true,
+                status: "running".into(),
+                artifact_states: None,
+            }],
+        )?;
+    }
+    let after = app(&fx).await?;
+    assert_eq!(
+        (after.status.as_str(), after.running, after.desired),
+        ("running", 3, 3),
+        "{after:?}"
+    );
+
+    // Both, or neither: refused.
+    let both = fx
+        .svc
+        .update_app_settings(req(
+            UpdateAppSettingsRequest {
+                name: "ingress".into(),
+                replicas: Some(2),
+                per_node: Some(true),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("replicas and per_node");
+    assert_eq!(both.code(), Code::InvalidArgument);
+    let neither = fx
+        .svc
+        .update_app_settings(req(
+            UpdateAppSettingsRequest {
+                name: "ingress".into(),
+                per_node: Some(false),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("per_node = false alone");
+    assert!(
+        neither.message().contains("set replicas instead"),
+        "{neither:?}"
+    );
+
+    // Back to a fixed count.
+    fx.svc
+        .update_app_settings(req(
+            UpdateAppSettingsRequest {
+                name: "ingress".into(),
+                replicas: Some(1),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    let mut reconciler = reconciler;
+    let outcome = reconciler.reconcile_app("ingress").await;
+    assert!(
+        matches!(&outcome, legion::manager::apps::PassOutcome::Submitted { action, .. }
+            if action == "settings changed (replicas per-node → 1)"),
+        "{outcome:?}"
+    );
+    let config_id = fx.store.get_job_config(job)?.id();
+    let tasks = fx.store.get_task_configs_for_job_config(&config_id)?;
+    let count = &tasks.first().context("a task")?.1.count;
+    assert_eq!((count.num, count.per.as_deref()), (1, None));
+    Ok(())
+}

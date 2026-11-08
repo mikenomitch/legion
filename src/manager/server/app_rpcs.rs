@@ -19,7 +19,7 @@ use crate::structs::acl::AclRule;
 use crate::structs::app::{
     changed_code_fields, install_prompt, permission_diff, validate_app_config, AppGrant,
     AppManifest, AppReconcileState, AppRecord, AppSettings, AppSource, ManagedBy, Placement,
-    RenderedApp, RECONCILER_PRINCIPAL,
+    RenderedApp, Replicas, RECONCILER_PRINCIPAL,
 };
 use crate::structs::config::{MANAGER_ROLE_ATTR, MANAGER_ROLE_VALUE};
 use crate::structs::extensions::{core_collision, key_overrides, manifest_decls, validate_decls};
@@ -49,7 +49,8 @@ fn rules_json(rules: &[AclRule]) -> String {
 
 fn settings_info(settings: &AppSettings) -> AppSettingsInfo {
     AppSettingsInfo {
-        replicas: settings.replicas,
+        replicas: settings.replicas.count().unwrap_or(0),
+        per_node: settings.replicas.is_per_node(),
         placement: settings.placement.as_str().to_string(),
         cpu: settings.resources.and_then(|resources| resources.cpu),
         memory: settings.resources.and_then(|resources| resources.memory),
@@ -1638,8 +1639,20 @@ impl ManagerDaemonService {
         }
         let record = self.load_app(&name)?;
         let mut settings = record.settings.clone();
-        if let Some(replicas) = inner.replicas {
-            settings.replicas = replicas;
+        match (inner.replicas, inner.per_node) {
+            (Some(_), Some(true)) => {
+                return Err(Status::invalid_argument(
+                    "set either replicas (a fixed number) or per_node, not both",
+                ));
+            }
+            (None, Some(false)) => {
+                return Err(Status::invalid_argument(
+                    "per_node = false does not say how many replicas: set replicas instead",
+                ));
+            }
+            (Some(replicas), _) => settings.replicas = Replicas::Count(replicas),
+            (None, Some(true)) => settings.replicas = Replicas::PerNode,
+            (None, None) => {}
         }
         if let Some(placement) = inner.placement.as_deref() {
             settings.placement = Placement::parse(placement).map_err(Status::invalid_argument)?;

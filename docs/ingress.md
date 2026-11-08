@@ -30,8 +30,8 @@ NAME     VERSION  SOURCE   STATUS   PLACEMENT  REPLICAS  UI        DETAIL
 ingress  0.1.0    bundled  running  managers   1/1       nav, job  on legion-system-x8f2k1qz
 ```
 
-It runs on a manager by default, listening on ports 80 and 443. That is
-the quickest way to start. For a site with real traffic, move it to worker
+It runs on every manager by default, one per manager, listening on ports
+80 and 443. That is the quickest way to start. For a site with real traffic, move it to worker
 nodes of its own ([Moving it to worker nodes](#moving-it-to-worker-nodes)).
 
 **2. Route a service.** Add `ingress` to the service block and run the
@@ -176,18 +176,23 @@ claims nothing until it runs again.
 
 ## Where it runs
 
-The ingress app's job binds static ports 80 and 443. At most one replica
-can hold them on a node, so replicas always land on different nodes:
+The ingress runs **one replica on every node it may run on**
+(`replicas = "per-node"`, [Replicas](apps.md#replicas)): every manager by
+default, or every node of its pool once you move it. A node that joins gets
+one, and a node that leaves takes its replica with it, so there is no count
+to keep in step with the cluster. Every replica is identical (routes come
+from the jobs, certificates from KV, and HTTP-01 needs no shared state), and
+each node it runs on is a front door DNS can point at.
 
 ```console
-$ legion app set ingress --replicas 3          # three managers, one each
-$ legion app set ingress --placement workers --pool edge --replicas 4
+$ legion app set ingress --placement workers --pool edge   # one on each edge node
+$ legion app set ingress --replicas 2                      # a fixed number instead
 ```
 
 | Setting | Default | |
 | --- | --- | --- |
 | placement | `managers` | The managers' [system workers](architecture-managers-workers.md#the-system-worker): nothing to set up, and right for small sites. For real traffic, use `workers` ([Moving it to worker nodes](#moving-it-to-worker-nodes)). |
-| replicas | `1` | One per node. Point DNS at every node that runs one (round-robin `A` records, or a cloud load balancer across them). |
+| replicas | `per-node` | One on every node the placement and pool allow. Point DNS at every node that runs one (round-robin `A` records, or a cloud load balancer across them). A number instead caps it; static ports keep one per node either way. |
 | resources | 500 MHz, 256 MiB | `legion app set ingress --cpu 2000 --memory 512`. On managers, it shares the system worker's lend (`systemWorker.resources`, 1000 MHz and 1024 MiB by default) with the other bundled apps. |
 
 `--placement workers` (or `any`) needs `operator:write`
@@ -246,15 +251,15 @@ $ LEGION_WORKER_PUBLIC_ADDRESS=203.0.113.20 legion join <token>   # on each edge
 its certificates' private keys ([Placement](apps.md#placement)):
 
 ```console
-$ legion app set ingress --placement workers --pool edge --replicas 2 --cpu 2000 --memory 512
-$ legion app status ingress        # PLACEMENT workers, REPLICAS 2/2 once both run
+$ legion app set ingress --placement workers --pool edge --cpu 2000 --memory 512
+$ legion app status ingress        # PLACEMENT workers (edge), REPLICAS 2/2 once both run
 ```
 
-The reconciler resubmits the ingress's job as a normal rollout: replicas
-start on the edge nodes, and the ones on the managers stop. Static ports
-keep one replica per node, so `--replicas` can be at most the number of
-edge nodes. Certificates live in KV, so the new replicas serve them within
-10 seconds, and nothing is re-issued.
+The reconciler resubmits the ingress's job as a normal rollout: a replica
+starts on every edge node, and the ones on the managers stop. Adding an
+edge node later adds a replica, with nothing to change. Certificates live
+in KV, so the new replicas serve them within 10 seconds, and nothing is
+re-issued.
 
 **4. Repoint DNS** at the edge nodes:
 
@@ -271,10 +276,20 @@ DNS pointed at a load balancer and change its targets instead. The Ingress
 page's DNS column turns back to `points here` as the new records reach the
 ingress's resolver.
 
-On a new cluster you can seed it straight onto workers with
-`apps = { ingress = { enabled = true, placement = "workers" } }` in the
-manager config. Seeding has no pool setting, so that lands it in the
-`default` pool; move it to an edge pool with `legion app set` as above.
+On a new cluster, start it on the edge pool from the manager config
+([Seeding](apps.md#seeding-and-the-manager-config)):
+
+```nickel
+# configs/manager.ncl
+apps = { ingress = { enabled = true, placement = "workers", pool = "edge" } },
+```
+
+**Keep it off shared pools.** Per-node means every node of the pool, so
+`--placement workers` without `--pool` (the `default` pool, where tenant
+jobs run) or `--placement any` puts the ingress on every tenant node. Each
+of those nodes then holds the ingress's token and every site's TLS keys,
+loses ports 80 and 443 for tenant jobs, and adds a replica that polls the
+manager for every routed service. A pool of its own avoids all of that.
 
 **Why worker nodes perform better.**
 
@@ -297,8 +312,8 @@ manager config. Seeding has no pool setting, so that lands it in the
 - **It scales out without touching quorum.** Managers come in small odd
   numbers sized for consensus, and adding one to add proxy capacity also
   adds a Raft voter. Edge workers are ordinary nodes: each one you add
-  brings its own CPU, network card, and connection table, and `--replicas`
-  spreads the ingress across them.
+  brings its own CPU, network card, and connection table, and gets a
+  replica of the ingress as it joins.
 - **Right-sized machines in the right place.** Edge nodes can be
   network-optimized machines in a public subnet, while the managers stay
   small and private. Managers then never need to accept internet traffic.
@@ -644,8 +659,9 @@ balancer's address to `X-Forwarded-For`, after the client's.
   can take a few seconds to receive traffic.
 - **Upgrades cause a short gap per node.** Upgrading Legion rolls the
   ingress's job. A static port is released before the new replica binds it,
-  so each node stops answering for a few seconds. Run two or more replicas
-  behind DNS to ride through it.
+  so each node stops answering for a few seconds. With a replica on every
+  manager (the default) or edge node, and DNS pointing at all of them,
+  clients ride through on the others.
 - **IPv4 listeners.** The ingress listens on `0.0.0.0`.
 - **Wildcards and internal names need an Issuer of your own** (DNS-01 or a
   private CA), or your own bundle. The default Issuer proves exact public
