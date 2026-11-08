@@ -13,6 +13,7 @@ pub mod exec;
 pub mod exec_key;
 pub mod exec_ticket;
 pub mod gitops;
+pub mod governance;
 pub mod guest_agent;
 pub mod guest_resume;
 pub mod helpers;
@@ -65,6 +66,7 @@ fn base_cli() -> Command {
         .propagate_version(true)
         .subcommand_required(true)
         .arg_required_else_help(true)
+        .arg(governance::approval_flag())
         .subcommand(capabilities::config())
         .subcommand(mcp::config())
         .subcommand(docs::config())
@@ -85,6 +87,9 @@ fn base_cli() -> Command {
         .subcommand(session::config())
         .subcommand(join::config())
         .subcommand(ledger::config())
+        .subcommand(governance::audit_config())
+        .subcommand(governance::approval_config())
+        .subcommand(governance::usage_config())
         .subcommand(events::config())
         .subcommand(kv::config())
         .subcommand(keyring::config())
