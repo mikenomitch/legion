@@ -596,7 +596,18 @@ pub fn build_task_allocation_with(
     // As declared, without the scheduler's defaults folded in, so an isolating
     // runtime can size its sandbox only where the job actually asked for a size.
     let task_resources = match task.resources.as_object() {
-        Some(resources) if !resources.is_empty() => serde_json::to_string(&task.resources)?,
+        Some(resources) if !resources.is_empty() => {
+            // Device requests travel with the ids the store assigned this
+            // allocation (`devices[i].assigned`, docs/devices.md): the
+            // worker allocates exactly those.
+            let mut declared = resources.clone();
+            if let Some(devices) = allocation.resources.get(crate::devices::RESOURCES_KEY) {
+                if declared.contains_key(crate::devices::RESOURCES_KEY) {
+                    declared.insert(crate::devices::RESOURCES_KEY.to_string(), devices.clone());
+                }
+            }
+            serde_json::to_string(&declared)?
+        }
         _ => String::new(),
     };
     // The declared stop ladder, carried because the worker rebuilds its

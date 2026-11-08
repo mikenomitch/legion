@@ -94,11 +94,30 @@ pub fn config() -> Command {
                         .default_value("client")
                         .help("Token type: client or management"),
                 )
+                .arg(Arg::new("ttl").long("ttl").value_name("TTL").help(
+                    "Lifetime (for example 8h, 30d). Default: acl.tokenDefaultTtl (30d); \
+                             a child token: acl.childTokenDefaultTtl (1h). `never` for a \
+                             management token",
+                ))
                 .arg(
-                    Arg::new("ttl")
-                        .long("ttl")
-                        .value_name("TTL")
-                        .help("Lifetime (for example 8h, 30d). Omit for a non-expiring token"),
+                    Arg::new("child")
+                        .long("child")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Mint a child of YOUR token: a subset of its policies (all of them \
+                             when --policy is omitted), expiring with it, revoked with it. \
+                             Needs no acl:write",
+                        ),
+                )
+                .arg(
+                    Arg::new("write-rate")
+                        .long("write-rate")
+                        .value_name("RATE")
+                        .requires("child")
+                        .help(
+                            "With --child: the child's write rate limit, e.g. 5/s or \
+                             5/s,burst=20 (other tokens: governance.rateLimit.overrides)",
+                        ),
                 )
                 .arg(json_flag()),
         )
@@ -516,8 +535,51 @@ async fn token_create(arg_matches: &ArgMatches) -> R<()> {
         .map(|values| values.cloned().collect())
         .unwrap_or_default();
     let ttl = arg_matches.get_one::<String>("ttl").cloned();
+    let write_rate = arg_matches.get_one::<String>("write-rate").cloned();
 
     let mut client = connect_manager_client().await?;
+    if arg_matches.get_flag("child") {
+        let reply = output::resolve(
+            format,
+            "Failed to create child token",
+            client
+                .create_child_token(tonic::Request::new(
+                    crate::structs::CreateChildTokenRequest {
+                        name: name.clone(),
+                        policies,
+                        ttl,
+                        write_rate,
+                    },
+                ))
+                .await,
+        )?
+        .into_inner();
+        let token = reply.token.unwrap_or_default();
+        if format.is_json() {
+            output::print_success(&json!({
+                "accessorId": token.accessor_id,
+                "secret": reply.secret,
+                "name": token.name,
+                "tokenType": token.token_type,
+                "policies": token.policies,
+                "expiresAt": token.expires_at,
+                "parentAccessorId": token.parent_accessor_id,
+            }));
+        } else {
+            println!(
+                "Created child token `{}` of {}. The secret is shown only once.\n",
+                token.name,
+                token.parent_accessor_id.as_deref().unwrap_or("-")
+            );
+            println!("  Accessor ID: {}", token.accessor_id);
+            println!("  Secret:      {}", reply.secret);
+            println!("  Policies:    {}", token.policies.join(", "));
+            if let Some(expires) = token.expires_at {
+                println!("  Expires:     {expires}");
+            }
+        }
+        return Ok(());
+    }
     let response = output::resolve(
         format,
         "Failed to create ACL token",
@@ -566,6 +628,7 @@ struct TokenPrint {
     r#type: String,
     policies: String,
     expires_at: String,
+    parent: String,
 }
 
 fn token_json(token: &AclTokenInfo) -> Value {
@@ -576,6 +639,7 @@ fn token_json(token: &AclTokenInfo) -> Value {
         "policies": token.policies,
         "createdAt": token.created_at,
         "expiresAt": token.expires_at,
+        "parentAccessorId": token.parent_accessor_id,
     })
 }
 
@@ -604,6 +668,7 @@ async fn token_list(format: OutputFormat) -> R<()> {
                     r#type: token.token_type,
                     policies: token.policies.join(", "),
                     expires_at: token.expires_at.unwrap_or_else(|| "never".to_string()),
+                    parent: token.parent_accessor_id.unwrap_or_else(|| "-".to_string()),
                 })
                 .collect(),
         );

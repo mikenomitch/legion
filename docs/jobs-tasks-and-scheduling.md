@@ -302,8 +302,11 @@ fails for good.
 Held tasks move on their own. When a worker reports that a task with
 dependents reached a terminal state, the manager queues an eval for the job:
 a `job_reschedule`, or a `rollout_tick` when the config is being rolled out
-to, so the rollout's step and health gating still apply. That eval places
-whatever the exit made ready. A three-step pipeline therefore runs one step
+to. That eval places whatever the exit made ready. A rollout places released
+dependents ahead of its own gates (a pause, a manual advance, the batch
+retire window), so a gated rollout does not freeze the DAG; a service
+dependent is still held to its rollout step's size (see
+[Rollouts](rollouts.md#resubmitting-a-batch-or-dag-job)). A three-step pipeline therefore runs one step
 at a time:
 
 ```nickel
@@ -404,15 +407,21 @@ regular affinity rules plus the `same_node_as` task colocation preference.
 On top of explicit affinity rules, policy scoring applies an automatic
 anti-affinity penalty.
 
-The penalty for each candidate node is:
+The penalty for each candidate node, with `collisions =
+max(same_task_allocations_on_node, same_group_allocations_on_node)`, is:
 
-- `max(same_task_allocations_on_node, same_group_allocations_on_node)`
+- `0` when `collisions` is 0;
+- `(collisions + 1) / count` otherwise, where `count` is the task's desired
+  replica count.
 
 It is then weighted by the scheduler setting `automatic_anti_affinity`
 (default `0.2`).
 
 As a result, the scheduler prefers not to stack allocations of the same task
-or group on one node. This is a soft preference, so it can still happen.
+or group on one node. This is a soft preference, and it weakens as the count
+grows: a three-replica service spreads, while under `bin_pack` a
+twenty-replica batch task packs onto as few nodes as fit it
+([scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#scoring)).
 
 ## Content Locality
 
@@ -433,7 +442,7 @@ Every candidate node's score is a weighted sum. Set the weights under
   schedulerSettings = {
     weights = {
       affinities = 1.0,              # affinity rules and same_node_as
-      automatic_anti_affinity = 0.2, # subtracted per stacked allocation
+      automatic_anti_affinity = 0.2, # times (stacked + 1) / count
       locality = 1.0,                # content locality; 0 disables
       # spread / bin_pack default to 1.0 for the matching policy, else 0.
     },
@@ -443,11 +452,26 @@ Every candidate node's score is a weighted sum. Set the weights under
 
 ```
 score = affinities * affinity
-      + spread * (emptiness relative to the other candidates)
-      + bin_pack * (fullness relative to the other candidates)
-      - automatic_anti_affinity * stacked allocations
+      + spread * (1 - utilization after placing)
+      + bin_pack * (utilization after placing)
+      - automatic_anti_affinity * (stacked + 1) / count   (0 when nothing is stacked)
       + locality * content locality
 ```
+
+**Utilization** is resource-based, not a count of allocations: the largest
+fraction, over the resources the task requests (memory, cpu, cores, allocation
+slots with a finite `maxAllocations`), of the node's schedulable capacity that
+would be in use once the task is placed. A small balanced-allocation term
+favors nodes whose resources fill evenly. It is absolute, so a node scores the
+same whichever other nodes are candidates. The exact formula is in
+[scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#scoring).
+
+So `bin_pack` puts a 2 GiB task on the node that is 75% full of one large
+allocation before the one that holds three small ones, keeping the emptier
+node whole for a large task, and `spread` does the reverse. Replicas of one
+task spread when they are few and pack under `bin_pack` when they are many,
+because the anti-affinity penalty is divided by the count (above); set
+`automatic_anti_affinity = 0` to stack them whatever the count.
 
 Weights must be non-negative numbers. Unknown keys are ignored. The highest
 score wins, with exact ties broken at random.
@@ -716,6 +740,16 @@ onUnhealthy = {
 },
 ```
 
+A keyed instance (`stateful.mode = "keyed"`, such as one sandbox or
+workspace per user) counts its own moves instead. Each keyed instance is a
+separate unit of work, so a few unrelated instances of one job failing does
+not fail the job: an instance whose moves inside `movePeriod` reach
+`moveCount` is stopped, as `legion instance stop` would leave it, and the
+job and its other instances keep running. Its `last_stop` names the spent
+budget, and `legion instance start <id>` retries it with a fresh budget.
+Slot instances and stateless tasks share the task's budget, and spending it
+fails the job.
+
 The hold is what makes the backoff stick. The scheduler leaves one
 replacement unplaced per active hold, whichever eval runs for the job: the
 capacity pass after other allocations free room, a node joining, or the
@@ -732,7 +766,8 @@ Operators see a deferred replacement in three places:
 - an `allocation.reschedule_deferred` event (warn) per deferral, with the
   task, instance, node, allocation, attempt, backoff, next attempt time, and
   reason, and an `allocation.reschedule_exhausted` event (error) when the
-  budget runs out, ahead of `job.failed` (see the
+  budget runs out, ahead of `job.failed` (or, for a keyed instance, with
+  `instanceStopped: true` and no `job.failed`; see the
   [event table](event-stream.md));
 - `legion instance get` and `instance list` for a stateful instance, whose
   state reads `rescheduling` and whose detail says why and until when:
@@ -883,6 +918,26 @@ Job config unchanged; no update needed (the job is running; use --force-reschedu
 "Not running" means no live allocation and no placing eval queued for the
 job, so a finished batch job runs again and a job that could not be placed
 gets another attempt.
+
+### Watching a job's status
+
+`legion job watch web` prints the job each time anything its status reads
+changes (its versions, allocations, or task outcomes), and
+`legion job info web --index <revision>` waits for the next such change. See
+[Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md).
+
+## Job Versions and Compare-and-Set
+
+`Job.version` is the job's spec version: the version of its latest config,
+raised by every submit that changes the spec. An unchanged resubmit, a
+stop, a status change, and a scale (`legion job scale`) leave it alone.
+`legion job run --expected-version N` submits only when the job is still at
+version `N` (`0`: only if it does not exist yet), checked in the same write
+that stores the new version, so two people or agents editing one job cannot
+silently overwrite each other; the loser gets `ABORTED` naming the current
+version and writes nothing. `legion job plan` lists, field by field, what a
+submit would change in the stored spec. See
+[Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md#compare-and-set-on-jobs).
 
 ## Job Timestamps: `created_at` and `updated_at`
 

@@ -421,6 +421,20 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         "Worker state directory (keep it stable across restarts: it is how a \
          restarted worker re-adopts its running tasks)"
     );
+    // Another identity's tasks on this host are nobody's now, and the
+    // manager places their work again: say so where the operator looks.
+    for (other, live) in
+        crate::worker::state::other_identities_with_live_tasks(&worker_state_dir(), &name)
+    {
+        warn!(
+            worker_name = %name,
+            other_identity = %other,
+            live_tasks = live,
+            "Worker identity {other} in this data dir left {live} task(s) running that this \
+             worker does not manage; unless a worker named {other} is running, start this \
+             worker as `--name {other}` to re-adopt them, or stop them"
+        );
+    }
     // Before anything writes into it: each entry's mode is part of the
     // isolation between allocations (see `prepare_layout`).
     WorkerStateStore::new(state_path.clone()).prepare_layout()?;
@@ -462,6 +476,10 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             )
         });
     let sessions_config = parse_sessions_payload(&config.artifacts);
+    // Device plugins, static devices, and CDI dirs (docs/devices.md).
+    let device_manager = Arc::new(crate::devices::plugin::DeviceManager::new(
+        parse_devices_payload(&config.artifacts),
+    ));
     let session_manifests = build_session_manifests(
         content_store_target.as_ref(),
         Arc::new(ManagerCredentialSource::new(
@@ -556,6 +574,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         }
     }
     apply_container_env(&config.container);
+    let runtime_classes = apply_runtime_classes(&config.container);
     // One host guard for the datapath and artifact fetches alike.
     let host_guard = Arc::new(host_guard_for(&config.security));
     let sandbox_bridges = apply_sandbox_bridges_env(enforcement_config.sandbox.as_ref());
@@ -573,6 +592,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         }
         manager.load_builtin_plugins();
         manager.configure_volumes(&name, host_volumes);
+        manager.configure_devices(device_manager.clone());
         // Before `configure_artifacts`, which hands the store to the stager.
         manager.configure_content_store(content_store.clone());
         manager.configure_content_publishing(content_publishing);
@@ -752,7 +772,24 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let plugins = task_manager.lock().expect("task manager").plugin_handles();
     let readiness =
         tokio::task::spawn_blocking(move || crate::task_plugins::readiness_of(&plugins)).await?;
-    let health_checks = run_health_checks(config.additional_node_checks.clone(), Some(readiness));
+    let mut health_checks =
+        run_health_checks(config.additional_node_checks.clone(), Some(readiness));
+    // The first device report rides the registration, so a GPU node is
+    // schedulable for GPU work from its first moment (docs/devices.md).
+    if device_manager.is_configured() {
+        let devices = device_manager.clone();
+        let report = tokio::task::spawn_blocking(move || devices.fingerprint()).await?;
+        info!(
+            groups = report.groups.len(),
+            instances = report
+                .groups
+                .iter()
+                .map(|group| group.instances.len())
+                .sum::<usize>(),
+            "Devices fingerprinted"
+        );
+        health_checks.insert(crate::devices::REPORT_KEY.into(), report.to_value());
+    }
 
     // Resolved before `config` is picked apart below (the helper borrows
     // the whole struct).
@@ -816,10 +853,43 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             json!(sandbox_bridges),
         );
     }
+    // The OCI runtime classes whose runtime answered: a container task that
+    // names one carries an implicit `container.runtimeClasses contains`
+    // constraint (docs/task-runtime-container.md, "Runtime classes").
+    if !runtime_classes.is_empty() {
+        config_attrs.insert(
+            crate::task_plugins::runtime_class::NODE_ATTR.into(),
+            json!(runtime_classes),
+        );
+    }
+    // A runc too old for idmapped mounts fails every default container
+    // start; saying so keeps user-namespaced container tasks off this node.
+    if let Some(value) =
+        tokio::task::spawn_blocking(crate::task_plugins::idmapped_mounts_attribute).await?
+    {
+        warn!(
+            "This node's OCI runtime is a runc older than 1.2, which cannot start a container \
+             with security.userNamespace (the default); such tasks will not be placed here. \
+             Install runc 1.2 or newer, or crun"
+        );
+        config_attrs.insert(
+            crate::task_plugins::IDMAPPED_MOUNTS_ATTR.into(),
+            Value::String(value.into()),
+        );
+    }
     // What managers (and edge routers) dial: the route's source address
     // toward the manager unless overridden (docs/architecture-managers-
     // workers.md, "Ports"). Always `https://`: the worker plane is mTLS.
     config_attrs.insert("workerAddress".into(), Value::String(advertised.clone()));
+    // Where this node reads published snapshot parts with its own
+    // credential: the scheduler prefers such a node for a published restore
+    // (docs/suspend-and-resume.md). The URL only, never its `auth`.
+    if let Some(target) = content_store_target.as_ref() {
+        config_attrs.insert(
+            crate::content_publish::NODE_ATTR.into(),
+            Value::String(target.url.clone()),
+        );
+    }
     // `legion node info` shows whether host-mode tasks are guarded here.
     config_attrs.insert(
         crate::worker::netd::kernel_guard::NODE_ATTR.into(),
@@ -926,6 +996,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 )
             }),
             classifier,
+        )
+        .with_guard_counter_interval(
+            serde_json::from_str::<crate::structs::WorkerSecurityConfig>(&config.security)
+                .ok()
+                .and_then(|security| security.host_guard)
+                .map(|guard| guard.counter_interval())
+                .unwrap_or(crate::structs::host_guard::DEFAULT_COUNTER_INTERVAL),
         ),
     );
     // Where the kernel classifier redirects host-mode flows only netd can
@@ -1893,6 +1970,21 @@ fn apply_container_env(raw: &str) {
     }
 }
 
+/// Publishes the worker type's OCI runtime classes to the container runtime
+/// and returns the ones whose runtime answers, which the node advertises
+/// (docs/task-runtime-container.md, "Runtime classes").
+fn apply_runtime_classes(raw: &str) -> Vec<String> {
+    let classes = crate::structs::WorkerContainerConfig::from_payload(raw)
+        .map(|config| config.runtime_classes)
+        .unwrap_or_default();
+    crate::task_plugins::runtime_class::publish(&classes);
+    let available = crate::task_plugins::runtime_class::probe(&classes);
+    if !available.is_empty() {
+        info!(runtime_classes = ?available, "Container runtime classes available on this node");
+    }
+    available
+}
+
 /// Publishes the worker's `sandbox.bridges` pools into the environment for
 /// the sandbox runtime, which leases TAP guests their addresses from them
 /// (docs/task-runtime-sandbox.md, "Addressing"). Returns the bridge names,
@@ -1947,6 +2039,22 @@ fn parse_sessions_payload(raw: &str) -> crate::structs::WorkerSessionsConfig {
         .ok()
         .and_then(|payload| payload.sessions)
         .unwrap_or_default()
+}
+
+/// The worker config's `devices` block, from the artifacts payload it rides
+/// in (none when absent or unreadable: an unreadable block is logged, and
+/// the node reports no devices rather than refusing to start).
+fn parse_devices_payload(raw: &str) -> crate::devices::plugin::WorkerDevicesConfig {
+    if raw.trim().is_empty() {
+        return Default::default();
+    }
+    match serde_json::from_str::<crate::structs::WorkerArtifactsPayload>(raw) {
+        Ok(payload) => payload.devices.unwrap_or_default(),
+        Err(err) => {
+            warn!(error = %err, "Invalid worker devices config; this node reports no devices");
+            Default::default()
+        }
+    }
 }
 
 /// The session manifests in the worker's `contentStore`, when one is
@@ -2690,6 +2798,9 @@ async fn heartbeat_tick(
             (allocations, allocation_health.clone(), allocation_health)
         };
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
+            // What the node holds of its endpoint feed, so the reply carries
+            // only what changed (mesh-control-path plan §6.1).
+            endpoint_feed: Some(netd.feed_report()),
             work_stream: work_stream.clone(),
             content_locations: content_report
                 .as_ref()
@@ -2906,13 +3017,13 @@ async fn heartbeat_tick(
         // endpoint feed, and the policy assignments.
         netd.send(NetdInput::Desired(DesiredNetwork {
             desired: reply.desired_allocations.clone(),
-            upstream_endpoints: reply.upstream_endpoints.clone(),
+            endpoint_feed: reply.endpoint_feed.take(),
             net_policies: reply.net_policies.clone(),
         }))
         .await;
         // Config-file templates, rendered from the same feed; written before
         // any launch below so a task starts with its files in place.
-        apply_templates(task_manager, &reply).await;
+        apply_templates(task_manager, netd, &reply).await;
         // KV files marked `onChange = "update"`, rewritten under running
         // allocations whose rendered content moved.
         apply_live_kv_files(task_manager, &reply);
@@ -2923,6 +3034,13 @@ async fn heartbeat_tick(
             credentials,
             manager_addr,
             &reply.cluster_ca_pins,
+            name,
+            reply
+                .next_interval_seconds
+                .map(|seconds| Duration::from_secs(u64::from(seconds)))
+                .unwrap_or(Duration::from_secs(
+                    crate::constants::WORKER_HEARTBEAT_DURATION_SEC,
+                )),
         )
         .await;
         // Policy bodies by hash, KV-held ingress certificates, and upstream
@@ -3211,7 +3329,11 @@ static TEMPLATES: LazyLock<crate::worker::templates::TemplateEngine> =
 /// endpoint feed: the first time before the task launches, then on every
 /// heartbeat that changes a file, applying `changeMode` after `coalesce`
 /// and `splay`.
-async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &HeartbeatReply) {
+async fn apply_templates(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    netd: &Netd,
+    reply: &HeartbeatReply,
+) {
     use crate::worker::templates::{ChangeAction, TemplateContext};
     let live: std::collections::HashSet<i64> = reply
         .desired_allocations
@@ -3236,17 +3358,8 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
         } else {
             serde_json::from_str(&allocation.network).ok()
         };
-        let endpoints: std::collections::BTreeMap<String, Vec<Endpoint>> = reply
-            .upstream_endpoints
-            .iter()
-            .filter(|u| u.allocation_id == allocation.allocation_id && !u.for_handler)
-            .map(|u| {
-                (
-                    u.service.clone(),
-                    crate::worker::netd::specs::dialable_endpoints(u),
-                )
-            })
-            .collect();
+        let endpoints: std::collections::BTreeMap<String, Vec<Endpoint>> =
+            netd.template_endpoints(allocation.allocation_id);
         let (running, base) = {
             let mut manager = task_manager.lock().expect("task manager");
             let running = manager.has_allocation(allocation.allocation_id);
@@ -3318,12 +3431,16 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
 }
 
 /// Keep the node certificate current: re-issued after a third of its
-/// lifetime, or at once when the manager's trust bundle differs from the
-/// node's (a CA rotation, or a CA added to or removed from the bundle). The
-/// same identity serves the worker plane listener (hot-swapped, no restart)
-/// and the mesh. Fail-static: a failed
-/// issuance keeps the certificate the node has, and a node without one
-/// refuses mesh flows rather than sending them in the clear.
+/// lifetime, or when the manager's trust bundle differs from the node's (a
+/// CA rotation, or a CA added to or removed from the bundle). A bundle
+/// change waits out the node's rotation splay first (mesh-control-path plan
+/// §6.7), so a rotation does not land every node's CSR on the signer in one
+/// beat; it is at once when the CA the node's certificate chains to left
+/// the bundle. The same identity serves the worker plane listener
+/// (hot-swapped, no restart) and the mesh. Fail-static: a failed issuance
+/// keeps the certificate the node has, and a node without one refuses mesh
+/// flows rather than sending them in the clear.
+#[allow(clippy::too_many_arguments)]
 async fn refresh_node_identity(
     node_identity: &crate::worker::plane::NodeIdentity,
     netd: &Netd,
@@ -3331,12 +3448,40 @@ async fn refresh_node_identity(
     credentials: &Arc<WorkerCredentials>,
     manager_addr: &str,
     manager_ca_pins: &[String],
+    node_id: &str,
+    interval: Duration,
 ) {
-    if !node_identity.needs_refresh(Some(manager_ca_pins)) {
-        return;
+    use crate::worker::plane::RefreshNeed;
+    let now = std::time::Instant::now();
+    match node_identity.refresh_need(Some(manager_ca_pins)) {
+        None => {
+            *ROTATION_DUE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return;
+        }
+        Some(RefreshNeed::BundleChanged { issuer_left: false }) => {
+            let mut pending = ROTATION_DUE.lock().unwrap_or_else(|p| p.into_inner());
+            let due = match pending.as_ref() {
+                Some((pins, due)) if pins.as_slice() == manager_ca_pins => *due,
+                _ => {
+                    let splay = crate::worker::plane::rotation_splay(node_id, interval);
+                    info!(
+                        splay_ms = splay.as_millis() as u64,
+                        "The cluster's trust bundle changed; re-issuing the node certificate after the rotation splay"
+                    );
+                    let due = now + splay;
+                    *pending = Some((manager_ca_pins.to_vec(), due));
+                    due
+                }
+            };
+            if now < due {
+                return;
+            }
+        }
+        Some(_) => {}
     }
     match node_identity.issue(client, credentials, manager_addr).await {
         Ok(()) => {
+            *ROTATION_DUE.lock().unwrap_or_else(|p| p.into_inner()) = None;
             if let Some(mesh) = node_identity.mesh_identity() {
                 netd.send(NetdInput::MeshIdentity(mesh)).await;
             }
@@ -3514,6 +3659,15 @@ static CONTENT_ADVERTISER: std::sync::LazyLock<
     Mutex<crate::worker::content_report::ContentAdvertiser>,
 > = std::sync::LazyLock::new(|| Mutex::new(Default::default()));
 
+/// A pending CA-rotation re-issue: the trust bundle (pins) it is for, and
+/// when it is due.
+type RotationDue = Option<(Vec<String>, std::time::Instant)>;
+
+/// The pending CA-rotation re-issue, if any (`refresh_node_identity`,
+/// mesh-control-path plan §6.7).
+static ROTATION_DUE: std::sync::LazyLock<Mutex<RotationDue>> =
+    std::sync::LazyLock::new(Default::default);
+
 /// Capability a worker that streams its work advertises at registration.
 pub const WORK_STREAM_CAPABILITY: &str = "work-stream";
 
@@ -3559,6 +3713,13 @@ fn launch_streamed_work(
 ) {
     if applied.reconcile {
         HEARTBEAT_WAKE.notify_one();
+    }
+    // Endpoint sets the manager pushed: applied to the listeners now, not at
+    // the next beat (mesh-control-path plan §6.1).
+    if let (Some(feed), Some(netd)) = (applied.endpoint_feed, launcher.netd.clone()) {
+        tokio::spawn(async move {
+            netd.send(NetdInput::Endpoints(feed)).await;
+        });
     }
     // Checkpoint work starts the moment it is pushed, deduplicated against
     // what this node already has in flight or finished, exactly as when a
@@ -3741,13 +3902,25 @@ async fn start_node_checks(
         // task-manager lock (and with it the heartbeat) for as long as it
         // hung (see `readiness_of`).
         let checks_data = {
-            let plugins = task_manager.lock().expect("task manager").plugin_handles();
+            let (plugins, devices) = {
+                let manager = task_manager.lock().expect("task manager");
+                (manager.plugin_handles(), manager.device_manager())
+            };
             let additional = additional_node_checks.clone();
             tokio::task::spawn_blocking(move || {
-                run_health_checks(
+                let mut checks = run_health_checks(
                     additional,
                     Some(crate::task_plugins::readiness_of(&plugins)),
-                )
+                );
+                // Device inventory and health, re-checked every pass
+                // (docs/devices.md, "Health").
+                if devices.is_configured() {
+                    checks.insert(
+                        crate::devices::REPORT_KEY.into(),
+                        devices.fingerprint().to_value(),
+                    );
+                }
+                checks
             })
             .await?
         };

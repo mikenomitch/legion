@@ -63,6 +63,7 @@ fn run_request(jobspec: String, name: &str) -> RunJobRequest {
         force_reschedule: false,
         idempotency_key: None,
         allow_unknown_fields: Default::default(),
+        expected_version: None,
     }
 }
 

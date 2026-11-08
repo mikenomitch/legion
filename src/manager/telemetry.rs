@@ -923,6 +923,14 @@ pub struct Metrics {
     pub raft_pipeline_wait_seconds: Arc<HistogramVec>,
     /// `legion_raft_pipeline_depth{lane}`
     pub raft_pipeline_depth: Arc<GaugeVec>,
+    /// `legion_raft_entry_ops{lane}`
+    pub raft_entry_ops: Arc<HistogramVec>,
+    /// `legion_raft_state_syncs_total{lane,outcome}`
+    pub raft_state_syncs_total: Arc<CounterVec>,
+    /// `legion_raft_log_retained_seconds{lane}`
+    pub raft_log_retained_seconds: Arc<GaugeVec>,
+    /// `legion_raft_speculation_total{lane,outcome}`
+    pub raft_speculation_total: Arc<CounterVec>,
     /// `legion_scheduler_index_queries_total{index,outcome}`
     pub scheduler_index_queries_total: Arc<CounterVec>,
     /// `legion_scheduler_locality_placements_total{outcome}`
@@ -960,6 +968,13 @@ pub struct Metrics {
     /// `legion_leader_forwards_total{lane,op,outcome}` (docs/metrics.md,
     /// "Raft")
     pub leader_forwards_total: Arc<CounterVec>,
+    /// `legion_plugin_panics_total{kind,name}` (docs/plugin-system.md,
+    /// "Panics and quarantine")
+    pub plugin_panics_total: Arc<CounterVec>,
+    /// `legion_governance_events_total{event}` (docs/metrics.md,
+    /// "Governance"): audit records written/dropped/unjournaled, rate-limit
+    /// refusals, approval gates.
+    pub governance_events_total: Arc<CounterVec>,
     /// `legion_read_model_drift_repaired_total{source}`
     pub read_model_drift_repaired_total: Arc<CounterVec>,
     /// `legion_read_model_external_writes_total`
@@ -1675,6 +1690,39 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let raft_entry_ops = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_raft_entry_ops",
+                help: "Replicated ops committed per raft entry (group commit). Ops queued behind an in-flight entry share the next one's capture, quorum round trip, log fsync and apply; 1 means no batching was possible because nothing was queued.",
+                labels: &["lane"],
+            },
+            bounds: COUNT_BUCKETS,
+            series: Series::new(),
+        });
+        let raft_state_syncs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_raft_state_syncs_total",
+                help: "State-database fsyncs run as the purge barrier before a raft log purge, by outcome (ok|error). The state DB runs synchronous=NORMAL; this barrier is what keeps the applied marker durable past the log's purge horizon. An error fails the purge and keeps the log.",
+                labels: &["lane", "outcome"],
+            },
+            series: Series::new(),
+        });
+        let raft_log_retained_seconds = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_raft_log_retained_seconds",
+                help: "Age of the oldest entry still in the group's raft log: how long a follower can be down and still catch up by log replay instead of a full snapshot install. Sized by raft.logRetainBytes.",
+                labels: &["lane"],
+            },
+            series: Series::new(),
+        });
+        let raft_speculation_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_raft_speculation_total",
+                help: "Speculatively committed leader batches by outcome: committed (written locally before the quorum round), matched (its entry applied without re-running the changeset), undone (reverted because the log went another way: leadership loss, truncation, or a crash before apply).",
+                labels: &["lane", "outcome"],
+            },
+            series: Series::new(),
+        });
 
         let scheduler_index_queries_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -1825,11 +1873,30 @@ impl Metrics {
             series: Series::new(),
         });
 
+        let plugin_panics_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_plugin_panics_total",
+                help: "Dylib plugin calls that panicked, by plugin kind (scheduling, rollouts, node_checks, artifacts) and name. The panic was contained and the plugin quarantined until this process restarts; any non-zero value needs the plugin fixed or removed.",
+                labels: &["kind", "name"],
+            },
+            series: Series::new(),
+        });
         let leader_forwards_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_leader_forwards_total",
                 help: "Store writes this manager forwarded to the lane's leader because it does not lead the lane (worker heartbeats, failure reports, and other worker-plane writes that land on a follower), by lane, op, and outcome: 'ok' (the leader executed it) or 'failed' (no leader known, unreachable, the target lost leadership, or the op failed there).",
                 labels: &["lane", "op", "outcome"],
+            },
+            series: Series::new(),
+        });
+
+        // Agent governance (docs/audit-journal.md,
+        // docs/approvals-and-rate-limits.md).
+        let governance_events_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_governance_events_total",
+                help: "Agent-governance events on this manager, by event: 'audit_written' (records journaled), 'audit_dropped' (records lost to a full queue), 'audit_unjournaled' (records this manager could not write because it leads no raft lane; logged to the `audit` tracing target instead), 'rate_limited' (writes refused with RATE_LIMITED), 'approval_required' (writes refused with APPROVAL_REQUIRED), 'approval_invalid', and 'approval_used'.",
+                labels: &["event"],
             },
             series: Series::new(),
         });
@@ -1934,6 +2001,8 @@ impl Metrics {
             Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_recovered_total) as Arc<dyn RenderMetric>,
             Arc::clone(&leader_forwards_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&plugin_panics_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&governance_events_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_drift_repaired_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_external_writes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
@@ -2007,6 +2076,10 @@ impl Metrics {
             Arc::clone(&raft_is_leader) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_ops_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_pipeline_depth) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_entry_ops) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_state_syncs_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_log_retained_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_speculation_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_pipeline_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_propose_apply_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_quorum) as Arc<dyn RenderMetric>,
@@ -2127,6 +2200,10 @@ impl Metrics {
             raft_ops_total,
             raft_pipeline_wait_seconds,
             raft_pipeline_depth,
+            raft_entry_ops,
+            raft_state_syncs_total,
+            raft_log_retained_seconds,
+            raft_speculation_total,
             scheduler_index_queries_total,
             scheduler_locality_placements_total,
             scheduler_index_candidates,
@@ -2145,6 +2222,8 @@ impl Metrics {
             nodes_marked_lost_total,
             nodes_recovered_total,
             leader_forwards_total,
+            plugin_panics_total,
+            governance_events_total,
             read_model_drift_repaired_total,
             read_model_external_writes_total,
             liveness_tracked_nodes,

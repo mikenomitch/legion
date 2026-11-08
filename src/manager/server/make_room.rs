@@ -410,12 +410,14 @@ mod tests {
     fn pool(memory: f64) -> ResourcePool {
         ResourcePool {
             values: HashMap::from([("memory".to_string(), ResourceValue::Amount(memory))]),
+            ..Default::default()
         }
     }
 
     fn request(memory: f64) -> ResourceRequest {
         ResourceRequest {
             values: HashMap::from([("memory".to_string(), ResourceValue::Amount(memory))]),
+            ..Default::default()
         }
     }
 

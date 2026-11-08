@@ -387,9 +387,7 @@ pub fn pending_units(
             ports: Vec::new(),
             members: Vec::new(),
         };
-        let mut request = ResourceRequest {
-            values: HashMap::new(),
-        };
+        let mut request = ResourceRequest::default();
         let mut ports: Vec<u16> = Vec::new();
         let mut errors = Vec::new();
         for row in &rows {

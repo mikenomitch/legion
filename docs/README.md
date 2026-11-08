@@ -60,6 +60,9 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Resource Enforcement](resource-enforcement.md): enforcing declared `memory`,
   `cores`, and `cpu` on Linux with hard memory limits, exclusive pinned
   cores, proportional CPU weight, and the interface runtimes adopt.
+- [Devices: GPUs and Other Hardware](devices.md): device plugins
+  (`legion-device/1`), `resources.devices` requests, topology-aware
+  assignment, CDI container edits, device health, and device quota.
 - [Job Templates](job-templates.md): reusable, versioned job specs with typed
   variables, guided submission, and template-scoped delegation.
 - [Artifacts](artifacts.md): declaring, fetching, verifying, and staging inputs.
@@ -154,6 +157,14 @@ Plans, roadmaps, to-do lists, and development notes live in
   outside the store, wrapped data keys inside it, rotation, backups, and
   what to do when a key is missing.
 - [Auth & ACLs](auth-and-acls.md): tokens, policies, scopes, and enforcement.
+  Token lifetimes and child tokens for sub-agents.
+- [Audit Journal](audit-journal.md): the durable, replicated record of every
+  write and denial: accessor, principal, on-behalf-of chain, target, request
+  digest, idempotency key, approval, and outcome.
+- [Approvals and Rate Limits](approvals-and-rate-limits.md): human-approval
+  gates for chosen writes, and per-token write rate limits.
+- [Usage Accounting](usage-accounting.md): reserved CPU, memory, cores and
+  custom resources integrated over time per namespace, job, and submitter.
 - [Namespaces](namespaces.md): name and permission scopes for jobs (not an
   isolation boundary), qualified ids, `-n`/`LEGION_NAMESPACE`, delegated
   creation, crossing namespaces in the mesh, and namespace policies (aggregate
@@ -192,6 +203,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   but capped, new work waits behind a backlog). Covers what to read, what
   the neighboring metric rules out, and what to change.
 - [Event Stream](event-stream.md): scheduler events as history and live tail.
+- [Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md):
+  the revision on every job, allocation, and KV read; blocking reads
+  (`--index`), `legion job watch` / `legion kv watch` with resume, linearizable
+  and read-your-writes consistency, job compare-and-set, and plan diffs.
 - [Streaming Persistence](persistence-streaming.md): WAL shipping and
   lease-fenced failover.
 - [Running Raft](raft-operations.md): leader election, failover, membership.

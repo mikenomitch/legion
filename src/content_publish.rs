@@ -164,6 +164,23 @@ pub struct ContentStoreTarget {
     pub dedup_window: Option<String>,
 }
 
+/// The node attribute a worker advertises its `contentStore.url` under (the
+/// URL only, never its `auth`), so the scheduler can send a published
+/// restore to a node that can read its parts with its own credential.
+pub const NODE_ATTR: &str = "contentStore";
+
+/// Whether a node whose `contentStore.url` is `node_store_url` reads `url`
+/// with its own store credential: the URL is in that store (same bucket and
+/// endpoint, under its prefix), which is the test the restoring node itself
+/// applies ([`ContentStoreTarget::contains_url`]).
+pub fn node_store_covers(node_store_url: &str, url: &str) -> bool {
+    ContentStoreTarget {
+        url: node_store_url.to_string(),
+        ..ContentStoreTarget::default()
+    }
+    .contains_url(url)
+}
+
 impl ContentStoreTarget {
     /// `chunkSize` and `dedupWindow`, parsed and checked.
     pub fn chunk_settings(&self) -> R<ChunkSettings> {

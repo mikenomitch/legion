@@ -1031,17 +1031,11 @@ fn migration_list() -> Vec<M<'static>> {
         // later still read as untouched. Unix seconds, matching
         // `job.created_at`; NULL only until the backfill below runs.
         M::up("ALTER TABLE job ADD COLUMN updated_at INTEGER;").down(""),
-        // Backfill: pre-migration rows have no mtime to recover, and their
-        // creation time is the only honest lower bound. Guarded on
-        // `typeof(created_at)` so a row whose created_at was written as text
-        // (only the pre-rename migration fixtures do this) leaves updated_at
-        // NULL rather than poisoning an INTEGER column with a string —
-        // `job_from_row` falls back to created_at for those.
-        M::up(
-            "UPDATE job SET updated_at = created_at
-             WHERE updated_at IS NULL AND typeof(created_at) = 'integer';",
-        )
-        .down(""),
+        // This slot held the `updated_at` backfill. It is a data step now
+        // (`data_migrations`, `job-updated-at-backfill`), applied once
+        // through the raft log; the slot stays so later schema versions keep
+        // their numbers.
+        M::up("-- moved to data_migrations: job-updated-at-backfill").down(""),
         // Stop causes (preemption-and-eviction plan § Phase 1a). Written in
         // the same transaction that removes an allocation, so a notice can
         // never claim a stop that did not happen, and read by the heartbeat
@@ -2384,13 +2378,12 @@ fn migration_list() -> Vec<M<'static>> {
         // Each app's own uid (docs/apps.md, "Trust model"): the uid and gid
         // its exec tasks run as, so no two apps share a user. Assigned on
         // insert, the lowest free one from `APP_UID_BASE` (1900000000);
-        // apps installed before this get one each, in name order. Unique
-        // among assigned ones. Appended at the end, since raft changesets
-        // bind columns by position.
+        // apps installed before this get one each, in name order, from the
+        // `app-uid-backfill` data step (`data_migrations`), which runs once
+        // through the raft log. Unique among assigned ones. Appended at the
+        // end, since raft changesets bind columns by position.
         M::up(
             "ALTER TABLE app ADD COLUMN uid INTEGER NOT NULL DEFAULT 0;
-        UPDATE app SET uid = 1900000000
-            + (SELECT COUNT(*) FROM app AS earlier WHERE earlier.name < app.name);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_app_uid ON app(uid) WHERE uid > 0;",
         )
         .down("DROP INDEX IF EXISTS idx_app_uid;"),
@@ -2473,14 +2466,146 @@ fn migration_list() -> Vec<M<'static>> {
         // state they kept under `policy:<id>` keys goes too: object targets
         // key it `object:<uid>`, and `scaling_action.policy` now holds that
         // key.
+        //
+        // The row cleanup that used to ride here is a data step now
+        // (`data_migrations`, `scaling-policy-state-cleanup`), applied once
+        // through the raft log so every replica deletes the same rows.
+        M::up("DROP TABLE IF EXISTS scaling_policy;").down(""),
+        // Speculative leader execution (raft-write-path plan §6.3): one undo
+        // record (the inverse changeset) per batch the leader committed
+        // locally before its raft entry applied. Node-local raft bookkeeping
+        // (`ownership::Owner::Internal`): never replicated, never in a
+        // snapshot (images are scrubbed), excluded from the content hash.
         M::up(
-            "DROP TABLE IF EXISTS scaling_policy;
-        DELETE FROM scaling_action;
-        DELETE FROM scaling_pause WHERE job_id LIKE 'policy:%';
-        DELETE FROM scale_history WHERE job_id LIKE 'policy:%';
-        DELETE FROM scaling_counter WHERE name = 'scaling_policy';",
+            "CREATE TABLE IF NOT EXISTS raft_speculative (
+            lane TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            undo BLOB NOT NULL,
+            PRIMARY KEY (lane, seq)
+        );",
         )
-        .down(""),
+        .down("DROP TABLE IF EXISTS raft_speculative;"),
+        // Data steps that have run (raft-write-path plan §6.5): one row per
+        // `data_migrations::DATA_MIGRATIONS` id, written by the replicated
+        // control-lane op that runs it, so each runs exactly once
+        // cluster-wide at one log index. Control lane.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS data_migration (
+            id TEXT PRIMARY KEY,
+            applied_at INTEGER NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS data_migration;"),
+        // Eval claims stay O(batch) as the queue grows (architecture review
+        // SCH3; `store/eval_claims.rs`). Both indexes are partial over
+        // pending rows, so they cost nothing for settled history.
+        // `idx_eval_pending_scope` serves the claim's duplicate lookup, an
+        // equality on (kind, job, job config, node) that the old
+        // `COALESCE(col, '')` form could not seek; `idx_eval_pending_kind_order`
+        // serves the throttled worker's non-planning claim, which otherwise
+        // walked every planning eval at the head of the queue to find none.
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_eval_pending_scope
+                 ON eval(type, job_id, job_config_id, node_id) WHERE status = 'pending';
+             CREATE INDEX IF NOT EXISTS idx_eval_pending_kind_order
+                 ON eval(type, priority DESC, id ASC) WHERE status = 'pending';",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_eval_pending_scope;
+             DROP INDEX IF EXISTS idx_eval_pending_kind_order;",
+        ),
+        // Agent governance (internal_docs/plans/agent-governance-plan.md):
+        // the audit journal (commutative: random ids, pruned locally),
+        // approval requests and token lineage/limits (control lane), and
+        // hourly usage rollups (status lane).
+        M::up(
+            "CREATE TABLE IF NOT EXISTS audit_event (
+            id TEXT PRIMARY KEY,
+            ts_ms INTEGER NOT NULL,
+            manager TEXT NOT NULL DEFAULT '',
+            operation TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            accessor_id TEXT NOT NULL DEFAULT '',
+            principal TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            on_behalf_of TEXT NOT NULL DEFAULT '',
+            parent_accessor_id TEXT NOT NULL DEFAULT '',
+            resource TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL DEFAULT '',
+            target TEXT NOT NULL DEFAULT '',
+            namespace TEXT NOT NULL DEFAULT '',
+            request_digest TEXT NOT NULL DEFAULT '',
+            idempotency_key TEXT NOT NULL DEFAULT '',
+            approval_id TEXT NOT NULL DEFAULT '',
+            outcome TEXT NOT NULL,
+            message TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '',
+            duration_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_event_ts ON audit_event(ts_ms);
+        CREATE INDEX IF NOT EXISTS idx_audit_event_accessor ON audit_event(accessor_id, ts_ms);
+        CREATE TABLE IF NOT EXISTS approval_request (
+            id TEXT PRIMARY KEY,
+            created_ms INTEGER NOT NULL,
+            expires_ms INTEGER NOT NULL,
+            ttl_secs INTEGER NOT NULL,
+            rule TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            permission TEXT NOT NULL DEFAULT '',
+            target TEXT NOT NULL DEFAULT '',
+            namespace TEXT NOT NULL DEFAULT '',
+            request_digest TEXT NOT NULL,
+            requester_principal TEXT NOT NULL,
+            requester_accessor TEXT NOT NULL DEFAULT '',
+            requester_root TEXT NOT NULL DEFAULT '',
+            requester_source TEXT NOT NULL DEFAULT '',
+            on_behalf_of TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            decided_by TEXT NOT NULL DEFAULT '',
+            decided_ms INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            consumed_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_request_status ON approval_request(status, created_ms);
+        CREATE TABLE IF NOT EXISTS acl_token_meta (
+            accessor_id TEXT PRIMARY KEY,
+            parent_accessor_id TEXT NOT NULL DEFAULT '',
+            root_accessor_id TEXT NOT NULL DEFAULT '',
+            depth INTEGER NOT NULL DEFAULT 0,
+            write_rate REAL NOT NULL DEFAULT 0,
+            write_burst INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_acl_token_meta_parent ON acl_token_meta(parent_accessor_id);
+        CREATE TABLE IF NOT EXISTS usage_rollup (
+            bucket_ms INTEGER NOT NULL,
+            namespace TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            submitter TEXT NOT NULL DEFAULT '',
+            dimension TEXT NOT NULL,
+            amount REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (bucket_ms, namespace, job_id, submitter, dimension)
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_rollup_namespace ON usage_rollup(namespace, bucket_ms);",
+        )
+        .down(
+            "DROP TABLE IF EXISTS usage_rollup;
+        DROP TABLE IF EXISTS acl_token_meta;
+        DROP TABLE IF EXISTS approval_request;
+        DROP TABLE IF EXISTS audit_event;",
+        ),
+        // Revisions and watches (revisions-and-watches plan §1): the
+        // `local_disk` revision counter's reserved bound, so a restart
+        // resumes above every revision already handed out. One row, written
+        // only in `local_disk` mode; raft mode derives revisions from
+        // `raft_applied` and never writes it (ownership: Internal).
+        M::up(
+            "CREATE TABLE IF NOT EXISTS store_revision (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            reserved INTEGER NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS store_revision;"),
     ]
 }
 
@@ -2848,10 +2973,55 @@ mod migrations_test {
         Ok(())
     }
 
+    /// Schema steps only (raft-write-path plan §6.5): every manager runs
+    /// these locally at startup, at whatever applied index it happens to be
+    /// at, so a step that rewrites rows (`UPDATE … SET`, `DELETE FROM`)
+    /// would compute different results on different replicas. Row rewrites
+    /// belong in `storage::data_migrations`, which applies them once through
+    /// the raft log. Deterministic copies (`INSERT INTO new SELECT … FROM
+    /// old` table rebuilds) and constant seed rows are fine.
+    #[test]
+    fn schema_migrations_carry_no_data_steps() {
+        for (index, migration) in migration_list().iter().enumerate() {
+            let rendered = format!("{migration:?}");
+            let up = rendered
+                .split_once("up: \"")
+                .and_then(|(_, rest)| rest.split_once("\", up_hook"))
+                .map(|(up, _)| up.to_string())
+                .unwrap_or_else(|| panic!("cannot read migration {index}'s up SQL: {rendered}"));
+            // Undo the Debug escaping of whitespace, so a keyword at the
+            // start of a line is preceded by a newline, not by `\n` text.
+            let up = up.replace("\\n", "\n").replace("\\t", "\t");
+            let upper = up.to_ascii_uppercase();
+            // A keyword, not part of an identifier (`job_update`) or a
+            // foreign-key action (`ON UPDATE`, `ON DELETE`).
+            let statement = |keyword: &str| {
+                upper.match_indices(keyword).any(|(at, _)| {
+                    let before = &upper[..at];
+                    let starts_word = before
+                        .chars()
+                        .last()
+                        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+                    starts_word && !before.trim_end().ends_with("ON")
+                })
+            };
+            let rewrites_rows = statement("DELETE FROM") || statement("UPDATE ");
+            assert!(
+                !rewrites_rows,
+                "schema migration {} (version {}) rewrites rows; move the UPDATE/DELETE into \
+                 storage::data_migrations so it runs once through the raft log: {up}",
+                index,
+                index + 1
+            );
+        }
+    }
+
     /// A cluster created before `job.updated_at` existed must come out of the
     /// migration with a usable mtime rather than a NULL or an epoch-zero
     /// timestamp — the UI's Updated column reads it directly, and "Jan 1
-    /// 1970" is a worse lie than "never changed since submission".
+    /// 1970" is a worse lie than "never changed since submission". The
+    /// backfill is a data step (raft-write-path plan §6.5): the schema step
+    /// adds the column, and the replicated data step fills it.
     #[test]
     fn job_updated_at_backfills_from_created_at() -> anyhow::Result<()> {
         let migrations = get_migrations();
@@ -2893,6 +3063,7 @@ mod migrations_test {
         )?;
 
         migrations.to_latest(&mut conn)?;
+        crate::storage::data_migrations::run_pending_on(&conn)?;
 
         let (created_at, updated_at): (i64, Option<i64>) = conn.query_row(
             "SELECT created_at, updated_at FROM job WHERE id = 'legacy';",

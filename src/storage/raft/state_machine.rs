@@ -14,6 +14,13 @@
 //! membership additionally persisting alongside it), in their own
 //! transaction on the same table.
 //!
+//! Under `single` the leader has usually committed an entry's batch already
+//! (speculation, raft-write-path plan §6.3): an entry tagged with this
+//! node's oldest outstanding `Proposal` only advances the marker and drops
+//! the batch's undo record; any other entry while batches are outstanding
+//! first undoes them, newest first (`speculation` module docs). The ledger
+//! check and the write share one hold of the capture mutex.
+//!
 //! `applied_state()` reads that table back; a brand-new node with no
 //! `raft_applied` row reports `(None, StoredMembership::default())` — the
 //! blank-slate contract openraft expects.
@@ -101,8 +108,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::prelude::*;
 use crate::storage::raft::capture;
 use crate::storage::raft::ownership;
+use crate::storage::raft::speculation::{self, SpeculationLedger};
 use crate::storage::raft::types::TypeConfig;
-use crate::storage::raft::{Lane, StoreResponse};
+use crate::storage::raft::{Lane, Proposal, StoreResponse};
 use crate::storage::store::Store;
 
 type NodeId = u64;
@@ -154,6 +162,11 @@ pub(crate) struct StoreStateMachine {
     /// index behind its log (the R1 failover regression). Never set in
     /// production.
     apply_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// The speculation ledger this group's pipeline commits batches into,
+    /// and this node's raft id (what a matching `Proposal` names) — set only
+    /// under `single`, the topology that speculates (`speculation` module
+    /// docs). `None`: every entry's changeset is applied.
+    speculation: Option<(Arc<SpeculationLedger>, u64)>,
 }
 
 impl std::fmt::Debug for StoreStateMachine {
@@ -179,7 +192,16 @@ impl StoreStateMachine {
             snapshots_dir,
             scope,
             apply_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            speculation: None,
         }
+    }
+
+    /// Recognize this node's speculatively committed batches (raft-write-path
+    /// plan §6.3): `ledger` is the one the group's pipeline commits into,
+    /// `node_id` this node's raft id.
+    pub(crate) fn with_speculation(mut self, ledger: Arc<SpeculationLedger>, node_id: u64) -> Self {
+        self.speculation = Some((ledger, node_id));
+        self
     }
 
     /// Share the driver's apply-pause test hook (see the field docs).
@@ -200,6 +222,7 @@ impl StoreStateMachine {
             snapshots_dir: self.snapshots_dir.clone(),
             scope: self.scope,
             apply_paused: self.apply_paused.clone(),
+            speculation: self.speculation.clone(),
         }
     }
 
@@ -239,28 +262,137 @@ impl StoreStateMachine {
         Ok(())
     }
 
-    /// Records the applied marker (and optionally membership) in its own
-    /// transaction — used for blank/membership entries, which carry no
-    /// changeset.
-    fn record_applied(
+    /// Apply one committed entry: settle this node's speculative batches
+    /// (match or undo — `speculation` module docs), write the entry's rows
+    /// and the applied marker in one transaction, and return the changesets
+    /// whose side effects the caller must project, in order, once the
+    /// capture mutex is released.
+    ///
+    /// Everything here runs under ONE hold of the capture mutex. Applies are
+    /// mutually exclusive with captures (a marker or a changeset written
+    /// while a capture savepoint is open would nest inside it and be erased
+    /// by the capture's rollback — adversarial finding: capture/apply
+    /// interleave), and the pipeline commits a speculative batch and records
+    /// it in the ledger under the same mutex, so the ledger read here always
+    /// agrees with the database.
+    fn apply_entry(
         &self,
         log_id: LogId<NodeId>,
-        membership: Option<&StoredMembership<NodeId, BasicNode>>,
-    ) -> R<()> {
-        // Applies are mutually exclusive with captures: writing the marker
-        // while a capture savepoint is open on the shared connection would
-        // nest this savepoint inside it and the capture's rollback would
-        // silently erase the marker (adversarial finding: capture/apply
-        // interleave).
+        payload: EntryPayload<TypeConfig>,
+    ) -> R<Vec<Vec<u8>>> {
         let _captures = capture::capture_exclusion()?;
-        // The apply guard admits this write through the raft-mode
-        // `write_connection` bypass guard (JC-14).
-        let _in_apply = capture::ApplyGuard::new();
-        let mut conn = self.store.write_connection()?;
-        let sp = Store::write_tx(&mut conn)?;
-        self.record_applied_on(&sp, log_id, membership)?;
-        sp.commit()?;
-        Ok(())
+        let mut project: Vec<Vec<u8>> = Vec::new();
+        if let Some((ledger, node_id)) = &self.speculation {
+            if let Some(oldest) = ledger.oldest(self.lane) {
+                let mine = Proposal {
+                    node: *node_id,
+                    seq: oldest,
+                };
+                if let EntryPayload::Normal(command) = payload {
+                    if command.proposal == Some(mine) {
+                        // This node's own batch: its rows are already in
+                        // place. Skip the changeset; advance the marker and
+                        // drop the undo record in one transaction. Side
+                        // effects are still projected from the entry, as for
+                        // any apply: the read model and the streams only
+                        // ever follow committed entries.
+                        capture::apply_tx_locked(&self.store, |conn| {
+                            speculation::resolve_matched(conn, self.lane, oldest)?;
+                            self.record_applied_on(conn, log_id, None)
+                        })?;
+                        ledger.pop_oldest(self.lane);
+                        crate::manager::telemetry::metrics()
+                            .raft_speculation_total
+                            .inc(&[self.lane.wire_name(), "matched"]);
+                        debug!(
+                            lane = self.lane.wire_name(),
+                            ops = ?command.ops,
+                            index = log_id.index,
+                            "applied this leader's speculative batch without re-running it"
+                        );
+                        return Ok(vec![command.changeset]);
+                    }
+                    return self.apply_after_undo(log_id, EntryPayload::Normal(command), ledger);
+                }
+                return self.apply_after_undo(log_id, payload, ledger);
+            }
+        }
+        self.apply_payload_locked(log_id, payload, &mut project)?;
+        Ok(project)
+    }
+
+    /// The log went another way while this node had speculative batches
+    /// outstanding (a new term's blank entry after a leadership change, a
+    /// membership entry, another leader's entry at a truncated index): undo
+    /// every outstanding batch, newest first, then apply the entry normally.
+    /// The caller holds the capture mutex.
+    fn apply_after_undo(
+        &self,
+        log_id: LogId<NodeId>,
+        payload: EntryPayload<TypeConfig>,
+        ledger: &SpeculationLedger,
+    ) -> R<Vec<Vec<u8>>> {
+        let undone = capture::apply_tx_locked(&self.store, |conn| {
+            speculation::undo_on(conn, Some(self.lane))
+        })?;
+        ledger.clear(self.lane);
+        crate::manager::telemetry::metrics()
+            .raft_speculation_total
+            .inc_by(&[self.lane.wire_name(), "undone"], undone.len() as u64);
+        warn!(
+            lane = self.lane.wire_name(),
+            batches = undone.len(),
+            index = log_id.index,
+            "Undid this node's speculative raft batches: the log continued with an entry this \
+             leader did not propose (leadership change or truncation)"
+        );
+        // The undo's own changes are projected too: a cache that loaded a
+        // speculative row from the database in the window is corrected.
+        let mut project = undone;
+        self.apply_payload_locked(log_id, payload, &mut project)?;
+        Ok(project)
+    }
+
+    /// Write one entry's rows and applied marker in one transaction (the
+    /// caller holds the capture mutex), appending to `project` the
+    /// changeset whose side effects must follow.
+    fn apply_payload_locked(
+        &self,
+        log_id: LogId<NodeId>,
+        payload: EntryPayload<TypeConfig>,
+        project: &mut Vec<Vec<u8>>,
+    ) -> R<()> {
+        match payload {
+            // Blank entries (leader no-op commits) only advance the applied
+            // marker.
+            EntryPayload::Blank => capture::apply_tx_locked(&self.store, |conn| {
+                self.record_applied_on(conn, log_id, None)
+            }),
+            // The core path: changeset rows + applied marker in ONE
+            // savepoint; the caller projects side effects from the committed
+            // changeset (JC-11).
+            EntryPayload::Normal(command) => {
+                debug!(
+                    lane = self.lane.wire_name(),
+                    ops = ?command.ops,
+                    index = log_id.index,
+                    "applying replicated store command"
+                );
+                capture::apply_changeset_locked(&self.store, &command.changeset, |conn| {
+                    self.record_applied_on(conn, log_id, None)
+                })?;
+                project.push(command.changeset);
+                Ok(())
+            }
+            // Membership entries persist the config next to the marker
+            // (openraft: "storing it" is all an implementation must do).
+            EntryPayload::Membership(membership) => {
+                let stored = StoredMembership::new(Some(log_id), membership);
+                capture::apply_tx_locked(&self.store, |conn| {
+                    self.record_applied_on(conn, log_id, Some(&stored))
+                })
+            }
+        }
     }
 
     /// Reads this lane's `raft_applied` row from `conn`.
@@ -382,6 +514,16 @@ impl StoreStateMachine {
             .with_context(|| format!("failed staging snapshot at {}", incoming.display()))?;
         fsync_file(&incoming)?;
         let _ = std::fs::remove_file(&staged);
+        // The install replaces the whole database, this node's speculative
+        // batches with it (their rows and undo records live in the file being
+        // replaced; the incoming image was scrubbed of speculation when it
+        // was built). Only a node that is not leading installs a snapshot, so
+        // its batches could never match an entry anyway. If the install fails
+        // the node stops on the storage error, and startup recovery undoes the
+        // batches from the table, not the ledger.
+        if let Some((ledger, _)) = &self.speculation {
+            ledger.clear(self.lane);
+        }
         self.store.install_state_db(&incoming)?;
 
         // Verify: the applied marker the swapped-in DB reports must equal
@@ -742,32 +884,15 @@ impl RaftStateMachine<TypeConfig> for StoreStateMachine {
                 replies.push(StoreResponse {});
                 continue;
             }
-            let result: R<()> = match entry.payload {
-                // Blank entries (leader no-op commits) only advance the
-                // applied marker.
-                EntryPayload::Blank => self.record_applied(log_id, None),
-                // The core path: changeset rows + applied marker in ONE
-                // savepoint, then side-effect projection from the committed
-                // changeset (JC-11).
-                EntryPayload::Normal(command) => {
-                    debug!(
-                        lane = self.lane.wire_name(),
-                        op = %command.op,
-                        index = log_id.index,
-                        "applying replicated store command"
-                    );
-                    capture::apply_changeset_with(&self.store, &command.changeset, |conn| {
-                        self.record_applied_on(conn, log_id, None)
-                    })
-                }
-                // Membership entries persist the config next to the marker
-                // (openraft: "storing it" is all an implementation must do).
-                EntryPayload::Membership(membership) => {
-                    let stored = StoredMembership::new(Some(log_id), membership);
-                    self.record_applied(log_id, Some(&stored))
-                }
-            };
-            result.map_err(|e| StorageIOError::apply(log_id, AnyError::error(format!("{e:#}"))))?;
+            let project = self
+                .apply_entry(log_id, entry.payload)
+                .map_err(|e| StorageIOError::apply(log_id, AnyError::error(format!("{e:#}"))))?;
+            // Side effects follow the committed rows on every replica
+            // (JC-11), outside the capture mutex; node-local and infallible
+            // (see `Store::project_changeset_side_effects`).
+            for changeset in &project {
+                self.store.project_changeset_side_effects(changeset);
+            }
             last_applied = Some(log_id);
             replies.push(StoreResponse {});
         }
@@ -968,6 +1093,19 @@ impl StoreSnapshotBuilder {
                     .execute("VACUUM INTO ?1;", [&tmp_str])
                     .with_context(|| format!("failed running VACUUM INTO {}", tmp.display()))?;
                 drop(source);
+                // The leader's in-flight speculative batches are committed
+                // rows in the state DB, and the read transaction above copied
+                // them along with their undo records (they always commit
+                // together). Revert them in the image, so the snapshot is
+                // exactly committed state (raft-write-path plan §6.3).
+                let scrubbed = speculation::scrub_image(&tmp)?;
+                if scrubbed > 0 {
+                    debug!(
+                        lane = lane.wire_name(),
+                        batches = scrubbed,
+                        "Reverted in-flight speculative batches in the snapshot image"
+                    );
+                }
                 let image =
                     Connection::open_with_flags(&tmp, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                         .with_context(|| format!("failed opening snapshot {}", tmp.display()))?;
@@ -975,11 +1113,27 @@ impl StoreSnapshotBuilder {
             }
             SnapshotScope::LaneTables => {
                 source.execute_batch("BEGIN;")?;
-                let dumped =
-                    StoreStateMachine::read_applied_row(&source, lane).and_then(|applied| {
-                        Self::dump_lane_tables(&source, lane, &tmp)?;
-                        Ok(applied)
-                    });
+                let dumped = (|| -> R<AppliedRow> {
+                    // `lanes` never speculates (three pipelines share one
+                    // database; `speculation` module docs), so a dump can
+                    // never meet a speculative row. Stop loudly if one ever
+                    // does rather than ship uncommitted rows to a replica.
+                    let speculative: i64 = source.query_row(
+                        &format!("SELECT COUNT(*) FROM {};", speculation::SPECULATION_TABLE),
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if speculative > 0 {
+                        bail!(
+                            "the state db holds {speculative} speculative raft batches under the \
+                             lanes topology, which never speculates; refusing to build a lane \
+                             snapshot that could carry uncommitted rows"
+                        );
+                    }
+                    let applied = StoreStateMachine::read_applied_row(&source, lane)?;
+                    Self::dump_lane_tables(&source, lane, &tmp)?;
+                    Ok(applied)
+                })();
                 let _ = source.execute_batch("COMMIT;");
                 dumped?
             }
@@ -1241,7 +1395,9 @@ mod tests {
             log_id: log_id(1, 5),
             payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                 lane: Lane::Control,
-                op: "put_kv".to_string(),
+                ops: vec!["put_kv".to_string()],
+                proposal: None,
+                schema_version: 0,
                 changeset,
             }),
         };
@@ -1300,7 +1456,9 @@ mod tests {
             log_id: log_id(1, 3),
             payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                 lane: Lane::Control,
-                op: "put_kv".to_string(),
+                ops: vec!["put_kv".to_string()],
+                proposal: None,
+                schema_version: 0,
                 changeset,
             }),
         };
@@ -1351,7 +1509,9 @@ mod tests {
             log_id: log_id(1, 1),
             payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                 lane: Lane::Control,
-                op: "put_kv".to_string(),
+                ops: vec!["put_kv".to_string()],
+                proposal: None,
+                schema_version: 0,
                 changeset,
             }),
         };
@@ -1406,7 +1566,9 @@ mod tests {
                 log_id: log_id(1, 1),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset,
                 }),
             }])
@@ -1447,7 +1609,9 @@ mod tests {
                     log_id: log_id(1, (i + 1) as u64),
                     payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                         lane: Lane::Control,
-                        op: "put_kv".to_string(),
+                        ops: vec!["put_kv".to_string()],
+                        proposal: None,
+                        schema_version: 0,
                         changeset,
                     }),
                 }])
@@ -1536,7 +1700,9 @@ mod tests {
                     log_id: log_id(1, (i + 1) as u64),
                     payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                         lane: Lane::Control,
-                        op: "put_kv".to_string(),
+                        ops: vec!["put_kv".to_string()],
+                        proposal: None,
+                        schema_version: 0,
                         changeset,
                     }),
                 }])
@@ -1723,7 +1889,9 @@ mod tests {
                 log_id: log_id(1, index),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Scheduler,
-                    op: "place_alloc".to_string(),
+                    ops: vec!["place_alloc".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset,
                 }),
             };
@@ -1787,7 +1955,9 @@ mod tests {
                 log_id: log_id(1, 1),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset,
                 }),
             }])
@@ -1869,7 +2039,9 @@ mod tests {
                 log_id: log_id(1, 1),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset,
                 }),
             }])
@@ -1928,7 +2100,9 @@ mod tests {
                 log_id: log_id(1, 1),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset,
                 }),
             }])
@@ -1987,7 +2161,9 @@ mod tests {
             log_id: log_id(1, 5),
             payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                 lane: Lane::Control,
-                op: "put_kv".to_string(),
+                ops: vec!["put_kv".to_string()],
+                proposal: None,
+                schema_version: 0,
                 changeset,
             }),
         };
@@ -2007,7 +2183,9 @@ mod tests {
                 log_id: log_id(1, 3),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset: old_changeset,
                 }),
             },
@@ -2015,7 +2193,9 @@ mod tests {
                 log_id: log_id(1, 6),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset: new_changeset,
                 }),
             },
@@ -2038,5 +2218,331 @@ mod tests {
             s.put_kv(key, value, KvValueType::String, None, None)?;
             Ok(())
         })
+    }
+
+    // ── speculation (raft-write-path plan §6.3) ─────────────────────────
+
+    /// The node id the speculation tests' state machines answer to.
+    const SELF_ID: u64 = 7;
+
+    /// Run one `put_kv` the way the leader's pipeline does under `single`:
+    /// one batch, committed locally with its undo record, recorded in the
+    /// ledger. Returns the batch's sequence number and its changeset (the
+    /// entry the leader proposes).
+    fn speculate_put_kv(
+        store: &Store,
+        ledger: &SpeculationLedger,
+        key: &str,
+        value: &str,
+    ) -> R<(u64, Vec<u8>)> {
+        let seq = ledger.next_seq();
+        let (key, value) = (key.to_string(), value.to_string());
+        let items = vec![capture::BatchItem {
+            lane: Lane::Control,
+            op: "put_kv",
+            f: Box::new(move |s: &Store| -> R<Box<dyn std::any::Any + Send>> {
+                s.put_kv(&key, &value, KvValueType::String, None, None)?;
+                Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+            }),
+        }];
+        let batch = capture::capture_batch(
+            store,
+            items,
+            usize::MAX,
+            &mut |_: Lane, _: &'static str, _: &[u8]| -> R<()> { Ok(()) },
+            capture::BatchEnd::Speculate {
+                ledger,
+                group: Lane::Control,
+                seq,
+            },
+        )?;
+        assert!(batch.committed, "a non-empty batch commits speculatively");
+        assert!(batch.results.iter().all(Result::is_ok));
+        Ok((seq, batch.changeset))
+    }
+
+    fn normal_entry(
+        term: u64,
+        index: u64,
+        changeset: Vec<u8>,
+        seq: Option<u64>,
+    ) -> Entry<TypeConfig> {
+        Entry {
+            log_id: log_id(term, index),
+            payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
+                lane: Lane::Control,
+                ops: vec!["put_kv".to_string()],
+                proposal: seq.map(|seq| Proposal { node: SELF_ID, seq }),
+                schema_version: 0,
+                changeset,
+            }),
+        }
+    }
+
+    fn undo_records(store: &Store) -> R<i64> {
+        Ok(store.read_connection()?.query_row(
+            "SELECT COUNT(*) FROM raft_speculative;",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn speculating_machine(store: &Store) -> (StoreStateMachine, Arc<SpeculationLedger>) {
+        let ledger = Arc::new(SpeculationLedger::new());
+        let sm =
+            state_machine(Lane::Control, store.clone()).with_speculation(ledger.clone(), SELF_ID);
+        (sm, ledger)
+    }
+
+    /// The leader executes once: its batch is committed before the quorum
+    /// round, and when its own entry comes back the state machine only
+    /// advances the marker and drops the undo record. Re-applying the
+    /// changeset would conflict-abort (the INSERT's row already exists), so
+    /// a clean apply is itself the proof the changeset was skipped.
+    #[tokio::test]
+    async fn own_speculative_entry_applies_once_and_resolves_its_undo_record() -> R<()> {
+        let store = setup_store()?;
+        let (mut sm, ledger) = speculating_machine(&store);
+        let (seq, changeset) = speculate_put_kv(&store, &ledger, "spec/a", "1")?;
+        assert_eq!(
+            kv_value(&store, "spec/a")?.as_deref(),
+            Some("1"),
+            "the batch is committed locally before its entry applies"
+        );
+        assert_eq!(undo_records(&store)?, 1);
+        assert_eq!(ledger.oldest(Lane::Control), Some(seq));
+
+        sm.apply([normal_entry(1, 1, changeset, Some(seq))])
+            .await
+            .unwrap();
+        assert_eq!(kv_value(&store, "spec/a")?.as_deref(), Some("1"));
+        assert_eq!(
+            undo_records(&store)?,
+            0,
+            "the undo record goes with the apply"
+        );
+        assert!(ledger.is_empty(Lane::Control));
+        let (applied, _) = sm.applied_state().await.unwrap();
+        assert_eq!(applied, Some(log_id(1, 1)));
+        Ok(())
+    }
+
+    /// Truncation: another leader's entry lands at the index this leader's
+    /// batch was proposed for, writing the same key. The speculative batch
+    /// must be undone first — applying on top of it would conflict-abort —
+    /// and the other leader's value wins.
+    #[tokio::test]
+    async fn a_foreign_entry_undoes_outstanding_speculation_first() -> R<()> {
+        let store = setup_store()?;
+        let other = setup_store()?;
+        other.adopt_keyring_from(&store)?;
+        let (mut sm, ledger) = speculating_machine(&store);
+        speculate_put_kv(&store, &ledger, "spec/x", "mine")?;
+        // Captured by the other leader on the committed state (no spec/x).
+        let ((), foreign) = capture_put_kv(&other, "spec/x", "theirs")?;
+
+        sm.apply([normal_entry(2, 1, foreign, None)]).await.unwrap();
+        assert_eq!(kv_value(&store, "spec/x")?.as_deref(), Some("theirs"));
+        assert_eq!(undo_records(&store)?, 0);
+        assert!(ledger.is_empty(Lane::Control));
+        Ok(())
+    }
+
+    /// Leadership loss with entries in flight: the new term's blank entry
+    /// undoes every outstanding batch, newest first — inserts disappear and
+    /// an update reverts to the committed value.
+    #[tokio::test]
+    async fn a_new_terms_blank_entry_undoes_every_outstanding_batch() -> R<()> {
+        let store = setup_store()?;
+        let (mut sm, ledger) = speculating_machine(&store);
+        // Committed baseline, applied normally.
+        let ((), base) = capture_put_kv(&store, "spec/k", "v0")?;
+        sm.apply([normal_entry(1, 1, base, None)]).await.unwrap();
+
+        speculate_put_kv(&store, &ledger, "spec/k", "v1")?;
+        speculate_put_kv(&store, &ledger, "spec/new", "n")?;
+        assert_eq!(kv_value(&store, "spec/k")?.as_deref(), Some("v1"));
+        assert_eq!(undo_records(&store)?, 2);
+
+        sm.apply([Entry {
+            log_id: log_id(2, 2),
+            payload: EntryPayload::Blank,
+        }])
+        .await
+        .unwrap();
+        assert_eq!(kv_value(&store, "spec/k")?.as_deref(), Some("v0"));
+        assert_eq!(kv_value(&store, "spec/new")?, None);
+        assert_eq!(undo_records(&store)?, 0);
+        assert!(ledger.is_empty(Lane::Control));
+        let (applied, _) = sm.applied_state().await.unwrap();
+        assert_eq!(applied, Some(log_id(2, 2)));
+        Ok(())
+    }
+
+    /// Leadership lost with the entry in flight: the deposed leader undoes
+    /// its batch as soon as the proposal fails, so it stops serving the
+    /// rows; and if the new leader commits the entry after all (it was
+    /// replicated before the leadership change), the state machine applies
+    /// it normally onto the state without the batch — once, and correctly.
+    #[tokio::test]
+    async fn a_failed_proposal_undoes_now_and_a_later_commit_still_applies() -> R<()> {
+        let store = setup_store()?;
+        let (mut sm, ledger) = speculating_machine(&store);
+        let (seq, changeset) = speculate_put_kv(&store, &ledger, "spec/flight", "v")?;
+        assert_eq!(
+            speculation::undo_outstanding(&store, &ledger, Lane::Control)?,
+            1
+        );
+        assert_eq!(kv_value(&store, "spec/flight")?, None);
+        assert_eq!(undo_records(&store)?, 0);
+        assert!(ledger.is_empty(Lane::Control));
+        // Nothing left to undo the second time.
+        assert_eq!(
+            speculation::undo_outstanding(&store, &ledger, Lane::Control)?,
+            0
+        );
+
+        // The new leader committed the entry: it applies like any entry.
+        sm.apply([normal_entry(2, 1, changeset, Some(seq))])
+            .await
+            .unwrap();
+        assert_eq!(kv_value(&store, "spec/flight")?.as_deref(), Some("v"));
+        Ok(())
+    }
+
+    /// Crash between the speculative commit and the apply: reopening the
+    /// store undoes the leftover batch before anything reads the state, and
+    /// if the entry did commit, re-applying it from the log (the restarted
+    /// ledger knows nothing of it) writes it normally.
+    #[tokio::test]
+    async fn restart_undoes_a_batch_left_between_commit_and_apply() -> R<()> {
+        let dir = Builder::new()
+            .prefix("khepri-raft-spec-crash-")
+            .tempdir_in(crate::test_scratch::root())?
+            .keep();
+        let mut config = ManagerConfigFull {
+            store_path: dir.to_str().context("store path")?.to_string(),
+            ..Default::default()
+        };
+        config.encryption.root_key.path =
+            Some(crate::storage::keyring::test_support::shared_root_key_path());
+
+        let changeset = {
+            let store = Store::start_storage(&config)?;
+            let ledger = SpeculationLedger::new();
+            let (_, changeset) = speculate_put_kv(&store, &ledger, "spec/crash", "uncommitted")?;
+            assert_eq!(undo_records(&store)?, 1);
+            changeset
+            // The process "dies": the store and its ledger go away with the
+            // batch committed and its entry never applied.
+        };
+
+        let store = Store::start_storage(&config)?;
+        assert_eq!(
+            kv_value(&store, "spec/crash")?,
+            None,
+            "startup recovery must undo a batch whose entry never applied"
+        );
+        assert_eq!(undo_records(&store)?, 0);
+
+        // The entry did commit after all: openraft re-applies it.
+        let (mut sm, _ledger) = speculating_machine(&store);
+        sm.apply([normal_entry(1, 1, changeset, Some(1))])
+            .await
+            .unwrap();
+        assert_eq!(
+            kv_value(&store, "spec/crash")?.as_deref(),
+            Some("uncommitted")
+        );
+        Ok(())
+    }
+
+    fn keys_in_image(bytes: &[u8]) -> R<(Vec<String>, i64)> {
+        let file = tempfile::NamedTempFile::new_in(crate::test_scratch::root())?;
+        std::fs::write(file.path(), bytes)?;
+        let conn = Connection::open(file.path())?;
+        let keys = {
+            let mut stmt = conn.prepare("SELECT key FROM kv_entry ORDER BY key;")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            Store::collect_rows(rows)?
+        };
+        let records: i64 = conn.query_row("SELECT COUNT(*) FROM raft_speculative;", [], |row| {
+            row.get(0)
+        })?;
+        Ok((keys, records))
+    }
+
+    /// A snapshot or a backup taken while a batch is in flight holds
+    /// committed state only: the copy is scrubbed of the batch (the live
+    /// database keeps it), and the batch still resolves normally afterwards.
+    #[tokio::test]
+    async fn snapshots_and_backups_never_carry_speculative_rows() -> R<()> {
+        let store = setup_store()?;
+        let (mut sm, ledger) = speculating_machine(&store);
+        let ((), base) = capture_put_kv(&store, "spec/committed", "c")?;
+        sm.apply([normal_entry(1, 1, base, None)]).await.unwrap();
+        let (seq, changeset) = speculate_put_kv(&store, &ledger, "spec/inflight", "s")?;
+
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        assert_eq!(snapshot.meta.last_log_id, Some(log_id(1, 1)));
+        let (keys, records) = keys_in_image(snapshot.snapshot.get_ref())?;
+        assert!(keys.contains(&"spec/committed".to_string()), "{keys:?}");
+        assert!(
+            !keys.contains(&"spec/inflight".to_string()),
+            "a snapshot must never carry a speculative row: {keys:?}"
+        );
+        assert_eq!(records, 0);
+
+        let backup_dir = Builder::new()
+            .prefix("khepri-raft-spec-backup-")
+            .tempdir_in(crate::test_scratch::root())?;
+        let backup = store.state_backup(Some(&backup_dir.path().join("b.sqlite")))?;
+        let (keys, records) = keys_in_image(&std::fs::read(&backup.path)?)?;
+        assert!(!keys.contains(&"spec/inflight".to_string()), "{keys:?}");
+        assert_eq!(records, 0);
+
+        // The live database still has the batch, and it resolves.
+        assert_eq!(kv_value(&store, "spec/inflight")?.as_deref(), Some("s"));
+        sm.apply([normal_entry(1, 2, changeset, Some(seq))])
+            .await
+            .unwrap();
+        assert_eq!(undo_records(&store)?, 0);
+        assert!(ledger.is_empty(Lane::Control));
+        Ok(())
+    }
+
+    /// A whole-DB install replaces the batches with the database they lived
+    /// in: the ledger forgets them, so a later entry is applied normally.
+    #[tokio::test]
+    async fn whole_db_install_clears_outstanding_speculation() -> R<()> {
+        let leader = setup_store()?;
+        let mut leader_sm = state_machine(Lane::Control, leader.clone());
+        let ((), base) = capture_put_kv(&leader, "spec/leader", "l")?;
+        leader_sm
+            .apply([normal_entry(1, 1, base, None)])
+            .await
+            .unwrap();
+        let snapshot = leader_sm
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let follower = setup_store()?;
+        let (mut follower_sm, ledger) = speculating_machine(&follower);
+        speculate_put_kv(&follower, &ledger, "spec/stale", "x")?;
+        let mut receiving = follower_sm.begin_receiving_snapshot().await.unwrap();
+        *receiving = Cursor::new(snapshot.snapshot.get_ref().clone());
+        follower_sm
+            .install_snapshot(&snapshot.meta, receiving)
+            .await
+            .unwrap();
+        assert!(ledger.is_empty(Lane::Control));
+        assert_eq!(kv_value(&follower, "spec/stale")?, None);
+        assert_eq!(undo_records(&follower)?, 0);
+        assert_eq!(kv_value(&follower, "spec/leader")?.as_deref(), Some("l"));
+        Ok(())
     }
 }

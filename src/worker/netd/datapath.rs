@@ -5,8 +5,9 @@
 //! Everything that crosses between them is one of three types:
 //!
 //! - [`NetdInput`] — what the worker tells the datapath: one acknowledged
-//!   heartbeat's desired set, endpoint feed, and policy assignments
-//!   ([`DesiredNetwork`]), and the answers to the fetches the datapath asked
+//!   heartbeat's desired set, endpoint feed delta, and policy assignments
+//!   ([`DesiredNetwork`]), endpoint sets pushed on the work stream, and the
+//!   answers to the fetches the datapath asked
 //!   for (policy bodies, ingress certificates, upstream credentials, the
 //!   node's mesh certificate), plus the node facts only the worker sees.
 //! - [`NetdWants`] — what the datapath needs fetched from the manager after
@@ -27,11 +28,11 @@ use crate::structs::source::{
     MATERIAL_POLICY, MATERIAL_PORT_CERT, MATERIAL_UPSTREAM_CA,
 };
 use crate::structs::{
-    AllocNetPolicy, Material, MaterialRef, NetAllocStatus, NetDenial, NetEdgeSample,
-    TaskAllocation, UpstreamEndpoints,
+    AllocNetPolicy, Material, MaterialRef, NetAllocStatus, NetDenial, NetEdgeSample, TaskAllocation,
 };
 use crate::worker::forwarder::{SecretValue, UpstreamForwarder};
 use crate::worker::netd::activity::ActivityLedger;
+use crate::worker::netd::endpoint_feed::EndpointFeedState;
 use crate::worker::netd::kernel_guard::GuardedAllocation;
 use crate::worker::netd::specs;
 use crate::worker::netd::state::{NetdState, NetdStateStore};
@@ -44,18 +45,20 @@ use std::path::PathBuf;
 /// One acknowledged heartbeat's datapath inputs. Sent only after the manager
 /// acknowledged the heartbeat, which is what makes the datapath fail-static:
 /// while the manager is unreachable the listeners keep their last known good
-/// endpoints and policy. Within one, an empty endpoint list is authoritative
+/// endpoints and policy. Within one, an empty endpoint set is authoritative
 /// (a killed or intention-denied backend must stop receiving traffic), while
-/// an upstream missing from `upstream_endpoints` keeps its current list.
+/// a set the feed leaves out keeps the copy held
+/// ([`crate::worker::netd::endpoint_feed`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DesiredNetwork {
     /// The allocations the node runs.
     #[serde(default)]
     pub desired: Vec<TaskAllocation>,
-    /// The endpoints each upstream (and each `proxy` handler) may dial.
-    #[serde(default)]
-    pub upstream_endpoints: Vec<UpstreamEndpoints>,
+    /// The heartbeat's endpoint feed: a delta against what the datapath
+    /// holds. `None` changes nothing (a restore, a test).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_feed: Option<crate::structs::EndpointFeed>,
     /// The policy hash each allocation runs under.
     #[serde(default)]
     pub net_policies: Vec<AllocNetPolicy>,
@@ -73,6 +76,9 @@ pub enum NetdInput {
     NodeId(String),
     /// The node's mesh certificate, issued or re-issued.
     MeshIdentity(MeshIdentity),
+    /// Endpoint sets the manager pushed on the work stream
+    /// (`StreamWorkReply.endpoint_feed`), applied at once.
+    Endpoints(crate::structs::EndpointFeed),
     /// `FetchDatapathMaterial`'s answer to [`NetdWants::material`]: policy
     /// bodies, KV-held certificates, and credential values. Values stay in
     /// memory only.
@@ -127,6 +133,8 @@ pub struct Netd {
     /// departures are torn down. A namespace that outlives a worker restart
     /// is found again by path.
     namespaces: Mutex<HashSet<i64>>,
+    /// The node's endpoint feed: bindings and the sets they name.
+    feed: Mutex<EndpointFeedState>,
 }
 
 impl Netd {
@@ -140,6 +148,7 @@ impl Netd {
             last_state_hash: Mutex::new(0),
             last: Mutex::new(DesiredNetwork::default()),
             namespaces: Mutex::new(HashSet::new()),
+            feed: Mutex::new(EndpointFeedState::default()),
         }
     }
 
@@ -162,6 +171,16 @@ impl Netd {
                 }
             }
             NetdInput::Material(materials) => self.apply_material(materials),
+            NetdInput::Endpoints(feed) => {
+                let taken = self.lock_feed().apply(&feed);
+                if taken > 0 {
+                    debug!(sets = taken, "Applied pushed endpoint sets");
+                    self.apply_endpoints();
+                    if self.lock_feed().mesh_wanted() {
+                        context.set_mesh_wanted(true);
+                    }
+                }
+            }
             NetdInput::RefreshNodeAddresses => context.refresh_node_addresses(),
             NetdInput::KernelGuard(allocations) => {
                 if !context.kernel_guard_active() {
@@ -238,6 +257,49 @@ impl Netd {
         NetdWants { material }
     }
 
+    fn lock_feed(&self) -> std::sync::MutexGuard<'_, EndpointFeedState> {
+        self.feed.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// What the next heartbeat reports holding of the endpoint feed
+    /// (`HeartbeatRequest.endpoint_feed`).
+    pub fn feed_report(&self) -> crate::structs::EndpointFeedState {
+        self.lock_feed().report()
+    }
+
+    /// One allocation's upstream endpoints by upstream key, for its
+    /// config-file templates.
+    pub fn template_endpoints(
+        &self,
+        allocation_id: i64,
+    ) -> std::collections::BTreeMap<String, Vec<crate::worker::balance::Endpoint>> {
+        self.lock_feed().template_endpoints(allocation_id)
+    }
+
+    /// Hand every listener the set its binding names. A listener whose list
+    /// did not change keeps the same shared list, which the forwarder takes
+    /// as no change.
+    fn apply_endpoints(&self) {
+        let listeners = self.lock_feed().listeners();
+        let context = self.forwarder.context();
+        for listener in listeners {
+            if listener.for_handler {
+                // A `proxy` handler's target: dialed on hand-off, no listener.
+                context.set_handler_endpoints_shared(
+                    listener.allocation_id,
+                    &listener.upstream,
+                    listener.endpoints,
+                );
+            } else {
+                self.forwarder.set_endpoints_shared(
+                    listener.allocation_id,
+                    &listener.upstream,
+                    listener.endpoints,
+                );
+            }
+        }
+    }
+
     /// Drain what the next heartbeat reports. Hand it back with
     /// [`Self::redrive`] when the heartbeat fails.
     pub fn report(&self) -> NetdReport {
@@ -296,6 +358,7 @@ impl Netd {
         };
         let state = NetdState {
             network: self.last.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+            feed: self.lock_feed().snapshot(),
             policy_bodies: self
                 .forwarder
                 .context()
@@ -374,6 +437,7 @@ impl Netd {
         }
         let NetdState {
             network,
+            feed,
             policy_bodies,
         } = state;
         // Only allocations that survived the restart get their datapath
@@ -392,13 +456,10 @@ impl Netd {
                 let _ = cache.insert_body(&hash, body);
             }
         }
+        *self.lock_feed() = EndpointFeedState::restore(feed, live);
         self.apply_desired(DesiredNetwork {
             desired,
-            upstream_endpoints: network
-                .upstream_endpoints
-                .into_iter()
-                .filter(|u| live.contains(&u.allocation_id))
-                .collect(),
+            endpoint_feed: None,
             net_policies: network
                 .net_policies
                 .into_iter()
@@ -414,7 +475,10 @@ impl Netd {
         restored
     }
 
-    async fn apply_desired(&self, input: DesiredNetwork) {
+    async fn apply_desired(&self, mut input: DesiredNetwork) {
+        if let Some(feed) = input.endpoint_feed.take() {
+            self.lock_feed().apply(&feed);
+        }
         let desired = &input.desired;
         let context = self.forwarder.context();
         // Policy first: attribution for every allocation and the hash each
@@ -444,17 +508,10 @@ impl Netd {
         if let Some(ingress) = forwarder.ingress() {
             ingress.sync(&specs::ingress_specs(desired, root)).await;
         }
-        let mut mesh_wanted = false;
-        for update in &input.upstream_endpoints {
-            let endpoints = specs::dialable_endpoints(update);
-            mesh_wanted |= endpoints.iter().any(|endpoint| endpoint.mesh_tls);
-            if update.for_handler {
-                // A `proxy` handler's target: dialed on hand-off, no listener.
-                context.set_handler_endpoints(update.allocation_id, &update.service, endpoints);
-            } else {
-                forwarder.set_endpoints(update.allocation_id, &update.service, endpoints);
-            }
-        }
+        // Every listener gets the set its binding names; only a changed set
+        // swaps a listener's list (mesh-control-path plan §6.1).
+        self.apply_endpoints();
+        let mut mesh_wanted = self.lock_feed().mesh_wanted();
         let live: HashSet<i64> = desired
             .iter()
             .map(|allocation| allocation.allocation_id)
@@ -729,7 +786,7 @@ impl Netd {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::ServiceEndpoint;
+    use crate::structs::{EndpointBinding, EndpointFeed, EndpointSet, ServiceEndpoint};
     use crate::worker::forwarder::{ForwarderContext, UpstreamSpec};
     use crate::worker::netd::attach::Attachment;
     use crate::worker::netd::{Denials, NetPolicyCache};
@@ -782,20 +839,34 @@ mod tests {
         }
     }
 
-    fn feed(allocation_id: i64, service: &str, mesh_tls: bool) -> UpstreamEndpoints {
-        UpstreamEndpoints {
-            allocation_id,
-            service: service.into(),
-            endpoints: vec![ServiceEndpoint {
-                address: "10.0.0.5".into(),
-                port: 20001,
-                allocation_id: 42,
-                node_id: "node-b".into(),
-                mesh_tls,
-                ..Default::default()
+    /// A feed binding `allocation_id`'s upstream `service` to one endpoint.
+    fn feed(allocation_id: i64, service: &str, mesh_tls: bool) -> Option<EndpointFeed> {
+        Some(EndpointFeed {
+            epoch: 1,
+            bindings_unchanged: false,
+            bindings_digest: "bindings".into(),
+            bindings: vec![EndpointBinding {
+                allocation_id,
+                upstream: service.into(),
+                for_handler: false,
+                service: service.into(),
+                consumer: "web".into(),
             }],
-            for_handler: false,
-        }
+            sets: vec![EndpointSet {
+                service: service.into(),
+                consumer: "web".into(),
+                version: 1,
+                digest: 1,
+                endpoints: vec![ServiceEndpoint {
+                    address: "10.0.0.5".into(),
+                    port: 20001,
+                    allocation_id: 42,
+                    node_id: "node-b".into(),
+                    mesh_tls,
+                    ..Default::default()
+                }],
+            }],
+        })
     }
 
     /// The datapath is driven entirely by desired sets: one must both start
@@ -808,7 +879,7 @@ mod tests {
         let local_port = free_port().await;
         netd.send(NetdInput::Desired(DesiredNetwork {
             desired: vec![connect_allocation(11, "db", local_port)],
-            upstream_endpoints: vec![feed(11, "db", false)],
+            endpoint_feed: feed(11, "db", false),
             net_policies: Vec::new(),
         }))
         .await;
@@ -856,7 +927,7 @@ mod tests {
         let netd = netd(root.path());
         netd.send(NetdInput::Desired(DesiredNetwork {
             desired: vec![connect_allocation(12, "db", free_port().await)],
-            upstream_endpoints: vec![feed(12, "db", true)],
+            endpoint_feed: feed(12, "db", true),
             net_policies: Vec::new(),
         }))
         .await;
@@ -881,7 +952,7 @@ mod tests {
         .to_string();
         netd.send(NetdInput::Desired(DesiredNetwork {
             desired: vec![allocation],
-            upstream_endpoints: Vec::new(),
+            endpoint_feed: None,
             net_policies: vec![AllocNetPolicy {
                 allocation_id: 21,
                 policy_hash: "abc".into(),
@@ -943,7 +1014,7 @@ mod tests {
         .to_string();
         netd.send(NetdInput::Desired(DesiredNetwork {
             desired: vec![allocation],
-            upstream_endpoints: Vec::new(),
+            endpoint_feed: None,
             net_policies: Vec::new(),
         }))
         .await;
@@ -1021,8 +1092,13 @@ mod tests {
                     // restored.
                     connect_allocation(32, "db", local_port + 1),
                 ],
-                upstream_endpoints: vec![feed(31, "db", false)],
+                endpoint_feed: None,
                 net_policies: Vec::new(),
+            },
+            feed: {
+                let mut state = EndpointFeedState::default();
+                state.apply(&feed(31, "db", false).unwrap());
+                state.snapshot()
             },
             policy_bodies: Vec::new(),
         })?;

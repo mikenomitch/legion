@@ -6,8 +6,11 @@
 //! `on_unhealthy` move budget decides what happens next: the replacement is
 //! deferred by a backoff that doubles per consecutive failure (a failure
 //! continues the chain while it comes within `move_period` of the previous
-//! replacement's release), or the job fails once `move_count` moves happened
-//! inside `move_period`.
+//! replacement's release), or the budget is spent once `move_count` moves
+//! happened inside `move_period`. A spent budget fails the job, except for a
+//! keyed instance: each keyed instance (a sandbox, a workspace) is its own
+//! unit of work, so it spends a budget of its own, and spending it stops
+//! just that instance.
 //!
 //! That decision is made here, inside the scheduler-lane op that removes the
 //! allocation, and recorded as a **hold** row in `reschedule_hold`:
@@ -189,6 +192,18 @@ pub enum MoveVerdict {
         move_period_secs: u64,
         reason: String,
     },
+    /// A keyed instance moved `move_count` times inside `move_period`: the
+    /// instance is stopped (in the same op) instead of moved again, and the
+    /// job and its other instances carry on. `legion instance start` retries
+    /// it with a fresh budget.
+    InstanceStopped {
+        instance_id: String,
+        task_name: String,
+        moves: u32,
+        move_count: u32,
+        move_period_secs: u64,
+        reason: String,
+    },
 }
 
 /// A removed failed allocation and the move budget's verdict on it.
@@ -302,19 +317,47 @@ impl Store {
             )
             .optional()?
             .unwrap_or_default();
-        // Moves of this task inside `move_period` (inclusive, as the
-        // in-memory history it replaces counted them): the `move_count`
-        // budget.
-        let earlier: u32 = tx.query_row(
-            "SELECT COUNT(*) FROM reschedule_hold \
-             WHERE job_config_id = ?1 AND task_config_id = ?2 AND created_at_unix >= ?3;",
-            params![
-                allocation.job_config_id,
-                allocation.task_config_id,
-                now - period_secs
-            ],
-            |row| row.get(0),
-        )?;
+        // A keyed instance spends a budget of its own: a few unrelated
+        // sandboxes of one job failing must not fail the job (or each
+        // other's next attempt). Slot instances and stateless tasks share
+        // the task's budget, as before.
+        let keyed_instance: Option<String> = match allocation.instance_id.as_deref() {
+            Some(instance_id) => tx
+                .query_row(
+                    "SELECT instance_id FROM instance WHERE instance_id = ?1 AND mode = 'keyed';",
+                    [instance_id],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        // Moves inside `move_period` (inclusive, as the in-memory history it
+        // replaces counted them): the `move_count` budget, of the keyed
+        // instance or else of the task.
+        let earlier: u32 = match keyed_instance.as_deref() {
+            Some(instance_id) => tx.query_row(
+                "SELECT COUNT(*) FROM reschedule_hold \
+                 WHERE job_config_id = ?1 AND task_config_id = ?2 AND instance_id = ?3 \
+                 AND created_at_unix >= ?4;",
+                params![
+                    allocation.job_config_id,
+                    allocation.task_config_id,
+                    instance_id,
+                    now - period_secs
+                ],
+                |row| row.get(0),
+            )?,
+            None => tx.query_row(
+                "SELECT COUNT(*) FROM reschedule_hold \
+                 WHERE job_config_id = ?1 AND task_config_id = ?2 AND created_at_unix >= ?3;",
+                params![
+                    allocation.job_config_id,
+                    allocation.task_config_id,
+                    now - period_secs
+                ],
+                |row| row.get(0),
+            )?,
+        };
         // The backoff follows a chain of failures: the previous hold of the
         // same instance (or, for a stateless task, of the task) continues
         // it when this failure came within `move_period` of that hold's
@@ -345,12 +388,30 @@ impl Store {
         let stopping_event = self.remove_allocation_row_tx(&tx, &allocation, cause, explanation)?;
 
         let verdict = match policy.move_count {
-            Some(limit) if earlier >= limit => MoveVerdict::Exhausted {
-                task_name,
-                moves: earlier,
-                move_count: limit,
-                move_period_secs: period_secs.max(0) as u64,
-                reason,
+            Some(limit) if earlier >= limit => match keyed_instance {
+                Some(instance_id) => {
+                    Self::stop_instance_for_spent_budget_tx(
+                        &tx,
+                        &instance_id,
+                        earlier,
+                        period_secs,
+                    )?;
+                    MoveVerdict::InstanceStopped {
+                        instance_id,
+                        task_name,
+                        moves: earlier,
+                        move_count: limit,
+                        move_period_secs: period_secs.max(0) as u64,
+                        reason,
+                    }
+                }
+                None => MoveVerdict::Exhausted {
+                    task_name,
+                    moves: earlier,
+                    move_count: limit,
+                    move_period_secs: period_secs.max(0) as u64,
+                    reason,
+                },
             },
             _ => {
                 let delay = move_backoff(
@@ -412,6 +473,42 @@ impl Store {
             allocation,
             verdict,
         }))
+    }
+
+    /// Park a keyed instance whose move budget is spent: `stopped`, with no
+    /// allocation, exactly as `legion instance stop` leaves it, so no plan
+    /// places it again until an explicit start. Its `last_stop` (written by
+    /// the removal) gains the budget and the way out.
+    fn stop_instance_for_spent_budget_tx(
+        tx: &Connection,
+        instance_id: &str,
+        moves: u32,
+        period_secs: i64,
+    ) -> R<()> {
+        tx.execute(
+            "UPDATE instance SET state = 'stopped', current_alloc_id = NULL, updated_at = ?1 \
+             WHERE instance_id = ?2 AND state NOT IN ('terminated', 'suspended');",
+            params![Self::now_rfc3339()?, instance_id],
+        )?;
+        let last_stop: Option<crate::structs::instance::InstanceLastStop> = tx
+            .query_row(
+                "SELECT last_stop FROM instance WHERE instance_id = ?1;",
+                [instance_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+        if let Some(mut last_stop) = last_stop {
+            last_stop.hint = format!(
+                "moved {moves} times in {}, its whole move budget (onUnhealthy.moveCount), so \
+                 the instance is stopped; `legion instance start {instance_id}` retries it \
+                 with a fresh budget",
+                short_duration(period_secs.max(0) as u64)
+            );
+            Self::write_instance_last_stop_tx(tx, instance_id, &last_stop)?;
+        }
+        Ok(())
     }
 
     /// Replacements a `Reschedule` plan of `job_config_id` must leave

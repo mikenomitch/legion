@@ -735,9 +735,10 @@ pub mod drafts {
     }
 
     /// `allocation.reschedule_exhausted` — a failed allocation found its
-    /// task's move budget spent (`move_count` moves inside `move_period`):
-    /// the task is not moved again, and the job is marked failed (a
-    /// `job.failed` event follows).
+    /// move budget spent (`move_count` moves inside `move_period`): it is
+    /// not moved again. With `stopped_instance`, the budget was a keyed
+    /// instance's own and only that instance is stopped; otherwise the job
+    /// is marked failed (a `job.failed` event follows).
     pub fn allocation_reschedule_exhausted(
         allocation: &Allocation,
         task_name: &str,
@@ -745,13 +746,20 @@ pub mod drafts {
         move_count: u32,
         move_period_secs: u64,
         reason: &str,
+        stopped_instance: Option<&str>,
     ) -> EventDraft {
+        let outcome = match stopped_instance {
+            Some(instance_id) => {
+                format!("stopping keyed instance {instance_id}; the rest of the job keeps running")
+            }
+            None => format!("marking job {} failed", allocation.job_id),
+        };
         EventDraft::error(
             "allocation.reschedule_exhausted",
             format!(
                 "Allocation {} of task {task_name} failed after {moves} moves in {}s \
-                 (move_count {move_count}); marking job {} failed: {reason}",
-                allocation.id, move_period_secs, allocation.job_id
+                 (move_count {move_count}); {outcome}: {reason}",
+                allocation.id, move_period_secs
             ),
         )
         .job(&allocation.job_id)
@@ -766,6 +774,7 @@ pub mod drafts {
             "moveCount": move_count,
             "movePeriodSecs": move_period_secs,
             "reason": reason,
+            "instanceStopped": stopped_instance.is_some(),
         }))
     }
 
@@ -2886,6 +2895,7 @@ impl EventRecorder<'_> {
         self.emit(drafts::allocation_reschedule_deferred(hold));
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn allocation_reschedule_exhausted(
         self,
         allocation: &Allocation,
@@ -2894,6 +2904,7 @@ impl EventRecorder<'_> {
         move_count: u32,
         move_period_secs: u64,
         reason: &str,
+        stopped_instance: Option<&str>,
     ) {
         self.emit(drafts::allocation_reschedule_exhausted(
             allocation,
@@ -2902,6 +2913,7 @@ impl EventRecorder<'_> {
             move_count,
             move_period_secs,
             reason,
+            stopped_instance,
         ));
     }
 

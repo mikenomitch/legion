@@ -37,6 +37,7 @@ impl AclTokenRecord {
             policies: self.policies.clone(),
             created_at: self.created_at.clone(),
             expires_at: self.expires_at.clone(),
+            parent_accessor_id: None,
         }
     }
 
@@ -738,6 +739,9 @@ impl Store {
             "DELETE FROM acl_token WHERE accessor_id = ?;",
             [accessor_id],
         )?;
+        // Revoking a token revokes the child tokens minted from it
+        // (docs/auth-and-acls.md, "Child tokens").
+        Self::delete_token_descendants_on(&conn, accessor_id)?;
         if deleted == 0 {
             return Err(anyhow::Error::new(StorageError::not_found(
                 "acl_token",
@@ -948,6 +952,13 @@ impl Store {
         let join_tokens = conn.execute(
             "DELETE FROM join_token WHERE expires_at IS NOT NULL AND expires_at <= ?;",
             [&now],
+        )?;
+        // Lineage rows of pruned tokens (a child expires no later than its
+        // parent, so its own row went with it).
+        conn.execute(
+            "DELETE FROM acl_token_meta
+             WHERE accessor_id NOT IN (SELECT accessor_id FROM acl_token);",
+            [],
         )?;
         Ok((acl_tokens, join_tokens))
     }

@@ -4,10 +4,11 @@
 //! Each lane owns a small dedicated database at
 //! `<data_dir>/<lane>/log.sqlite`, entirely separate from the state DB:
 //!
-//! - `log(idx INTEGER PRIMARY KEY, payload BLOB)` — one row per raft log
-//!   entry, keyed by the entry's log index; the payload is the serde_json
-//!   encoding of `Entry<TypeConfig>` (the same encoding the transport uses
-//!   on the wire, see `network.rs`).
+//! - `log(idx INTEGER PRIMARY KEY, payload BLOB, appended_ms INTEGER)` — one
+//!   row per raft log entry, keyed by the entry's log index; the payload is
+//!   the serde_json encoding of `Entry<TypeConfig>` (the same encoding the
+//!   transport uses on the wire, see `network.rs`), and `appended_ms` is
+//!   when this node appended it (wall clock, for the retained-span gauge).
 //! - `meta(key TEXT PRIMARY KEY, value BLOB)` — vote, committed log id, and
 //!   last purged log id, each a serde_json blob of the openraft type.
 //!
@@ -22,6 +23,21 @@
 //! the bytes are on disk. This is deliberately stricter than the state DB's
 //! `synchronous = NORMAL` (state is recoverable from the log; the log is
 //! recoverable from nothing).
+//!
+//! "Recoverable from the log" stops at the purge horizon, so `purge` runs
+//! the **purge barrier** first ([`RaftLogStore::with_purge_barrier`]): the
+//! driver installs a hook that fsyncs the state DB, so the applied marker a
+//! purge relies on is durable before any entry it covers is deleted
+//! (raft-write-path plan §6.1). One state-DB fsync per purge replaces the
+//! one per entry that `synchronous = FULL` on the state DB used to cost.
+//!
+//! # Retention
+//!
+//! openraft's own count-based purge is disabled (the driver sets
+//! `max_in_snapshot_log_to_keep` to `u64::MAX`). The driver's retention task
+//! asks [`RaftLogStore::retention_purge_point`] for the index behind the
+//! newest `raft.logRetainBytes` bytes after each snapshot and purges to it
+//! (plan §6.6).
 //!
 //! # Sync-inside-async
 //!
@@ -46,7 +62,9 @@ use std::path::Path;
 use std::sync::MutexGuard;
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
-use openraft::{Entry, LogId, OptionalSend, RaftLogReader, StorageError, StorageIOError, Vote};
+use openraft::{
+    AnyError, Entry, LogId, OptionalSend, RaftLogReader, StorageError, StorageIOError, Vote,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::prelude::*;
@@ -66,6 +84,11 @@ const META_VOTE: &str = "vote";
 const META_COMMITTED: &str = "committed";
 const META_PURGED: &str = "purged";
 
+/// A hook `purge` runs before it deletes anything: it must make every state
+/// the purge relies on durable (the driver passes the state DB fsync), and
+/// an error from it fails the purge with the log intact.
+pub(crate) type PurgeBarrier = Arc<dyn Fn() -> R<()> + Send + Sync>;
+
 /// The per-lane raft log store. Cheap to clone (the driver hands one clone
 /// to openraft as the log store and `get_log_reader` hands out more); all
 /// clones share the same connection, and the mutex serializes every
@@ -74,6 +97,12 @@ const META_PURGED: &str = "purged";
 #[derive(Clone)]
 pub(crate) struct RaftLogStore {
     conn: Arc<Mutex<Connection>>,
+    /// `<data_dir>/<lane>/log.sqlite`, for the retention task's own
+    /// read-only connection (its scans must not hold up appends).
+    path: std::path::PathBuf,
+    /// Runs before every purge (module docs, "Durability"). `None` only in
+    /// tests that exercise the log alone.
+    purge_barrier: Option<PurgeBarrier>,
 }
 
 impl Debug for RaftLogStore {
@@ -100,7 +129,8 @@ impl RaftLogStore {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS log (
                 idx INTEGER PRIMARY KEY,
-                payload BLOB NOT NULL
+                payload BLOB NOT NULL,
+                appended_ms INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -110,7 +140,66 @@ impl RaftLogStore {
         .context("failed creating raft log tables")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            path,
+            purge_barrier: None,
         })
+    }
+
+    /// Install the purge barrier (module docs, "Durability").
+    pub(crate) fn with_purge_barrier(mut self, barrier: PurgeBarrier) -> Self {
+        self.purge_barrier = Some(barrier);
+        self
+    }
+
+    /// The highest log index retention may purge so that the newest entries
+    /// totalling at most `retain_bytes` of payload stay in the log, or `None`
+    /// when the whole log fits. Entries are walked newest first and counted
+    /// by their encoded size, so the budget bounds the log's disk use
+    /// whatever the entries look like. The caller also caps the result at
+    /// the latest snapshot: openraft never purges an entry no snapshot
+    /// covers.
+    ///
+    /// Reads on its own read-only connection, so the scan never holds up
+    /// `append` (WAL readers do not block the writer).
+    pub(crate) fn retention_purge_point(&self, retain_bytes: u64) -> R<Option<u64>> {
+        let conn = self.reader()?;
+        let mut stmt =
+            conn.prepare_cached("SELECT idx, length(payload) FROM log ORDER BY idx DESC;")?;
+        let mut rows = stmt.query([])?;
+        let mut retained: u64 = 0;
+        while let Some(row) = rows.next()? {
+            let idx: i64 = row.get(0)?;
+            let bytes: i64 = row.get(1)?;
+            retained = retained.saturating_add(u64::try_from(bytes).unwrap_or(0));
+            if retained > retain_bytes {
+                return Ok(Some(u64::try_from(idx).unwrap_or(0)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// When the oldest entry still in the log was appended (unix millis),
+    /// or `None` for an empty log: how far back a follower can restart from
+    /// and still catch up by replay.
+    pub(crate) fn oldest_appended_ms(&self) -> R<Option<i64>> {
+        let conn = self.reader()?;
+        Ok(conn
+            .query_row(
+                "SELECT appended_ms FROM log ORDER BY idx ASC LIMIT 1;",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn reader(&self) -> R<Connection> {
+        let conn = Connection::open_with_flags(
+            &self.path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("failed opening raft log db {}", self.path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(conn)
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -291,12 +380,18 @@ impl RaftLogStorage<TypeConfig> for RaftLogStore {
                 // OR REPLACE: after a truncate-then-append raft may rewrite
                 // an index with a different entry; last write wins.
                 let mut stmt = tx
-                    .prepare_cached("INSERT OR REPLACE INTO log (idx, payload) VALUES (?1, ?2);")
+                    .prepare_cached(
+                        "INSERT OR REPLACE INTO log (idx, payload, appended_ms) \
+                         VALUES (?1, ?2, ?3);",
+                    )
                     .map_err(|e| StorageIOError::write_logs(&e))?;
+                let appended_ms =
+                    time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+                let appended_ms = i64::try_from(appended_ms).unwrap_or(i64::MAX);
                 for entry in entries {
                     let payload =
                         serde_json::to_vec(&entry).map_err(|e| StorageIOError::write_logs(&e))?;
-                    stmt.execute(params![sql_idx(entry.log_id.index), payload])
+                    stmt.execute(params![sql_idx(entry.log_id.index), payload, appended_ms])
                         .map_err(|e| StorageIOError::write_logs(&e))?;
                 }
             }
@@ -318,6 +413,18 @@ impl RaftLogStorage<TypeConfig> for RaftLogStore {
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+        // The purge barrier, before anything is deleted: every purge reaches
+        // only entries the state machine has already committed a marker for
+        // (openraft purges behind a snapshot, and a snapshot is read from
+        // committed state), and the barrier makes that marker durable. If it
+        // fails, the log stays whole and openraft surfaces the storage error.
+        if let Some(barrier) = &self.purge_barrier {
+            barrier().map_err(|e| {
+                StorageIOError::write_logs(AnyError::error(format!(
+                    "purge barrier (state db fsync) failed; log not purged: {e:#}"
+                )))
+            })?;
+        }
         let conn = self.lock();
         // Record the purge marker before deleting rows: if we crash between
         // the two statements, a marker with leftover rows below it is
@@ -352,7 +459,9 @@ mod tests {
             log_id: log_id(term, index),
             payload: EntryPayload::Normal(StoreCommand {
                 lane: Lane::Control,
-                op: "test".to_string(),
+                ops: vec!["test".to_string()],
+                proposal: None,
+                schema_version: 0,
                 changeset: vec![index as u8],
             }),
         }
@@ -396,7 +505,7 @@ mod tests {
         // Payload round-trips exactly.
         match &entries[0].payload {
             EntryPayload::Normal(cmd) => {
-                assert_eq!(cmd.op, "test");
+                assert_eq!(cmd.ops, vec!["test".to_string()]);
                 assert_eq!(cmd.changeset, vec![2u8]);
                 assert_eq!(cmd.lane, Lane::Control);
             }
@@ -473,6 +582,99 @@ mod tests {
         assert!(status.try_get_log_entries(..).await.unwrap().is_empty());
         assert!(dir.path().join("control/log.sqlite").exists());
         assert!(dir.path().join("status/log.sqlite").exists());
+        Ok(())
+    }
+
+    /// The purge barrier runs before anything is deleted, on every purge
+    /// (plan §6.1): the state DB runs `synchronous = NORMAL`, so the barrier
+    /// is the only thing standing between a purge and an applied marker that
+    /// a power loss could roll back below it.
+    #[tokio::test]
+    async fn purge_runs_the_barrier_before_deleting() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let probe = RaftLogStore::open(dir.path(), Lane::Control)?;
+        // The barrier observes the log as it stands when it runs: the
+        // entries are all still there, and no purge marker is written yet.
+        let seen: Arc<std::sync::Mutex<Vec<(usize, bool)>>> = Arc::default();
+        let observed = Arc::clone(&seen);
+        let watcher = probe.clone();
+        let mut store = probe.with_purge_barrier(Arc::new(move || {
+            let conn = watcher.lock();
+            let rows: i64 = conn.query_row("SELECT COUNT(*) FROM log;", [], |r| r.get(0))?;
+            let marker = RaftLogStore::read_meta::<LogId<NodeId>>(&conn, META_PURGED)?.is_some();
+            observed
+                .lock()
+                .expect("barrier probe")
+                .push((rows as usize, marker));
+            Ok(())
+        }));
+        store
+            .blocking_append([entry(1, 1), entry(1, 2), entry(1, 3)])
+            .await
+            .unwrap();
+        store.purge(log_id(1, 2)).await.unwrap();
+        store.purge(log_id(1, 3)).await.unwrap();
+        assert_eq!(
+            *seen.lock().expect("barrier probe"),
+            vec![(3, false), (1, true)],
+            "the barrier must run once per purge, before the marker and the deletes"
+        );
+        Ok(())
+    }
+
+    /// A failed barrier leaves the log whole: no marker, no deleted rows.
+    #[tokio::test]
+    async fn purge_refuses_when_the_barrier_fails() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = RaftLogStore::open(dir.path(), Lane::Control)?
+            .with_purge_barrier(Arc::new(|| Err(anyhow!("disk on fire"))));
+        store
+            .blocking_append([entry(1, 1), entry(1, 2)])
+            .await
+            .unwrap();
+        let err = store
+            .purge(log_id(1, 2))
+            .await
+            .expect_err("a failed barrier must fail the purge");
+        assert!(format!("{err}").contains("purge barrier"), "{err}");
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, None);
+        assert_eq!(store.try_get_log_entries(..).await.unwrap().len(), 2);
+        Ok(())
+    }
+
+    /// Retention keeps the newest `retain_bytes` of payload (plan §6.6):
+    /// the purge point is the newest entry that no longer fits, and a log
+    /// that fits entirely has none.
+    #[tokio::test]
+    async fn retention_keeps_the_newest_bytes() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let mut store = RaftLogStore::open(dir.path(), Lane::Control)?;
+        store
+            .blocking_append((1..=10).map(|index| entry(1, index)))
+            .await
+            .unwrap();
+        let sizes: Vec<u64> = {
+            let conn = store.lock();
+            let mut stmt = conn.prepare("SELECT length(payload) FROM log ORDER BY idx DESC;")?;
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            rows.map(|size| size.map(|size| size as u64))
+                .collect::<Result<_, _>>()?
+        };
+        let total: u64 = sizes.iter().sum();
+        assert_eq!(store.retention_purge_point(total)?, None);
+        // Room for exactly the newest three entries: entry 7 is the first
+        // that does not fit, so everything up to it may go.
+        let three: u64 = sizes[..3].iter().sum();
+        assert_eq!(store.retention_purge_point(three)?, Some(7));
+        assert_eq!(store.retention_purge_point(three + 1)?, Some(7));
+        assert_eq!(store.retention_purge_point(0)?, Some(10));
+        // The oldest retained entry carries its append time.
+        let appended = store.oldest_appended_ms()?.context("non-empty log")?;
+        let now_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        assert!(appended <= now_ms && now_ms - appended < 60_000);
+        store.purge(log_id(1, 10)).await.unwrap();
+        assert_eq!(store.oldest_appended_ms()?, None);
         Ok(())
     }
 }

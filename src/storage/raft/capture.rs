@@ -2,14 +2,19 @@
 //! primitives (plan §2, JC-12..15; mechanism validated by
 //! `tests/integration/raft_changeset_capture.rs`).
 //!
-//! A mutation in raft mode runs on a lane's pipeline thread as:
-//! global capture mutex -> `SAVEPOINT legion_capture` + session attach ->
-//! run the existing method body (its own transactions become nested
-//! savepoints) -> capture the changeset -> `ROLLBACK` -> propose the
-//! changeset via raft -> on quorum commit every node applies it via
-//! [`apply_changeset`]. Side effects (event broadcast, eval notify,
-//! read-model cache) are suppressed while `in_capture` is set and are
-//! re-projected from the committed changeset at apply time (JC-11).
+//! Mutations in raft mode run on a lane's pipeline thread in batches
+//! ([`capture_batch`], raft-write-path plan §6.2): global capture mutex ->
+//! `SAVEPOINT legion_capture` -> per op: its own session + `SAVEPOINT
+//! legion_op`, run the existing method body (its own transactions become
+//! nested savepoints), extract and check the op's changeset, release or roll
+//! back the op alone -> combine the ops' changesets -> roll the batch back,
+//! or (speculation, `single` topology, §6.3) commit it with its undo record
+//! -> propose the combined changeset via raft -> on quorum commit every node
+//! applies it ([`apply_changeset_locked`]; a speculating leader skips its own
+//! batch). Side effects (event broadcast, eval notify, read-model cache) are
+//! suppressed while `in_capture` is set and are re-projected from the
+//! committed changeset at apply time (JC-11). [`capture_mutation`] is the
+//! single-op, always-rolled-back form the tests use.
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -222,6 +227,10 @@ const CAPTURE_ROLLBACK_SQL: &str = "ROLLBACK TO legion_capture; RELEASE legion_c
 /// this function's own locking); `f` locks and unlocks the write connection
 /// freely, and its `Store::write_tx` savepoints nest inside the capture
 /// savepoint.
+///
+/// The pipeline captures through [`capture_batch`]; this single-op form is
+/// what the capture/apply tests use to produce changesets.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn capture_mutation<T>(
     store: &Store,
     lane: Lane,
@@ -310,6 +319,320 @@ pub(crate) fn capture_mutation<T>(
     rollback_result?;
     let changeset = changeset_result?;
     Ok((value, changeset))
+}
+
+/// One op of a [`capture_batch`]: the public store method's body, boxed,
+/// with the lane and op name it was classified under.
+pub(crate) struct BatchItem {
+    pub(crate) lane: Lane,
+    pub(crate) op: &'static str,
+    pub(crate) f: crate::storage::raft::ReplicatedOp,
+}
+
+/// What a [`capture_batch`] produced.
+pub(crate) struct CapturedBatch {
+    /// One result per executed op, in order: the op's return value, or why
+    /// it failed (an error, a panic, or a per-op check) — a failed op was
+    /// rolled back alone.
+    pub(crate) results: Vec<R<Box<dyn std::any::Any + Send>>>,
+    /// Per executed op: whether its own changeset was non-empty (it wrote
+    /// something the entry carries).
+    pub(crate) wrote: Vec<bool>,
+    /// The batch's net effect: every successful op's changeset combined in
+    /// order. Empty when nothing changed.
+    pub(crate) changeset: Vec<u8>,
+    /// Ops not executed because the batch reached its byte budget; the
+    /// caller runs them first in its next batch, in this order.
+    pub(crate) deferred: Vec<BatchItem>,
+    /// Whether the batch was committed locally (speculation) rather than
+    /// rolled back.
+    pub(crate) committed: bool,
+}
+
+/// How a [`capture_batch`] ends once every op ran.
+pub(crate) enum BatchEnd<'a> {
+    /// Roll the whole batch back: the entry is applied on every node,
+    /// this one included, when it commits (the classic capture).
+    RollBack,
+    /// Commit the batch locally with its undo record and record it in the
+    /// ledger, all under the capture mutex (raft-write-path plan §6.3).
+    Speculate {
+        ledger: &'a crate::storage::raft::speculation::SpeculationLedger,
+        group: Lane,
+        seq: u64,
+    },
+}
+
+const BATCH_OP_SAVEPOINT_SQL: &str = "SAVEPOINT legion_op;";
+const BATCH_OP_RELEASE_SQL: &str = "RELEASE legion_op;";
+const BATCH_OP_ROLLBACK_SQL: &str = "ROLLBACK TO legion_op; RELEASE legion_op;";
+
+/// The panic payload of a caught unwind, as text.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| message.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+/// The per-op ownership guard `capture_batch` runs on each op's changeset:
+/// `(lane, op name, changeset)`, failing the op on a violation.
+pub(crate) type OwnershipCheck<'a> = dyn FnMut(Lane, &'static str, &[u8]) -> R<()> + 'a;
+
+/// Group commit's capture (raft-write-path plan §6.2): run a batch of ops in
+/// ONE capture savepoint, each in its own nested savepoint with its own
+/// session, and combine their changesets into one.
+///
+/// Per op: open a session and `SAVEPOINT legion_op`, run the body (panics
+/// caught), extract its changeset, and run `check` on it (the ownership
+/// guard and the mixed-version guard). Success releases the op's savepoint;
+/// an error, a panic or a failed check rolls back to it, so a failing op
+/// undoes only itself and the ops after it run on the state without it.
+/// Each op's changeset is relative to the state after the ops before it, so
+/// combining them in order (`sqlite3changegroup`) is the batch's exact net
+/// effect.
+///
+/// Ops run until `items` is exhausted or the successful ops' changesets
+/// reach `max_bytes`; the rest come back in [`CapturedBatch::deferred`].
+/// The first op always runs, however large.
+///
+/// The batch then ends per `end`: rolled back, or committed with its undo
+/// record ([`BatchEnd::Speculate`]). An empty net effect is always rolled
+/// back — there is nothing to replicate or undo. If ending fails, every op
+/// reports the error and the database is left as it was.
+///
+/// Locking and the `'static` session borrow follow [`capture_mutation`];
+/// the capture mutex is held for the whole batch, and each op runs with its
+/// own lane as the thread's capture lane (JC-42 id residues).
+pub(crate) fn capture_batch(
+    store: &Store,
+    items: Vec<BatchItem>,
+    max_bytes: usize,
+    check: &mut OwnershipCheck<'_>,
+    end: BatchEnd<'_>,
+) -> R<CapturedBatch> {
+    let _capture_lock = capture_lock();
+    let first_lane = items.first().map(|item| item.lane).unwrap_or(Lane::Control);
+    let _in_capture = CaptureGuard::new(first_lane);
+
+    {
+        let guard = store.write_connection()?;
+        guard
+            .execute_batch(CAPTURE_SAVEPOINT_SQL)
+            .context("failed opening capture savepoint")?;
+    }
+
+    let mut results: Vec<R<Box<dyn std::any::Any + Send>>> = Vec::with_capacity(items.len());
+    let mut wrote: Vec<bool> = Vec::with_capacity(items.len());
+    let mut changesets: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+    let mut bytes = 0usize;
+    let mut items = items.into_iter();
+    let mut deferred: Vec<BatchItem> = Vec::new();
+    // A failure of the connection itself (not of an op) poisons the batch:
+    // stop running ops and roll everything back below.
+    let mut connection_error: Option<anyhow::Error> = None;
+
+    while let Some(item) = items.next() {
+        if !results.is_empty() && bytes >= max_bytes {
+            deferred.push(item);
+            deferred.extend(items.by_ref());
+            break;
+        }
+        let BatchItem { lane, op, f } = item;
+        let _op_lane = CaptureGuard::new(lane);
+        let session = (|| -> R<Session<'static>> {
+            let guard = store.write_connection()?;
+            let conn: &Connection = &guard;
+            // SAFETY: as in `capture_mutation` — the connection lives in an
+            // `Arc<Mutex<..>>` on `store`, which outlives this function; the
+            // capture mutex (held for the whole batch) and the raft-mode
+            // bypass guard confine every other writer; and the session is
+            // dropped below, before the next op's session exists and before
+            // this function returns.
+            let static_conn: &'static Connection =
+                unsafe { std::mem::transmute::<&Connection, &'static Connection>(conn) };
+            let mut session = Session::new(static_conn)
+                .context("failed creating sqlite session for a batch op")?;
+            session
+                .attach(None)
+                .context("failed attaching sqlite session to all tables")?;
+            conn.execute_batch(BATCH_OP_SAVEPOINT_SQL)
+                .context("failed opening a batch op savepoint")?;
+            Ok(session)
+        })();
+        let mut session = match session {
+            Ok(session) => session,
+            Err(err) => {
+                results.push(Err(anyhow!(
+                    "replicated store op {op} could not start its capture: {err:#}"
+                )));
+                wrote.push(false);
+                connection_error = Some(err);
+                break;
+            }
+        };
+
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(store)));
+
+        let guard = match store.write_connection() {
+            Ok(guard) => guard,
+            Err(err) => {
+                // Without the connection the session cannot be deleted
+                // safely; leak it (only reachable with a poisoned mutex,
+                // which already wedges every writer).
+                std::mem::forget(session);
+                connection_error = Some(err);
+                results.push(Err(anyhow!(
+                    "replicated store op {op} lost the write connection"
+                )));
+                wrote.push(false);
+                break;
+            }
+        };
+        let outcome: R<(Box<dyn std::any::Any + Send>, Vec<u8>)> = match ran {
+            Ok(Ok(value)) => {
+                let mut changeset = Vec::new();
+                session
+                    .changeset_strm(&mut changeset)
+                    .context("failed extracting a batch op's changeset")
+                    .and_then(|()| check(lane, op, &changeset))
+                    .map(|()| (value, changeset))
+            }
+            Ok(Err(err)) => Err(err),
+            Err(panic) => {
+                let message = panic_message(panic.as_ref());
+                error!(
+                    op,
+                    panic = %message,
+                    "replicated store op panicked inside a batch; it was rolled back alone"
+                );
+                Err(anyhow!("replicated store op {op} panicked: {message}"))
+            }
+        };
+        drop(session);
+        match outcome {
+            Ok((value, changeset)) => {
+                if let Err(err) = guard
+                    .execute_batch(BATCH_OP_RELEASE_SQL)
+                    .context("failed releasing a batch op savepoint")
+                {
+                    connection_error = Some(err);
+                    results.push(Err(anyhow!(
+                        "replicated store op {op} could not be committed to its batch"
+                    )));
+                    wrote.push(false);
+                    break;
+                }
+                bytes += changeset.len();
+                wrote.push(!changeset.is_empty());
+                if !changeset.is_empty() {
+                    changesets.push(changeset);
+                }
+                results.push(Ok(value));
+            }
+            Err(err) => {
+                if let Err(rollback) = guard
+                    .execute_batch(BATCH_OP_ROLLBACK_SQL)
+                    .context("failed rolling back a batch op savepoint")
+                {
+                    connection_error = Some(rollback);
+                    results.push(Err(err));
+                    wrote.push(false);
+                    break;
+                }
+                wrote.push(false);
+                results.push(Err(err));
+            }
+        }
+    }
+    // Ops never reached because the connection failed are deferred to the
+    // next batch rather than dropped.
+    deferred.extend(items);
+
+    // Combine the per-op changesets in order: the batch's net effect.
+    let combined: R<Vec<u8>> = match changesets.len() {
+        0 => Ok(Vec::new()),
+        1 => Ok(changesets.pop().unwrap_or_default()),
+        _ => (|| -> R<Vec<u8>> {
+            let mut group =
+                rusqlite::session::Changegroup::new().context("failed creating a changegroup")?;
+            for changeset in &changesets {
+                let mut input: &[u8] = changeset;
+                group
+                    .add_stream(&mut input)
+                    .context("failed adding a batch op's changeset to the changegroup")?;
+            }
+            let mut combined = Vec::new();
+            group
+                .output_strm(&mut combined)
+                .context("failed combining the batch's changesets")?;
+            Ok(combined)
+        })(),
+    };
+
+    let guard = store.write_connection()?;
+    let ended: R<bool> = (|| -> R<bool> {
+        if let Some(err) = connection_error {
+            return Err(err);
+        }
+        let combined = combined.as_ref().map_err(|err| anyhow!("{err:#}"))?;
+        match end {
+            BatchEnd::Speculate { ledger, group, seq } if !combined.is_empty() => {
+                let undo = crate::storage::raft::speculation::invert(combined)?;
+                crate::storage::raft::speculation::record_undo(&guard, group, seq, &undo)?;
+                guard
+                    .execute_batch("RELEASE legion_capture;")
+                    .context("failed committing a speculative batch")?;
+                // Still under the capture mutex: an apply can never see this
+                // batch committed without the ledger knowing about it.
+                ledger.push(group, seq);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    })();
+    let committed = match ended {
+        Ok(true) => true,
+        Ok(false) => {
+            guard
+                .execute_batch(CAPTURE_ROLLBACK_SQL)
+                .context("failed rolling back capture savepoint")?;
+            false
+        }
+        Err(err) => {
+            let rollback = guard.execute_batch(CAPTURE_ROLLBACK_SQL);
+            if !guard.is_autocommit() {
+                // A failed RELEASE can leave the outer savepoint open; never
+                // leave the connection inside a transaction.
+                let _ = guard.execute_batch("ROLLBACK;");
+            }
+            rollback.context("failed rolling back capture savepoint")?;
+            let rendered = format!("{err:#}");
+            for result in results.iter_mut() {
+                if result.is_ok() {
+                    *result = Err(anyhow!(
+                        "replicated batch could not be captured: {rendered}"
+                    ));
+                }
+            }
+            return Ok(CapturedBatch {
+                wrote: vec![false; results.len()],
+                results,
+                changeset: Vec::new(),
+                deferred,
+                committed: false,
+            });
+        }
+    };
+    drop(guard);
+    Ok(CapturedBatch {
+        results,
+        wrote,
+        changeset: combined?,
+        deferred,
+        committed,
+    })
 }
 
 /// A scoped LOCAL write: committed to this node's database only, never
@@ -523,15 +846,21 @@ fn assert_local_write_scope(op: &str, changeset: &[u8]) -> R<()> {
     Ok(())
 }
 
-/// Tables whose rows the read model holds or keys off: the only ones a
-/// `local_disk` projected mutation records. Everything else (events, evals,
-/// jobs) keeps its existing direct side effects in `local_disk` mode.
-const READ_MODEL_TABLES: [&str; 5] = [
+/// Tables whose rows the read model holds or keys off, plus the tables the
+/// revision journal watches (`job`, `job_config`, `task_status`,
+/// `kv_entry`; revisions-and-watches plan §1): the only ones a `local_disk`
+/// projected mutation records. Everything else (events, evals) keeps its
+/// existing direct side effects in `local_disk` mode.
+const READ_MODEL_TABLES: [&str; 9] = [
     "node",
     "node_health",
     "allocation",
     "task_config",
     "allocation_epoch_partition",
+    "job",
+    "job_config",
+    "task_status",
+    "kv_entry",
 ];
 
 /// RAII guard for the local-projection thread flag.
@@ -747,7 +1076,9 @@ pub(crate) fn apply_changeset(store: &Store, bytes: &[u8]) -> R<()> {
 /// with the data it describes — applied state and data can never diverge,
 /// even on a crash between them (plan §A5 "state and index can never
 /// diverge"). If `within_tx` fails, the whole savepoint (changeset included)
-/// rolls back.
+/// rolls back. (The state machine itself uses [`apply_changeset_locked`],
+/// because it must check the speculation ledger under the same mutex hold.)
+#[cfg_attr(not(test), allow(dead_code))] // the capture round-trip tests apply through it
 pub(crate) fn apply_changeset_with(
     store: &Store,
     bytes: &[u8],
@@ -758,6 +1089,28 @@ pub(crate) fn apply_changeset_with(
         // an apply must never run while a capture savepoint is open on the
         // shared connection, or the capture's rollback would erase it.
         let _captures = capture_lock();
+        apply_changeset_locked(store, bytes, within_tx)?;
+    }
+
+    // Side effects are driven by the committed changeset on every replica
+    // (JC-11). They are node-local and derived from the committed rows, so
+    // a projection failure is recovered in place, never returned: the raft
+    // state machine would turn it into a fatal storage error and stop this
+    // replica's raft core over an entry it applied correctly.
+    store.project_changeset_side_effects(bytes);
+    Ok(())
+}
+
+/// The transaction half of [`apply_changeset_with`], for a caller that
+/// already holds the capture mutex ([`capture_exclusion`]) — the raft state
+/// machine, which must check the speculation ledger and apply under one
+/// hold. Projects nothing: the caller projects after releasing the mutex.
+pub(crate) fn apply_changeset_locked(
+    store: &Store,
+    bytes: &[u8],
+    within_tx: impl FnOnce(&Connection) -> R<()>,
+) -> R<()> {
+    {
         let _in_apply = ApplyGuard::new();
         let mut conn = store.write_connection()?;
         // Belt-and-braces: the capture mutex guarantees no capture savepoint
@@ -813,14 +1166,34 @@ pub(crate) fn apply_changeset_with(
         apply_result?;
         restore_result.context("failed re-enabling foreign_keys after changeset apply")?;
     }
-
-    // Side effects are driven by the committed changeset on every replica
-    // (JC-11). They are node-local and derived from the committed rows, so
-    // a projection failure is recovered in place, never returned: the raft
-    // state machine would turn it into a fatal storage error and stop this
-    // replica's raft core over an entry it applied correctly.
-    store.project_changeset_side_effects(bytes);
     Ok(())
+}
+
+/// Run `body` on the write connection in one savepoint with the apply guard
+/// set and `foreign_keys = OFF` — the frame every state-machine write
+/// shares (changeset apply, speculation undo, marker-only applies). The
+/// caller holds the capture mutex.
+pub(crate) fn apply_tx_locked<T>(store: &Store, body: impl FnOnce(&Connection) -> R<T>) -> R<T> {
+    let _in_apply = ApplyGuard::new();
+    let mut conn = store.write_connection()?;
+    if !conn.is_autocommit() {
+        bail!(
+            "state machine write found the write connection inside an open transaction; \
+             writing would nest and could be silently rolled back"
+        );
+    }
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .context("failed disabling foreign_keys for a state machine write")?;
+    let result = (|| -> R<T> {
+        let sp = Store::write_tx(&mut conn)?;
+        let value = body(&sp)?;
+        sp.commit()?;
+        Ok(value)
+    })();
+    let restore = conn.pragma_update(None, "foreign_keys", "ON");
+    let value = result?;
+    restore.context("failed re-enabling foreign_keys after a state machine write")?;
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -1493,6 +1866,178 @@ mod tests {
         assert!(
             format!("{err:#}").contains("inside a replicated capture"),
             "{err:#}"
+        );
+        Ok(())
+    }
+
+    // ── group commit (raft-write-path plan §6.2) ─────────────────────────
+
+    type OpBody = Box<dyn FnOnce(&Store) -> R<()> + Send>;
+
+    fn batch_item(op: &'static str, body: OpBody) -> BatchItem {
+        BatchItem {
+            lane: Lane::Control,
+            op,
+            f: Box::new(move |s: &Store| -> R<Box<dyn std::any::Any + Send>> {
+                body(s)?;
+                Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+            }),
+        }
+    }
+
+    fn put(key: &'static str, value: &'static str) -> OpBody {
+        Box::new(move |s: &Store| -> R<()> {
+            s.put_kv(key, value, KvValueType::String, None, None)?;
+            Ok(())
+        })
+    }
+
+    fn no_check() -> impl FnMut(Lane, &'static str, &[u8]) -> R<()> {
+        |_, _, _| Ok(())
+    }
+
+    /// One failing op, one panicking op and one op its check rejects each
+    /// roll back alone: the batch's other ops commit, the entry carries
+    /// exactly their effects, and the local database is untouched (a
+    /// rolled-back batch).
+    #[test]
+    fn batch_capture_isolates_failing_panicking_and_rejected_ops() -> R<()> {
+        let store = setup_store()?;
+        let replica = setup_store()?;
+        replica.adopt_keyring_from(&store)?;
+        let items = vec![
+            batch_item("first", put("batch/a", "1")),
+            batch_item(
+                "fails",
+                Box::new(|s: &Store| -> R<()> {
+                    s.put_kv("batch/err", "x", KvValueType::String, None, None)?;
+                    bail!("op failed after writing")
+                }),
+            ),
+            batch_item(
+                "panics",
+                Box::new(|s: &Store| -> R<()> {
+                    s.put_kv("batch/panic", "x", KvValueType::String, None, None)?;
+                    panic!("op panicked after writing");
+                }),
+            ),
+            batch_item("rejected", put("batch/rejected", "x")),
+            batch_item("last", put("batch/b", "2")),
+        ];
+        let mut check = |_lane: Lane, op: &'static str, _changeset: &[u8]| -> R<()> {
+            if op == "rejected" {
+                bail!("ownership guard says no");
+            }
+            Ok(())
+        };
+        let batch = capture_batch(&store, items, usize::MAX, &mut check, BatchEnd::RollBack)?;
+        let outcomes: Vec<bool> = batch.results.iter().map(Result::is_ok).collect();
+        assert_eq!(outcomes, vec![true, false, false, false, true]);
+        assert!(format!("{:#}", batch.results[2].as_ref().err().unwrap()).contains("panicked"));
+        assert!(batch.deferred.is_empty());
+        assert!(!batch.committed);
+        // Rolled back locally: nothing landed.
+        assert_eq!(kv_value(&store, "batch/a")?, None);
+
+        apply_changeset(&replica, &batch.changeset)?;
+        assert_eq!(kv_value(&replica, "batch/a")?.as_deref(), Some("1"));
+        assert_eq!(kv_value(&replica, "batch/b")?.as_deref(), Some("2"));
+        for key in ["batch/err", "batch/panic", "batch/rejected"] {
+            assert_eq!(
+                kv_value(&replica, key)?,
+                None,
+                "{key} must have rolled back"
+            );
+        }
+        // The store stays writable after the panic.
+        let ((), changeset) = capture_mutation(&store, Lane::Control, |s| {
+            s.put_kv("batch/after", "ok", KvValueType::String, None, None)?;
+            Ok(())
+        })?;
+        assert!(!changeset.is_empty());
+        Ok(())
+    }
+
+    /// The combined changeset is the batch's net effect, ops applied in
+    /// order: a later op's update of an earlier op's insert lands as the
+    /// final value, and an insert a later op deletes leaves nothing.
+    #[test]
+    fn batch_combined_changeset_equals_the_ops_in_order() -> R<()> {
+        let store = setup_store()?;
+        let replica = setup_store()?;
+        replica.adopt_keyring_from(&store)?;
+        let items = vec![
+            batch_item("insert", put("net/k", "first")),
+            batch_item("update", put("net/k", "second")),
+            batch_item("transient", put("net/gone", "x")),
+            batch_item(
+                "delete",
+                Box::new(|s: &Store| -> R<()> {
+                    s.delete_kv("net/gone", None, None)?;
+                    Ok(())
+                }),
+            ),
+        ];
+        let batch = capture_batch(
+            &store,
+            items,
+            usize::MAX,
+            &mut no_check(),
+            BatchEnd::RollBack,
+        )?;
+        assert!(batch.results.iter().all(Result::is_ok));
+        apply_changeset(&replica, &batch.changeset)?;
+        assert_eq!(kv_value(&replica, "net/k")?.as_deref(), Some("second"));
+        assert_eq!(kv_value(&replica, "net/gone")?, None);
+        Ok(())
+    }
+
+    /// The byte budget stops a batch after the op that crosses it; the rest
+    /// come back, in order, for the next batch. The first op always runs.
+    #[test]
+    fn batch_capture_defers_ops_past_the_byte_budget() -> R<()> {
+        let store = setup_store()?;
+        let items = vec![
+            batch_item("one", put("budget/1", "a")),
+            batch_item("two", put("budget/2", "b")),
+            batch_item("three", put("budget/3", "c")),
+        ];
+        let batch = capture_batch(&store, items, 1, &mut no_check(), BatchEnd::RollBack)?;
+        assert_eq!(batch.results.len(), 1);
+        let deferred: Vec<&str> = batch.deferred.iter().map(|item| item.op).collect();
+        assert_eq!(deferred, vec!["two", "three"]);
+        Ok(())
+    }
+
+    /// Every replicated table has a primary key. SQLite sessions ignore
+    /// tables without one, so such a table's writes would never replicate —
+    /// and under speculation the leader would keep them while every
+    /// follower lacked them, and an undo could not revert them.
+    #[test]
+    fn every_replicated_table_has_a_primary_key() -> R<()> {
+        let store = setup_store()?;
+        let conn = store.read_connection()?;
+        let tables: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%';",
+            )?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            Store::collect_rows(rows)?
+        };
+        let mut missing = Vec::new();
+        for table in tables {
+            if !ownership::table_applies_from_changeset(&table) {
+                continue;
+            }
+            let has_pk =
+                table_pk_flags(&conn, &table)?.is_some_and(|flags| flags.iter().any(|pk| *pk));
+            if !has_pk {
+                missing.push(table);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "tables without a primary key: {missing:?}"
         );
         Ok(())
     }

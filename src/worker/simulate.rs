@@ -1489,6 +1489,8 @@ async fn heartbeat_sim_node(
         // Nor sessions (no `sessions` capability), so no envelopes to size.
         session_report: None,
         envelope_resizes: Vec::new(),
+        // Nor upstreams to feed.
+        endpoint_feed: None,
     }));
     let reply = match client.clone().heartbeat(req).await {
         Ok(reply) => reply.into_inner(),

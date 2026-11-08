@@ -13,7 +13,9 @@ use legion::prelude::{json, Context, R};
 use legion::storage::store::{ClaimScope, EvalBatchLimits, Store};
 use legion::storage::store::{FailedMove, MovePolicy, MoveVerdict};
 use legion::structs::config::ManagerConfigFull;
-use legion::structs::job::{GangConfig, JobConfig, MemberLossPolicy, TaskConfig, TaskCount};
+use legion::structs::job::{
+    GangConfig, GangTopology, JobConfig, MemberLossPolicy, TaskConfig, TaskCount, TopologyMode,
+};
 use legion::structs::manager_server::Manager;
 use legion::structs::{
     GetJobInfoRequest, Node, NodeMsg, PlanJobRequest, StopCause, StopConfig, Submission,
@@ -755,6 +757,74 @@ fn a_replacement_takes_the_lost_rank() -> R<()> {
     assert_eq!(after[&2], before[&2]);
     assert_ne!(after[&1].0, lost_id, "rank 1 is a new allocation");
     assert_ne!(after[&1].1, lost_node);
+    Ok(())
+}
+
+/// A node with room for one replica, in `rack`.
+fn rack_node(id: &str, rack: &str) -> Node {
+    let mut node = node(id);
+    node.config_attrs["rack"] = json!(rack);
+    node
+}
+
+/// Topology (docs/gang-scheduling.md, "Topology"): a `required` gang of two
+/// on two racks with room for one each waits — the cluster has room for
+/// two, no rack does — and `job plan` and `job info` name the closest rack.
+/// A node joining one of the racks makes room there, and the gang starts
+/// whole inside it.
+#[test]
+fn a_required_topology_gang_waits_for_one_domain_and_starts_inside_it() -> R<()> {
+    let cluster = Cluster::with_nodes(vec![rack_node("a-1", "a"), rack_node("b-1", "b")])?;
+    let trainer = job(
+        "trainer",
+        2,
+        Some(GangConfig {
+            topology: Some(GangTopology {
+                key: "rack".into(),
+                mode: TopologyMode::Required,
+            }),
+            ..GangConfig::default()
+        }),
+    );
+
+    let plan = cluster.plan(&trainer)?;
+    let report = plan.gang_reports.first().context("a gang report")?;
+    assert!(!report.would_place, "no single rack holds two");
+    assert_eq!(report.topology_key, "rack");
+    assert_eq!(report.topology_mode, "required");
+    assert_eq!(report.topology_domains, 2);
+    assert_eq!(report.placeable, 1, "the closest rack holds one");
+    assert!(
+        report.reason.contains("No single rack fits"),
+        "{}",
+        report.reason
+    );
+
+    cluster.submit(&trainer)?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 0, "waiting, holding nothing");
+    let gang = cluster
+        .job_info("trainer")?
+        .blocked
+        .and_then(|blocked| blocked.gang)
+        .context("a blocked gang")?;
+    assert_eq!(gang.topology_key, "rack");
+    assert!(!gang.topology_domain.is_empty());
+
+    cluster
+        .store()
+        .insert_node(NodeMsg::from(rack_node("b-2", "b")))?;
+    cluster.store().request_capacity_reconcile()?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 2, "rack b now holds the gang");
+    assert!(
+        cluster
+            .store()
+            .allocs_for_node("a-1")?
+            .iter()
+            .all(|allocation| allocation.job_id != "trainer"),
+        "nothing of the gang outside rack b"
+    );
     Ok(())
 }
 

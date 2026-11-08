@@ -81,14 +81,16 @@ use crate::prelude::*;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// Default `content.budgets.artifacts`: 10% of the content filesystem,
-/// clamped to 1 GiB..20 GiB. Artifacts are a cache whose misses cost one
-/// refetch, so a large disk gains little past 20 GiB, and below 1 GiB a
-/// single model or toolchain image would not fit.
+/// Default `content.budgets.artifacts`: half the content filesystem, at
+/// least 1 GiB, with **no ceiling**. Model weights are the largest artifacts
+/// a node pulls (a 70B checkpoint is ~140 GB), and a miss costs a download
+/// of that size, so the cache grows with the disk (review finding AI6). It
+/// was 10% clamped to 20 GiB, which held no large model at all. An operator
+/// caps it with `{ share = "50%", max = "2TiB" }` or a fixed size.
 pub const DEF_CONTENT_ARTIFACTS_BUDGET: BudgetSpec = BudgetSpec::Share {
-    percent: 10.0,
+    percent: 50.0,
     min: GIB,
-    max: 20 * GIB,
+    max: u64::MAX,
 };
 /// Default `content.budgets.snapshots`: 20% of the content filesystem,
 /// clamped to 2 GiB..200 GiB. Memory checkpoints are pinned while their
@@ -296,6 +298,25 @@ impl BudgetSpec {
         }
     }
 
+    /// A share with an operator's floor and ceiling: the object form
+    /// `{ share = "60%", min = "10GiB", max = "4TiB" }`. Either bound may be
+    /// left out.
+    pub fn share_within(share: &str, min: Option<&str>, max: Option<&str>) -> R<Self> {
+        let BudgetSpec::Share { percent, .. } = BudgetSpec::parse(share)? else {
+            bail!("share {share:?} must be a percentage such as \"50%\"");
+        };
+        let bound = |raw: Option<&str>, default: u64| -> R<u64> {
+            raw.map(|raw| crate::structs::parse_byte_size(raw.trim()))
+                .transpose()
+                .map(|value| value.unwrap_or(default))
+        };
+        let (min, max) = (bound(min, 0)?, bound(max, u64::MAX)?);
+        if min > max {
+            bail!("min ({min} bytes) is above max ({max} bytes)");
+        }
+        Ok(BudgetSpec::Share { percent, min, max })
+    }
+
     /// The budget in bytes on a filesystem of `filesystem_bytes` total.
     pub fn resolve(&self, filesystem_bytes: u64) -> u64 {
         match *self {
@@ -314,6 +335,9 @@ impl fmt::Display for BudgetSpec {
             BudgetSpec::Bytes(bytes) => write!(f, "{bytes} bytes"),
             BudgetSpec::Share { percent, min, max } if min == 0 && max == u64::MAX => {
                 write!(f, "{percent}% of the disk")
+            }
+            BudgetSpec::Share { percent, min, max } if max == u64::MAX => {
+                write!(f, "{percent}% of the disk, at least {} GiB", min / GIB)
             }
             BudgetSpec::Share { percent, min, max } => write!(
                 f,
@@ -405,14 +429,14 @@ pub struct ContentStoreConfig {
     pub min_free_disk: u64,
 }
 
-/// The built-in defaults as they resolve on a 1 TiB filesystem (both shares
-/// hit their caps). Fixed numbers, so tests do not depend on the disk they
-/// run on.
+/// The built-in defaults as they resolve on a 1 TiB filesystem (artifacts
+/// half of it, snapshots at their cap). Fixed numbers, so tests do not
+/// depend on the disk they run on.
 impl Default for ContentStoreConfig {
     fn default() -> Self {
         ContentStoreConfig {
             budgets: ContentBudgets {
-                artifacts: 20 * GIB,
+                artifacts: 512 * GIB,
                 snapshots: 200 * GIB,
             },
             ttl: Some(Duration::from_secs(72 * 3600)),
@@ -585,7 +609,18 @@ impl ContentStore {
              CREATE TABLE IF NOT EXISTS image_ref(
                reference TEXT PRIMARY KEY,
                digest TEXT NOT NULL,
-               resolved_at INTEGER NOT NULL);",
+               resolved_at INTEGER NOT NULL);
+             -- Each repository an image's bytes were pulled and verified from
+             -- on this node, and whether the registry served them with no
+             -- credential (src/artifacts/fetchers/oci.rs). A cached image is
+             -- served only for a repository it came from, and a private one
+             -- only to a credential that registry accepts.
+             CREATE TABLE IF NOT EXISTS image_source(
+               digest TEXT NOT NULL,
+               repository TEXT NOT NULL,
+               anonymous INTEGER NOT NULL,
+               verified_at INTEGER NOT NULL,
+               PRIMARY KEY(digest, repository));",
         )
         .context("initialize content index")?;
         let seq: i64 = db.query_row("SELECT COALESCE(MAX(use_seq), 0) FROM entry", [], |r| {
@@ -1042,6 +1077,45 @@ impl ContentStore {
             .optional()?;
         row.map(|(digest, at)| Ok((ContentDigest::parse(&digest)?, at)))
             .transpose()
+    }
+
+    /// Record that the image `digest` (what a reference names: a manifest
+    /// or an index) was pulled and verified from `repository`
+    /// (`registry/repo`), with no credential when `anonymous`. Once served
+    /// anonymously, a repository's image stays known to be public.
+    pub fn record_image_source(
+        &self,
+        digest: &ContentDigest,
+        repository: &str,
+        anonymous: bool,
+    ) -> R<()> {
+        let inner = self.inner.lock().expect("content store");
+        inner.db.execute(
+            "INSERT INTO image_source(digest, repository, anonymous, verified_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(digest, repository) DO UPDATE SET
+               anonymous = MAX(anonymous, excluded.anonymous),
+               verified_at = excluded.verified_at",
+            params![digest.as_str(), repository, anonymous as i64, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the image `digest` was pulled and verified from `repository`
+    /// on this node: `Some(true)` when the registry served it anonymously
+    /// (a public image), `Some(false)` when only with a credential, `None`
+    /// when never from this repository.
+    pub fn image_source(&self, digest: &str, repository: &str) -> R<Option<bool>> {
+        let inner = self.inner.lock().expect("content store");
+        Ok(inner
+            .db
+            .query_row(
+                "SELECT anonymous FROM image_source WHERE digest = ?1 AND repository = ?2",
+                params![digest, repository],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|anonymous| anonymous != 0))
     }
 
     /// Bytes used, pinned, and budgeted per class.
@@ -1836,8 +1910,27 @@ mod tests {
         assert_eq!(BudgetSpec::parse("20%")?.resolve(10_000 * GIB), 2_000 * GIB);
         assert_eq!(
             DEF_CONTENT_ARTIFACTS_BUDGET.to_string(),
-            "10% of the disk, clamped to 1 GiB..20 GiB"
+            "50% of the disk, at least 1 GiB"
         );
+        Ok(())
+    }
+
+    /// AI6: the default artifacts budget is model scale (half the disk, no
+    /// ceiling), and an operator can cap a share with the object form.
+    #[test]
+    fn the_artifacts_budget_grows_with_the_disk_test() -> R<()> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const TIB: u64 = 1024 * GIB;
+        // A 1 TiB disk holds a 512 GiB cache: room for a 70B checkpoint.
+        assert_eq!(DEF_CONTENT_ARTIFACTS_BUDGET.resolve(TIB), 512 * GIB);
+        assert_eq!(DEF_CONTENT_ARTIFACTS_BUDGET.resolve(8 * TIB), 4 * TIB);
+        assert_eq!(DEF_CONTENT_ARTIFACTS_BUDGET.resolve(GIB), GIB, "the floor");
+        let capped = BudgetSpec::share_within("60%", Some("10GiB"), Some("2TiB"))?;
+        assert_eq!(capped.resolve(10 * TIB), 2 * TIB);
+        assert_eq!(capped.resolve(GIB), 10 * GIB);
+        assert_eq!(capped.resolve(TIB), (TIB as f64 * 0.6) as u64);
+        assert!(BudgetSpec::share_within("60GiB", None, None).is_err());
+        assert!(BudgetSpec::share_within("60%", Some("2TiB"), Some("1TiB")).is_err());
         // A real filesystem has a size.
         #[cfg(unix)]
         assert!(filesystem_bytes(&std::env::temp_dir()).is_some_and(|total| total > 0));

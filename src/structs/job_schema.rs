@@ -49,8 +49,38 @@ pub fn core_jobspec_schema() -> Value {
         .replace("#/definitions/", "#/$defs/");
     schema["$defs"]["task"]["properties"]["autoscale"] =
         serde_json::from_str(&text).unwrap_or(Value::Null);
+    // Built apart: inline, the envelope's `json!` exceeds the macro
+    // recursion limit.
+    if let Some(gang_block) = schema["$defs"]["task"]["properties"]["gang"]["oneOf"]
+        .as_array_mut()
+        .and_then(|forms| forms.get_mut(1))
+    {
+        gang_block["properties"]["topology"] = gang_topology_schema();
+    }
     schema["taskRuntimes"] = Value::Object(task_runtimes);
     schema
+}
+
+/// `gang.topology` (docs/gang-scheduling.md, "Topology").
+fn gang_topology_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key"],
+        "description": "Place every member within one value (domain) of a node attribute, such as one rack or one NVLink domain. Nodes without the attribute are in no domain. The planner tries whole domains, best fit first, at most eight per plan; `job plan` reports the domain chosen or the closest one. See docs/gang-scheduling.md, \"Topology\".",
+        "properties": {
+            "key": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The node attribute name, looked up like count.per and distinct (config, then fingerprint, then dynamic attributes)."
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["required", "preferred"],
+                "description": "`required` (default): every member in one domain, or the gang waits holding nothing; a top-up stays in its domain. `preferred`: one domain when one fits, else the fewest domains that hold the quorum, else any eligible nodes."
+            }
+        }
+    })
 }
 
 fn jobspec_schema_envelope() -> Value {
@@ -140,7 +170,7 @@ fn jobspec_schema_envelope() -> Value {
                         }
                     },
                     "gang": {
-                        "description": "All-or-nothing placement for this task's replicas. `true`: every replica places in one plan or none does, and a gang that does not fit places nothing (nor do the job's other tasks in that pass), holds no capacity, and waits blocked until a node that could help has room. `{ min: N }` places once N replicas fit together and adds the rest as room appears; `placementTimeout` bounds the wait and `onMemberLoss` says what a lost member does to the rest. Not combinable with count.per or keyed stateful tasks; the task must have its group to itself, and that group's rollout must replace it in one step. See docs/gang-scheduling.md.",
+                        "description": "All-or-nothing placement for this task's replicas. `true`: every replica places in one plan or none does, and a gang that does not fit places nothing (nor do the job's other tasks in that pass), holds no capacity, and waits blocked until a node that could help has room. `{ min: N }` places once N replicas fit together and adds the rest as room appears; `placementTimeout` bounds the wait and `onMemberLoss` says what a lost member does to the rest; `topology` keeps every member inside one domain of a node attribute (one rack). Not combinable with count.per or keyed stateful tasks; the task must have its group to itself, and that group's rollout must replace it in one step. See docs/gang-scheduling.md.",
                         "oneOf": [
                             { "type": "boolean" },
                             {

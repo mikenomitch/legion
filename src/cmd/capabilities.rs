@@ -50,9 +50,9 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "job.info",
-            cli: "legion job info <NAME>",
+            cli: "legion job info <NAME> [--index REVISION [--wait SECONDS]] [--consistent]",
             grpc: Some("Manager/GetJobInfo"),
-            summary: "Inspect a single job's current state.",
+            summary: "Inspect a single job's current state, its spec `version`, and the `revision` the answer reflects. --index blocks until the job changes after that revision (a blocking query); --consistent reads through the leader.",
             mutates: false,
             read_only_safe: true,
         },
@@ -230,9 +230,9 @@ pub fn catalog() -> Vec<Capability> {
         // --- Jobs: write ---
         Capability {
             name: "job.run",
-            cli: "legion job run <PATH>",
+            cli: "legion job run <PATH> [--expected-version N]",
             grpc: Some("Manager/RunJob"),
-            summary: "Submit or update a job. Supports --wait, --idempotency-key, and --allow-unknown-fields.",
+            summary: "Submit or update a job. Supports --wait, --idempotency-key, --allow-unknown-fields, and --expected-version (compare-and-set on the job's spec version; 0 = must not exist; a lost race is Aborted naming the current version).",
             mutates: true,
             read_only_safe: false,
         },
@@ -712,6 +712,17 @@ pub fn catalog() -> Vec<Capability> {
             mutates: false,
             read_only_safe: true,
         },
+        // --- Devices and plugin seams (device-model-and-plugin-seams plan) ---
+        Capability {
+            name: "device.plugin.test",
+            cli: "legion device plugin test -- <COMMAND...>",
+            grpc: None,
+            summary: "Run the legion-device/1 conformance checks against a device plugin \
+                 locally (fingerprint twice, allocate one instance per group). No manager \
+                 needed. A node's devices show in `legion node info`.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Rollouts ---
         Capability {
             name: "rollout.list",
@@ -1030,10 +1041,11 @@ pub fn catalog() -> Vec<Capability> {
         // --- KV ---
         Capability {
             name: "kv.get",
-            cli: "legion kv get <KEY>",
+            cli: "legion kv get <KEY> [--index REVISION [--wait SECONDS]] [--consistent]",
             grpc: Some("Manager/GetKv"),
             summary: "Read a value from the KV store. A missing key is a `NotFound` error \
-                 (non-zero exit), so `kv get || kv put` works.",
+                 (non-zero exit), so `kv get || kv put` works. --index blocks until the key \
+                 changes after that revision; --consistent reads through the leader.",
             mutates: false,
             read_only_safe: true,
         },
@@ -1559,7 +1571,7 @@ pub fn catalog() -> Vec<Capability> {
             grpc: Some("Manager/RotateMeshCa"),
             summary: "Rotate the built-in cluster CA in two steps: the new CA, cross-signed by \
                  the old one, signs at once and the old one stays trusted for 24h, so no \
-                 connection breaks. Nodes re-issue within one heartbeat. `file` and `exec` \
+                 connection breaks. Nodes re-issue within a 10-minute splay. `file` and `exec` \
                  CAs rotate outside Legion; this refuses with the procedure.",
             mutates: true,
             read_only_safe: false,
@@ -1660,16 +1672,89 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Agent governance (internal_docs/plans/agent-governance-plan.md) ---
+        Capability {
+            name: "audit.list",
+            cli: "legion audit list [--accessor ID] [--operation RPC] [--target PREFIX] [--since 24h] [--follow]",
+            grpc: Some("Manager/ListAuditEvents"),
+            summary: "Query the durable audit journal: who (accessor, principal, on-behalf-of chain) did which write or was denied, on what target, with which outcome. Needs audit:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "acl.token.child",
+            cli: "legion acl token create --child --name NAME [--policy P]... [--ttl 1h] [--write-rate 5/s]",
+            grpc: Some("Manager/CreateChildToken"),
+            summary: "Mint a child of your own token for a sub-agent: a subset of its policies, expiring no later than it (default 1h, at most 24h), revoked with it. Needs no acl:write.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "approval.list",
+            cli: "legion approval list [--status pending] [--mine]",
+            grpc: Some("Manager/ListApprovals"),
+            summary: "List approval requests filed by governance.approvals gates (your own without approval:read).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "approval.get",
+            cli: "legion approval get <ID>",
+            grpc: Some("Manager/GetApproval"),
+            summary: "Show one approval request: what it gates, who asked, and whether it was decided or used.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "approval.decide",
+            cli: "legion approval approve|deny <ID> [--reason TEXT]",
+            grpc: Some("Manager/DecideApproval"),
+            summary: "Approve or deny a pending approval request (approval:write; never your own). The requester then retries with --approval <ID>.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "usage",
+            cli: "legion usage [--namespaces NS] [--by namespace|job|submitter|hour] [--since 7d] | legion namespace usage <NS>",
+            grpc: Some("Manager/GetUsage"),
+            summary: "Time-integrated reserved usage (CPU core-hours, memory GiB-hours, cores, allocation-hours, custom resources) per namespace, job, or submitting token.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        // --- Revisions and watches (revisions-and-watches plan) ---
+        Capability {
+            name: "job.watch",
+            cli: "legion job watch [NAME] [--allocations [--node NODE]] [--from REVISION] [--timeout SECONDS]",
+            grpc: Some("Manager/Watch"),
+            summary: "Stream each change to a job (status, versions, allocations) or to its allocations as it commits, resuming after a revision with --from. A revision older than the manager's journal is a ResyncRequired error: read again and watch from the read's revision. NDJSON with --json.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "kv.watch",
+            cli: "legion kv watch [PREFIX] [--from REVISION] [--timeout SECONDS]",
+            grpc: Some("Manager/Watch"),
+            summary: "Stream each write or delete of a KV key under a prefix as it commits, resuming after a revision with --from. NDJSON with --json.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Discovery ---
         Capability {
             name: "capabilities",
-            cli: "legion capabilities",
-            grpc: None,
-            summary: "List the operations described by this catalog.",
+            cli: "legion capabilities [--mine]",
+            grpc: Some("Manager/GetCallerCapabilities"),
+            summary: "List the operations described by this catalog; --mine marks each allowed, partial (some namespaces), or denied for your token.",
             mutates: false,
             read_only_safe: true,
         },
     ]
+}
+
+#[derive(Tabled)]
+struct MineRow {
+    name: String,
+    access: String,
+    permission: String,
 }
 
 #[derive(Tabled)]
@@ -1685,13 +1770,112 @@ struct CapabilityRow {
 pub fn config() -> Command {
     Command::new("capabilities")
         .about("List Legion's agent-callable operations (machine-readable with --json)")
+        .arg(
+            Arg::new("mine")
+                .long("mine")
+                .action(ArgAction::SetTrue)
+                .help("Ask the manager which of them your token may perform"),
+        )
         .arg(json_flag())
+}
+
+/// The catalog as `client`'s caller may use it: each entry gains `access`
+/// (`allowed`, `partial`, `denied`, `open`, or `local` for entries no RPC
+/// backs) and, for `partial`, the `namespaces` where it holds
+/// (`GetCallerCapabilities`).
+pub async fn caller_catalog(
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
+) -> Result<Value, tonic::Status> {
+    let reply = client
+        .get_caller_capabilities(crate::structs::GetCallerCapabilitiesRequest {})
+        .await?
+        .into_inner();
+    let by_rpc: HashMap<String, crate::structs::RpcAccess> = reply
+        .rpcs
+        .into_iter()
+        .map(|access| (access.rpc.clone(), access))
+        .collect();
+    let entries: Vec<Value> = catalog()
+        .into_iter()
+        .map(|cap| {
+            let mut entry = serde_json::to_value(&cap).unwrap_or(Value::Null);
+            let access = cap
+                .grpc
+                .and_then(|grpc| grpc.strip_prefix("Manager/"))
+                .and_then(|rpc| by_rpc.get(rpc));
+            if let Some(fields) = entry.as_object_mut() {
+                match access {
+                    Some(access) => {
+                        fields.insert("access".into(), json!(access.access));
+                        if !access.permission.is_empty() {
+                            fields.insert("permission".into(), json!(access.permission));
+                        }
+                        if !access.namespaces.is_empty() {
+                            fields.insert("namespaces".into(), json!(access.namespaces));
+                        }
+                    }
+                    None => {
+                        fields.insert("access".into(), json!("local"));
+                    }
+                }
+            }
+            entry
+        })
+        .collect();
+    Ok(json!({
+        "principal": reply.principal,
+        "accessorId": reply.accessor_id,
+        "source": reply.source,
+        "isManagement": reply.is_management,
+        "aclEnabled": reply.acl_enabled,
+        "capabilities": entries,
+    }))
 }
 
 /// Handle `legion capabilities`.
 #[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
+    if matches.get_flag("mine") {
+        let mut client = crate::cmd::helpers::connect_manager_client().await?;
+        let view = output::resolve(
+            format,
+            "Failed to read your capabilities",
+            caller_catalog(&mut client).await,
+        )?;
+        if format.is_json() {
+            output::print_success(&view);
+            return Ok(());
+        }
+        println!(
+            "Capabilities of {} ({}):",
+            view["principal"].as_str().unwrap_or("-"),
+            view["source"].as_str().unwrap_or("-")
+        );
+        let rows = view["capabilities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| MineRow {
+                name: entry["name"].as_str().unwrap_or_default().to_string(),
+                access: match entry["namespaces"].as_array() {
+                    Some(namespaces) => format!(
+                        "partial ({})",
+                        namespaces
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    None => entry["access"].as_str().unwrap_or_default().to_string(),
+                },
+                permission: entry["permission"].as_str().unwrap_or("-").to_string(),
+            })
+            .collect::<Vec<_>>();
+        crate::cmd::helpers::print_table(rows);
+        return Ok(());
+    }
     let caps = catalog();
 
     if format.is_json() {

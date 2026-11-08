@@ -100,8 +100,10 @@ When one is required and what goes in it:
 | Plan | Status |
 | --- | --- |
 | [adaptive-scheduler-concurrency-plan.md](plans/adaptive-scheduler-concurrency-plan.md) | in execution (phases 1–3 shipped 2026-08-04, default `observe`); its motivating "4 beats 16" measurement was retracted the next day ([aws-phase4-findings.md](aws-phase4-findings.md)), so phase 0 now has to find a conflict-bound cell before phase 4's default flip can be argued |
+| [agent-governance-plan.md](plans/agent-governance-plan.md) | in execution (2026-11-08): the audit journal, token expiry by default, child tokens, approval gates, per-token rate limits, the caller-aware catalog, MCP 2025-06-18 with full RPC coverage, and usage rollups shipped. Deferred: follower-side journaling, an external audit sink, inline child-token narrowing, multi-party approvals, budgets, MCP HTTP SSE/auth |
 | [artifact-system-plan.md](plans/artifact-system-plan.md) | shipped |
 | [artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md) | in execution (Phase 1 partly shipped as the node content store, Phase 3 partly as suspend plan Phase 7a) |
+| [device-model-and-plugin-seams-plan.md](plans/device-model-and-plugin-seams-plan.md) | in execution (2026-11-08, review findings PLG1–PLG5 and AI6; public pages [devices.md](../docs/devices.md), [plugin-system.md](../docs/plugin-system.md), [namespaces.md](../docs/namespaces.md), [artifacts.md](../docs/artifacts.md), [task-runtime-container.md](../docs/task-runtime-container.md)): a device model (exec device plugins `legion-device/1`, `resources.devices`, topology-aware assignment at insert, CDI edits for containers, env for exec, device health, device quota, reference `nvidia` and `fake` plugins); a model-scale artifacts cache and ORAS layer caching; panic containment and quarantine for scheduling, rollout, node-check, and fetcher plugins; typed, cached node checks; OCI runtime classes; CEL job rules. Not run on real GPUs, gVisor, or Kata. MIG/MPS, VFIO, DRA claims, task-runtime containment, WASM hooks, P2P and lazy loading, job mutation, secrets providers, and rollout hooks deferred |
 | [autoscaler-plan.md](plans/autoscaler-plan.md) | **superseded** by autoscaler-v2-plan; its Phase 1 (`legion job scale`, count overrides) shipped 2026-07-30 and is v2's Phase 0 |
 | [autoscaler-v2-plan.md](plans/autoscaler-v2-plan.md) | shipped (Phase 1 scaling inputs, the engine core, Phase 2 task autoscaling as the bundled app, Phase 3 external sources/scale to zero/`scaling simulate`, Phase 4 plugins and standalone policies, and Phase 5a node-autoscaling substrate shipped 2026-10-28; Phase 6 the autoscaler's UI as app views, Phase 5b node groups run by the app with the `aws-asg` plugin, and Phase 7 sharded replicas with the 10,000-policy load test shipped 2026-10-28). Planned 2026-10-19: the autoscaler as a Legion app; `autoscale = true` defaults, overridable field by field per task, namespace, or cluster and resolved live; a self-reporting safeguard pipeline, JSON-RPC source/strategy/target plugins, cluster-wide usage rollups, node groups from simulated pending demand, sharded replicas. Service wake from zero, keyed/`count.per` scaling, vertical and predictive scaling deferred |
 | [gitops-plan.md](plans/gitops-plan.md) | shipped (planned and built 2026-11-07; Phases G1-G3 in one change; public page [gitops.md](../docs/gitops.md)): `gitops`, a bundled app with one kind, `gitops/Repo` (a URL, a ref, a path, an interval). It deploys a repository's jobspecs into the Repo's namespace acting for the Repo (its own credential can do nothing), renders every file in a child process with imports confined to the checkout, preflights with `PlanJob` so a bad commit deploys nothing, keeps an inventory in status for prune and drift, and reports `Ready` from the rollouts; `legion gitops add|status|sync`, MCP tools, and a GitOps page, job panel, and Sync now action. SSH, webhooks, image automation, HA replicas, non-`normal` bands, and jobs with `permissions` deferred |
@@ -138,9 +140,11 @@ When one is required and what goes in it:
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | shipped (graceful stop, six priority bands, plan-atomic preemption) |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
+| [raft-write-path-plan.md](plans/raft-write-path-plan.md) | in execution (2026-11-08, review SCH1/ST1/ST4): group commit, the leader executing each write once under `single` (speculative commit with undo records), one state-DB fsync per log purge instead of per entry, the log tail retained by bytes (`raft.logRetainBytes`), and data migrations as replicated control-lane entries. Deferred: a capture mutex per lane (per-lane DB files), speculation under `lanes`, overlapping capture with the quorum wait, logical commands |
 | [multi-eval-plans-plan.md](plans/multi-eval-plans-plan.md) | in execution: Phase 2 shipped (the fused settle in every placing handler whose plan is its last write, and no second settle write). Phase 1, one running eval per job, was built and measured and left out until a lane-bound rig run shows a gain. Phase 3 deferred behind it |
 | [namespaces-plan.md](plans/namespaces-plan.md) | shipped 2026-10-19 (all four phases; public page [docs/namespaces.md](../docs/namespaces.md)): canonical `namespace/name` job ids (bare in `default`), explicit `namespaces` on ACL rules, services and instance keys namespaced with jobs, cross-namespace upstreams, tenant events, namespace metrics, the UI switcher and Namespaces pages, and namespace policies (aggregate per-band quota, counts, pools, runtimes, host volumes); hierarchy, rename/move and namespaced KV deliberately out |
 | [read-model-coherence-plan.md](plans/read-model-coherence-plan.md) | in execution (all five phases built; raft shadow check deferred) |
+| [mesh-control-path-plan.md](plans/mesh-control-path-plan.md) | shipped (planned and built 2026-11-08 for [architecture review](architecture-review-2026-11-07.md) NET1–NET9; calls: [mesh-control-path-plan_calls.md](calls/mesh-control-path-plan_calls.md)): per-service versioned endpoint sets with heartbeat deltas and work-stream pushes, memoized policy assignments, mesh TLS sessions kept across certificate refreshes and bounded by certificate expiry, streamed HTTP request bodies with `retries.maxBodyBytes`, IPv6 host:port handling and dual-stack ingress, the nftables guard's established short-circuit and counter interval, a CA-rotation splay, sharded per-connection counters, and 16,384 VIP blocks with a separate datapath port range. Pooled node-to-node tunnels, kTLS, netlink guard counters, and configurable port ranges deferred |
 | [service-mesh-plan.md](plans/service-mesh-plan.md) | **authoritative for the mesh**; shipped M1–M10 (policy, HTTP mode, name-is-config, gated, ingress, handlers, mTLS, graph, sandbox vsock, templates) with two named deferrals — unifies the SD §8 follow-on with the handlers plan |
 | [network-handlers-plan.md](plans/network-handlers-plan.md) | shipped as phases of service-mesh-plan (policy objects, `gated` mode, handlers); the `legion netd` process split is the deferred piece |
 | [datapath-performance-plan.md](plans/datapath-performance-plan.md) | shipped: HTTP-mode pooling, `splice(2)` for bulk L4 on Linux, `least_latency` as the default strategy, the per-byte `legion_net_bytes_total` fix, `net_bench`; kTLS and multiplexed mesh tunnels deferred |
@@ -151,6 +155,7 @@ When one is required and what goes in it:
 | [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
 | [scheduler-sharding-strategies-proposal.md](plans/scheduler-sharding-strategies-proposal.md) | proposal, revision 3 (sharding the scheduler across more raft groups; extends multi-raft Phase 8; recommends pool-keyed shards that are raft group **plus** own state file, co-located first, spread later, with plan shipping (M3) as the peer lever for planner-bound large fleets; Phase 0 attributes the October campaigns' wall per fleet-size regime before anything graduates) |
 | [plan-path-scale-levers-plan.md](plans/plan-path-scale-levers-plan.md) | shipped (D4/D5/D6, 2026-07-30; batch-as-a-transaction, 2026-08-03) |
+| [placement-and-commit-cost-plan.md](plans/placement-and-commit-cost-plan.md) | shipped (2026-11-08: review SCH2/SCH3/SCH4/SCH8, the SCH5 plan round trip, and gang topology (AI7); the SCH5 node-row half, spot-interruption handling, and multi-level topology deferred) |
 | [plan-path-fleet-scaling-plan.md](plans/plan-path-fleet-scaling-plan.md) | in execution (per-eval cost that grows with node count, from the 2026-10-09 campaign: 99 ms/eval at 10k vs 36 at 5k; Phases 1-3 done; Phase 4 removed the per-eval node lookup and O(jobs) SQL scans and instruments the whole eval, AWS re-run pending) |
 | [plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md) | in execution (two-pass bind + candidate-list restoration + decorrelated tails landed; **measured on AWS 2026-08-04: rejections 31.9% -> 0%**, but throughput unchanged — see [aws-phase3-findings.md](aws-phase3-findings.md); the throughput half of that cell is retracted by [aws-phase4-findings.md](aws-phase4-findings.md), which found the rig measuring its own submission rate) |
 | [eval-path-raft-cost-plan.md](plans/eval-path-raft-cost-plan.md) | in execution (claim/complete fusion + batched enqueue + eval-loop batching landed; phase 5 — in-memory reprojection memo + audit hardening — landed 2026-08-06; the AWS re-measurement is not run) |
@@ -163,6 +168,7 @@ When one is required and what goes in it:
 | [liveness-off-the-raft-path-plan.md](plans/liveness-off-the-raft-path-plan.md) | **shipped** 2026-08-03 (D8: heartbeats leave raft — leader-memory liveness, transitions-only replication, failover grace, digest, display checkpoint); phase 1's AWS measurement is not run |
 | [aws-comparative-benchmark-plan.md](plans/aws-comparative-benchmark-plan.md) | in execution (cross-system campaign rerun 2026-10-14 with every store on NVMe, results in [docs/benchmarks.md](../docs/benchmarks.md)) |
 | [worker-simulation-plan.md](plans/worker-simulation-plan.md) | shipped (2026-07-30) |
+| [launch-blockers-and-security-gaps-plan.md](plans/launch-blockers-and-security-gaps-plan.md) | shipped (2026-11-08): Tier 1 spot-check bugs and four security gaps; deferrals in §9, AWS re-run pending |
 | [launch-spot-check-fixes-plan.md](plans/launch-spot-check-fixes-plan.md) | in execution (every 2026-10-11 spot-check finding fixed in #17, open; P1-5 in part; deferrals in §8.7; AWS re-run pending) |
 | [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md) | in execution: Phases 0 to 8 built; hardware verification open (launch blocker: workers on other hosts lose exec, logs, and the mesh. Also owns local workload isolation: ACLs on by default, the host guard, gated containers by default, the container privilege floor, and the `host` grant for host-level jobs. Carries the sandbox-exec plan's ticket caller class) |
 | [scheduler-diagnosis-tooling-plan.md](plans/scheduler-diagnosis-tooling-plan.md) | planned (`legion scheduler diagnose` + the metric gaps that blocked the 2026-08-04 diagnosis) |
@@ -202,6 +208,7 @@ When one is required and what goes in it:
 | [shared-alloc-dir-proposal.md](plans/shared-alloc-dir-proposal.md) | proposal |
 | [swappable-seams-plan.md](plans/swappable-seams-plan.md) | shipped (2026-10-14: one attachment type for the datapath, one listener and dialer, the typed worker ↔ `netd` boundary, one object-storage layer, DNS on hickory-proto, the egress proxy on hyper, and the VIP and mesh-TLS fixes; the `legion netd` process split, a `NetdInput` wire encoding, GCS/Azure, and a `Vmm` trait deferred) |
 | [data-dir-env-plan.md](plans/data-dir-env-plan.md) | shipped (`LEGION_DATA_DIR`; no config-file field, by design) |
+| [revisions-and-watches-plan.md](plans/revisions-and-watches-plan.md) | in execution: built (review ST2, ST3, ST5, AI5): revisions on job/allocation/KV reads and writes, blocking reads, `Manager.Watch` with resume and resync-required, failover-safe event ids, follower read-after-write, linearizable reads, `StreamWork` resume from a revision, the heartbeat offload, `RunJob` compare-and-set, plan diffs, and MCP `legion_watch`/`legion_job_run` wait; `WatchObjects` on the journal, a persisted modify revision, and watches on other kinds deferred |
 
 ## Judgement calls
 
@@ -216,9 +223,11 @@ header. Entries give the call, the alternatives, the trade-off, and why — rank
 by project impact. The full template and a worked example:
 [`calls/README.md`](calls/README.md).
 
+- [agent-governance-plan_calls.md](calls/agent-governance-plan_calls.md)
 - [architecture-audit-2026-10-09_calls.md](calls/architecture-audit-2026-10-09_calls.md)
 - [artifact-system-plan_calls.md](calls/artifact-system-plan_calls.md)
 - [artifact-cache-and-prewarm-plan_calls.md](calls/artifact-cache-and-prewarm-plan_calls.md)
+- [device-model-and-plugin-seams-plan_calls.md](calls/device-model-and-plugin-seams-plan_calls.md)
 - [autoscaler-plan_calls.md](calls/autoscaler-plan_calls.md)
 - [autoscaler-v2-plan_calls.md](calls/autoscaler-v2-plan_calls.md)
 - [legion-apps-plan_calls.md](calls/legion-apps-plan_calls.md)
@@ -242,6 +251,7 @@ by project impact. The full template and a worked example:
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gated-restore-datapath-wait_calls.md](calls/gated-restore-datapath-wait_calls.md): the 5 s datapath wait on every sandbox restore (no plan, a fix to the gated checkpoints plan's wait)
 - [gated-sandbox-checkpoints-plan_calls.md](calls/gated-sandbox-checkpoints-plan_calls.md)
+- [revisions-and-watches-plan_calls.md](calls/revisions-and-watches-plan_calls.md)
 - [rootfs-base-cache-plan_calls.md](calls/rootfs-base-cache-plan_calls.md)
 - [sandbox-boot-throughput-plan_calls.md](calls/sandbox-boot-throughput-plan_calls.md)
 - [sandbox-clean-stop_calls.md](calls/sandbox-clean-stop_calls.md)
@@ -277,6 +287,7 @@ by project impact. The full template and a worked example:
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [kv-cert-delivery-plan_calls.md](calls/kv-cert-delivery-plan_calls.md)
 - [join-token-file-and-cli-timeouts_calls.md](calls/join-token-file-and-cli-timeouts_calls.md)
+- [launch-blockers-and-security-gaps-plan_calls.md](calls/launch-blockers-and-security-gaps-plan_calls.md)
 - [launch-spot-check-fixes-plan_calls.md](calls/launch-spot-check-fixes-plan_calls.md)
 - [lazy-memory-restore-plan_calls.md](calls/lazy-memory-restore-plan_calls.md)
 - [liveness-off-the-raft-path-plan_calls.md](calls/liveness-off-the-raft-path-plan_calls.md)
@@ -285,15 +296,18 @@ by project impact. The full template and a worked example:
 - [manager-reverse-proxy-plan_calls.md](calls/manager-reverse-proxy-plan_calls.md)
 - [manager-workload-identity-plan_calls.md](calls/manager-workload-identity-plan_calls.md)
 - [macos-gated-plan_calls.md](calls/macos-gated-plan_calls.md)
+- [mesh-control-path-plan_calls.md](calls/mesh-control-path-plan_calls.md)
 - [mesh-interfaces-plan_calls.md](calls/mesh-interfaces-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
+- [raft-write-path-plan_calls.md](calls/raft-write-path-plan_calls.md)
 - [multi-eval-plans-plan_calls.md](calls/multi-eval-plans-plan_calls.md)
 - [namespaces-plan_calls.md](calls/namespaces-plan_calls.md)
 - [network-handlers-plan_calls.md](calls/network-handlers-plan_calls.md)
 - [service-mesh-plan_calls.md](calls/service-mesh-plan_calls.md)
 - [nickel-config-language-plan_calls.md](calls/nickel-config-language-plan_calls.md)
 - [persistence-plan_calls.md](calls/persistence-plan_calls.md)
+- [placement-and-commit-cost-plan_calls.md](calls/placement-and-commit-cost-plan_calls.md)
 - [plan-apply-conflict-reduction-plan_calls.md](calls/plan-apply-conflict-reduction-plan_calls.md)
 - [plan-path-fleet-scaling-plan_calls.md](calls/plan-path-fleet-scaling-plan_calls.md)
 - [plan-path-scale-levers-plan_calls.md](calls/plan-path-scale-levers-plan_calls.md)

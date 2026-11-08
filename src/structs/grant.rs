@@ -207,6 +207,8 @@ pub fn resource_named(name: &str) -> Option<AclResource> {
         AclResource::Namespace,
         AclResource::App,
         AclResource::Object,
+        AclResource::Audit,
+        AclResource::Approval,
     ];
     ALL.iter()
         .copied()

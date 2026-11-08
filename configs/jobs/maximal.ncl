@@ -358,12 +358,15 @@
                     # a per-request deadline, bounded retries (idempotent
                     # methods only by default), and a canary split by service
                     # tag. An endpoint that answers 5xx five times in a row is
-                    # ejected for 30s, with no setting.
+                    # ejected for 30s, with no setting. A request body up to
+                    # `maxBodyBytes` (default 1Mi, at most 64Mi) is kept so
+                    # a retry can resend it; a larger one streams once and
+                    # is not retried ("Request bodies").
                     {
                         to = "http://api",
                         http = {
                             timeout = "3s",
-                            retries = { attempts = 2, on = ["5xx", "connect-failure"], budget = "20%" },
+                            retries = { attempts = 2, on = ["5xx", "connect-failure"], budget = "20%", maxBodyBytes = "1Mi" },
                             split = [{ tag = "canary", weight = 10 }],
                         },
                     },
@@ -590,6 +593,9 @@
                 restartCount = 3,
                 restartPeriod = "30m",
                 restartDelay = "30s",
+                # Moves inside movePeriod before the job fails. A keyed
+                # instance counts its own, and spending them stops just
+                # that instance.
                 moveCount = 3,
                 movePeriod = "30m",
                 # The first reschedule's wait. It doubles for each earlier
@@ -741,6 +747,31 @@
             resources = {
                 cpu = 500,
                 memory = 256,
+                # Devices (docs/devices.md): whole devices from the node's
+                # device plugins or `devices.static`. The task sees the ids
+                # it got as LEGION_DEVICE_<NAME>_IDS, plus whatever env the
+                # plugin adds (CUDA_VISIBLE_DEVICES for nvidia).
+                devices = [
+                    {
+                        # `type`, `vendor/type`, or `vendor/type/model`.
+                        name = "nvidia/gpu",
+                        # Default 1. All from one device group (one model).
+                        count = 2,
+                        # The task constraint syntax, over the device's
+                        # attributes (the group's, then the instance's) plus
+                        # vendor, type, model, and id.
+                        constraints = [
+                            { key = "memoryMiB", operator = ">=", value = 40000 },
+                        ],
+                        # Prefer devices; picks devices on the node, never
+                        # the node. Within a group Legion already keeps a
+                        # request inside one peerGroup (NVLink), then one
+                        # numaNode, when it can.
+                        affinities = [
+                            { key = "computeCapability", value = "9.0", multiplier = 1 },
+                        ],
+                    },
+                ],
             },
             constraints = [
                 {
@@ -1303,6 +1334,11 @@
                     nofile = 65536,
                     nproc = { soft = 4096, hard = 8192 },
                 },
+                # An OCI runtime class the worker type declares in
+                # container.runtimeClasses (docs/task-runtime-container.md,
+                # "Runtime classes"): gVisor, Kata, ... The task only places
+                # on nodes that advertise it. Unset: the node's runc or crun.
+                runtimeClass = "gvisor",
             },
             resources = {
                 # Real limits on Linux when the worker runs with
@@ -1364,6 +1400,19 @@
                 # alone. Restarts after a failure spend onUnhealthy's move
                 # budget; once it is spent the job fails.
                 onMemberLoss = "restart",
+                # Keep the members inside one value of a node attribute: one
+                # rack, one NVLink domain (docs/gang-scheduling.md,
+                # "Topology"). `key` names the attribute the way count.per
+                # and `distinct` do. `mode`:
+                #   "required" (default) every member in one domain, or the
+                #              gang waits, holding nothing, until one domain
+                #              has room; a top-up stays in its domain;
+                #   "preferred" one domain when one fits, else the fewest
+                #              domains that hold the quorum, else anywhere.
+                # Nodes without the attribute are in no domain. `job plan`
+                # reports the domain chosen, or the best one and how many
+                # members it fits.
+                topology = { key = "rack", mode = "preferred" },
             },
             # Every member starts with LEGION_GANG_RANK (0..count-1),
             # LEGION_GANG_SIZE, LEGION_GANG_MIN, and LEGION_GANG_LEADER_ADDR

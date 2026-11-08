@@ -303,7 +303,7 @@ fn endpoint_json(endpoint: &ServiceEndpoint) -> Value {
 
 /// `host:port` form of an endpoint — what a client actually dials.
 fn endpoint_address(endpoint: &ServiceEndpoint) -> String {
-    format!("{}:{}", endpoint.address, endpoint.port)
+    crate::structs::hostport::join(&endpoint.address, endpoint.port as u16)
 }
 
 async fn list(matches: &ArgMatches) -> R<()> {
@@ -408,11 +408,11 @@ async fn resolve(matches: &ArgMatches) -> R<()> {
     }
 
     let rows = endpoints.into_iter().map(|endpoint| EndpointRow {
-        address: format!("{}:{}", endpoint.address, endpoint.port),
+        address: endpoint_address(&endpoint),
         public: if endpoint.public_address.is_empty() {
             "-".to_string()
         } else {
-            format!("{}:{}", endpoint.public_address, endpoint.port)
+            crate::structs::hostport::join(&endpoint.public_address, endpoint.port as u16)
         },
         alloc: endpoint.allocation_id,
         node: endpoint.node_id,

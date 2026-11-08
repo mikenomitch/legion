@@ -292,20 +292,32 @@ impl NodeIdentity {
     /// (docs/cluster-ca.md#rotation). Either way the reply to the re-issue
     /// carries the new bundle.
     pub fn needs_refresh(&self, manager_ca_pins: Option<&[String]>) -> bool {
+        self.refresh_need(manager_ca_pins).is_some()
+    }
+
+    /// [`Self::needs_refresh`], with why: a bundle change can wait out the
+    /// rotation splay ([`rotation_splay`]); everything else cannot.
+    pub fn refresh_need(&self, manager_ca_pins: Option<&[String]>) -> Option<RefreshNeed> {
         let issued = self.issued.lock().unwrap_or_else(|p| p.into_inner());
         let Some(issued) = issued.as_ref() else {
-            return true;
+            return Some(RefreshNeed::Now);
         };
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         if issued.issued.elapsed() >= crate::manager::mesh_ca::NODE_CERT_REFRESH_AFTER
             || issued.expires_at - now < 60 * 60
         {
-            return true;
+            return Some(RefreshNeed::Now);
         }
-        match manager_ca_pins.filter(|pins| !pins.is_empty()) {
-            Some(pins) => !bundle_matches(&issued.ca_pem, pins),
-            None => false,
+        let pins = manager_ca_pins.filter(|pins| !pins.is_empty())?;
+        if bundle_matches(&issued.ca_pem, pins) {
+            return None;
         }
+        // The held bundle's anchor is the CA this certificate chains to: when
+        // the manager's bundle no longer holds it, the certificate no longer
+        // verifies anywhere, and waiting would only break this node.
+        let held = crate::cluster_tls::bundle_pins(&issued.ca_pem);
+        let issuer_left = held.first().is_some_and(|anchor| !pins.contains(anchor));
+        Some(RefreshNeed::BundleChanged { issuer_left })
     }
 
     /// Asks the manager to sign a CSR for this node's key, checks the CA
@@ -620,6 +632,43 @@ pub fn trust_manager_bundle(manager_addr: &str, roots: Arc<SwappableRoots>) {
 
 /// Whether a held bundle is the one the manager reports: the same anchor
 /// (first certificate) and the same set of CAs.
+/// Why a node certificate should be re-issued ([`NodeIdentity::refresh_need`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshNeed {
+    /// None held, a third of its life gone, or under an hour left: at once.
+    Now,
+    /// The manager's trust bundle differs from the held one (a rotation, or
+    /// a CA added or removed). `issuer_left`: the CA the held certificate
+    /// chains to is gone from it, so the certificate no longer verifies and
+    /// the node re-issues at once; otherwise it waits out its splay.
+    BundleChanged { issuer_left: bool },
+}
+
+/// How many heartbeat intervals a rotation's re-issues spread over.
+pub const ROTATION_SPLAY_BEATS: u32 = 25;
+
+/// The most a rotation's re-issues spread over, so a fleet holds the new
+/// bundle well inside the old CA's 24-hour overlap.
+pub const ROTATION_SPLAY_MAX: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// How long `node_id` waits after seeing a changed trust bundle before it
+/// re-issues (mesh-control-path plan §6.7): a deterministic offset in
+/// `[0, window)`, `window = min(25 × interval, 10 min)`. The interval is the
+/// cadence the manager serves, which grows with the fleet past 2,500 nodes,
+/// so the signer sees about `1250 / 25 = 50` CSRs a second however large the
+/// fleet, up to the cap.
+pub fn rotation_splay(node_id: &str, interval: std::time::Duration) -> std::time::Duration {
+    let window = (interval * ROTATION_SPLAY_BEATS).min(ROTATION_SPLAY_MAX);
+    let millis = window.as_millis() as u64;
+    if millis == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let hash = crate::storage::endpoint_index::StableHash::default()
+        .str(node_id)
+        .finish();
+    std::time::Duration::from_millis(hash % millis)
+}
+
 fn bundle_matches(held_pem: &str, manager_pins: &[String]) -> bool {
     let held = crate::cluster_tls::bundle_pins(held_pem);
     if held.first() != manager_pins.first() {
@@ -846,9 +895,40 @@ mod plane_test {
         assert!(identity.needs_refresh(Some(&[pin_b.clone(), pin_a.clone()])));
         // A CA removed from the bundle: refresh, to stop trusting it.
         assert!(identity.needs_refresh(Some(std::slice::from_ref(&pin_a))));
+        // The rotation splay applies while the held anchor is still trusted,
+        // not once it is gone.
+        assert_eq!(
+            identity.refresh_need(Some(std::slice::from_ref(&pin_a))),
+            Some(RefreshNeed::BundleChanged { issuer_left: false })
+        );
+        assert_eq!(
+            identity.refresh_need(Some(std::slice::from_ref(&pin_b))),
+            Some(RefreshNeed::BundleChanged { issuer_left: true })
+        );
         // No news from the manager: nothing to compare.
         assert!(!identity.needs_refresh(Some(&[])));
         assert!(!identity.needs_refresh(None));
         Ok(())
+    }
+
+    /// Mesh-control-path plan §6.7: the splay is deterministic per node,
+    /// inside its window, spread across nodes, and grows with the cadence up
+    /// to the cap.
+    #[test]
+    fn rotation_splay_is_deterministic_bounded_and_spread_test() {
+        let two = std::time::Duration::from_secs(2);
+        let window = two * ROTATION_SPLAY_BEATS;
+        assert_eq!(rotation_splay("node-1", two), rotation_splay("node-1", two));
+        let offsets: std::collections::BTreeSet<u128> = (0..200)
+            .map(|n| rotation_splay(&format!("node-{n}"), two).as_millis())
+            .collect();
+        assert!(offsets.iter().all(|offset| *offset < window.as_millis()));
+        assert!(offsets.len() > 150, "nodes land at different times");
+        let slow = std::time::Duration::from_secs(3600);
+        assert!(rotation_splay("node-1", slow) < ROTATION_SPLAY_MAX);
+        assert_eq!(
+            rotation_splay("node-1", std::time::Duration::ZERO),
+            std::time::Duration::ZERO
+        );
     }
 }

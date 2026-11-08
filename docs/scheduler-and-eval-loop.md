@@ -170,6 +170,19 @@ settle, in the same write:
   field only matches another empty field),
 - already claimable (`ready_at <= now`).
 
+A claim costs the same whatever the queue holds. The duplicate lookup is an
+equality seek on a partial index over pending rows (an absent scope is stored
+as NULL and matched with `IS`), the head of the queue is read in index order
+and stops after the batch, and the pending count that sizes the batch stops
+counting at the point where a deeper queue would not change the batch
+(`evalThreads × 16`). Measured on one store at 50,000 pending evals, a batch of
+16 went from 116 ms to under a millisecond.
+
+`legion_eval_queue_depth` is exact while the queue is shallower than that
+point. Deeper, it is refreshed from a full count at most once a second, and
+each enqueue adds one in between, so on a deep queue it can lag by about a
+second.
+
 This keeps the queue from filling with redundant work for the same entity.
 It only discards work the claimed eval covers. Node-scoped kinds
 (`node_drain`, `node_lost_reschedule`) carry no job, so they collapse per
@@ -241,7 +254,7 @@ Placement apply uses optimistic concurrency with partitioned epochs.
 Legion maintains an epoch per `job_config_id` in `allocation_epoch_partition`.
 
 1. Scheduler reads the current epoch for the target job config.
-2. Scheduler writes `plan_submission.expected_epoch` with that value.
+2. Scheduler carries that value in the plan's expected version vector.
 3. Apply path re-reads the current epoch for that same job config in-transaction.
 4. Apply proceeds only when epochs still match.
 5. On successful allocation changes, only that job config epoch is bumped.
@@ -273,7 +286,30 @@ the v2 rollout finished, is a no-op instead of placing the full count.
 The plan submission and its apply run as **one replicated store op**
 (`Store::submit_and_apply_plan` / `submit_and_apply_plan_with_candidates`).
 That means one write-transaction boundary, and on raft one
-propose→quorum-commit→apply instead of two.
+propose→quorum-commit→apply instead of two. The apply walks the plan's
+placements as the planner handed them over; the plan is not written to the
+store and read back first.
+
+### Plan records
+
+`plan_submission` is a short record of plans a person might want to look at,
+not a log of every plan:
+
+| Plan | Row in `plan_submission` |
+| --- | --- |
+| Applied (every scheduler plan and edge-boot ratification) | none |
+| Rejected at apply | one row, `status = 'rejected'`, with `rejection_reason`, the placements, and the evictions |
+| Staged through the two-step `insert_plan_submission` / `apply_plan_submission` API (tests and benchmarks) | a `queued` row until its apply deletes it, or marks it rejected |
+
+The table keeps about the last 1,000 rows: each new row deletes the ones more
+than 1,000 ids older, in the same write. The scheduler-lane leader also sweeps
+it on startup and whenever it gains leadership, which removes rows outside
+that window and staged rows that were never applied within ten minutes. A
+staged plan that falls out of the window before it is applied cannot be
+applied; its apply fails with `plan submission N no longer exists`.
+
+Before this, every plan left a row carrying all of its candidate lists, in the
+raft log and in every snapshot, and nothing deleted them.
 
 ### Candidate lists (late-binding apply)
 
@@ -724,6 +760,80 @@ Selection policy:
 - optional score jitter on reschedule mode for less deterministic stickiness
 
 Resource fit is checked before a node can be selected.
+
+### Scoring
+
+`bin_pack` and `spread` score a node by how full it would be **after** the
+placement, measured in the resources the task asks for against what the node
+has:
+
+```text
+util_d   = (in use_d + request_d) / capacity_d    for each resource d the task requests
+                                                   whose capacity is finite:
+                                                   memory, cpu, cores, allocation slots
+dominant = the largest util_d                      (0 if no resource qualifies)
+balance  = 1 - (largest util_d - smallest util_d)
+
+bin_pack term = dominant       + 0.05 × balance    fullest node first
+spread term   = (1 - dominant) + 0.05 × balance    emptiest node first
+```
+
+Capacity is the node's schedulable capacity: its fingerprint, capped by
+`capacity`, less `reservedResources`, times any oversubscription ratio. A node
+that does not report a resource (no `maxAllocations`, say) has unlimited
+capacity of it, and that resource does not count.
+
+The score is the policy's term times its weight, plus the other terms:
+
+```text
+score = affinities × weights.affinities
+      + bin_pack term × weights.bin_pack            (1 under bin_pack, else 0)
+      + spread term × weights.spread                (1 under spread, else 0)
+      - anti-affinity × weights.automatic_anti_affinity (0.2)
+      + content locality × weights.locality
+```
+
+Two properties follow:
+
+- **A large allocation weighs what it uses.** A node holding one 12 GiB
+  allocation is fuller than one holding three of 256 MiB. `bin_pack` tops off
+  the first and keeps the second whole for a large task; `spread` sends new
+  work to the second.
+- **A node's score does not depend on the other candidates.** Utilization is
+  absolute, so truncating the candidate list (scheduling indexes,
+  `nodes_considered`, `score_sample`) changes which nodes are scored, never
+  how any one of them scores.
+
+The balance term breaks near-ties toward the node whose resources fill
+evenly, so a node is less likely to be left with memory and no CPU, or the
+reverse.
+
+The **anti-affinity** term is scaled by the task's replica count, the shape
+of Nomad's job anti-affinity:
+
+```text
+collisions    = allocations of this task (or its group) already on the node,
+                counting the ones this plan placed
+anti-affinity = 0                                  when collisions = 0
+              = (collisions + 1) / desired count   otherwise
+```
+
+A replica of a small service moves a node's utilization by a few hundredths,
+so how the two terms trade off depends on the count:
+
+- **A few replicas spread.** For three replicas a first collision costs
+  0.2 × 2/3 ≈ 0.13, more than the packing gain of one more small replica, so
+  under `bin_pack` too they land on different nodes.
+- **Many replicas pack.** For twenty, a first collision costs 0.2 × 2/20 =
+  0.02, less than one replica's share of a typical node, so `bin_pack` fills
+  a node with them before starting the next, and `spread` still spreads them
+  (its term already prefers the emptier node).
+
+Set `schedulerSettings.weights.automatic_anti_affinity = 0` to stack replicas
+whatever their count, or raise it to spread larger tasks.
+
+Scheduling plugins are not affected: their context still carries allocation
+counts and no capacity ([plugin system](plugin-system.md)).
 
 Constraints, permit, and volume-driver support are applied once, when the
 task's candidate list is built. The per-placement passes (eligibility, load

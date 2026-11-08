@@ -975,6 +975,7 @@ fn timeout_error(
             ),
             hint: Some("check it later with `legion instance get`, or raise --timeout".into()),
             retryable: true,
+            details: None,
         },
     )
 }

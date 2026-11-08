@@ -53,6 +53,14 @@ struct ContainerTaskConfig {
     #[serde(default)]
     ulimits: std::collections::BTreeMap<String, Value>,
 
+    /// The OCI runtime class to run this container with (docs/task-runtime-
+    /// container.md, "Runtime classes"): a name from the worker type's
+    /// `container.runtimeClasses`, such as `gvisor` or `kata`. The task only
+    /// places on nodes that advertise the class. Unset runs the node's
+    /// default runtime (runc or crun). Linux only.
+    #[serde(default, rename = "runtimeClass")]
+    runtime_class: Option<String>,
+
     /// Additional plugin-specific fields reserved for forward compatibility.
     #[serde(default, flatten)]
     #[schemars(skip)]
@@ -151,6 +159,10 @@ impl ContainerTaskConfig {
     fn validate(&self) -> R<()> {
         if self.command.is_empty() {
             bail!("container task command must include at least one entry");
+        }
+        if let Some(class) = &self.runtime_class {
+            crate::task_plugins::runtime_class::validate_name(class)
+                .context("config.runtimeClass")?;
         }
         if ![SECCOMP_DEFAULT, SECCOMP_UNCONFINED].contains(&self.security.seccomp.as_str()) {
             bail!(
@@ -355,6 +367,59 @@ fn idmapped_mount_gap(binary: &str, version_output: &str) -> Option<String> {
     ))
 }
 
+/// The node attribute a worker sets (to `"unsupported"`) when its OCI
+/// runtime is a runc that predates idmapped mounts. A container task with
+/// `security.userNamespace` on (the default) carries the implicit constraint
+/// that it is not set ([`constrain_to_idmapped_mounts`]), so it never places
+/// on such a node, where every start would fail. The attribute is absent on
+/// every other node: crun, runc 1.2 or later, Apple `container` (which
+/// ignores `security`), and a node with no container runtime.
+pub const IDMAPPED_MOUNTS_ATTR: &str = "container.idmappedMounts";
+
+/// This node's value for [`IDMAPPED_MOUNTS_ATTR`]: `Some("unsupported")`
+/// when its OCI runtime is a runc before 1.2, `None` otherwise. Shells out
+/// to `<runtime> --version`.
+pub fn idmapped_mounts_attribute() -> Option<&'static str> {
+    let Ok(ContainerRuntime::Oci { binary, .. }) = ContainerRuntime::detect() else {
+        return None;
+    };
+    let version = crate::util::output_with_timeout(
+        Command::new(&binary).arg("--version"),
+        crate::util::RUNTIME_CLI_TIMEOUT,
+    )
+    .ok()
+    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())?;
+    idmapped_mount_gap(&binary, &version).map(|_| "unsupported")
+}
+
+/// Give a user-namespaced container task (the default) the implicit
+/// constraint `container.idmappedMounts is_not_set`, so it places only on
+/// nodes whose OCI runtime can start it. Constraints in the object form
+/// become the equivalent list. Idempotent, so a resubmit does not stack
+/// copies, and a no-op for a task that sets `security.userNamespace = false`.
+fn constrain_to_idmapped_mounts(task: &mut TaskConfig) {
+    if !container_security(&task.config).user_namespace {
+        return;
+    }
+    let rule = serde_json::json!({ "key": IDMAPPED_MOUNTS_ATTR, "operator": "is_not_set" });
+    let mut rules = match std::mem::take(&mut task.constraints) {
+        Value::Array(rules) => rules,
+        Value::Object(map) => map
+            .into_iter()
+            .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+            .collect(),
+        Value::Null => Vec::new(),
+        other => {
+            task.constraints = other;
+            return;
+        }
+    };
+    if !rules.contains(&rule) {
+        rules.push(rule);
+    }
+    task.constraints = Value::Array(rules);
+}
+
 /// Apple's container CLI (macOS). Installed via `brew install container`.
 const APPLE_CONTAINER_BIN: &str = apple_container::BIN;
 
@@ -367,7 +432,16 @@ enum ContainerRuntime {
     /// Linux: a low-level OCI runtime (runc by default) run against a bundle
     /// Legion builds from the image's OCI layout. The runtime itself neither
     /// pulls nor understands image references.
-    Oci { binary: String },
+    Oci {
+        binary: String,
+        /// The runtime class (`config.runtimeClass`) this runtime serves, with
+        /// its declared support for the privilege floor; `None` for the
+        /// node's default runc or crun.
+        class: Option<(
+            String,
+            crate::task_plugins::runtime_class::RuntimeClassConfig,
+        )>,
+    },
 }
 
 impl ContainerRuntime {
@@ -382,10 +456,42 @@ impl ContainerRuntime {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| DEFAULT_OCI_RUNTIME.to_string());
-            Ok(Self::Oci { binary })
+            Ok(Self::Oci {
+                binary,
+                class: None,
+            })
         } else {
             bail!("container tasks are not supported on this OS");
         }
+    }
+
+    /// The runtime one task runs on: its `config.runtimeClass` when it names
+    /// one (docs/task-runtime-container.md, "Runtime classes"), else
+    /// [`Self::detect`]. A class this node does not have fails with the
+    /// classes it does.
+    fn for_task(task: &TaskConfig) -> R<Self> {
+        let Some(name) = crate::task_plugins::runtime_class::task_class(&task.config) else {
+            return Self::detect();
+        };
+        if !cfg!(target_os = "linux") {
+            bail!(
+                "task {} names runtime class {name}, but runtime classes are Linux only",
+                task.name
+            );
+        }
+        let classes = crate::task_plugins::runtime_class::configured();
+        let Some(class) = classes.get(&name).cloned() else {
+            let known: Vec<&String> = classes.keys().collect();
+            bail!(
+                "task {} names runtime class {name}, which this node does not configure \
+                 (it has {known:?}); the worker type's container.runtimeClasses declares them",
+                task.name
+            );
+        };
+        Ok(Self::Oci {
+            binary: class.path.clone(),
+            class: Some((name, class)),
+        })
     }
 
     /// Whether this runtime can exec into a running container. Both dialects
@@ -429,7 +535,14 @@ impl ContainerRuntime {
             }
             // runc or crun, installed: anything else is refused here
             // ([`unsupported_oci_runtime`]).
-            Self::Oci { binary } => probe_oci_runtime(binary).map(|_| ()),
+            Self::Oci {
+                binary,
+                class: None,
+            } => probe_oci_runtime(binary).map(|_| ()),
+            Self::Oci {
+                class: Some((name, class)),
+                ..
+            } => crate::task_plugins::runtime_class::preflight(name, class),
         }
     }
 
@@ -437,7 +550,11 @@ impl ContainerRuntime {
     /// that cannot apply idmapped mounts (see [`idmapped_mount_gap`]). A
     /// no-op for Apple `container`, which ignores `security`.
     fn check_idmapped_mounts(&self) -> R<()> {
-        let Self::Oci { binary } = self else {
+        let Self::Oci {
+            binary,
+            class: None,
+        } = self
+        else {
             return Ok(());
         };
         let version = Command::new(binary)
@@ -756,7 +873,7 @@ fn build_signal_command(
             signal,
             name,
         ],
-        ContainerRuntime::Oci { binary } => {
+        ContainerRuntime::Oci { binary, .. } => {
             vec![binary.clone(), "kill".to_string(), name, signal]
         }
     })
@@ -776,7 +893,7 @@ fn remove_stale_container(oci_runtime: &ContainerRuntime, allocation: &Allocatio
     let name = container_name(oci_runtime, allocation);
     match oci_runtime {
         ContainerRuntime::AppleContainer => apple_container::remove_stale(&name, allocation),
-        ContainerRuntime::Oci { binary } => {
+        ContainerRuntime::Oci { binary, .. } => {
             crate::util::output_with_timeout(
                 Command::new(binary).args(["delete", "--force", &name]),
                 crate::util::RUNTIME_CLI_TIMEOUT,
@@ -831,7 +948,7 @@ fn build_exec_command(
             argv.extend(command.iter().cloned());
             argv
         }
-        ContainerRuntime::Oci { binary } => {
+        ContainerRuntime::Oci { binary, .. } => {
             let mut argv = vec![binary.clone(), "exec".to_string()];
             if tty {
                 argv.push("--tty".to_string());
@@ -886,6 +1003,18 @@ pub struct ContainerTaskPlugin;
 impl ContainerTaskPlugin {}
 
 impl TaskPlugin for ContainerTaskPlugin {
+    /// Implicit placement constraints:
+    ///
+    /// - a user-namespaced task (the default) gains
+    ///   `container.idmappedMounts is_not_set`, so it never places on a node
+    ///   whose runc predates idmapped mounts ([`constrain_to_idmapped_mounts`]);
+    /// - a task that names a runtime class places only where the class is
+    ///   (the node attribute `container.runtimeClasses`).
+    fn normalize_task(&self, task: &mut TaskConfig) {
+        constrain_to_idmapped_mounts(task);
+        crate::task_plugins::runtime_class::constrain_to_class(task);
+    }
+
     /// A gated allocation's namespace is a real boundary: nothing leaves it
     /// except through the datapath, which holds its policy until ratified.
     fn network_gate_for(&self, allocation: &Allocation) -> crate::task_plugins::NetworkGate {
@@ -1028,7 +1157,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         _instance: &mut TaskInstance,
         signal: &str,
     ) -> R<()> {
-        let oci_runtime = ContainerRuntime::detect()?;
+        let oci_runtime = ContainerRuntime::for_task(task)?;
         let argv = build_signal_command(&oci_runtime, allocation, signal)?;
         let (program, args) = argv.split_first().expect("signal argv is never empty");
         let output = crate::util::output_with_timeout(
@@ -1072,7 +1201,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         _instance: &mut TaskInstance,
         mut opts: ExecOptions,
     ) -> R<Box<dyn ExecSession>> {
-        let oci_runtime = ContainerRuntime::detect()?;
+        let oci_runtime = ContainerRuntime::for_task(task)?;
         if !oci_runtime.supports_exec() {
             bail!("this container runtime does not support exec yet");
         }
@@ -1157,7 +1286,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         instance: &mut TaskInstance,
     ) -> R<()> {
         let config = ContainerTaskConfig::from_value(&task.config)?;
-        let oci_runtime = ContainerRuntime::detect()?;
+        let oci_runtime = ContainerRuntime::for_task(task)?;
         check_apple_memory_floor(&oci_runtime, task)?;
         // Before any image work: a task that asks for more than the operator
         // allows here fails now, naming what to change.
@@ -1168,7 +1297,42 @@ impl TaskPlugin for ContainerTaskPlugin {
             &oci_bundle::CapabilityAllowlist::from_env(),
         )?;
         oci_runtime.preflight()?;
-        if config.security.user_namespace {
+        // The privilege floor this runtime can carry (docs/task-runtime-
+        // container.md, "Runtime classes"): a class that cannot apply a part
+        // and isolates root itself drops it; one that does not refuses.
+        let wants_seccomp = config.security.seccomp == SECCOMP_DEFAULT;
+        let floor = match &oci_runtime {
+            ContainerRuntime::Oci {
+                class: Some((name, class)),
+                ..
+            } => {
+                let floor = crate::task_plugins::runtime_class::effective_floor(
+                    name,
+                    class,
+                    config.security.user_namespace,
+                    wants_seccomp,
+                )?;
+                if floor.user_namespace != config.security.user_namespace
+                    || floor.seccomp != wants_seccomp
+                {
+                    info!(
+                        allocation_id = allocation.id,
+                        task_name = %task.name,
+                        runtime_class = %name,
+                        user_namespace = floor.user_namespace,
+                        seccomp = floor.seccomp,
+                        "Runtime class isolates root itself; Legion's privilege floor parts it \
+                         cannot apply are left to it"
+                    );
+                }
+                floor
+            }
+            _ => crate::task_plugins::runtime_class::EffectiveFloor {
+                user_namespace: config.security.user_namespace,
+                seccomp: wants_seccomp,
+            },
+        };
+        if floor.user_namespace {
             oci_runtime.check_idmapped_mounts()?;
         }
         if oci_runtime == ContainerRuntime::AppleContainer && config.adjusts_linux_process() {
@@ -1253,7 +1417,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                 cmd.args(args);
                 cmd
             }
-            ContainerRuntime::Oci { binary } => {
+            ContainerRuntime::Oci { binary, .. } => {
                 // The runtime runs a bundle, not an image: get the image's OCI
                 // layout (from the artifact pipeline if staged, else pull it),
                 // convert it to a bundle, then `run` it.
@@ -1274,7 +1438,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                 // The privilege floor (worker-plane-auth plan §6.14): an id
                 // range of this allocation's own, the default seccomp
                 // profile, and a cgroup namespace.
-                let id_map = if config.security.user_namespace {
+                let id_map = if floor.user_namespace {
                     let alloc_dir = instance
                         .alloc_dir
                         .clone()
@@ -1290,7 +1454,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                 };
                 let security = oci_bundle::BundleSecurity {
                     id_map,
-                    seccomp: config.security.seccomp == SECCOMP_DEFAULT,
+                    seccomp: floor.seccomp,
                     cgroup_namespace: true,
                 };
                 let policy = config.process_policy()?;
@@ -1309,6 +1473,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                         netns: gated_netns.as_deref(),
                         security,
                         policy: &policy,
+                        devices: &instance.devices,
                     },
                 )?;
                 if let Some(range) = id_map {
@@ -1374,7 +1539,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         instance: &mut TaskInstance,
         ctx: &crate::task_plugins::StopContext,
     ) -> R<bool> {
-        let Ok(oci_runtime) = ContainerRuntime::detect() else {
+        let Ok(oci_runtime) = ContainerRuntime::for_task(task) else {
             return Ok(false);
         };
         let name = container_name(&oci_runtime, allocation);
@@ -1387,7 +1552,7 @@ impl TaskPlugin for ContainerTaskPlugin {
             // `runc`/`crun` `kill` signals the container init and
             // returns immediately, which is exactly the contract here — the
             // worker's reaper owns the deadline.
-            ContainerRuntime::Oci { binary } => (
+            ContainerRuntime::Oci { binary, .. } => (
                 binary.as_str(),
                 vec![
                     "kill".to_string(),
@@ -1456,7 +1621,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         // the container init when the foreground `run` is killed). Tear it down
         // explicitly by name first. Best-effort: an already-exited `--rm` /
         // deleted container is gone, which is success.
-        if let Ok(oci_runtime) = ContainerRuntime::detect() {
+        if let Ok(oci_runtime) = ContainerRuntime::for_task(task) {
             let name = container_name(&oci_runtime, allocation);
             let (program, args, timeout): (&str, Vec<&str>, _) = match &oci_runtime {
                 // `stop` signals the container's init and waits, so the
@@ -1466,7 +1631,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                     vec!["stop", &name],
                     apple_container::STOP_TIMEOUT,
                 ),
-                ContainerRuntime::Oci { binary } => (
+                ContainerRuntime::Oci { binary, .. } => (
                     binary.as_str(),
                     vec!["delete", "--force", &name],
                     crate::util::RUNTIME_CLI_TIMEOUT,
@@ -1624,6 +1789,7 @@ mod tests {
     fn preflight_reports_a_missing_oci_runtime() {
         let oci_runtime = ContainerRuntime::Oci {
             binary: "legion-no-such-oci-runtime".into(),
+            class: None,
         };
         let err = oci_runtime.preflight().expect_err("missing runtime");
         let message = err.to_string();
@@ -1643,7 +1809,7 @@ mod tests {
         let (probe, args) = match &oci_runtime {
             // `ls` needs the daemon, so it fails exactly where a launch would.
             ContainerRuntime::AppleContainer => (APPLE_CONTAINER_BIN, ["ls"]),
-            ContainerRuntime::Oci { binary } => (binary.as_str(), ["--version"]),
+            ContainerRuntime::Oci { binary, .. } => (binary.as_str(), ["--version"]),
         };
         let usable = Command::new(probe)
             .args(args)
@@ -1764,6 +1930,7 @@ mod tests {
         // Linux keeps `legion-<alloc>`, shared with the cgroup leaf name.
         let oci = ContainerRuntime::Oci {
             binary: "runc".into(),
+            class: None,
         };
         assert_eq!(container_name(&oci, &allocation), "legion-5");
         Ok(())
@@ -2379,6 +2546,7 @@ mod tests {
         for binary in ["runc", "/usr/local/sbin/runc", "crun"] {
             let oci_runtime = ContainerRuntime::Oci {
                 binary: binary.into(),
+                class: None,
             };
             let argv = build_exec_command(
                 &oci_runtime,
@@ -2415,6 +2583,58 @@ mod tests {
             );
             assert_eq!(argv, vec![binary, "exec", "legion-42", "/bin/true"]);
         }
+    }
+
+    /// Regression (TODO "`container: pass` readiness"): a runc before 1.2
+    /// passed readiness and failed every default start. A user-namespaced
+    /// task now carries a constraint such a node fails, and a task that
+    /// turns user namespaces off does not.
+    #[test]
+    fn a_user_namespaced_task_avoids_nodes_without_idmapped_mounts_test() -> R<()> {
+        let node = |attrs: Value| crate::structs::Node {
+            id: "n".into(),
+            pool: "default".into(),
+            status: "ready".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
+            config_attrs: attrs,
+            fingerprint_attrs: serde_json::json!({}),
+            dynamic_attrs: serde_json::json!({}),
+            health_checks: serde_json::json!({}),
+        };
+        let old_runc = node(serde_json::json!({ IDMAPPED_MOUNTS_ATTR: "unsupported" }));
+        let new_runc = node(serde_json::json!({}));
+
+        let mut task = TaskConfig {
+            config: serde_json::json!({ "image": "nginx", "command": ["nginx"] }),
+            constraints: serde_json::json!({ "role": "web" }),
+            ..TaskConfig::new("web", "container")
+        };
+        ContainerTaskPlugin.normalize_task(&mut task);
+        ContainerTaskPlugin.normalize_task(&mut task);
+        let rules = task.constraints.as_array().expect("list form");
+        assert_eq!(
+            rules.len(),
+            2,
+            "idempotent, and the object form kept: {rules:?}"
+        );
+        let constraints = crate::constraints::ConstraintSet::new(&task.constraints)?;
+        let with_role = |mut n: crate::structs::Node| {
+            n.config_attrs["role"] = serde_json::json!("web");
+            n
+        };
+        assert!(!constraints.is_satisfied(&with_role(old_runc.clone()), None));
+        assert!(constraints.is_satisfied(&with_role(new_runc), None));
+
+        let mut opted_out = TaskConfig {
+            config: serde_json::json!({ "image": "nginx", "security": { "userNamespace": false } }),
+            ..TaskConfig::new("legacy", "container")
+        };
+        ContainerTaskPlugin.normalize_task(&mut opted_out);
+        let constraints = crate::constraints::ConstraintSet::new(&opted_out.constraints)?;
+        assert!(constraints.is_satisfied(&old_runc, None));
+        Ok(())
     }
 
     /// The default privilege floor needs idmapped mounts: runc before 1.2
@@ -2505,7 +2725,8 @@ mod tests {
     fn exec_support_is_reported_for_every_detected_runtime() {
         assert!(ContainerRuntime::AppleContainer.supports_exec());
         assert!(ContainerRuntime::Oci {
-            binary: "runc".into()
+            binary: "runc".into(),
+            class: None,
         }
         .supports_exec());
 
@@ -2718,7 +2939,8 @@ mod tests {
         assert_eq!(
             build_signal_command(
                 &ContainerRuntime::Oci {
-                    binary: "crun".into()
+                    binary: "crun".into(),
+                    class: None,
                 },
                 &allocation,
                 "SIGHUP",
@@ -3404,6 +3626,7 @@ mod tests {
     fn the_node_allowlist_gates_linux_container_starts() -> R<()> {
         let linux = ContainerRuntime::Oci {
             binary: "runc".into(),
+            class: None,
         };
         let with = |security: Value| {
             ContainerTaskConfig::from_value(&json!({
@@ -3485,6 +3708,7 @@ mod tests {
         assert!(ContainerTaskPlugin.check_resources(&small)?.is_empty());
         let linux = ContainerRuntime::Oci {
             binary: "runc".into(),
+            class: None,
         };
         check_apple_memory_floor(&linux, &small)?;
 

@@ -148,6 +148,25 @@ that into `NotFound`. There is no MCP tool for KV.
 
 This is used for optimistic concurrency.
 
+## Waiting for a key to change
+
+`GetKv` and `ListKv` replies carry a `revision`, and both take the
+blocking-read headers, so you can wait for a key (or a prefix) to change
+instead of polling it:
+
+```console
+$ legion kv get app/config --json | jq -r .data.revision
+4812
+$ legion kv get app/config --index 4812 --wait 60 --json   # returns when it changes
+$ legion kv watch app/                                       # every write and delete under app/
+$ legion kv watch app/ --from 4812 --json                    # resume after a revision
+```
+
+A watch carries each changed entry with its value (or `deleted`), filtered
+to the keys you can read. `PutKv` and `DeleteKv` replies carry the revision
+at which the write is visible. See
+[Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md).
+
 ## Locking Model
 
 Optional lock enforcement for mutating operations:

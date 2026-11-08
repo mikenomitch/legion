@@ -346,7 +346,8 @@ static __always_inline __u32 guard(struct flow *flow)
 			return LN_EV_CONTROL;
 	}
 	if (flow->family == 4) {
-		if ((flow->addr[0] & ln_htonl(0xffff0000)) == ln_htonl(0x7f2a0000))
+		/* Another allocation's VIP block: 127.64.0.0/10 (VIP_RANGE). */
+		if ((flow->addr[0] & ln_htonl(0xffc00000)) == ln_htonl(0x7f400000))
 			return LN_EV_DATAPATH;
 		if (is_loopback(flow) && flow->protocol == IPPROTO_TCP) {
 			__u32 port = flow->port;

@@ -1596,10 +1596,14 @@ fn parse_percent(raw: &str) -> Option<f64> {
 /// lost member does to the rest when the loss leaves fewer than `min`
 /// running ([`MemberLossPolicy`]).
 ///
+/// `topology` keeps the members inside one domain of a node attribute (a
+/// rack, an NVLink domain): [`GangTopology`].
+///
 /// Spelled `true`, `false` (no gang), or `{ min = N, placementTimeout =
-/// "30m", onMemberLoss = "fail" }`. It serializes back to the short form when
-/// nothing but the defaults is set, like [`TaskCount`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// "30m", onMemberLoss = "fail", topology = { key = "rack" } }`. It
+/// serializes back to the short form when nothing but the defaults is set,
+/// like [`TaskCount`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GangConfig {
     /// Replicas that must run together. `None` = the task's whole count.
     pub min: Option<u32>,
@@ -1608,6 +1612,108 @@ pub struct GangConfig {
     pub placement_timeout: Option<Duration>,
     /// What a member loss that breaks the quorum does to the survivors.
     pub on_member_loss: MemberLossPolicy,
+    /// Place the members within one value of a node attribute. `None` = no
+    /// topology preference.
+    pub topology: Option<GangTopology>,
+}
+
+/// A gang's `topology` block (docs/gang-scheduling.md, "Topology"): place
+/// every member on nodes that share one value of the node attribute `key`
+/// — a **domain**, such as one rack or one NVLink domain.
+///
+/// `key` is a node attribute name, looked up the way `count.per` and
+/// `distinct` look one up (config, then fingerprint, then dynamic
+/// attributes). Nodes without the attribute belong to no domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GangTopology {
+    pub key: String,
+    pub mode: TopologyMode,
+}
+
+/// How hard a gang's [`GangTopology`] binds.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TopologyMode {
+    /// Every member in one domain, or the gang waits (holding nothing) until
+    /// one domain has room. A top-up stays in the domain its running members
+    /// occupy. The default: naming a domain usually means a throughput cliff
+    /// outside it.
+    #[default]
+    Required,
+    /// One domain when one fits; otherwise the fewest domains that hold the
+    /// quorum, then any eligible nodes. Never makes the gang wait.
+    Preferred,
+}
+
+impl TopologyMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TopologyMode::Required => "required",
+            TopologyMode::Preferred => "preferred",
+        }
+    }
+}
+
+impl GangTopology {
+    /// Parse `{ key = "rack", mode = "required" }`.
+    fn from_value(value: Value) -> Result<GangTopology, String> {
+        let Value::Object(fields) = value else {
+            return Err(format!(
+                "gang.topology must be an object like {{ key = \"rack\", mode = \"required\" }}, \
+                 got {value}"
+            ));
+        };
+        let mut key: Option<String> = None;
+        let mut mode = TopologyMode::default();
+        for (field, value) in fields {
+            match field.as_str() {
+                "key" => {
+                    let raw = value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|raw| !raw.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "gang.topology.key must be a node attribute name like \"rack\", \
+                                 got {value}"
+                            )
+                        })?;
+                    key = Some(raw.to_string());
+                }
+                "mode" => {
+                    mode = serde_json::from_value(value.clone()).map_err(|_| {
+                        format!(
+                            "gang.topology.mode must be \"required\" or \"preferred\", got {value}"
+                        )
+                    })?;
+                }
+                other => {
+                    return Err(format!(
+                        "unknown field `{other}` in gang.topology, expected one of `key`, `mode` \
+                         (see docs/gang-scheduling.md)"
+                    ))
+                }
+            }
+        }
+        let key = key.ok_or_else(|| {
+            "gang.topology needs a key: the node attribute whose value the members share, \
+             like `topology = { key = \"rack\" }`"
+                .to_string()
+        })?;
+        Ok(GangTopology { key, mode })
+    }
+}
+
+impl Serialize for GangTopology {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("GangTopology", 2)?;
+        state.serialize_field("key", &self.key)?;
+        state.serialize_field("mode", &self.mode)?;
+        state.end()
+    }
 }
 
 /// What happens to a gang's other members when one is lost — it failed, its
@@ -1711,10 +1817,16 @@ impl GangConfig {
                                     )
                                 })?;
                         }
+                        "topology" => {
+                            gang.topology = match value {
+                                Value::Null => None,
+                                value => Some(GangTopology::from_value(value)?),
+                            };
+                        }
                         other => {
                             return Err(format!(
                                 "unknown field `{other}` in gang, expected one of `min`, \
-                                 `placementTimeout`, `onMemberLoss` (see \
+                                 `placementTimeout`, `onMemberLoss`, `topology` (see \
                                  docs/gang-scheduling.md)"
                             ))
                         }
@@ -1738,7 +1850,7 @@ impl Serialize for GangConfig {
         if *self == GangConfig::default() {
             return serializer.serialize_bool(true);
         }
-        let mut state = serializer.serialize_struct("GangConfig", 3)?;
+        let mut state = serializer.serialize_struct("GangConfig", 4)?;
         if let Some(min) = self.min {
             state.serialize_field("min", &min)?;
         }
@@ -1750,6 +1862,9 @@ impl Serialize for GangConfig {
         }
         if self.on_member_loss != MemberLossPolicy::default() {
             state.serialize_field("onMemberLoss", &self.on_member_loss)?;
+        }
+        if let Some(topology) = &self.topology {
+            state.serialize_field("topology", topology)?;
         }
         state.end()
     }
@@ -2993,7 +3108,7 @@ impl TaskConfigInput {
             restart: self.restart,
             stop: self.stop,
             disruption: self.disruption,
-            gang: self.gang,
+            gang: self.gang.clone(),
             kv_injections: Some(if let Some(existing) = self.kv_injections {
                 TaskKvInjections {
                     kv: self.kv.or(existing.kv),
@@ -5704,7 +5819,7 @@ mod tests {
                 ..Default::default()
             })
         );
-        assert_eq!(all.gang.map(|gang| gang.quorum(8)), Some(8));
+        assert_eq!(all.gang.as_ref().map(|gang| gang.quorum(8)), Some(8));
         assert_eq!(serde_json::to_value(&all)?["gang"], serde_json::json!(true));
 
         let quorum = gang_task(serde_json::json!({ "min": 6 }))?;
@@ -5733,7 +5848,7 @@ mod tests {
     #[test]
     fn gang_placement_timeout_parses_and_round_trips() -> R<()> {
         let task = gang_task(serde_json::json!({ "min": 6, "placementTimeout": "30m" }))?;
-        let gang = task.gang.expect("gang");
+        let gang = task.gang.clone().expect("gang");
         assert_eq!(gang.placement_timeout, Some(Duration::from_secs(1800)));
         let stored = serde_json::to_value(&task)?["gang"].clone();
         assert_eq!(
@@ -5788,6 +5903,61 @@ mod tests {
                 .contains("gang.onMemberLoss must be one of"),
             "{error}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn gang_topology_parses_defaults_to_required_and_round_trips() -> R<()> {
+        let task = gang_task(serde_json::json!({ "topology": { "key": "rack" } }))?;
+        assert_eq!(
+            task.gang.as_ref().and_then(|gang| gang.topology.clone()),
+            Some(GangTopology {
+                key: "rack".into(),
+                mode: TopologyMode::Required,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&task)?["gang"],
+            serde_json::json!({ "topology": { "key": "rack", "mode": "required" } })
+        );
+        let reparsed: TaskConfig = serde_json::from_value(serde_json::to_value(&task)?)?;
+        assert_eq!(reparsed.gang, task.gang);
+
+        let preferred = gang_task(
+            serde_json::json!({ "min": 4, "topology": { "key": "nvlink", "mode": "preferred" } }),
+        )?;
+        let gang = preferred.gang.clone().expect("gang");
+        assert_eq!(gang.min, Some(4));
+        assert_eq!(
+            gang.topology.map(|topology| topology.mode),
+            Some(TopologyMode::Preferred)
+        );
+
+        for (bad, needle) in [
+            (
+                serde_json::json!({ "topology": "rack" }),
+                "gang.topology must be an object",
+            ),
+            (
+                serde_json::json!({ "topology": {} }),
+                "gang.topology needs a key",
+            ),
+            (
+                serde_json::json!({ "topology": { "key": "" } }),
+                "gang.topology.key",
+            ),
+            (
+                serde_json::json!({ "topology": { "key": "rack", "mode": "strict" } }),
+                "gang.topology.mode must be",
+            ),
+            (
+                serde_json::json!({ "topology": { "key": "rack", "level": 2 } }),
+                "unknown field `level` in gang.topology",
+            ),
+        ] {
+            let error = gang_task(bad).expect_err(needle);
+            assert!(error.to_string().contains(needle), "{needle}: {error}");
+        }
         Ok(())
     }
 

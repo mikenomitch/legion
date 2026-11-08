@@ -27,6 +27,7 @@ mod oci_bundle;
 mod oci_image;
 pub mod resource_enforcement;
 pub mod rootfs_cache;
+pub mod runtime_class;
 mod sandbox;
 pub(crate) mod sandbox_addr;
 mod sandbox_checkpoint;
@@ -47,7 +48,10 @@ mod vmm_api;
 pub mod vsock_exec;
 
 pub use checkpoint::{AfterCheckpoint, CheckpointDir, CheckpointQuery, CheckpointSupport};
-pub use container::{container_task_capabilities, ContainerTaskPlugin};
+pub use container::{
+    container_task_capabilities, idmapped_mounts_attribute, ContainerTaskPlugin,
+    IDMAPPED_MOUNTS_ATTR,
+};
 pub use exec::ExecTaskPlugin;
 pub use exec_session::{spawn_pipe, spawn_pty, ExecOptions, ExecOutputStreams, ExecSession};
 pub use oci_bundle::CapabilityAllowlist;
@@ -454,6 +458,13 @@ pub struct TaskInstance {
     /// `legion_task_start_stage_seconds` (`crate::worker::start_timing`).
     /// Runtimes record their own sub-stages of `start` here.
     pub start_timings: crate::worker::start_timing::StartTimings,
+    /// The container edits of the devices this allocation was assigned
+    /// (docs/devices.md): env, device nodes, mounts, and hooks, from the
+    /// device plugins' `allocate` and CDI specs. Filled by worker core
+    /// before `prepare()`. Host-process runtimes need nothing from it (the
+    /// env is in [`Self::extra_env`] too); the `container` runtime applies
+    /// all of it to the OCI bundle. Empty for a task with no devices.
+    pub devices: crate::devices::cdi::ContainerEdits,
 }
 
 impl TaskInstance {

@@ -302,10 +302,12 @@ impl IngressListeners {
     }
 
     async fn start(&self, spec: IngressSpec) {
-        let listen = ListenAddr::host(SocketAddr::new(
-            spec.bind.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            spec.host_port,
-        ));
+        // No explicit bind: every address, IPv4 and IPv6 (mesh-control-path
+        // plan §6.5).
+        let listen = match spec.bind {
+            Some(ip) => ListenAddr::host(SocketAddr::new(ip, spec.host_port)),
+            None => ListenAddr::AnyAddress(spec.host_port),
+        };
         let key = (spec.allocation_id, spec.label.clone());
         match listen.bind().await {
             Ok(listener) => {
@@ -442,6 +444,15 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
                 return;
             }
         };
+    // A resumed session carries the identity of the handshake that started
+    // its chain; it is refused once that certificate has expired, so a node
+    // that stopped being re-issued cannot keep resuming (mesh-control-path
+    // plan §6.3).
+    if crate::worker::netd::mesh_tls::resumed_with_expired_peer(stream.get_ref().1) {
+        debug!(allocation_id, peer = %peer, "Refusing a resumed session whose certificate expired");
+        net_metrics::connection("ingress", PROTOCOL_TCP, "error");
+        return;
+    }
     let peer_identity = stream
         .get_ref()
         .1

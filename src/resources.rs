@@ -106,6 +106,17 @@ impl ResourcePolicy {
             // row is never re-judged, or raising the default would make every
             // node holding an old row fit nothing.
             validate_memory_max(&normalized)?;
+            // Device requests (docs/devices.md), also submit-path only.
+            if let Some(name) = normalized
+                .keys()
+                .find(|key| key.starts_with(crate::devices::POOL_KEY_PREFIX))
+            {
+                bail!(
+                    "resources.{name} is reserved for assigned devices; ask for devices with \
+                     resources.devices"
+                );
+            }
+            crate::devices::validate_requests(&Value::Object(normalized.clone()))?;
         }
 
         Ok(Value::Object(normalized))
@@ -427,6 +438,7 @@ mod tests {
                     ("cpu".to_string(), ResourceValue::Amount(4000.0)),
                     ("allocations".to_string(), ResourceValue::Amount(2.0)),
                 ]),
+                ..Default::default()
             };
             let running = policy
                 .usage_request(&json!({ "memory": 2048, "cpu": 2000 }))
@@ -521,6 +533,56 @@ mod tests {
                 "cpus": { "0": { "frequency": "2000" }, "1": { "frequency": "2000" } },
             }))
         }
+    }
+
+    /// Devices (docs/devices.md): a node's healthy instances are capacity, a
+    /// task's unassigned request fits and debits ids, an allocation row's
+    /// assigned ids are held, and a released unhealthy id does not return.
+    #[test]
+    fn devices_fit_debit_and_hold_test() -> R<()> {
+        let mut node = node_with_attrs(json!({}));
+        node.health_checks = json!({ "devices": { "groups": [{
+            "vendor": "fake", "type": "gpu", "model": "f1",
+            "instances": [
+                { "id": "g0", "attributes": { "peerGroup": "a" } },
+                { "id": "g1", "attributes": { "peerGroup": "a" } },
+                { "id": "g2", "healthy": false },
+            ],
+        }]}});
+        let policy = usage_test_policy();
+        let mut pool = ResourcePool::from_node(&node)?;
+        let two = request(json!({ "devices": [{ "name": "gpu", "count": 2 }] }));
+        let three = request(json!({ "devices": [{ "name": "gpu", "count": 3 }] }));
+        assert!(pool.can_fit(&two));
+        assert!(!pool.can_fit(&three), "g2 is unhealthy");
+        pool.consume(&two);
+        assert!(!pool.can_fit(&request(json!({ "devices": [{ "name": "gpu" }] }))));
+
+        // An allocation row holds its assigned ids.
+        let held = json!({ "memory": 64, "devices": [{ "name": "gpu", "count": 1,
+            "assigned": { "device": "fake/gpu/f1", "plugin": "fake", "ids": ["g1"] } }] });
+        let free = ResourcePool::free_from_rows(&node, [(1, &held)], &policy);
+        let assigned = free
+            .assign_devices(&two.devices)
+            .map(|assigned| assigned.len());
+        assert_eq!(assigned, None, "only g0 is free");
+        let one = request(json!({ "devices": [{ "name": "fake/gpu" }] }));
+        let picked = free.assign_devices(&one.devices).expect("g0 fits");
+        assert_eq!(picked[0].1.ids, vec!["g0".to_string()]);
+
+        // Releasing a victim's unhealthy device does not make it free.
+        let mut free = free;
+        free.release(&policy.usage_request(&json!({ "devices": [{ "name": "gpu",
+            "assigned": { "device": "fake/gpu/f1", "ids": ["g1", "g2"] } }] }))?);
+        assert!(free.can_fit(&two));
+        assert!(!free.can_fit(&three));
+
+        // A node without devices fits no device request.
+        let plain = ResourcePool::from_node(&node_with_attrs(json!({})))?;
+        assert!(!plain.can_fit(&two));
+        // A worker type may not declare devices as custom resources.
+        assert!(validate_node_resources(&json!({ "devices": [] })).is_err());
+        Ok(())
     }
 
     /// `(physical - reservedResources) x ratio`, for memory and CPU MHz,
@@ -872,17 +934,59 @@ pub(crate) enum ResourceValue {
 }
 
 /// A task's normalized resource demands.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ResourceRequest {
     pub(crate) values: HashMap<String, ResourceValue>,
+    /// Device requests not assigned yet (`resources.devices` entries with no
+    /// `assigned`): a task's request at plan time. An allocation row's
+    /// devices are assigned, and count as items in `values` under their
+    /// group's [`crate::devices::pool_key`].
+    pub(crate) devices: Vec<crate::devices::DeviceDemand>,
 }
 
 /// One node's resource capacity (or free capacity, once usage is applied).
 /// Resources the node did not fingerprint carry infinite capacity, so an
 /// unfingerprinted node does not reject every task.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ResourcePool {
     pub(crate) values: HashMap<String, ResourceValue>,
+    /// What the node offers before any allocation is subtracted: the
+    /// denominator utilization scoring divides by (`scheduler.rs`,
+    /// "Scoring"). Set once, by [`ResourcePool::from_node`]; usage never
+    /// changes it. All zero for a pool not born from a node, which scores
+    /// as unmeasured.
+    pub(crate) capacity: PoolCapacity,
+    /// The node's device groups (attributes and health), when it reports
+    /// any. Each group's free instances are the item set under its
+    /// [`crate::devices::pool_key`] in `values`.
+    pub(crate) devices: Option<Arc<crate::devices::NodeDeviceInventory>>,
+}
+
+/// A node's schedulable capacity of the four common dims, after
+/// `capacity` ceilings, `reservedResources`, and oversubscription: exactly
+/// the amounts [`ResourcePool::from_node`] starts the free pool from.
+/// Infinite where the node does not limit the dim (`maxAllocations` unset).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct PoolCapacity {
+    pub(crate) memory: f64,
+    pub(crate) cpu: f64,
+    pub(crate) cores: f64,
+    pub(crate) allocations: f64,
+}
+
+impl PoolCapacity {
+    fn of(values: &HashMap<String, ResourceValue>) -> Self {
+        let amount = |name: &str| match values.get(name) {
+            Some(ResourceValue::Amount(amount)) => *amount,
+            _ => 0.0,
+        };
+        PoolCapacity {
+            memory: amount("memory"),
+            cpu: amount("cpu"),
+            cores: amount("cores"),
+            allocations: amount("allocations"),
+        }
+    }
 }
 
 impl ResourceRequest {
@@ -903,6 +1007,10 @@ impl ResourceRequest {
             // have free. Counting it would make it a custom resource no node
             // advertises, which fits nothing.
             if key == MEMORY_MAX_KEY {
+                continue;
+            }
+            // Device requests: parsed below, never a custom resource.
+            if key == crate::devices::RESOURCES_KEY {
                 continue;
             }
             let demand = match value {
@@ -932,7 +1040,17 @@ impl ResourceRequest {
             values.insert(key.clone(), demand);
         }
 
-        Ok(ResourceRequest { values })
+        let (devices, held) = crate::devices::parse_for_scheduling(value)?;
+        for (key, ids) in held {
+            let entry = values
+                .entry(key)
+                .or_insert_with(|| ResourceValue::Items(HashSet::new()));
+            if let ResourceValue::Items(items) = entry {
+                items.extend(ids);
+            }
+        }
+
+        Ok(ResourceRequest { values, devices })
     }
 }
 
@@ -984,7 +1102,7 @@ impl ResourcePool {
                 .as_object()
                 .context("node resources must be an object")?;
             for (name, value) in custom {
-                if is_builtin_resource(name) {
+                if is_builtin_resource(name) || is_device_resource(name) {
                     continue;
                 }
                 let resource = parse_resource_value(name, value)?;
@@ -992,7 +1110,34 @@ impl ResourcePool {
             }
         }
 
-        let mut pool = ResourcePool { values };
+        // Devices the node reports (docs/devices.md): each group's healthy
+        // instances are the items under its pool key. An unhealthy instance
+        // is not capacity: it never enters the set, so nothing can be
+        // assigned it, while a running allocation that already holds it
+        // still subtracts cleanly (removing an absent item is a no-op).
+        let groups = crate::devices::node_devices(node);
+        let devices = (!groups.is_empty()).then(|| {
+            for group in &groups {
+                values.insert(
+                    crate::devices::pool_key(&group.id()),
+                    ResourceValue::Items(
+                        group
+                            .instances
+                            .iter()
+                            .filter(|instance| instance.healthy)
+                            .map(|instance| instance.id.clone())
+                            .collect(),
+                    ),
+                );
+            }
+            Arc::new(crate::devices::NodeDeviceInventory { groups })
+        });
+
+        let mut pool = ResourcePool {
+            values,
+            capacity: PoolCapacity::default(),
+            devices,
+        };
 
         if let Some(reserved) =
             config_value(config_attrs, &["reservedResources", "reserved_resources"])
@@ -1020,6 +1165,7 @@ impl ResourcePool {
                 }
             }
         }
+        pool.capacity = PoolCapacity::of(&pool.values);
 
         Ok(pool)
     }
@@ -1052,9 +1198,7 @@ impl ResourcePool {
         allocation_resources: impl IntoIterator<Item = (i64, &'a Value)>,
         policy: &ResourcePolicy,
     ) -> ResourcePool {
-        let empty = || ResourcePool {
-            values: HashMap::new(),
-        };
+        let empty = ResourcePool::default;
         let mut pool = match ResourcePool::from_node(node) {
             Ok(pool) => pool,
             Err(error) => {
@@ -1105,7 +1249,34 @@ impl ResourcePool {
                 Some(ResourceValue::Items(available)) => items.is_subset(available),
                 _ => false,
             },
-        })
+        }) && (request.devices.is_empty() || self.assign_devices(&request.devices).is_some())
+    }
+
+    /// Devices for unassigned demands from this pool's free instances
+    /// (docs/devices.md, "Assignment"), or `None` when they do not fit. The
+    /// planner's fit check, its ledger debit, and the store's assignment at
+    /// insert all call this, so all three agree on what fits and on which
+    /// ids a placement gets.
+    pub(crate) fn assign_devices(
+        &self,
+        demands: &[crate::devices::DeviceDemand],
+    ) -> Option<Vec<(usize, crate::devices::DeviceAssignment)>> {
+        if demands.is_empty() {
+            return Some(Vec::new());
+        }
+        let inventory = self.devices.as_ref()?;
+        let free: HashMap<String, HashSet<String>> = inventory
+            .groups
+            .iter()
+            .filter_map(|group| {
+                let key = crate::devices::pool_key(&group.id());
+                match self.values.get(&key) {
+                    Some(ResourceValue::Items(items)) => Some((key, items.clone())),
+                    _ => None,
+                }
+            })
+            .collect();
+        inventory.assign(&free, demands)
     }
 
     pub(crate) fn consume(&mut self, request: &ResourceRequest) {
@@ -1131,9 +1302,30 @@ impl ResourcePool {
                     }
                 }
                 ResourceValue::Items(items) => {
+                    // A victim's device that turned unhealthy is not handed
+                    // back: it was never free capacity (docs/devices.md).
+                    let healthy =
+                        name.strip_prefix(crate::devices::POOL_KEY_PREFIX)
+                            .and_then(|group_id| {
+                                let inventory = self.devices.as_ref()?;
+                                let group = inventory.groups.iter().find(|g| g.id() == group_id)?;
+                                Some(
+                                    group
+                                        .instances
+                                        .iter()
+                                        .filter(|instance| instance.healthy)
+                                        .map(|instance| instance.id.clone())
+                                        .collect::<HashSet<String>>(),
+                                )
+                            });
                     if let Some(ResourceValue::Items(available)) = self.values.get_mut(name) {
                         for item in items {
-                            available.insert(item.clone());
+                            if healthy
+                                .as_ref()
+                                .is_none_or(|healthy| healthy.contains(item))
+                            {
+                                available.insert(item.clone());
+                            }
                         }
                     }
                 }
@@ -1142,6 +1334,20 @@ impl ResourcePool {
     }
 
     pub(crate) fn apply_usage(&mut self, request: &ResourceRequest) {
+        // Unassigned device demands (a plan's own placements): debit the ids
+        // the store will assign, chosen the same way.
+        if let Some(assigned) = self.assign_devices(&request.devices) {
+            for (_, assignment) in assigned {
+                if let Some(ResourceValue::Items(available)) = self
+                    .values
+                    .get_mut(&crate::devices::pool_key(&assignment.device))
+                {
+                    for id in &assignment.ids {
+                        available.remove(id);
+                    }
+                }
+            }
+        }
         for (name, demand) in &request.values {
             match demand {
                 ResourceValue::Amount(amount) => {
@@ -1353,9 +1559,7 @@ impl ResourcePool {
                     %error,
                     "Node resources failed to parse; node will fit no tasks until corrected"
                 );
-                return ResourcePool {
-                    values: HashMap::new(),
-                };
+                return ResourcePool::default();
             }
         };
         for (name, dim) in &usage.dims {
@@ -1583,6 +1787,12 @@ pub(crate) fn is_builtin_resource(name: &str) -> bool {
     matches!(name, "memory" | "cpu" | "cores" | "allocations")
 }
 
+/// The device model's names in a resources map: the `devices` request list
+/// and the `device:` pool keys. Never a custom resource.
+pub(crate) fn is_device_resource(name: &str) -> bool {
+    name == crate::devices::RESOURCES_KEY || name.starts_with(crate::devices::POOL_KEY_PREFIX)
+}
+
 /// Reject a worker type's `resources` block that names a builtin resource.
 /// The node's `memory`, `cpu`, and `cores` come from its fingerprint and
 /// `allocations` from `maxAllocations`, so [`ResourcePool::from_node`] skips
@@ -1593,6 +1803,13 @@ pub(crate) fn validate_node_resources(resources: &Value) -> R<()> {
     let Some(custom) = resources.as_object() else {
         bail!("resources must be an object of custom resource names to amounts");
     };
+    if let Some(name) = custom.keys().find(|name| is_device_resource(name)) {
+        bail!(
+            "resources may not declare {name:?}: devices are declared in the worker type's \
+             `devices` block (`devices.static` for a fixed list, `devices.plugins` to \
+             discover them; see docs/devices.md)"
+        );
+    }
     let mut builtin: Vec<&str> = custom
         .keys()
         .map(String::as_str)

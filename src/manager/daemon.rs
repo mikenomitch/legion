@@ -249,6 +249,9 @@ pub async fn run_manager_with(
         if let Err(err) = store.prune_rollouts() {
             warn!(error = ?err, "Failed pruning retained rollout history");
         }
+        if let Err(err) = store.prune_plan_submissions() {
+            warn!(error = ?err, "Failed pruning plan_submission records");
+        }
     } else {
         info!("Skipping scheduler-lane startup writes (rollout prune) on raft non-leader manager");
     }
@@ -301,6 +304,9 @@ pub async fn run_manager_with(
                     info!("Raft scheduler-lane leadership acquired; pruning rollout history");
                     if let Err(err) = watch_store.prune_rollouts() {
                         warn!(error = ?err, "Failed pruning retained rollout history");
+                    }
+                    if let Err(err) = watch_store.prune_plan_submissions() {
+                        warn!(error = ?err, "Failed pruning plan_submission records");
                     }
                 }
                 was_scheduler_leader = scheduler_leader;
@@ -433,6 +439,12 @@ pub async fn run_manager_with(
              cluster. Remove acl.enabled = false and --no-acl to turn them back on"
         );
     }
+
+    // Endpoint sets (mesh-control-path plan §6.1): re-read the consumed
+    // services the projection marked dirty and push them on the consuming
+    // nodes' work streams. Every manager, leader or not: a worker may
+    // stream from any of them, and each serves from its own replica.
+    tokio::spawn(crate::manager::server::endpoint_feed::run_endpoint_refresher(store.clone()));
 
     // Idempotency records only need to outlive a client's retry window;
     // without this the table grows by one row per keyed mutation forever.
@@ -619,6 +631,27 @@ pub async fn run_manager_with(
     // Follower-side forwarding of rejected writes to the raft leader
     // (docs/raft-operations.md, "Writes on any manager").
     let leader_forward = crate::manager::leader_forward::LeaderForwardLayer::new(store.clone());
+    // Agent governance (docs/audit-journal.md,
+    // docs/approvals-and-rate-limits.md, docs/usage-accounting.md): the
+    // batched audit writer, the usage accumulator, and the request layer
+    // that journals and gates every Manager RPC.
+    full_config
+        .governance
+        .validate()
+        .map_err(|message| anyhow!("invalid governance config: {message}"))?;
+    let audit_journal = full_config.governance.audit_enabled().then(|| {
+        crate::manager::governance::journal::start(store.clone(), &full_config.governance)
+    });
+    if full_config.governance.usage_enabled() {
+        crate::manager::governance::usage::start(store.clone(), &full_config.governance);
+    }
+    let governance_layer = crate::manager::governance::layer::GovernanceLayer::new(Arc::new(
+        crate::manager::governance::Governance::new(
+            store.clone(),
+            full_config.governance.clone(),
+            audit_journal,
+        ),
+    ));
     let manager_node = Arc::new(
         ManagerDaemonService::with_manager_config(store, &full_config)
             .with_workload_identity(workload_identity_state.clone())
@@ -777,6 +810,10 @@ pub async fn run_manager_with(
         // not-the-leader is replayed to the leader and the leader's reply
         // returned, so every manager accepts every request.
         .layer(leader_forward)
+        // Inside leader forwarding: the manager that executes a request
+        // journals and gates it; a not-the-leader rejection it forwards is
+        // journaled by the leader (src/manager/governance/layer.rs).
+        .layer(governance_layer)
         .add_service(manager_service)
         .add_service(raft_transport_service)
         .serve_with_incoming_shutdown(api_incoming, async move {
@@ -4099,12 +4136,18 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 .fence_list_every()
                 .with_context(|| format!("invalid sessions config in worker config {path_str}"))?;
         }
-        // The top-level `content` and `contentStore` blocks ride in the
-        // artifacts payload (see `WorkerArtifactsPayload`).
+        if let Some(devices) = wcp.devices.as_ref() {
+            devices
+                .validate()
+                .with_context(|| format!("invalid devices config in worker config {path_str}"))?;
+        }
+        // The top-level `content`, `contentStore`, `sessions`, and `devices`
+        // blocks ride in the artifacts payload (see `WorkerArtifactsPayload`).
         let artifacts = if wcp.artifacts.is_none()
             && wcp.content.is_none()
             && wcp.content_store.is_none()
             && wcp.sessions.is_none()
+            && wcp.devices.is_none()
         {
             String::new()
         } else {
@@ -4113,6 +4156,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 content: wcp.content.clone(),
                 content_store: wcp.content_store.clone(),
                 sessions: wcp.sessions.clone(),
+                devices: wcp.devices.clone(),
             })?
         };
 
@@ -4230,8 +4274,11 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                     block.allow_caps.as_deref(),
                 )
                 .with_context(|| format!("invalid worker config {path_str}"))?;
+                crate::task_plugins::runtime_class::validate_classes(&block.runtime_classes)
+                    .with_context(|| format!("invalid worker config {path_str}"))?;
                 serde_json::to_string(&crate::structs::WorkerContainerConfig {
                     allow_caps: Some(allowlist.to_config()),
+                    runtime_classes: block.runtime_classes.clone(),
                 })?
             }
         };

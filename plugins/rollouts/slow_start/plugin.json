@@ -1,5 +1,5 @@
 {
   "kind": "rollouts",
   "name": "slow_start",
-  "legionApiVersion": 2
+  "legionApiVersion": 3
 }

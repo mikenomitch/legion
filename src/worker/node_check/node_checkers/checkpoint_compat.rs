@@ -15,10 +15,6 @@ impl NodeChecker for CheckpointCompatNodeChecker {
         "checkpoint-compat"
     }
 
-    fn has_fingerprinter(&self) -> bool {
-        true
-    }
-
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = local_cpu_attrs();
         // `sandbox.vmm`, `sandbox.vmm.version`, and one

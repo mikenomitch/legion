@@ -5,6 +5,18 @@ use legion::tracing_util::init_tracing_with_options;
 #[tokio::main]
 async fn main() -> R<()> {
     let matches = cmd::cli().get_matches();
+    // `--approval <ID>` (global): every request this process sends presents
+    // the approval (docs/approvals-and-rate-limits.md).
+    {
+        let mut level = Some(&matches);
+        while let Some(current) = level {
+            if let Ok(Some(id)) = current.try_get_one::<String>("approval") {
+                cmd::governance::set_cli_approval(id);
+                break;
+            }
+            level = current.subcommand().map(|(_, sub)| sub);
+        }
+    }
     let enable_o11y = matches!(
         matches.subcommand(),
         Some(("start", sub_matches))
@@ -65,6 +77,9 @@ async fn main() -> R<()> {
         Some(("session", sub_matches)) => cmd::session::handle(sub_matches).await?,
         Some(("join", sub_matches)) => cmd::join::handle(sub_matches).await?,
         Some(("ledger", sub_matches)) => cmd::ledger::handle(sub_matches).await?,
+        Some(("audit", sub_matches)) => cmd::governance::handle_audit(sub_matches).await?,
+        Some(("approval", sub_matches)) => cmd::governance::handle_approval(sub_matches).await?,
+        Some(("usage", sub_matches)) => cmd::governance::handle_usage(sub_matches).await?,
         Some(("events", sub_matches)) => cmd::events::handle(sub_matches).await?,
         Some(("kv", sub_matches)) => cmd::kv::handle(sub_matches).await?,
         Some(("keyring", sub_matches)) => cmd::keyring::handle(sub_matches).await?,
@@ -73,6 +88,7 @@ async fn main() -> R<()> {
         Some(("guest-agent", sub_matches)) => cmd::guest_agent::handle(sub_matches).await?,
         Some(("guest-resume", sub_matches)) => cmd::guest_resume::handle(sub_matches).await?,
         Some(("volume", sub_matches)) => cmd::volume::handle(sub_matches).await?,
+        Some(("device", sub_matches)) => cmd::device::handle(sub_matches).await?,
         Some(("snapshot", sub_matches)) => cmd::snapshot::handle(sub_matches).await?,
         Some(("state", sub_matches)) => cmd::state::handle(sub_matches).await?,
         Some(("raft", sub_matches)) => cmd::raft::handle(sub_matches).await?,

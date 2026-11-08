@@ -18,10 +18,12 @@
             parallelism = 4,
             # Per-artifact retries before the allocation fails.
             attempts = 3,
-            # Overall fetch deadline per artifact.
-            timeout = "10m",
-            # Per-artifact size cap; also bounds decompression.
-            maxArtifactSize = "50GiB",
+            # Overall fetch deadline per artifact. Generous by default so a
+            # model checkpoint of a few hundred GB fetches over a 1 Gbps link.
+            timeout = "2h",
+            # Per-artifact size cap; also bounds decompression. Lower it for
+            # nodes that fetch from sources you do not trust.
+            maxArtifactSize = "1TiB",
         },
     },
     # The node content store (docs/artifacts.md, "The node content store"):
@@ -40,8 +42,10 @@
         # same as leaving it unset. Shares, defaults included, must add up
         # to at most 100%.
         budgets = {
-            # Unset: 10% of the disk, clamped to 1GiB..20GiB.
-            # artifacts = "20GiB",
+            # Unset: 50% of the disk, at least 1GiB, no ceiling: room for
+            # model weights. Cap a share with an object:
+            # artifacts = { share = "50%", max = "2TiB", min = "10GiB" },
+            # or set a fixed size: artifacts = "200GiB",
             # Unset: 20% of the disk, clamped to 2GiB..200GiB. Holds memory
             # checkpoints: local ones pinned until resumed or deleted,
             # published ones (suspend.durability = "store") as evictable
@@ -183,6 +187,17 @@
             # host network can then also read the node's traffic.
             # "NET_RAW",
         ],
+        # OCI runtimes a task can pick with config.runtimeClass
+        # (docs/task-runtime-container.md, "Runtime classes"). The worker
+        # runs `<path> --version` at start and advertises the classes that
+        # answer as container.runtimeClasses. isolatesRoot = true says the
+        # runtime keeps container root off host root itself (a user-space
+        # kernel, a VM), so floor parts it cannot apply are dropped instead
+        # of refusing the task.
+        # runtimeClasses = {
+        #     gvisor = { path = "/usr/local/bin/runsc", userNamespace = false, isolatesRoot = true },
+        #     kata = { path = "/usr/bin/kata-runtime", userNamespace = false, isolatesRoot = true },
+        # },
     },
     # Whether this node serves `Worker.StartClaim` — that is, whether it will
     # start work on a boot ticket at all (docs/edge-boot.md). Off by default
@@ -226,6 +241,9 @@
     #     allow = ["10.0.1.7:9100"],
     #     # Extra destinations to refuse like metadata: IPs or CIDRs.
     #     deny = ["10.0.0.2/32"],
+    #     # How often the nftables guard's drop counters are read for
+    #     # net.denied events (each read runs `nft -j list table`).
+    #     counterInterval = "10s",
     # },
     # Direct exec (docs/exec-and-actions.md, "Direct exec"): admit exec
     # tickets on this node's worker plane, so `legion exec --direct` and
@@ -233,4 +251,32 @@
     # Off by default: with it on, any client that can reach port 4848 and
     # holds a ticket for this node can open the session the ticket names.
     # exec = { direct = true },
+    # Devices (docs/devices.md): GPUs and other whole devices a task can ask
+    # for with resources.devices. Absent: this node has no devices.
+    # devices = {
+    #     # Device plugins (protocol legion-device/1): commands the worker
+    #     # runs at start and on every node-check pass (30s) to discover
+    #     # devices and their health, and at task start to allocate them.
+    #     plugins = {
+    #         nvidia = {
+    #             command = ["/opt/legion/plugins/devices/nvidia/legion-device-nvidia"],
+    #             # Passed to the plugin as `config` on every request.
+    #             # config = {},
+    #             # How long one call may run. Default 10s.
+    #             # timeout = "10s",
+    #         },
+    #     },
+    #     # Devices declared by hand, for hardware no plugin reports.
+    #     static = [
+    #         {
+    #             vendor = "xilinx", type = "fpga", model = "u250",
+    #             attributes = { memoryMiB = 65536 },
+    #             # `cdi` names the device in a CDI spec under cdiSpecDirs,
+    #             # whose container edits a container task then gets.
+    #             instances = [{ id = "0", cdi = "xilinx.com/fpga=0" }],
+    #         },
+    #     ],
+    #     # Where CDI spec files (JSON) are read. Default:
+    #     cdiSpecDirs = ["/etc/cdi", "/var/run/cdi"],
+    # },
 }

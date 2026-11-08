@@ -36,6 +36,7 @@ loses a member is restarted whole.
 | `gang = { min = 6 }` | Place once at least 6 fit together. The rest place as room appears. `min` must be between 1 and `count`. |
 | `gang = { placementTimeout = "30m" }` | Fail the job if the gang has waited 30 minutes without reaching its quorum ([Placement timeout](#placement-timeout)). |
 | `gang = { onMemberLoss = "replace" }` | What a lost member does to the rest: `restart` (default), `replace`, or `fail` ([When a member is lost](#when-a-member-is-lost)). |
+| `gang = { topology = { key = "rack" } }` | Place every member within one value of a node attribute: one rack, one NVLink domain ([Topology](#topology)). |
 | `gang = false`, or no `gang` | Replicas place independently (the default). |
 
 The fields combine: `gang = { min = 6, placementTimeout = "30m", onMemberLoss
@@ -46,11 +47,12 @@ The fields combine: `gang = { min = 6, placementTimeout = "30m", onMemberLoss
 | `min` | `count` | The gang's **quorum**: the replicas that must run together. If `legion job scale` lowers the count below `min`, the quorum drops with it. |
 | `placementTimeout` | unset (wait indefinitely) | How long the gang may wait for its quorum before its job fails. A duration (`"30m"`, `"2h"`) or a number of seconds; at least `1s`. |
 | `onMemberLoss` | `"restart"` | What a loss that leaves fewer than `min` running does to the survivors. |
+| `topology` | unset (any nodes) | `{ key = "<node attribute>", mode = "required" \| "preferred" }`. `mode` defaults to `"required"`. |
 
 Unknown fields are rejected, not parsed and ignored:
 
 ```console
-error: unknown field `recovery` in gang, expected one of `min`, `placementTimeout`, `onMemberLoss` (see docs/gang-scheduling.md)
+error: unknown field `recovery` in gang, expected one of `min`, `placementTimeout`, `onMemberLoss`, `topology` (see docs/gang-scheduling.md)
 ```
 
 `legion job schema` and `configs/jobs/maximal.ncl` describe the field too.
@@ -210,6 +212,74 @@ the rest of the gang keeps running beside the restarted member. For a
 framework that cannot take a member back mid-run, set `restart = { policy =
 "never" }` so a crash becomes a member failure and `onMemberLoss` applies.
 
+### Topology
+
+A gang that runs a collective (all-reduce, MPI) runs at the speed of its
+slowest link. `topology` keeps every member inside one **domain**: the nodes
+that share one value of a node attribute, such as a rack or an NVLink domain.
+
+```nickel
+{
+  name = "worker",
+  group = "worker",
+  count = 8,
+  resources = { cpu = 16000, memory = 131072, gpu = 8 },
+  gang = { topology = { key = "rack" } },       # mode = "required" by default
+}
+```
+
+`key` is a node attribute name, looked up the way `count.per` and `distinct`
+look one up: the node's config attributes, then its fingerprint, then its
+dynamic attributes. Give nodes the attribute in the worker config (`attrs = {
+rack = "r12" }`) or let a fingerprint report it. Nodes that do not have it are
+in no domain.
+
+| `mode` | Places | When no domain fits the quorum |
+| --- | --- | --- |
+| `"required"` (default) | Every member in one domain. | The gang waits, holding nothing, like any gang short of its quorum. |
+| `"preferred"` | Every member in one domain when one fits. | The fewest domains that together hold the quorum, then any eligible nodes. It never waits for topology. |
+
+**Which domain.** The scheduler estimates how many members fit in each domain
+(free capacity on each eligible node over the task's request, summed), then
+places the gang inside one domain at a time: first the domains that fit every
+member, smallest first, so large domains stay whole for large gangs (best
+fit); then the domains that fit the quorum, largest first. A domain the
+estimate admits can still fail (anti-affinity, a static port, `distinct`), in
+which case its placement is discarded and the next domain is tried. At most
+eight domains are tried per gang per plan.
+
+**Top-ups stay put.** A running gang that tops up (`onMemberLoss = "replace"`,
+or members above `min` placing later) places in the domain its running
+members occupy: only there under `required`, there first under `preferred`.
+A `restart` re-places the whole gang and may choose a different domain.
+
+**Seeing it.** `legion job plan` names the domain, or the best domain and how
+far it got:
+
+```console
+$ legion job plan trainer.ncl
+Gang:
+  worker: places (8 fit, needs all 8 together; 40 of 48 nodes accept it)
+    in rack=r12 (6 rack domain(s) have eligible nodes)
+$ legion job plan trainer.ncl
+Gang:
+  worker: would NOT place — 6 of the 8 it needs fit (all 8 together; 40 of 48 nodes accept it); the job would wait, holding nothing
+    No single rack fits the 8 member(s) the gang needs together (topology rack, required); the closest, rack=r12, fits 6. Failed to place task worker: ...
+```
+
+A `preferred` gang that spans racks prints `across more than one rack: none of
+the 6 with eligible nodes fits it alone (topology preferred)`.
+
+With `-j`, each gang report carries `topologyKey`, `topologyMode`,
+`topologyDomain` (the domain chosen, or the best one tried), and
+`topologyDomains` (how many domains have eligible nodes). The blocked job's
+`gang` report has the same fields.
+
+`topology` changes nothing else: the quorum, the timeout, member-loss
+handling, preemption floors, and the rendezvous variables are as for any gang.
+Preemption runs inside the domain being tried, so a gang that can only fit by
+preempting does so within one domain.
+
 ## Starting together
 
 A gang **places** together: every member is assigned a node in one plan, or
@@ -324,6 +394,9 @@ $ legion job plan trainer.ncl -j
 | `eligibleNodes` / `nodes` | Nodes whose constraints, permit, and volume drivers accept the task, out of the schedulable nodes. 0 eligible points at the jobspec, not at capacity. |
 | `reason` | Why the first missing replica did not fit. |
 | `placementTimeoutSeconds` | The gang's `placementTimeout`, in seconds. 0 when unset. |
+| `topologyKey` / `topologyMode` | The gang's `topology`, empty without one. |
+| `topologyDomain` | The attribute value the gang places in, or for a gang that does not place, the domain that came closest. Empty without `topology`, or when a `preferred` gang spans domains. |
+| `topologyDomains` | How many domains have at least one eligible node. |
 | `waitingSince` / `deadline` | `job info` only (0 in a dry run): when the wait started, and when it times out, as Unix seconds. `deadline` is 0 without a timeout. |
 
 A job without `gang` still fails its dry run when a replica does not fit, as
@@ -498,6 +571,8 @@ the new size instead.
 | `legion_gang_blocked_jobs` stays above zero while jobs keep placing | Smaller jobs take capacity as it frees, and the gang never sees enough at once. | Fence capacity for the gang with a node pool and `permit` ([Jobs, Tasks, and Scheduling](jobs-tasks-and-scheduling.md)), or stop competing work. See [Limitations](#limitations). |
 | A higher-band job fails to place, naming `disruption.minAvailable` | Every candidate victim is a gang member at its quorum. | Expected. Stop the gang, or give it `min` below `count`. |
 | `job validate` rejects the gang | One of the [validation](#validation) rules. | The error names the fix. |
+| `status: blocked`, the reason says `No single <key> fits` | A `required` topology gang: the eligible nodes have room, but no one domain holds the quorum. `topologyDomain` is the closest. | Free room in one domain, lower `count`/`min`, or switch to `mode = "preferred"`. |
+| `topologyDomains: 0` | No eligible node has the topology attribute. | Check the key's spelling and that the nodes report it (`legion node info`). |
 
 ## Limitations
 
@@ -536,8 +611,16 @@ the new size instead.
   place either, and a gang `restart` or `fail` stops only the gang task's
   allocations (`fail` stops the whole job). Split unrelated tasks into
   separate jobs.
-- **One job per gang.** Two jobs cannot be gang-scheduled together, and there
-  is no topology control (same rack, same zone) beyond ordinary constraints
-  and affinities.
+- **One job per gang.** Two jobs cannot be gang-scheduled together.
+- **One level of topology.** `topology` names one attribute. There is no
+  "one rack, else one zone" fallback: a `preferred` gang that fits no single
+  rack spans the fewest racks that hold it, with no preference for racks in
+  the same zone. At most eight domains are tried per plan, so on a cluster
+  with many domains a gang that fits only by preemption may not try the one
+  where it would have.
+- **No spot-interruption handling.** A spot reclaim reaches a gang as a node
+  loss or drain after the fact, and `onMemberLoss` applies then (`restart` by
+  default). Nothing reacts to the two-minute notice ahead of the loss, and a
+  fresh gang can be placed onto a node that has one.
 - **Older managers ignore `gang`.** A manager that predates the field accepts
   a jobspec with `gang` and schedules it without gang semantics.

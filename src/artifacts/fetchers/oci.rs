@@ -64,6 +64,39 @@ fn parse_reference(req: &FetchRequest<'_>) -> R<(Reference, ClientProtocol)> {
     Ok((reference, protocol))
 }
 
+/// Judge the registry `reference` resolves to with the worker's host guard,
+/// before any request to it. A registry the job named on loopback, on this
+/// node's own addresses, or at the cloud metadata service is refused unless
+/// the worker's `hostGuard.allow` opens it, as for an `http(s)` artifact.
+///
+/// The `http(s)` fetcher also pins its connection to the judged addresses;
+/// oci-client builds its own HTTP client with no resolver to pin, and
+/// follows redirects (a blob's CDN, the token `realm`) on its own, so those
+/// are not judged. Every blob is verified against the manifest's digest, so
+/// what a redirect returns cannot land in the task directory unless it is
+/// the content the manifest names.
+fn judge_registry(
+    req: &FetchRequest<'_>,
+    reference: &Reference,
+    protocol: &ClientProtocol,
+) -> R<()> {
+    let Some(guard) = req.limits.egress.as_deref() else {
+        return Ok(());
+    };
+    let scheme = match protocol {
+        ClientProtocol::Http => "http",
+        _ => "https",
+    };
+    let registry = url::Url::parse(&format!("{scheme}://{}/", reference.resolve_registry()))
+        .with_context(|| format!("{} names an invalid registry", req.redacted_source))?;
+    let host = registry
+        .host()
+        .with_context(|| format!("{} names no registry host", req.redacted_source))?;
+    let port = registry.port_or_known_default().unwrap_or(443);
+    crate::artifacts::fetchers::http::judged_addrs(guard, &host, port, req.redacted_source)?;
+    Ok(())
+}
+
 fn registry_auth(req: &FetchRequest<'_>) -> R<RegistryAuth> {
     match req.credential {
         None => Ok(RegistryAuth::Anonymous),
@@ -265,6 +298,7 @@ impl ArtifactFetcher for OciFetcher {
         if reference.digest().is_some() {
             return Ok(None);
         }
+        judge_registry(req, &reference, &protocol)?;
         let auth = registry_auth(req)?;
         // Pinning HEADs the reference itself, so no platform is selected: a
         // multi-platform tag pins to its index digest, which is what the
@@ -288,6 +322,7 @@ impl ArtifactFetcher for OciFetcher {
 
     fn fetch(&self, req: &FetchRequest<'_>, sink: &mut ArtifactSink) -> R<FetchedArtifact> {
         let (reference, protocol) = parse_reference(req)?;
+        judge_registry(req, &reference, &protocol)?;
         let auth = registry_auth(req)?;
         let client = oci_client(protocol, req.media_type.is_none(), &auth);
         let runtime = blocking_runtime()?;
@@ -304,6 +339,7 @@ impl ArtifactFetcher for OciFetcher {
                     runtime,
                     &client,
                     &reference,
+                    &auth,
                     manifest,
                     manifest_digest,
                     media_type,
@@ -485,13 +521,147 @@ static TAG_FLIGHTS: std::sync::LazyLock<
 /// start its image.
 struct ImageBlobCache<'a> {
     store: &'a ContentStore,
+    /// Whether this pull may be served from the store. `false` for a pull
+    /// the cache is not authorized for ([`ImageBlobCache::authorize`]): its
+    /// manifests come from the registry, which so proves this credential
+    /// may read the repository, and only blobs already verified as
+    /// [`Self::repository`]'s are placed from the store (a moved tag still
+    /// downloads only the layers that changed). It keeps what it pulls.
+    reads: bool,
+    /// The repository this pull is from ([`image_repository`]).
+    repository: String,
+}
+
+/// How long the registry's answer that a credential may pull an image is
+/// trusted, before a cached private image is checked with the registry
+/// again.
+const CACHE_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Recent proof that a credential may pull an image: the registry answered
+/// it for the image's digest or its tag. In memory only, because the key
+/// holds an unsalted hash of the credential, and a restarted worker simply
+/// asks the registry again.
+static CACHE_GRANTS: std::sync::LazyLock<std::sync::Mutex<CacheGrants>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// `(digest, repository, credential fingerprint)` -> when the registry
+/// answered.
+type CacheGrants = std::collections::HashMap<(String, String, [u8; 32]), std::time::Instant>;
+
+fn grant_key(digest: &str, repository: &str, auth: &RegistryAuth) -> (String, String, [u8; 32]) {
+    (
+        digest.to_string(),
+        repository.to_string(),
+        credential_fingerprint(auth),
+    )
+}
+
+fn record_grant(digest: &str, repository: &str, auth: &RegistryAuth) {
+    CACHE_GRANTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            grant_key(digest, repository, auth),
+            std::time::Instant::now(),
+        );
+}
+
+fn grant_fresh(digest: &str, repository: &str, auth: &RegistryAuth) -> bool {
+    let mut grants = CACHE_GRANTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    grants.retain(|_, at| at.elapsed() < CACHE_GRANT_TTL);
+    grants.contains_key(&grant_key(digest, repository, auth))
+}
+
+/// The repository an image comes from, registry included
+/// (`index.docker.io/library/nginx`): what a cached image's provenance is
+/// recorded and checked under.
+fn image_repository(reference: &Reference) -> String {
+    format!(
+        "{}/{}",
+        reference.resolve_registry(),
+        reference.repository()
+    )
 }
 
 impl ImageBlobCache<'_> {
+    /// Whether a pull of `digest` from `reference`'s repository, with `auth`,
+    /// may be served from the node's store.
+    ///
+    /// The store is shared by every job on the node, and a blob in it says
+    /// nothing about who may read it. So a cached image is served only when
+    /// its bytes were pulled and verified from this same repository before
+    /// (another repository answering for the digest proves nothing), and
+    /// then only when it was public there, or the registry accepts this
+    /// credential for it: a recent grant, or one manifest `HEAD` by digest.
+    /// A registry that refuses the credential fails the pull; it is never
+    /// served from the cache. A registry that cannot answer leaves the
+    /// cache out of this pull (`false`), and the pull goes to the registry.
+    #[allow(clippy::too_many_arguments)]
+    fn authorize(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        client: &Client,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        digest: &str,
+        repository: &str,
+        redacted: &str,
+    ) -> R<bool> {
+        match self.store.image_source(digest, repository) {
+            Ok(Some(true)) => return Ok(true),
+            Ok(Some(false)) => {}
+            Ok(None) | Err(_) => return Ok(false),
+        }
+        if grant_fresh(digest, repository, auth) {
+            return Ok(true);
+        }
+        let target = reference.clone_with_digest(digest.to_string());
+        match runtime.block_on(client.fetch_manifest_digest(&target, auth)) {
+            Ok(_) => {
+                record_grant(digest, repository, auth);
+                if matches!(auth, RegistryAuth::Anonymous) {
+                    if let Ok(parsed) = ContentDigest::parse(digest) {
+                        let _ = self.store.record_image_source(&parsed, repository, true);
+                    }
+                }
+                Ok(true)
+            }
+            Err(err) => {
+                let err = anyhow::Error::from(err);
+                if crate::artifacts::fetcher::is_transient_fetch_error(&err) {
+                    Ok(false)
+                } else {
+                    Err(err).with_context(|| {
+                        format!(
+                            "{redacted}: the registry refused this job's credentials for an \
+                             image this node holds; a cached private image is served only to \
+                             jobs its registry lets pull it"
+                        )
+                    })
+                }
+            }
+        }
+    }
+
+    /// Whether the cache may serve `digest` from `repository` to `auth`
+    /// with no registry to ask: a public image, or a recent grant.
+    fn authorized_offline(&self, digest: &str, repository: &str, auth: &RegistryAuth) -> bool {
+        match self.store.image_source(digest, repository) {
+            Ok(Some(true)) => true,
+            Ok(Some(false)) => grant_fresh(digest, repository, auth),
+            _ => false,
+        }
+    }
+
     /// A cached blob's bytes, for manifests and indexes (small JSON, so they
     /// are rehashed on every read: one that no longer matches its digest is
     /// dropped from the store and fetched again).
     fn read(&self, digest: &str) -> Option<Vec<u8>> {
+        if !self.reads {
+            return None;
+        }
         let digest = ContentDigest::parse(digest).ok()?;
         if !self.store.contains(&digest).ok()? {
             return None;
@@ -503,6 +673,14 @@ impl ImageBlobCache<'_> {
     /// Places a cached blob at `dest`: a hard link into the store's blob
     /// (same filesystem, no bytes copied), else a copy. `false` on a miss.
     fn place(&self, digest: &str, dest: &std::path::Path) -> bool {
+        if !self.reads
+            && !matches!(
+                self.store.image_source(digest, &self.repository),
+                Ok(Some(_))
+            )
+        {
+            return false;
+        }
         let Ok(digest) = ContentDigest::parse(digest) else {
             return false;
         };
@@ -516,10 +694,69 @@ impl ImageBlobCache<'_> {
         std::fs::hard_link(&entry.path, dest).is_ok() || std::fs::copy(&entry.path, dest).is_ok()
     }
 
+    /// Copies a cached blob to `dest` (an in-kernel copy, a reflink where
+    /// the filesystem offers one). For files a task sees directly, such as
+    /// ORAS layers: the task gets its own copy, so it cannot change what the
+    /// next allocation receives. `false` on a miss, and, like
+    /// [`Self::place`], for a blob not verified as [`Self::repository`]'s
+    /// when this pull is not authorized to read the store.
+    fn copy_out(&self, digest: &str, dest: &std::path::Path) -> bool {
+        if !self.reads
+            && !matches!(
+                self.store.image_source(digest, &self.repository),
+                Ok(Some(_))
+            )
+        {
+            return false;
+        }
+        let Ok(digest) = ContentDigest::parse(digest) else {
+            return false;
+        };
+        let Ok(Some(entry)) = self.store.get(&digest) else {
+            return false;
+        };
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(dest);
+        std::fs::copy(&entry.path, dest).is_ok()
+    }
+
+    /// Keeps a copy of a blob just pulled into `path`; `path` stays the
+    /// task's own file. The store verifies the digest as it copies, and the
+    /// blob is recorded as [`Self::repository`]'s (`anonymous`: pulled with
+    /// no credential), which is what lets [`Self::copy_out`] serve it to a
+    /// later pull from the same repository.
+    fn keep_copy(&self, digest: &str, path: &std::path::Path, anonymous: bool) {
+        let Ok(digest) = ContentDigest::parse(digest) else {
+            return;
+        };
+        let opts = PutOptions::default()
+            .expect(digest.clone())
+            .label("oras layer");
+        if let Err(err) = self.store.put_file(ContentClass::Artifacts, path, opts) {
+            warn!(
+                %digest,
+                error = %format!("{err:#}"),
+                "Could not cache ORAS layer in node content store"
+            );
+            return;
+        }
+        if let Err(err) = self
+            .store
+            .record_image_source(&digest, &self.repository, anonymous)
+        {
+            debug!(error = %format!("{err:#}"), "Could not record ORAS layer provenance");
+        }
+    }
+
     /// The platform manifest of the image `top_digest` names, when it and
     /// every blob it lists are already in the store: an image this node can
     /// lay out with no registry request. `None` when anything is missing.
     fn whole_image(&self, top_digest: &str) -> Option<(Vec<u8>, String)> {
+        if !self.reads {
+            return None;
+        }
         let top = self.read(top_digest)?;
         let (raw, digest) = match serde_json::from_slice::<OciManifest>(&top).ok()? {
             OciManifest::Image(_) => (top, top_digest.to_string()),
@@ -599,6 +836,7 @@ impl ImageBlobCache<'_> {
         redacted: &str,
     ) -> R<String> {
         let key = reference.whole();
+        let repository = image_repository(reference);
         match runtime.block_on(client.fetch_manifest_digest(reference, auth)) {
             Ok(digest) => {
                 if let Ok(parsed) = ContentDigest::parse(&digest) {
@@ -606,22 +844,39 @@ impl ImageBlobCache<'_> {
                         debug!(error = %format!("{err:#}"), "Could not record image tag digest");
                     }
                 }
+                // The registry answered this credential for the tag.
+                record_grant(&digest, &repository, auth);
                 Ok(digest)
             }
-            Err(err) => match self.store.image_ref(&key) {
-                Ok(Some((digest, resolved_at))) => {
-                    warn!(
-                        image = %redacted,
-                        %digest,
-                        resolved_at,
-                        error = %err,
-                        "Registry did not answer for this tag; using the digest it last resolved                          to on this node"
-                    );
-                    Ok(digest.as_str().to_string())
+            Err(err) => {
+                let err = anyhow::Error::from(err);
+                // Only when the registry cannot answer, and only for an image
+                // this credential may read with no registry to ask: never
+                // after the registry refused the credential, and never for a
+                // private image another job's credential pulled.
+                let fallback = crate::artifacts::fetcher::is_transient_fetch_error(&err)
+                    .then(|| self.store.image_ref(&key).ok().flatten())
+                    .flatten()
+                    .filter(|(digest, _)| {
+                        self.authorized_offline(digest.as_str(), &repository, auth)
+                    });
+                match fallback {
+                    Some((digest, resolved_at)) => {
+                        warn!(
+                            image = %redacted,
+                            %digest,
+                            resolved_at,
+                            error = %err,
+                            "Registry did not answer for this tag; using the digest it last \
+                             resolved to on this node"
+                        );
+                        Ok(digest.as_str().to_string())
+                    }
+                    None => {
+                        Err(err).with_context(|| format!("resolve manifest digest for {redacted}"))
+                    }
                 }
-                _ => Err(anyhow::Error::from(err))
-                    .with_context(|| format!("resolve manifest digest for {redacted}")),
-            },
+            }
         }
     }
 }
@@ -637,6 +892,7 @@ impl OciFetcher {
         runtime: &tokio::runtime::Runtime,
         client: &Client,
         reference: &Reference,
+        auth: &RegistryAuth,
         manifest: OciImageManifest,
         manifest_digest: String,
         media_type: &str,
@@ -660,6 +916,27 @@ impl OciFetcher {
         let total = check_size_budget(req, &selected)?;
         sink.set_bytes_total(Some(total));
 
+        // Layers (model weights, usually) are content addressed by their
+        // digest, so the node content store serves them like image layers:
+        // a layer the node already holds is copied in, not downloaded
+        // (review finding AI6; docs/artifacts.md, "ORAS layers"). The
+        // manifest just came from the registry with this job's credential,
+        // which proves it may read the repository; as for an image pulled
+        // that way (`reads: false`), only layers verified as this
+        // repository's are served from the store, so a manifest elsewhere
+        // naming a private layer's digest never reads it from the cache.
+        let store = sink.content_store().cloned();
+        let anonymous = matches!(auth, RegistryAuth::Anonymous);
+        let cache = store.as_deref().map(|store| ImageBlobCache {
+            store,
+            reads: false,
+            repository: image_repository(reference),
+        });
+        let _claim = cache
+            .as_ref()
+            .map(|_| ImagePullClaim::claim(&format!("oras:{manifest_digest}:{media_type}")));
+        let (mut cached, mut pulled) = (0usize, 0usize);
+
         let layers_dir = sink.dir().join("layers");
         let mut files = Vec::with_capacity(selected.len());
         for descriptor in selected {
@@ -677,9 +954,31 @@ impl OciFetcher {
                         .unwrap_or_else(|| "layer".to_string())
                 });
             let path = layers_dir.join(file_name);
-            runtime.block_on(pull_blob_to_file(client, reference, descriptor, &path))?;
+            // Copies both ways, never a shared inode: the task can write to
+            // its layer files without touching the store's.
+            if cache
+                .as_ref()
+                .is_some_and(|cache| cache.copy_out(&descriptor.digest, &path))
+            {
+                cached += 1;
+            } else {
+                runtime.block_on(pull_blob_to_file(client, reference, descriptor, &path))?;
+                if let Some(cache) = cache.as_ref() {
+                    cache.keep_copy(&descriptor.digest, &path, anonymous);
+                }
+                pulled += 1;
+            }
             sink.record_external_bytes(descriptor.size.max(0) as u64)?;
             files.push(path);
+        }
+        if cache.is_some() {
+            info!(
+                artifact = %req.redacted_source,
+                digest = %manifest_digest,
+                layers_cached = cached,
+                layers_pulled = pulled,
+                "ORAS layers ready (node content store)"
+            );
         }
         Ok(FetchedArtifact {
             bytes: sink.bytes_written(),
@@ -713,7 +1012,12 @@ impl OciFetcher {
         auth: &RegistryAuth,
     ) -> R<FetchedArtifact> {
         let store = sink.content_store().cloned();
-        let cache = store.as_deref().map(|store| ImageBlobCache { store });
+        let repository = image_repository(reference);
+        let cache = store.as_deref().map(|store| ImageBlobCache {
+            store,
+            reads: true,
+            repository: repository.clone(),
+        });
         let requested_at = std::time::Instant::now();
 
         // The digest the reference names: given, or (with a cache to serve
@@ -727,6 +1031,23 @@ impl OciFetcher {
                 || cache.resolve_tag(runtime, client, reference, auth, req.redacted_source),
             )?),
             (None, None) => None,
+        };
+        // Serve from the store only what this pull is authorized for; any
+        // other pull goes to the registry for every blob.
+        let cache = match (cache, top_digest.as_deref()) {
+            (Some(cache), Some(digest)) => {
+                let reads = cache.authorize(
+                    runtime,
+                    client,
+                    reference,
+                    auth,
+                    digest,
+                    &repository,
+                    req.redacted_source,
+                )?;
+                Some(ImageBlobCache { reads, ..cache })
+            }
+            (cache, _) => cache,
         };
         // An image already whole on the node (every start but its first)
         // is laid out with no claim: a burst of starts of one image used to
@@ -771,6 +1092,10 @@ impl OciFetcher {
         std::fs::write(&manifest_path, &raw_manifest)?;
 
         let (mut cached, mut pulled) = (0usize, 0usize);
+        let blob_digests: Vec<String> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.digest.clone())
+            .collect();
         for descriptor in descriptors {
             req.limits.check_deadline(req.redacted_source)?;
             let path = blob_path(&layout_root, &descriptor.digest)?;
@@ -788,7 +1113,7 @@ impl OciFetcher {
             }
             sink.record_external_bytes(descriptor.size.max(0) as u64)?;
         }
-        if cache.is_some() {
+        if let Some(cache) = cache.as_ref() {
             info!(
                 image = %req.redacted_source,
                 digest = %manifest_digest,
@@ -797,6 +1122,29 @@ impl OciFetcher {
                 manifest_cached,
                 "Image layout ready (node content store)"
             );
+            // Every blob of this image is now verified on the node as this
+            // repository's, which is what lets a later pull be served here.
+            // A pull served whole from the store already recorded them.
+            if !cache.reads || pulled > 0 || !manifest_cached {
+                let anonymous = matches!(auth, RegistryAuth::Anonymous);
+                let digests = top_digest
+                    .iter()
+                    .chain(std::iter::once(&manifest_digest))
+                    .chain(blob_digests.iter())
+                    .filter_map(|digest| ContentDigest::parse(digest).ok());
+                for digest in digests {
+                    if let Err(err) =
+                        cache
+                            .store
+                            .record_image_source(&digest, &repository, anonymous)
+                    {
+                        debug!(error = %format!("{err:#}"), "Could not record image provenance");
+                    }
+                }
+            }
+            if let Some(digest) = top_digest.as_deref() {
+                record_grant(digest, &repository, auth);
+            }
         }
 
         let manifest_media_type = manifest
@@ -1096,6 +1444,10 @@ mod tests {
         routes: Routes,
         log: Arc<std::sync::Mutex<Vec<String>>>,
         down: Arc<std::sync::atomic::AtomicBool>,
+        /// When set, the `Authorization` header every request must carry
+        /// (`Basic <base64>`); `/v2/` then answers `401` with a Basic
+        /// challenge, as a private registry does.
+        basic: Arc<std::sync::Mutex<Option<String>>>,
     }
 
     impl FakeRegistry {
@@ -1106,8 +1458,9 @@ mod tests {
             let routes: Routes = Arc::default();
             let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
             let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (thread_routes, thread_log, thread_down) =
-                (routes.clone(), log.clone(), down.clone());
+            let basic: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+            let (thread_routes, thread_log, thread_down, thread_basic) =
+                (routes.clone(), log.clone(), down.clone(), basic.clone());
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { continue };
@@ -1116,16 +1469,33 @@ mod tests {
                     if reader.read_line(&mut request_line).is_err() {
                         continue;
                     }
+                    let mut authorization = None;
                     loop {
                         let mut header = String::new();
                         if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
                             break;
+                        }
+                        if let Some((name, value)) = header.split_once(':') {
+                            if name.eq_ignore_ascii_case("authorization") {
+                                authorization = Some(value.trim().to_string());
+                            }
                         }
                     }
                     let mut parts = request_line.split_whitespace();
                     let method = parts.next().unwrap_or_default().to_string();
                     let path = parts.next().unwrap_or_default().to_string();
                     thread_log.lock().unwrap().push(format!("{method} {path}"));
+                    let required = thread_basic.lock().unwrap().clone();
+                    if let Some(required) = required {
+                        if path == "/v2/" || authorization.as_deref() != Some(required.as_str()) {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic \
+                                  realm=\"fake\"\r\nContent-Length: 0\r\n\
+                                  Connection: close\r\n\r\n",
+                            );
+                            continue;
+                        }
+                    }
                     let found = if thread_down.load(std::sync::atomic::Ordering::SeqCst) {
                         None
                     } else if path == "/v2/" {
@@ -1169,6 +1539,7 @@ mod tests {
                 routes,
                 log,
                 down,
+                basic,
             }
         }
 
@@ -1272,6 +1643,198 @@ mod tests {
         }
     }
 
+    /// Publishes `lib/img:<tag>` as an ORAS artifact: one manifest whose
+    /// layers carry `media_type` and a title annotation each.
+    fn publish_oras(
+        registry: &FakeRegistry,
+        tag: &str,
+        media_type: &str,
+        layers: &[(&str, &[u8])],
+    ) {
+        publish_oras_in(registry, "lib/img", tag, media_type, layers, true);
+    }
+
+    /// [`publish_oras`] in `repository`; with `blobs` false only the manifest
+    /// is served, as for a repository that names blobs it does not hold.
+    fn publish_oras_in(
+        registry: &FakeRegistry,
+        repository: &str,
+        tag: &str,
+        media_type: &str,
+        layers: &[(&str, &[u8])],
+        blobs: bool,
+    ) {
+        let descriptor = |media_type: &str, bytes: &[u8]| {
+            json!({
+                "mediaType": media_type,
+                "digest": ContentDigest::of_bytes(bytes).as_str(),
+                "size": bytes.len(),
+            })
+        };
+        let config = b"{}".as_slice();
+        let manifest = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+            "config": descriptor("application/vnd.oci.empty.v1+json", config),
+            "layers": layers
+                .iter()
+                .map(|(title, bytes)| {
+                    let mut entry = descriptor(media_type, bytes);
+                    let mut annotations = serde_json::Map::new();
+                    annotations.insert(TITLE_ANNOTATION.to_string(), json!(title));
+                    entry["annotations"] = Value::Object(annotations);
+                    entry
+                })
+                .collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        let layer_blobs = layers.iter().map(|(_, bytes)| *bytes);
+        for blob in std::iter::once(config).chain(layer_blobs.filter(|_| blobs)) {
+            registry.serve(
+                format!(
+                    "/v2/{repository}/blobs/{}",
+                    ContentDigest::of_bytes(blob).as_str()
+                ),
+                "application/octet-stream",
+                blob.to_vec(),
+            );
+        }
+        let digest = ContentDigest::of_bytes(&manifest).as_str().to_string();
+        for name in [tag.to_string(), digest] {
+            registry.serve(
+                format!("/v2/{repository}/manifests/{name}"),
+                oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+                manifest.clone(),
+            );
+        }
+    }
+
+    /// AI6: ORAS layers (how model weights ship) are served from the node
+    /// content store by digest, like image layers: the second pull of the
+    /// same weights downloads no layer, and a new version downloads only
+    /// the layers it changed.
+    #[test]
+    fn oras_layers_are_cached_by_digest_test() -> R<()> {
+        let registry = FakeRegistry::start();
+        let dir = tempfile::tempdir()?;
+        let store = open_store(dir.path());
+        let media_type = "application/vnd.acme.model.weights.v1";
+        let source = format!("oci://127.0.0.1:{}/lib/img:v1?protocol=http", registry.port);
+        let pull_oras = |name: &str| -> R<Vec<std::path::PathBuf>> {
+            let parsed = parse_artifact_source(&source)?;
+            let limits = FetchLimits::default();
+            let mut sink = ArtifactSink::new(dir.path().join(name), limits.max_bytes)?;
+            sink.set_content_store(Some(store.clone()));
+            let request = FetchRequest {
+                media_type: Some(media_type),
+                ..request(&parsed, &limits, &source)
+            };
+            match OciFetcher::new().fetch(&request, &mut sink)?.payload {
+                FetchedPayload::Layers { files, .. } => Ok(files),
+                other => panic!("expected layers, got {other:?}"),
+            }
+        };
+        let (shard_a, shard_b) = (b"weights-shard-a".as_slice(), b"weights-shard-b".as_slice());
+        publish_oras(
+            &registry,
+            "v1",
+            media_type,
+            &[
+                ("model-00001.safetensors", shard_a),
+                ("model-00002.safetensors", shard_b),
+            ],
+        );
+
+        let first = pull_oras("first")?;
+        assert_eq!(std::fs::read(&first[0])?, shard_a);
+        assert_eq!(
+            blob_pulls(&registry.take_log()).len(),
+            2,
+            "both shards pulled"
+        );
+
+        let second = pull_oras("second")?;
+        assert_eq!(std::fs::read(&second[1])?, shard_b);
+        assert!(
+            blob_pulls(&registry.take_log()).is_empty(),
+            "the second pull downloads no layer"
+        );
+
+        // v1 again under a new manifest with one changed shard.
+        let shard_b2 = b"weights-shard-b-v2".as_slice();
+        publish_oras(
+            &registry,
+            "v1",
+            media_type,
+            &[
+                ("model-00001.safetensors", shard_a),
+                ("model-00002.safetensors", shard_b2),
+            ],
+        );
+        let third = pull_oras("third")?;
+        assert_eq!(std::fs::read(&third[1])?, shard_b2);
+        assert_eq!(
+            blob_pulls(&registry.take_log()).len(),
+            1,
+            "only the changed shard is downloaded"
+        );
+        Ok(())
+    }
+
+    /// Regression (merging AI6's ORAS layer cache with the private image
+    /// cache fix): a cached layer is served only to a pull from the
+    /// repository it was verified in. A manifest in another repository that
+    /// names a private layer's digest gets the registry's answer for that
+    /// repository (here, no such blob), never the node's copy.
+    #[test]
+    fn a_cached_oras_layer_is_served_only_to_its_own_repository_test() -> R<()> {
+        let registry = FakeRegistry::start();
+        let dir = tempfile::tempdir()?;
+        let store = open_store(dir.path());
+        let media_type = "application/vnd.acme.model.weights.v1";
+        let pull_oras = |name: &str, repository: &str| -> R<Vec<std::path::PathBuf>> {
+            let source = format!(
+                "oci://127.0.0.1:{}/{repository}:v1?protocol=http",
+                registry.port
+            );
+            let parsed = parse_artifact_source(&source)?;
+            let limits = FetchLimits::default();
+            let mut sink = ArtifactSink::new(dir.path().join(name), limits.max_bytes)?;
+            sink.set_content_store(Some(store.clone()));
+            let request = FetchRequest {
+                media_type: Some(media_type),
+                ..request(&parsed, &limits, &source)
+            };
+            match OciFetcher::new().fetch(&request, &mut sink)?.payload {
+                FetchedPayload::Layers { files, .. } => Ok(files),
+                other => panic!("expected layers, got {other:?}"),
+            }
+        };
+        let secret = b"private-weights".as_slice();
+        let layers = [("model.safetensors", secret)];
+        publish_oras(&registry, "v1", media_type, &layers);
+        pull_oras("owner", "lib/img")?;
+        registry.take_log();
+
+        // The same repository is served from the store.
+        let again = pull_oras("owner-again", "lib/img")?;
+        assert_eq!(std::fs::read(&again[0])?, secret);
+        assert!(blob_pulls(&registry.take_log()).is_empty());
+
+        // Another repository naming the same digest is not.
+        publish_oras_in(&registry, "attacker/img", "v1", media_type, &layers, false);
+        pull_oras("attacker", "attacker/img")
+            .expect_err("the attacker's repository does not hold the layer");
+        // A failed pull may leave an empty file; never the cached bytes.
+        let attacker_layer = dir.path().join("attacker/layers/model.safetensors");
+        assert_ne!(
+            std::fs::read(&attacker_layer).ok().as_deref(),
+            Some(secret),
+            "the cached layer was copied out"
+        );
+        Ok(())
+    }
+
     fn blob_pulls(log: &[String]) -> Vec<&String> {
         log.iter()
             .filter(|line| line.starts_with("GET") && line.contains("/blobs/"))
@@ -1282,6 +1845,142 @@ mod tests {
         log.iter()
             .filter(|line| line.starts_with("GET") && line.contains("/manifests/"))
             .collect()
+    }
+
+    /// Pulls `source` as `credential` into a fresh directory under `dir`.
+    fn pull_as(
+        dir: &std::path::Path,
+        name: &str,
+        source: &str,
+        credential: Option<&Credential>,
+        store: Arc<ContentStore>,
+    ) -> R<()> {
+        let parsed = parse_artifact_source(source)?;
+        let limits = FetchLimits::default();
+        let mut sink = ArtifactSink::new(dir.join(name), limits.max_bytes)?;
+        sink.set_content_store(Some(store));
+        let request = FetchRequest {
+            credential,
+            ..request(&parsed, &limits, source)
+        };
+        OciFetcher::new().fetch(&request, &mut sink)?;
+        Ok(())
+    }
+
+    /// Regression (TODO "Node caches serve private images to jobs without
+    /// credentials for them"): a private image one job pulled used to start
+    /// for any job on the node, by digest with no request at all, or by tag
+    /// whenever the registry refused the job's credential. Now the cache
+    /// serves it only to a credential the registry accepts, falls back only
+    /// when the registry cannot answer, and never across repositories.
+    #[test]
+    fn a_cached_private_image_is_served_only_to_credentials_the_registry_accepts_test() -> R<()> {
+        use base64::Engine;
+        let registry = FakeRegistry::start();
+        let dir = tempfile::tempdir()?;
+        let store = open_store(dir.path());
+        let digest = registry.publish("v1", br#"{"config":{}}"#, &[b"secret-layer".as_slice()]);
+        *registry.basic.lock().unwrap() = Some(format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("alice:s3cret")
+        ));
+        let port = registry.port;
+        let tag = format!("oci://127.0.0.1:{port}/lib/img:v1?protocol=http");
+        let by_digest = format!("oci://127.0.0.1:{port}/lib/img@{digest}?protocol=http");
+        let alice = Credential::Basic {
+            username: "alice".into(),
+            password: "s3cret".into(),
+        };
+        let mallory = Credential::Basic {
+            username: "mallory".into(),
+            password: "guess".into(),
+        };
+
+        // Alice pulls it: it is on the node now.
+        pull_as(dir.path(), "alice", &tag, Some(&alice), store.clone())?;
+
+        // Nobody else gets it from the cache, by digest or by tag.
+        for (name, source, credential) in [
+            ("anon-digest", &by_digest, None),
+            ("anon-tag", &tag, None),
+            ("mallory-digest", &by_digest, Some(&mallory)),
+            ("mallory-tag", &tag, Some(&mallory)),
+        ] {
+            let err = pull_as(dir.path(), name, source, credential, store.clone()).expect_err(name);
+            assert!(
+                !dir.path().join(name).join("oci").exists(),
+                "{name}: {err:#}"
+            );
+        }
+        // Alice still does, from the cache: no blob is downloaded again.
+        registry.take_log();
+        pull_as(
+            dir.path(),
+            "alice-again",
+            &by_digest,
+            Some(&alice),
+            store.clone(),
+        )?;
+        assert!(blob_pulls(&registry.take_log()).is_empty());
+
+        // The registry stops answering: Alice's cached image still starts;
+        // an anonymous pull still does not.
+        registry
+            .down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        pull_as(
+            dir.path(),
+            "alice-offline",
+            &tag,
+            Some(&alice),
+            store.clone(),
+        )?;
+        pull_as(dir.path(), "anon-offline", &tag, None, store.clone())
+            .expect_err("no fallback without a credential the registry accepted");
+        registry
+            .down
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // Another repository answering for the same digest is not this
+        // image's source: the cache is not used for it.
+        *registry.basic.lock().unwrap() = None;
+        let elsewhere = format!("oci://127.0.0.1:{port}/attacker/img@{digest}?protocol=http");
+        pull_as(dir.path(), "elsewhere", &elsewhere, None, store.clone())
+            .expect_err("the attacker's repository does not hold the image");
+        Ok(())
+    }
+
+    /// Regression (TODO "Git and OCI artifact fetches ... are still not
+    /// judged"): a registry on a guarded address is refused before any
+    /// request reaches it, and opened by an exact `hostGuard.allow` entry.
+    #[test]
+    fn the_host_guard_judges_the_registry_test() -> R<()> {
+        use crate::structs::host_guard::{HostGuard, HostGuardConfig};
+        let registry = FakeRegistry::start();
+        registry.publish("v1", br#"{"config":{}}"#, &[b"layer".as_slice()]);
+        let source = format!("oci://127.0.0.1:{}/lib/img:v1?protocol=http", registry.port);
+        let pull_guarded = |guard: HostGuard| -> R<()> {
+            let dir = tempfile::tempdir()?;
+            let parsed = parse_artifact_source(&source)?;
+            let limits = FetchLimits {
+                egress: Some(Arc::new(guard)),
+                ..FetchLimits::default()
+            };
+            let mut sink = ArtifactSink::new(dir.path().join("img"), limits.max_bytes)?;
+            OciFetcher::new().fetch(&request(&parsed, &limits, &source), &mut sink)?;
+            Ok(())
+        };
+        let err = pull_guarded(HostGuard::new(&HostGuardConfig::default())?)
+            .expect_err("loopback is guarded");
+        assert!(format!("{err:#}").contains("host guard refuses"), "{err:#}");
+        assert!(registry.take_log().is_empty(), "refused before any request");
+
+        pull_guarded(HostGuard::new(&HostGuardConfig {
+            allow: vec![format!("127.0.0.1:{}", registry.port)],
+            ..HostGuardConfig::default()
+        })?)?;
+        assert!(!registry.take_log().is_empty());
+        Ok(())
     }
 
     /// P2-9: every start pulled the image again, and anonymous registries

@@ -260,7 +260,8 @@ Reconcile loop:
 - `batch` tasks: old batch allocations that are still running are not killed by default during rollout. The rollout waits for them to finish (the batch retire window), and the group's event reads `Group <name> waiting for batch retire window` meanwhile.
 - `batchKillAfter`: if set, running old batch allocations are force-retired after that elapsed time in-step.
 - Finished old allocations (`complete` or `failed`, of any lifecycle) run nothing, so the rollout retires them at once and before any live allocation of the same task. They never wait on the batch retire window.
-- `sidecar` tasks: rollout follows the group progression and updates in lockstep with the group.
+- `sidecar` tasks: rollout follows the group progression and updates in lockstep with the group. A sidecar on a node where the batch retire window keeps a running old batch step of its group waits with that step, so the step never runs on without it.
+- A `batch` task that another task waits on to exit (`dependsOn` with `complete` or `success`) is placed whole at every step, whatever the step's fraction. Its dependents need every replica to finish, so placing a fraction of it would hold them, and the step with them, forever.
 
 ### Resubmitting a batch or DAG job
 
@@ -269,6 +270,8 @@ A new version of a batch job runs from the top. Its tasks are new task configs w
 1. The old version's finished steps are retired on the first tick. A step still running holds the group until it exits (or `batchKillAfter` passes).
 2. The rollout places the new version's DAG roots. Each later step is placed when its dependency's exit is reported, through a `rollout_tick` (see [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#task-lists-and-dependency-readiness)).
 3. A `service` that depends on a batch step is placed once that step succeeds, and the rollout completes when it is healthy.
+
+Releasing a held dependent is DAG progress inside the new version, not a step of replacing the old one, so every `rollout_tick` does it first, ahead of the rollout's gates. A dependent is placed even while the rollout is paused, waits for a manual advance or a step stagger, or waits on the batch retire window, and the rollout logs `Released N allocation(s) held behind a dependency's exit`. The release does not widen a step: a `batch` dependent is placed whole, but a `service` or `sidecar` dependent is placed only up to its group's active step target, and not while `destroyFirst` still has old allocations of it to retire. A paused rollout stays paused: the tick releases the dependents and runs no step.
 
 Once the new version lands, the old version is superseded: nothing more of it is placed. A service of the old version that was still waiting on its dependencies never starts, and the new version's service replaces it.
 

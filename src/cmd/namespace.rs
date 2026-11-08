@@ -106,6 +106,14 @@ pub fn config() -> Command {
         )
         .subcommand(crate::cmd::namespace_policy::config())
         .subcommand(
+            crate::cmd::governance::usage_command(
+                "usage",
+                "Reserved CPU, memory and other resources used over time in a namespace \
+                 (docs/usage-accounting.md)",
+            )
+            .arg(Arg::new("name").value_name("NAMESPACE").required(true)),
+        )
+        .subcommand(
             Command::new("delete")
                 .about(
                     "Delete a namespace. Refused while it holds anything; --cascade stops and \
@@ -144,6 +152,10 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         Some(("apply", sub)) => apply(sub).await,
         Some(("delete", sub)) => delete(sub).await,
         Some(("policy", sub)) => crate::cmd::namespace_policy::handle(sub).await,
+        Some(("usage", sub)) => {
+            let name = sub.get_one::<String>("name").cloned().unwrap_or_default();
+            crate::cmd::governance::usage(sub, vec![name]).await
+        }
         _ => unreachable!("subcommand_required"),
     }
 }

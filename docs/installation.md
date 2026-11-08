@@ -103,8 +103,14 @@ with:
 OCI runtime `runc` is not installed on this node (install runc 1.2+ or crun, or set LEGION_OCI_RUNTIME to one that is)
 ```
 
-`container: pass` does not check runc's version. A runc older than 1.2 still
-passes, and its user-namespaced starts fail with:
+`container: pass` does not check runc's version, but placement does. A
+worker whose runc is older than 1.2 registers with the node attribute
+`container.idmappedMounts = "unsupported"` and logs a warning saying so, and
+every container task that keeps `security.userNamespace` on (the default)
+carries the implicit constraint `container.idmappedMounts is_not_set`, so
+it is never placed there. `legion job inspect` shows the constraint. A task
+that reaches such a node anyway (one that registered before the upgrade)
+fails its start with:
 
 ```text
 OCI runtime `runc` is runc 1.1.12-0ubuntu3, which predates idmapped mounts; security.userNamespace (on by default) needs them for the task directory and volumes. Install runc 1.2 or newer (the default) or crun, and point LEGION_OCI_RUNTIME at it, or set security.userNamespace = false on the task

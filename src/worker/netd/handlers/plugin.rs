@@ -1001,6 +1001,7 @@ mod plugin_host_test {
             &crate::structs::host_guard::HostGuardConfig {
                 allow: guard_allow.to_vec(),
                 deny: Vec::new(),
+                ..Default::default()
             },
         )
         .unwrap();

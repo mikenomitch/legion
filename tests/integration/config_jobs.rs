@@ -206,6 +206,10 @@ fn maximal_job_spec_parse() {
             min: Some(3),
             placement_timeout: Some(std::time::Duration::from_secs(30 * 60)),
             on_member_loss: legion::structs::MemberLossPolicy::Restart,
+            topology: Some(legion::structs::GangTopology {
+                key: "rack".into(),
+                mode: legion::structs::TopologyMode::Preferred,
+            }),
         })
     );
     let scratch = config

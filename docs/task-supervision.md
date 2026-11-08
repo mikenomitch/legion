@@ -85,7 +85,7 @@ What happens on an exit:
 | policy wants a restart, budget available | wait `delay`, relaunch in place |
 | policy wants a restart, budget exhausted | allocation fails → manager reschedules it after a backoff that doubles per consecutive failure, capped at 30 minutes (`move_*` budget, see [Manager-side move logic](jobs-tasks-and-scheduling.md#manager-side-move-logic)) → job fails when `moveCount` is set and spent |
 | policy does not want a restart, exit was a success | allocation is complete |
-| policy does not want a restart, exit was not a success | allocation fails, as above |
+| policy is `never`, exit was not a success | allocation ends as failed: the task's status is `Failed`, and it is neither restarted nor moved |
 
 While a replacement waits out its backoff, nothing places it, whichever eval
 runs for the job. Each deferral emits an `allocation.reschedule_deferred`
@@ -98,7 +98,12 @@ replacement survives `movePeriod`. Raise `moveDelay` to back off harder,
 and set `moveCount` to fail the job instead of retrying forever.
 
 A process killed by a signal has no exit code and never counts as a success.
-With `policy = "never"`, a `SIGKILL` is a failure.
+With `policy = "never"`, a `SIGKILL` ends the allocation as failed.
+
+`never` means run once. An unsuccessful exit is final: the allocation keeps
+its row with status `failed`, `success` dependents stay held, and `complete`
+dependents start. To retry a failing task, use `onFailure` (the batch
+default) instead.
 
 Restarts happen in place on the same node. The allocation keeps its id, its
 directory, its staged artifacts, and its volumes. The work moves to another
@@ -149,7 +154,9 @@ Know two things before you upgrade:
   status message.
 
 The worker reports the exit on its next heartbeat, and keeps reporting it
-until a manager records it. That heartbeat can land on any manager. When the
+until a manager records it. The outcome is written to the worker's state file
+the moment it is decided, so a worker restarted before the report lands
+re-sends it after the restart and does not run the finished task again. That heartbeat can land on any manager. When the
 manager can't record the exit yet (it hasn't applied the placement, or the
 write can't reach the raft leader), it asks the worker to send the report
 again on the next beat. A report from a node that doesn't own the allocation
@@ -330,7 +337,7 @@ config = {
 - Exit status is unknown after a worker restart. An allocation re-adopted by
   pid has no parent to reap it. When it later exits, the worker only sees that
   the process is gone. That never counts as a success, so a `never`-policy task
-  in this state ends as a failure.
+  in this state ends as failed.
 - Re-adoption checks identity, not just liveness. The worker persists each
   task's pid together with the process start time, and after a restart it
   re-adopts a pid only when the live process with that pid started at the

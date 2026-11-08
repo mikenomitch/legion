@@ -276,14 +276,23 @@ elsewhere). Two settings decide whether that works under systemd:
   fixed `LEGION_DATA_DIR` (or `WorkingDirectory=`) and a fixed `--name`. A
   worker started from another directory finds no state, registers as a
   different node, and cannot see the tasks the previous process left
-  running; the worker logs the state directory it uses at startup.
+  running; the worker logs the state directory it uses at startup. A worker
+  started under a new `--name` in the same data dir warns when another
+  identity there left tasks running (`Worker identity <name> in this data
+  dir left N task(s) running that this worker does not manage`); start it
+  under the old name to re-adopt them, or stop them. It does not stop them
+  itself, because another worker may be running under that name.
 - **`KillMode=process`.** systemd's default (`control-group`) kills every
   task with the worker on `systemctl stop` or `restart`, so nothing is left
   to re-adopt and every restart restarts every task. `KillMode=process`
   stops only the worker; systemd then reports `Unit process N remains
   running after unit stopped` for each task, which is expected. Choose
   `control-group` (or `mixed`) instead when you prefer a worker restart to
-  restart its tasks too.
+  restart its tasks too. With resource enforcement on (the Linux default),
+  each task runs in its own cgroup under the worker's cgroup parent
+  (`/sys/fs/cgroup/legion/` by default), outside the unit's cgroup, so
+  systemd's `KillMode` does not reach it either way; a restarted worker
+  re-adopts it, or stops it when it cannot.
 - **The join token in a file.** A token passed as an argument stays in the
   worker's command line for the life of the process, where any local user
   can read it with `ps` or `/proc/<pid>/cmdline`, and every restart needs it
@@ -640,15 +649,33 @@ whatever the heartbeat cadence:
   when the worker opened it, so no per-delta certificate check applies),
   and runs its reconcile at once for a
   stop or a changed payload. It acks each message it applied.
-- **Full resync.** A worker the manager cannot continue gets its whole
-  desired set once, in place of what it holds, then deltas. That happens
-  when the position the worker reconnects with is from another manager
-  process (a failover, a manager restart, a different manager), is ahead of
-  the manager's, or is older than the messages the manager still holds. A
-  manager also resyncs every worker streaming from it after it installs a
-  raft snapshot, or when it cannot tell which allocations a committed change
-  touched. Such a failure never fails the change itself, which has already
-  committed.
+- **Resume.** Every message carries the
+  [revision](watches-and-blocking-queries.md#revisions) its contents
+  reflect, and the worker keeps the revision of the last message it applied
+  across a dropped stream. A worker that reconnects to another manager
+  process (a failover, a different manager) sends it. When that manager's
+  revision journal still holds every allocation change on the node since
+  then (the newest 256 per node, from when the manager started), it waits
+  for its own replica to catch up to the revision (up to 5 seconds) and
+  sends **one resume message**: only the allocations that changed since, as
+  upserts and stops, on top of what the worker holds, and the digest of the
+  node's whole set. Revisions are raft log positions, so they mean the same
+  thing on every manager. The manager then knows the node's allocation ids
+  but not every payload; the heartbeat's connect and policy feeds read the
+  ones they need the first time they need them. A worker applies a resume
+  only when it continues from the revision it last applied; otherwise it
+  reopens the stream with no position and gets a full resync.
+- **Full resync.** A worker the manager can neither replay to nor resume
+  gets its whole desired set once, in place of what it holds, then deltas.
+  That happens when the worker sends no revision (a fresh worker process),
+  when its revision is older than the manager's journal (the manager
+  restarted since, or more than 256 changes landed on the node), when its
+  position is ahead of the manager's or older than the messages the manager
+  still holds, or when the manager did not catch up to the worker's revision
+  in time. A manager also resyncs every worker streaming from it after it
+  installs a raft snapshot, or when it cannot tell which allocations a
+  committed change touched. Such a failure never fails the change itself,
+  which has already committed.
 - **Replay.** A worker that reconnects to the same manager process with a
   position it still holds gets the messages after it, in order. Nothing is
   lost and nothing is applied twice.
@@ -659,8 +686,11 @@ whatever the heartbeat cadence:
 - **Any manager serves it.** The delivery log is memory on the manager the
   worker streams from, fed by the changeset projection every manager runs on
   its own replica. A leader failover disturbs only the streams attached to
-  the manager that died: their workers reconnect and resync once; workers
-  streaming from a surviving manager keep their position.
+  the manager that died: their workers reconnect to a survivor and resume
+  from their revision (one message with what changed since); workers
+  streaming from a surviving manager keep their position. A manager that
+  restarts comes back with an empty journal, so workers that reconnect to
+  it resync once.
 - **Checkpoint work.** When a snapshot row of the node commits in a state
   that is work for it (a capture for a suspend, fork, or snapshot, a
   publish, a reclaim), or a warm is queued for it, the next message pushes
@@ -670,6 +700,14 @@ whatever the heartbeat cadence:
   node's outstanding checkpoint work on every beat, so a lost push costs one
   heartbeat interval, and a new stream is pushed everything still
   outstanding. See [How it works](suspend-and-resume.md#how-it-works).
+- **Endpoint sets.** When a service an upstream on the node uses changes
+  (a backend placed, removed, unhealthy, or its node lost), the manager
+  sends a **push-only** message (`push_only`, `endpoint_feed`) carrying the
+  changed sets. It has no place in the sequence: the worker neither moves
+  its position nor acknowledges it, and it is never replayed. The
+  heartbeat's endpoint feed stays the record, so a lost push costs one
+  heartbeat interval. See
+  [How endpoints reach a node](service-discovery.md#how-endpoints-reach-a-node).
 
 A worker on the stream sends a heartbeat of a few dozen bytes and gets a
 reply of a few bytes, however many allocations it runs; the manager builds
