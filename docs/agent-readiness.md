@@ -1040,7 +1040,11 @@ token can act. See [Namespaces](namespaces.md).
      the reply succeeds with no allocations, and a submit would wait, blocked
      and holding nothing, until the gang fits, or until its
      `placementTimeoutSeconds` runs out and the job fails
-     ([gang-scheduling.md](gang-scheduling.md)).
+     ([gang-scheduling.md](gang-scheduling.md)). A gang with `topology`
+     adds `topologyKey`, `topologyMode`, `topologyDomain` (the domain it
+     would use, or the closest one when it would wait), and
+     `topologyDomains`; `topologyDomains: 0` means no eligible node reports
+     the attribute ([Topology](gang-scheduling.md#topology)).
 
    `preemptionMode` tells you whether that list is empty because nothing would
    be displaced or because preemption is off. Ask for confirmation when

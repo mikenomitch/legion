@@ -1347,6 +1347,19 @@
                 # alone. Restarts after a failure spend onUnhealthy's move
                 # budget; once it is spent the job fails.
                 onMemberLoss = "restart",
+                # Keep the members inside one value of a node attribute: one
+                # rack, one NVLink domain (docs/gang-scheduling.md,
+                # "Topology"). `key` names the attribute the way count.per
+                # and `distinct` do. `mode`:
+                #   "required" (default) every member in one domain, or the
+                #              gang waits, holding nothing, until one domain
+                #              has room; a top-up stays in its domain;
+                #   "preferred" one domain when one fits, else the fewest
+                #              domains that hold the quorum, else anywhere.
+                # Nodes without the attribute are in no domain. `job plan`
+                # reports the domain chosen, or the best one and how many
+                # members it fits.
+                topology = { key = "rack", mode = "preferred" },
             },
             # Every member starts with LEGION_GANG_RANK (0..count-1),
             # LEGION_GANG_SIZE, LEGION_GANG_MIN, and LEGION_GANG_LEADER_ADDR

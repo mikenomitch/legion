@@ -13,7 +13,9 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use crate::constraints::{AffinitySet, ConstraintSet, DistinctTracker, PermitSet};
 use crate::prelude::*;
-use crate::resources::{ResourcePolicy, ResourcePool, ResourceRequest, ResourceValue};
+use crate::resources::{
+    PoolCapacity, ResourcePolicy, ResourcePool, ResourceRequest, ResourceValue,
+};
 use crate::scheduling_index::{IndexMode, IndexQueryOutcome};
 pub use crate::storage::content_index::{ContentRef, LocalityScores};
 use crate::storage::errors::StorageError;
@@ -23,9 +25,8 @@ use crate::storage::store::{
 };
 use crate::structs::{
     Allocation, Band, JobConfig, Node, TaskConfig, TaskDependencyCondition, TaskLifecycle,
-    TaskStatusState,
+    TaskStatusState, TopologyMode,
 };
-use policy::score_node_for_context;
 pub use policy::{
     load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy,
     DEF_SCHEDULER_LOCALITY_WEIGHT,
@@ -37,8 +38,14 @@ pub use preemption::{
 
 mod policy;
 mod preemption;
+mod topology;
 
 const RESCHEDULE_SCORE_JITTER_THRESHOLD: f64 = 0.01;
+
+/// A `plan_and_apply` slower than this logs one `info` line (every plan
+/// logs at `debug`). Plans take single-digit milliseconds when healthy, so a
+/// second is an outlier worth an operator's attention without being noise.
+const SLOW_PLAN_LOG_MS: u64 = 1_000;
 
 #[derive(Debug, Clone)]
 pub struct PlannedAllocation {
@@ -119,6 +126,17 @@ pub struct GangReport {
     /// When a waiting gang's `placementTimeout` runs out, unix seconds; 0
     /// when it has none, and in a dry run.
     pub deadline: i64,
+    /// The gang's `topology.key`, empty without one.
+    pub topology_key: String,
+    /// The gang's `topology.mode` (`required`, `preferred`), empty without
+    /// one.
+    pub topology_mode: String,
+    /// The domain (attribute value) the gang places in, or for a gang that
+    /// does not place, the domain that came closest. Empty without topology,
+    /// or when a `preferred` gang spans domains.
+    pub topology_domain: String,
+    /// Domains with at least one eligible node.
+    pub topology_domains: u32,
 }
 
 impl GangReport {
@@ -137,6 +155,10 @@ impl GangReport {
             "placementTimeoutSeconds": self.placement_timeout_secs,
             "waitingSince": self.waiting_since,
             "deadline": self.deadline,
+            "topologyKey": self.topology_key,
+            "topologyMode": self.topology_mode,
+            "topologyDomain": self.topology_domain,
+            "topologyDomains": self.topology_domains,
         })
     }
 
@@ -178,6 +200,10 @@ impl GangReport {
                 .and_then(Value::as_i64)
                 .unwrap_or(0),
             deadline: value.get("deadline").and_then(Value::as_i64).unwrap_or(0),
+            topology_key: text("topologyKey"),
+            topology_mode: text("topologyMode"),
+            topology_domain: text("topologyDomain"),
+            topology_domains: count("topologyDomains"),
         })
     }
 
@@ -196,6 +222,10 @@ impl GangReport {
             placement_timeout_seconds: self.placement_timeout_secs,
             waiting_since: self.waiting_since,
             deadline: self.deadline,
+            topology_key: self.topology_key.clone(),
+            topology_mode: self.topology_mode.clone(),
+            topology_domain: self.topology_domain.clone(),
+            topology_domains: self.topology_domains,
         }
     }
 
@@ -680,6 +710,9 @@ struct PreemptionSearch {
 ///   and together take eight;
 /// - the victim metadata is loaded once and only on demand, so a plan that
 ///   never needs preemption never touches the store for it.
+///
+/// Cloned only to undo a topology gang's try in one domain before the next.
+#[derive(Clone)]
 struct PreemptionPass {
     /// The band of the job being placed.
     preemptor_band: Band,
@@ -964,7 +997,7 @@ impl PreemptionPass {
 ///
 /// Lazy: a node's set is read from the snapshot the first time a static-port
 /// task asks about it, so a plan with no static ports pays nothing.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PortLedger {
     /// Ports in use per node: the snapshot's allocations, plus ports this
     /// plan already claimed. Built on first use per node.
@@ -1076,6 +1109,7 @@ struct ResourceLedger {
     pools: SharedNodePools,
 }
 
+#[derive(Clone)]
 struct TaskPlan<'a> {
     /// The task's hard filters (constraints, permit), parsed once per plan
     /// in `build_plan` and shared with the group-filter pass.
@@ -1091,6 +1125,9 @@ struct TaskPlan<'a> {
     /// looked up by this job id and the task's group and name instead.
     /// Looked up by the positional id, they were another job's pins.
     positional_job_id: Option<String>,
+    /// The task's desired replica count in this plan: what scales the
+    /// automatic anti-affinity penalty ([`anti_affinity_penalty`]).
+    desired_count: u32,
 }
 
 impl TaskPlan<'_> {
@@ -1117,11 +1154,31 @@ struct CommonResourceAvailability {
     cpu: f64,
     cores: f64,
     allocations: f64,
+    /// The node's schedulable capacity of the same four dims, the
+    /// denominator of [`Self::utilization_after`].
+    capacity: PoolCapacity,
 }
+
+/// How full a node would be after one more placement, in the resources the
+/// placement asks for (architecture review SCH4; docs/scheduler-and-eval-loop.md,
+/// "Scoring").
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Utilization {
+    /// The largest per-resource fraction in use: what decides whether the
+    /// next large task still fits.
+    dominant: f64,
+    /// `1 - (largest - smallest)` fraction: 1 when every resource fills
+    /// evenly, lower when one runs out ahead of the others.
+    balance: f64,
+}
+
+/// Weight of the balanced-allocation term inside the `bin_pack` and
+/// `spread` terms: a tie-break among nodes of similar fullness, never a
+/// reason to pick a much emptier (or fuller) node.
+const BALANCE_TIE_BREAK: f64 = 0.05;
 
 #[derive(Debug, Clone)]
 struct NodeScoringState {
-    assigned_count: usize,
     same_task_allocations: usize,
     same_group_allocations: usize,
     task_presence: HashSet<i64>,
@@ -1205,6 +1262,8 @@ struct PlanScoringCache {
     /// This task's locality scores, kept for nodes outside `states` and for
     /// the policy-plugin path. `None` skips the term.
     locality: Option<Arc<crate::storage::content_index::LocalityScores>>,
+    /// The task's desired replica count, for [`anti_affinity_penalty`].
+    desired_count: u32,
 }
 
 impl PlanScoringCache {
@@ -1218,14 +1277,13 @@ impl PlanScoringCache {
         task_id: i64,
         task_config: &TaskConfig,
         affinity_set: &AffinitySet,
-        allocations_by_node: &SharedNodeAllocations,
         own_by_node: &OwnAllocationsByNode,
         task_name_to_id: &HashMap<String, i64>,
         task_id_to_group: &HashMap<i64, String>,
         planned_task_allocations: &HashMap<String, Vec<i64>>,
-        planned: &HashMap<String, usize>,
         resource_ledger: &ResourceLedger,
         task_request: &ResourceRequest,
+        desired_count: u32,
     ) -> Self {
         let group_name = task_id_to_group.get(&task_id).cloned();
         let affinity = TaskAffinityCache::new(task_config, task_name_to_id);
@@ -1243,11 +1301,6 @@ impl PlanScoringCache {
             NodeKeyIndex::with_capacity_and_hasher(candidates.len(), Default::default());
         for (position, node) in candidates.iter().enumerate() {
             let node_id = node.id.as_str();
-            let assigned_count = allocations_by_node
-                .get(node_id)
-                .map_or(0, |allocations| allocations.len())
-                + planned.get(node_id).copied().unwrap_or_default();
-
             // The planned config's allocations already on this node come
             // from the plan's own-allocation index — not from a walk of
             // every allocation the node holds, which made building this
@@ -1289,7 +1342,6 @@ impl PlanScoringCache {
 
             index.insert(NodeKey::of(node), position);
             states.push(NodeScoringState {
-                assigned_count,
                 same_task_allocations,
                 same_group_allocations,
                 task_presence,
@@ -1308,6 +1360,7 @@ impl PlanScoringCache {
             common_demand,
             group_name,
             locality: None,
+            desired_count: desired_count.max(1),
         }
     }
 
@@ -1363,7 +1416,6 @@ impl PlanScoringCache {
             return;
         };
         let state = &mut self.states[position];
-        state.assigned_count += 1;
         state.same_task_allocations += 1;
         if self.group_name.as_ref().is_some_and(|group| {
             task_id_to_group
@@ -1456,7 +1508,10 @@ impl CommonResourceAvailability {
     /// scoring cache. A dim the pool lacks, or carries as items, reads as
     /// `0.0`, exactly as the lookups did.
     fn from_pool(pool: &ResourcePool) -> Self {
-        let mut availability = CommonResourceAvailability::default();
+        let mut availability = CommonResourceAvailability {
+            capacity: pool.capacity,
+            ..CommonResourceAvailability::default()
+        };
         for (name, value) in &pool.values {
             let ResourceValue::Amount(amount) = value else {
                 continue;
@@ -1470,6 +1525,43 @@ impl CommonResourceAvailability {
             }
         }
         availability
+    }
+
+    /// Utilization after placing `demand`, over the dims it asks for whose
+    /// capacity is finite and positive. Absolute, so a node scores the same
+    /// whichever other nodes are candidates. A node with no qualifying dim
+    /// (nothing requested it can measure) reads as empty and balanced.
+    fn utilization_after(&self, demand: &CommonResourceDemand) -> Utilization {
+        let dims = [
+            (self.memory, self.capacity.memory, demand.memory),
+            (self.cpu, self.capacity.cpu, demand.cpu),
+            (self.cores, self.capacity.cores, demand.cores),
+            (
+                self.allocations,
+                self.capacity.allocations,
+                demand.allocations,
+            ),
+        ];
+        let mut highest: Option<f64> = None;
+        let mut lowest: Option<f64> = None;
+        for (free, capacity, request) in dims {
+            if request <= 0.0 || !capacity.is_finite() || capacity <= 0.0 || !free.is_finite() {
+                continue;
+            }
+            let used = (1.0 - (free - request) / capacity).clamp(0.0, 1.0);
+            highest = Some(highest.map_or(used, |high: f64| high.max(used)));
+            lowest = Some(lowest.map_or(used, |low: f64| low.min(used)));
+        }
+        match (highest, lowest) {
+            (Some(high), Some(low)) => Utilization {
+                dominant: high,
+                balance: 1.0 - (high - low),
+            },
+            _ => Utilization {
+                dominant: 0.0,
+                balance: 1.0,
+            },
+        }
     }
 
     fn consume(&mut self, demand: &CommonResourceDemand) {
@@ -2003,7 +2095,7 @@ impl<'a> Scheduler<'a> {
     ) -> R<PlanOutcome> {
         let started = std::time::Instant::now();
         let mut timings = PlanTimings::default();
-        info!(%job_config_id, mode = mode.as_str(), target_override = task_targets.is_some(), "Starting scheduler plan_and_apply");
+        debug!(%job_config_id, mode = mode.as_str(), target_override = task_targets.is_some(), "Starting scheduler plan_and_apply");
         // Evals wait in a queue, and the job can be stopped or move on to a
         // newer config meanwhile. Planning for either would place the full
         // count of something nobody wants, so bail before doing the work.
@@ -2343,7 +2435,7 @@ impl<'a> Scheduler<'a> {
                 timings.observe();
                 warn!(
                     %job_config_id,
-                    submission_id = submission.id,
+                    submission_id = ?submission.id,
                     mode = mode.as_str(),
                     apply_plan_submission_ms = apply_started.elapsed().as_millis() as u64,
                     "Scheduler plan submission rejected: {reason}"
@@ -2388,7 +2480,23 @@ impl<'a> Scheduler<'a> {
             held_tasks,
             backoff_held,
         };
-        info!(
+        // Per-plan lifecycle detail is debug (AGENTS.md tracing guidance):
+        // at a thousand plans a second an info line per plan is the
+        // noise that hides everything else. A plan slow enough to matter
+        // still says so at info, with the same fields.
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= SLOW_PLAN_LOG_MS {
+            info!(
+                %job_config_id,
+                mode = mode.as_str(),
+                applied_allocations = outcome.allocations.len(),
+                elapsed_ms,
+                apply_us = outcome.timings.apply_us,
+                build_plan_us = outcome.timings.build_plan_us,
+                "Slow scheduler plan_and_apply"
+            );
+        }
+        debug!(
             %job_config_id,
             mode = mode.as_str(),
             applied_allocations = outcome.allocations.len(),
@@ -2406,6 +2514,75 @@ impl<'a> Scheduler<'a> {
             "Completed scheduler plan_and_apply"
         );
         Ok(outcome)
+    }
+
+    /// Placements of `task_id` among `placements`.
+    fn placed_for_task(placements: &[PlannedAllocation], task_id: i64) -> u32 {
+        placements
+            .iter()
+            .filter(|placement| placement.task_config_id == task_id)
+            .count() as u32
+    }
+
+    /// A gang placement's first missing replica and why, from what the
+    /// placement returned. A bail site that fails outright (disk, checkpoint
+    /// room) is a shortfall like any other when it is a placement block;
+    /// anything else is a broken job and fails the plan (`Err`).
+    fn gang_shortfall(
+        placed: R<()>,
+        gang_unplaced: Vec<UnplacedTask>,
+        task_id: i64,
+        task_name: &str,
+    ) -> R<Option<UnplacedTask>> {
+        match placed {
+            Ok(()) => Ok(gang_unplaced.into_iter().next()),
+            Err(error) => {
+                let Some(blocked) =
+                    crate::manager::blocked::PlacementBlocked::in_chain(&error).cloned()
+                else {
+                    return Err(error);
+                };
+                Ok(Some(UnplacedTask {
+                    task_config_id: task_id,
+                    task_name: task_name.to_string(),
+                    count: 0,
+                    reason: blocked.message.clone(),
+                    static_port: error
+                        .downcast_ref::<PlacementBlocked>()
+                        .and_then(PlacementBlocked::static_port),
+                    blocked,
+                }))
+            }
+        }
+    }
+
+    /// The topology domain most of a running gang's members occupy (ties to
+    /// the smallest token): where a top-up must stay. `None` when none of its
+    /// members runs on an available node that has the attribute.
+    fn running_topology_domain(
+        own_by_node: &OwnAllocationsByNode,
+        task_id: i64,
+        node_lookup: &AvailableNodes,
+        key: &str,
+    ) -> Option<String> {
+        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+        for (node_id, task_ids) in own_by_node {
+            let members = task_ids.iter().filter(|id| **id == task_id).count();
+            if members == 0 {
+                continue;
+            }
+            let Some(node) = node_lookup.get(node_id.as_str()) else {
+                continue;
+            };
+            if let Some(value) = node_attribute(node, key).filter(|value| !value.is_null()) {
+                *counts.entry(value_token(value)).or_default() += members;
+            }
+        }
+        let most = counts.values().copied().max()?;
+        counts
+            .into_iter()
+            .find(|(_, members)| *members == most)
+            .map(|(token, _)| token)
     }
 
     /// Allocations of the planned config per task, from the plan's
@@ -2782,6 +2959,7 @@ impl<'a> Scheduler<'a> {
                 namespace,
                 positional_job_id,
             )?;
+            plan.desired_count = desired_count.max(needed).max(1);
 
             let base_eligible = plan.base_eligible.clone();
             if let Some(per_key) = per_key {
@@ -2902,41 +3080,222 @@ impl<'a> Scheduler<'a> {
                 // it got. Submit validation keeps gangs out of multi-task
                 // groups (which place all or nothing on one node anyway) and
                 // away from `count.per`.
-                let gang = task_config.gang.filter(|_| group_key.is_none());
+                let gang = task_config.gang.clone().filter(|_| group_key.is_none());
                 let placed_before = placements.len();
                 let mut gang_unplaced: Vec<UnplacedTask> = Vec::new();
-                let placed = self.place_task_allocations(
-                    needed,
-                    task_id,
-                    &task_config,
-                    job_config_id,
-                    candidates_for_group,
-                    allocations_by_node,
-                    &own_by_node,
-                    &task_name_to_id,
-                    &task_id_to_group,
-                    &mut planned_task_allocations,
-                    &mut planned,
-                    &mut reschedule_rng,
-                    nodes_considered_setting.as_ref(),
-                    score_sample_setting.as_ref(),
-                    &mut nodes_considered_rng,
-                    node_lookup,
-                    &mut resource_ledger,
-                    &mut plan,
-                    &mut placements,
-                    weights,
-                    group_key.as_ref(),
-                    &mut group_assignments,
-                    candidates_setting,
-                    &mut preemption_pass,
-                    &mut port_ledger,
-                    if gang.is_some() {
-                        Some(&mut gang_unplaced)
-                    } else {
-                        applying.then_some(&mut unplaced)
-                    },
-                );
+                // The one placement call, over a candidate list and into an
+                // unplaced list, so topology can run it once per domain.
+                macro_rules! place_on {
+                    ($candidates:expr, $unplaced:expr) => {
+                        self.place_task_allocations(
+                            needed,
+                            task_id,
+                            &task_config,
+                            job_config_id,
+                            $candidates,
+                            allocations_by_node,
+                            &own_by_node,
+                            &task_name_to_id,
+                            &task_id_to_group,
+                            &mut planned_task_allocations,
+                            &mut planned,
+                            &mut reschedule_rng,
+                            nodes_considered_setting.as_ref(),
+                            score_sample_setting.as_ref(),
+                            &mut nodes_considered_rng,
+                            node_lookup,
+                            &mut resource_ledger,
+                            &mut plan,
+                            &mut placements,
+                            weights,
+                            group_key.as_ref(),
+                            &mut group_assignments,
+                            candidates_setting,
+                            &mut preemption_pass,
+                            &mut port_ledger,
+                            $unplaced,
+                        )
+                    };
+                }
+                let topology = gang.as_ref().and_then(|gang| gang.topology.clone());
+                let mut topology_outcome: Option<topology::TopologyOutcome> = None;
+                // A `required` topology gang that no domain could take: how
+                // many members the closest domain held, and its shortfall.
+                let mut topology_shortfall: Option<(u32, UnplacedTask)> = None;
+                let placed = match (gang.as_ref(), topology.as_ref()) {
+                    (Some(gang), Some(topology)) => {
+                        // Topology (docs/gang-scheduling.md, "Topology"):
+                        // place the whole gang inside one domain at a time,
+                        // keep the first that reaches the quorum, and undo
+                        // every other try.
+                        let running = running_by_task.get(&task_id).copied().unwrap_or(0);
+                        let quorum = gang.quorum(desired_count);
+                        let need_now = quorum.saturating_sub(running);
+                        let domains = topology::domains(
+                            candidates_for_group,
+                            &topology.key,
+                            &resource_ledger.pools,
+                            &plan.task_request,
+                            needed,
+                        );
+                        let pinned = Self::running_topology_domain(
+                            &own_by_node,
+                            task_id,
+                            node_lookup,
+                            &topology.key,
+                        );
+                        let order = topology::trial_order(
+                            &domains,
+                            needed,
+                            need_now,
+                            pinned.as_deref(),
+                            topology.mode,
+                        );
+                        let mut outcome = topology::TopologyOutcome {
+                            domain: String::new(),
+                            domains: domains.len() as u32,
+                        };
+                        let mut accepted: Option<R<()>> = None;
+                        let mut closest: Option<(u32, String, UnplacedTask)> = None;
+                        // `&[_]`: the element is the plan's `&'b Node`, so
+                        // the closure must not be generic over it.
+                        let mut try_on =
+                            |nodes: &[_],
+                             label: &str,
+                             closest: &mut Option<(u32, String, UnplacedTask)>|
+                             -> R<Option<(R<()>, Vec<UnplacedTask>)>> {
+                                let saved = (
+                                    resource_ledger.clone(),
+                                    planned.clone(),
+                                    planned_task_allocations.clone(),
+                                    plan.clone(),
+                                    port_ledger.clone(),
+                                    preemption_pass.clone(),
+                                );
+                                let mut trial_unplaced: Vec<UnplacedTask> = Vec::new();
+                                let attempt = place_on!(nodes, Some(&mut trial_unplaced));
+                                let placed_now =
+                                    Self::placed_for_task(&placements[placed_before..], task_id);
+                                if attempt.is_ok() && running + placed_now >= quorum {
+                                    return Ok(Some((attempt, trial_unplaced)));
+                                }
+                                if let Some(shortfall) = Self::gang_shortfall(
+                                    attempt,
+                                    trial_unplaced,
+                                    task_id,
+                                    &task_config.name,
+                                )? {
+                                    if closest
+                                        .as_ref()
+                                        .is_none_or(|(placed, _, _)| placed_now > *placed)
+                                    {
+                                        *closest = Some((placed_now, label.to_string(), shortfall));
+                                    }
+                                }
+                                placements.truncate(placed_before);
+                                (
+                                    resource_ledger,
+                                    planned,
+                                    planned_task_allocations,
+                                    plan,
+                                    port_ledger,
+                                    preemption_pass,
+                                ) = saved;
+                                Ok(None)
+                            };
+                        for index in order {
+                            let domain = &domains[index];
+                            if let Some((attempt, trial_unplaced)) =
+                                try_on(&domain.nodes, &domain.label, &mut closest)?
+                            {
+                                outcome.domain = domain.label.clone();
+                                gang_unplaced = trial_unplaced;
+                                accepted = Some(attempt);
+                                break;
+                            }
+                        }
+                        if accepted.is_none() && topology.mode == TopologyMode::Preferred {
+                            if let Some((nodes, _spanned)) =
+                                topology::fewest_domains(&domains, need_now)
+                            {
+                                let mut ignored = None;
+                                if let Some((attempt, trial_unplaced)) =
+                                    try_on(&nodes, "", &mut ignored)?
+                                {
+                                    gang_unplaced = trial_unplaced;
+                                    accepted = Some(attempt);
+                                }
+                            }
+                        }
+                        drop(try_on);
+                        let result = match accepted {
+                            Some(attempt) => attempt,
+                            // Preferred never waits for topology: anywhere.
+                            None if topology.mode == TopologyMode::Preferred => {
+                                place_on!(candidates_for_group, Some(&mut gang_unplaced))
+                            }
+                            None => {
+                                let key = &topology.key;
+                                let shortfall = match closest {
+                                    Some((placed, label, mut shortfall)) => {
+                                        shortfall.reason = format!(
+                                            "No single {key} fits the {need_now} member(s) the gang \
+                                             needs together (topology {key}, required); the \
+                                             closest, {key}={label}, fits {placed}. {}",
+                                            shortfall.reason
+                                        );
+                                        outcome.domain = label;
+                                        (placed, shortfall)
+                                    }
+                                    None => {
+                                        let reason = if domains.is_empty() {
+                                            format!(
+                                                "No eligible node has the topology attribute \
+                                                 {key} (topology {key}, required)"
+                                            )
+                                        } else {
+                                            format!(
+                                                "The {key} its running members occupy has no \
+                                                 eligible node left, and a top-up stays in its \
+                                                 domain (topology {key}, required)"
+                                            )
+                                        };
+                                        let blocked =
+                                            crate::manager::blocked::PlacementBlocked::for_task(
+                                                &task_config,
+                                                task_id,
+                                                None,
+                                                reason.clone(),
+                                            );
+                                        (
+                                            0,
+                                            UnplacedTask {
+                                                task_config_id: task_id,
+                                                task_name: task_config.name.clone(),
+                                                count: needed,
+                                                reason,
+                                                static_port: None,
+                                                blocked,
+                                            },
+                                        )
+                                    }
+                                };
+                                topology_shortfall = Some(shortfall);
+                                Ok(())
+                            }
+                        };
+                        topology_outcome = Some(outcome);
+                        result
+                    }
+                    _ => place_on!(
+                        candidates_for_group,
+                        if gang.is_some() {
+                            Some(&mut gang_unplaced)
+                        } else {
+                            applying.then_some(&mut unplaced)
+                        }
+                    ),
+                };
                 let Some(gang) = gang else {
                     placed?;
                     index_report.push(plan.index_usage.clone());
@@ -2947,31 +3306,15 @@ impl<'a> Scheduler<'a> {
                 // that fails outright (disk, checkpoint room) is a shortfall
                 // like any other when it is a placement block; anything else
                 // is a broken job and fails the plan.
-                let shortfall = match placed {
-                    Ok(()) => gang_unplaced.into_iter().next(),
-                    Err(error) => {
-                        let Some(blocked) =
-                            crate::manager::blocked::PlacementBlocked::in_chain(&error).cloned()
-                        else {
-                            return Err(error);
-                        };
-                        Some(UnplacedTask {
-                            task_config_id: task_id,
-                            task_name: task_config.name.clone(),
-                            count: 0,
-                            reason: blocked.message.clone(),
-                            static_port: error
-                                .downcast_ref::<PlacementBlocked>()
-                                .and_then(PlacementBlocked::static_port),
-                            blocked,
-                        })
-                    }
+                let (shortfall, placed_now) = match topology_shortfall {
+                    // Nothing placed: report how far the closest domain got.
+                    Some((closest, shortfall)) => (Some(shortfall), closest),
+                    None => (
+                        Self::gang_shortfall(placed, gang_unplaced, task_id, &task_config.name)?,
+                        Self::placed_for_task(&placements[placed_before..], task_id),
+                    ),
                 };
                 let running = running_by_task.get(&task_id).copied().unwrap_or(0);
-                let placed_now = placements[placed_before..]
-                    .iter()
-                    .filter(|placement| placement.task_config_id == task_id)
-                    .count() as u32;
                 let quorum = gang.quorum(desired_count);
                 let mut report = GangReport {
                     task_name: task_config.name.clone(),
@@ -2989,6 +3332,21 @@ impl<'a> Scheduler<'a> {
                         .unwrap_or(0),
                     waiting_since: 0,
                     deadline: 0,
+                    topology_key: topology
+                        .as_ref()
+                        .map(|topology| topology.key.clone())
+                        .unwrap_or_default(),
+                    topology_mode: topology
+                        .as_ref()
+                        .map(|topology| topology.mode.as_str().to_string())
+                        .unwrap_or_default(),
+                    topology_domain: topology_outcome
+                        .as_ref()
+                        .map(|outcome| outcome.domain.clone())
+                        .unwrap_or_default(),
+                    topology_domains: topology_outcome
+                        .as_ref()
+                        .map_or(0, |outcome| outcome.domains),
                 };
                 let Some(mut shortfall) = shortfall else {
                     gang_reports.push(report);
@@ -3553,6 +3911,7 @@ impl<'a> Scheduler<'a> {
             distinct_tracker,
             index_usage,
             positional_job_id: positional_job_id.map(str::to_owned),
+            desired_count: needed.max(1),
         })
     }
 
@@ -3602,14 +3961,13 @@ impl<'a> Scheduler<'a> {
             task_id,
             task_config,
             &plan.affinity_set,
-            allocations_by_node,
             own_by_node,
             task_name_to_id,
             task_id_to_group,
             planned_task_allocations,
-            planned,
             resource_ledger,
             &plan.task_request,
+            plan.desired_count,
         );
         // Content locality: computed once per task, from the in-memory
         // location index. Skipped (no cost beyond walking the task's
@@ -3766,14 +4124,13 @@ impl<'a> Scheduler<'a> {
                     task_id,
                     task_config,
                     &plan.affinity_set,
-                    allocations_by_node,
                     own_by_node,
                     task_name_to_id,
                     task_id_to_group,
                     planned_task_allocations,
-                    planned,
                     resource_ledger,
                     &plan.task_request,
+                    plan.desired_count,
                 );
                 scoring_cache.apply_locality(&candidates, locality.as_ref());
                 eligible = Self::eligible_nodes(
@@ -5339,44 +5696,30 @@ impl<'a> Scheduler<'a> {
         Ok(eligible.into_iter().take(limit).collect())
     }
 
+    /// A scheduling plugin's pick on a reschedule. Only plugins reach this
+    /// (the built-in policies score through the plan's scoring cache), and
+    /// a plugin exposes no scores to jitter over, so it picks as it would
+    /// on a fresh plan.
     fn select_policy_node_with_jitter<'b>(
         &self,
         ctx: &SchedulingContext<'b>,
-        rng: &mut StdRng,
+        _rng: &mut StdRng,
     ) -> Option<&'b Node> {
-        if !matches!(self.policy.name(), "bin_pack" | "spread") {
-            let fallback_ctx = SchedulingContext::new(
-                ctx.eligible_nodes.clone(),
-                ctx.task,
-                ctx.task_id,
-                ctx.affinity_set,
-                ctx.job_config_id,
-                ctx.allocations,
-                ctx.task_name_to_id,
-                ctx.task_id_to_group,
-                ctx.planned_task_allocations,
-                ctx.planned,
-                ctx.weights,
-            )
-            .with_locality(ctx.locality);
-            return self.policy.select_node(fallback_ctx);
-        }
-
-        let scored = score_nodes_for_context(ctx);
-        if scored.is_empty() {
-            return None;
-        }
-
-        let max_score = scored
-            .iter()
-            .fold(f64::NEG_INFINITY, |best, (_, score)| best.max(*score));
-        let mut top = scored
-            .into_iter()
-            .filter(|(_, score)| *score >= max_score - RESCHEDULE_SCORE_JITTER_THRESHOLD)
-            .map(|(node, _)| node)
-            .collect::<Vec<_>>();
-        top.shuffle(rng);
-        top.first().copied()
+        let fallback_ctx = SchedulingContext::new(
+            ctx.eligible_nodes.clone(),
+            ctx.task,
+            ctx.task_id,
+            ctx.affinity_set,
+            ctx.job_config_id,
+            ctx.allocations,
+            ctx.task_name_to_id,
+            ctx.task_id_to_group,
+            ctx.planned_task_allocations,
+            ctx.planned,
+            ctx.weights,
+        )
+        .with_locality(ctx.locality);
+        self.policy.select_node(fallback_ctx)
     }
 
     /// The per-placement hot loop: pick the best-scoring node, breaking
@@ -5394,12 +5737,11 @@ impl<'a> Scheduler<'a> {
         if eligible.is_empty() {
             return None;
         }
-        let bounds = cached_load_bounds(eligible, scoring_cache);
         let mut rng = rand::thread_rng();
         let mut best: Option<(&'b Node, f64)> = None;
         let mut tie_count = 0usize;
         for node in eligible.iter().copied() {
-            let score = score_node_with_cache(node, affinity_set, scoring_cache, weights, bounds);
+            let score = score_node_with_cache(node, affinity_set, scoring_cache, weights);
             match best {
                 None => {
                     best = Some((node, score));
@@ -6138,45 +6480,6 @@ fn group_nodes_by_attr<'a>(nodes: &'a [&'a Node], key: &str) -> HashMap<String, 
     grouped
 }
 
-fn score_nodes_for_context<'a>(ctx: &SchedulingContext<'a>) -> Vec<(&'a Node, f64)> {
-    if ctx.eligible_nodes.is_empty() {
-        return Vec::new();
-    }
-
-    let mut min_load: Option<usize> = None;
-    let mut max_load: Option<usize> = None;
-    let mut loads: HashMap<&'a str, usize> = HashMap::new();
-
-    for node in &ctx.eligible_nodes {
-        let load = ctx.total_assigned(&node.id);
-        loads.insert(node.id.as_str(), load);
-        min_load = Some(min_load.map_or(load, |min| min.min(load)));
-        max_load = Some(max_load.map_or(load, |max| max.max(load)));
-    }
-
-    let min_load = min_load.unwrap_or_default() as f64;
-    let max_load = max_load.unwrap_or_default() as f64;
-    let range = (max_load - min_load).max(0.0);
-
-    ctx.eligible_nodes
-        .iter()
-        .copied()
-        .map(|node| {
-            let score = score_node_for_context(ctx, node, &loads, min_load, range);
-            (node, score)
-        })
-        .collect()
-}
-
-/// Min/max assigned load over `eligible` plus the normalization range —
-/// the cheap first pass both the fused selector and the batch scorer share.
-#[derive(Debug, Clone, Copy)]
-struct CachedLoadBounds {
-    min_load: f64,
-    max_load: f64,
-    range: f64,
-}
-
 /// `legion_scheduler_locality_placements_total{outcome}`: how warm the chosen
 /// node was for placements that had a content set. `warm` held all of it,
 /// `partial` some, `cold` none. The hit ratio is warm over the total.
@@ -6193,57 +6496,41 @@ fn record_locality_placement(score: f64) {
         .inc(&[outcome]);
 }
 
-fn cached_load_bounds(eligible: &[&Node], scoring_cache: &PlanScoringCache) -> CachedLoadBounds {
-    let mut min_load: Option<usize> = None;
-    let mut max_load: Option<usize> = None;
-    for node in eligible {
-        let load = scoring_cache
-            .state_of(node)
-            .map(|state| state.assigned_count)
-            .unwrap_or_default();
-        min_load = Some(min_load.map_or(load, |min| min.min(load)));
-        max_load = Some(max_load.map_or(load, |max| max.max(load)));
-    }
-    let min_load = min_load.unwrap_or_default() as f64;
-    let max_load = max_load.unwrap_or_default() as f64;
-    CachedLoadBounds {
-        min_load,
-        max_load,
-        range: (max_load - min_load).max(0.0),
-    }
-}
-
 /// One node's score under the cached plan state — the body both the fused
 /// single-pass selector and the batch scorer run per candidate.
+///
+/// The policy terms score the node's resource utilization after this
+/// placement (SCH4): `bin_pack` the dominant fraction in use, `spread` the
+/// dominant fraction free, each plus a small balanced-allocation tie-break.
+/// Absolute per node, so the score does not depend on which other nodes
+/// made the candidate list.
 fn score_node_with_cache(
     node: &Node,
     affinity_set: &AffinitySet,
     scoring_cache: &PlanScoringCache,
     weights: SchedulerWeights,
-    bounds: CachedLoadBounds,
 ) -> f64 {
     let state = scoring_cache.state_of(node);
-    let load = state.map(|s| s.assigned_count).unwrap_or_default() as f64;
-    let (spread_score, bin_pack_score) = if bounds.range > 0.0 {
-        (
-            (bounds.max_load - load) / bounds.range,
-            (load - bounds.min_load) / bounds.range,
-        )
-    } else {
-        (0.0, 0.0)
+    let (spread_score, bin_pack_score) = match state {
+        Some(state) if weights.spread != 0.0 || weights.bin_pack != 0.0 => {
+            let utilization = state
+                .common_resources
+                .utilization_after(&scoring_cache.common_demand);
+            let balance = BALANCE_TIE_BREAK * utilization.balance;
+            (
+                1.0 - utilization.dominant + balance,
+                utilization.dominant + balance,
+            )
+        }
+        _ => (0.0, 0.0),
     };
     let affinity_score = state
         .map(|s| s.base_affinity + scoring_cache.affinity.colocation_score(s))
         .unwrap_or_else(|| affinity_set.score(node));
-    let anti_affinity_penalty = state
-        .map(|s| s.same_task_allocations.max(s.same_group_allocations) as f64)
-        .unwrap_or_else(|| {
-            if scoring_cache.group_name.is_some() {
-                1.0
-            } else {
-                0.0
-            }
-        });
+    let collisions = state
+        .map(|s| s.same_task_allocations.max(s.same_group_allocations))
+        .unwrap_or_else(|| usize::from(scoring_cache.group_name.is_some()));
+    let anti_affinity_penalty = anti_affinity_penalty(collisions, scoring_cache.desired_count);
     let locality_score = match state {
         Some(state) => state.locality,
         None => scoring_cache
@@ -6258,6 +6545,26 @@ fn score_node_with_cache(
         + weights.locality * locality_score
 }
 
+/// The automatic anti-affinity penalty for a node already holding
+/// `collisions` allocations of this task (or its group), before
+/// `weights.automatic_anti_affinity`: `(collisions + 1) / desired`, and 0
+/// for a node holding none — the shape of Nomad's job anti-affinity.
+///
+/// Scaling by the task's count is what lets both rules hold at once: a
+/// two- or three-replica service spreads (the penalty, 0.2 x 2/3 for a
+/// first collision at the default weight, outweighs the few hundredths of
+/// utilization a small replica adds), while a twenty-replica batch task
+/// under `bin_pack` packs (0.2 x 2/20 is less than one replica's share of a
+/// node). A flat per-collision penalty spread every task, which cost
+/// many-replica plans their density and the apply a node-row recheck per
+/// extra node (docs/scheduler-and-eval-loop.md, "Scoring").
+fn anti_affinity_penalty(collisions: usize, desired_count: u32) -> f64 {
+    if collisions == 0 {
+        return 0.0;
+    }
+    (collisions as f64 + 1.0) / f64::from(desired_count.max(1))
+}
+
 fn score_nodes_with_cache<'a>(
     eligible: &[&'a Node],
     affinity_set: &AffinitySet,
@@ -6267,14 +6574,13 @@ fn score_nodes_with_cache<'a>(
     if eligible.is_empty() {
         return Vec::new();
     }
-    let bounds = cached_load_bounds(eligible, scoring_cache);
     eligible
         .iter()
         .copied()
         .map(|node| {
             (
                 node,
-                score_node_with_cache(node, affinity_set, scoring_cache, weights, bounds),
+                score_node_with_cache(node, affinity_set, scoring_cache, weights),
             )
         })
         .collect()
@@ -6603,35 +6909,6 @@ mod tests {
         Ok(task.0)
     }
 
-    fn score_with_legacy_context<'a>(
-        eligible: Vec<&'a Node>,
-        task: &'a TaskConfig,
-        task_id: i64,
-        affinity_set: &'a AffinitySet,
-        job_config_id: &'a str,
-        allocations_by_node: &'a SharedNodeAllocations,
-        task_name_to_id: &'a HashMap<String, i64>,
-        task_id_to_group: &'a HashMap<i64, String>,
-        planned_task_allocations: &'a HashMap<String, Vec<i64>>,
-        planned: &'a HashMap<String, usize>,
-        weights: SchedulerWeights,
-    ) -> Vec<(&'a Node, f64)> {
-        let ctx = SchedulingContext::new(
-            eligible,
-            task,
-            task_id,
-            affinity_set,
-            job_config_id,
-            allocations_by_node,
-            task_name_to_id,
-            task_id_to_group,
-            planned_task_allocations,
-            planned,
-            weights,
-        );
-        score_nodes_for_context(&ctx)
-    }
-
     #[test]
     fn plans_fresh_allocations_and_deltas() -> R<()> {
         let store = setup_store()?;
@@ -6723,7 +7000,19 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
 
         assert_eq!(outcome.allocations.len(), 2);
-        assert_eq!(outcome.deltas.len(), 1);
+        // One delta per node the reschedule placed on. The task has three
+        // replicas, so a collision costs 0.2 x 2/3 under the count-scaled
+        // anti-affinity penalty, more than the ~0.03 of an 8 GiB node one
+        // 256 MiB replica adds: the first replica goes to node-b, and the
+        // second ties between the two nodes (docs/scheduler-and-eval-loop.md,
+        // "Scoring"). Count-based scoring stacked both onto node-a; a
+        // many-replica task still packs (`bin_pack_packs_many_replicas_and_spreads_few`).
+        let placed_on: HashSet<&str> = outcome
+            .allocations
+            .iter()
+            .map(|alloc| alloc.node_id.as_str())
+            .collect();
+        assert_eq!(outcome.deltas.len(), placed_on.len());
 
         let node_a_added = outcome
             .allocations
@@ -7660,8 +7949,63 @@ mod tests {
         Ok(())
     }
 
+    /// The anti-affinity penalty scales with the task's count: none without
+    /// a collision, `(collisions + 1) / count` with one, so a small service's
+    /// replicas pay more per collision than a large batch task's.
     #[test]
-    fn distinct_constraints_cache_selection_matches_legacy_scoring() -> R<()> {
+    fn anti_affinity_penalty_scales_with_the_desired_count() {
+        assert_eq!(anti_affinity_penalty(0, 3), 0.0);
+        assert!((anti_affinity_penalty(1, 2) - 1.0).abs() < 1e-12);
+        assert!((anti_affinity_penalty(1, 20) - 0.1).abs() < 1e-12);
+        assert!((anti_affinity_penalty(4, 20) - 0.25).abs() < 1e-12);
+        assert!(anti_affinity_penalty(1, 3) > anti_affinity_penalty(1, 20));
+        assert_eq!(
+            anti_affinity_penalty(2, 0),
+            3.0,
+            "a zero count reads as one"
+        );
+    }
+
+    /// Under `bin_pack` a many-replica task packs onto a node again, while a
+    /// small one still spreads (review SCH4 follow-up).
+    #[test]
+    fn bin_pack_packs_many_replicas_and_spreads_few() -> R<()> {
+        let nodes_used = |count: u32| -> R<usize> {
+            let store = setup_store_with_scheduler("bin_pack", None)?;
+            for index in 0..6 {
+                store.insert_node(make_node_msg(&format!("node-{index}"), json!({})))?;
+            }
+            let job_config_id = submit_job(
+                &store,
+                "packing",
+                vec![TaskConfig {
+                    count: TaskCount::new(count),
+                    resources: json!({ "memory": 256, "cpu": 100 }),
+                    ..TaskConfig::new("worker", "noop")
+                }],
+            )?;
+            let placements = Scheduler::new(&store)?.plan_only(&job_config_id, PlanMode::Fresh)?;
+            assert_eq!(placements.len(), count as usize);
+            Ok(placements
+                .iter()
+                .map(|placement| placement.node_id.as_str())
+                .collect::<HashSet<_>>()
+                .len())
+        };
+        assert_eq!(
+            nodes_used(20)?,
+            1,
+            "twenty small replicas pack onto one node"
+        );
+        assert_eq!(nodes_used(3)?, 3, "three replicas spread");
+        Ok(())
+    }
+
+    /// Two identical, empty nodes score identically under the cached
+    /// scorer, and the scores are utilization (not min-max of counts, which
+    /// was 0 for every node when all were equal).
+    #[test]
+    fn distinct_constraints_cache_scores_identical_nodes_identically() -> R<()> {
         let nodes = vec![
             Node {
                 id: "node-a".into(),
@@ -7695,9 +8039,7 @@ mod tests {
             ..TaskConfig::new("api", "noop")
         };
         let task_id = 7_i64;
-        let allocations_by_node = SharedNodeAllocations::new();
         let planned_task_allocations: HashMap<String, Vec<i64>> = HashMap::new();
-        let planned: HashMap<String, usize> = HashMap::new();
         let task_name_to_id = HashMap::from([(task.name.clone(), task_id)]);
         let task_id_to_group = HashMap::new();
         let affinity_set = AffinitySet::new(&task.affinities)?;
@@ -7718,14 +8060,13 @@ mod tests {
             task_id,
             &task,
             &affinity_set,
-            &allocations_by_node,
             &own_by_node,
             &task_name_to_id,
             &task_id_to_group,
             &planned_task_allocations,
-            &planned,
             &resource_ledger,
             &request,
+            2,
         );
 
         let eligible = Scheduler::eligible_nodes(
@@ -7734,19 +8075,6 @@ mod tests {
             Some(&distinct_tracker),
             &scoring_cache,
         );
-        let legacy_scored = score_with_legacy_context(
-            eligible.clone(),
-            &task,
-            task_id,
-            &affinity_set,
-            "job-1",
-            &allocations_by_node,
-            &task_name_to_id,
-            &task_id_to_group,
-            &planned_task_allocations,
-            &planned,
-            SchedulerWeights::for_policy("bin_pack"),
-        );
         let cached_scored = score_nodes_with_cache(
             &eligible,
             &affinity_set,
@@ -7754,13 +8082,12 @@ mod tests {
             SchedulerWeights::for_policy("bin_pack"),
         );
 
-        assert_eq!(legacy_scored.len(), cached_scored.len());
-        for ((legacy_node, legacy_score), (cached_node, cached_score)) in
-            legacy_scored.iter().zip(cached_scored.iter())
-        {
-            assert_eq!(legacy_node.id, cached_node.id);
-            assert!((legacy_score - cached_score).abs() <= 1e-9);
-        }
+        assert_eq!(cached_scored.len(), 2);
+        assert!((cached_scored[0].1 - cached_scored[1].1).abs() <= 1e-9);
+        assert!(
+            cached_scored[0].1 > 0.0,
+            "a placement on an empty node still uses some of it: {cached_scored:?}"
+        );
 
         let chosen = eligible[0];
         distinct_tracker.insert_from_node(chosen);
@@ -8010,7 +8337,6 @@ mod tests {
         let mut ledger = ResourceLedger {
             pools: pools.into(),
         };
-        let allocations_by_node = SharedNodeAllocations::new();
         let mut planned: HashMap<String, usize> = HashMap::new();
         let mut planned_task_allocations: HashMap<String, Vec<i64>> = HashMap::new();
         let task_name_to_id = HashMap::from([(task.name.clone(), task_id)]);
@@ -8022,14 +8348,13 @@ mod tests {
             task_id,
             &task,
             &affinity_set,
-            &allocations_by_node,
             &own_by_node,
             &task_name_to_id,
             &task_id_to_group,
             &planned_task_allocations,
-            &planned,
             &ledger,
             &request,
+            1,
         );
 
         assert!(cache.can_fit_task_request(&nodes[0]));
@@ -10934,28 +11259,111 @@ mod tests {
         Ok(())
     }
 
-    fn latest_placements_json(store: &Store) -> R<String> {
+    fn plan_records(store: &Store) -> R<Vec<(String, String)>> {
         let conn = store.read_connection()?;
-        Ok(conn.query_row(
-            "SELECT placements FROM plan_submission ORDER BY id DESC LIMIT 1;",
-            [],
-            |row| row.get(0),
-        )?)
+        let mut stmt =
+            conn.prepare("SELECT status, placements FROM plan_submission ORDER BY id;")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// An applied plan leaves nothing in `plan_submission` (review SCH2),
+    /// whichever submission format the kill switch picks.
     #[test]
-    fn plan_candidates_zero_emits_format1_rows() -> R<()> {
-        let store = setup_store_with_scheduler("bin_pack", Some(json!({ "plan_candidates": 0 })))?;
-        insert_test_nodes(&store)?;
-        let job_config_id = submit_job(&store, "kill-switch", vec![task_config("api")])?;
-        let scheduler = Scheduler::new(&store)?;
-        scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+    fn applied_plans_leave_no_plan_record() -> R<()> {
+        for settings in [None, Some(json!({ "plan_candidates": 0 }))] {
+            let store = setup_store_with_scheduler("bin_pack", settings)?;
+            insert_test_nodes(&store)?;
+            let job_config_id = submit_job(&store, "no-record", vec![task_config("api")])?;
+            let outcome =
+                Scheduler::new(&store)?.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+            assert_eq!(outcome.allocations.len(), 1);
+            assert!(
+                plan_records(&store)?.is_empty(),
+                "an applied plan keeps no row"
+            );
+        }
+        Ok(())
+    }
 
-        let placements_json = latest_placements_json(&store)?;
-        let value: Value = serde_json::from_str(&placements_json)?;
+    /// A rejected plan keeps one record, in the shape its submission had:
+    /// `plan_candidates: 0` still emits the pre-candidate array, so the
+    /// kill switch keeps format-2 JSON off the log in a mixed-version window.
+    #[test]
+    fn rejected_plans_keep_a_record_in_their_submission_format() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_config_id = submit_job(&store, "rejected", vec![task_config("api")])?;
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+        let node_id = store.get_nodes()?[0].id.clone();
+        // An epoch from the future: the compare-and-set rejects.
+        let stale = std::collections::BTreeMap::from([(format!("job_config:{job_config_id}"), 99)]);
+
+        let (submission, outcome) = store.submit_and_apply_plan(
+            &job_config_id,
+            "fresh",
+            &[(node_id.clone(), task_id)],
+            &stale,
+            &[],
+        )?;
+        assert!(matches!(outcome, PlanApplyOutcome::Rejected { .. }));
+        assert!(submission.id.is_some(), "the rejection names its record");
+        let (submission, outcome) = store.submit_and_apply_plan_with_candidates(
+            &job_config_id,
+            "fresh",
+            &[PlanSubmissionPlacement {
+                task_id,
+                candidates: vec![node_id],
+                instance_id: None,
+            }],
+            &stale,
+            &[],
+        )?;
+        assert!(matches!(outcome, PlanApplyOutcome::Rejected { .. }));
+        assert!(submission.id.is_some());
+
+        let records = plan_records(&store)?;
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|(status, _)| status == "rejected"));
+        let format1: Value = serde_json::from_str(&records[0].1)?;
+        assert!(format1.is_array(), "format 1 stays an array: {format1}");
+        let format2: Value = serde_json::from_str(&records[1].1)?;
+        assert_eq!(format2["format"], 2, "{format2}");
+        Ok(())
+    }
+
+    /// A staged plan is a `queued` row until the apply that consumes it,
+    /// which deletes it in the same transaction; applying it twice is an
+    /// error, not a second placement.
+    #[test]
+    fn staged_plans_are_deleted_by_the_apply_that_consumes_them() -> R<()> {
+        let store = setup_store()?;
+        insert_test_nodes(&store)?;
+        let job_config_id = submit_job(&store, "staged", vec![task_config("api")])?;
+        let task_id = task_id_for(&store, &job_config_id, "api")?;
+        let node_id = store.get_nodes()?[0].id.clone();
+        let epochs =
+            store.allocation_version_vector_for_candidates(&job_config_id, &[node_id.as_str()])?;
+        let staged = store.insert_plan_submission(
+            &job_config_id,
+            "fresh",
+            &[(node_id, task_id)],
+            &epochs,
+        )?;
+        assert_eq!(plan_records(&store)?.len(), 1);
+        assert_eq!(plan_records(&store)?[0].0, "queued");
+
+        assert!(matches!(
+            store.apply_plan_submission(&staged)?,
+            PlanApplyOutcome::Applied(_)
+        ));
+        assert!(plan_records(&store)?.is_empty(), "consumed with the apply");
+        let again = store
+            .apply_plan_submission(&staged)
+            .expect_err("a consumed plan cannot apply twice");
         assert!(
-            value.is_array(),
-            "plan_candidates: 0 must emit the pre-candidate array shape, got: {placements_json}"
+            format!("{again:#}").contains("no longer exists"),
+            "{again:#}"
         );
         Ok(())
     }
@@ -11156,24 +11564,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_candidates_default_emits_format2_rows() -> R<()> {
-        let store = setup_store()?;
-        insert_test_nodes(&store)?;
-        let job_config_id = submit_job(&store, "format-two", vec![task_config("api")])?;
-        let scheduler = Scheduler::new(&store)?;
-        scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
-
-        let placements_json = latest_placements_json(&store)?;
-        let value: Value = serde_json::from_str(&placements_json)?;
-        assert_eq!(
-            value.get("format").and_then(Value::as_i64),
-            Some(2),
-            "candidates on must emit format-2 rows, got: {placements_json}"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn job_plan_previews_the_victims_a_submit_would_take() -> R<()> {
         let store = setup_store()?;
         small_node(&store, "node-a")?;
@@ -11253,6 +11643,196 @@ mod tests {
         crate::manager::blocked::PlacementBlocked::in_chain(error)
             .map(|blocked| blocked.detail["gang"].clone())
             .unwrap_or(Value::Null)
+    }
+
+    /// A 512 MiB node (two 256 MiB gang members) in `rack`.
+    fn rack_node(store: &Store, id: &str, rack: &str) -> R<()> {
+        store.insert_node(make_node_msg_with_sources(
+            id,
+            json!({ "rack": rack }),
+            json!({
+                "memory_total": "536870912",
+                "cpus": { "cpu-1": { "frequency": "1000" } }
+            }),
+            json!({}),
+        ))?;
+        Ok(())
+    }
+
+    fn topology_gang(mode: crate::structs::TopologyMode) -> Option<crate::structs::GangConfig> {
+        Some(crate::structs::GangConfig {
+            topology: Some(crate::structs::GangTopology {
+                key: "rack".into(),
+                mode,
+            }),
+            ..Default::default()
+        })
+    }
+
+    fn racks_of(store: &Store, job: &str) -> R<Vec<String>> {
+        let nodes: HashMap<String, Node> = store
+            .get_nodes()?
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect();
+        let mut racks: Vec<String> = store
+            .get_allocs()?
+            .into_iter()
+            .filter(|allocation| allocation.job_id == job)
+            .filter_map(|allocation| {
+                nodes[&allocation.node_id].config_attrs["rack"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        racks.sort();
+        racks.dedup();
+        Ok(racks)
+    }
+
+    /// A `required` topology gang lands in one rack, and picks the
+    /// smallest rack that holds it (best fit), keeping the big rack whole.
+    #[test]
+    fn a_required_topology_gang_places_in_the_tightest_domain_that_fits() -> R<()> {
+        let store = setup_store()?;
+        for node in ["big-1", "big-2", "big-3"] {
+            rack_node(&store, node, "big")?;
+        }
+        for node in ["small-1", "small-2"] {
+            rack_node(&store, node, "small")?;
+        }
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                4,
+                topology_gang(crate::structs::TopologyMode::Required),
+            ),
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let preview = scheduler.plan_only_preview(&trainer, PlanMode::Fresh)?;
+        let report = &preview.gang_reports[0];
+        assert!(report.would_place);
+        assert_eq!(report.topology_key, "rack");
+        assert_eq!(report.topology_mode, "required");
+        assert_eq!(report.topology_domain, "small", "best fit: 4 of 4 slots");
+        assert_eq!(report.topology_domains, 2);
+
+        let outcome = scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 4);
+        assert_eq!(racks_of(&store, "trainer")?, vec!["small"]);
+        Ok(())
+    }
+
+    /// No single rack holds the quorum: a `required` gang waits, holding
+    /// nothing, and its report names the closest rack, though the cluster
+    /// as a whole has room.
+    #[test]
+    fn a_required_topology_gang_waits_when_no_domain_fits() -> R<()> {
+        let store = setup_store()?;
+        rack_node(&store, "a-1", "a")?;
+        rack_node(&store, "b-1", "b")?;
+        let scheduler = Scheduler::new(&store)?;
+
+        let plain = submit_config(&store, &gang_job("plain", Band::Normal, 3, whole_gang()))?;
+        assert_eq!(
+            scheduler
+                .plan_and_apply(&plain, PlanMode::Fresh)?
+                .allocations
+                .len(),
+            3,
+            "without topology the gang fits across racks"
+        );
+        store.remove_allocs_for_job("plain")?;
+
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                3,
+                topology_gang(crate::structs::TopologyMode::Required),
+            ),
+        )?;
+        let error = scheduler
+            .plan_and_apply(&trainer, PlanMode::Fresh)
+            .expect_err("no rack holds three");
+        let gang = gang_detail(&error);
+        assert_eq!(gang["wouldPlace"], false);
+        assert_eq!(gang["placeable"], 2, "the closest rack holds two");
+        assert_eq!(gang["topologyKey"], "rack");
+        assert_eq!(gang["topologyDomain"], "a");
+        assert_eq!(gang["topologyDomains"], 2);
+        let reason = gang["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("No single rack fits"), "{reason}");
+        assert!(
+            store.get_allocs()?.is_empty(),
+            "a waiting topology gang holds nothing, and every try was undone"
+        );
+        Ok(())
+    }
+
+    /// `preferred` never waits for topology: with no rack that holds the
+    /// gang, it spans the fewest racks that do.
+    #[test]
+    fn a_preferred_topology_gang_spans_domains_when_none_fits_alone() -> R<()> {
+        let store = setup_store()?;
+        rack_node(&store, "a-1", "a")?;
+        rack_node(&store, "b-1", "b")?;
+        rack_node(&store, "c-1", "c")?;
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                3,
+                topology_gang(crate::structs::TopologyMode::Preferred),
+            ),
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let preview = scheduler.plan_only_preview(&trainer, PlanMode::Fresh)?;
+        assert!(preview.gang_reports[0].would_place);
+        assert_eq!(
+            preview.gang_reports[0].topology_domain, "",
+            "it spans racks"
+        );
+        let outcome = scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 3);
+        assert_eq!(
+            racks_of(&store, "trainer")?.len(),
+            2,
+            "two racks, not three"
+        );
+        Ok(())
+    }
+
+    /// Nodes without the attribute are in no domain: a `required` gang with
+    /// no domain at all says so.
+    #[test]
+    fn a_required_topology_gang_without_the_attribute_anywhere_says_so() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                2,
+                topology_gang(crate::structs::TopologyMode::Required),
+            ),
+        )?;
+        let error = Scheduler::new(&store)?
+            .plan_and_apply(&trainer, PlanMode::Fresh)
+            .expect_err("no node has a rack");
+        let gang = gang_detail(&error);
+        assert_eq!(gang["topologyDomains"], 0);
+        let reason = gang["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("No eligible node has the topology attribute rack"),
+            "{reason}"
+        );
+        Ok(())
     }
 
     /// Room for two of three: without `gang` the plan places two (partial

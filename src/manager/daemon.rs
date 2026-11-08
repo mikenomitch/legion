@@ -249,6 +249,9 @@ pub async fn run_manager_with(
         if let Err(err) = store.prune_rollouts() {
             warn!(error = ?err, "Failed pruning retained rollout history");
         }
+        if let Err(err) = store.prune_plan_submissions() {
+            warn!(error = ?err, "Failed pruning plan_submission records");
+        }
     } else {
         info!("Skipping scheduler-lane startup writes (rollout prune) on raft non-leader manager");
     }
@@ -301,6 +304,9 @@ pub async fn run_manager_with(
                     info!("Raft scheduler-lane leadership acquired; pruning rollout history");
                     if let Err(err) = watch_store.prune_rollouts() {
                         warn!(error = ?err, "Failed pruning retained rollout history");
+                    }
+                    if let Err(err) = watch_store.prune_plan_submissions() {
+                        warn!(error = ?err, "Failed pruning plan_submission records");
                     }
                 }
                 was_scheduler_leader = scheduler_leader;

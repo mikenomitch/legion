@@ -529,7 +529,10 @@ mod preemption_test {
         let mut values = HashMap::new();
         values.insert("cpu".to_string(), ResourceValue::Amount(cpu));
         values.insert("memory".to_string(), ResourceValue::Amount(memory));
-        ResourcePool { values }
+        ResourcePool {
+            values,
+            capacity: Default::default(),
+        }
     }
 
     fn candidate(id: i64, band: Band, cpu: f64, memory: f64) -> VictimCandidate {

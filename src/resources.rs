@@ -427,6 +427,7 @@ mod tests {
                     ("cpu".to_string(), ResourceValue::Amount(4000.0)),
                     ("allocations".to_string(), ResourceValue::Amount(2.0)),
                 ]),
+                capacity: PoolCapacity::default(),
             };
             let running = policy
                 .usage_request(&json!({ "memory": 2048, "cpu": 2000 }))
@@ -883,6 +884,39 @@ pub(crate) struct ResourceRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct ResourcePool {
     pub(crate) values: HashMap<String, ResourceValue>,
+    /// What the node offers before any allocation is subtracted: the
+    /// denominator utilization scoring divides by (`scheduler.rs`,
+    /// "Scoring"). Set once, by [`ResourcePool::from_node`]; usage never
+    /// changes it. All zero for a pool not born from a node, which scores
+    /// as unmeasured.
+    pub(crate) capacity: PoolCapacity,
+}
+
+/// A node's schedulable capacity of the four common dims, after
+/// `capacity` ceilings, `reservedResources`, and oversubscription: exactly
+/// the amounts [`ResourcePool::from_node`] starts the free pool from.
+/// Infinite where the node does not limit the dim (`maxAllocations` unset).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct PoolCapacity {
+    pub(crate) memory: f64,
+    pub(crate) cpu: f64,
+    pub(crate) cores: f64,
+    pub(crate) allocations: f64,
+}
+
+impl PoolCapacity {
+    fn of(values: &HashMap<String, ResourceValue>) -> Self {
+        let amount = |name: &str| match values.get(name) {
+            Some(ResourceValue::Amount(amount)) => *amount,
+            _ => 0.0,
+        };
+        PoolCapacity {
+            memory: amount("memory"),
+            cpu: amount("cpu"),
+            cores: amount("cores"),
+            allocations: amount("allocations"),
+        }
+    }
 }
 
 impl ResourceRequest {
@@ -992,7 +1026,10 @@ impl ResourcePool {
             }
         }
 
-        let mut pool = ResourcePool { values };
+        let mut pool = ResourcePool {
+            values,
+            capacity: PoolCapacity::default(),
+        };
 
         if let Some(reserved) =
             config_value(config_attrs, &["reservedResources", "reserved_resources"])
@@ -1020,6 +1057,7 @@ impl ResourcePool {
                 }
             }
         }
+        pool.capacity = PoolCapacity::of(&pool.values);
 
         Ok(pool)
     }
@@ -1054,6 +1092,7 @@ impl ResourcePool {
     ) -> ResourcePool {
         let empty = || ResourcePool {
             values: HashMap::new(),
+            capacity: PoolCapacity::default(),
         };
         let mut pool = match ResourcePool::from_node(node) {
             Ok(pool) => pool,
@@ -1355,6 +1394,7 @@ impl ResourcePool {
                 );
                 return ResourcePool {
                     values: HashMap::new(),
+                    capacity: PoolCapacity::default(),
                 };
             }
         };

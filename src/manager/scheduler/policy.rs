@@ -215,6 +215,15 @@ pub trait SchedulingPolicy {
     fn select_node<'a>(&self, ctx: SchedulingContext<'a>) -> Option<&'a Node>;
 }
 
+/// The built-in policies as trait objects. The scheduler never calls their
+/// `select_node`: it recognizes `bin_pack` and `spread` by name and scores
+/// them itself, by resource utilization against capacity, through the
+/// plan's scoring cache (`scheduler.rs` `score_node_with_cache`;
+/// docs/scheduler-and-eval-loop.md, "Scoring"). `SchedulingContext` — the
+/// plugin-facing context — carries allocation counts and no capacity, so
+/// the trait implementations below can only approximate a policy by
+/// counts; they exist for the trait's sake and for callers outside the
+/// scheduler.
 #[derive(Default)]
 pub struct BinPackPolicy;
 

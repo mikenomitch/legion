@@ -404,15 +404,21 @@ regular affinity rules plus the `same_node_as` task colocation preference.
 On top of explicit affinity rules, policy scoring applies an automatic
 anti-affinity penalty.
 
-The penalty for each candidate node is:
+The penalty for each candidate node, with `collisions =
+max(same_task_allocations_on_node, same_group_allocations_on_node)`, is:
 
-- `max(same_task_allocations_on_node, same_group_allocations_on_node)`
+- `0` when `collisions` is 0;
+- `(collisions + 1) / count` otherwise, where `count` is the task's desired
+  replica count.
 
 It is then weighted by the scheduler setting `automatic_anti_affinity`
 (default `0.2`).
 
 As a result, the scheduler prefers not to stack allocations of the same task
-or group on one node. This is a soft preference, so it can still happen.
+or group on one node. This is a soft preference, and it weakens as the count
+grows: a three-replica service spreads, while under `bin_pack` a
+twenty-replica batch task packs onto as few nodes as fit it
+([scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#scoring)).
 
 ## Content Locality
 
@@ -433,7 +439,7 @@ Every candidate node's score is a weighted sum. Set the weights under
   schedulerSettings = {
     weights = {
       affinities = 1.0,              # affinity rules and same_node_as
-      automatic_anti_affinity = 0.2, # subtracted per stacked allocation
+      automatic_anti_affinity = 0.2, # times (stacked + 1) / count
       locality = 1.0,                # content locality; 0 disables
       # spread / bin_pack default to 1.0 for the matching policy, else 0.
     },
@@ -443,11 +449,26 @@ Every candidate node's score is a weighted sum. Set the weights under
 
 ```
 score = affinities * affinity
-      + spread * (emptiness relative to the other candidates)
-      + bin_pack * (fullness relative to the other candidates)
-      - automatic_anti_affinity * stacked allocations
+      + spread * (1 - utilization after placing)
+      + bin_pack * (utilization after placing)
+      - automatic_anti_affinity * (stacked + 1) / count   (0 when nothing is stacked)
       + locality * content locality
 ```
+
+**Utilization** is resource-based, not a count of allocations: the largest
+fraction, over the resources the task requests (memory, cpu, cores, allocation
+slots with a finite `maxAllocations`), of the node's schedulable capacity that
+would be in use once the task is placed. A small balanced-allocation term
+favors nodes whose resources fill evenly. It is absolute, so a node scores the
+same whichever other nodes are candidates. The exact formula is in
+[scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#scoring).
+
+So `bin_pack` puts a 2 GiB task on the node that is 75% full of one large
+allocation before the one that holds three small ones, keeping the emptier
+node whole for a large task, and `spread` does the reverse. Replicas of one
+task spread when they are few and pack under `bin_pack` when they are many,
+because the anti-affinity penalty is divided by the count (above); set
+`automatic_anti_affinity = 0` to stack them whatever the count.
 
 Weights must be non-negative numbers. Unknown keys are ignored. The highest
 score wins, with exact ties broken at random.
