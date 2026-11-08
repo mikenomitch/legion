@@ -202,6 +202,31 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- GitOps (docs/gitops.md) ---
+        Capability {
+            name: "gitops.status",
+            cli: "legion gitops status [REPO] [-n NS | -A]",
+            grpc: Some("Manager/ListObjects"),
+            summary: "Repos (gitops/Repo objects): each one's state, ref, deployed commit, and every job it deployed with its state (deployed, progressing, failed, stopped, pending).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "gitops.add",
+            cli: "legion gitops add <NAME> --url URL [--ref REF] [--path DIR] [--interval D] [--jobs A,B] [--host-level] [--no-prune] [--credentials-kv KEY] [--kv-key KEY]... [--dry-run] [--wait] [--idempotency-key K]",
+            grpc: Some("Manager/ApplyObject"),
+            summary: "Create a Repo: gitops deploys every jobspec in the repository's path into the Repo's namespace and keeps it deployed. Writing it needs job:read and job:write there (on --jobs alone when given).",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "gitops.sync",
+            cli: "legion gitops sync <REPO> [--wait] [--timeout D]",
+            grpc: Some("Manager/ApplyObject"),
+            summary: "Sync a Repo now (sets its gitops/sync label, which gitops echoes); --wait waits until the commit is deployed and every rollout finished, and fails if one did not.",
+            mutates: true,
+            read_only_safe: false,
+        },
         // --- Jobs: write ---
         Capability {
             name: "job.run",

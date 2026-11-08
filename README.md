@@ -47,6 +47,12 @@ still be happy with at fifty thousand nodes.
   Add-ons run as [apps](docs/apps.md): jobs on the managers that Legion keeps
   running, each with a grant it shows you before you install it, and able to
   add [object kinds](docs/app-objects.md) of their own.
+- **GitOps, built in.** `legion gitops add web --url <repo> --path jobs`
+  deploys every jobspec in a git repository and keeps it deployed: a merge
+  rolls out, a deleted file's job stops, and a hand edit is written back.
+  CI runs `legion gitops sync web --wait` to deploy now and fail on a bad
+  rollout. gitops can deploy only what the Repo's author could
+  ([GitOps](docs/gitops.md)).
 - **Readable job specs.** [Nickel](docs/configuration-language.md) gives you
   types, imports, and functions for DRY specs. You don't need YAML or Helm
   charts.
@@ -417,8 +423,8 @@ add:
 
 - **Faster sandbox wake-ups.** Node-local wake on connect and diff snapshots
   on top of [suspend and resume](docs/suspend-and-resume.md).
-- **Built-in ingress gateway, autoscaler, cert-manager, and GitOps tools,**
-  for a more omakase starting experience.
+- **Built-in ingress gateway and cert-manager,** beside the built-in
+  autoscaler and GitOps, for a more omakase starting experience.
 - **Resource registry.** Share and pull jobs, templates, and plugins.
 - **Sharded scheduler.** Scale placement throughput past a single Raft
   cluster.
@@ -442,7 +448,7 @@ start:
   [Adaptive Scheduler Concurrency](docs/adaptive-scheduler-concurrency.md)
 - **Running workloads:** [Task Runtimes](docs/task-runtime-plugins.md) ·
   [Artifacts](docs/artifacts.md) · [Rollouts](docs/rollouts.md) ·
-  [Autoscaling](docs/autoscaling.md) ·
+  [GitOps](docs/gitops.md) · [Autoscaling](docs/autoscaling.md) ·
   [Autoscaling Plugins](docs/autoscaling-plugins.md) ·
   [Gang Scheduling](docs/gang-scheduling.md) ·
   [Task Supervision](docs/task-supervision.md) ·

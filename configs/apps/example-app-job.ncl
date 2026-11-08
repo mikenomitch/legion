@@ -1,7 +1,7 @@
-# A job that sets the example gitops app's jobspec keys
+# A job that sets the example deployer app's jobspec keys
 # (configs/apps/example-app.ncl; docs/apps.md, "Jobspec extensions").
 #
-# It submits only where that app is installed: elsewhere `gitops` and
+# It submits only where that app is installed: elsewhere `deployer` and
 # `syncWave` are unknown keys (or, with --allow-unknown-fields, pending
 # values the app adopts when it is installed).
 #
@@ -11,9 +11,9 @@
 #   legion job info storefront                             # each value, with its defaults, and its state
 {
   name = "storefront",
-  # The job point: the app's `gitops` key, next to what it describes.
+  # The job point: the app's `deployer` key, next to what it describes.
   # `autoSync` is left out: it reads as the schema's default (true).
-  gitops = {
+  deployer = {
     repo = "https://github.com/acme/deploy",
     path = "jobs/storefront.ncl",
   },
@@ -37,7 +37,7 @@
       resources = { cpu = 100, memory = 64 },
       # The qualified spelling, which works at every point and never
       # collides with a core field.
-      apps = { gitops = { wave = 2 } },
+      apps = { deployer = { wave = 2 } },
     },
   ],
 }

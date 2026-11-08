@@ -743,7 +743,7 @@ async fn the_app_refuses_direct_calls_without_a_matching_assertion_test() -> R<(
     assert_eq!(get(path.clone(), Some("not-a-jwt".into())).await?.0, 401);
     let expired = fx.sign(APP, &claim, now - 600, now - 540)?;
     assert_eq!(get(path.clone(), Some(expired)).await?.0, 401);
-    let other_app = fx.sign("gitops", &claim, now, now + 60)?;
+    let other_app = fx.sign("deployer", &claim, now, now + 60)?;
     assert_eq!(get(path.clone(), Some(other_app)).await?.0, 401);
     let valid = fx.sign(APP, &claim, now, now + 60)?;
     let (status, body) = get(

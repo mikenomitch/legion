@@ -516,7 +516,7 @@ The same check bounds what else an app can reach through other people:
   ([Host-level jobs](#host-level-jobs)).
 
 ```text
-Error: app gitops 0.2.0 asks for job:write in team-*, which your token does not hold
+Error: app deployer 0.2.0 asks for job:write in team-*, which your token does not hold
 Hint: have someone who holds it do this, or ask for it to be granted to you
 ```
 
@@ -693,7 +693,9 @@ permissions = [
 ```
 
 gitops's own credential then writes no job anywhere; acting for a Repo, it
-writes exactly the jobs that Repo's author was checked for. The rule is
+writes exactly the jobs that Repo's author was checked for. The bundled
+[gitops](gitops.md#who-can-do-what) app goes further: every rule it holds is
+`via = "objects"`, so its own credential can do nothing at all. The rule is
 granted like any other: the installer must hold it (`legion acl grants
 list` shows it with `(via objects)`), and the install prompt says what it
 means:

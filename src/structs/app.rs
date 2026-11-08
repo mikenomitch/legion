@@ -2476,7 +2476,7 @@ mod app_tests {
             "{prompt}"
         );
         assert!(
-            prompt.contains("while gitops acts for one of its gitops/Repo objects"),
+            prompt.contains("while deployer acts for one of its deployer/Repo objects"),
             "{prompt}"
         );
         let without_kinds = manifest(json!({
@@ -2582,7 +2582,7 @@ mod app_tests {
         let console = ui.page("console").expect("the console page");
         assert!(console.allows_rpc("RunJob"));
         assert!(manifest.ui_summary().contains(
-            &"a GitOps console page (sandboxed; calls ListJobs, GetJobInfo, RunJob as the viewer)"
+            &"a Deployer console page (sandboxed; calls ListJobs, GetJobInfo, RunJob as the viewer)"
                 .to_string()
         ));
         assert_eq!(
@@ -2621,8 +2621,8 @@ mod app_tests {
         assert_eq!(
             keys,
             vec![
-                ("job", "gitops", ""),
-                ("group", "apps.gitops", "background"),
+                ("job", "deployer", ""),
+                ("group", "apps.deployer", "background"),
                 ("group", "syncWave", "frontend"),
             ]
         );

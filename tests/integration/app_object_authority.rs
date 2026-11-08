@@ -3,7 +3,7 @@
 //! object").
 //!
 //! In process, against a manager service with ACLs and workload identity
-//! on, a `gitops` app whose `Repo` kind requires job:write on the jobs a
+//! on, a `deployer` app whose `Repo` kind requires job:write on the jobs a
 //! Repo names in the namespace it targets, and whose own job:write is
 //! `via = "objects"`:
 //!
@@ -49,9 +49,9 @@ type R<T> = anyhow::Result<T>;
 const ISSUER: &str = "https://legion.test:4747";
 const MGR_NODE: &str = "mgr-1";
 const NODE: &str = "node-1";
-const APP: &str = "gitops";
+const APP: &str = "deployer";
 const OTHER_APP: &str = "other";
-const KIND: &str = "gitops/Repo";
+const KIND: &str = "deployer/Repo";
 
 fn req<T>(inner: T, token: &str) -> Request<T> {
     let mut request = Request::new(inner);
@@ -87,10 +87,10 @@ fn app_job() -> Value {
                       "config": { "command": ["sleep", "3600"] } } })
 }
 
-/// `gitops`: reads jobs in team-*, writes them there only for its Repos,
+/// `deployer`: reads jobs in team-*, writes them there only for its Repos,
 /// and keeps state in its own KV prefix. A Repo requires job:write on the
 /// jobs it names in the namespace it targets.
-fn gitops_manifest(name: &str) -> Value {
+fn deployer_manifest(name: &str) -> Value {
     json!({
         "name": name,
         "version": "1.0.0",
@@ -469,7 +469,8 @@ async fn fixture() -> R<Fixture> {
     for namespace in ["team-a", "team-b", "other"] {
         fx.namespace(namespace).await?;
     }
-    fx.install(&gitops_manifest(APP), &fx.admin.clone()).await?;
+    fx.install(&deployer_manifest(APP), &fx.admin.clone())
+        .await?;
     fx.start_app(APP).await?;
     fx.install(&other_manifest(), &fx.admin.clone()).await?;
     fx.start_app(OTHER_APP).await?;
@@ -494,7 +495,7 @@ fn alice_rules() -> Value {
 async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     let fx = fixture().await?;
     let alice = fx.person("alice", alice_rules()).await?;
-    let gitops = fx.app_token(APP)?;
+    let deployer = fx.app_token(APP)?;
     let storefront = fx
         .apply(
             repo(
@@ -513,7 +514,7 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     let reply = fx
         .run(for_object(
             Fixture::submit(&job("team-a", "storefront", 1)),
-            &gitops,
+            &deployer,
             &acting,
         ))
         .await?;
@@ -524,7 +525,7 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     );
     fx.run(for_object(
         Fixture::submit(&job("team-a", "storefront-worker", 1)),
-        &gitops,
+        &deployer,
         &acting,
     ))
     .await?;
@@ -534,33 +535,33 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     assert_code(
         fx.run(for_object(
             Fixture::submit(&job("team-a", "billing", 1)),
-            &gitops,
+            &deployer,
             &acting,
         ))
         .await,
         Code::PermissionDenied,
-        "outside what gitops for Repo team-a/storefront holds",
+        "outside what deployer for Repo team-a/storefront holds",
     );
     assert_code(
         fx.run(for_object(
             Fixture::submit(&job("team-b", "storefront", 1)),
-            &gitops,
+            &deployer,
             &acting,
         ))
         .await,
         Code::PermissionDenied,
-        "gitops for Repo team-a/storefront",
+        "deployer for Repo team-a/storefront",
     );
     assert_code(
         fx.svc
             .put_kv(for_object(
                 PutKvRequest {
-                    key: "legion/apps/gitops/state".into(),
+                    key: "legion/apps/deployer/state".into(),
                     value: "{}".into(),
                     value_type: KvValueType::String.into(),
                     ..Default::default()
                 },
-                &gitops,
+                &deployer,
                 &acting,
             ))
             .await,
@@ -570,12 +571,12 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     fx.svc
         .put_kv(req(
             PutKvRequest {
-                key: "legion/apps/gitops/state".into(),
+                key: "legion/apps/deployer/state".into(),
                 value: "{}".into(),
                 value_type: KvValueType::String.into(),
                 ..Default::default()
             },
-            &gitops,
+            &deployer,
         ))
         .await
         .context("the app's own credential reaches its KV prefix")?;
@@ -585,7 +586,7 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
                 GetJobInfoRequest {
                     name: "team-a/storefront".into(),
                 },
-                &gitops,
+                &deployer,
                 &acting,
             ))
             .await,
@@ -595,11 +596,11 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     // WhoAmI through the same client says who it is and what it holds.
     let who = fx
         .svc
-        .who_am_i(for_object(WhoAmIRequest {}, &gitops, &acting))
+        .who_am_i(for_object(WhoAmIRequest {}, &deployer, &acting))
         .await?
         .into_inner();
     assert_eq!(who.source, "for-object");
-    assert_eq!(who.principal, "gitops for Repo team-a/storefront");
+    assert_eq!(who.principal, "deployer for Repo team-a/storefront");
     assert!(who.policies.is_empty());
 
     // 5. The app's `via = "objects"` job:write does nothing for its plain
@@ -607,7 +608,7 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     assert_code(
         fx.run(req(
             Fixture::submit(&job("team-a", "storefront", 2)),
-            &gitops,
+            &deployer,
         ))
         .await,
         Code::PermissionDenied,
@@ -615,7 +616,7 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     );
 
     // 2. Never beyond the app's grant: alice may write jobs in `other`, and
-    // a Repo targeting it records that, but gitops writes jobs only in
+    // a Repo targeting it records that, but deployer writes jobs only in
     // team-*.
     let wide = fx
         .apply(
@@ -636,12 +637,12 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     assert_code(
         fx.run(for_object(
             Fixture::submit(&job("other", "anything", 1)),
-            &gitops,
+            &deployer,
             &reference(&wide),
         ))
         .await,
         Code::PermissionDenied,
-        "gitops for Repo team-a/wide",
+        "deployer for Repo team-a/wide",
     );
 
     // 3. Only the owning app's own identity names an object.
@@ -694,7 +695,7 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     // object) is refused before either is checked.
     let mut both = for_object(
         Fixture::submit(&job("team-a", "storefront", 3)),
-        &gitops,
+        &deployer,
         &acting,
     );
     both.metadata_mut()
@@ -704,7 +705,11 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     // Streams and the app plane take the app's own credential.
     assert_code(
         fx.svc
-            .watch_objects(for_object(WatchObjectsRequest::default(), &gitops, &acting))
+            .watch_objects(for_object(
+                WatchObjectsRequest::default(),
+                &deployer,
+                &acting,
+            ))
             .await,
         Code::PermissionDenied,
         "legion-for-object",
@@ -720,7 +725,7 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
                     observed_generation: 1,
                     ..Default::default()
                 },
-                &gitops,
+                &deployer,
                 &acting,
             ))
             .await,
@@ -733,8 +738,11 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     assert_code(
         fx.run(for_object(
             Fixture::submit(&job("team-a", "storefront", 3)),
-            &gitops,
-            &format!("gitops/Repo/team-a/storefront#{}@1", storefront.uid + 1000),
+            &deployer,
+            &format!(
+                "deployer/Repo/team-a/storefront#{}@1",
+                storefront.uid + 1000
+            ),
         ))
         .await,
         Code::PermissionDenied,
@@ -743,18 +751,18 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     assert_code(
         fx.run(for_object(
             Fixture::submit(&job("team-a", "storefront", 3)),
-            &gitops,
-            &format!("gitops/Repo/team-a/billing#{}@1", storefront.uid),
+            &deployer,
+            &format!("deployer/Repo/team-a/billing#{}@1", storefront.uid),
         ))
         .await,
         Code::PermissionDenied,
-        "not gitops/Repo/team-a/billing",
+        "not deployer/Repo/team-a/billing",
     );
     assert_code(
         fx.run(for_object(
             Fixture::submit(&job("team-a", "storefront", 3)),
-            &gitops,
-            "gitops/Repo/storefront",
+            &deployer,
+            "deployer/Repo/storefront",
         ))
         .await,
         Code::Unauthenticated,
@@ -798,7 +806,7 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     }
     fx.run(for_object(
         Fixture::submit(&job("team-a", "leaving", 1)),
-        &gitops,
+        &deployer,
         &reference(&leaving),
     ))
     .await
@@ -806,7 +814,7 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     assert_code(
         fx.run(for_object(
             Fixture::submit(&job("team-a", "doomed", 1)),
-            &gitops,
+            &deployer,
             &reference(&doomed),
         ))
         .await,
@@ -829,7 +837,7 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
     assert_eq!(updated.generation, storefront.generation + 1);
     fx.run(for_object(
         Fixture::submit(&job("team-a", "storefront-cron", 1)),
-        &gitops,
+        &deployer,
         &acting,
     ))
     .await
@@ -843,7 +851,7 @@ async fn acting_for_an_object_holds_its_authority_test() -> R<()> {
 async fn jobs_written_for_an_object_are_stamped_test() -> R<()> {
     let fx = fixture().await?;
     let alice = fx.person("alice", alice_rules()).await?;
-    let gitops = fx.app_token(APP)?;
+    let deployer = fx.app_token(APP)?;
     let storefront = fx
         .apply(
             repo(
@@ -856,7 +864,7 @@ async fn jobs_written_for_an_object_are_stamped_test() -> R<()> {
         .await?;
     fx.run(for_object(
         Fixture::submit(&job("team-a", "storefront", 1)),
-        &gitops,
+        &deployer,
         &reference(&storefront),
     ))
     .await?;
@@ -867,7 +875,7 @@ async fn jobs_written_for_an_object_are_stamped_test() -> R<()> {
     assert_eq!(stamp.app, APP);
     assert_eq!(
         stamp.object,
-        format!("gitops/Repo/team-a/storefront#{}", storefront.uid)
+        format!("deployer/Repo/team-a/storefront#{}", storefront.uid)
     );
     assert!(stamp.digest.is_empty());
 
@@ -875,7 +883,7 @@ async fn jobs_written_for_an_object_are_stamped_test() -> R<()> {
     // submit replaces it, with a warning naming who will write it back.
     fx.run(for_object(
         Fixture::submit(&job("team-a", "storefront", 1)),
-        &gitops,
+        &deployer,
         &reference(&storefront),
     ))
     .await?;
@@ -889,7 +897,7 @@ async fn jobs_written_for_an_object_are_stamped_test() -> R<()> {
         reply
             .warnings
             .iter()
-            .any(|w| w.contains("was managed by gitops for Repo team-a/storefront")),
+            .any(|w| w.contains("was managed by deployer for Repo team-a/storefront")),
         "{:?}",
         reply.warnings
     );
@@ -897,7 +905,7 @@ async fn jobs_written_for_an_object_are_stamped_test() -> R<()> {
     // The app writing it back stamps it again.
     fx.run(for_object(
         Fixture::submit(&job("team-a", "storefront", 1)),
-        &gitops,
+        &deployer,
         &reference(&storefront),
     ))
     .await?;
@@ -924,7 +932,7 @@ async fn installers_must_hold_via_rules_test() -> R<()> {
         )
         .await?;
     assert_code(
-        fx.install(&gitops_manifest("gitops2"), &reader.secret)
+        fx.install(&deployer_manifest("deployer2"), &reader.secret)
             .await,
         Code::PermissionDenied,
         "job:write in team-* (via objects)",
@@ -940,7 +948,7 @@ async fn installers_must_hold_via_rules_test() -> R<()> {
         )
         .await?;
     let installed = fx
-        .install(&gitops_manifest("gitops2"), &writer.secret)
+        .install(&deployer_manifest("deployer2"), &writer.secret)
         .await?;
     assert!(
         installed
@@ -969,14 +977,14 @@ async fn installers_must_hold_via_rules_test() -> R<()> {
 }
 
 /// 8. Authority is recorded, not revoked: after alice loses a right, or
-/// her token, gitops keeps acting within what she authorized, and
+/// her token, deployer keeps acting within what she authorized, and
 /// `--authority-lapsed` finds those Repos; re-applying re-authorizes.
 #[tokio::test(flavor = "multi_thread")]
 async fn lapsed_authority_is_listed_not_revoked_test() -> R<()> {
     let fx = fixture().await?;
     let alice = fx.person("alice", alice_rules()).await?;
     let bob = fx.person("bob", alice_rules()).await?;
-    let gitops = fx.app_token(APP)?;
+    let deployer = fx.app_token(APP)?;
     let spec = |name: &str| {
         json!({ "url": format!("https://git.example/{name}"), "targetNamespace": "team-a",
                 "jobs": [name] })
@@ -1031,11 +1039,11 @@ async fn lapsed_authority_is_listed_not_revoked_test() -> R<()> {
     assert_eq!(state, "lapsed");
     assert!(detail.contains("was deleted"), "{detail}");
 
-    // Not revoked: gitops still deploys both within what was recorded.
+    // Not revoked: deployer still deploys both within what was recorded.
     for object in [&storefront, &billing] {
         fx.run(for_object(
             Fixture::submit(&job("team-a", &object.name, 1)),
-            &gitops,
+            &deployer,
             &reference(object),
         ))
         .await

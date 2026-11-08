@@ -11,6 +11,7 @@ pub mod events;
 pub mod exec;
 pub mod exec_key;
 pub mod exec_ticket;
+pub mod gitops;
 pub mod guest_agent;
 pub mod guest_resume;
 pub mod helpers;
@@ -71,6 +72,7 @@ fn base_cli() -> Command {
         .subcommand(app::config())
         .subcommand(namespace::config())
         .subcommand(object::config())
+        .subcommand(gitops::config())
         .subcommand(template::config())
         .subcommand(instance::config())
         .subcommand(node::config())
@@ -118,6 +120,9 @@ mod tests {
         "legion mcp serve",
         // The in-task entrypoint of a bundled app: a long-running process.
         "legion app run",
+        // gitops's renderer, which only the app runs: its stdout is already
+        // a JSON answer for the app.
+        "legion app gitops-render",
         "legion guest-agent",
         "legion guest-resume",
     ];

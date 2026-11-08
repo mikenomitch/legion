@@ -1,7 +1,7 @@
 //! App-owned object kinds (app-object-kinds plan §9; docs/app-objects.md).
 //!
 //! In process, against a manager service with ACLs and workload identity
-//! on, a `gitops` app declaring a `Repo` kind, and a fake app port behind a
+//! on, a `deployer` app declaring a `Repo` kind, and a fake app port behind a
 //! loopback forwarder answering the object validate call:
 //!
 //! - apply, get, list, delete with ACLs: the `object` resource by namespace
@@ -51,8 +51,8 @@ type R<T> = anyhow::Result<T>;
 const ISSUER: &str = "https://legion.test:4747";
 const MGR_NODE: &str = "mgr-1";
 const NODE: &str = "node-1";
-const APP: &str = "gitops";
-const KIND: &str = "gitops/Repo";
+const APP: &str = "deployer";
+const KIND: &str = "deployer/Repo";
 
 fn req<T>(inner: T, token: &str) -> Request<T> {
     let mut request = Request::new(inner);
@@ -63,7 +63,7 @@ fn req<T>(inner: T, token: &str) -> Request<T> {
     request
 }
 
-/// The `gitops` app: a `Repo` kind whose writer needs job:write on the jobs
+/// The `deployer` app: a `Repo` kind whose writer needs job:write on the jobs
 /// it names, with a cleanup window, a write-only key, and the validate call.
 fn manifest(version: &str, with_kind: bool) -> Value {
     let mut manifest = json!({
@@ -1211,7 +1211,7 @@ async fn kinds_follow_their_app_test() -> R<()> {
         )
         .await,
         Code::InvalidArgument,
-        "gitops/Repo",
+        "deployer/Repo",
     );
 
     fx.apply(
@@ -1404,7 +1404,7 @@ async fn rules_fail_closed_test() -> R<()> {
             fx.apply_with(both.clone(), &fx.admin, |request| request.dry_run = dry_run)
                 .await,
             Code::InvalidArgument,
-            "gitops/Repo team-a/api: spec.url: url must be https; spec.branch: no tmp branches",
+            "deployer/Repo team-a/api: spec.url: url must be https; spec.branch: no tmp branches",
         );
     }
     assert_code(

@@ -443,6 +443,16 @@ impl ObjectOutcome {
         }
     }
 
+    /// Accepted and still working toward ready (a rollout under way):
+    /// `Ready=unknown` with `reason`. The object reads `Pending`, which
+    /// `--wait` keeps waiting through (Flux's `Ready=Unknown, Progressing`).
+    pub fn progressing(reason: &str, message: impl AsRef<str>) -> ObjectOutcome {
+        ObjectOutcome {
+            ready: Some(condition("unknown", reason, message.as_ref())),
+            ..ObjectOutcome::ready()
+        }
+    }
+
     /// The app understood the spec and refuses it: `Accepted=false`. The
     /// object reads `Rejected: <reason>` until its spec changes.
     pub fn rejected(reason: &str, message: impl AsRef<str>) -> ObjectOutcome {
@@ -758,6 +768,9 @@ pub struct Reconciler {
     concurrency: usize,
     cleanup: Option<CleanupHandler>,
     connection: Option<ManagerConnection>,
+    /// Uids to reconcile at once ([`Reconciler::wake`]). Taken by the one
+    /// loop that runs; a clone of the reconciler shares it.
+    wake: Option<Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<u64>>>>>,
 }
 
 impl std::fmt::Debug for Reconciler {
@@ -772,6 +785,7 @@ impl std::fmt::Debug for Reconciler {
             .field("concurrency", &self.concurrency)
             .field("cleanup", &self.cleanup.is_some())
             .field("connection", &self.connection.is_some())
+            .field("wake", &self.wake.is_some())
             .finish()
     }
 }
@@ -790,6 +804,7 @@ impl Reconciler {
             concurrency: DEFAULT_CONCURRENCY,
             cleanup: None,
             connection: None,
+            wake: None,
         }
     }
 
@@ -832,6 +847,15 @@ impl Reconciler {
     /// Reconcile at most this many objects at once (default 4).
     pub fn concurrency(mut self, limit: usize) -> Reconciler {
         self.concurrency = limit.max(1);
+        self
+    }
+
+    /// Reconcile an object at once when its uid arrives on `wake`, as a
+    /// change to it would: the hook for an app's own trigger (gitops's
+    /// Sync now action). A uid the loop does not hold is ignored; one that
+    /// is reconciling now runs again when that run ends.
+    pub fn wake(mut self, wake: tokio::sync::mpsc::UnboundedReceiver<u64>) -> Reconciler {
+        self.wake = Some(Arc::new(std::sync::Mutex::new(Some(wake))));
         self
     }
 
@@ -1028,6 +1052,11 @@ async fn reconcile_loop<P: ObjectPlane>(
     let mut cache = ObjectCache::default();
     let mut work: HashMap<u64, Work> = HashMap::new();
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Done>();
+    let mut wake = config
+        .wake
+        .as_ref()
+        .and_then(|wake| wake.lock().ok().and_then(|mut slot| slot.take()));
+    let mut wake_open = wake.is_some();
     let mut running = 0usize;
     let mut watch_retry = Duration::from_millis(500);
     info!(app = %config.app, kind = %config.kind, "Reconciling objects");
@@ -1116,6 +1145,26 @@ async fn reconcile_loop<P: ObjectPlane>(
                     None => {
                         debug!(kind = %config.kind, "The object watch closed");
                         break;
+                    }
+                },
+                woken = async {
+                    match wake.as_mut() {
+                        Some(wake) => wake.recv().await,
+                        None => None,
+                    }
+                }, if wake_open => {
+                    match woken {
+                        Some(uid) if cache.get(uid).is_some() => {
+                            let entry = work.entry(uid).or_default();
+                            if entry.running {
+                                entry.dirty = true;
+                            } else {
+                                entry.due = Some(Instant::now());
+                                entry.failures = 0;
+                            }
+                        }
+                        Some(uid) => debug!(kind = %config.kind, uid, "Woken for an object this loop does not hold"),
+                        None => wake_open = false,
                     }
                 },
                 Some(done) = done_rx.recv() => {
@@ -1358,7 +1407,7 @@ mod tests {
         let mut cluster = object(9, 1, 1);
         cluster.namespace = String::new();
         assert_eq!(acting_for(&cluster).header_value(), "gitops/Repo//r9#9@1");
-        let err = request.client().err().expect("no connection");
+        let err = request.client().expect_err("no connection");
         assert!(
             format!("{err:#}").contains("no Legion connection"),
             "{err:#}"
@@ -1564,6 +1613,64 @@ mod tests {
                 .count(),
             1
         );
+        stop_tx.send(true).expect("stop");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("stops")
+            .expect("joins");
+    }
+
+    /// A uid sent on the wake channel reconciles that object at once, with
+    /// nothing changed; an unknown uid is ignored, and a closed channel
+    /// leaves the loop running.
+    #[tokio::test]
+    async fn waking_an_object_reconciles_it_now_test() {
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let plane = FakePlane {
+            events: Arc::new(StdMutex::new(Some(receiver))),
+            ..Default::default()
+        };
+        let calls = Arc::new(StdMutex::new(Vec::<u64>::new()));
+        let seen = calls.clone();
+        let (wake_tx, wake_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop_tx, stop) = tokio::sync::watch::channel(false);
+        let task = Reconciler::new("gitops", "Repo")
+            .resync(Duration::from_secs(3600))
+            .wake(wake_rx)
+            .run(plane.clone(), stop, move |request| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().expect("lock").push(request.object.uid);
+                    Ok(ObjectOutcome::ready())
+                }
+            });
+        events
+            .send(ObjectEvent {
+                snapshot: true,
+                snapshot_done: true,
+                upserts: vec![object(1, 1, 1), object(2, 1, 2)],
+                ..Default::default()
+            })
+            .expect("send");
+        eventually("two reconciles", || calls.lock().expect("lock").len() == 2).await;
+        wake_tx.send(99).expect("send");
+        wake_tx.send(2).expect("send");
+        eventually("a woken reconcile", || {
+            calls.lock().expect("lock").as_slice().ends_with(&[2])
+                && calls.lock().expect("lock").len() == 3
+        })
+        .await;
+        drop(wake_tx);
+        events
+            .send(ObjectEvent {
+                upserts: vec![object(1, 2, 3)],
+                ..Default::default()
+            })
+            .expect("send");
+        eventually("the loop still runs", || {
+            calls.lock().expect("lock").len() == 4
+        })
+        .await;
         stop_tx.send(true).expect("stop");
         tokio::time::timeout(Duration::from_secs(5), task)
             .await

@@ -449,7 +449,11 @@ async fn fixture() -> R<Fixture> {
             },
         },
     );
-    assert_eq!(reconciler.seed()?, vec![APP.to_string()]);
+    // Every bundled app is seeded; this test drives the autoscaler.
+    assert_eq!(
+        reconciler.seed()?,
+        vec![APP.to_string(), "gitops".to_string()]
+    );
     let outcome = reconciler.reconcile_app(APP).await;
     assert!(
         matches!(outcome, PassOutcome::Submitted { .. }),
@@ -517,8 +521,9 @@ async fn fixture() -> R<Fixture> {
 async fn the_job_page_shows_the_autoscaling_panel_test() -> R<()> {
     let fx = fixture().await?;
 
-    // Listed on web's page for the admin.
-    let listed = fx
+    // Listed on web's page for the admin, beside gitops's panel (which
+    // hides itself on a job no Repo deployed).
+    let listed: Vec<_> = fx
         .svc
         .list_ui_extensions(req(
             ListUiExtensionsRequest {
@@ -530,7 +535,10 @@ async fn the_job_page_shows_the_autoscaling_panel_test() -> R<()> {
         ))
         .await?
         .into_inner()
-        .extensions;
+        .extensions
+        .into_iter()
+        .filter(|extension| extension.app == APP)
+        .collect();
     assert_eq!(listed.len(), 1, "{listed:?}");
     assert_eq!(
         (listed[0].app.as_str(), listed[0].title.as_str()),
@@ -601,7 +609,10 @@ async fn the_job_page_shows_the_autoscaling_panel_test() -> R<()> {
         .await?
         .into_inner()
         .extensions;
-    assert!(listed.is_empty(), "{listed:?}");
+    assert!(
+        listed.iter().all(|extension| extension.app != APP),
+        "{listed:?}"
+    );
     let denied = fx.job_panel(&reader, "web").await.unwrap_err();
     assert_eq!(denied.code(), Code::PermissionDenied, "{denied}");
     let denied = fx

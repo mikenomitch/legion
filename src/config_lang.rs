@@ -316,6 +316,153 @@ fn loaded_sources(program: &Program<CacheImpl>, primary: &Path) -> Vec<LoadedSou
     sources
 }
 
+/// The most files [`eval_file_confined`] follows imports through.
+pub const MAX_CONFINED_FILES: usize = 512;
+
+/// The largest file [`eval_file_confined`] reads to look for imports.
+pub const MAX_CONFINED_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Evaluates a configuration file like [`eval_file_tracked`] (no `vars`),
+/// but only when every file the program could load lies inside `root`.
+///
+/// This is for source someone else wrote that Legion evaluates on their
+/// behalf: the jobspecs in a repository the `gitops` app deploys
+/// (docs/gitops.md). Before anything is evaluated, every Nickel file the
+/// program reaches is lexed for its imports, transitively, and the
+/// evaluation is refused when one is not a plain string (a package import,
+/// or a string with interpolation or escapes), is an absolute path, or
+/// resolves, with symlinks followed, outside `root`. Checking first, rather
+/// than after evaluating, is what keeps an outside file's contents out of
+/// the output *and* out of an error message (a parse error quotes the file).
+///
+/// Paths in errors and in the returned sources are relative to `root`.
+pub fn eval_file_confined(path: &Path, root: &Path) -> R<(String, Vec<LoadedSource>)> {
+    let root = std::fs::canonicalize(root)
+        .with_context(|| format!("failed to read the directory {}", root.display()))?;
+    let relative = |path: &Path| -> String {
+        path.strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    };
+    check_confined(path, &root, &relative)?;
+    let (json, sources) = eval_file_tracked(path, None).map_err(|err| {
+        // Nickel names files by their full path; the caller knows the
+        // checkout by its repository-relative paths.
+        let prefix = format!("{}/", root.display());
+        anyhow!("{}", format!("{err:#}").replace(&prefix, ""))
+    })?;
+    // Belt and braces: everything the evaluation loaded is inside `root`.
+    let mut confined = Vec::with_capacity(sources.len());
+    for source in sources {
+        let canonical = std::fs::canonicalize(&source.path)
+            .with_context(|| format!("failed to resolve {}", source.path))?;
+        if !canonical.starts_with(&root) {
+            bail!("{} loaded a file outside the repository", relative(path));
+        }
+        confined.push(LoadedSource {
+            path: relative(&canonical),
+            ..source
+        });
+    }
+    Ok((json, confined))
+}
+
+/// Walk `entry`'s imports, transitively, refusing any that leave `root`.
+fn check_confined(entry: &Path, root: &Path, relative: &dyn Fn(&Path) -> String) -> R<()> {
+    // Each file, with the file that imports it and the import as written.
+    let mut queue = vec![(entry.to_path_buf(), None::<(String, String)>)];
+    let mut seen = std::collections::HashSet::new();
+    while let Some((file, imported_by)) = queue.pop() {
+        let shown = imported_by
+            .as_ref()
+            .map(|(by, import)| format!("{by} imports {import:?}"))
+            .unwrap_or_else(|| relative(&file));
+        let canonical =
+            std::fs::canonicalize(&file).map_err(|_| anyhow!("{shown}, which does not exist"))?;
+        if !canonical.starts_with(root) {
+            bail!("{shown}, which is outside the repository: imports must stay inside it");
+        }
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        if seen.len() > MAX_CONFINED_FILES {
+            bail!("{shown}: more than {MAX_CONFINED_FILES} files are imported");
+        }
+        // Data formats (`.json`, `.yaml`, `.toml`, `.txt`) import nothing.
+        let data = canonical
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext, "json" | "yaml" | "yml" | "toml" | "txt"));
+        if data {
+            continue;
+        }
+        let size = std::fs::metadata(&canonical)
+            .with_context(|| format!("failed to read {}", relative(&canonical)))?
+            .len();
+        if size > MAX_CONFINED_FILE_BYTES {
+            bail!(
+                "{} is {size} bytes; files are at most {MAX_CONFINED_FILE_BYTES}",
+                relative(&canonical)
+            );
+        }
+        let source = std::fs::read_to_string(&canonical)
+            .with_context(|| format!("failed to read {}", relative(&canonical)))?;
+        let parent = canonical.parent().unwrap_or(root).to_path_buf();
+        for import in static_imports(&source).with_context(|| relative(&canonical))? {
+            if Path::new(&import).is_absolute() {
+                bail!(
+                    "{} imports {import:?}, an absolute path: imports must be relative and stay \
+                     inside the repository",
+                    relative(&canonical)
+                );
+            }
+            queue.push((parent.join(&import), Some((relative(&canonical), import))));
+        }
+    }
+    Ok(())
+}
+
+/// The paths a Nickel source imports, from its tokens. Every import must be
+/// `import "<plain string>"` (optionally `as '<Format>'`): a package import
+/// or a string with interpolation or escapes is refused, since only a
+/// literal path can be checked before evaluation. Lexical errors end the
+/// scan: the parser refuses the file before it loads any import.
+fn static_imports(source: &str) -> R<Vec<String>> {
+    use nickel_lang_core::parser::lexer::StringToken;
+    const SHAPE: &str = "an import must name a file as a plain string (`import \"lib/web.ncl\"`); \
+                         package imports, interpolation, and escapes are not supported here";
+    let mut lexer = Lexer::new(source);
+    let mut imports = Vec::new();
+    while let Some(token) = lexer.next() {
+        match token {
+            Ok((_, Token::Normal(NormalToken::Import), _)) => {
+                match lexer.next() {
+                    Some(Ok((_, Token::Normal(NormalToken::DoubleQuote), _))) => {}
+                    _ => bail!("{SHAPE}"),
+                }
+                let mut path = String::new();
+                loop {
+                    match lexer.next() {
+                        Some(Ok((_, Token::Str(StringToken::Literal(text)), _))) => {
+                            path.push_str(&text)
+                        }
+                        // The lexer hands the closing quote back in normal
+                        // mode.
+                        Some(Ok((_, Token::Normal(NormalToken::DoubleQuote), _)))
+                        | Some(Ok((_, Token::Str(StringToken::DoubleQuote), _))) => break,
+                        _ => bail!("{SHAPE}"),
+                    }
+                }
+                imports.push(path);
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    Ok(imports)
+}
+
 /// Evaluates an in-memory Nickel snippet to JSON with imports rejected.
 ///
 /// `name` labels the snippet in error messages. This is what the manager uses
@@ -559,5 +706,103 @@ mod config_lang_test {
         assert!(sources[0].is_primary);
         assert!(sources[0].path.ends_with("job.ncl"));
         assert!(sources.iter().any(|s| s.path.ends_with("lib.ncl")));
+    }
+
+    /// A repository: `jobs/web.ncl` imports `lib/common.ncl`, which imports
+    /// `lib/data.json`; `secret.txt` sits beside the repository.
+    fn confined_fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret.txt"), "hunter2").unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("jobs")).unwrap();
+        std::fs::create_dir_all(repo.join("lib")).unwrap();
+        std::fs::write(repo.join("lib/data.json"), "{\"memory\": 64}").unwrap();
+        std::fs::write(
+            repo.join("lib/common.ncl"),
+            "let data = import \"data.json\" in { memory = data.memory }",
+        )
+        .unwrap();
+        (dir, repo)
+    }
+
+    #[test]
+    fn confined_evaluation_follows_imports_inside_the_root_test() {
+        let (_dir, repo) = confined_fixture();
+        let job = repo.join("jobs/web.ncl");
+        std::fs::write(
+            &job,
+            "let common = import \"../lib/common.ncl\" in { name = \"web\", memory = common.memory }",
+        )
+        .unwrap();
+        let (json, sources) = eval_file_confined(&job, &repo).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["memory"], 64);
+        assert_eq!(sources[0].path, "jobs/web.ncl");
+        assert!(sources[0].is_primary);
+        assert!(sources.iter().any(|s| s.path == "lib/common.ncl"));
+    }
+
+    #[test]
+    fn confined_evaluation_refuses_imports_that_leave_the_root_test() {
+        let (_dir, repo) = confined_fixture();
+        let job = repo.join("web.ncl");
+        let refused = |source: &str| -> String {
+            std::fs::write(&job, source).unwrap();
+            format!("{:#}", eval_file_confined(&job, &repo).unwrap_err())
+        };
+        // A relative path that climbs out.
+        let err = refused("import \"../secret.txt\" as 'Text");
+        assert!(err.contains("outside the repository"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+        // An absolute path.
+        let err = refused("import \"/etc/hostname\" as 'Text");
+        assert!(err.contains("absolute path"), "{err}");
+        // A package import, and an escape, cannot be checked statically.
+        let err = refused("import common");
+        assert!(err.contains("plain string"), "{err}");
+        let err = refused("import \"lib\\u{2f}common.ncl\"");
+        assert!(err.contains("plain string"), "{err}");
+        // A missing file.
+        let err = refused("import \"nope.ncl\"");
+        assert!(err.contains("does not exist"), "{err}");
+        // A transitive import that climbs out is refused too.
+        std::fs::write(
+            repo.join("lib/leak.ncl"),
+            "import \"../../secret.txt\" as 'Text",
+        )
+        .unwrap();
+        let err = refused("import \"lib/leak.ncl\"");
+        assert!(err.contains("lib/leak.ncl imports"), "{err}");
+        assert!(err.contains("outside the repository"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_evaluation_refuses_symlinks_out_of_the_root_test() {
+        let (dir, repo) = confined_fixture();
+        std::os::unix::fs::symlink(dir.path().join("secret.txt"), repo.join("lib/link.txt"))
+            .unwrap();
+        let job = repo.join("web.ncl");
+        std::fs::write(&job, "{ name = import \"lib/link.txt\" as 'Text }").unwrap();
+        let err = format!("{:#}", eval_file_confined(&job, &repo).unwrap_err());
+        assert!(err.contains("outside the repository"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+        // The file itself may not be a link out either.
+        std::os::unix::fs::symlink(dir.path().join("secret.txt"), repo.join("evil.ncl")).unwrap();
+        let err = format!(
+            "{:#}",
+            eval_file_confined(&repo.join("evil.ncl"), &repo).unwrap_err()
+        );
+        assert!(err.contains("outside the repository"), "{err}");
+    }
+
+    #[test]
+    fn confined_evaluation_reports_errors_relative_to_the_root_test() {
+        let (_dir, repo) = confined_fixture();
+        let job = repo.join("broken.ncl");
+        std::fs::write(&job, "{ name = 1 + \"x\" }").unwrap();
+        let err = format!("{:#}", eval_file_confined(&job, &repo).unwrap_err());
+        assert!(err.contains("broken.ncl"), "{err}");
+        assert!(!err.contains(&repo.display().to_string()), "{err}");
     }
 }

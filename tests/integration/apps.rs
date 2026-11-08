@@ -25,7 +25,7 @@
 //!   with a new `buildId` rolls, an older node joining does not move it
 //!   back, `unknown` is left out, the constraint, the straggler status, and
 //!   manifest adoption only when the leader runs the marker's build;
-//! - the §6.8 GitOps-shaped manifest: the prompt, the grant, the job.
+//! - the §6.8 Deployer-shaped manifest: the prompt, the grant, the job.
 //!
 //! The end to end case, `legion app list` on a fresh single-manager cluster
 //! showing the autoscaler running on the system worker, starts the real
@@ -280,7 +280,10 @@ async fn seeded() -> R<(Fixture, AppReconciler)> {
         fx.store.insert_node(manager_node(id, "0.1.0", "a"))?;
     }
     let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
-    assert_eq!(reconciler.seed()?, vec!["autoscaler".to_string()]);
+    assert_eq!(
+        reconciler.seed()?,
+        vec!["autoscaler".to_string(), "gitops".to_string()]
+    );
     let outcome = reconciler.reconcile_app("autoscaler").await;
     assert!(
         matches!(&outcome, PassOutcome::Submitted { action, deduplicated: false } if action == "created the job"),
@@ -307,7 +310,10 @@ async fn seeding_happens_once_test() -> R<()> {
         },
     );
     let reconciler = fx.reconciler_seeded(marker("0.1.0", "a"), seed);
-    assert_eq!(reconciler.seed()?, vec!["autoscaler".to_string()]);
+    assert_eq!(
+        reconciler.seed()?,
+        vec!["autoscaler".to_string(), "gitops".to_string()]
+    );
     let record = fx.app("autoscaler")?;
     assert!(!record.enabled, "the seed-time override applied");
     assert_eq!(record.grant.granted_by, BOOTSTRAP_PRINCIPAL);
@@ -318,7 +324,8 @@ async fn seeding_happens_once_test() -> R<()> {
             .context("bundled")?
             .permissions
     );
-    assert_eq!(fx.events("app.installed")?.len(), 1);
+    // Every bundled app is seeded: the autoscaler and gitops.
+    assert_eq!(fx.events("app.installed")?.len(), 2);
 
     // An operator enables it; a later leader's seed pass, with a config
     // that still says disabled, changes nothing.
@@ -334,7 +341,7 @@ async fn seeding_happens_once_test() -> R<()> {
     let later = fx.reconciler_seeded(marker("0.1.0", "a"), seed);
     assert!(later.seed()?.is_empty());
     assert!(fx.app("autoscaler")?.enabled);
-    assert_eq!(fx.events("app.installed")?.len(), 1);
+    assert_eq!(fx.events("app.installed")?.len(), 2);
     Ok(())
 }
 
@@ -798,7 +805,7 @@ async fn a_refused_submit_waits_for_a_change_test() -> R<()> {
     Ok(())
 }
 
-/// The §6.8 GitOps-shaped manifest: the prompt says what runs where, as
+/// The §6.8 Deployer-shaped manifest: the prompt says what runs where, as
 /// whom, with what grant and UI; a token lacking the grant cannot install
 /// it; the admin can, the grant is recorded in their name, and the
 /// reconciled job carries it. Uninstall stops the job and revokes the grant.
@@ -806,20 +813,20 @@ async fn a_refused_submit_waits_for_a_change_test() -> R<()> {
 async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
     let fx = fixture()?;
     let manifest = json!({
-        "name": "gitops",
+        "name": "deployer",
         "version": "0.2.0",
         "placement": "managers",
         "job": { "task": { "name": "sync", "runtime": "exec",
-            "artifacts": ["https://example.com/gitops/0.2.0/legion-gitops-linux-amd64.tar.gz"],
-            "config": { "command": ["legion-gitops"] },
+            "artifacts": ["https://example.com/deployer/0.2.0/legion-deployer-linux-amd64.tar.gz"],
+            "config": { "command": ["legion-deployer"] },
             "network": { "ports": [{ "name": "api" }] } } },
         "permissions": [
             { "resources": ["job"], "actions": ["read", "write"], "namespaces": ["team-*"] },
             { "resources": ["template"], "actions": ["read"] },
-            { "resources": ["kv"], "actions": ["read"], "paths": ["legion/apps/gitops/*"] },
+            { "resources": ["kv"], "actions": ["read"], "paths": ["legion/apps/deployer/*"] },
         ],
         "ui": {
-            "nav": [{ "title": "GitOps", "view": "repos" }],
+            "nav": [{ "title": "Deployer", "view": "repos" }],
             "job": [{ "title": "Sync", "view": "job-sync",
                       "permission": { "resource": "job", "action": "read" } }],
             "actions": [{ "name": "sync-now", "title": "Sync now",
@@ -838,7 +845,7 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
             InstallAppRequest {
                 manifest_json: manifest.to_string(),
                 source: "url".into(),
-                source_ref: "https://example.com/gitops/0.2.0/app.ncl".into(),
+                source_ref: "https://example.com/deployer/0.2.0/app.ncl".into(),
                 dry_run: true,
                 ..Default::default()
             },
@@ -849,7 +856,7 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
     let prompt = preview.prompt.join("\n");
     assert!(
         prompt.starts_with(
-            "gitops 0.2.0 runs its own code (1 artifact) on your managers, as its own \
+            "deployer 0.2.0 runs its own code (1 artifact) on your managers, as its own \
              unprivileged user,"
         ),
         "{prompt}"
@@ -861,13 +868,13 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
     assert!(prompt.contains("namespaces: team-*"), "{prompt}");
     assert!(
         prompt.contains(
-            "UI: a GitOps page, a Sync panel on job pages, one action (Sync now, needs job:write)"
+            "UI: a Deployer page, a Sync panel on job pages, one action (Sync now, needs job:write)"
         ),
         "{prompt}"
     );
     assert!(preview.uncovered.is_empty());
     assert!(
-        fx.store.get_app("gitops")?.is_none(),
+        fx.store.get_app("deployer")?.is_none(),
         "a dry run installs nothing"
     );
 
@@ -884,7 +891,7 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
     assert_eq!(refused.code(), Code::PermissionDenied);
     assert!(
         refused.message().starts_with(
-            "app gitops 0.2.0 asks for job:write in team-*, which your token does not hold"
+            "app deployer 0.2.0 asks for job:write in team-*, which your token does not hold"
         ),
         "{}",
         refused.message()
@@ -893,14 +900,14 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
     let installed = install(&fx, &manifest, &fx.admin).await?;
     assert_eq!(
         installed.message,
-        "installed gitops 0.2.0; job legion-system/gitops starting"
+        "installed deployer 0.2.0; job legion-system/deployer starting"
     );
-    let record = fx.app("gitops")?;
+    let record = fx.app("deployer")?;
     assert_eq!(record.grant.rules.len(), 3);
     let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
-    let outcome = reconciler.reconcile_app("gitops").await;
+    let outcome = reconciler.reconcile_app("deployer").await;
     assert!(submitted(&outcome), "{outcome:?}");
-    let stored = fx.stored("legion-system/gitops")?;
+    let stored = fx.stored("legion-system/deployer")?;
     assert_eq!(stored["tasks"][0]["identities"][0]["name"], "legion");
     assert_eq!(
         stored["tasks"][0]["identities"][0]["permissions"],
@@ -915,7 +922,7 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
         .svc
         .list_grants(req(
             ListGrantsRequest {
-                job: Some("legion-system/gitops".into()),
+                job: Some("legion-system/deployer".into()),
                 include_revoked: false,
             },
             &fx.admin,
@@ -924,7 +931,10 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
         .into_inner()
         .grants;
     assert_eq!(grants.len(), 1, "{grants:?}");
-    assert!(grants[0].granted_by.ends_with("(app gitops)"), "{grants:?}");
+    assert!(
+        grants[0].granted_by.ends_with("(app deployer)"),
+        "{grants:?}"
+    );
 
     // Editing the job directly is refused.
     let mut edited = stored.clone();
@@ -932,7 +942,9 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
     edited["version"] = Value::Null;
     let refused = fx.run(&edited, &fx.admin).await.expect_err("an app's job");
     assert!(
-        refused.message().contains("`legion app uninstall gitops`"),
+        refused
+            .message()
+            .contains("`legion app uninstall deployer`"),
         "{}",
         refused.message()
     );
@@ -942,8 +954,8 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
     let uninstall = || {
         fx.svc.uninstall_app(req(
             UninstallAppRequest {
-                name: "gitops".into(),
-                idempotency_key: Some("uninstall-gitops".into()),
+                name: "deployer".into(),
+                idempotency_key: Some("uninstall-deployer".into()),
                 ..Default::default()
             },
             &fx.admin,
@@ -958,16 +970,16 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
         (again.revoked_grants, again.message.as_str()),
         (reply.revoked_grants, reply.message.as_str())
     );
-    assert!(fx.store.get_app("gitops")?.is_none());
+    assert!(fx.store.get_app("deployer")?.is_none());
     assert!(fx
-        .version("legion-system/gitops")?
+        .version("legion-system/deployer")?
         .context("job")?
         .is_stopped());
     let live = fx
         .svc
         .list_grants(req(
             ListGrantsRequest {
-                job: Some("legion-system/gitops".into()),
+                job: Some("legion-system/deployer".into()),
                 include_revoked: false,
             },
             &fx.admin,
@@ -977,14 +989,14 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
         .grants;
     assert!(live.is_empty(), "{live:?}");
     assert_eq!(
-        reconciler.reconcile_app("gitops").await,
+        reconciler.reconcile_app("deployer").await,
         PassOutcome::Missing
     );
     // With the app gone, its stopped job is an ordinary job.
     fx.svc
         .destroy_job(req(
             DestroyJobRequest {
-                name: "legion-system/gitops".into(),
+                name: "legion-system/deployer".into(),
                 ..Default::default()
             },
             &fx.admin,

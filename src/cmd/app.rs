@@ -364,6 +364,28 @@ pub fn config() -> Command {
                         .help("Read the config (JSON) here instead of $LEGION_APP_CONFIG"),
                 ),
         )
+        .subcommand(
+            // The gitops app renders each jobspec file of a repository in a
+            // child process of its own binary, so a file that never finishes
+            // evaluating is killed without taking the app with it
+            // (docs/gitops.md). Internal: not a user command.
+            Command::new(crate::apps::gitops::RENDER_COMMAND)
+                .hide(true)
+                .about("Render one jobspec file of a gitops checkout to JSON (internal)")
+                .arg(
+                    Arg::new("root")
+                        .long("root")
+                        .value_name("DIR")
+                        .required(true)
+                        .value_hint(ValueHint::DirPath),
+                )
+                .arg(
+                    Arg::new("file")
+                        .value_name("FILE")
+                        .required(true)
+                        .value_hint(ValueHint::FilePath),
+                ),
+        )
 }
 
 pub async fn handle(matches: &ArgMatches) -> R<()> {
@@ -385,6 +407,13 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         Some(("uninstall", sub)) => uninstall(sub).await,
         Some(("extensions", sub)) => extensions(sub).await,
         Some(("view", sub)) => crate::cmd::app_view::handle(sub).await,
+        Some((crate::apps::gitops::RENDER_COMMAND, sub)) => {
+            crate::apps::gitops::render::render_command(
+                std::path::Path::new(sub.get_one::<String>("root").expect("required")),
+                std::path::Path::new(sub.get_one::<String>("file").expect("required")),
+            );
+            Ok(())
+        }
         Some(("run", sub)) => {
             crate::apps::run_app(
                 sub.get_one::<String>("name").expect("required"),

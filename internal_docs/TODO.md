@@ -515,6 +515,7 @@ How to use it:
 | [#58](https://github.com/mikenomitch/legion/pull/58) | Park: the workload says when it is waiting, and its node suspends it | Plan [park-plan.md](plans/park-plan.md); Phases 1–2, entries under "Park" above and in Done |
 | [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after adversarial security and correctness reviews | All three plans SHIPPED; their items, and both hardening passes, are checked off and in Done; the reviews' open and design-level items are under *Ecosystem apps* |
 | branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phases O1-O4 | Builds on #60; O1-O4 are checked off and in Done; the deferrals and follow-ups are open under Ecosystem apps |
+| [#66](https://github.com/mikenomitch/legion/pull/66) | GitOps: the bundled `gitops` app, `legion gitops`, its views | Plan [gitops-plan.md](plans/gitops-plan.md); G1-G3 checked off and in Done; follow-ups open under *Ecosystem apps* |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -5065,7 +5066,37 @@ plan.
         and `count.per` autoscaling, consolidation, predictive and vertical
         strategies, WASM strategies.
 - [ ] Ingress proxy / load balancer (also listed under *Networking*)
-- [ ] GitOps helper — deploy to git, job updates automatically
+- [ ] **GitOps follow-ups** (the bundled app shipped; see Done:
+      [plan](plans/gitops-plan.md) · [calls](calls/gitops-plan_calls.md) ·
+      docs: [gitops.md](../docs/gitops.md)). Deliberately deferred, each a
+      documented limitation:
+  - [ ] SSH URLs and deploy keys: needs a host-key policy (a `knownHosts`
+        field, or a cluster-wide one) before it is safe; HTTPS tokens from
+        KV cover GitHub, GitLab, and Bitbucket today (calls entry 7).
+  - [ ] Push webhooks: needs a route from the internet to the app's port
+        (the gateway, once it routes to app ports); CI calls `legion gitops
+        sync` meanwhile.
+  - [ ] More than one replica: lease-based shards, as the autoscaler's
+        replicas hold them (`Reconciler::shards_from`). Today a second
+        replica would sync each Repo twice.
+  - [ ] Repos at a priority band other than `normal`: a `band` field (one
+        per Repo, since `requires` resolves one band), plus a writer check
+        on it. Jobs with another `priority` are refused at render today.
+  - [ ] Jobs that ask for workload-identity `permissions`: a Repo's
+        authority records job and KV permissions only, so the submit is
+        refused. Needs a way to record "may grant X" in a Repo's authority.
+  - [ ] `vars` for rendered jobspecs (`vars.gitops.commit`, ...) and job
+        templates (`RunJobTemplate`) as a Repo's output.
+  - [ ] `legion gitops diff`: render a branch and `PlanJob` it without
+        deploying (a PR check).
+  - [ ] Image automation: watch a registry and commit new tags.
+  - [ ] `PlanJob` does not check the grants a submit claims (host-level
+        tasks, priority bands; it is a read). gitops checks both itself
+        before submitting (calls entry 2); a `PlanJob` that reported them
+        would make every preflight complete.
+  - [ ] With ACLs off nothing is stamped, so two Repos that define one job
+        flip it between them instead of one being refused.
+- [ ] Ingress proxy / load balancer (also listed under *Networking*)
 - [ ] Cert manager (also listed under *Auth, TLS & security*)
 - [ ] Overlay network controller
 
@@ -6740,6 +6771,35 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       Federation still needs an explicit public `issuer`.
 
 ## Ecosystem apps
+
+- [x] **GitOps: the bundled `gitops` app** (2026-11-07, in flight in
+      [#66](https://github.com/mikenomitch/legion/pull/66);
+      [plan](plans/gitops-plan.md) ·
+      [calls](calls/gitops-plan_calls.md) · docs:
+      [gitops.md](../docs/gitops.md), [apps.md](../docs/apps.md),
+      [agent-readiness.md](../docs/agent-readiness.md)). Was "GitOps helper —
+      deploy to git, job updates automatically".
+  - [x] G1: `gitops`, bundled and seeded enabled, with one kind,
+        `gitops/Repo` (`url`, `ref`, `path`, `interval`, `jobs`, `prune`,
+        `suspend`, `hostLevel`, `credentials`, `kvKeys`), CEL rules, and
+        `requires` on `job:read`/`job:write` (on `jobs`, or
+        namespace-wide), host-level writes with `hostLevel`, and `kv:read`
+        on the keys it names. Its grant is all `via = "objects"`; every call
+        acts for the Repo. `git ls-remote` per interval, a shallow fetch per
+        commit, each file rendered in a child process with imports confined
+        to the checkout (`config_lang::eval_file_confined`); render
+        everything, check what no authority covers, preflight with
+        `PlanJob`, apply, prune by inventory, health from rollouts;
+        inventory in status; drift written back, stopped jobs left stopped;
+        cleanup on delete.
+  - [x] G2: `legion gitops add|status|sync` (`sync` sets the `gitops/sync`
+        label and waits for the echo; `--wait` until deployed and healthy),
+        capabilities, `legion_gitops_status` and `legion_gitops_sync`.
+  - [x] G3: a GitOps page, a job panel, and Sync now, as app views; the
+        framework's `Reconciler::wake` and `ObjectOutcome::progressing`.
+  - [x] Found on the way: a kind's `requires` with `job:read` recorded a
+        band on the read, so the authority rule matched no read at all;
+        reads carry no band now (`resolve_requirements`).
 
 - [x] **App-owned object kinds, Phase O4: CEL validation `rules`**
       (2026-10-29, merged into branch `claude/app-objects`;

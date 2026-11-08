@@ -108,6 +108,8 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_object_get` | no | One object (`kind`, `name`, optional `namespace`): spec with `writeOnly` values redacted, effective spec, status, summary, `specVersion` (for `expected_version`), `managedBy`, and the authority recorded at its last write. |
 | `legion_object_apply` | **yes** | Create or update an object (`object`: `{ kind: "<app>/<Kind>", name, namespace?, labels?, spec }`). Checks the closed schema (unknown fields fail with a did-you-mean), immutable fields, the kind's CEL `rules` (every failing rule named, with its path), and what the kind `requires` of the writer, then asks the app (advice). `dry_run` returns the field diff; `expected_version` is compare-and-set (`0`: create only); `force` changes an object an app manages; `wait` (with `timeout_seconds`) returns once the app has reported on the new generation, failing on `Rejected`/`NotReady`; `idempotency_key`. |
 | `legion_object_delete` | **yes** | Delete an object; a kind with a cleanup window marks it Deleting until its app releases it (`now` skips the window). Takes `expected_version`, `force`, `idempotency_key`. |
+| `legion_gitops_status` | no | GitOps Repos ([gitops.md](gitops.md)): with `name` (optional `namespace`), one Repo; otherwise every Repo in `namespaces` (`["*"]` for all you can read). Each has its `url`, `ref`, `path`, `interval`, the manager's `summary` (`Ready`; `Pending` while a rollout runs; `NotReady: FetchFailed\|RenderFailed\|ApplyFailed\|RolloutFailed\|PruneFailed\|Suspended`; `Rejected`; `Stale`) and `detail`, the deployed `commit` and `subject`, the `latest` commit seen, and `jobs`: each job it deployed with `file`, `state` (`deployed`, `progressing`, `pending`, `failed`, `stopped`) and `detail`. |
+| `legion_gitops_sync` | **yes** | Sync a Repo now (`name`, optional `namespace`): sets its `gitops/sync` label (so it needs what writing the Repo needs) and returns once gitops has synced; `wait` (with `timeout_seconds`, default 300) returns once the commit is deployed and every rollout finished, failing on `NotReady`/`Rejected` with the reason. Create Repos with `legion_object_apply` (`kind: "gitops/Repo"`). |
 | `legion_events` | no | List scheduler events. Poll with `after_id` to tail. `instance_id` narrows to one stateful instance (its own events plus its allocations'), `allocation_id` to one allocation. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job, including allocations removed in the last 24 hours (`removed`, `removalCause`). |
 | `legion_state_query` | no | Read-only SQL against the state store. |
@@ -645,6 +647,15 @@ namespace), and reads the per-tick numbers with `legion_scaling_status` and
 blocks until the autoscaler has drained and terminated its members and
 released it, or its 15-minute cleanup window ends.
 
+Deploying from git is the same loop with the bundled gitops app
+([gitops.md](gitops.md)): an agent writes a `gitops/Repo` with
+`legion_object_apply` (`dry_run` first; `wait` waits through the first
+rollout, since a Repo reads `Pending` while its jobs roll out and `Ready`
+once they are deployed), pushes to the repository, and calls
+`legion_gitops_sync` with `wait`, which fails with the reason on a render
+error, a refused job, or a failed rollout. `legion gitops sync --wait
+--json` is the CLI form, for a CI pipeline.
+
 **Agents that are apps.** An app that owns a kind can act for one of its
 objects by naming it in `legion-for-object:
 <app>/<Kind>/<namespace>/<name>#<uid>@<generation>`: its calls then hold
@@ -841,8 +852,8 @@ data an agent can read: whatever a person sees on a panel, an agent sees too.
 ```bash
 legion app view gitops                       # what the app shows you, and where
 legion app view gitops job web -j            # the job panel for `web`, as JSON
-legion app view gitops task web sync -j      # a task's badge view
-legion app view gitops node wkr-3 -j         # the node panel
+legion app view autoscaler task web api -j   # a task's badge view
+legion app view autoscaler node wkr-3 -j     # the node panel
 ```
 
 `-j` (and the `legion_app_view` MCP tool) returns the validated
