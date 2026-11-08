@@ -29,6 +29,44 @@ pub const MANIFEST_API_VERSION: u32 = 1;
 /// Node fingerprint attribute: the sandbox VMM this node runs by default
 /// (`cloud-hypervisor`, `firecracker`, `apple-container`, `oci-runtime`).
 pub const ATTR_SANDBOX_VMM: &str = "sandbox.vmm";
+/// The microVM monitors a sandbox can run on, as Legion names them
+/// everywhere it records one (`sandbox.vmm`, a checkpoint's `compat.vmm`).
+///
+/// [`SandboxVmm::parse`] is the one place a VMM name is read, aliases
+/// included, so the worker's backend selection, the checkpoint support
+/// check, network-mode resolution, and the manager's suspend checks all
+/// agree on what `fc` or `CH` means. A new VMM is a new variant, and every
+/// exhaustive `match` on it (or on the worker's `Backend`) says where it
+/// needs code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxVmm {
+    /// `firecracker`, alias `fc`.
+    Firecracker,
+    /// `cloud-hypervisor`, aliases `cloudhypervisor` and `ch`.
+    CloudHypervisor,
+}
+
+impl SandboxVmm {
+    /// The VMM a name means, ignoring case and surrounding space. `None` for
+    /// anything that is not a microVM monitor: `auto`, `dev`, the dev
+    /// backends (`apple-container`, `oci-runtime`), and unknown names.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "firecracker" | "fc" => Some(Self::Firecracker),
+            "cloud-hypervisor" | "cloudhypervisor" | "ch" => Some(Self::CloudHypervisor),
+            _ => None,
+        }
+    }
+
+    /// The canonical name, as recorded in fingerprints and checkpoints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Firecracker => "firecracker",
+            Self::CloudHypervisor => "cloud-hypervisor",
+        }
+    }
+}
+
 /// Node fingerprint attribute: the version of [`ATTR_SANDBOX_VMM`].
 pub const ATTR_SANDBOX_VMM_VERSION: &str = "sandbox.vmm.version";
 /// Node fingerprint attribute: CPU vendor (`GenuineIntel`, `AuthenticAMD`,
@@ -476,6 +514,26 @@ pub fn compat_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One parser for every VMM alias (TODO "the sandbox VMM is a closed
+    /// enum"): the four call sites used to spell the aliases separately.
+    #[test]
+    fn sandbox_vmm_parses_every_alias_once_test() {
+        for (raw, vmm) in [
+            ("firecracker", SandboxVmm::Firecracker),
+            ("fc", SandboxVmm::Firecracker),
+            (" FC ", SandboxVmm::Firecracker),
+            ("cloud-hypervisor", SandboxVmm::CloudHypervisor),
+            ("cloudhypervisor", SandboxVmm::CloudHypervisor),
+            ("CH", SandboxVmm::CloudHypervisor),
+        ] {
+            assert_eq!(SandboxVmm::parse(raw), Some(vmm), "{raw:?}");
+            assert_eq!(SandboxVmm::parse(vmm.as_str()), Some(vmm));
+        }
+        for raw in ["", "auto", "dev", "apple-container", "oci-runtime", "qemu"] {
+            assert_eq!(SandboxVmm::parse(raw), None, "{raw:?}");
+        }
+    }
     use serde_json::json;
 
     fn memory_manifest() -> SnapshotManifest {

@@ -492,12 +492,13 @@ impl ManagerDaemonService {
             Vec::new(),
         )?;
         let message = submitted.message_with_warnings();
-        self.store
-            .idempotency_record(&stored_key, "app_reconcile", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        // Two managers' reconcilers racing the same key: the second
+        // submit resolved to `Unchanged`, and says it was deduplicated.
+        let (message, deduplicated) =
+            self.record_idempotent(&stored_key, "app_reconcile", message)?;
         Ok(AppSubmit {
             message,
-            deduplicated: false,
+            deduplicated,
         })
     }
 
@@ -522,9 +523,7 @@ impl ManagerDaemonService {
         }
         self.stop_job_now(job_id)?;
         let message = format!("Stopped {job_id}");
-        self.store
-            .idempotency_record(&stored_key, "app_stop", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, _) = self.record_idempotent(&stored_key, "app_stop", message)?;
         Ok(message)
     }
 
@@ -1279,16 +1278,15 @@ impl ManagerDaemonService {
                 orphaned_jobs.join(", ")
             ));
         }
-        self.store
-            .idempotency_record(&idempotency_key, "upgrade_app", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "upgrade_app", message)?;
         self.nudge_app(&name);
         Ok(Response::new(UpgradeAppReply {
             app: Some(self.app_info(&next)?),
             diff: Some(diff_message),
             upgraded: true,
             message,
-            deduplicated: false,
+            deduplicated,
             prompt,
             uncovered: String::new(),
             orphaned_jobs,
@@ -1597,14 +1595,13 @@ impl ManagerDaemonService {
             (true, true) => format!("{name} is enabled; reconciling it again"),
             (false, false) => format!("{name} is already disabled"),
         };
-        self.store
-            .idempotency_record(&idempotency_key, "set_app_enabled", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "set_app_enabled", message)?;
         self.nudge_app(&name);
         Ok(Response::new(SetAppEnabledReply {
             app: Some(self.app_info(&next)?),
             message,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -1705,14 +1702,13 @@ impl ManagerDaemonService {
         let next = self.write_app(&record, next)?;
         info!(app = %name, by = %identity.principal, change = %change, "Changed app settings");
         let message = format!("{name}: {change}");
-        self.store
-            .idempotency_record(&idempotency_key, "update_app_settings", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "update_app_settings", message)?;
         self.nudge_app(&name);
         Ok(Response::new(UpdateAppSettingsReply {
             app: Some(self.app_info(&next)?),
             message,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -1825,15 +1821,14 @@ impl ManagerDaemonService {
             .events()
             .app_config_changed(&name, &identity.principal, &code_fields);
         let message = format!("{name}: config changed; its job rolls with the new config");
-        self.store
-            .idempotency_record(&idempotency_key, "set_app_config", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "set_app_config", message)?;
         self.nudge_app(&name);
         Ok(Response::new(SetAppConfigReply {
             app: Some(self.app_info(&next)?),
             message,
             code_fields_changed: code_fields,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 }

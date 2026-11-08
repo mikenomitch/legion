@@ -1168,7 +1168,7 @@ fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_net_plugin_apply",
-            description: "Create or replace a network plugin object from its JSON (a NetPluginObject: name, module {source, checksum}, stages, usableBy, nodePools, limits, configSchema, targets, credentials). Nodes running it load the new revision within one heartbeat. Set dry_run to validate (including every policy that uses it) without writing; idempotency_key makes a retry safe.",
+            description: "Create or replace a network plugin object from its JSON (a NetPluginObject: name, module {source, checksum}, stages, usableBy, nodePools, limits, configSchema, targets, credentials). Nodes running it load the new revision within one heartbeat. Set dry_run to validate (including every policy and running job that uses it) without writing; idempotency_key makes a retry safe.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {

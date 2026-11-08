@@ -17,6 +17,15 @@ At manager startup:
 - Any worker that exits is immediately restarted.
 - Startup recovery calls `requeue_in_flight_evals()`, which forgets every
   claim this manager held and arms the blocked-eval wake replay (below).
+- A manager that starts as the scheduler's writer (always in `local_disk`
+  and `streaming` mode; the scheduler-lane leader in raft mode) then runs
+  the same reconciliation a raft manager runs when it gains leadership:
+  missing rollouts are created, and an eval is queued for every job, stop,
+  drain, and lost node whose stored state still needs work and has none
+  queued. That is what heals a crash between two writes of one operation,
+  such as a lost-node reschedule that removed allocations and died before
+  it re-placed them. Each regenerated eval is an idempotent pass, so the
+  cost is one re-plan per active job at startup.
 
 Each worker loop:
 
@@ -38,6 +47,25 @@ Each worker loop:
    `blocked` (see [Blocked evals](#blocked-evals)), and a transient
    rejection returns the row to `pending` after a delay. The permit is
    released, and asked for again at the next batch.
+
+**A settle only writes over its own claim.** Claims live in the leader's
+memory and are forgotten whenever the manager loses or gains scheduler-lane
+leadership, but a handler that was already running finishes anyway. If
+leadership left and came back while it ran, another worker may have claimed
+the same eval again. Every forget therefore starts a new claim epoch, a
+batch is settled against the epoch it was claimed in, and an outcome whose
+eval is no longer claimed in that epoch is dropped with a warning (`Dropping
+eval outcomes whose claims were cleared while their handlers ran`). The row
+is still `pending`, so whoever holds it now, or the next claim, settles it.
+The handler's own writes are not undone, which is safe because handlers are
+idempotent reconciles; a handler whose plan settled its eval in the plan's
+own entry (below) is not fenced this way.
+
+**A no-op rollout tick requeues itself quietly.** A `rollout_tick` that only
+waited and changed nothing asks the worker to put its eval back to `pending`
+for the wait instead of completing it and enqueueing a successor, so it
+writes no `eval.completed` and no `eval.enqueued` event
+([rollouts.md](rollouts.md)).
 
 **An eval can settle with its own plan.** An eval whose plan is its last
 write carries its settle into that plan's apply: the applied plan deletes
@@ -520,7 +548,8 @@ What this means in practice:
   allocation (a placement, a stop, a preemption, a node removal, a job
   destroy) moves the fingerprint, which invalidates the affected rows. A
   stale, wrong, or missing row costs one rebuild. It can never inflate a
-  node's free capacity.
+  node's free capacity. The row of a removed node is deleted by a periodic
+  scheduler-lane sweep.
 - **Version skew is safe in both directions.** A manager binary without
   this feature neither reads nor writes the table, so a leader on either
   side of an upgrade finds the fingerprints stale and rebuilds. The table
@@ -1004,7 +1033,10 @@ A capacity event is any committed change that may have made room:
 - a node's liveness status changing, as when it returns to `ready`
   (`ready`);
 - allocations leaving a node: a stop, a destroy, a suspend, a preemption
-  (`freed`).
+  (`freed`);
+- a changeset whose projection failed (`recovered`): its own events are
+  lost with the projection, so the manager records one for every available
+  node instead ([state-store.md](state-store.md#read-model-coherence)).
 
 The changeset projection records these on every manager. The scheduler-lane
 leader's wake pass runs within 50 ms of an event (a burst costs one pass),

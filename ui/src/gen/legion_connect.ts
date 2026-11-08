@@ -3278,7 +3278,13 @@ export const Manager = {
      * Schema every reference's `config` must satisfy, the HTTP targets it may
      * call, and the KV-held keys it may sign with. Validated on write; a
      * plugin that a stored policy references must keep stages that policy can
-     * run and a schema its config still satisfies, or the write is refused.
+     * run and a schema its config still satisfies, or the write is refused
+     * (FailedPrecondition). The same holds for every job that is not stopped
+     * and whose latest config references the plugin: the write is refused if
+     * that job could no longer be submitted (a dropped stage, a config the new
+     * schema rejects, or `usableBy` no longer `jobs`). The error names the job
+     * when the caller may read it. A stopped job is checked when it is next
+     * run.
      * Nodes running the plugin pick up the new revision on their next
      * heartbeat and fetch the module once per node.
      *

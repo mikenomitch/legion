@@ -99,11 +99,19 @@ call it records. The trade-offs:
   drops are counted on `legion_governance_events_total{event="audit_dropped"}`.
 - In raft mode the journal is a commutative table: whichever lane the
   handling manager leads carries the batch, and every manager serves the
-  journal. A follower that leads **no** lane cannot write it. Writes never
-  end on such a follower (they are forwarded to the leader, which journals
-  them), but the requests it refuses itself — denials, validation errors —
-  do. Those records go to the `audit` tracing target on that manager
-  instead, counted as `audit_unjournaled`.
+  journal. A follower that leads **no** lane (every follower in the default
+  `single` topology) cannot write it itself. Writes never end on such a
+  follower (they are forwarded to the leader, which journals them), but the
+  requests it refuses itself — denials, validation errors — do. The
+  follower forwards those batches to the status-lane leader, which
+  journals them like its own, so `legion audit list` shows a denial
+  whichever manager answered it. Forwarded batches are counted on
+  `legion_leader_forwards_total{op="append_audit_events"}`.
+- When that forward cannot complete — no lane leader is known (an
+  election, a lost quorum) or it cannot be reached — the batch is not
+  retried: its records go to the `audit` tracing target on that manager
+  instead, counted as `audit_unjournaled`. Ship that target with your logs
+  if a quorum loss must not leave gaps.
 
 ## Retention
 

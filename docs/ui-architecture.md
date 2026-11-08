@@ -672,8 +672,17 @@ Known limits:
 
 `WhoAmI` returns the caller's effective rules (`rulesJson`).
 `utils/acl.ts` mirrors the manager's evaluation behind
-`allows(resource, action, scope)`: same globbing, same default-deny, and the
-same rule that a selector never matches a request without that attribute.
+`allows(resource, action, scope)`. The rule engine underneath,
+`utils/aclEngine.ts`, follows `src/structs/acl.rs` rule for rule: the same
+resources (`boot`, `object`, `audit` and `approval` included), globbing,
+default-deny, the same rule that a selector never matches a request without
+that attribute, the `bands`, `kinds` and `host` selectors (`host` on `exec`
+and `job`), the reserved `legion-` namespaces and pools and `legion/` KV
+keys that only a pattern naming them reaches, and `via = "objects"` rules
+granting nothing. Both engines run the shared cases in
+`tests/fixtures/acl_parity_cases.json` (`npm run test:unit` in `ui/`), so
+they cannot drift apart silently. The mirror only decides what to show; the
+manager enforces every call.
 
 - **Nav**: an authenticated identity only sees destinations it can read
   (`ROUTE_RESOURCE` in `utils/acl.ts` maps each top-level route to the

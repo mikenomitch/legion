@@ -1205,6 +1205,73 @@ mod acl_rules_test {
         parse_rules(json).expect("rules should parse")
     }
 
+    /// The cases the UI's mirror (`ui/src/utils/aclEngine.ts`) is checked
+    /// against too, by `ui/tests/unit/acl-parity.mjs`: a case this engine
+    /// answers differently is a drift, caught on whichever side moved.
+    #[test]
+    fn parity_fixture() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Scope {
+            #[serde(default)]
+            any: bool,
+            namespace: Option<String>,
+            name: Option<String>,
+            pool: Option<String>,
+            path: Option<String>,
+            action_name: Option<String>,
+            template: Option<String>,
+            band: Option<String>,
+            #[serde(default)]
+            host: bool,
+            kind: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Case {
+            name: String,
+            rules: Vec<AclRule>,
+            resource: String,
+            action: String,
+            scope: Scope,
+            allowed: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../../tests/fixtures/acl_parity_cases.json"))
+                .expect("the parity fixture parses");
+        assert!(!fixture.cases.is_empty());
+        let mut failures = Vec::new();
+        for case in fixture.cases {
+            let resource = AclResource::parse(&case.resource)
+                .unwrap_or_else(|| panic!("{}: unknown resource {}", case.name, case.resource));
+            let action = AclAction::parse(&case.action)
+                .unwrap_or_else(|| panic!("{}: unknown action {}", case.name, case.action));
+            let scope = AclScope {
+                any: case.scope.any,
+                namespace: case.scope.namespace,
+                name: case.scope.name,
+                pool: case.scope.pool,
+                path: case.scope.path,
+                action_name: case.scope.action_name,
+                template: case.scope.template,
+                band: case.scope.band,
+                host: case.scope.host,
+                kind: case.scope.kind,
+            };
+            if evaluate(&case.rules, resource, action, &scope) != case.allowed {
+                failures.push(format!(
+                    "{} (expected allowed = {})",
+                    case.name, case.allowed
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "parity cases failed: {failures:#?}");
+    }
+
     /// `object` is namespaced with a `kinds` selector over `<app>/<Kind>`
     /// (docs/app-objects.md); a cluster kind's objects carry namespace `*`,
     /// which only `namespaces = ["*"]` reaches, and a `kinds` rule grants

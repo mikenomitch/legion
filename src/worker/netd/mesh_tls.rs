@@ -482,7 +482,7 @@ mod mesh_tls_test {
         // and the stale ones are dropped.
         let later = start + TAKE_WINDOW * 2;
         assert_eq!(shelf.take("b", later, |generation| generation >= 2), None);
-        assert!(shelf.tickets.get("b").is_none());
+        assert!(!shelf.tickets.contains_key("b"));
         // A full handshake under generation 2, long after any take, is
         // generation 2.
         shelf.insert("b", 13, 2, later);

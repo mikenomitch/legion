@@ -114,6 +114,15 @@ fn sorted_tasks(tasks: Option<&Arc<Vec<(i64, TaskConfig)>>>) -> Vec<(i64, TaskCo
     out
 }
 
+/// The timed scrub's rotation: what is still to visit this sweep. Nodes and
+/// job configs rotate separately, each with its own per-tick budget, so a
+/// cluster with a long job history does not slow the node sweep.
+#[derive(Debug, Default)]
+pub(crate) struct ScrubRotation {
+    nodes: Vec<String>,
+    job_configs: Vec<String>,
+}
+
 impl Store {
     #[cfg(test)]
     fn cached_node_for_test(&self, id: &str) -> R<Node> {
@@ -326,17 +335,22 @@ impl Store {
         Ok(true)
     }
 
-    /// Reload up to `nodes` nodes from committed state, compare each with
-    /// the cache, and repair any that differ. The rotation covers every
-    /// committed and every cached node once per sweep, so drift on a node
-    /// that no write ever touches again is still repaired. Returns how
-    /// many nodes it repaired; each repair increments
-    /// `legion_read_model_drift_repaired_total{source="scrub"}`.
-    pub fn scrub_read_model_slice(&self, nodes: usize) -> R<usize> {
-        let ids = self.next_read_model_scrub_nodes(nodes)?;
+    /// Reload up to `count` nodes and up to `count` job configs' task lists
+    /// from committed state, compare each with the cache, and repair any
+    /// that differ. Each rotation covers every committed and every cached
+    /// entry once per sweep, so drift that no write ever touches again is
+    /// still repaired. Returns how many entries it repaired; each repair
+    /// increments `legion_read_model_drift_repaired_total{source="scrub"}`.
+    pub fn scrub_read_model_slice(&self, count: usize) -> R<usize> {
+        let (node_ids, job_config_ids) = self.next_read_model_scrub_slice(count)?;
         let mut repaired = 0;
-        for id in ids {
+        for id in node_ids {
             if self.scrub_read_model_node(&id)? {
+                repaired += 1;
+            }
+        }
+        for id in job_config_ids {
+            if self.scrub_read_model_task_configs(&id)? {
                 repaired += 1;
             }
         }
@@ -348,12 +362,12 @@ impl Store {
         Ok(repaired)
     }
 
-    fn next_read_model_scrub_nodes(&self, count: usize) -> R<Vec<String>> {
-        let mut queue = self
+    fn next_read_model_scrub_slice(&self, count: usize) -> R<(Vec<String>, Vec<String>)> {
+        let mut rotation = self
             .read_model_scrub_queue
             .lock()
             .map_err(|_| anyhow!("read-model scrub queue lock poisoned"))?;
-        if queue.is_empty() {
+        if rotation.nodes.is_empty() {
             let mut ids: BTreeSet<String> = {
                 let conn = self.read_connection()?;
                 let mut stmt = conn.prepare_cached("SELECT id FROM node;")?;
@@ -361,10 +375,75 @@ impl Store {
                 Self::collect_rows(rows)?.into_iter().collect()
             };
             ids.extend(self.read_model_reader()?.nodes.keys().cloned());
-            queue.extend(ids);
+            rotation.nodes.extend(ids);
         }
-        let keep = queue.len().saturating_sub(count);
-        Ok(queue.split_off(keep))
+        if rotation.job_configs.is_empty() {
+            let mut ids: BTreeSet<String> = {
+                let conn = self.read_connection()?;
+                let mut stmt =
+                    conn.prepare_cached("SELECT DISTINCT job_config_id FROM task_config;")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                Self::collect_rows(rows)?.into_iter().collect()
+            };
+            ids.extend(self.read_model_reader()?.task_configs.keys().cloned());
+            rotation.job_configs.extend(ids);
+        }
+        let keep = rotation.nodes.len().saturating_sub(count);
+        let nodes = rotation.nodes.split_off(keep);
+        let keep = rotation.job_configs.len().saturating_sub(count);
+        let job_configs = rotation.job_configs.split_off(keep);
+        Ok((nodes, job_configs))
+    }
+
+    /// One job config of [`Self::scrub_read_model_slice`]: returns whether
+    /// its cached task list was wrong and has been repaired.
+    ///
+    /// Optimistic like [`Self::scrub_read_model_node`], with one more
+    /// guard: the task-config epoch. Pointer equality alone cannot see a
+    /// list that was absent, then cached, then removed again while this
+    /// visit read (a read-through racing a `destroy_job`), so the visit
+    /// publishes only if no authoritative write of the cache happened
+    /// since it began.
+    fn scrub_read_model_task_configs(&self, job_config_id: &str) -> R<bool> {
+        let _exclusive = if self.raft_mode() {
+            None
+        } else {
+            Some(capture::capture_exclusion()?)
+        };
+        let (cached, epoch) = {
+            let guard = self.read_model_reader()?;
+            (
+                guard.task_configs.get(job_config_id).cloned(),
+                guard.task_configs_epoch,
+            )
+        };
+        let mut committed = self.get_task_configs_for_job_config(job_config_id)?;
+        committed.sort_by_key(|(id, _)| *id);
+
+        let mut guard = self.read_model_writer()?;
+        if guard.task_configs_epoch != epoch
+            || !same_arc(&cached, guard.task_configs.get(job_config_id))
+        {
+            return Ok(false);
+        }
+        if sorted_tasks(guard.task_configs.get(job_config_id)) == committed {
+            return Ok(false);
+        }
+        warn!(
+            job_config_id,
+            cached = guard.task_configs.contains_key(job_config_id),
+            committed_tasks = committed.len(),
+            "Cached task configs disagreed with the state database; reloaded them"
+        );
+        guard.task_configs_epoch = guard.task_configs_epoch.wrapping_add(1);
+        if committed.is_empty() {
+            guard.task_configs.remove(job_config_id);
+        } else {
+            guard
+                .task_configs
+                .insert(job_config_id.to_string(), Arc::new(committed));
+        }
+        Ok(true)
     }
 
     /// One node of [`Self::scrub_read_model_slice`]: returns whether the
@@ -746,6 +825,71 @@ mod tests {
         }
         assert!(repaired >= 2, "repaired {repaired}");
         assert_coherent(&store, "one sweep of the scrub")
+    }
+
+    #[test]
+    fn the_scrub_repairs_task_config_drift() -> R<()> {
+        let store = setup_store()?;
+        let kept = submit(&store, "kept")?;
+        let lost = submit(&store, "lost")?;
+        let _check = ShadowCheckSuspended::new();
+        {
+            let mut guard = store.read_model_writer()?;
+            // A list the cache lost, one behind the database, and one for a
+            // config that has no rows at all.
+            guard.task_configs.remove(&lost);
+            let tasks = Arc::make_mut(guard.task_configs.get_mut(&kept).expect("cached"));
+            tasks[0].1.name = "stale".into();
+            let ghost = Arc::new(tasks.clone());
+            guard.task_configs.insert("ghost".into(), ghost);
+        }
+        assert_eq!(store.read_model_divergence()?.len(), 3);
+        let mut repaired = 0;
+        for _ in 0..3 {
+            repaired += store.scrub_read_model_slice(1)?;
+        }
+        assert_eq!(repaired, 3);
+        assert_coherent(&store, "one sweep of the task-config scrub")
+    }
+
+    /// A read-through that misses, reads the list, and is overtaken by a
+    /// `destroy_job` before it caches must not put the destroyed list back.
+    #[test]
+    fn a_read_through_racing_a_destroy_does_not_resurrect_the_list() -> R<()> {
+        let store = setup_store()?;
+        let job_config_id = submit(&store, "racing")?;
+        {
+            let _check = ShadowCheckSuspended::new();
+            store
+                .read_model_writer()?
+                .task_configs
+                .remove(&job_config_id);
+        }
+        let destroyer = store.clone();
+        super::AFTER_TASK_CONFIG_READ_THROUGH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // The evicted list is drift until the destroy's last step
+                // removes the rows it described; the test checks coherence
+                // itself once the read-through returns.
+                let _check = ShadowCheckSuspended::new();
+                destroyer.stop_job("racing").expect("stop");
+                destroyer.destroy_job("racing").expect("destroy");
+            }))
+        });
+        let read = store.shared_task_configs_for_job_config(&job_config_id)?;
+        assert_eq!(read.len(), 1, "the read itself saw the pre-destroy rows");
+        assert!(
+            super::AFTER_TASK_CONFIG_READ_THROUGH.with(|hook| hook.borrow().is_none()),
+            "the hook ran"
+        );
+        assert!(
+            !store
+                .read_model_reader()?
+                .task_configs
+                .contains_key(&job_config_id),
+            "the destroyed config's list was cached again"
+        );
+        assert_coherent(&store, "a read-through racing destroy_job")
     }
 
     /// Phase 4 relies on this for `destroy_job`: a session changeset

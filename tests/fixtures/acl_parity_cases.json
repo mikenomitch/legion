@@ -1,0 +1,426 @@
+{
+  "about": "ACL evaluation cases run against BOTH engines: the manager's (`parity_fixture` in src/structs/acl.rs) and the UI's mirror (ui/tests/unit/acl-parity.mjs, against ui/src/utils/aclEngine.ts). A case states the rules, the request, and the answer the manager gives; a change to either engine that changes an answer fails one of the two tests. Rules are evaluated as stored (not through parse_rules), so legacy shapes can be covered. Scope keys: any, namespace, name, pool, path, actionName, template, band, host, kind.",
+  "cases": [
+    {
+      "name": "default deny: no rules",
+      "rules": [],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "default", "name": "web" },
+      "allowed": false
+    },
+    {
+      "name": "namespaces * reaches an ordinary namespace",
+      "rules": [{ "resources": ["job"], "actions": ["read"], "namespaces": ["*"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "payments-prod", "name": "web" },
+      "allowed": true
+    },
+    {
+      "name": "write does not imply read",
+      "rules": [{ "resources": ["job"], "actions": ["write"], "namespaces": ["*"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "default", "name": "web" },
+      "allowed": false
+    },
+    {
+      "name": "namespaces * does not reach a reserved legion- namespace",
+      "rules": [{ "resources": ["job"], "actions": ["read"], "namespaces": ["*"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "legion-system", "name": "agent" },
+      "allowed": false
+    },
+    {
+      "name": "a legion- pattern reaches a reserved namespace",
+      "rules": [{ "resources": ["job"], "actions": ["read"], "namespaces": ["legion-*"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "legion-system", "name": "agent" },
+      "allowed": true
+    },
+    {
+      "name": "a deny's namespaces are plain globs: * denies a reserved namespace",
+      "rules": [
+        { "resources": ["job"], "actions": ["read"], "namespaces": ["legion-*"] },
+        { "resources": ["job"], "actions": ["read"], "namespaces": ["*"], "effect": "deny" }
+      ],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "legion-system", "name": "agent" },
+      "allowed": false
+    },
+    {
+      "name": "a deny with no namespaces denies every namespace",
+      "rules": [
+        { "resources": ["job"], "actions": ["read"], "namespaces": ["*"] },
+        { "resources": ["job"], "actions": ["read"], "names": ["secret"], "effect": "deny" }
+      ],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "payments-prod", "name": "secret" },
+      "allowed": false
+    },
+    {
+      "name": "legacy allow rule without namespaces reaches default",
+      "rules": [{ "resources": ["job"], "actions": ["read"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "default", "name": "web" },
+      "allowed": true
+    },
+    {
+      "name": "legacy allow rule without namespaces reaches only default",
+      "rules": [{ "resources": ["job"], "actions": ["read"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "payments-prod", "name": "web" },
+      "allowed": false
+    },
+    {
+      "name": "a * resource rule without namespaces reaches every ordinary namespace",
+      "rules": [{ "resources": ["*"], "actions": ["read"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "payments-prod", "name": "web" },
+      "allowed": true
+    },
+    {
+      "name": "a * resource rule without namespaces does not reach a reserved namespace",
+      "rules": [{ "resources": ["*"], "actions": ["*"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "legion-system", "name": "agent" },
+      "allowed": false
+    },
+    {
+      "name": "a rule with namespaces never matches a scope without one",
+      "rules": [{ "resources": ["node"], "actions": ["read"], "namespaces": ["*"] }],
+      "resource": "node",
+      "action": "read",
+      "scope": { "pool": "gpu" },
+      "allowed": false
+    },
+    {
+      "name": "exact names never prefix-match",
+      "rules": [{ "resources": ["job"], "actions": ["read"], "namespaces": ["*"], "names": ["web"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "default", "name": "web-1" },
+      "allowed": false
+    },
+    {
+      "name": "a trailing * matches a prefix",
+      "rules": [{ "resources": ["job"], "actions": ["read"], "namespaces": ["*"], "names": ["web-*"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "default", "name": "web-1" },
+      "allowed": true
+    },
+    {
+      "name": "middle * segments match in order",
+      "rules": [{ "resources": ["job"], "actions": ["read"], "namespaces": ["*"], "names": ["a*b*c"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "default", "name": "axxbyyc" },
+      "allowed": true
+    },
+    {
+      "name": "middle * segments do not match out of order",
+      "rules": [{ "resources": ["job"], "actions": ["read"], "namespaces": ["*"], "names": ["a*b*c"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "default", "name": "acb" },
+      "allowed": false
+    },
+    {
+      "name": "a host-level job write needs host = true",
+      "rules": [{ "resources": ["job"], "actions": ["write"], "namespaces": ["*"] }],
+      "resource": "job",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web", "band": "normal", "host": true },
+      "allowed": false
+    },
+    {
+      "name": "a host = true job rule allows a host-level job write",
+      "rules": [{ "resources": ["job"], "actions": ["write"], "namespaces": ["*"], "host": true }],
+      "resource": "job",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web", "band": "normal", "host": true },
+      "allowed": true
+    },
+    {
+      "name": "a host-level exec needs host = true",
+      "rules": [{ "resources": ["exec"], "actions": ["write"], "namespaces": ["*"] }],
+      "resource": "exec",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web", "host": true },
+      "allowed": false
+    },
+    {
+      "name": "the host flag is only checked on exec and job",
+      "rules": [{ "resources": ["scale"], "actions": ["write"], "namespaces": ["*"] }],
+      "resource": "scale",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web", "host": true },
+      "allowed": true
+    },
+    {
+      "name": "a bands rule does not cover another band",
+      "rules": [{ "resources": ["job"], "actions": ["write"], "namespaces": ["*"], "bands": ["critical"] }],
+      "resource": "job",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web", "band": "normal" },
+      "allowed": false
+    },
+    {
+      "name": "a bands rule covers its band",
+      "rules": [{ "resources": ["job"], "actions": ["write"], "namespaces": ["*"], "bands": ["critical", "high"] }],
+      "resource": "job",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web", "band": "critical" },
+      "allowed": true
+    },
+    {
+      "name": "a bands rule grants nothing to a scope without a band (reads)",
+      "rules": [{ "resources": ["job"], "actions": ["*"], "namespaces": ["*"], "bands": ["*"] }],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "default", "name": "web" },
+      "allowed": false
+    },
+    {
+      "name": "boot is a resource of its own, scoped by job",
+      "rules": [{ "resources": ["boot"], "actions": ["write"], "namespaces": ["*"], "names": ["web"] }],
+      "resource": "boot",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web" },
+      "allowed": true
+    },
+    {
+      "name": "job does not cover boot",
+      "rules": [{ "resources": ["job"], "actions": ["write"], "namespaces": ["*"] }],
+      "resource": "boot",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web" },
+      "allowed": false
+    },
+    {
+      "name": "a templates rule grants nothing to a raw submit",
+      "rules": [{ "resources": ["job"], "actions": ["write"], "namespaces": ["*"], "templates": ["web-tpl"] }],
+      "resource": "job",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web", "band": "normal" },
+      "allowed": false
+    },
+    {
+      "name": "a templates rule covers a submit through its template",
+      "rules": [{ "resources": ["job"], "actions": ["write"], "namespaces": ["*"], "templates": ["web-tpl"] }],
+      "resource": "job",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web", "band": "normal", "template": "web-tpl" },
+      "allowed": true
+    },
+    {
+      "name": "action names select actions",
+      "rules": [{ "resources": ["action"], "actions": ["write"], "namespaces": ["*"], "actionNames": ["restart"] }],
+      "resource": "action",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web", "actionName": "drain" },
+      "allowed": false
+    },
+    {
+      "name": "kinds select app-declared objects",
+      "rules": [{ "resources": ["object"], "actions": ["read"], "namespaces": ["*"], "kinds": ["gitops/*"] }],
+      "resource": "object",
+      "action": "read",
+      "scope": { "namespace": "default", "name": "repo-1", "kind": "gitops/Repo" },
+      "allowed": true
+    },
+    {
+      "name": "kinds do not cover another app's kind",
+      "rules": [{ "resources": ["object"], "actions": ["read"], "namespaces": ["*"], "kinds": ["gitops/*"] }],
+      "resource": "object",
+      "action": "read",
+      "scope": { "namespace": "default", "name": "db-1", "kind": "databases/Postgres" },
+      "allowed": false
+    },
+    {
+      "name": "a kinds rule grants nothing to a request that is not about an object",
+      "rules": [{ "resources": ["scale"], "actions": ["write"], "namespaces": ["*"], "kinds": ["gitops/*"] }],
+      "resource": "scale",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web" },
+      "allowed": false
+    },
+    {
+      "name": "a via = objects rule is inert on a plain identity",
+      "rules": [{ "resources": ["scale"], "actions": ["write"], "namespaces": ["*"], "via": "objects" }],
+      "resource": "scale",
+      "action": "write",
+      "scope": { "namespace": "default", "name": "web" },
+      "allowed": false
+    },
+    {
+      "name": "a via = objects rule is inert for list gating too",
+      "rules": [{ "resources": ["scale"], "actions": ["read"], "namespaces": ["*"], "via": "objects" }],
+      "resource": "scale",
+      "action": "read",
+      "scope": { "any": true },
+      "allowed": false
+    },
+    {
+      "name": "a node rule without pools reaches an ordinary pool",
+      "rules": [{ "resources": ["node"], "actions": ["read"] }],
+      "resource": "node",
+      "action": "read",
+      "scope": { "pool": "gpu" },
+      "allowed": true
+    },
+    {
+      "name": "a node rule without pools does not reach a reserved pool",
+      "rules": [{ "resources": ["node"], "actions": ["read"] }],
+      "resource": "node",
+      "action": "read",
+      "scope": { "pool": "legion-system" },
+      "allowed": false
+    },
+    {
+      "name": "pools * does not reach a reserved pool",
+      "rules": [{ "resources": ["node"], "actions": ["read"], "pools": ["*"] }],
+      "resource": "node",
+      "action": "read",
+      "scope": { "pool": "legion-system" },
+      "allowed": false
+    },
+    {
+      "name": "a legion- pools pattern reaches a reserved pool",
+      "rules": [{ "resources": ["node"], "actions": ["read"], "pools": ["legion-*"] }],
+      "resource": "node",
+      "action": "read",
+      "scope": { "pool": "legion-system" },
+      "allowed": true
+    },
+    {
+      "name": "a deny's pools are plain globs",
+      "rules": [
+        { "resources": ["node"], "actions": ["read"], "pools": ["legion-*"] },
+        { "resources": ["node"], "actions": ["read"], "pools": ["*"], "effect": "deny" }
+      ],
+      "resource": "node",
+      "action": "read",
+      "scope": { "pool": "legion-system" },
+      "allowed": false
+    },
+    {
+      "name": "a kv rule without paths reaches an ordinary key",
+      "rules": [{ "resources": ["kv"], "actions": ["read"] }],
+      "resource": "kv",
+      "action": "read",
+      "scope": { "path": "app/config" },
+      "allowed": true
+    },
+    {
+      "name": "a kv rule without paths does not reach a reserved key",
+      "rules": [{ "resources": ["kv"], "actions": ["read"] }],
+      "resource": "kv",
+      "action": "read",
+      "scope": { "path": "legion/apps/gitops" },
+      "allowed": false
+    },
+    {
+      "name": "paths * does not reach a reserved key",
+      "rules": [{ "resources": ["kv"], "actions": ["read"], "paths": ["*"] }],
+      "resource": "kv",
+      "action": "read",
+      "scope": { "path": "legion/apps/gitops" },
+      "allowed": false
+    },
+    {
+      "name": "a legion/ paths pattern reaches a reserved key",
+      "rules": [{ "resources": ["kv"], "actions": ["read"], "paths": ["legion/*"] }],
+      "resource": "kv",
+      "action": "read",
+      "scope": { "path": "legion/apps/gitops" },
+      "allowed": true
+    },
+    {
+      "name": "list gating: a scoped allow rule proves something is visible",
+      "rules": [{ "resources": ["kv"], "actions": ["read"], "paths": ["team/*"] }],
+      "resource": "kv",
+      "action": "read",
+      "scope": { "any": true },
+      "allowed": true
+    },
+    {
+      "name": "list gating: a scoped deny does not deny the whole list",
+      "rules": [
+        { "resources": ["kv"], "actions": ["read"] },
+        { "resources": ["kv"], "actions": ["read"], "paths": ["secret/*"], "effect": "deny" }
+      ],
+      "resource": "kv",
+      "action": "read",
+      "scope": { "any": true },
+      "allowed": true
+    },
+    {
+      "name": "list gating: an unscoped deny vetoes the list",
+      "rules": [
+        { "resources": ["kv"], "actions": ["read"] },
+        { "resources": ["kv"], "actions": ["read"], "effect": "deny" }
+      ],
+      "resource": "kv",
+      "action": "read",
+      "scope": { "any": true },
+      "allowed": false
+    },
+    {
+      "name": "a scoped deny still denies its instance",
+      "rules": [
+        { "resources": ["kv"], "actions": ["read"] },
+        { "resources": ["kv"], "actions": ["read"], "paths": ["secret/*"], "effect": "deny" }
+      ],
+      "resource": "kv",
+      "action": "read",
+      "scope": { "path": "secret/db" },
+      "allowed": false
+    },
+    {
+      "name": "a deny on another action does not apply",
+      "rules": [
+        { "resources": ["job"], "actions": ["*"], "namespaces": ["*"] },
+        { "resources": ["job"], "actions": ["write"], "effect": "deny" }
+      ],
+      "resource": "job",
+      "action": "read",
+      "scope": { "namespace": "default", "name": "web" },
+      "allowed": true
+    },
+    {
+      "name": "cluster-scoped resources: audit",
+      "rules": [{ "resources": ["audit"], "actions": ["read"] }],
+      "resource": "audit",
+      "action": "read",
+      "scope": {},
+      "allowed": true
+    },
+    {
+      "name": "cluster-scoped resources: an app's names",
+      "rules": [{ "resources": ["app"], "actions": ["write"], "names": ["gitops"] }],
+      "resource": "app",
+      "action": "write",
+      "scope": { "name": "autoscaler" },
+      "allowed": false
+    },
+    {
+      "name": "namespace objects match on their namespace",
+      "rules": [{ "resources": ["namespace"], "actions": ["write"], "namespaces": ["payments-*"] }],
+      "resource": "namespace",
+      "action": "write",
+      "scope": { "namespace": "payments-prod", "name": "payments-prod" },
+      "allowed": true
+    }
+  ]
+}

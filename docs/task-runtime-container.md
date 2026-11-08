@@ -108,9 +108,22 @@ A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
    - `RLIMIT_NOFILE` at 1048576, adjustable with
      [`ulimits`](#resource-limits-ulimits),
    - `noNewPrivileges`.
-3. **Run it:** `<runtime> run --bundle <dir> legion-<alloc>`, with the task's
-   log files as its stdout and stderr (see
-   [Stdout and stderr](#stdout-and-stderr)).
+3. **Run it:** `<runtime> run --bundle <dir> legion-<node>-<alloc>`, with the
+   task's log files as its stdout and stderr (see
+   [Stdout and stderr](#stdout-and-stderr)). The container id is also the
+   container's hostname. It carries the node id (lowercased, reduced to
+   `[a-z0-9-]`) because OCI ids are global to the runtime's state directory
+   (`/run/runc`), which every cluster on the host shares. The node part is
+   cut short when the id would pass the kernel's 63-byte hostname limit; the
+   allocation id never is.
+
+   A container still holding the id from an earlier start (a worker crash,
+   or a run killed before the runtime reaped it) is removed first, but only
+   if `<runtime> state` says it was created from this allocation's own
+   bundle directory. Anything else under the id is left alone and the start
+   fails with `an OCI container with id legion-<node>-<alloc> already exists
+   in runc's state and is not this allocation's (it was created from bundle
+   …)`, naming the `delete --force` that removes it if it really is stale.
 
 The image and bundle scratch space lives under the allocation's private
 directory and is removed on destroy.
@@ -657,7 +670,7 @@ one.
 
 How each platform does it:
 
-- **Linux:** `<runtime> kill legion-<alloc> <signal>` ("not running" is
+- **Linux:** `<runtime> kill legion-<node>-<alloc> <signal>` ("not running" is
   ignored, since a finished batch container is already gone). Then Legion
   polls `<runtime> state` until the container is stopped or gone, up to the
   grace period. Finally it always runs `<runtime> delete --force`, which
@@ -905,6 +918,8 @@ config = {
   | `…/allocs/` | `0711` | anyone, by exact path (no listing) |
   | `…/allocs/<alloc>/` | `0710`, group = the allocation's range | the worker, and this allocation's container root |
   | `…/allocs/<alloc>/<task>/` | `0700` | the worker. It reaches the container as an idmapped mount, which the runtime opens with the worker's privilege |
+  | `…/local-volumes/` | `0711` | anyone, by exact path (no listing) |
+  | `…/local-volumes/<volume>/` | `0700` | the worker (or an `exec` task's `user` it was handed to). Its `data/` reaches the container as a mount |
   | state files, `logs/`, `content/`, `volumes/`, `identity/` | `0600` / `0700` | the worker |
 
   Another allocation's root is another gid, so it can't enter. Without a
@@ -1065,9 +1080,10 @@ only its changed layers.
 ## Current Scope and Limitations
 
 - The runtime integration is simple: it shells out to runtime binaries.
-- On Linux the container id stays `legion-<alloc>`, with no node in it. OCI
-  runtimes have no labels, so stale-container cleanup deletes by name. Two
-  clusters sharing one Linux host and one runtime state directory can collide.
+- On Linux the task's cgroup leaf stays `legion-<alloc>` (see
+  [resource enforcement](resource-enforcement.md)), under the worker's own
+  cgroup root. Two workers on one host need different `cgroupParent`s, as
+  they already do for their slice masks.
 - A container left running by a cluster whose state was deleted keeps
   running under its old node's name. Legion doesn't remove it, because it no
   longer belongs to any node. Remove it with `container rm --force`.

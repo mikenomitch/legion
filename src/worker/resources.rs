@@ -60,9 +60,9 @@ impl std::fmt::Display for PlacementExhausted {
 
 impl std::error::Error for PlacementExhausted {}
 
-/// Per-allocation cgroup leaf name. Matches the container name the runtimes
-/// already use, so `legion-<alloc>` is one identifier across the container
-/// list, the process table, and the cgroup tree.
+/// Per-allocation cgroup leaf name, `legion-<alloc>`. Unlike the container
+/// name (`legion-<node>-<alloc>`, global to the host's runtime state), it
+/// needs no node: it lives under this worker's own cgroup root.
 fn leaf_name(allocation_id: i64) -> String {
     format!("legion-{allocation_id}")
 }

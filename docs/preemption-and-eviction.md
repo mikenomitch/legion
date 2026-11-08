@@ -196,7 +196,9 @@ The floor has two properties:
   violated in practice, including by Nomad's own drainer.
 
 Percentages round up: `minAvailable = "50%"` of 5 protects 3. The floor is
-measured against the task's live allocation count, and it holds across a whole
+measured against the task's allocation count across the whole fleet,
+including nodes the preemption pass is not considering (cordoned nodes, nodes
+outside the preemptor's constraints), and it holds across a whole
 plan. Eight placements cannot each take one allocation below the floor and
 together take eight.
 

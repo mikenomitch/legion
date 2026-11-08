@@ -1097,12 +1097,8 @@ async fn forward_absolute(
         body.map_err(|err| Box::new(err) as handlers::BoxError)
             .boxed()
     } else {
-        match http_body_util::Limited::new(body, exchange.body_cap() as usize)
-            .collect()
-            .await
-        {
-            Ok(collected) => {
-                let mut bytes = collected.to_bytes();
+        match handlers::read_capped(body, exchange.body_cap()).await {
+            Ok(handlers::CappedBody::Whole(mut bytes)) => {
                 bytes_in = bytes.len() as u64;
                 match exchange.body(&mut bytes).await {
                     ExchangeOutcome::Continue | ExchangeOutcome::Proxy(_) => {}
@@ -1143,8 +1139,9 @@ async fn forward_absolute(
                 }
                 full_body(bytes)
             }
-            Err(_) => {
-                // Over the cap, or the client went away mid-body.
+            Ok(handlers::CappedBody::Over(prefix, rest)) => {
+                // Over the cap: a body hop that fails closed refuses it; when
+                // every body hop fails open, it goes on unread.
                 if let Some(source) = exchange.body_unreadable_denied_by() {
                     log_request(
                         &proxy,
@@ -1169,8 +1166,17 @@ async fn forward_absolute(
                         (&method, path_only),
                     );
                 }
-                return status_response(StatusCode::PAYLOAD_TOO_LARGE);
+                debug!(
+                    allocation_id = proxy.allocation_id,
+                    cap = exchange.body_cap(),
+                    "Request body is over the body hops' maxBytes and they fail open; streaming it unread"
+                );
+                crate::worker::netd::http::Prefixed::new(prefix, rest)
+                    .map_err(|err| Box::new(err) as handlers::BoxError)
+                    .boxed()
             }
+            // The client went away mid-body.
+            Err(_) => return status_response(StatusCode::BAD_REQUEST),
         }
     };
     // Hop-by-hop headers stay on this hop; the upstream connection carries

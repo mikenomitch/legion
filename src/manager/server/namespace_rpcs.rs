@@ -482,16 +482,22 @@ impl ManagerDaemonService {
             principal = %identity.principal,
             "namespace deleted"
         );
-        let _ = self.store.idempotency_record(
-            &idempotency_key,
-            "delete_namespace",
-            &serde_json::to_string(&steps).unwrap_or_default(),
+        // Best effort, as before: the namespace is gone either way. A
+        // concurrent delete with the same key that recorded first makes
+        // this one a duplicate.
+        let deduplicated = matches!(
+            self.store.idempotency_record(
+                &idempotency_key,
+                "delete_namespace",
+                &serde_json::to_string(&steps).unwrap_or_default(),
+            ),
+            Ok(false)
         );
         Ok(Response::new(DeleteNamespaceReply {
             deleted: true,
             contents: Some(contents_to_proto(&contents)),
             steps,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 }

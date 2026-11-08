@@ -382,10 +382,10 @@ pub fn sandbox_checkpoint_support(query: &CheckpointQuery<'_>) -> CheckpointSupp
         },
         other => other.to_string(),
     };
+    if crate::structs::checkpoint::SandboxVmm::parse(&resolved).is_some() {
+        return CheckpointSupport::Memory;
+    }
     match resolved.as_str() {
-        "firecracker" | "fc" | "cloud-hypervisor" | "cloudhypervisor" | "ch" => {
-            CheckpointSupport::Memory
-        }
         "dev" | "apple-container" | "oci-runtime" => CheckpointSupport::Disk,
         _ => CheckpointSupport::None,
     }
@@ -737,11 +737,17 @@ pub(crate) fn checkpoint_microvm(
     let started = std::time::Instant::now();
     let pause = || match backend {
         Backend::Firecracker { .. } => FirecrackerApi::new(&socket).pause(),
-        _ => CloudHypervisorApi::new(&socket).pause(),
+        Backend::CloudHypervisor { .. } => CloudHypervisorApi::new(&socket).pause(),
+        Backend::AppleContainer | Backend::OciRuntime { .. } => {
+            bail!("{} has no checkpoint API", backend.label())
+        }
     };
     let resume = || match backend {
         Backend::Firecracker { .. } => FirecrackerApi::new(&socket).resume(),
-        _ => CloudHypervisorApi::new(&socket).resume(),
+        Backend::CloudHypervisor { .. } => CloudHypervisorApi::new(&socket).resume(),
+        Backend::AppleContainer | Backend::OciRuntime { .. } => {
+            bail!("{} has no checkpoint API", backend.label())
+        }
     };
     pause()?;
 
@@ -754,7 +760,7 @@ pub(crate) fn checkpoint_microvm(
                 )?;
                 vec![("memory", parts::FC_MEMORY), ("vm-state", parts::FC_STATE)]
             }
-            _ => {
+            Backend::CloudHypervisor { .. } => {
                 snapshot_cloud_hypervisor(
                     &CloudHypervisorApi::new(&socket),
                     out.path(),
@@ -765,6 +771,10 @@ pub(crate) fn checkpoint_microvm(
                     ("vm-state", parts::CH_STATE),
                     ("vm-config", parts::CH_CONFIG),
                 ]
+            }
+            // Unreachable past the `pause` above, which refuses these.
+            Backend::AppleContainer | Backend::OciRuntime { .. } => {
+                bail!("{} has no checkpoint API", backend.label())
             }
         };
         // Copied while paused, so the disk and the page cache that describes
@@ -1983,10 +1993,14 @@ pub(crate) fn restore_microvm(
             // `--restore` loads the state at launch, paused. Its API socket
             // is up before the restore finishes, and the resume queues
             // behind it, so the resume waits out an eager copy too.
-            _ => {
+            Backend::CloudHypervisor { .. } => {
                 write_boot_record(scratch, &next)?;
                 await_datapath(target);
                 CloudHypervisorApi::new(&socket).resume_restored()
+            }
+            // Refused before the spawn above.
+            other @ (Backend::AppleContainer | Backend::OciRuntime { .. }) => {
+                bail!("{} cannot restore a memory checkpoint", other.label())
             }
         }
     })();

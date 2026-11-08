@@ -178,6 +178,14 @@ pub struct PersistedStop {
 /// data, and the node's key. Each is owner-only, because the state dir
 /// itself is traverse-only.
 const STATE_PRIVATE_SUBDIRS: [&str; 4] = ["logs", "content", "volumes", "identity"];
+/// Directories beside the state file that are traverse-only (`0711`)
+/// because every entry beneath guards itself: the per-allocation
+/// directories (`allocs/`) and the `local-dir` volumes (`local-volumes/`,
+/// see `crate::volumes::builtins::LocalDirDriver`).
+const STATE_TRAVERSE_ONLY_SUBDIRS: [&str; 2] = [
+    STATE_ALLOCS_SUBDIR,
+    crate::volumes::builtins::LOCAL_VOLUMES_SUBDIR,
+];
 /// The per-allocation directories (`<state dir>/allocs/`), traverse-only.
 const STATE_ALLOCS_SUBDIR: &str = "allocs";
 
@@ -359,9 +367,11 @@ impl WorkerStateStore {
             ensure_dir(&path)?;
             crate::util::restrict_dir_to_owner(&path)?;
         }
-        let allocs = dir.join(STATE_ALLOCS_SUBDIR);
-        ensure_dir(&allocs)?;
-        crate::util::restrict_dir_to_traverse_only(&allocs)?;
+        for traverse_only in STATE_TRAVERSE_ONLY_SUBDIRS {
+            let path = dir.join(traverse_only);
+            ensure_dir(&path)?;
+            crate::util::restrict_dir_to_traverse_only(&path)?;
+        }
         Ok(())
     }
 
@@ -386,6 +396,39 @@ impl WorkerStateStore {
             secs.to_string().as_bytes(),
             false,
         )
+    }
+
+    /// File recording the allocations the boot fence killed before this
+    /// process reached a manager (allocation id to failure reason), beside
+    /// the state file. Read and removed by the restore that follows.
+    pub fn boot_fenced_path(&self) -> PathBuf {
+        self.path.with_file_name("boot_fenced.json")
+    }
+
+    /// Add `fenced` (allocation id, reason) to [`Self::boot_fenced_path`].
+    /// Fsynced: a fence the next restore cannot see is reported as nothing
+    /// at all, which is the bug this file exists to fix.
+    pub fn record_boot_fenced(&self, fenced: &[(i64, String)]) -> R<()> {
+        if fenced.is_empty() {
+            return Ok(());
+        }
+        let mut all = self.boot_fenced();
+        all.extend(fenced.iter().cloned());
+        write_owner_only(&self.boot_fenced_path(), &serde_json::to_vec(&all)?, true)
+    }
+
+    /// What [`Self::record_boot_fenced`] recorded, without removing it.
+    pub fn boot_fenced(&self) -> std::collections::BTreeMap<i64, String> {
+        fs::read(self.boot_fenced_path())
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Forget the boot fence's record, once a restore has turned it into
+    /// failure reports.
+    pub fn clear_boot_fenced(&self) {
+        let _ = fs::remove_file(self.boot_fenced_path());
     }
 
     /// The last successful manager contact a previous worker process
@@ -928,11 +971,14 @@ mod tests {
         store.save_node_token("lgntok_secret")?;
 
         assert_eq!(mode(&dir)?, 0o711, "the state dir is traverse-only");
-        assert_eq!(
-            mode(&dir.join("allocs"))?,
-            0o711,
-            "allocs/ is traverse-only"
-        );
+        for traverse_only in STATE_TRAVERSE_ONLY_SUBDIRS {
+            assert_eq!(
+                mode(&dir.join(traverse_only))?,
+                0o711,
+                "{traverse_only}/ is traverse-only"
+            );
+        }
+        assert!(STATE_TRAVERSE_ONLY_SUBDIRS.contains(&"local-volumes"));
         for private in STATE_PRIVATE_SUBDIRS {
             assert_eq!(mode(&dir.join(private))?, 0o700, "{private}/ is owner-only");
         }

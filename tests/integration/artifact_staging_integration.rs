@@ -684,6 +684,64 @@ async fn git_ref_pins_to_commit_sha_at_submit() -> R<()> {
     Ok(())
 }
 
+/// The manager's own `resolve: "pin"` lookup at submit goes to a host the
+/// job chose, so it is judged by the host guard's built-in classes and the
+/// manager's own addresses: a git ref or an OCI tag on loopback (or at the
+/// cloud metadata address) is refused before any connection is made.
+#[tokio::test(flavor = "multi_thread")]
+async fn pin_lookups_at_submit_are_held_to_the_host_guard() -> R<()> {
+    let store = setup_store()?;
+    let manager = ManagerDaemonService::new(store.clone());
+    insert_node(&store, "node-a")?;
+
+    // A loopback listener that counts connections: none may arrive.
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let port = listener.local_addr()?.port();
+
+    let sources = [
+        format!("git::https://127.0.0.1:{port}/repo.git?ref=main"),
+        format!("oci://127.0.0.1:{port}/team/tool:latest"),
+        "git::https://169.254.169.254/latest/meta-data.git?ref=main".to_string(),
+    ];
+    for (index, source) in sources.iter().enumerate() {
+        let name = format!("guarded-pin-{index}");
+        let jobspec = json!({
+            "name": name,
+            "tasks": [{
+                "name": "repo",
+                "runtime": "exec",
+                "artifacts": [{"source": source, "name": "repo", "resolve": "pin"}],
+                "config": {"command": ["true"]},
+            }],
+        })
+        .to_string();
+        let status = manager
+            .run_job(Request::new(run_request(jobspec, &name)))
+            .await
+            .expect_err("a pin lookup to a guarded address must be refused");
+        assert!(
+            status.message().contains("host guard"),
+            "{source}: {}",
+            status.message()
+        );
+        assert!(
+            status.message().contains("resolve: \"always\""),
+            "the refusal names the way out: {}",
+            status.message()
+        );
+        assert!(
+            store.get_job_config(&name).is_err(),
+            "a refused submit stores nothing"
+        );
+    }
+    match listener.accept() {
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("the manager connected to a guarded address: {other:?}"),
+    }
+    Ok(())
+}
+
 /// `resolve: "always"` keeps the mutable reference for staging-time
 /// resolution.
 #[tokio::test]

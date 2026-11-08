@@ -154,10 +154,11 @@ pub struct WorkerDaemonService {
     /// worker an edge resume probes (`StartSession.resume_id`). `None` in
     /// tests: such a node cannot probe, so it moves only with `force_move`.
     pub node_identity: Option<Arc<crate::worker::plane::NodeIdentity>>,
-    /// The node datapath, so a gated sandbox delivered by push or the work
-    /// stream has its egress proxy bound before its launch rather than on
-    /// the next heartbeat ([`Netd::bind_launch`](crate::worker::netd::Netd::bind_launch)).
-    /// A restored guest resumes only once that socket exists. `None` in
+    /// The node datapath, so a gated task delivered by push or the work
+    /// stream has its datapath (namespace, egress proxy, resolver, upstream
+    /// listeners) bound before its launch rather than on the next heartbeat
+    /// ([`Netd::bind_launch`](crate::worker::netd::Netd::bind_launch)).
+    /// A restored guest resumes only once its proxy socket exists. `None` in
     /// tests that run no datapath.
     pub netd: Option<Arc<crate::worker::netd::Netd>>,
 }
@@ -281,8 +282,12 @@ impl WorkerDaemonService {
         // resumes its guest only once the socket exists, and no heartbeat
         // has bound this delivery's datapath yet. It also wakes the
         // heartbeat, which brings the policy, resolver, and upstream sockets.
+        // A gated container or exec task gets its namespace here too, with
+        // its listeners bound inside it.
+        let mut datapath_bound = false;
         if let Some(netd) = self.netd.as_ref() {
             if netd.bind_launch(&allocation).await.is_some() {
+                datapath_bound = true;
                 crate::worker::daemon::wake_heartbeat();
             }
         }
@@ -296,6 +301,23 @@ impl WorkerDaemonService {
                 .await
                 .map_err(|err| Status::internal(format!("launch task panicked: {err}")))?;
         if let Err(err) = launched {
+            // A start refused before the task manager took the allocation
+            // leaves no one to tear down the namespace the launch path made;
+            // its listeners go with the next heartbeat's sync.
+            if datapath_bound {
+                let held = self
+                    .task_manager
+                    .lock()
+                    .map(|manager| manager.is_allocation_active(allocation_id))
+                    .unwrap_or(true);
+                if !held && crate::worker::netd::netns::netns_exists(allocation_id) {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = crate::worker::netd::netns::destroy(allocation_id);
+                        let _ = crate::worker::netd::netns::set_gate(allocation_id, false);
+                    })
+                    .await;
+                }
+            }
             return Err(task_start_status("Failed to start task", &err));
         }
 

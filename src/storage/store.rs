@@ -497,6 +497,14 @@ pub struct SchedulingReadModel {
     /// `Arc`'d so a hot reader ([`Store::shared_task_configs_for_job_config`])
     /// takes a refcount bump instead of deep-cloning every task's JSON.
     pub task_configs: HashMap<String, Arc<Vec<(i64, TaskConfig)>>>,
+    /// Bumped by every authoritative write of `task_configs` (the changeset
+    /// projection, a scrub repair) and carried forward (+1) across full
+    /// rebuilds. What makes the read-through in
+    /// [`Store::shared_task_configs_for_job_config`] and the scrub safe: they
+    /// read SQLite outside the write lock and publish what they read only
+    /// if this has not moved since, so a read that straddles a projection
+    /// (a `destroy_job` removing the list) cannot put the old list back.
+    pub(crate) task_configs_epoch: u64,
     /// Priority band per job config id, filled lazily by
     /// [`Store::cached_band_for_job_config`]. Never invalidated, for the same
     /// reason `task_configs` is not: a job config's band is immutable, and a
@@ -1125,6 +1133,22 @@ struct EvalSettleScope {
     started: Instant,
     armed: bool,
     settled: bool,
+    /// Set by [`request_quiet_requeue`]: release this eval back to pending
+    /// after the delay, with no lifecycle event, instead of completing it.
+    quiet_requeue: Option<Duration>,
+}
+
+/// What a handler run under [`with_eval_settle_scope`] left for the eval
+/// loop besides its result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvalScopeExit {
+    /// A plan the handler applied already settled the eval (deleted its row
+    /// and recorded `eval.completed`): the caller must write no completion.
+    pub settled: bool,
+    /// The handler did nothing and asked to run again after this delay
+    /// ([`request_quiet_requeue`]): on success the caller releases the eval
+    /// back to pending, with no event, instead of completing it.
+    pub quiet_requeue: Option<Duration>,
 }
 
 thread_local! {
@@ -1140,19 +1164,47 @@ thread_local! {
 /// [`arm_eval_settle`], because only the handler knows the plan is its last
 /// write: a write after a settled plan would be lost if the manager died
 /// between the two, since nothing would re-run the eval.
-pub fn with_eval_settle_scope<T>(eval: &Eval, handle: impl FnOnce() -> T) -> (T, bool) {
+pub fn with_eval_settle_scope<T>(eval: &Eval, handle: impl FnOnce() -> T) -> (T, EvalScopeExit) {
     EVAL_SETTLE_SCOPE.with(|scope| {
         *scope.borrow_mut() = Some(EvalSettleScope {
             eval: eval.clone(),
             started: Instant::now(),
             armed: false,
             settled: false,
+            quiet_requeue: None,
         });
     });
     let result = handle();
-    let settled = EVAL_SETTLE_SCOPE
-        .with(|scope| scope.borrow_mut().take().is_some_and(|scope| scope.settled));
-    (result, settled)
+    let exit = EVAL_SETTLE_SCOPE.with(|scope| {
+        scope
+            .borrow_mut()
+            .take()
+            .map(|scope| EvalScopeExit {
+                settled: scope.settled,
+                quiet_requeue: scope.quiet_requeue.filter(|_| !scope.settled),
+            })
+            .unwrap_or_default()
+    });
+    (result, exit)
+}
+
+/// Ask the eval loop to run the current eval again after `delay` by
+/// releasing it back to pending, with no `eval.completed` and no
+/// `eval.enqueued` event, instead of completing it and enqueueing a
+/// successor. For a handler that found nothing to do and only has to look
+/// again later (a rollout tick waiting on a health window, capacity, or a
+/// backoff), where a completed/enqueued pair per poll is noise on the event
+/// stream. Returns false outside [`with_eval_settle_scope`] (a test or a
+/// one-shot caller), or once a plan settled the eval: the caller then
+/// enqueues its successor itself.
+pub fn request_quiet_requeue(delay: Duration) -> bool {
+    EVAL_SETTLE_SCOPE.with(|scope| match scope.borrow_mut().as_mut() {
+        Some(scope) if !scope.settled => {
+            scope.quiet_requeue = Some(delay);
+            true
+        }
+        _ => false,
+    })
 }
 
 /// Declare that the next plan this eval handler applies is its last write,
@@ -1573,9 +1625,10 @@ pub struct Store {
     // which clears it if nothing waits.
     capacity_waiters: Arc<AtomicBool>,
     // The timed read-model scrub's own rotation (`scrub_read_model_slice`):
-    // nodes still to visit this sweep, refilled from committed AND cached
-    // node ids so a node missing from either side is visited too.
-    read_model_scrub_queue: Arc<std::sync::Mutex<Vec<String>>>,
+    // the nodes and job configs still to visit this sweep, each refilled
+    // from committed AND cached ids so an entry missing from either side is
+    // visited too.
+    read_model_scrub_queue: Arc<std::sync::Mutex<read_model_check::ScrubRotation>>,
     // `PRAGMA data_version` as the write connection last saw it
     // (`check_external_writes`). `None` until the first check, and reset
     // whenever the write connection is replaced, since the counter is per
@@ -1860,6 +1913,10 @@ fn reconcile_conflict_forced() -> bool {
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_PROJECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Runs once on this thread between a task-config read-through's SQLite
+    // read and its cache insert, so a test can land a write in that window.
+    static AFTER_TASK_CONFIG_READ_THROUGH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// SQL fragment: the id of the newest `job_config` for the job aliased `j`
@@ -2179,7 +2236,6 @@ const KEYED_BIND_SQL: &str = "SELECT instance.instance_id, instance.job_id, inst
                  ), ?5) = ?5) \
                  ORDER BY EXISTS (SELECT 1 FROM reschedule_hold \
                      WHERE reschedule_hold.instance_id = instance.instance_id \
-                     AND reschedule_hold.task_config_id = ?4 \
                      AND reschedule_hold.not_before_unix > ?7) ASC, \
                  (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
                  COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
@@ -2287,7 +2343,7 @@ impl Store {
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             capacity_waiters: Arc::new(AtomicBool::new(true)),
-            read_model_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
+            read_model_scrub_queue: Arc::new(std::sync::Mutex::new(Default::default())),
             external_write_baseline: Arc::new(std::sync::Mutex::new(None)),
             keyring,
             cluster_ca,
@@ -2331,7 +2387,13 @@ impl Store {
         // through the log once every voter can apply them.
         store.run_data_migrations_at_start();
 
-        Store::spawn_wal_checkpointer(Arc::downgrade(&store.checkpoint_conn));
+        // Streaming with a replica: rustyriver owns checkpointing, and a
+        // second checkpointer would race its WAL capture.
+        if store.persistence_driver.owns_wal_checkpointing() {
+            info!("rustyriver owns WAL checkpointing; the store's checkpointer is off");
+        } else {
+            Store::spawn_wal_checkpointer(Arc::downgrade(&store.checkpoint_conn));
+        }
 
         Ok(store)
     }
@@ -3082,10 +3144,11 @@ impl Store {
     /// through (plan §2, JC-1/JC-12/JC-13):
     ///
     /// - `local_disk`/`streaming` mode: run `f(self)` on this thread under
-    ///   `capture::local_projected_mutation`. It commits as it always did,
-    ///   and the read model is projected from the changeset it committed,
-    ///   the same way raft replicas project theirs (read-model-coherence
-    ///   plan § 5.4). Nested calls compose into the outer body.
+    ///   `capture::local_projected_mutation`. It commits all or nothing
+    ///   (its own savepoint, rolled back when `f` fails), and the read
+    ///   model is projected from the changeset it committed, the same way
+    ///   raft replicas project theirs (read-model-coherence plan § 5.4).
+    ///   Nested calls compose into the outer body.
     /// - Inside an active capture on this thread: run `f(self)` inline, so
     ///   nested public-method calls compose into the outer capture and a
     ///   composite operation produces ONE atomic raft entry (JC-13).
@@ -3775,6 +3838,9 @@ impl Store {
                 .into_iter()
                 .map(|(job_config_id, tasks)| (job_config_id, Arc::new(tasks)))
                 .collect(),
+            // Placeholder, carried forward by `refresh_read_model` like
+            // `generation`.
+            task_configs_epoch: 0,
             job_config_bands: HashMap::new(),
             indexes: IndexSet::new(Arc::clone(&self.index_settings)),
             node_pools: SharedNodePools::new(),
@@ -3891,9 +3957,13 @@ impl Store {
         // Same for the node epoch: an off-lock available-node rebuild that
         // read the previous model must not install its list into this one.
         let next_nodes_epoch = guard.nodes_epoch.wrapping_add(1);
+        // And for task configs: a read-through that read the old rows must
+        // not cache them into the rebuilt model.
+        let next_task_configs_epoch = guard.task_configs_epoch.wrapping_add(1);
         *guard = model;
         guard.generation = next_generation;
         guard.nodes_epoch = next_nodes_epoch;
+        guard.task_configs_epoch = next_task_configs_epoch;
         Ok(())
     }
 
@@ -4502,6 +4572,7 @@ impl Store {
             return Ok(());
         }
         let mut guard = self.read_model_writer()?;
+        guard.task_configs_epoch = guard.task_configs_epoch.wrapping_add(1);
         // A config with no task rows left (destroyed, its rows removed by
         // the job's FK cascade) leaves the cache instead of lingering as an
         // empty list per destroyed config. A later lookup reads through.
@@ -4526,20 +4597,46 @@ impl Store {
 
     /// [`Self::cached_task_configs_for_job_config`] without the deep clone:
     /// the read model's shared list. For per-eval readers that only look.
+    ///
+    /// A miss reads SQLite and caches what it read, but only if no
+    /// authoritative write of the task-config cache happened since the miss
+    /// (`SchedulingReadModel::task_configs_epoch`). Otherwise a read that
+    /// straddles a `destroy_job` could re-insert the destroyed list after
+    /// the projection removed it. A skipped insert costs the next lookup
+    /// one more read; the answer returned is still a committed state.
     pub fn shared_task_configs_for_job_config(
         &self,
         job_config_id: &str,
     ) -> R<Arc<Vec<(i64, TaskConfig)>>> {
-        {
+        let epoch = {
             let guard = self.read_model_reader()?;
             if let Some(tasks) = guard.task_configs.get(job_config_id) {
                 return Ok(Arc::clone(tasks));
             }
-        }
+            guard.task_configs_epoch
+        };
 
-        let tasks = self.get_task_configs_for_job_config(job_config_id)?;
-        self.cache_set_task_configs_for_job_config(job_config_id, tasks.clone())?;
-        Ok(Arc::new(tasks))
+        let tasks = Arc::new(self.get_task_configs_for_job_config(job_config_id)?);
+        #[cfg(test)]
+        if let Some(hook) = AFTER_TASK_CONFIG_READ_THROUGH.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        // Inside a mutation body the read may have seen uncommitted rows;
+        // and an empty list is never cached (see
+        // `cache_set_task_configs_for_job_config`).
+        if capture::read_model_deferred() || tasks.is_empty() {
+            return Ok(tasks);
+        }
+        let mut guard = self.read_model_writer()?;
+        if guard.task_configs_epoch != epoch {
+            return Ok(tasks);
+        }
+        Ok(Arc::clone(
+            guard
+                .task_configs
+                .entry(job_config_id.to_string())
+                .or_insert(tasks),
+        ))
     }
 
     /// A job config's priority band, from the read model when it has it.
@@ -4808,6 +4905,33 @@ impl Store {
                 })
             })?)?;
         Ok(rows)
+    }
+
+    /// How many allocations each of `task_config_ids` has across the whole
+    /// fleet: what a `disruption.minAvailable` floor is measured against.
+    ///
+    /// The preemption pass loads victims only from its candidate nodes, so
+    /// counting their rows would undercount a task that also runs
+    /// elsewhere and bind the floor tighter than documented. One grouped
+    /// count over `idx_allocation_task_config_id` (an index-only range per
+    /// task), never a fleet scan. A task with no rows is absent.
+    pub fn allocation_counts_for_tasks(&self, task_config_ids: &[i64]) -> R<HashMap<i64, u32>> {
+        if task_config_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", task_config_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT task_config_id, COUNT(*) FROM allocation \
+             WHERE task_config_id IN ({placeholders}) GROUP BY task_config_id;"
+        );
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(task_config_ids.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?.max(0) as u32))
+        })?;
+        Ok(Self::collect_rows(rows)?.into_iter().collect())
     }
 
     /// Runs one scheduling-index candidate query under the read-model lock
@@ -8826,6 +8950,57 @@ impl Store {
         Ok(swept)
     }
 
+    /// Sweep `node_alloc_usage` rows whose node is gone. Node removal is a
+    /// control-lane op and may not delete this scheduler-lane cache, so
+    /// without the sweep a churning fleet keeps one inert row per departed
+    /// node, in the table, every raft snapshot, and every plan changeset
+    /// that republishes it. Same shape as
+    /// [`Self::prune_node_health_orphans`], run from the same periodic
+    /// maintenance, but only on the scheduler-lane leader (it proposes a
+    /// scheduler-lane write) and with no two-sweep grace: a usage row is a
+    /// cache that the next plan touching the node rebuilds, so deleting one
+    /// a lagging replica wrongly thought orphaned costs one rebuild, where
+    /// deleting a live `node_health` row would lose liveness state.
+    #[instrument(err, skip_all)]
+    pub fn prune_node_alloc_usage_orphans(&self) -> R<usize> {
+        if !self.is_raft_leader(Lane::Scheduler) {
+            return Ok(0);
+        }
+        let orphans: Vec<String> = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT node_alloc_usage.node_id FROM node_alloc_usage
+                 LEFT JOIN node ON node.id = node_alloc_usage.node_id
+                 WHERE node.id IS NULL;",
+            )?;
+            let orphans = Self::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+            drop(stmt);
+            orphans
+        };
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+        self.replicated(
+            Lane::Scheduler,
+            "prune_node_alloc_usage_orphans",
+            move |s| s.prune_node_alloc_usage_orphans_apply(&orphans),
+        )
+    }
+
+    fn prune_node_alloc_usage_orphans_apply(&self, ids: &[String]) -> R<usize> {
+        let conn = self.write_connection()?;
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        // Re-check inside the write so a node that registered (again)
+        // between the read and this apply keeps its row.
+        let sql = format!(
+            "DELETE FROM node_alloc_usage WHERE node_id IN ({placeholders})
+             AND NOT EXISTS (SELECT 1 FROM node WHERE node.id = node_alloc_usage.node_id);"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let swept = stmt.execute(params_from_iter(ids))?;
+        Ok(swept)
+    }
+
     #[instrument(err, skip_all)]
     pub fn update_node_dyamic(&self, id: &str, dynamic_diff: &Map<String, Value>) -> R<Node> {
         let id = id.to_owned();
@@ -11993,6 +12168,31 @@ impl Store {
         })
     }
 
+    /// End a rollout `cancelled` with `message` and, for a revert, remove
+    /// every allocation of `revert_target` (its destination config) in the
+    /// same scheduler-lane op. One op so a revert can never leave the new
+    /// version removed while the rollout is still live: a live rollout's
+    /// next tick would place the new version again. Returns the removed
+    /// allocations.
+    #[instrument(err, skip(self, message))]
+    pub fn cancel_rollout(
+        &self,
+        rollout_id: i64,
+        message: &str,
+        revert_target: Option<&str>,
+    ) -> R<Vec<Allocation>> {
+        let message = message.to_owned();
+        let revert_target = revert_target.map(str::to_owned);
+        self.replicated(Lane::Scheduler, "cancel_rollout", move |s| {
+            let removed = match revert_target.as_deref() {
+                Some(job_config_id) => s.remove_allocs_for_job_config_apply(job_config_id)?,
+                None => Vec::new(),
+            };
+            s.update_rollout_status_apply(rollout_id, "cancelled", false, Some(&message))?;
+            Ok(removed)
+        })
+    }
+
     fn update_rollout_status_apply(
         &self,
         rollout_id: i64,
@@ -12344,6 +12544,11 @@ impl Store {
              and resyncing its work streams"
         );
         self.rebuild_node_local_state(!read_model_only);
+        // The capacity events the changeset carried were lost with the
+        // projection, and a blocked eval waiting on them would otherwise
+        // wait for the next one: re-match the blocked evals against every
+        // available node.
+        self.note_capacity_recovered();
         if !read_model_only {
             // The eval wakes may not have run: wake every parked worker, and
             // leave a permit for the next one to park. A spurious wake costs
@@ -14952,13 +15157,18 @@ impl Store {
 
         // Slots whose replacement waits out a reschedule backoff: the planner
         // withheld their placements, so prefer any other free slot (a slot
-        // lost to a node, or a scale-out).
+        // lost to a node, or a scale-out). A hold from an earlier config of
+        // the job counts too: a rollout's replacement of a failed slot owes
+        // the same backoff (`held_replacements_for_job_config`).
         let mut held_stmt = tx.prepare_cached(
             "SELECT instance_id FROM reschedule_hold \
-             WHERE task_config_id = ?1 AND instance_id IS NOT NULL AND not_before_unix > ?2;",
+             WHERE job_id = ?1 AND group_name = ?2 AND task_name = ?3 \
+             AND instance_id IS NOT NULL AND not_before_unix > ?4;",
         )?;
         let held: HashSet<String> = Self::collect_rows(
-            held_stmt.query_map(params![task_id, Self::now_unix()], |row| row.get(0))?,
+            held_stmt.query_map(params![job_id, group, task_name, Self::now_unix()], |row| {
+                row.get(0)
+            })?,
         )?
         .into_iter()
         .collect();
@@ -19125,6 +19335,38 @@ impl Store {
     ) -> R<Vec<Eval>> {
         self.write_eval_completions(completions)?;
         self.claim_evals(limits, scope)
+    }
+
+    /// [`Self::complete_evals_and_claim_next`] for a batch claimed in
+    /// `claim_epoch` ([`Self::claim_evals_in_epoch`]), the form the eval
+    /// loop uses: an outcome is written only while its eval is still
+    /// claimed in that epoch. A handler that outlived a clear of the claims
+    /// (leadership lost and regained while it ran) may have had its eval
+    /// claimed again by another worker; writing its outcome would delete,
+    /// fail, or release work the newer claimant still holds. Such outcomes
+    /// are dropped with a warning — the row is still `pending`, so the
+    /// newer claim (or the next one) settles it — and neither their claims
+    /// nor their subsumed duplicates are touched. Returns the next batch
+    /// and the epoch it was claimed in.
+    #[instrument(err, skip_all)]
+    pub fn complete_claimed_evals_and_claim_next(
+        &self,
+        completions: Vec<(String, EvalCompletion)>,
+        claim_epoch: u64,
+        limits: EvalBatchLimits,
+        scope: ClaimScope,
+    ) -> R<(Vec<Eval>, u64)> {
+        let (current, stale) = self.completions_claimed_in_epoch(completions, claim_epoch);
+        if !stale.is_empty() {
+            warn!(
+                claim_epoch,
+                current_epoch = self.eval_claim_epoch(),
+                stale = %stale.join(","),
+                "Dropping eval outcomes whose claims were cleared while their handlers ran"
+            );
+        }
+        self.write_eval_completions(current)?;
+        self.claim_evals_in_epoch(limits, scope)
     }
 
     /// Finish one handled eval AND claim its next one: the single-eval form
@@ -23586,6 +23828,55 @@ mod tests {
         };
         assert_eq!(remaining, vec!["node-two".to_string()]);
         assert_eq!(store.prune_node_health_orphans()?, 0, "sweep is idempotent");
+        Ok(())
+    }
+
+    /// `node_alloc_usage` is a scheduler-lane cache that control-lane node
+    /// removal may not delete: the scheduler-lane sweep sheds the rows of
+    /// departed nodes and keeps every live node's.
+    #[test]
+    fn the_usage_cache_sheds_rows_of_removed_nodes() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-live", "ready"))?;
+        store.insert_node(make_node_msg("node-gone", "ready"))?;
+        {
+            let conn = store.write_connection()?;
+            for node in ["node-live", "node-gone"] {
+                conn.execute(
+                    "INSERT INTO node_alloc_usage \
+                         (node_id, alloc_epoch, alloc_count, alloc_id_sum, usage_json) \
+                     VALUES (?1, 0, 0, 0, '{}');",
+                    [node],
+                )?;
+            }
+        }
+        let usage_rows = |store: &Store| -> R<Vec<String>> {
+            let conn = store.read_connection()?;
+            let mut stmt =
+                conn.prepare("SELECT node_id FROM node_alloc_usage ORDER BY node_id;")?;
+            let rows = Store::collect_rows(stmt.query_map([], |row| row.get(0))?)?;
+            drop(stmt);
+            Ok(rows)
+        };
+        assert_eq!(
+            store.prune_node_alloc_usage_orphans()?,
+            0,
+            "nothing departed"
+        );
+
+        store.remove_node("node-gone")?;
+        assert_eq!(
+            usage_rows(&store)?.len(),
+            2,
+            "remove_node must not delete scheduler-lane rows"
+        );
+        assert_eq!(store.prune_node_alloc_usage_orphans()?, 1);
+        assert_eq!(usage_rows(&store)?, vec!["node-live".to_string()]);
+        assert_eq!(
+            store.prune_node_alloc_usage_orphans()?,
+            0,
+            "sweep is idempotent"
+        );
         Ok(())
     }
 
@@ -33215,7 +33506,7 @@ mod tests {
         let second_local = local_port(&second)?;
         assert_ne!(first_local, second_local);
         assert!(first_local >= crate::structs::DATAPATH_PORT_MIN);
-        assert!(second_local <= crate::structs::DATAPATH_PORT_MAX);
+        assert!(second_local >= crate::structs::DATAPATH_PORT_MIN);
 
         // Upstream ports come from the same per-node set as task ports, so
         // they never land on a port already handed to a task.

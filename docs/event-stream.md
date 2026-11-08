@@ -14,7 +14,7 @@ It is available from the CLI, the MCP server, the UI, and raw gRPC.
 | `scheduler.concurrency_adjusted` | info | The adaptive concurrency controller moved the number of planners it admits. Emitted on the change, never per tick (docs/adaptive-scheduler-concurrency.md). |
 | `scheduler.concurrency_saturated` | warn | Backing off did not improve goodput, so the cluster's plan conflicts are capacity-driven rather than concurrency-driven. Add nodes; waiting will not help. |
 | `eval.enqueued` | info | An eval was added to the queue. |
-| `eval.completed` | info | An eval handler finished successfully. |
+| `eval.completed` | info | An eval handler finished successfully. A `rollout_tick` that only waited and changed nothing writes neither this nor an `eval.enqueued` for its successor: its eval goes back to pending quietly (see [Rollouts](rollouts.md)). |
 | `eval.failed` | error | An eval handler returned an error. |
 | `eval.requeued` | warn | An eval used up its plan-conflict retries and was released back to pending with a delay instead of failing. See [Late-binding plan apply](late-binding-plan-apply.md). |
 | `eval.blocked` | warn | An eval's plan found no room, so the eval waits blocked instead of failing. Metadata carries the blocking `key` (`class:pool=...`, `node:<id>`, `escaped`) and the `detail` (task, cpu, memory, message, and for a [gang](gang-scheduling.md) short of its quorum a `gang` report: desired, min, running, placeable, eligible nodes). See [Blocked evals](scheduler-and-eval-loop.md#blocked-evals). |

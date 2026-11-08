@@ -403,15 +403,11 @@ impl ManagerDaemonService {
             .store
             .apply_namespace_policy(policy)
             .map_err(|e| map_store_error("Error applying namespace policy", e))?;
-        if !idempotency_key.is_empty() {
-            self.store
-                .idempotency_record(
-                    &idempotency_key,
-                    "apply_namespace_policy",
-                    &record.policy.name,
-                )
-                .map_err(|e| map_store_error("Error recording idempotency", e))?;
-        }
+        let (_, deduplicated) = self.record_idempotent(
+            &idempotency_key,
+            "apply_namespace_policy",
+            record.policy.name.clone(),
+        )?;
         info!(
             policy = %record.policy.name,
             namespaces = %record.policy.selector(),
@@ -423,7 +419,7 @@ impl ManagerDaemonService {
             policy: Some(record_to_proto(&record)),
             created,
             violations: Vec::new(),
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -466,11 +462,8 @@ impl ManagerDaemonService {
                 "namespace policy '{name}' does not exist"
             )));
         }
-        if !idempotency_key.is_empty() {
-            self.store
-                .idempotency_record(&idempotency_key, "delete_namespace_policy", &name)
-                .map_err(|e| map_store_error("Error recording idempotency", e))?;
-        }
+        let (_, deduplicated) =
+            self.record_idempotent(&idempotency_key, "delete_namespace_policy", name.clone())?;
         info!(
             policy = %name,
             accessor_id = identity.accessor_id.as_deref().unwrap_or("-"),
@@ -478,7 +471,7 @@ impl ManagerDaemonService {
         );
         Ok(Response::new(DeleteNamespacePolicyReply {
             deleted: true,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 }

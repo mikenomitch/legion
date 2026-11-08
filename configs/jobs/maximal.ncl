@@ -505,6 +505,9 @@
             ],
             # Task-level KV policy defaults; entries override field-by-field
             # (see docs/kv-store.md "Reactive updates"). Keys are camelCase.
+            # onChange / onDelete: none (store the new render; it reaches
+            # the task at its next replacement) | update (files only) |
+            # restart | rollout | fail.
             kv = {
                 watch = true,
                 onChange = "restart",

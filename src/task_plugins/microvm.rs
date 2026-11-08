@@ -120,15 +120,18 @@ impl Backend {
             })
             .unwrap_or_else(|| "auto".to_string());
 
+        use crate::structs::checkpoint::SandboxVmm;
         match selection.to_ascii_lowercase().as_str() {
             "auto" => Self::detect_auto(),
-            "cloud-hypervisor" | "cloudhypervisor" | "ch" => Self::cloud_hypervisor(),
-            "firecracker" | "fc" => Self::firecracker(),
             "dev" => Self::dev(),
-            other => bail!(
-                "unknown sandbox hypervisor `{other}`; expected auto, cloud-hypervisor, \
-                 firecracker, or dev"
-            ),
+            other => match SandboxVmm::parse(other) {
+                Some(SandboxVmm::CloudHypervisor) => Self::cloud_hypervisor(),
+                Some(SandboxVmm::Firecracker) => Self::firecracker(),
+                None => bail!(
+                    "unknown sandbox hypervisor `{other}`; expected auto, cloud-hypervisor, \
+                     firecracker, or dev"
+                ),
+            },
         }
     }
 

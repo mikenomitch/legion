@@ -105,19 +105,32 @@ the write's own code:
 
 - **`raft`**: each manager projects the cache from the changeset it applies
   (see [Persistence Modes](#persistence-modes)). The projection runs after
-  the changeset commits. If it fails, the manager logs `Failed to project a
-  committed changeset's side effects`, re-sends every streaming worker its
-  full desired set, and leaves the cache to the scrub below. It keeps
-  applying the log. A projection error doesn't stop the manager's raft
-  group. The scrub doesn't cover task configs, so a cached task list the
-  failed projection skipped stays stale until the manager restarts.
+  the changeset commits.
 - **`local_disk` and `streaming`**: each mutation runs with a SQLite session
   attached to the cache's tables (`node`, `node_health`, `allocation`,
   `task_config`, `allocation_epoch_partition`). When the mutation returns, the
-  cache is projected from what it committed. That includes rows removed by
-  `ON DELETE CASCADE` and rows a mutation committed before it failed.
-  Mutations run one at a time on a process-wide lock, so projections apply in
-  commit order.
+  cache is projected from what it committed, including rows removed by
+  `ON DELETE CASCADE`. Each mutation runs inside its own savepoint, so one
+  that fails (or panics) part way commits nothing, which is the same
+  all-or-nothing contract a raft entry has. Mutations run one at a time on a
+  process-wide lock, so projections apply in commit order.
+
+In either mode a projection that fails part way never fails the write: the
+rows are committed. The manager logs `Failed projecting a committed
+changeset; rebuilding this manager's read model and resyncing its work
+streams`, rebuilds the whole cache from SQLite, re-sends every streaming
+worker its full desired set, and restarts the change journal (open watches
+resync). The capacity events the changeset carried are lost with the
+projection, so the manager records a `recovered` capacity event for every
+available node instead, and the next wake pass re-matches every blocked eval
+against the whole fleet ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)).
+In raft mode it keeps applying the log: a projection error doesn't stop the
+manager's raft group.
+
+A task-config lookup that misses the cache reads SQLite and caches what it
+read, unless a projection or a scrub repair changed the task-config cache in
+the meantime. So a lookup racing a `job destroy` cannot put the destroyed
+config's task list back after the projection removed it.
 
 A stale cache cannot oversubscribe a node, because plan-apply rechecks free
 capacity against SQLite inside its write transaction. It can still make the
@@ -135,9 +148,10 @@ background checks run every 5 seconds on every manager to bound that:
 - **Scrub.** The manager reloads 128 nodes per tick from SQLite (the node row
   and its allocation list), compares them with the cache, and repairs any
   that differ. The rotation covers every node, cached or committed, so a
-  10,000-node fleet is swept in about 6.5 minutes. Each repair logs a warning
+  10,000-node fleet is swept in about 6.5 minutes. Task configs rotate the
+  same way, 128 job configs' task lists per tick, on their own budget, so a
+  long job history does not slow the node sweep. Each repair logs a warning
   and increments `legion_read_model_drift_repaired_total{source="scrub"}`.
-  Task configs are not scrubbed.
 
 Either counter rising in a healthy cluster is a bug worth reporting.
 
@@ -201,6 +215,9 @@ Main tables (see migrations):
   row written under a different `taskResourceDefaults`/`customResources`
   configuration is rebuilt instead of served
   (see [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md#the-per-node-usage-cache)).
+  Removing a node leaves its row behind (node removal is a control-lane
+  write, and this table belongs to the scheduler lane). The scheduler-lane
+  leader sweeps rows whose node is gone on every node-status check.
 - `rollout`, `allocation_health`, `rollout_event`
 - `instance` (stateful identity), `volume` (the storage its handle points at,
   see [volumes.md](volumes.md))

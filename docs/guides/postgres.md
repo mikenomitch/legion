@@ -125,7 +125,7 @@ Scope:      node-local (instance is pinned to its node)
 Job:        postgres
 Instance:   postgres-db-0
 Node:       node-a1
-Mounted at: /var/lib/legion/workers/node-a1/volumes/local-dir/9f2c8a1b…
+Mounted at: /var/lib/legion/workers/node-a1/local-volumes/9f2c8a1b…/data
 Params:     {"size":"20G"}
 ```
 

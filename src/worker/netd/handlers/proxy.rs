@@ -34,9 +34,11 @@ impl Proxy {
         facts: &HopFacts<'_>,
     ) -> Result<ProxyTarget, String> {
         let proxy_protocol = self.config.proxy_protocol.unwrap_or(true);
-        let (label, candidates): (String, Vec<String>) =
+        // Each candidate: its address, the node it runs on when it is a mesh
+        // endpoint, and whether it is on another node.
+        let (label, candidates): (String, Vec<(String, Option<String>, bool)>) =
             if let Some(service) = self.config.service.as_deref() {
-                let node = self.config.local.then(|| context.node_id()).flatten();
+                let node = context.node_id();
                 let label = if self.config.local {
                     format!("node-local service {service}")
                 } else {
@@ -50,7 +52,13 @@ impl Proxy {
                         .filter(|e| {
                             !self.config.local || node.as_deref().is_none_or(|n| n == e.node_id)
                         })
-                        .map(|e| e.addr)
+                        .map(|e| {
+                            // An unknown own node id counts as remote, so a
+                            // hand-off fails closed rather than open.
+                            let remote = node.as_deref() != Some(e.node_id.as_str());
+                            let mesh_node = e.mesh_tls.then_some(e.node_id);
+                            (e.addr, mesh_node, remote)
+                        })
                         .collect(),
                 )
             } else if let Some(port) = self.config.port.as_deref() {
@@ -58,7 +66,7 @@ impl Proxy {
                     format!("port {port}"),
                     context
                         .sidecar_port(facts.allocation_id, port)
-                        .map(|p| vec![format!("127.0.0.1:{p}")])
+                        .map(|p| vec![(format!("127.0.0.1:{p}"), None, false)])
                         .unwrap_or_default(),
                 )
             } else {
@@ -80,10 +88,13 @@ impl Proxy {
         let pick = context.next_handler_pick() % candidates.len();
         context.note_handler(facts.allocation_id, &self.source, "proxy", &target, Ok(()));
         net_metrics::handler("proxy", "proxy", 0.0);
+        let (addr, mesh_node, remote) = candidates[pick].clone();
         Ok(ProxyTarget {
             source: self.source.clone(),
-            addr: candidates[pick].clone(),
+            addr,
             proxy_protocol,
+            mesh_node,
+            remote,
         })
     }
 }

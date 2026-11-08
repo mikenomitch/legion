@@ -890,16 +890,21 @@ impl Drop for LocalProjectionGuard {
 ///    this body's session;
 /// 2. set [`in_local_projection`], which defers every read-model hook;
 /// 3. attach a session filtered to [`READ_MODEL_TABLES`];
-/// 4. run the body, which commits normally;
-/// 5. extract the changeset whether or not the body succeeded, because a
-///    body that fails after a commit has still changed state;
+/// 4. run the body inside `SAVEPOINT legion_local`, released when it
+///    returns `Ok` and rolled back when it errors or panics, so a failed
+///    body leaves nothing behind (the raft capture's per-op savepoint gives
+///    replicas the same all-or-nothing contract);
+/// 5. extract the changeset (empty for a rolled-back body);
 /// 6. project the changeset's read-model effects, still under the mutex,
 ///    so projections land in commit order (the delta path assumes it);
 /// 7. run `after` (the shadow check) while nothing else can write.
 ///
-/// A panicking body skips projection: the scrub repairs whatever it
-/// committed. Callers nested inside the body compose inline (see
+/// A panicking body is rolled back and skips projection. Callers nested inside the body compose inline (see
 /// `Store::replicated`).
+const LOCAL_SAVEPOINT_SQL: &str = "SAVEPOINT legion_local;";
+const LOCAL_RELEASE_SQL: &str = "RELEASE legion_local;";
+const LOCAL_ROLLBACK_SQL: &str = "ROLLBACK TO legion_local; RELEASE legion_local;";
+
 pub(crate) fn local_projected_mutation<T>(
     store: &Store,
     f: impl FnOnce(&Store) -> R<T>,
@@ -930,7 +935,23 @@ pub(crate) fn local_projected_mutation<T>(
         session
     };
 
+    // The body runs in its own savepoint, so an error (or a panic) undoes
+    // every write it made, as the raft capture's per-op savepoint does.
+    // Without it each statement committed as it ran, and a body that failed
+    // half way left its first writes behind on a single manager only.
+    store
+        .write_connection()?
+        .execute_batch(LOCAL_SAVEPOINT_SQL)
+        .context("failed opening the local mutation savepoint")?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(store)));
+    let settle = match &result {
+        Ok(Ok(_)) => LOCAL_RELEASE_SQL,
+        _ => LOCAL_ROLLBACK_SQL,
+    };
+    let settled = store
+        .write_connection()
+        .and_then(|conn| Ok(conn.execute_batch(settle)?))
+        .context("failed settling the local mutation savepoint");
 
     // Changeset generation reads the current rows through the connection,
     // and deleting the session detaches it from the connection, so both
@@ -960,6 +981,7 @@ pub(crate) fn local_projected_mutation<T>(
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
     };
+    settled?;
     extract?;
     // The write committed: a projection failure rebuilds the read model
     // rather than reporting the write as failed (see
@@ -1311,6 +1333,39 @@ mod tests {
     /// open `legion_capture` savepoint between the capture's statements,
     /// and the capture's `ROLLBACK TO legion_capture` silently erased the
     /// quorum-committed rows.
+    /// A `local_disk` mutation is all or nothing, like a raft entry: a body
+    /// that writes and then fails (or panics) leaves none of its writes
+    /// behind, and a body that succeeds keeps them.
+    #[test]
+    fn a_failed_local_mutation_commits_nothing_test() -> R<()> {
+        let store = setup_store()?;
+        let failed = store.replicated(Lane::Control, "test_failing_body", |s| {
+            s.put_kv("local/half", "written", KvValueType::String, None, None)?;
+            Err::<(), _>(anyhow!("the body fails after its first write"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(kv_value(&store, "local/half")?, None);
+
+        let panic_store = store.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _ = panic_store.replicated(Lane::Control, "test_panicking_body", |s| {
+                s.put_kv("local/panic", "written", KvValueType::String, None, None)?;
+                panic!("the body panics after its first write");
+                #[allow(unreachable_code)]
+                Ok(())
+            });
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(kv_value(&store, "local/panic")?, None);
+
+        store.replicated(Lane::Control, "test_ok_body", |s| {
+            s.put_kv("local/kept", "written", KvValueType::String, None, None)?;
+            Ok(())
+        })?;
+        assert_eq!(kv_value(&store, "local/kept")?.as_deref(), Some("written"));
+        Ok(())
+    }
+
     #[test]
     fn committed_apply_survives_a_concurrent_capture_rollback() -> R<()> {
         let store = setup_store()?;

@@ -682,6 +682,12 @@ impl TaskPlugin for ExecTaskPlugin {
                         alloc_dir.display()
                     )
                 })?;
+                // The same for its `local-dir` volumes, which guard
+                // themselves the same way (`<state dir>/allocs/<id>` is
+                // the alloc dir, so the state dir is two levels up).
+                if let Some(data_dir) = alloc_dir.parent().and_then(Path::parent) {
+                    hand_local_volumes_to(&instance.volumes, data_dir, user.uid, user.gid)?;
+                }
             }
         }
 
@@ -1067,6 +1073,52 @@ fn apply_landlock(options: &LandlockOptions) -> R<()> {
     Ok(())
 }
 
+/// Hand each filesystem-mode `local-dir` volume the task mounts to the
+/// task's `user`: its per-volume guard directory (owner-only, so it stays
+/// unreachable to every other user), and its data. The data tree is walked
+/// only when its top is not the user's already (the rule Kubernetes'
+/// `fsGroupChangePolicy: OnRootMismatch` uses), so restarting a task on a
+/// large volume costs one `stat`. Any other volume (a `host` path, an NFS
+/// export, a tmpfs) is the operator's to own and is never changed.
+#[cfg(unix)]
+fn hand_local_volumes_to(
+    volumes: &[crate::task_plugins::MountedVolume],
+    data_dir: &Path,
+    uid: u32,
+    gid: u32,
+) -> R<()> {
+    use std::os::unix::fs::MetadataExt;
+    for volume in volumes {
+        if volume.mode != crate::volumes::VolumeMode::Filesystem {
+            continue;
+        }
+        let Some(guard) = crate::volumes::builtins::local_dir_guard(&volume.host_path, data_dir)
+        else {
+            continue;
+        };
+        let handed = (|| -> R<()> {
+            std::os::unix::fs::lchown(guard, Some(uid), Some(gid))
+                .with_context(|| format!("failed to chown {}", guard.display()))?;
+            let top = volume
+                .host_path
+                .symlink_metadata()
+                .with_context(|| format!("failed to stat {}", volume.host_path.display()))?;
+            if top.uid() != uid || top.gid() != gid {
+                chown_tree(&volume.host_path, uid, gid)?;
+            }
+            Ok(())
+        })();
+        handed.with_context(|| {
+            format!(
+                "failed to hand volume `{}` ({}) to exec task user",
+                volume.name,
+                volume.host_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Chown a directory tree without following symlinks: a symlink staged into
 /// the task dir (e.g. inside a tree artifact) must not hand ownership of a
 /// path outside the allocation tree to the task user.
@@ -1401,6 +1453,71 @@ mod tests {
         );
         assert_eq!(resolve_program("/bin/echo")?, "/bin/echo");
         assert_eq!(resolve_program("legion")?, "legion");
+        Ok(())
+    }
+
+    /// The finding: an `exec` task with a `user` could not reach its own
+    /// `local-dir` volume. Its guard and data are handed over; another
+    /// volume's are not, and neither is a `host` path. Needs root to chown
+    /// to another uid, so off root it checks only what is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn exec_user_is_handed_its_local_dir_volumes_only_test() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        let temp_dir = tempfile::TempDir::new()?;
+        let data_dir = temp_dir.path();
+        let volume =
+            |name: &str, host_path: std::path::PathBuf| crate::task_plugins::MountedVolume {
+                name: name.into(),
+                mode: crate::volumes::VolumeMode::Filesystem,
+                host_path,
+                path: None,
+                fs: None,
+                fresh: true,
+                read_only: false,
+            };
+        let ours = data_dir.join("local-volumes/vol-a/data");
+        let theirs = data_dir.join("local-volumes/vol-b/data");
+        let host = data_dir.join("srv/shared");
+        for dir in [&ours, &theirs, &host] {
+            std::fs::create_dir_all(dir.join("nested"))?;
+            std::fs::write(dir.join("nested/file"), b"x")?;
+        }
+        let owner = |path: &Path| -> R<(u32, u32)> {
+            let meta = path.symlink_metadata()?;
+            Ok((meta.uid(), meta.gid()))
+        };
+        let before_theirs = owner(&theirs)?;
+        let before_host = owner(&host)?;
+        // SAFETY: trivial libc getter with no preconditions.
+        let (uid, gid) = if unsafe { libc::geteuid() } == 0 {
+            (
+                crate::structs::app::APP_UID_BASE + 4310,
+                crate::structs::app::APP_UID_BASE + 4310,
+            )
+        } else {
+            // SAFETY: as above.
+            unsafe { (libc::geteuid(), libc::getegid()) }
+        };
+        hand_local_volumes_to(
+            &[volume("data", ours.clone()), volume("shared", host.clone())],
+            data_dir,
+            uid,
+            gid,
+        )?;
+        for path in [
+            ours.parent().unwrap().to_path_buf(),
+            ours.clone(),
+            ours.join("nested/file"),
+        ] {
+            assert_eq!(owner(&path)?, (uid, gid), "{}", path.display());
+        }
+        assert_eq!(
+            owner(&theirs)?,
+            before_theirs,
+            "another volume is untouched"
+        );
+        assert_eq!(owner(&host)?, before_host, "a host path is never chowned");
         Ok(())
     }
 

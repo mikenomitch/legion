@@ -270,11 +270,9 @@ impl ManagerDaemonService {
             inner.idempotency_key.as_deref(),
             &inner,
         );
-        if let Some(snapshot_id) = self
-            .store
-            .idempotency_lookup(&idempotency_key)
-            .map_err(|e| map_store_error("Error checking idempotency", e))?
-        {
+        // The reply for a key another request already used: the snapshot
+        // it created.
+        let replay = |snapshot_id: String| -> Result<Response<CreateSnapshotReply>, Status> {
             let snapshot = self
                 .store
                 .get_snapshot(&snapshot_id)
@@ -285,11 +283,18 @@ impl ManagerDaemonService {
                     ))
                 })?;
             self.enforce_snapshot_scope(&identity, AclAction::Write, &snapshot.job_id)?;
-            return Ok(Response::new(CreateSnapshotReply {
+            Ok(Response::new(CreateSnapshotReply {
                 snapshot: Some(snapshot_info(snapshot, false)),
                 deduplicated: true,
                 notes: Vec::new(),
-            }));
+            }))
+        };
+        if let Some(snapshot_id) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return replay(snapshot_id);
         }
 
         let kind: SnapshotKind = inner.kind.parse().map_err(Status::invalid_argument)?;
@@ -379,23 +384,46 @@ impl ManagerDaemonService {
             .and_then(|snapshots| snapshots.resolve().ok())
             .and_then(|resolved| resolved.ttl)
             .map(|ttl| chrono::Utc::now().timestamp() + ttl.as_secs() as i64);
-        let snapshot = self
+        let new = NewSnapshot {
+            snapshot_id: crate::structs::snapshot::new_snapshot_id(),
+            job_id: instance.job_id.clone(),
+            task_name: task.name.clone(),
+            instance_id: instance.instance_id.clone(),
+            name,
+            kind,
+            purpose: SnapshotPurpose::Manual,
+            node_id: node.id.clone(),
+            allocation_id: allocation.id,
+            expires_at,
+            suspend_reason: None,
+            durability,
+        };
+        // The row and the idempotency claim commit together, so a
+        // concurrent request with the same key never starts a second
+        // capture: whichever loses (its claim, or the one-capture-at-a-time
+        // check against the winner's row) is handed the winner's snapshot.
+        let key = idempotency_key.clone();
+        let committed = self
             .store
-            .create_snapshot(NewSnapshot {
-                snapshot_id: crate::structs::snapshot::new_snapshot_id(),
-                job_id: instance.job_id.clone(),
-                task_name: task.name.clone(),
-                instance_id: instance.instance_id.clone(),
-                name,
-                kind,
-                purpose: SnapshotPurpose::Manual,
-                node_id: node.id.clone(),
-                allocation_id: allocation.id,
-                expires_at,
-                suspend_reason: None,
-                durability,
-            })
-            .map_err(|e| map_store_error("Error creating snapshot", e))?;
+            .scheduler_group_commit("create_snapshot", move |s| {
+                claimed_body(s, |s| {
+                    let snapshot = s.create_snapshot(new)?;
+                    claim_idempotency_key(s, &key, "create_snapshot", &snapshot.snapshot_id)?;
+                    Ok(snapshot)
+                })
+            });
+        if let Err(err) = &committed {
+            if !super::idempotency::IdempotencyKeyTaken::in_chain(err) {
+                if let Some(snapshot_id) = self.idempotency_winner(&idempotency_key)? {
+                    return replay(snapshot_id);
+                }
+            }
+        }
+        let snapshot =
+            match self.claimed_write(&idempotency_key, "Error creating snapshot", committed)? {
+                Ok(snapshot) => snapshot,
+                Err(snapshot_id) => return replay(snapshot_id),
+            };
         info!(
             snapshot_id = %snapshot.snapshot_id,
             instance_id = %instance.instance_id,
@@ -404,9 +432,6 @@ impl ManagerDaemonService {
             durability = durability.as_str(),
             "Snapshot requested"
         );
-        self.store
-            .idempotency_record(&idempotency_key, "create_snapshot", &snapshot.snapshot_id)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
         let notes = if kind == SnapshotKind::Memory {
             super::suspend_rpcs::gated_capture_note(
                 &task,
@@ -588,12 +613,11 @@ impl ManagerDaemonService {
                 format!("Snapshot {} already deleting", snapshot.snapshot_id)
             }
         };
-        self.store
-            .idempotency_record(&idempotency_key, "delete_snapshot", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "delete_snapshot", message)?;
         Ok(Response::new(DeleteSnapshotReply {
             message,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -733,13 +757,25 @@ impl ManagerDaemonService {
             "Restoring instance {} from snapshot {}",
             instance.instance_id, snapshot.snapshot_id
         );
-        self.store
-            .idempotency_record(
-                &idempotency_key,
-                "restore_instance",
-                &format!("{} {message}", snapshot.snapshot_id),
-            )
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        // A concurrent restore with the same key that recorded first
+        // restored the same snapshot; this one's repeat converged on it.
+        let (recorded, deduplicated) = self.record_idempotent(
+            &idempotency_key,
+            "restore_instance",
+            format!("{} {message}", snapshot.snapshot_id),
+        )?;
+        if deduplicated {
+            // Recorded as "<snapshot_id> <message>".
+            let (snapshot_id, message) = recorded
+                .split_once(' ')
+                .map(|(id, message)| (id.to_string(), message.to_string()))
+                .unwrap_or_else(|| (String::new(), recorded.clone()));
+            return Ok(Response::new(RestoreInstanceReply {
+                message,
+                snapshot_id,
+                deduplicated: true,
+            }));
+        }
         Ok(Response::new(RestoreInstanceReply {
             message,
             snapshot_id: snapshot.snapshot_id,
@@ -894,13 +930,17 @@ impl ManagerDaemonService {
             already_warm: plan.already_warm,
             incompatible: plan.incompatible,
         };
-        self.store
-            .idempotency_record(
-                &idempotency_key,
-                "warm_snapshot",
-                &serde_json::to_string(&recorded).unwrap_or_default(),
-            )
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        // Warming converges, so a concurrent call with the same key that
+        // recorded first only changes what this caller is handed: its plan.
+        let (winner, deduplicated) = self.record_idempotent(
+            &idempotency_key,
+            "warm_snapshot",
+            serde_json::to_string(&recorded).unwrap_or_default(),
+        )?;
+        if deduplicated {
+            let winner: RecordedWarm = serde_json::from_str(&winner).unwrap_or_default();
+            return Ok(Response::new(winner.into_reply(true)));
+        }
         Ok(Response::new(recorded.into_reply(false)))
     }
 }

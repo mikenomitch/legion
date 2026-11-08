@@ -289,6 +289,69 @@ fn a_follower_forwards_a_lost_nodes_recovery_in_single_topology() -> R<()> {
     Ok(())
 }
 
+/// Agent-governance calls #5: the audit records of a follower that leads no
+/// lane (the denials and validation errors it answered itself) are
+/// forwarded to the status-lane leader and journaled, instead of only
+/// reaching the follower's `audit` tracing target.
+#[test]
+fn a_follower_forwards_its_audit_records_in_single_topology() -> R<()> {
+    use legion::storage::governance_store::{AuditFilter, AuditRecord};
+
+    let _serial = cluster_gate();
+    let dir = tempfile::tempdir()?;
+    let nodes = start_cluster(dir.path())?;
+    let leader = leader_index(&nodes);
+    let follower = (leader + 1) % nodes.len();
+    assert!(
+        !nodes[follower].store().can_write_audit(),
+        "a single-topology follower leads no lane"
+    );
+
+    let record = AuditRecord {
+        id: "0123456789abcdef0123456789abcdef".into(),
+        ts_ms: 1_700_000_000_000,
+        manager: nodes[follower].name.into(),
+        operation: "RunJob".into(),
+        kind: "denied".into(),
+        principal: "anonymous".into(),
+        resource: "job".into(),
+        action: "write".into(),
+        target: "web".into(),
+        outcome: "PERMISSION_DENIED".into(),
+        ..Default::default()
+    };
+    nodes[follower]
+        .store()
+        .append_audit_events(vec![record.clone()])
+        .context("a follower must forward its audit batch to a lane leader")?;
+    let filter = AuditFilter {
+        limit: 10,
+        ..Default::default()
+    };
+    wait_for(
+        Duration::from_secs(30),
+        "every manager journals the follower's record",
+        || {
+            nodes.iter().all(|node| {
+                node.store()
+                    .list_audit_events(&filter)
+                    .is_ok_and(|records| records.iter().any(|seen| seen.id == record.id))
+            })
+        },
+    );
+    // A retried forward of the same batch inserts nothing twice.
+    nodes[follower]
+        .store()
+        .append_audit_events(vec![record.clone()])?;
+    let records = nodes[leader].store().list_audit_events(&filter)?;
+    assert_eq!(
+        records.iter().filter(|seen| seen.id == record.id).count(),
+        1,
+        "{records:?}"
+    );
+    Ok(())
+}
+
 /// AWS spot check, DAG stuck after its first step: a batch task's exit
 /// reported to a FOLLOWER completes the allocation and the task. Both lanes'
 /// halves (`complete_allocation` on the scheduler lane, `set_task_status`

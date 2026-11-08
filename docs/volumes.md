@@ -194,6 +194,16 @@ A directory under the worker's state dir, created on first mount and removed on
 destroy. It is node-local and needs no configuration. A bare
 `storage = { path = … }` uses this driver.
 
+Each volume lives at `<state dir>/local-volumes/<volume_id>/`, and that
+directory is the volume's guard: owner-only (`0700`) from the moment it
+exists, including the copies a clone or restore makes. The data is inside it,
+in `data/` in filesystem mode and `disk.img` in block mode. `local-volumes/`
+itself is traverse-only (`0711`), so a task running as its own `user` can
+reach its own volume by path but cannot list or enter the others. An `exec`
+task with a `user` is handed its volume's guard and data at start (see
+[task-runtime-exec.md](task-runtime-exec.md)). Container and sandbox tasks
+reach the data through the runtime, which runs as root.
+
 ```nickel
 storage = { path = "/var/lib/db", params = { size = "10G", mode = "0700" } }
 ```
@@ -207,10 +217,11 @@ replacement after a failure, a rollout's new version) is not charged its
 `size` again, since that volume adds nothing to the node's disk. A node whose
 free disk has dropped under the declared size can still take its own
 instances back.
-`mode` sets the directory permissions.
+`mode` sets the data directory's permissions (`data/`, not the guard
+around it). Without it the data directory gets the worker's umask.
 
 In **block mode**, the driver serves a sparse disk image at
-`<volume dir>/<volume_id>/disk.img`, formatted with `params.fs` (default
+`<state dir>/local-volumes/<volume_id>/disk.img`, formatted with `params.fs` (default
 `ext4`) at `params.size` (default 1GiB). Here `size` is enforced, because it is
 the image's size. The image is a plain file, so creating one needs no
 privileges and no loop device. Block mode is advertised only on nodes with the
@@ -679,8 +690,9 @@ finished snapshot and returns it instead of taking a second one. `restore`,
 The caller stops writing to the volume before `snapshot`, and unmounts it
 before `restore`. A snapshot of a volume under write is only crash-consistent.
 
-`local-dir` keeps snapshots beside its volumes, at
-`<volume dir>/../local-dir-snapshots/<snapshot_id>/`:
+`local-dir` keeps snapshots apart from its volumes, at
+`<state dir>/volumes/local-dir-snapshots/<snapshot_id>/` (owner-only, like
+the rest of `volumes/`):
 
 - **Filesystem mode** copies the directory tree. **Block mode** copies the disk
   image.

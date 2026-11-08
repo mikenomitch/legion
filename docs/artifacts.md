@@ -169,8 +169,10 @@ This sits next to the worker's `worker_state.json`, for example
 - The directories above it, the worker state dir and `allocs/`, are
   traverse-only (`0711`). A task's own user can reach its allocation
   directory by path, but nothing can list a node's allocations. Every other
-  entry in the state dir guards itself: the state files are `0600`, and
-  `logs/`, `content/`, `volumes/`, and `identity/` are owner-only.
+  entry in the state dir guards itself: the state files are `0600`;
+  `logs/`, `content/`, `volumes/`, and `identity/` are owner-only; and
+  `local-volumes/` is traverse-only with an owner-only directory per volume
+  (see [volumes.md](volumes.md#local-dir-the-default)).
 - It is exposed to the task as the `LEGION_ALLOC_DIR` and `LEGION_TASK_DIR`
   env vars, for runtimes that apply worker-injected env (see the
   [capability matrix](#task-runtime-support)).
@@ -398,6 +400,7 @@ hold it to what was judged:
 | `git::git://` | — | Refused on a guarded worker: nothing can pin it. Use `https://` or `ssh://` |
 | `git::file://` | — | No network |
 | `oci://` | the registry's host | No: the registry client resolves the name again, and follows a blob's or token's redirect on its own |
+| A runtime's own image pull (a `container` or `sandbox` `image` with no staged image artifact) | the registry's host, as `oci://` | No, as `oci://` |
 | `s3://` | the custom endpoint: the `endpoint` query parameter, else the one the KV credential names | No: the S3 client resolves it again and follows redirects |
 
 A guarded `git` fetch also sets `GIT_LFS_SKIP_SMUDGE=1`: a repository's own
@@ -419,8 +422,31 @@ redirects, and neither the second lookup nor a redirect's target is judged.
 For OCI, every blob is checked against the manifest's digest, so a redirect
 cannot put anything but the image's own bytes in the task directory. An S3
 endpoint that passes the check and answers with a redirect to a guarded
-address is followed. The tag and branch lookups the manager makes at submit
-(`resolve = "pin"`, below) run on the manager, which has no host guard.
+address is followed.
+
+**The manager's pin lookups.** The tag and branch lookups the manager makes
+at submit (`resolve = "pin"`, below) also go to a host the job chose, from
+the manager, so they are judged the same way: `git ls-remote` is held to
+the judged addresses as in the table above, and an OCI registry is judged
+before the tag's `HEAD`. The manager judges with the guard's built-in
+classes (loopback, the unspecified address, link-local, cloud metadata) and
+its own interface addresses. It has no `hostGuard.allow` or `hostGuard.deny`
+(those are worker settings), so nothing opens a guarded address for a pin
+lookup:
+
+```console
+resolve artifact git::https://127.0.0.1:3000/acme/tools?ref=main at submit failed; fix the reference or set resolve: "always" to re-resolve at staging instead: the source refused the reference: the manager will not look up git::https://127.0.0.1:3000/acme/tools?ref=main at submit: its host guard refuses loopback, link-local and cloud metadata addresses, and the manager's own, and no setting opens them for a pin lookup. Pin the digest or commit yourself, or set resolve: "always" so the worker resolves it, where hostGuard.allow applies: ...
+```
+
+A source on the manager's own machine (a dev registry on `localhost`) takes
+an explicit digest or commit, or `resolve = "always"`, which resolves it on
+the worker at staging, under that worker's `hostGuard.allow`. A `git://`
+source cannot be pinned by the manager, for the reason a guarded worker
+refuses it. Private ranges (`10.0.0.0/8` and the like) are not a guarded
+class, on the manager or a worker. The same limit as the worker's applies to
+OCI: the registry client resolves the name again for the `HEAD`, which is
+not judged.
+
 ## Pinning: `resolve = "pin"` vs `'always'`
 
 Mutable references (OCI tags and git branches or tags) default to

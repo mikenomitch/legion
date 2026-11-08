@@ -283,19 +283,58 @@ impl WorkerVolumeManager {
         }
     }
 
+    /// Unmount the volumes a persisted allocation held when its task is
+    /// gone and this process never mounted them: one the boot fence killed,
+    /// or one that died while no worker ran (audit W6). The request is the
+    /// one its mount would have sent, from the persisted mount and its
+    /// recorded attrs, with the op swapped. Best-effort, like
+    /// [`Self::unmount_for_allocation`].
+    #[instrument(skip_all, fields(allocation_id = allocation.id))]
+    pub fn release_persisted(
+        &self,
+        allocation: &Allocation,
+        instance: Option<&VolumeInstanceRef>,
+        mounts: &[VolumeMount],
+    ) {
+        for mount in mounts.iter().rev() {
+            let request = VolumeRequest {
+                api_version: crate::volumes::VOLUME_API_VERSION,
+                op: VolumeOp::Unmount,
+                mode: mount.mode,
+                volume: VolumeRef {
+                    id: mount.volume_id.clone(),
+                    name: mount.name.clone(),
+                    driver: mount.driver.clone(),
+                    attrs: mount.attrs.clone(),
+                    read_only: mount.read_only,
+                },
+                params: mount.params.clone(),
+                instance: instance.cloned(),
+                alloc_id: allocation.id,
+                node: self.registry.node_ref(&self.node_id),
+                snapshot: None,
+            };
+            self.unmount_request(&mount.volume_id, &mount.driver, &request);
+        }
+    }
+
     fn unmount_one(&self, mount: &MountedVolume) {
-        let Some(plugin) = self.registry.get(&mount.driver) else {
+        self.unmount_request(&mount.volume_id, &mount.driver, &mount.request);
+    }
+
+    fn unmount_request(&self, volume_id: &str, driver: &str, request: &VolumeRequest) {
+        let Some(plugin) = self.registry.get(driver) else {
             return;
         };
-        match plugin.unmount(&mount.request) {
+        match plugin.unmount(request) {
             Ok(()) => {
                 info!(
-                    volume_id = %mount.volume_id,
-                    driver = %mount.driver,
+                    volume_id = %volume_id,
+                    driver = %driver,
                     "Unmounted volume"
                 );
                 self.push_report(VolumeReport {
-                    volume_id: mount.volume_id.clone(),
+                    volume_id: volume_id.to_string(),
                     op: VolumeOp::Unmount.as_str().to_string(),
                     ok: true,
                     mount_path: String::new(),
@@ -308,13 +347,13 @@ impl WorkerVolumeManager {
             }
             Err(err) => {
                 warn!(
-                    volume_id = %mount.volume_id,
-                    driver = %mount.driver,
+                    volume_id = %volume_id,
+                    driver = %driver,
                     error = ?err,
                     "Failed to unmount volume"
                 );
                 self.push_report(VolumeReport {
-                    volume_id: mount.volume_id.clone(),
+                    volume_id: volume_id.to_string(),
                     op: VolumeOp::Unmount.as_str().to_string(),
                     ok: false,
                     mount_path: String::new(),
