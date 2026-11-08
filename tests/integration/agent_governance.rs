@@ -127,6 +127,7 @@ fn put(key: &str, value: &str) -> PutKvRequest {
     PutKvRequest {
         key: key.into(),
         value: value.into(),
+        value_type: KvValueType::String as i32,
         ..Default::default()
     }
 }
@@ -254,9 +255,14 @@ async fn journal_records_writes_denials_and_their_callers_test() -> R<()> {
         })
         .await?
         .into_inner();
+    // Only kv-team's refused ListAuditEvents came after it: denials of reads
+    // are journaled too.
     assert!(
-        follow.events.is_empty(),
-        "nothing newer: {:?}",
+        follow.events.len() == 1
+            && follow.events[0].operation == "ListAuditEvents"
+            && follow.events[0].kind == "denied"
+            && follow.events[0].accessor_id == accessor,
+        "newer records: {:?}",
         follow.events
     );
     Ok(())
@@ -589,13 +595,14 @@ async fn approval_gate_flow_end_to_end_test() -> R<()> {
     let again = agent.put_kv(put("prod/db", "v1")).await.expect_err("gated");
     assert_eq!(details(&again)["approvalId"], approval_id.as_str());
     // Nothing was written.
-    assert!(agent
+    let absent = agent
         .get_kv(GetKvRequest {
             key: "prod/db".into(),
-            metadata_only: false
+            metadata_only: false,
         })
-        .await
-        .is_err());
+        .await?
+        .into_inner();
+    assert!(absent.entry.is_none(), "the gated write did not happen");
 
     // The agent cannot approve its own request, even with approval:write.
     let own = agent

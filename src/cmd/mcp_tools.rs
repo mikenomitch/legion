@@ -120,7 +120,14 @@ macro_rules! rpc_tools {
         pub(super) const TOOL_RPCS: &[(&str, &str)] = &[ $( ($tool, $rpc), )* ];
 
         /// Runs a tool from this module; `None` when the name is not one.
-        pub(super) async fn dispatch(name: &str, args: Value) -> Option<Result<Value, String>> {
+        pub(super) async fn dispatch(name: &str, mut args: Value) -> Option<Result<Value, String>> {
+            // A KV write without a type stores a string (the API rejects
+            // an unspecified type).
+            if name == "legion_kv_put" {
+                if let Some(fields) = args.as_object_mut() {
+                    fields.entry("value_type").or_insert(json!(1));
+                }
+            }
             match name {
                 $( $tool => Some(async {
                     let req: $req = request(args)?;
@@ -205,7 +212,7 @@ rpc_tools! {
         props(&[("prefix", "string", "Key prefix."), ("include_values", "boolean", "Include values."), ("include_locks", "boolean", "Include lock holders.")], &[]);
     "legion_kv_put" => "PutKv", put_kv(PutKvRequest), true,
         "Write a KV entry. expected_version makes it a compare-and-set (0 = create only).",
-        props(&[("key", "string", "Key."), ("value", "string", "Value."), ("value_type", "integer", "KvValueType (0 = string)."), ("expected_version", "integer", "Compare-and-set version."), ("lock_id", "string", "Lock held on the key, if any.")], &["key", "value"]);
+        props(&[("key", "string", "Key."), ("value", "string", "Value."), ("value_type", "integer", "KvValueType: 1 string (default), 2 number, 3 JSON."), ("expected_version", "integer", "Compare-and-set version."), ("lock_id", "string", "Lock held on the key, if any.")], &["key", "value"]);
     "legion_kv_patch" => "PatchKv", patch_kv(PatchKvRequest), true,
         "Apply a JSON merge patch to a JSON-typed KV entry.",
         props(&[("key", "string", "Key."), ("patch_json", "string", "JSON merge patch."), ("expected_version", "integer", "Compare-and-set version."), ("lock_id", "string", "Lock held on the key, if any.")], &["key", "patch_json"]);

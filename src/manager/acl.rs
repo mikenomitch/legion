@@ -624,8 +624,22 @@ impl Authenticator {
             (None, inherited) => inherited,
         };
 
-        let (record, secret) = build_token_record(name, "client", &policies, Some(ttl), None)
-            .map_err(|e| Status::internal(format!("failed to build token: {e:#}")))?;
+        let (mut record, secret) =
+            build_token_record(name, "client", &policies, Some(ttl), None)
+                .map_err(|e| Status::internal(format!("failed to build token: {e:#}")))?;
+        // `ttl` was measured against the parent's expiry a moment ago; pin
+        // the child to it exactly rather than a few microseconds past it.
+        if let (Some(parent_expiry), Some(child_expiry)) = (
+            parent_record.expires_at.as_deref(),
+            record.expires_at.as_deref(),
+        ) {
+            let parse = |raw: &str| OffsetDateTime::parse(raw, &Rfc3339).ok();
+            if let (Some(parent_at), Some(child_at)) = (parse(parent_expiry), parse(child_expiry)) {
+                if child_at > parent_at {
+                    record.expires_at = Some(parent_expiry.to_string());
+                }
+            }
+        }
         let meta = crate::storage::governance_store::TokenMeta {
             accessor_id: record.accessor_id.clone(),
             parent_accessor_id: parent_accessor.to_string(),

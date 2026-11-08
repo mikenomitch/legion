@@ -146,7 +146,10 @@ governance = {
 
 Each token (by accessor; JWT callers by principal) has a token bucket. Every
 mutating call that passes its ACL check takes one token; reads are never
-limited. The first matching override wins; a [child
+limited. Management tokens are exempt by default, and so are installed apps
+acting for a viewer or for one of their objects (gitops applying a Repo, the
+cert manager renewing a certificate): that is the operator's own automation,
+journaled and gated like everything else but not throttled. The first matching override wins; a [child
 token](auth-and-acls.md#child-tokens) minted with `--write-rate 5/s` (or
 `5/s,burst=20`) carries its own limit, which wins over config and may not
 exceed its parent's own limit.
@@ -179,5 +182,9 @@ accounting](usage-accounting.md) instead.
 - One approver per request; multi-party approval is not implemented.
 - Gates and limits apply to calls through the gRPC listener (CLI, UI, MCP,
   SDKs). The manager's in-process reconcilers are not gated.
+- Gates also match writes apps make for their objects (principal
+  `gitops for Repo team/web`): a rule meant for people and agents should
+  say so with `principals` or `policies`, or a gitops sync into a gated
+  namespace waits for an approval nobody will retry.
 - A gate consumes its approval before the operation runs: if the operation
   then fails, file a new request.

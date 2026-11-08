@@ -30,7 +30,9 @@ handlers under the same context the layer installs (`layer::audited`).
 **Why (simplicity, extensibility).** One hook in the one function every
 endpoint must already call makes coverage structural: a new write RPC is
 journaled, rate-limited and gateable the day it ships, with no line of
-governance code. Gating at `enforce` instead of the layer is what lets a rule
+governance code. The one handler the coverage test caught checking its
+write on a `spawn_blocking` thread (`MintExecTicket`) now wraps the closure
+in `governance::carry`, which re-enters the request's context there. Gating at `enforce` instead of the layer is what lets a rule
 say "destroy in namespace prod" without the layer parsing every request type.
 
 ## 2. Child tokens narrow by policy subset plus the root's deny rules, re-evaluated per request

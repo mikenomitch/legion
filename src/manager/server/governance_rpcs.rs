@@ -145,10 +145,15 @@ impl ManagerDaemonService {
         // unauthenticated.
         let identity = self.authenticate_acl(&request)?;
         if identity.source == crate::structs::acl::AclSource::Anonymous {
-            return Err(Status::unauthenticated(
-                "CreateChildToken mints a child of the presented token, and no token was \
-                 provided\nHint: set LEGION_TOKEN or run `legion login`",
-            ));
+            let message = "CreateChildToken mints a child of the presented token, and no \
+                           token was provided\nHint: set LEGION_TOKEN or run `legion login`";
+            // Audit-only mode refuses nothing for want of a credential; there
+            // is still nothing to mint a child of.
+            return Err(if identity.audit_only {
+                Status::failed_precondition(message)
+            } else {
+                Status::unauthenticated(message)
+            });
         }
         let req = request.into_inner();
         let name = req.name.trim();

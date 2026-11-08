@@ -1688,7 +1688,9 @@ async fn handle_message(line: &str, allow_write: bool) -> Option<Value> {
 /// Run a tool and return its data payload as JSON, or a human-readable error
 /// string on failure.
 async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
-    if let Some(result) = mcp_tools::dispatch(name, args.clone()).await {
+    // Boxed: the tool futures are large, and inlining them here would grow
+    // every tool call's stack frame.
+    if let Some(result) = Box::pin(mcp_tools::dispatch(name, args.clone())).await {
         return result;
     }
     match name {

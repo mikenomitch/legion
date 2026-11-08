@@ -262,6 +262,19 @@ pub fn current() -> Option<Arc<RequestAudit>> {
     REQUEST.try_with(Arc::clone).ok()
 }
 
+/// Wraps a closure bound for `spawn_blocking` so the ACL checks it makes
+/// still report to (and are gated by) the request's governance context.
+pub fn carry<F, T>(f: F) -> impl FnOnce() -> T + Send + 'static
+where
+    F: FnOnce() -> T + Send + 'static,
+{
+    let request = current();
+    move || match request {
+        Some(request) => REQUEST.sync_scope(request, f),
+        None => f(),
+    }
+}
+
 /// Hook: the handler authenticated `identity` (`authenticate_acl`).
 pub fn note_identity(identity: &AclIdentity) {
     if let Some(request) = current() {
@@ -329,6 +342,12 @@ fn rate_gate(request: &RequestAudit, caller: &Caller) -> Result<(), Status> {
             return Ok(());
         }
         state.rate_checked = true;
+    }
+    // An installed app acting for a viewer or for one of its objects is the
+    // operator's own automation (gitops applying a Repo, the cert manager
+    // renewing): it is journaled and gated, but not throttled per token.
+    if !caller.on_behalf_of.is_empty() {
+        return Ok(());
     }
     let governance = &request.governance;
     let token_limit = caller

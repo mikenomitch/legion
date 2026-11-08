@@ -5816,16 +5816,17 @@ impl Manager for ManagerDaemonService {
         request: Request<MintExecTicketRequest>,
     ) -> Result<Response<MintExecTicketReply>, Status> {
         let identity = self.authenticate_acl(&request)?;
-        if !identity.would_allow(AclResource::Exec, AclAction::Write, &AclScope::any())
-            && !identity.would_allow(AclResource::Action, AclAction::Write, &AclScope::any())
+        // Coarse gate: `exec:write` or `action:write` somewhere. Enforced
+        // (not just evaluated) so the write check reaches the audit journal
+        // and the gates; the precise check runs in the mint.
+        let coarse = if identity.would_allow(AclResource::Exec, AclAction::Write, &AclScope::any())
+            || !identity.would_allow(AclResource::Action, AclAction::Write, &AclScope::any())
         {
-            acl::enforce(
-                &identity,
-                AclResource::Exec,
-                AclAction::Write,
-                &AclScope::any(),
-            )?;
-        }
+            AclResource::Exec
+        } else {
+            AclResource::Action
+        };
+        acl::enforce(&identity, coarse, AclAction::Write, &AclScope::any())?;
         let req = request.into_inner();
         tracing::Span::current().record("allocation_id", req.allocation_id);
         tracing::Span::current().record("instance_id", req.instance_id.as_str());
@@ -5845,7 +5846,8 @@ impl Manager for ManagerDaemonService {
         let store = self.store.clone();
         let state = state.clone();
         let limits = self.exec_tickets.clone();
-        let reply = tokio::task::spawn_blocking(move || {
+        // `carry`: the precise exec/action check runs in the blocking task.
+        let reply = tokio::task::spawn_blocking(crate::manager::governance::carry(move || {
             crate::manager::exec::mint_exec_ticket(
                 &store,
                 &identity,
@@ -5854,7 +5856,7 @@ impl Manager for ManagerDaemonService {
                 &req,
                 std::time::SystemTime::now(),
             )
-        })
+        }))
         .await
         .map_err(|e| Status::internal(format!("mint task failed: {e}")))??;
         Ok(Response::new(reply))

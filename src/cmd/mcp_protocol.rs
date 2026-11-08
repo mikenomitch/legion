@@ -453,7 +453,12 @@ async fn tools_call(
         .and_then(|id| id.as_str().map(str::to_string));
     let mut asked = 0;
     loop {
-        let outcome = call_with_approval(&name, arguments.clone(), approval.clone()).await;
+        let outcome = Box::pin(call_with_approval(
+            &name,
+            arguments.clone(),
+            approval.clone(),
+        ))
+        .await;
         let Err(message) = &outcome else {
             return result_value(session, &outcome);
         };
@@ -489,13 +494,11 @@ async fn call_with_approval(
     arguments: Value,
     approval: Option<String>,
 ) -> Result<Value, String> {
+    // Boxed: `dispatch_tool`'s future holds every tool's state machine.
+    let call = Box::pin(dispatch_tool(name, arguments));
     match approval {
-        Some(id) => {
-            crate::cmd::governance::TASK_APPROVAL
-                .scope(id, dispatch_tool(name, arguments))
-                .await
-        }
-        None => dispatch_tool(name, arguments).await,
+        Some(id) => crate::cmd::governance::TASK_APPROVAL.scope(id, call).await,
+        None => call.await,
     }
 }
 
