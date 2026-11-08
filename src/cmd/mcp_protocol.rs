@@ -83,32 +83,60 @@ impl Session {
 
 /// The client end for server-initiated requests (elicitation) on stdio.
 pub(super) struct Peer {
-    out: mpsc::Sender<Value>,
+    /// `None` once the client's input has closed: dropping the sender lets
+    /// the stdio writer drain and exit.
+    out: Mutex<Option<mpsc::Sender<Value>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Value>>>,
     next: AtomicU64,
+    closed: AtomicBool,
 }
 
 impl Peer {
     fn new(out: mpsc::Sender<Value>) -> Self {
         Peer {
-            out,
+            out: Mutex::new(Some(out)),
             pending: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
         }
+    }
+
+    /// The client's input closed: no answer can arrive any more. Fails every
+    /// request still waiting (and any made later) and releases the outbound
+    /// sender so the writer can finish once in-flight replies are written.
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.out.lock().unwrap_or_else(|p| p.into_inner()).take();
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
     }
 
     /// Sends a request to the client and waits for its response message.
     async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = format!("legion-{}", self.next.fetch_add(1, Ordering::Relaxed));
+        const CLOSED: &str = "the client connection closed";
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(id.clone(), tx);
-        self.out
-            .send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+        // Checked after the insert: `close` sets the flag before it clears
+        // `pending`, so a request racing it either sees the flag here or has
+        // its waiter dropped by the clear.
+        let out = self.out.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let Some(out) = out.filter(|_| !self.closed.load(Ordering::SeqCst)) else {
+            self.pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            return Err(CLOSED.to_string());
+        };
+        out.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
             .await
-            .map_err(|_| "the client connection closed".to_string())?;
+            .map_err(|_| CLOSED.to_string())?;
+        drop(out);
         rx.await
             .map_err(|_| "the client did not answer".to_string())
     }
@@ -188,6 +216,10 @@ pub(super) async fn serve_stdio(allow_write: bool) -> R<()> {
             }
         });
     }
+    // Input closed. Requests still running finish and write their replies;
+    // any waiting on the client (an elicitation) fail now, since no answer
+    // can arrive. The writer exits once the last sender is gone.
+    peer.close();
     drop(out_tx);
     let _ = writer.await;
     Ok(())
@@ -856,5 +888,23 @@ mod mcp_protocol_test {
             "result": { "action": "accept", "content": { "decision": "retry" } }
         })));
         assert!(asking.await.unwrap());
+    }
+
+    /// End of input fails an elicitation still waiting on the client (and any
+    /// made later) and releases the outbound sender, so `serve_stdio` exits
+    /// instead of waiting forever for an answer or for its writer.
+    #[tokio::test]
+    async fn closing_the_peer_fails_waiting_requests_and_frees_the_writer_test() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let peer = Arc::new(Peer::new(tx));
+        let waiting = {
+            let peer = peer.clone();
+            tokio::spawn(async move { peer.request("elicitation/create", json!({})).await })
+        };
+        rx.recv().await.expect("the request was sent");
+        peer.close();
+        assert!(waiting.await.unwrap().is_err());
+        assert!(peer.request("elicitation/create", json!({})).await.is_err());
+        assert!(rx.recv().await.is_none(), "every sender was dropped");
     }
 }
