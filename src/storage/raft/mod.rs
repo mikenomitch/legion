@@ -218,18 +218,41 @@ impl std::fmt::Debug for RaftTransportRegistry {
 }
 
 /// The payload proposed to a lane's raft group: the exact row-level effects
-/// (a SQLite session changeset) of one store operation, captured on the
-/// leader. `op` is metadata for observability only — application is driven
-/// entirely by the changeset bytes (JC-1).
+/// (one SQLite session changeset) of a **batch** of store operations,
+/// captured together on the leader (group commit, raft-write-path plan
+/// §6.2). Application is driven entirely by the changeset bytes (JC-1); the
+/// rest is metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StoreCommand {
+    /// The lane of the batch's first op (every op of a batch runs on one
+    /// raft group; under `single` their logical lanes may differ).
     pub(crate) lane: Lane,
-    pub(crate) op: String,
-    /// Base64 on the wire and in `log.sqlite` (both serde_json): see
-    /// [`types::wire_bytes`] — a raw `Vec<u8>` would render as a JSON
-    /// number array, ~4x larger.
+    /// The op names in the batch, in capture order. Observability only.
+    pub(crate) ops: Vec<String>,
+    /// The batch's net effect: the per-op changesets combined in order
+    /// (`sqlite3changegroup`). Base64 on the wire and in `log.sqlite` (both
+    /// serde_json): see [`types::wire_bytes`] — a raw `Vec<u8>` would
+    /// render as a JSON number array, ~4x larger.
     #[serde(with = "crate::storage::raft::types::wire_bytes")]
     pub(crate) changeset: Vec<u8>,
+    /// Set when the proposing leader already committed this batch locally
+    /// (speculative execution, plan §6.3): its state machine recognizes its
+    /// own entry by this id and skips re-applying the changeset. `None`
+    /// means every node, the proposer included, applies the changeset.
+    pub(crate) proposal: Option<Proposal>,
+    /// The schema version (migration count) of the build that captured the
+    /// changeset. Diagnostics only: the apply-side shape check stays the
+    /// authority on whether a replica can apply it (R2).
+    pub(crate) schema_version: u32,
+}
+
+/// Identifies one speculatively committed batch: the proposer's raft node
+/// id and a sequence number unique within that process's ledger
+/// (`speculation::SpeculationLedger`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Proposal {
+    pub(crate) node: u64,
+    pub(crate) seq: u64,
 }
 
 /// Raft state-machine response for a [`StoreCommand`]. Deliberately empty:

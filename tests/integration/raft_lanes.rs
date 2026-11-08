@@ -269,6 +269,10 @@ fn node_config(
     config.persistence.raft.advertise_addr = Some(format!("127.0.0.1:{port}"));
     config.persistence.raft.join_token = join_token;
     config.persistence.raft.snapshot_entries = snapshot_entries;
+    // Keep no log behind a snapshot: these tests need a follower that is
+    // past the compaction horizon as soon as a snapshot exists (the
+    // production default retains `raft.logRetainBytes`, 256 MiB).
+    config.persistence.raft.log_retain_bytes = 0;
     config.persistence.raft.data_dir = dir
         .join("raft")
         .to_str()

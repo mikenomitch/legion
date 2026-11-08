@@ -188,6 +188,10 @@ fn node_config(
     config.persistence.raft.advertise_addr = Some(format!("127.0.0.1:{port}"));
     config.persistence.raft.join_token = join_token;
     config.persistence.raft.snapshot_entries = snapshot_entries;
+    // Keep no log behind a snapshot: these tests need a follower that is
+    // past the compaction horizon as soon as a snapshot exists (the
+    // production default retains `raft.logRetainBytes`, 256 MiB).
+    config.persistence.raft.log_retain_bytes = 0;
     config.persistence.raft.data_dir = dir
         .join("raft")
         .to_str()
@@ -312,7 +316,7 @@ fn single_node_snapshot_compaction_and_restart_recovery() -> R<()> {
     }
 
     // Snapshot trigger (snapshot_policy = LogsSinceLast(snapshotEntries))
-    // and log purge (max_in_snapshot_log_to_keep = snapshotEntries / 2) are
+    // and log purge (the retention task, `logRetainBytes = 0` here) are
     // asynchronous behind the applies; wait for both.
     let snapshots_dir = a.snapshots_dir();
     let log_db = a.log_db_path();

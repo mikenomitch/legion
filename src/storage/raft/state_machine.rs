@@ -752,7 +752,7 @@ impl RaftStateMachine<TypeConfig> for StoreStateMachine {
                 EntryPayload::Normal(command) => {
                     debug!(
                         lane = self.lane.wire_name(),
-                        op = %command.op,
+                        ops = ?command.ops,
                         index = log_id.index,
                         "applying replicated store command"
                     );
@@ -1241,7 +1241,9 @@ mod tests {
             log_id: log_id(1, 5),
             payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                 lane: Lane::Control,
-                op: "put_kv".to_string(),
+                ops: vec!["put_kv".to_string()],
+                proposal: None,
+                schema_version: 0,
                 changeset,
             }),
         };
@@ -1300,7 +1302,9 @@ mod tests {
             log_id: log_id(1, 3),
             payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                 lane: Lane::Control,
-                op: "put_kv".to_string(),
+                ops: vec!["put_kv".to_string()],
+                proposal: None,
+                schema_version: 0,
                 changeset,
             }),
         };
@@ -1351,7 +1355,9 @@ mod tests {
             log_id: log_id(1, 1),
             payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                 lane: Lane::Control,
-                op: "put_kv".to_string(),
+                ops: vec!["put_kv".to_string()],
+                proposal: None,
+                schema_version: 0,
                 changeset,
             }),
         };
@@ -1406,7 +1412,9 @@ mod tests {
                 log_id: log_id(1, 1),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset,
                 }),
             }])
@@ -1447,7 +1455,9 @@ mod tests {
                     log_id: log_id(1, (i + 1) as u64),
                     payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                         lane: Lane::Control,
-                        op: "put_kv".to_string(),
+                        ops: vec!["put_kv".to_string()],
+                        proposal: None,
+                        schema_version: 0,
                         changeset,
                     }),
                 }])
@@ -1536,7 +1546,9 @@ mod tests {
                     log_id: log_id(1, (i + 1) as u64),
                     payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                         lane: Lane::Control,
-                        op: "put_kv".to_string(),
+                        ops: vec!["put_kv".to_string()],
+                        proposal: None,
+                        schema_version: 0,
                         changeset,
                     }),
                 }])
@@ -1723,7 +1735,9 @@ mod tests {
                 log_id: log_id(1, index),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Scheduler,
-                    op: "place_alloc".to_string(),
+                    ops: vec!["place_alloc".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset,
                 }),
             };
@@ -1787,7 +1801,9 @@ mod tests {
                 log_id: log_id(1, 1),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset,
                 }),
             }])
@@ -1869,7 +1885,9 @@ mod tests {
                 log_id: log_id(1, 1),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset,
                 }),
             }])
@@ -1928,7 +1946,9 @@ mod tests {
                 log_id: log_id(1, 1),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset,
                 }),
             }])
@@ -1987,7 +2007,9 @@ mod tests {
             log_id: log_id(1, 5),
             payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                 lane: Lane::Control,
-                op: "put_kv".to_string(),
+                ops: vec!["put_kv".to_string()],
+                proposal: None,
+                schema_version: 0,
                 changeset,
             }),
         };
@@ -2007,7 +2029,9 @@ mod tests {
                 log_id: log_id(1, 3),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset: old_changeset,
                 }),
             },
@@ -2015,7 +2039,9 @@ mod tests {
                 log_id: log_id(1, 6),
                 payload: EntryPayload::Normal(crate::storage::raft::StoreCommand {
                     lane: Lane::Control,
-                    op: "put_kv".to_string(),
+                    ops: vec!["put_kv".to_string()],
+                    proposal: None,
+                    schema_version: 0,
                     changeset: new_changeset,
                 }),
             },

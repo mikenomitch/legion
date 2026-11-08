@@ -923,6 +923,14 @@ pub struct Metrics {
     pub raft_pipeline_wait_seconds: Arc<HistogramVec>,
     /// `legion_raft_pipeline_depth{lane}`
     pub raft_pipeline_depth: Arc<GaugeVec>,
+    /// `legion_raft_entry_ops{lane}`
+    pub raft_entry_ops: Arc<HistogramVec>,
+    /// `legion_raft_state_syncs_total{lane,outcome}`
+    pub raft_state_syncs_total: Arc<CounterVec>,
+    /// `legion_raft_log_retained_seconds{lane}`
+    pub raft_log_retained_seconds: Arc<GaugeVec>,
+    /// `legion_raft_speculation_total{lane,outcome}`
+    pub raft_speculation_total: Arc<CounterVec>,
     /// `legion_scheduler_index_queries_total{index,outcome}`
     pub scheduler_index_queries_total: Arc<CounterVec>,
     /// `legion_scheduler_locality_placements_total{outcome}`
@@ -1675,6 +1683,39 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let raft_entry_ops = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_raft_entry_ops",
+                help: "Replicated ops committed per raft entry (group commit). Ops queued behind an in-flight entry share the next one's capture, quorum round trip, log fsync and apply; 1 means no batching was possible because nothing was queued.",
+                labels: &["lane"],
+            },
+            bounds: COUNT_BUCKETS,
+            series: Series::new(),
+        });
+        let raft_state_syncs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_raft_state_syncs_total",
+                help: "State-database fsyncs run as the purge barrier before a raft log purge, by outcome (ok|error). The state DB runs synchronous=NORMAL; this barrier is what keeps the applied marker durable past the log's purge horizon. An error fails the purge and keeps the log.",
+                labels: &["lane", "outcome"],
+            },
+            series: Series::new(),
+        });
+        let raft_log_retained_seconds = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_raft_log_retained_seconds",
+                help: "Age of the oldest entry still in the group's raft log: how long a follower can be down and still catch up by log replay instead of a full snapshot install. Sized by raft.logRetainBytes.",
+                labels: &["lane"],
+            },
+            series: Series::new(),
+        });
+        let raft_speculation_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_raft_speculation_total",
+                help: "Speculatively committed leader batches by outcome: committed (written locally before the quorum round), matched (its entry applied without re-running the changeset), undone (reverted because the log went another way: leadership loss, truncation, or a crash before apply).",
+                labels: &["lane", "outcome"],
+            },
+            series: Series::new(),
+        });
 
         let scheduler_index_queries_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -2007,6 +2048,10 @@ impl Metrics {
             Arc::clone(&raft_is_leader) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_ops_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_pipeline_depth) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_entry_ops) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_state_syncs_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_log_retained_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&raft_speculation_total) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_pipeline_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_propose_apply_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&raft_quorum) as Arc<dyn RenderMetric>,
@@ -2127,6 +2172,10 @@ impl Metrics {
             raft_ops_total,
             raft_pipeline_wait_seconds,
             raft_pipeline_depth,
+            raft_entry_ops,
+            raft_state_syncs_total,
+            raft_log_retained_seconds,
+            raft_speculation_total,
             scheduler_index_queries_total,
             scheduler_locality_placements_total,
             scheduler_index_candidates,

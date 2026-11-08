@@ -2087,8 +2087,10 @@ fn execute_replicated(
     }
     let command = StoreCommand {
         lane,
-        op: op.to_string(),
+        ops: vec![op.to_string()],
         changeset,
+        proposal: None,
+        schema_version: crate::storage::migrations::schema_version(),
     };
     let propose_started = std::time::Instant::now();
     let write_result = handle.block_on(raft.client_write(command));
@@ -2243,6 +2245,84 @@ fn pipeline_loop(
         group = group.wire_name(),
         "raft replication pipeline thread exiting"
     );
+}
+
+// ── log retention (raft-write-path plan §6.6) ────────────────────────────
+
+/// How often a group's retention task looks for a new snapshot to purge
+/// behind, and refreshes `legion_raft_log_retained_seconds`.
+const LOG_RETENTION_POLL: Duration = Duration::from_secs(2);
+
+/// Purges a group's log behind each new snapshot down to its newest
+/// `retain_bytes` bytes, and reports how far back the retained log reaches.
+///
+/// openraft's own purge is disabled (`max_in_snapshot_log_to_keep =
+/// u64::MAX`): it only knows an entry count, and Legion's entries range from
+/// hundreds of bytes to megabytes, so a count bounds neither the disk the
+/// tail takes nor how long it lasts. The purge goes through
+/// `trigger().purge_log`, so it passes the state-DB purge barrier like every
+/// other purge, never reaches past the snapshot, and waits for in-flight
+/// replication of the entries it removes. The scan runs on the blocking pool
+/// on its own read-only connection to the log, so appends never wait on it.
+async fn log_retention_loop(lane: Lane, raft: Raft, log: RaftLogStore, retain_bytes: u64) {
+    let telemetry = crate::manager::telemetry::metrics();
+    // The snapshot index this task last purged behind: one scan per new
+    // snapshot, not per poll.
+    let mut handled_snapshot: Option<u64> = None;
+    loop {
+        tokio::time::sleep(LOG_RETENTION_POLL).await;
+        let metrics = raft.metrics().borrow().clone();
+        let snapshot = metrics.snapshot.map(|log_id| log_id.index);
+        let purged = metrics.purged.map(|log_id| log_id.index).unwrap_or(0);
+        let scan_for = snapshot.filter(|index| handled_snapshot != Some(*index));
+        let probe = log.clone();
+        let scanned = tokio::task::spawn_blocking(move || -> R<(Option<i64>, Option<u64>)> {
+            let oldest = probe.oldest_appended_ms()?;
+            let point = match scan_for {
+                Some(_) => probe.retention_purge_point(retain_bytes)?,
+                None => None,
+            };
+            Ok((oldest, point))
+        })
+        .await;
+        let (oldest, point) = match scanned {
+            Ok(Ok(found)) => found,
+            Ok(Err(err)) => {
+                warn!(lane = lane.wire_name(), error = %err, "Raft log retention scan failed");
+                continue;
+            }
+            // The runtime is shutting down.
+            Err(_) => return,
+        };
+        let now_ms = (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        let retained_secs = oldest.map(|ms| (now_ms - ms).max(0) / 1_000).unwrap_or(0);
+        telemetry
+            .raft_log_retained_seconds
+            .set(&[lane.wire_name()], retained_secs);
+        let Some(snapshot_index) = scan_for else {
+            continue;
+        };
+        handled_snapshot = Some(snapshot_index);
+        let Some(point) = point else {
+            continue;
+        };
+        let upto = point.min(snapshot_index);
+        if upto <= purged {
+            continue;
+        }
+        match raft.trigger().purge_log(upto).await {
+            Ok(()) => debug!(
+                lane = lane.wire_name(),
+                upto, snapshot_index, retain_bytes, "Purging raft log behind the retained tail"
+            ),
+            // Fatal: the raft core is gone (shutdown or a storage error it
+            // already reported); nothing left to retain.
+            Err(err) => {
+                debug!(lane = lane.wire_name(), error = %err, "Raft log retention stopping");
+                return;
+            }
+        }
+    }
 }
 
 // ── join client (fresh node with a join token, plan §A4) ─────────────────
@@ -3698,11 +3778,14 @@ impl PersistenceDriver for MultiRaftDriver {
         // openraft's own (weaker) `validate()` below.
         //
         // Snapshots + compaction (plan §A5 / §7-C3): every lane snapshots
-        // after `raft.snapshotEntries` applied entries and purges its log
-        // behind the snapshot, keeping a tail of `snapshot_entries / 2`
-        // (clamped to [1, 1000]) entries so a slightly-behind follower
-        // catches up by cheap log replay instead of a full snapshot install;
-        // anything older is served by the snapshot. The snapshot's SCOPE
+        // after `raft.snapshotEntries` applied entries. How much log stays
+        // behind the snapshot is NOT openraft's entry count any more
+        // (raft-write-path plan §6.6): `max_in_snapshot_log_to_keep` is
+        // `u64::MAX`, which disables openraft's own purge, and
+        // `log_retention_loop` purges behind each new snapshot down to the
+        // newest `raft.logRetainBytes` bytes, so a slightly-behind follower
+        // catches up by cheap log replay instead of a full snapshot install
+        // however large or small the entries are. The snapshot's SCOPE
         // depends on topology: `single` builds whole-DB `VACUUM INTO`
         // images; `lanes` builds table-scoped dumps of each lane's owned
         // tables (sound because single-writer table ownership is enforced at
@@ -3714,7 +3797,7 @@ impl PersistenceDriver for MultiRaftDriver {
         };
         let snapshot_entries = self.cfg.snapshot_entries.max(1);
         let snapshot_policy = SnapshotPolicy::LogsSinceLast(snapshot_entries);
-        let max_in_snapshot_log_to_keep = (snapshot_entries / 2).clamp(1, 1000);
+        let max_in_snapshot_log_to_keep = u64::MAX;
         let raft_config = Arc::new(
             openraft::Config {
                 cluster_name: cluster_id.clone(),
@@ -3764,9 +3847,24 @@ impl PersistenceDriver for MultiRaftDriver {
         // start_storage was called from sync or async context.
         let bring_up = async {
             let mut lanes: HashMap<Lane, Raft> = HashMap::new();
+            let mut log_stores: HashMap<Lane, RaftLogStore> = HashMap::new();
             let mut had_any_state = false;
             for lane in lanes_list.iter().copied() {
-                let log_store = RaftLogStore::open(&data_dir, lane)?;
+                // The purge barrier (raft-write-path plan §6.1): the state DB
+                // runs synchronous=NORMAL, so every purge first fsyncs it.
+                let barrier_store = engine_store.clone();
+                let barrier: crate::storage::raft::log_store::PurgeBarrier = Arc::new(move || {
+                    let synced = barrier_store.sync_state_db_to_disk();
+                    crate::manager::telemetry::metrics()
+                        .raft_state_syncs_total
+                        .inc(&[
+                            lane.wire_name(),
+                            if synced.is_ok() { "ok" } else { "error" },
+                        ]);
+                    synced
+                });
+                let log_store = RaftLogStore::open(&data_dir, lane)?.with_purge_barrier(barrier);
+                log_stores.insert(lane, log_store.clone());
                 let mut log_probe = log_store.clone();
                 let had_state = openraft::storage::RaftLogStorage::get_log_state(&mut log_probe)
                     .await
@@ -4011,9 +4109,9 @@ impl PersistenceDriver for MultiRaftDriver {
                 }
                 lanes.insert(lane, raft);
             }
-            Ok::<_, anyhow::Error>((lanes, had_any_state))
+            Ok::<_, anyhow::Error>((lanes, log_stores, had_any_state))
         };
-        let (lanes, had_any_state) = std::thread::scope(|scope| {
+        let (lanes, log_stores, had_any_state) = std::thread::scope(|scope| {
             let handle = handle.clone();
             scope
                 .spawn(move || handle.block_on(bring_up))
@@ -4053,6 +4151,20 @@ impl PersistenceDriver for MultiRaftDriver {
                 self.history.clone(),
                 self.election_epoch_ms.clone(),
             ));
+        }
+
+        // Log retention by bytes (raft-write-path plan §6.6): openraft's own
+        // purge is off (`max_in_snapshot_log_to_keep = u64::MAX`), so every
+        // group purges behind its snapshots here.
+        for (lane, raft) in &lanes {
+            if let Some(log_store) = log_stores.get(lane) {
+                handle.spawn(log_retention_loop(
+                    *lane,
+                    raft.clone(),
+                    log_store.clone(),
+                    self.cfg.log_retain_bytes,
+                ));
+            }
         }
 
         // Co-located lane leadership (JC-40): under a multi-lane topology,
