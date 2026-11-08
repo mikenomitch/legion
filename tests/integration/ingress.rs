@@ -1,6 +1,7 @@
 //! The bundled ingress (docs/ingress.md; ingress plan §9): the real proxy,
-//! certificate store, and issuer, driven through a fake [`Control`] so no
-//! cluster is needed, against real HTTP backends on loopback.
+//! certificate store, and certificates loop, driven through a fake
+//! [`Control`] so no cluster is needed, against real HTTP backends on
+//! loopback.
 //!
 //! - routing by host and by path prefix, `stripPath`, `X-Forwarded-*`, and
 //!   the standard error envelope for an unknown host or a route with no
@@ -8,19 +9,19 @@
 //! - HTTP/2 from the client (prior knowledge) to an HTTP/1.1 backend;
 //! - balancing across endpoints, and retrying past one that refuses;
 //! - a WebSocket-style upgrade relayed both ways;
+//! - connections to a service reused across requests;
 //! - HTTPS from an operator bundle in KV, chosen by SNI, and the redirect
 //!   from HTTP once a certificate is served;
-//! - HTTP-01 answers read from the shared board;
-//! - automatic certificates against an in-process ACME CA that verifies
-//!   every signature, nonce, and URL, refuses one nonce, and validates
-//!   HTTP-01 by fetching the answer from the ingress: registered, ordered,
-//!   stored in KV, served by SNI, and loaded by a second replica without a
-//!   second order;
-//! - against Pebble (Let's Encrypt's test CA) when `LEGION_TEST_PEBBLE_DIR`
-//!   names a directory holding `pebble` and `pebble-challtestsrv`: a
-//!   certificate ordered over HTTP-01 and served.
+//! - one `certs/Certificate` kept per routed host the Issuer can prove,
+//!   dropped with its route, and its bundle served once the cert manager
+//!   writes it; the default Issuer kept from the config;
+//! - HTTP-01 answered from the Issuer's thumbprint, with no shared state;
+//! - where to point DNS, from the ingress's own catalog service, and each
+//!   host's DNS checked against it.
 //!
-//! The manager side (the key registered by seeding, checked at submit, and
+//! The cert manager issuing for the ingress, end to end against a fake ACME
+//! CA that validates HTTP-01 through the ingress, is in `certs.rs`. The
+//! manager side (the key registered by seeding, checked at submit, and
 //! delivered to the app's identity) is in `app_extensions.rs`.
 
 use std::collections::{BTreeMap, HashMap};
@@ -34,8 +35,13 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use http_body_util::{BodyExt, Full};
 use legion::apps::ingress::backend::CatalogEndpoint;
+use legion::apps::ingress::certificates::{
+    certificate_name, issued_key, CertState, DEFAULT_ISSUER, HOST_LABEL,
+    NAMESPACE as CERT_NAMESPACE,
+};
 use legion::apps::ingress::certs::{KvVersion, OPERATOR_PREFIX};
-use legion::apps::ingress::control::Control;
+use legion::apps::ingress::control::{Control, ObjectView};
+use legion::apps::ingress::edge::{self, DnsCheck};
 use legion::apps::ingress::{Ingress, IngressConfig, Listen, State};
 use legion::structs::{AppExtensionEvent, AppExtensionValue, ExtensionPath};
 use serde_json::{json, Value};
@@ -43,18 +49,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 type R<T> = anyhow::Result<T>;
 
-/// Routes, endpoints, KV, and the issuer lock, in memory.
+/// Routes, endpoints, KV, the certificates lock, and objects, in memory.
+/// `certs.rs` borrows its routes and endpoints for the end-to-end test.
 #[derive(Default)]
-struct FakeControl {
+pub(crate) struct FakeControl {
     events: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<R<AppExtensionEvent>>>>,
     /// Service ref -> (job\0task, endpoint).
     endpoints: Mutex<HashMap<String, Vec<(String, CatalogEndpoint)>>>,
     kv: Mutex<BTreeMap<String, (String, i64)>>,
     version: std::sync::atomic::AtomicI64,
+    /// (kind, namespace, name) to the object.
+    objects: Mutex<BTreeMap<(String, String, String), ObjectView>>,
 }
 
 impl FakeControl {
-    fn new() -> (
+    pub(crate) fn new() -> (
         Arc<FakeControl>,
         tokio::sync::mpsc::UnboundedSender<R<AppExtensionEvent>>,
     ) {
@@ -66,7 +75,7 @@ impl FakeControl {
         (Arc::new(control), tx)
     }
 
-    fn set_endpoints(&self, service: &str, job: &str, task: &str, addrs: &[SocketAddr]) {
+    pub(crate) fn set_endpoints(&self, service: &str, job: &str, task: &str, addrs: &[SocketAddr]) {
         let entries = addrs
             .iter()
             .enumerate()
@@ -80,6 +89,7 @@ impl FakeControl {
                         node_id: "node-1".into(),
                         healthy: true,
                         mesh_tls: false,
+                        public_address: String::new(),
                     },
                 )
             })
@@ -88,6 +98,32 @@ impl FakeControl {
             .lock()
             .unwrap()
             .insert(service.to_string(), entries);
+    }
+
+    /// The ingress's own replicas: (node, cluster address, public address).
+    fn set_edge(&self, replicas: &[(&str, &str, &str)]) {
+        let entries = replicas
+            .iter()
+            .enumerate()
+            .map(|(i, (node, host, public))| {
+                (
+                    "legion-system/ingress\u{0}proxy".to_string(),
+                    CatalogEndpoint {
+                        host: host.to_string(),
+                        port: 80,
+                        allocation_id: i as i64 + 1,
+                        node_id: node.to_string(),
+                        healthy: true,
+                        mesh_tls: false,
+                        public_address: public.to_string(),
+                    },
+                )
+            })
+            .collect();
+        self.endpoints
+            .lock()
+            .unwrap()
+            .insert(edge::SERVICE.to_string(), entries);
     }
 
     fn put(&self, key: &str, value: &str) {
@@ -154,6 +190,94 @@ impl Control for FakeControl {
     }
 
     async fn unlock(&self, _key: &str, _lock_id: &str) {}
+
+    async fn apply_object(&self, document: &Value) -> R<()> {
+        let text = |field: &str| document[field].as_str().unwrap_or_default().to_string();
+        let key = (text("kind"), text("namespace"), text("name"));
+        let mut objects = self.objects.lock().unwrap();
+        let previous = objects.get(&key).cloned().unwrap_or_default();
+        objects.insert(
+            key,
+            ObjectView {
+                name: text("name"),
+                namespace: text("namespace"),
+                labels: serde_json::from_value(document["labels"].clone()).unwrap_or_default(),
+                spec: document["spec"].clone(),
+                ..previous
+            },
+        );
+        Ok(())
+    }
+
+    async fn get_object(&self, kind: &str, name: &str, namespace: &str) -> R<Option<ObjectView>> {
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .get(&(kind.to_string(), namespace.to_string(), name.to_string()))
+            .cloned())
+    }
+
+    async fn list_objects(
+        &self,
+        kind: &str,
+        namespace: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> R<Vec<ObjectView>> {
+        Ok(self
+            .objects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((k, ns, _), _)| k == kind && ns == namespace)
+            .filter(|(_, object)| {
+                labels
+                    .iter()
+                    .all(|(key, value)| object.labels.get(key) == Some(value))
+            })
+            .map(|(_, object)| object.clone())
+            .collect())
+    }
+
+    async fn delete_object(&self, kind: &str, name: &str, namespace: &str) -> R<()> {
+        self.objects.lock().unwrap().remove(&(
+            kind.to_string(),
+            namespace.to_string(),
+            name.to_string(),
+        ));
+        Ok(())
+    }
+}
+
+impl FakeControl {
+    /// Report a status on an object, as its app would.
+    fn report(&self, kind: &str, namespace: &str, name: &str, ready: (&str, &str), fields: Value) {
+        let mut objects = self.objects.lock().unwrap();
+        let object = objects
+            .get_mut(&(kind.to_string(), namespace.to_string(), name.to_string()))
+            .expect("the object exists");
+        object.ready = Some((ready.0.to_string(), ready.1.to_string(), String::new()));
+        object.fields = fields;
+        object.reported = true;
+    }
+
+    fn object(&self, kind: &str, namespace: &str, name: &str) -> Option<ObjectView> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(&(kind.to_string(), namespace.to_string(), name.to_string()))
+            .cloned()
+    }
+
+    fn certificates(&self) -> Vec<String> {
+        self.objects
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(kind, _, _)| kind == "certs/Certificate")
+            .map(|(_, _, name)| name.clone())
+            .collect()
+    }
 }
 
 /// A route value as `WatchAppExtensions` delivers it.
@@ -177,7 +301,7 @@ fn route(job: &str, service: &str, effective: Value) -> AppExtensionValue {
     }
 }
 
-fn snapshot(values: Vec<AppExtensionValue>) -> R<AppExtensionEvent> {
+pub(crate) fn snapshot(values: Vec<AppExtensionValue>) -> R<AppExtensionEvent> {
     Ok(AppExtensionEvent {
         snapshot: true,
         upserts: values,
@@ -187,7 +311,7 @@ fn snapshot(values: Vec<AppExtensionValue>) -> R<AppExtensionEvent> {
 }
 
 /// An HTTP backend that answers with what it saw, as JSON.
-async fn backend(name: &'static str) -> R<SocketAddr> {
+pub(crate) async fn backend(name: &'static str) -> R<SocketAddr> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
@@ -272,6 +396,17 @@ async fn dead_address() -> R<SocketAddr> {
 }
 
 async fn start(config: Value, control: Arc<FakeControl>, https: bool, issue: bool) -> R<Ingress> {
+    start_with_edge(config, control, https, issue, None).await
+}
+
+/// [`start`], following the ingress's own replicas at `edge_service`.
+async fn start_with_edge(
+    config: Value,
+    control: Arc<FakeControl>,
+    https: bool,
+    issue: bool,
+    edge_service: Option<&str>,
+) -> R<Ingress> {
     let state = State::new(IngressConfig::from_value(&config)?);
     let mut ingress = Ingress::start(
         state,
@@ -281,13 +416,23 @@ async fn start(config: Value, control: Arc<FakeControl>, https: bool, issue: boo
         },
     )
     .await?;
-    ingress.connect(control, "test".into(), None, issue);
+    ingress.connect(
+        control,
+        "test".into(),
+        edge_service.map(str::to_string),
+        issue,
+    );
     Ok(ingress)
 }
 
 /// Wait until `check` holds, polling.
-async fn eventually(what: &str, mut check: impl FnMut() -> bool) -> R<()> {
-    for _ in 0..200 {
+async fn eventually(what: &str, check: impl FnMut() -> bool) -> R<()> {
+    eventually_within(what, Duration::from_secs(10), check).await
+}
+
+async fn eventually_within(what: &str, within: Duration, mut check: impl FnMut() -> bool) -> R<()> {
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
         if check() {
             return Ok(());
         }
@@ -321,8 +466,8 @@ async fn get_json(client: &reqwest::Client, url: &str) -> R<(u16, Value)> {
     ))
 }
 
-fn no_acme() -> Value {
-    json!({ "acme": { "enabled": false } })
+fn no_certificates() -> Value {
+    json!({ "certificates": false })
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -350,7 +495,7 @@ async fn routes_by_host_and_path_with_forwarded_headers_test() -> R<()> {
             json!({ "host": "dark.example.com", "path": "/", "stripPath": false }),
         ),
     ]))?;
-    let ingress = start(no_acme(), control.clone(), false, false).await?;
+    let ingress = start(no_certificates(), control.clone(), false, false).await?;
     eventually("the routes", || ingress.state.table().served() == 3).await?;
     let client = client(
         &ingress,
@@ -457,7 +602,7 @@ async fn balances_and_retries_past_a_dead_endpoint_test() -> R<()> {
         "web",
         json!({ "host": "shop.example.com", "path": "/", "stripPath": false }),
     )]))?;
-    let ingress = start(no_acme(), control.clone(), false, false).await?;
+    let ingress = start(no_certificates(), control.clone(), false, false).await?;
     eventually("the endpoints", || {
         ingress
             .state
@@ -498,7 +643,7 @@ async fn upgrades_are_relayed_both_ways_test() -> R<()> {
         "ws",
         json!({ "host": "chat.example.com", "path": "/", "stripPath": false }),
     )]))?;
-    let ingress = start(no_acme(), control.clone(), false, false).await?;
+    let ingress = start(no_certificates(), control.clone(), false, false).await?;
     eventually("the endpoint", || {
         ingress
             .state
@@ -636,693 +781,6 @@ fn client_for_http(ingress: &Ingress) -> R<reqwest::Client> {
     client(ingress, &["shop.example.com", "plain.example.com"], &[])
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn answers_http01_challenges_from_the_shared_board_test() -> R<()> {
-    let (control, _events) = FakeControl::new();
-    control.put(
-        "legion/apps/ingress/acme/challenges/tok_123-abc",
-        "tok_123-abc.thumb",
-    );
-    let ingress = start(no_acme(), control.clone(), false, false).await?;
-    let client = client(&ingress, &["any.example.com"], &[])?;
-    let port = ingress.http.port();
-    let mut found = None;
-    for _ in 0..50 {
-        let response = client
-            .get(format!(
-                "http://any.example.com:{port}/.well-known/acme-challenge/tok_123-abc"
-            ))
-            .send()
-            .await?;
-        if response.status().as_u16() == 200 {
-            found = Some(response.text().await?);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(found.as_deref(), Some("tok_123-abc.thumb"));
-    let missing = client
-        .get(format!(
-            "http://any.example.com:{port}/.well-known/acme-challenge/unknown"
-        ))
-        .send()
-        .await?;
-    assert_eq!(missing.status().as_u16(), 404);
-    let bad = client
-        .get(format!(
-            "http://any.example.com:{port}/.well-known/acme-challenge/..%2Fx"
-        ))
-        .send()
-        .await?;
-    assert_eq!(bad.status().as_u16(), 404);
-    ingress.stop().await;
-    Ok(())
-}
-
-/// Against Pebble: the issuer registers, orders over HTTP-01 (Pebble's
-/// validator fetching the answer from the ingress's HTTP port), stores the
-/// bundle in KV, and the HTTPS port serves it. Needs `pebble` and
-/// `pebble-challtestsrv` in `LEGION_TEST_PEBBLE_DIR`; skipped otherwise.
-#[tokio::test(flavor = "multi_thread")]
-async fn orders_a_certificate_from_pebble_test() -> R<()> {
-    let Ok(dir) = std::env::var("LEGION_TEST_PEBBLE_DIR") else {
-        eprintln!("skipped: set LEGION_TEST_PEBBLE_DIR to a directory with pebble and pebble-challtestsrv");
-        return Ok(());
-    };
-    let dir = std::path::PathBuf::from(dir);
-    let work = tempfile::Builder::new()
-        .prefix("legion-ingress-pebble-")
-        .tempdir_in(crate::support::scratch_root())?;
-    // Pebble's own listener certificate, trusted by the issuer.
-    let key = rcgen::KeyPair::generate()?;
-    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
-    params
-        .subject_alt_names
-        .push(rcgen::SanType::IpAddress("127.0.0.1".parse()?));
-    let pebble_cert = params.self_signed(&key)?;
-    std::fs::write(work.path().join("cert.pem"), pebble_cert.pem())?;
-    std::fs::write(work.path().join("key.pem"), key.serialize_pem())?;
-
-    let (control, events) = FakeControl::new();
-    let site = backend("site").await?;
-    control.set_endpoints("web", "shop", "web", &[site]);
-    let host = "shop.legion-ingress.dev";
-    events.send(snapshot(vec![route(
-        "shop",
-        "web",
-        json!({ "host": host, "path": "/", "stripPath": false }),
-    )]))?;
-    let free_port = |_: ()| -> R<u16> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        Ok(listener.local_addr()?.port())
-    };
-    let (acme_port, management_port, dns_port) = (free_port(())?, free_port(())?, free_port(())?);
-    let state = State::new(IngressConfig::from_value(&json!({
-        "acme": {
-            "directory": format!("https://127.0.0.1:{acme_port}/dir"),
-            "trustRoots": pebble_cert.pem(),
-            "email": "ops@legion-ingress.dev",
-        }
-    }))?);
-    let mut ingress = Ingress::start(
-        state,
-        Listen {
-            http: "127.0.0.1:0".parse()?,
-            https: Some("127.0.0.1:0".parse()?),
-        },
-    )
-    .await?;
-    std::fs::write(
-        work.path().join("pebble.json"),
-        json!({
-            "pebble": {
-                "listenAddress": format!("127.0.0.1:{acme_port}"),
-                "managementListenAddress": format!("127.0.0.1:{management_port}"),
-                "certificate": work.path().join("cert.pem"),
-                "privateKey": work.path().join("key.pem"),
-                "httpPort": ingress.http.port(),
-                "tlsPort": 5001,
-                "ocspResponderURL": "",
-                "externalAccountBindingRequired": false,
-                "retryAfter": { "authz": 1, "order": 1 },
-            }
-        })
-        .to_string(),
-    )?;
-    let mut challtestsrv = tokio::process::Command::new(dir.join("pebble-challtestsrv"))
-        .args([
-            "-defaultIPv4",
-            "127.0.0.1",
-            "-defaultIPv6",
-            "",
-            "-dns01",
-            &format!("127.0.0.1:{dns_port}"),
-            "-http01",
-            "",
-            "-https01",
-            "",
-            "-tlsalpn01",
-            "",
-            "-doh",
-            "",
-            "-management",
-            &format!("127.0.0.1:{}", free_port(())?),
-        ])
-        .kill_on_drop(true)
-        .spawn()
-        .context("starting pebble-challtestsrv")?;
-    let mut pebble = tokio::process::Command::new(dir.join("pebble"))
-        .args([
-            "-config",
-            &work.path().join("pebble.json").to_string_lossy(),
-            "-dnsserver",
-            &format!("127.0.0.1:{dns_port}"),
-        ])
-        .env("PEBBLE_VA_NOSLEEP", "1")
-        .kill_on_drop(true)
-        .spawn()
-        .context("starting pebble")?;
-    // Wait for Pebble to answer.
-    let probe = reqwest::Client::builder()
-        .no_proxy()
-        .add_root_certificate(reqwest::Certificate::from_pem(
-            pebble_cert.pem().as_bytes(),
-        )?)
-        .build()?;
-    let mut up = false;
-    for _ in 0..100 {
-        if probe
-            .get(format!("https://127.0.0.1:{acme_port}/dir"))
-            .send()
-            .await
-            .is_ok()
-        {
-            up = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    anyhow::ensure!(up, "pebble did not start");
-
-    ingress.connect(control.clone(), "test".into(), None, true);
-    for _ in 0..600 {
-        if ingress.state.certs.serves(host) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let status = ingress.state.issuer_status();
-    anyhow::ensure!(
-        ingress.state.certs.serves(host),
-        "no certificate was ordered: {status:?}"
-    );
-    assert!(control
-        .kv
-        .lock()
-        .unwrap()
-        .contains_key(&format!("legion/apps/ingress/acme/certs/{host}")));
-    assert!(
-        !control
-            .kv
-            .lock()
-            .unwrap()
-            .keys()
-            .any(|key| key.contains("/acme/challenges/")),
-        "answers are taken down after the order"
-    );
-
-    // The chain Pebble issued verifies against Pebble's root.
-    let root = probe
-        .get(format!("https://127.0.0.1:{management_port}/roots/0"))
-        .send()
-        .await?
-        .text()
-        .await?;
-    let https = ingress.https.context("https")?;
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .resolve(host, https)
-        .add_root_certificate(reqwest::Certificate::from_pem(root.as_bytes())?)
-        .build()?;
-    let (status, body) = get_json(&client, &format!("https://{host}:{}/", https.port())).await?;
-    assert_eq!((status, &body["backend"]), (200, &json!("site")), "{body}");
-    ingress.stop().await;
-    let _ = pebble.kill().await;
-    let _ = challtestsrv.kill().await;
-    Ok(())
-}
-
-/// A small ACME CA (RFC 8555), in process, for
-/// [`orders_a_certificate_from_an_acme_ca_test`]: it serves a directory,
-/// verifies every request's ES256 JWS against the account's key and its
-/// nonce and URL, refuses the first order once with `badNonce`, validates
-/// HTTP-01 by fetching the answer from the ingress's HTTP port, and signs
-/// the CSR with its own root.
-struct FakeCa {
-    base: String,
-    /// The ingress's HTTP port, where HTTP-01 answers are fetched.
-    http_port: u16,
-    root: rcgen::Certificate,
-    root_key: rcgen::KeyPair,
-    state: Mutex<CaState>,
-}
-
-#[derive(Default)]
-struct CaState {
-    nonces: std::collections::HashSet<String>,
-    jwk: Option<Value>,
-    refused_once: bool,
-    host: String,
-    token: String,
-    authorized: Option<bool>,
-    chain: Option<String>,
-    seen: Vec<String>,
-    /// Orders created (a refused attempt is not one).
-    orders: u32,
-}
-
-fn b64url_decode(text: &str) -> R<Vec<u8>> {
-    use base64::Engine as _;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(text)?)
-}
-
-fn b64url(bytes: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-impl FakeCa {
-    fn nonce(&self) -> String {
-        let nonce = format!("n{:016x}", rand::random::<u64>());
-        self.state.lock().unwrap().nonces.insert(nonce.clone());
-        nonce
-    }
-
-    fn thumbprint(jwk: &Value) -> String {
-        let canonical = format!(
-            r#"{{"crv":"{}","kty":"{}","x":"{}","y":"{}"}}"#,
-            jwk["crv"].as_str().unwrap_or_default(),
-            jwk["kty"].as_str().unwrap_or_default(),
-            jwk["x"].as_str().unwrap_or_default(),
-            jwk["y"].as_str().unwrap_or_default()
-        );
-        b64url(ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes()).as_ref())
-    }
-
-    /// Check a JWS as RFC 8555 §6.2-6.5 asks: a known, unused nonce, the
-    /// request's URL, ES256 over the account's key. Returns the payload.
-    fn verify(&self, url: &str, body: &[u8]) -> Result<Value, (u16, &'static str)> {
-        let jws: Value = serde_json::from_slice(body).map_err(|_| (400, "malformed"))?;
-        let field = |name: &str| jws[name].as_str().unwrap_or_default().to_string();
-        let protected: Value = serde_json::from_slice(
-            &b64url_decode(&field("protected")).map_err(|_| (400, "malformed"))?,
-        )
-        .map_err(|_| (400, "malformed"))?;
-        let mut state = self.state.lock().unwrap();
-        let nonce = protected["nonce"].as_str().unwrap_or_default();
-        if !state.nonces.remove(nonce) {
-            return Err((400, "badNonce"));
-        }
-        if protected["url"] != url || protected["alg"] != "ES256" {
-            return Err((401, "unauthorized"));
-        }
-        let jwk = match protected.get("jwk") {
-            Some(jwk) => {
-                state.jwk = Some(jwk.clone());
-                jwk.clone()
-            }
-            None => {
-                if protected["kid"] != format!("{}/acct/1", self.base) {
-                    return Err((400, "accountDoesNotExist"));
-                }
-                state.jwk.clone().ok_or((400, "accountDoesNotExist"))?
-            }
-        };
-        let mut public = vec![0x04];
-        public.extend(
-            b64url_decode(jwk["x"].as_str().unwrap_or_default()).map_err(|_| (400, "malformed"))?,
-        );
-        public.extend(
-            b64url_decode(jwk["y"].as_str().unwrap_or_default()).map_err(|_| (400, "malformed"))?,
-        );
-        let message = format!("{}.{}", field("protected"), field("payload"));
-        ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, public)
-            .verify(
-                message.as_bytes(),
-                &b64url_decode(&field("signature")).map_err(|_| (400, "malformed"))?,
-            )
-            .map_err(|_| (401, "unauthorized"))?;
-        state.seen.push(url.to_string());
-        let payload = field("payload");
-        if payload.is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_slice(&b64url_decode(&payload).map_err(|_| (400, "malformed"))?)
-            .map_err(|_| (400, "malformed"))
-    }
-
-    async fn answer(
-        self: Arc<Self>,
-        request: hyper::Request<hyper::body::Incoming>,
-    ) -> hyper::Response<Full<Bytes>> {
-        let path = request.uri().path().to_string();
-        let url = format!("{}{path}", self.base);
-        let method = request.method().clone();
-        let body = request
-            .into_body()
-            .collect()
-            .await
-            .map(|body| body.to_bytes())
-            .unwrap_or_default();
-        let reply = |status: u16, body: Value, location: Option<String>| {
-            let mut response = hyper::Response::new(Full::new(Bytes::from(body.to_string())));
-            *response.status_mut() = hyper::StatusCode::from_u16(status).unwrap();
-            let headers = response.headers_mut();
-            headers.insert("replay-nonce", self.nonce().parse().unwrap());
-            headers.insert("content-type", "application/json".parse().unwrap());
-            if let Some(location) = location {
-                headers.insert("location", location.parse().unwrap());
-            }
-            response
-        };
-        if path == "/dir" {
-            return reply(
-                200,
-                json!({
-                    "newNonce": format!("{}/nonce", self.base),
-                    "newAccount": format!("{}/acct", self.base),
-                    "newOrder": format!("{}/order", self.base),
-                }),
-                None,
-            );
-        }
-        if path == "/nonce" && method == hyper::Method::HEAD {
-            return reply(200, json!({}), None);
-        }
-        let payload = match self.verify(&url, &body) {
-            Ok(payload) => payload,
-            Err((status, kind)) => {
-                return reply(
-                    status,
-                    json!({ "type": format!("urn:ietf:params:acme:error:{kind}"), "detail": kind }),
-                    None,
-                )
-            }
-        };
-        let order = |state: &CaState, base: &str| {
-            let status = match (&state.chain, state.authorized) {
-                (Some(_), _) => "valid",
-                (None, Some(true)) => "ready",
-                (None, Some(false)) => "invalid",
-                (None, None) => "pending",
-            };
-            let mut order = json!({
-                "status": status,
-                "identifiers": [{ "type": "dns", "value": state.host }],
-                "authorizations": [format!("{base}/authz/1")],
-                "finalize": format!("{base}/finalize/1"),
-            });
-            if state.chain.is_some() {
-                order["certificate"] = json!(format!("{base}/cert/1"));
-            }
-            order
-        };
-        match path.as_str() {
-            "/acct" => {
-                assert_eq!(payload["termsOfServiceAgreed"], true);
-                reply(
-                    201,
-                    json!({ "status": "valid" }),
-                    Some(format!("{}/acct/1", self.base)),
-                )
-            }
-            "/order" => {
-                let mut state = self.state.lock().unwrap();
-                if !state.refused_once {
-                    // A CA may refuse any nonce; the client must retry.
-                    state.refused_once = true;
-                    drop(state);
-                    return reply(
-                        400,
-                        json!({ "type": "urn:ietf:params:acme:error:badNonce", "detail": "try again" }),
-                        None,
-                    );
-                }
-                state.orders += 1;
-                state.host = payload["identifiers"][0]["value"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                state.token = format!("tok{:016x}", rand::random::<u64>());
-                let body = order(&state, &self.base);
-                drop(state);
-                reply(201, body, Some(format!("{}/order/1", self.base)))
-            }
-            "/order/1" => {
-                let state = self.state.lock().unwrap();
-                let body = order(&state, &self.base);
-                drop(state);
-                reply(200, body, None)
-            }
-            "/authz/1" => {
-                let state = self.state.lock().unwrap();
-                let status = match state.authorized {
-                    Some(true) => "valid",
-                    Some(false) => "invalid",
-                    None => "pending",
-                };
-                let body = json!({
-                    "status": status,
-                    "identifier": { "type": "dns", "value": state.host },
-                    "challenges": [{
-                        "type": "http-01",
-                        "url": format!("{}/chall/1", self.base),
-                        "token": state.token,
-                        "status": status,
-                    }],
-                });
-                drop(state);
-                reply(200, body, None)
-            }
-            "/chall/1" => {
-                // Validate as a CA does: fetch the answer over plain HTTP,
-                // naming the host, from the address DNS gives (here, the
-                // ingress).
-                let (host, token, jwk) = {
-                    let state = self.state.lock().unwrap();
-                    (
-                        state.host.clone(),
-                        state.token.clone(),
-                        state.jwk.clone().unwrap_or_default(),
-                    )
-                };
-                let fetched = reqwest::Client::builder()
-                    .no_proxy()
-                    .build()
-                    .unwrap()
-                    .get(format!(
-                        "http://127.0.0.1:{}/.well-known/acme-challenge/{token}",
-                        self.http_port
-                    ))
-                    .header("host", host)
-                    .send()
-                    .await;
-                let answer = match fetched {
-                    Ok(response) if response.status().is_success() => {
-                        response.text().await.unwrap_or_default()
-                    }
-                    _ => String::new(),
-                };
-                let valid = answer == format!("{token}.{}", Self::thumbprint(&jwk));
-                self.state.lock().unwrap().authorized = Some(valid);
-                reply(200, json!({ "status": "processing" }), None)
-            }
-            "/finalize/1" => {
-                let der =
-                    b64url_decode(payload["csr"].as_str().unwrap_or_default()).unwrap_or_default();
-                let csr = rcgen::CertificateSigningRequestParams::from_der(
-                    &rustls_pki_types::CertificateSigningRequestDer::from(der),
-                )
-                .expect("the CSR parses");
-                let host = self.state.lock().unwrap().host.clone();
-                assert_eq!(
-                    csr.params.subject_alt_names,
-                    vec![rcgen::SanType::DnsName(host.clone().try_into().unwrap())],
-                    "the CSR names the ordered host"
-                );
-                let leaf = csr.signed_by(&self.root, &self.root_key).expect("signed");
-                let mut state = self.state.lock().unwrap();
-                state.chain = Some(format!("{}{}", leaf.pem(), self.root.pem()));
-                let body = order(&state, &self.base);
-                drop(state);
-                reply(200, body, None)
-            }
-            "/cert/1" => {
-                let chain = self.state.lock().unwrap().chain.clone().unwrap_or_default();
-                let mut response = hyper::Response::new(Full::new(Bytes::from(chain)));
-                response.headers_mut().insert(
-                    "content-type",
-                    "application/pem-certificate-chain".parse().unwrap(),
-                );
-                response
-                    .headers_mut()
-                    .insert("replay-nonce", self.nonce().parse().unwrap());
-                response
-            }
-            _ => reply(404, json!({ "detail": "no such resource" }), None),
-        }
-    }
-
-    /// Serve over TLS on loopback; returns the CA and its TLS root (PEM).
-    async fn start(http_port: u16) -> R<(Arc<FakeCa>, String)> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let base = format!("https://127.0.0.1:{}", listener.local_addr()?.port());
-        let tls_key = rcgen::KeyPair::generate()?;
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
-        params
-            .subject_alt_names
-            .push(rcgen::SanType::IpAddress("127.0.0.1".parse()?));
-        let tls_cert = params.self_signed(&tls_key)?;
-        let root_key = rcgen::KeyPair::generate()?;
-        let mut root_params = rcgen::CertificateParams::new(Vec::<String>::new())?;
-        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        root_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "Legion test ACME root");
-        let root = root_params.self_signed(&root_key)?;
-        let ca = Arc::new(FakeCa {
-            base,
-            http_port,
-            root,
-            root_key,
-            state: Mutex::new(CaState::default()),
-        });
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![tls_cert.der().clone()],
-            rustls_pki_types::PrivateKeyDer::try_from(tls_key.serialize_der())
-                .map_err(|err| anyhow::anyhow!(err))?,
-        )?;
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let serving = ca.clone();
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let acceptor = acceptor.clone();
-                let ca = serving.clone();
-                tokio::spawn(async move {
-                    let Ok(stream) = acceptor.accept(stream).await else {
-                        return;
-                    };
-                    let service = hyper::service::service_fn(move |request| {
-                        let ca = ca.clone();
-                        async move { Ok::<_, std::convert::Infallible>(ca.answer(request).await) }
-                    });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                        .await;
-                });
-            }
-        });
-        Ok((ca, tls_cert.pem()))
-    }
-}
-
-/// The issuer, against an ACME CA in process: it registers, orders over
-/// HTTP-01 (the CA fetching the answer from the ingress's HTTP port by way
-/// of the shared board), retries a `badNonce`, finalizes with a CSR for the
-/// host, stores the bundle in KV, takes the answer down, and serves the
-/// certificate by SNI. A second replica sharing the KV loads it and does not
-/// order again.
-#[tokio::test(flavor = "multi_thread")]
-async fn orders_a_certificate_from_an_acme_ca_test() -> R<()> {
-    let (control, events) = FakeControl::new();
-    let site = backend("site").await?;
-    control.set_endpoints("web", "shop", "web", &[site]);
-    let host = "shop.legion-ingress.dev";
-    events.send(snapshot(vec![route(
-        "shop",
-        "web",
-        json!({ "host": host, "path": "/", "stripPath": false }),
-    )]))?;
-    // The CA must know the ingress's HTTP port, and the ingress the CA's
-    // directory: pick the port first.
-    let http_port = std::net::TcpListener::bind("127.0.0.1:0")?
-        .local_addr()?
-        .port();
-    let (ca, tls_root) = FakeCa::start(http_port).await?;
-    let state = State::new(IngressConfig::from_value(&json!({
-        "acme": {
-            "directory": format!("{}/dir", ca.base),
-            "trustRoots": tls_root,
-            "email": "ops@legion-ingress.dev",
-        }
-    }))?);
-    let http: SocketAddr = format!("127.0.0.1:{}", ca.http_port).parse()?;
-    let mut ingress = Ingress::start(
-        state,
-        Listen {
-            http,
-            https: Some("127.0.0.1:0".parse()?),
-        },
-    )
-    .await?;
-    ingress.connect(control.clone(), "replica-a".into(), None, true);
-    for _ in 0..300 {
-        if ingress.state.certs.serves(host) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let status = ingress.state.issuer_status();
-    anyhow::ensure!(
-        ingress.state.certs.serves(host),
-        "no certificate: {status:?}; the CA saw {:?}",
-        ca.state.lock().unwrap().seen
-    );
-    assert_eq!(
-        ca.state.lock().unwrap().authorized,
-        Some(true),
-        "HTTP-01 answered"
-    );
-    {
-        let kv = control.kv.lock().unwrap();
-        assert!(kv.contains_key(&format!("legion/apps/ingress/acme/certs/{host}")));
-        assert!(
-            kv.keys()
-                .any(|key| key.starts_with("legion/apps/ingress/acme/accounts/")),
-            "the account is kept for the next issuer"
-        );
-        assert!(
-            !kv.keys().any(|key| key.contains("/acme/challenges/")),
-            "answers are taken down after the order"
-        );
-    }
-
-    // HTTPS, verified against the CA's root.
-    let https = ingress.https.context("https")?;
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .resolve(host, https)
-        .add_root_certificate(reqwest::Certificate::from_pem(ca.root.pem().as_bytes())?)
-        .build()?;
-    let (status, body) = get_json(&client, &format!("https://{host}:{}/", https.port())).await?;
-    assert_eq!((status, &body["backend"]), (200, &json!("site")), "{body}");
-    assert_eq!(body["proto"], "https");
-
-    // Another replica on the same KV serves it without ordering.
-    let (other_control, other_events) = FakeControl::new();
-    *other_control.kv.lock().unwrap() = control.kv.lock().unwrap().clone();
-    other_events.send(snapshot(vec![route(
-        "shop",
-        "web",
-        json!({ "host": host, "path": "/", "stripPath": false }),
-    )]))?;
-    let other = start(
-        json!({ "acme": { "enabled": false } }),
-        other_control,
-        true,
-        false,
-    )
-    .await?;
-    eventually("the second replica to load the certificate", || {
-        other.state.certs.serves(host)
-    })
-    .await?;
-    let (orders, refused_once) = {
-        let state = ca.state.lock().unwrap();
-        (state.orders, state.refused_once)
-    };
-    assert!(refused_once, "the badNonce was retried");
-    assert_eq!(orders, 1, "one order, however many replicas");
-    other.stop().await;
-    ingress.stop().await;
-    Ok(())
-}
-
 /// A backend like [`backend`] that counts the TCP connections it accepts.
 async fn counting_backend() -> R<(SocketAddr, Arc<std::sync::atomic::AtomicUsize>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -1365,7 +823,7 @@ async fn connections_to_a_service_are_reused_test() -> R<()> {
         "web",
         json!({ "host": "shop.example.com", "path": "/", "stripPath": false }),
     )]))?;
-    let ingress = start(no_acme(), control.clone(), false, false).await?;
+    let ingress = start(no_certificates(), control.clone(), false, false).await?;
     eventually("the endpoint", || {
         ingress
             .state
@@ -1396,6 +854,327 @@ async fn connections_to_a_service_are_reused_test() -> R<()> {
         1,
         "every request rode the first connection"
     );
+    ingress.stop().await;
+    Ok(())
+}
+
+pub(crate) fn web_route(service: &str, host: &str) -> AppExtensionValue {
+    route(
+        "shop",
+        service,
+        json!({ "host": host, "path": "/", "stripPath": false }),
+    )
+}
+
+fn skipped(states: &BTreeMap<String, CertState>, host: &str) -> String {
+    match states.get(host) {
+        Some(CertState::Skipped(why)) => why.clone(),
+        other => panic!("{host} is not skipped: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keeps_one_certificate_per_routed_host_test() -> R<()> {
+    let (control, events) = FakeControl::new();
+    let site = backend("site").await?;
+    for service in ["web", "wild", "intra", "blog"] {
+        control.set_endpoints(service, "shop", "web", &[site]);
+    }
+    // What the cert manager writes for shop.example.com, at the key the
+    // ingress's Certificate names (stable per host, so it can be first).
+    let (bundle, cert) = self_signed(&["shop.example.com"])?;
+    control.put(&issued_key("shop.example.com"), &bundle);
+    events.send(snapshot(vec![
+        web_route("web", "shop.example.com"),
+        web_route("wild", "*.apps.example.com"),
+        web_route("intra", "db.internal"),
+    ]))?;
+    let ingress = start(
+        json!({ "acme": { "email": "ops@example.com" } }),
+        control.clone(),
+        true,
+        true,
+    )
+    .await?;
+    eventually("the certificate states", || {
+        ingress.state.cert_states().len() == 3
+    })
+    .await?;
+    // Nothing is ordered until the cert manager has registered the
+    // Issuer's account: its thumbprint answers the HTTP-01 challenge.
+    assert_eq!(
+        ingress.state.cert_states()["shop.example.com"],
+        CertState::AwaitingIssuer
+    );
+    assert!(control.certificates().is_empty());
+    control.report(
+        "certs/Issuer",
+        "",
+        DEFAULT_ISSUER,
+        ("true", "Registered"),
+        json!({ "thumbprint": "thumb-print" }),
+    );
+    eventually_within("the Certificate", Duration::from_secs(15), || {
+        ingress.state.cert_states().get("shop.example.com") == Some(&CertState::Waiting)
+    })
+    .await?;
+
+    // The default Issuer, from the config: HTTP-01 against Let's Encrypt,
+    // for the ingress's namespace only.
+    let issuer = control
+        .object("certs/Issuer", "", DEFAULT_ISSUER)
+        .context("the default Issuer")?;
+    assert_eq!(
+        issuer.spec,
+        json!({
+            "namespaces": ["legion-system"],
+            "acme": { "server": "letsencrypt", "email": "ops@example.com", "http01": {} },
+        })
+    );
+
+    // One Certificate, for the one host an HTTP-01 Issuer can prove.
+    let shop = certificate_name("shop.example.com");
+    assert_eq!(control.certificates(), vec![shop.clone()]);
+    let certificate = control
+        .object("certs/Certificate", CERT_NAMESPACE, &shop)
+        .context("shop's Certificate")?;
+    assert_eq!(
+        certificate.spec,
+        json!({
+            "issuer": "ingress",
+            "dnsNames": ["shop.example.com"],
+            "kv": issued_key("shop.example.com"),
+        })
+    );
+    assert_eq!(certificate.labels[HOST_LABEL], "shop.example.com");
+    let states = ingress.state.cert_states();
+    assert_eq!(states["shop.example.com"], CertState::Waiting);
+    let why = skipped(&states, "*.apps.example.com");
+    assert!(why.contains("DNS-01"), "{why}");
+    let why = skipped(&states, "db.internal");
+    assert!(why.contains("no public CA"), "{why}");
+
+    // The bundle at the key it names is served by SNI.
+    eventually("the issued bundle", || {
+        ingress.state.certs.serves("shop.example.com")
+    })
+    .await?;
+    let https = ingress.https.context("https listens")?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("shop.example.com", https)
+        .add_root_certificate(reqwest::Certificate::from_pem(cert.as_bytes())?)
+        .build()?;
+    let (status, body) = get_json(
+        &client,
+        &format!("https://shop.example.com:{}/", https.port()),
+    )
+    .await?;
+    assert_eq!((status, &body["proto"]), (200, &json!("https")), "{body}");
+
+    // The cert manager reports it issued; a new route gets its own
+    // Certificate, and routes that leave take theirs with them.
+    control.report(
+        "certs/Certificate",
+        CERT_NAMESPACE,
+        &shop,
+        ("true", "Issued"),
+        json!({}),
+    );
+    events.send(snapshot(vec![
+        web_route("web", "shop.example.com"),
+        web_route("blog", "blog.example.com"),
+    ]))?;
+    let blog = certificate_name("blog.example.com");
+    eventually("blog's Certificate and shop's status", || {
+        let states = ingress.state.cert_states();
+        control.certificates() == vec![blog.clone(), shop.clone()]
+            && matches!(
+                states.get("shop.example.com"),
+                Some(CertState::Requested { ready: true, reason, .. }) if reason == "Issued"
+            )
+            && states.len() == 2
+    })
+    .await?;
+    events.send(snapshot(vec![web_route("blog", "blog.example.com")]))?;
+    eventually("shop's Certificate dropped", || {
+        control.certificates() == vec![blog.clone()]
+    })
+    .await?;
+    assert!(
+        !control
+            .kv
+            .lock()
+            .unwrap()
+            .contains_key(&issued_key("shop.example.com")),
+        "its bundle goes with it"
+    );
+    ingress.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_named_issuer_covers_wildcards_and_private_names_test() -> R<()> {
+    let (control, events) = FakeControl::new();
+    let site = backend("site").await?;
+    for service in ["web", "wild", "intra"] {
+        control.set_endpoints(service, "shop", "web", &[site]);
+    }
+    control
+        .apply_object(&json!({
+            "kind": "certs/Issuer",
+            "name": "corp-ca",
+            "spec": {
+                "namespaces": ["legion-system"],
+                "ca": { "kv": "certs/ca/corp" },
+            },
+        }))
+        .await?;
+    events.send(snapshot(vec![
+        web_route("web", "shop.example.com"),
+        web_route("wild", "*.apps.example.com"),
+        web_route("intra", "db.internal"),
+    ]))?;
+    let ingress = start(json!({ "issuer": "corp-ca" }), control.clone(), false, true).await?;
+    eventually("a Certificate per host", || {
+        control.certificates().len() == 3
+    })
+    .await?;
+    for host in ["shop.example.com", "*.apps.example.com", "db.internal"] {
+        let certificate = control
+            .object("certs/Certificate", CERT_NAMESPACE, &certificate_name(host))
+            .with_context(|| format!("{host}'s Certificate"))?;
+        assert_eq!(certificate.spec["issuer"], "corp-ca");
+        assert_eq!(certificate.spec["dnsNames"], json!([host]));
+    }
+    assert!(
+        control.object("certs/Issuer", "", DEFAULT_ISSUER).is_none(),
+        "the ingress keeps no Issuer of its own when the config names one"
+    );
+    ingress.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn answers_http01_with_the_issuer_thumbprint_test() -> R<()> {
+    let (control, events) = FakeControl::new();
+    let site = backend("site").await?;
+    control.set_endpoints("web", "shop", "web", &[site]);
+    events.send(snapshot(vec![web_route("web", "shop.example.com")]))?;
+    let ingress = start(json!({}), control.clone(), false, true).await?;
+    eventually("the default Issuer", || {
+        control.object("certs/Issuer", "", DEFAULT_ISSUER).is_some()
+    })
+    .await?;
+    let http = client(&ingress, &["shop.example.com"], &[])?;
+    let challenge = format!(
+        "http://shop.example.com:{}/.well-known/acme-challenge/tok_123-abc",
+        ingress.http.port()
+    );
+    // Until the cert manager registers the account there is nothing to
+    // answer with.
+    let response = http.get(&challenge).send().await?;
+    assert_eq!(response.status().as_u16(), 503);
+
+    control.report(
+        "certs/Issuer",
+        "",
+        DEFAULT_ISSUER,
+        ("true", "Registered"),
+        json!({ "thumbprint": "thumb-print" }),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let answer = loop {
+        let response = http.get(&challenge).send().await?;
+        if response.status().as_u16() == 200 {
+            break response.text().await?;
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the challenge is never answered"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(answer, "tok_123-abc.thumb-print");
+    // Every other path on the host is the app's.
+    let (status, body) = get_json(
+        &http,
+        &format!("http://shop.example.com:{}/cart", ingress.http.port()),
+    )
+    .await?;
+    assert_eq!((status, &body["backend"]), (200, &json!("site")), "{body}");
+    ingress.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn says_where_to_point_dns_test() -> R<()> {
+    let (control, events) = FakeControl::new();
+    let site = backend("site").await?;
+    for service in ["here", "elsewhere", "missing", "wild"] {
+        control.set_endpoints(service, "shop", "web", &[site]);
+    }
+    control.set_edge(&[
+        ("mgr-1", "127.0.0.1", ""),
+        ("mgr-2", "10.0.0.2", "203.0.113.7"),
+    ]);
+    events.send(snapshot(vec![
+        web_route("here", "localhost"),
+        // An address literal resolves to itself, and no replica has it.
+        web_route("elsewhere", "127.0.0.2"),
+        web_route("missing", "nothing.invalid"),
+        web_route("wild", "*.apps.example.com"),
+    ]))?;
+    let ingress = start_with_edge(
+        no_certificates(),
+        control.clone(),
+        false,
+        false,
+        Some(edge::SERVICE),
+    )
+    .await?;
+    eventually("every exact host checked", || {
+        ingress.state.dns().len() == 3
+    })
+    .await?;
+    let targets: Vec<String> = ingress
+        .state
+        .edge()
+        .iter()
+        .map(|replica| replica.target().to_string())
+        .collect();
+    assert_eq!(targets, ["127.0.0.1", "203.0.113.7"], "public first");
+    let dns = ingress.state.dns();
+    assert_eq!(dns["localhost"], DnsCheck::Here);
+    assert_eq!(
+        dns["127.0.0.2"],
+        DnsCheck::Elsewhere(vec!["127.0.0.2".parse()?])
+    );
+    assert_eq!(dns["nothing.invalid"], DnsCheck::Missing);
+
+    // The Ingress page says it in words.
+    let viewer = legion::apps::ui::Viewer {
+        principal: "user:alice".into(),
+        accessor: None,
+        permission: Some("job:read".into()),
+        scope: legion::structs::app_ui::AssertionScope::Any,
+        namespaces: vec!["*".into()],
+        delegation: None,
+    };
+    let page = serde_json::to_string(&legion::apps::ingress::views::routes_view(
+        &ingress.state,
+        &viewer,
+    ))?;
+    for expected in [
+        "Point DNS here",
+        "203.0.113.7",
+        "LEGION_WORKER_PUBLIC_ADDRESS",
+        "points here",
+        "points to 127.0.0.2",
+        "no record",
+    ] {
+        assert!(page.contains(expected), "{expected:?} not in {page}");
+    }
     ingress.stop().await;
     Ok(())
 }

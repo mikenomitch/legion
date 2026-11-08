@@ -7,8 +7,9 @@
 //! - **operator bundles**, any key under `legion/apps/ingress/certs/`,
 //!   served for the names in their leaf's SANs, wildcards included. They
 //!   win over ordered ones, and the issuer orders nothing they cover;
-//! - **ordered bundles**, `legion/apps/ingress/acme/certs/<host>`, which the
-//!   issuer writes.
+//! - **issued bundles**, `legion/apps/ingress/issued/<certificate>`, which
+//!   the cert manager writes for the `certs/Certificate` the ingress keeps
+//!   for each routed host ([`super::certificates`]).
 //!
 //! Every replica follows both with [`CertStore::sync`] and resolves SNI from
 //! memory; the handshake never waits on Legion.
@@ -25,23 +26,23 @@ use crate::prelude::*;
 pub const KV_PREFIX: &str = "legion/apps/ingress/";
 /// Operator bundles.
 pub const OPERATOR_PREFIX: &str = "legion/apps/ingress/certs/";
-/// Ordered bundles, one per host.
-pub const ACME_PREFIX: &str = "legion/apps/ingress/acme/certs/";
+/// Bundles the cert manager issued for the ingress's Certificates.
+pub const ISSUED_PREFIX: &str = super::certificates::ISSUED_PREFIX;
 
 /// Where a bundle came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CertSource {
     /// Under [`OPERATOR_PREFIX`].
     Operator,
-    /// Under [`ACME_PREFIX`].
-    Acme,
+    /// Under [`ISSUED_PREFIX`].
+    Issued,
 }
 
 impl CertSource {
     pub fn label(self) -> &'static str {
         match self {
             CertSource::Operator => "operator",
-            CertSource::Acme => "acme",
+            CertSource::Issued => "cert manager",
         }
     }
 
@@ -49,8 +50,8 @@ impl CertSource {
     pub fn of_key(key: &str) -> Option<CertSource> {
         if key.starts_with(OPERATOR_PREFIX) && key.len() > OPERATOR_PREFIX.len() {
             Some(CertSource::Operator)
-        } else if key.starts_with(ACME_PREFIX) && key.len() > ACME_PREFIX.len() {
-            Some(CertSource::Acme)
+        } else if key.starts_with(ISSUED_PREFIX) && key.len() > ISSUED_PREFIX.len() {
+            Some(CertSource::Issued)
         } else {
             None
         }
@@ -86,7 +87,7 @@ impl std::fmt::Debug for LoadedCert {
 
 impl LoadedCert {
     /// Whether a third or less of its lifetime is left at `now` (unix
-    /// seconds): when the issuer renews an ordered one.
+    /// seconds): when it is due for renewal.
     pub fn renewal_due(&self, now: i64) -> bool {
         let lifetime = (self.not_after - self.not_before).max(0);
         self.not_after - now <= lifetime / 3
@@ -161,7 +162,7 @@ struct Index {
 }
 
 impl Index {
-    /// Rebuild `by_name`: for each name, an operator bundle over an ordered
+    /// Rebuild `by_name`: for each name, an operator bundle over an issued
     /// one, then the one that expires last, skipping expired bundles while
     /// a live one exists.
     fn rebuild(&mut self, now: i64) {
@@ -221,8 +222,8 @@ impl CertStore {
         self.lookup(host).is_some()
     }
 
-    /// Whether a live operator bundle covers `host`: the issuer orders
-    /// nothing for it.
+    /// Whether a live operator bundle covers `host`: the ingress asks the
+    /// cert manager for nothing for it.
     pub fn operator_covers(&self, host: &str, now: i64) -> bool {
         let Ok(index) = self.index.read() else {
             return false;
@@ -239,12 +240,6 @@ impl CertStore {
         })
     }
 
-    /// The ordered bundle for `host`, if there is one.
-    pub fn ordered(&self, host: &str) -> Option<LoadedCert> {
-        let index = self.index.read().ok()?;
-        index.loaded.get(&format!("{ACME_PREFIX}{host}")).cloned()
-    }
-
     /// Every loaded bundle, and every broken one with its error.
     pub fn snapshot(&self) -> (Vec<LoadedCert>, Vec<(String, String)>) {
         match self.index.read() {
@@ -257,16 +252,6 @@ impl CertStore {
                     .collect(),
             ),
             Err(_) => (Vec::new(), Vec::new()),
-        }
-    }
-
-    /// Install one bundle now (the issuer, right after it orders), ahead of
-    /// the next sync.
-    pub fn install(&self, cert: LoadedCert, now: i64) {
-        if let Ok(mut index) = self.index.write() {
-            index.broken.remove(&cert.key);
-            index.loaded.insert(cert.key.clone(), cert);
-            index.rebuild(now);
         }
     }
 
@@ -421,7 +406,7 @@ pub(crate) mod tests {
     #[test]
     fn renewal_is_due_in_the_last_third() {
         let pem = bundle(&["a.example.com"], 20);
-        let cert = parse_bundle("k", 1, CertSource::Acme, &pem).unwrap();
+        let cert = parse_bundle("k", 1, CertSource::Issued, &pem).unwrap();
         // 21 days of life (one before now), 20 left: not due.
         assert!(!cert.renewal_due(now()));
         assert!(cert.renewal_due(now() + 14 * 86_400));
@@ -434,7 +419,7 @@ pub(crate) mod tests {
         let ordered = bundle(&["shop.example.com"], 90);
         let kv: std::collections::HashMap<String, (String, i64)> = [
             (format!("{OPERATOR_PREFIX}wild"), (operator, 1)),
-            (format!("{ACME_PREFIX}shop.example.com"), (ordered, 4)),
+            (format!("{ISSUED_PREFIX}shop-example-com-0"), (ordered, 4)),
             (format!("{OPERATOR_PREFIX}broken"), ("junk".to_string(), 2)),
         ]
         .into_iter()
@@ -461,7 +446,6 @@ pub(crate) mod tests {
         assert!(!store.serves("example.org"));
         assert!(store.operator_covers("other.example.com", now()));
         assert!(store.operator_covers("shop.example.com", now()));
-        assert!(store.ordered("shop.example.com").is_some());
         let (loaded, broken) = store.snapshot();
         assert_eq!(loaded.len(), 2);
         assert_eq!(broken.len(), 1);

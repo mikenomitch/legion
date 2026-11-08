@@ -6,8 +6,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::certificates::CertState;
 use super::certs::LoadedCert;
-use super::routes::{publicly_issuable, RouteRow};
+use super::edge::{DnsCheck, EdgeAddress};
+use super::routes::RouteRow;
 use super::State;
 use crate::apps::ui::{UiRegistry, Viewer};
 use crate::structs::app_ui::{
@@ -93,22 +95,18 @@ fn certificate_cell(state: &State, host: &str, now: i64) -> Cell {
             None => rich("served", Some(Tone::Ok), None, None),
         };
     }
-    if host.starts_with("*.") {
-        return rich("needs an operator bundle", Some(Tone::Warn), None, None);
+    if !state.config.certificates {
+        return rich("HTTP only (certificates off)", None, None, None);
     }
-    if !publicly_issuable(host) {
-        return rich("HTTP only", None, None, None);
-    }
-    if !state.config.acme.enabled {
-        return rich("HTTP only (acme off)", None, None, None);
-    }
-    let failed = state
-        .issuer_status()
-        .and_then(|status| status.hosts.get(host).cloned())
-        .and_then(|host| host.error);
-    match failed {
-        Some(_) => rich("ordering failed", Some(Tone::Danger), None, None),
-        None => rich("ordering", Some(Tone::Info), None, None),
+    match state.cert_states().get(host) {
+        Some(CertState::Skipped(_)) => rich("HTTP only", None, None, None),
+        Some(CertState::AwaitingIssuer) => rich("waiting for issuer", Some(Tone::Info), None, None),
+        Some(CertState::Requested {
+            ready: false,
+            reason,
+            ..
+        }) => rich(reason.clone(), Some(Tone::Danger), None, None),
+        _ => rich("requested", Some(Tone::Info), None, None),
     }
 }
 
@@ -171,6 +169,7 @@ fn problem(row: &RouteRow, health: Option<&super::backend::BackendHealth>) -> Op
 }
 
 fn route_rows(state: &State, rows: &[&RouteRow], with_target: bool) -> Vec<BTreeMap<String, Cell>> {
+    let dns = state.dns();
     let now = chrono::Utc::now().timestamp();
     let table = state.table();
     rows.iter()
@@ -198,6 +197,7 @@ fn route_rows(state: &State, rows: &[&RouteRow], with_target: bool) -> Vec<BTree
                 cells.insert("target".into(), text(row.target.service.clone()));
             }
             cells.insert("endpoints".into(), endpoints_cell(state, row));
+            cells.insert("dns".into(), dns_cell(&dns, &row.host));
             cells.insert(
                 "certificate".into(),
                 if row.served {
@@ -236,6 +236,11 @@ fn route_columns(target_label: &str) -> Vec<Column> {
             kind: ColumnType::Text,
         },
         Column {
+            key: "dns".into(),
+            label: "DNS".into(),
+            kind: ColumnType::Text,
+        },
+        Column {
             key: "certificate".into(),
             label: "Certificate".into(),
             kind: ColumnType::Text,
@@ -246,6 +251,85 @@ fn route_columns(target_label: &str) -> Vec<Column> {
             kind: ColumnType::Text,
         },
     ]
+}
+
+/// Where to point DNS: one `A` record per host, at any of these. A node
+/// with no public address shows its cluster one, with how to give it one.
+fn point_dns_here(edge: &[EdgeAddress]) -> Block {
+    if edge.is_empty() {
+        return Block::Notice(NoticeBlock {
+            tone: Tone::Warn,
+            title: Some("Point DNS here".into()),
+            text: "No replica of the ingress is running and healthy yet, so there is no address to point DNS at. `legion app status ingress` says why.".into(),
+        });
+    }
+    let targets: Vec<String> = edge
+        .iter()
+        .map(|replica| format!("`{}`", replica.target()))
+        .collect();
+    let mut text = format!(
+        "Create an `A` (or `AAAA`) record for each host below pointing at {} {}.",
+        if edge.len() == 1 {
+            "the ingress node,"
+        } else {
+            "the ingress nodes:"
+        },
+        targets.join(", ")
+    );
+    let private: Vec<&str> = edge
+        .iter()
+        .filter(|replica| replica.public_address.is_none())
+        .map(|replica| replica.node_id.as_str())
+        .collect();
+    if !private.is_empty() {
+        text.push_str(&format!(
+            " Node {} reports only its cluster address; if it is behind NAT, start its worker with `LEGION_WORKER_PUBLIC_ADDRESS=<public IP>` and its public address shows here.",
+            private.join(", ")
+        ));
+    }
+    Block::KeyValue(KeyValueBlock {
+        title: Some("Point DNS here".into()),
+        items: std::iter::once(KeyValueItem {
+            key: "records".into(),
+            value: text,
+            tone: None,
+            route: None,
+        })
+        .chain(edge.iter().map(|replica| KeyValueItem {
+            key: replica.node_id.clone(),
+            value: match &replica.public_address {
+                Some(public) => format!("{public} (public; cluster {})", replica.address),
+                None => format!("{} (cluster)", replica.address),
+            },
+            tone: None,
+            route: Some(format!("/nodes/{}", replica.node_id)),
+        }))
+        .collect(),
+    })
+}
+
+/// A route's DNS, as the ingress last resolved its host.
+fn dns_cell(dns: &BTreeMap<String, DnsCheck>, host: &str) -> Cell {
+    if host.starts_with("*.") {
+        return text("-");
+    }
+    match dns.get(host) {
+        Some(DnsCheck::Here) => rich("points here", Some(Tone::Ok), None, None),
+        Some(DnsCheck::Elsewhere(ips)) => rich(
+            format!(
+                "points to {}",
+                ips.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Some(Tone::Warn),
+            None,
+            None,
+        ),
+        Some(DnsCheck::Missing) => rich("no record", Some(Tone::Warn), None, None),
+        None => rich("…", None, None, None),
+    }
 }
 
 /// The Ingress page.
@@ -288,12 +372,39 @@ pub fn routes_view(state: &State, viewer: &Viewer) -> AppView {
             ),
         }));
     }
-    if let Some(error) = state.issuer_status().and_then(|status| status.error) {
-        blocks.push(Block::Notice(NoticeBlock {
-            tone: Tone::Danger,
-            title: Some("Certificates".into()),
-            text: format!("The issuer cannot reach its ACME CA: {error}"),
-        }));
+    if state.config.certificates {
+        if let Some(issuer) = state.issuer() {
+            let problem = if issuer.kind.is_none() {
+                Some(format!(
+                    "There is no certs/Issuer named {}, so no certificate is issued. {}",
+                    issuer.name,
+                    if issuer.name == super::certificates::DEFAULT_ISSUER {
+                        "The ingress creates it; check that the certs app is enabled (`legion app status certs`)."
+                    } else {
+                        "Create it, or set the ingress's `issuer` to one that exists."
+                    }
+                ))
+            } else if !issuer.admits_ingress {
+                Some(format!(
+                    "The certs/Issuer {} does not serve the legion-system namespace, where the ingress keeps its Certificates: add it to the Issuer's `namespaces`.",
+                    issuer.name
+                ))
+            } else if !issuer.ready {
+                Some(format!(
+                    "The certs/Issuer {} is not ready ({}): {}",
+                    issuer.name, issuer.reason, issuer.message
+                ))
+            } else {
+                None
+            };
+            if let Some(text) = problem {
+                blocks.push(Block::Notice(NoticeBlock {
+                    tone: Tone::Danger,
+                    title: Some("Certificates".into()),
+                    text,
+                }));
+            }
+        }
     }
     blocks.push(Block::Stats(StatsBlock {
         title: None,
@@ -314,10 +425,10 @@ pub fn routes_view(state: &State, viewer: &Viewer) -> AppView {
                 label: "Certificates".into(),
                 value: certificates.len().to_string(),
                 tone: None,
-                hint: Some(if state.config.acme.enabled {
-                    "ordered automatically".into()
+                hint: Some(if state.config.certificates {
+                    format!("issued by certs/Issuer {}", state.config.issuer)
                 } else {
-                    "acme off".into()
+                    "certificates off".into()
                 }),
             },
             Stat {
@@ -328,31 +439,7 @@ pub fn routes_view(state: &State, viewer: &Viewer) -> AppView {
             },
         ],
     }));
-    let replicas = state.replicas();
-    blocks.push(Block::KeyValue(KeyValueBlock {
-        title: Some("Listening on".into()),
-        items: if replicas.is_empty() {
-            vec![KeyValueItem {
-                key: "replicas".into(),
-                value: "none reported yet".into(),
-                tone: Some(Tone::Warn),
-                route: None,
-            }]
-        } else {
-            replicas
-                .iter()
-                .map(|(id, record)| KeyValueItem {
-                    key: format!("allocation {id}"),
-                    value: format!(
-                        "{} (http {}, https {})",
-                        record.address, record.http_port, record.https_port
-                    ),
-                    tone: None,
-                    route: None,
-                })
-                .collect()
-        },
-    }));
+    blocks.push(point_dns_here(&state.edge()));
     blocks.push(Block::Table(TableBlock {
         title: Some("Routes".into()),
         columns: route_columns("Service"),
@@ -393,30 +480,38 @@ pub fn routes_view(state: &State, viewer: &Viewer) -> AppView {
             cert_rows.push(cells);
         }
     }
-    let ordering_errors: Vec<(String, String)> = state
-        .issuer_status()
-        .map(|status| {
-            status
-                .hosts
-                .into_iter()
-                .filter(|(host, _)| hosts.contains(host.as_str()))
-                .filter_map(|(host, status)| status.error.map(|error| (host, error)))
-                .collect()
-        })
-        .unwrap_or_default();
-    for (host, error) in ordering_errors {
+    // The cert manager's word on each host it has not issued for yet, and
+    // why the ingress asks for nothing for a host.
+    for (host, state) in state.cert_states() {
+        if !hosts.contains(host.as_str()) {
+            continue;
+        }
+        let (label, tone) = match state {
+            CertState::Requested {
+                ready: false,
+                reason,
+                message,
+            } => (format!("{reason}: {message}"), Some(Tone::Danger)),
+            CertState::Requested {
+                ready: true,
+                reason,
+                message,
+            } if reason != "Issued" => (format!("{reason}: {message}"), Some(Tone::Warn)),
+            CertState::Waiting => (
+                "requested from the cert manager".to_string(),
+                Some(Tone::Info),
+            ),
+            CertState::AwaitingIssuer => (
+                "waiting for the Issuer to register its ACME account".to_string(),
+                Some(Tone::Info),
+            ),
+            CertState::Skipped(why) => (format!("not requested: {why}"), None),
+            CertState::Requested { .. } => continue,
+        };
         let mut cells = BTreeMap::new();
         cells.insert("names".into(), text(host));
-        cells.insert("source".into(), text("acme"));
-        cells.insert(
-            "state".into(),
-            rich(
-                format!("ordering failed: {error}"),
-                Some(Tone::Danger),
-                None,
-                None,
-            ),
-        );
+        cells.insert("source".into(), text("cert manager"));
+        cells.insert("state".into(), rich(label, tone, None, None));
         cert_rows.push(cells);
     }
     blocks.push(Block::Table(TableBlock {

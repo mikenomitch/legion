@@ -154,7 +154,8 @@ mod tests {
     use crate::structs::app_object::KindScope;
 
     /// The manifest's grant is exactly what the app calls: its own KV for
-    /// ACME account keys, and every other key only for one of its objects.
+    /// ACME account keys, and every other key (another app's private prefix
+    /// included) only for one of its objects.
     #[test]
     fn the_certs_manifest_asks_for_what_it_calls_test() {
         let manifest = bundled_manifest("certs").expect("bundled");
@@ -163,7 +164,7 @@ mod tests {
             rules,
             json!([
                 { "resources": ["kv"], "actions": ["read", "write"], "paths": ["legion/apps/certs/*"] },
-                { "resources": ["kv"], "actions": ["read", "write"], "paths": ["*"], "via": "objects" },
+                { "resources": ["kv"], "actions": ["read", "write"], "paths": ["*", "legion/apps/*"], "via": "objects" },
             ])
         );
         let decls = crate::structs::app_object::manifest_kinds(manifest).expect("kinds parse");

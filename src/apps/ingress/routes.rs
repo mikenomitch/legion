@@ -192,8 +192,8 @@ pub fn strip_prefix<'a>(prefix: &str, path: &'a str) -> std::borrow::Cow<'a, str
 
 /// Whether a public CA could issue a certificate for `host`: a name with a
 /// dot, not an IP literal, outside the names reserved for local and test
-/// use. The issuer orders only these; the others are served over HTTP, or
-/// with an operator's bundle.
+/// use. The ingress asks an ACME Issuer only for these; the others are
+/// served over HTTP, from an operator's bundle, or by a private-CA Issuer.
 pub fn publicly_issuable(host: &str) -> bool {
     const RESERVED: [&str; 9] = [
         "localhost",
@@ -375,14 +375,14 @@ impl RouteTable {
                 .is_some_and(|(_, parent)| self.wildcard.contains_key(parent))
     }
 
-    /// Every served exact host a public CA could issue for: what the issuer
-    /// keeps certificates for.
-    pub fn issuable_hosts(&self) -> Vec<String> {
+    /// Every served host, exact names and `*.` wildcards, once each: what
+    /// the ingress asks the cert manager to keep certificates for.
+    pub fn served_hosts(&self) -> Vec<String> {
         let mut hosts: Vec<String> = self
             .exact
             .keys()
-            .filter(|host| publicly_issuable(host))
             .cloned()
+            .chain(self.wildcard.keys().map(|parent| format!("*.{parent}")))
             .collect();
         hosts.sort();
         hosts
@@ -477,7 +477,10 @@ mod tests {
         );
         assert_eq!(job("other.com", "/"), None);
         assert_eq!(backends.len(), 3);
-        assert_eq!(table.issuable_hosts(), vec!["example.com".to_string()]);
+        assert_eq!(
+            table.served_hosts(),
+            vec!["*.example.com".to_string(), "example.com".to_string()]
+        );
         assert!(table.knows_host("acme.example.com"));
     }
 

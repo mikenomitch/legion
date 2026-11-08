@@ -17,7 +17,11 @@
 //!   other namespaces away;
 //! - an ACME Issuer registers with a fake RFC 8555 CA, keeps its account
 //!   key under the app's own KV prefix, and issues a wildcard through
-//!   DNS-01 and the webhook provider.
+//!   DNS-01 and the webhook provider;
+//! - the bundled ingress asks for a certificate for a routed host, the CA
+//!   checks HTTP-01 against the ingress's own port 80, answered from the
+//!   Issuer's thumbprint, and the ingress serves what lands under its KV
+//!   prefix (docs/ingress.md, "HTTPS").
 
 #![allow(clippy::result_large_err)]
 
@@ -805,4 +809,178 @@ fn a_fresh_cluster_runs_the_cert_manager_test() {
     assert_ne!(after["serial"], json!(bundle.leaf.serial));
     let again = Bundle::parse(&kv("certs/web")).expect("a servable bundle");
     assert_eq!(after["serial"], json!(again.leaf.serial));
+}
+
+/// The ingress's routes and endpoints from the in-memory fake
+/// (`ingress.rs`), and everything else (KV, its lock, the cert manager's
+/// objects) from this manager, over gRPC, with the grant its manifest gives.
+struct HalfFake {
+    routes: Arc<crate::ingress::FakeControl>,
+    real: legion::apps::ingress::control::GrpcControl,
+}
+
+#[async_trait::async_trait]
+impl legion::apps::ingress::control::Control for HalfFake {
+    async fn watch_routes(&self) -> R<futures::stream::BoxStream<'static, R<AppExtensionEvent>>> {
+        self.routes.watch_routes().await
+    }
+    async fn resolve(
+        &self,
+        service: &str,
+    ) -> R<Vec<(String, legion::apps::ingress::backend::CatalogEndpoint)>> {
+        self.routes.resolve(service).await
+    }
+    async fn kv_list(&self, prefix: &str) -> R<Vec<legion::apps::ingress::certs::KvVersion>> {
+        self.real.kv_list(prefix).await
+    }
+    async fn kv_get(&self, key: &str) -> R<Option<(String, i64)>> {
+        self.real.kv_get(key).await
+    }
+    async fn kv_put(&self, key: &str, value: &str) -> R<()> {
+        self.real.kv_put(key, value).await
+    }
+    async fn kv_delete(&self, key: &str) -> R<()> {
+        self.real.kv_delete(key).await
+    }
+    async fn lock(&self, key: &str, lock_id: &str, owner: &str, ttl: Duration) -> R<bool> {
+        self.real.lock(key, lock_id, owner, ttl).await
+    }
+    async fn unlock(&self, key: &str, lock_id: &str) {
+        self.real.unlock(key, lock_id).await
+    }
+    async fn apply_object(&self, document: &Value) -> R<()> {
+        self.real.apply_object(document).await
+    }
+    async fn get_object(
+        &self,
+        kind: &str,
+        name: &str,
+        namespace: &str,
+    ) -> R<Option<legion::apps::ingress::control::ObjectView>> {
+        self.real.get_object(kind, name, namespace).await
+    }
+    async fn list_objects(
+        &self,
+        kind: &str,
+        namespace: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> R<Vec<legion::apps::ingress::control::ObjectView>> {
+        self.real.list_objects(kind, namespace, labels).await
+    }
+    async fn delete_object(&self, kind: &str, name: &str, namespace: &str) -> R<()> {
+        self.real.delete_object(kind, name, namespace).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ingress_serves_what_the_cert_manager_issues_for_it_test() -> R<()> {
+    use legion::apps::ingress::certificates::{certificate_name, issued_key, Kinds};
+    use legion::apps::ingress::control::Control;
+    use legion::apps::ingress::{Ingress, IngressConfig, Listen, State};
+
+    let fx = fixture().await?;
+    let ca = FakeAcme::start(FakeAcmeOptions::default()).await?;
+    // An HTTP-01 Issuer for the ingress's namespace, named in its config.
+    fx.apply(
+        "Issuer",
+        "fake-ca",
+        "",
+        json!({}),
+        json!({ "namespaces": ["legion-system"],
+                "acme": { "server": ca.directory_url(), "http01": {} } }),
+        &fx.admin,
+    )
+    .await?;
+    let stop = fx.run_engine(options())?;
+
+    // The ingress, with its manifest's grant (the kinds under this test's
+    // name for the cert manager).
+    let token = fx
+        .token(
+            "ingress",
+            json!([
+                { "resources": ["kv"], "actions": ["read", "write"],
+                  "paths": ["legion/apps/ingress/*"] },
+                { "resources": ["object"], "actions": ["read", "write"],
+                  "namespaces": ["legion-system"], "kinds": [format!("{APP}/Certificate")] },
+                { "resources": ["object"], "actions": ["read"],
+                  "namespaces": ["*"], "kinds": [format!("{APP}/Issuer")] },
+            ]),
+        )
+        .await?;
+    let (routes, events) = crate::ingress::FakeControl::new();
+    let site = crate::ingress::backend("site").await?;
+    routes.set_endpoints("web", "shop", "web", &[site]);
+    events.send(crate::ingress::snapshot(vec![crate::ingress::web_route(
+        "web",
+        "shop.example.com",
+    )]))?;
+    let mut config = IngressConfig::from_value(&json!({ "issuer": "fake-ca" }))?;
+    config.kinds = Kinds { app: APP.into() };
+    let mut ingress = Ingress::start(
+        State::new(config),
+        Listen {
+            http: "127.0.0.1:0".parse()?,
+            https: Some("127.0.0.1:0".parse()?),
+        },
+    )
+    .await?;
+    // The CA checks the challenge where DNS would send it: the ingress.
+    ca.set_http01_target(&ingress.http.to_string());
+    let control: Arc<dyn Control> = Arc::new(HalfFake {
+        routes,
+        real: legion::apps::ingress::control::GrpcControl::new(fx.connection(&token)?.client()),
+    });
+    ingress.connect(control, "test".into(), None, true);
+
+    let name = certificate_name("shop.example.com");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while fx.get("Certificate", &name, "legion-system").await.is_err() {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the ingress never asked for a certificate: {:?}, {:?}",
+            ingress.state.issuer(),
+            ingress.state.cert_states()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let certificate = fx
+        .wait_ready("Certificate", &name, "legion-system", "Issued", |_| true)
+        .await?;
+    let spec: Value = serde_json::from_str(&certificate.spec_json)?;
+    assert_eq!(spec["kv"], issued_key("shop.example.com"));
+    assert_eq!(
+        ca.validations().get("shop.example.com").map(String::as_str),
+        Some("http-01")
+    );
+    assert_eq!(ca.orders(), 1, "no failed first order");
+
+    // Served by SNI, chaining to the CA.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !ingress.state.certs.serves("shop.example.com") {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the ingress never served the issued certificate"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let https = ingress.https.context("https listens")?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("shop.example.com", https)
+        .add_root_certificate(reqwest::Certificate::from_pem(ca.root_pem().as_bytes())?)
+        .build()?;
+    let response = client
+        .get(format!("https://shop.example.com:{}/", https.port()))
+        .send()
+        .await?;
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await?;
+    assert_eq!(
+        (&body["backend"], &body["proto"]),
+        (&json!("site"), &json!("https"))
+    );
+    ingress.stop().await;
+    let _ = stop.send(true);
+    Ok(())
 }

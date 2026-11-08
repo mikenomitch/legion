@@ -748,7 +748,9 @@ mod tests {
     }
 
     /// The ingress asks for what it calls: the catalog in every tenant
-    /// namespace (`job:read`) and its own reserved KV. It is seeded off,
+    /// namespace (`job:read`), its own reserved KV, and the cert manager's
+    /// Certificates in `legion-system` and Issuers (its own one to write).
+    /// It is seeded off,
     /// binds 80 and 443 with the one capability exec tasks may keep, and
     /// declares `ingress` on services, checked by its validate call.
     #[test]
@@ -758,7 +760,11 @@ mod tests {
             serde_json::to_value(&manifest.permissions).expect("rules"),
             json!([
                 { "resources": ["job"], "actions": ["read"], "namespaces": ["*"] },
+                { "resources": ["job"], "actions": ["read"], "namespaces": ["legion-system"], "names": ["ingress"] },
                 { "resources": ["kv"], "actions": ["read", "write"], "paths": ["legion/apps/ingress/*"] },
+                { "resources": ["object"], "actions": ["read", "write"], "namespaces": ["legion-system"], "kinds": ["certs/Certificate"] },
+                { "resources": ["object"], "actions": ["read"], "namespaces": ["*"], "kinds": ["certs/Issuer"] },
+                { "resources": ["object"], "actions": ["write"], "namespaces": ["*"], "kinds": ["certs/Issuer"], "names": ["ingress"] },
             ])
         );
         assert!(!seeds_enabled("ingress"));
@@ -803,7 +809,8 @@ mod tests {
         // The default config reads as the app reads it.
         let config = crate::apps::ingress::IngressConfig::from_value(&manifest.default_config())
             .expect("the default config");
-        assert!(config.acme.enabled);
+        assert!(config.certificates);
+        assert_eq!(config.issuer, "ingress");
     }
 
     #[test]

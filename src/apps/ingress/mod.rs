@@ -14,19 +14,22 @@
 //!   HTTP/1.1 to services, upgrades, `X-Forwarded-*`);
 //! - [`certs`]: the bundles port 443 serves by SNI, followed from the app's
 //!   KV;
-//! - [`issuer`] and [`acme`]: automatic certificates from an ACME CA, one
-//!   issuer per cluster by KV lock;
+//! - [`certificates`]: automatic certificates, from the bundled cert
+//!   manager: one `certs/Certificate` per routed host, and HTTP-01 answered
+//!   statelessly from the Issuer's public thumbprint;
+//! - [`edge`]: where the replicas run (the ingress's own catalog service)
+//!   and whether each routed host's DNS points there;
 //! - [`views`]: the Ingress page and the job panel.
 //!
 //! [`Ingress::start`] runs all of it against any [`control::Control`], so
 //! the integration tests drive the real proxy without a cluster; [`run`] is
 //! the bundled app's body.
 
-pub mod acme;
 pub mod backend;
+pub mod certificates;
 pub mod certs;
 pub mod control;
-pub mod issuer;
+pub mod edge;
 pub mod proxy;
 pub mod routes;
 pub mod views;
@@ -39,9 +42,9 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use self::backend::{Backend, CatalogEndpoint};
-use self::certs::{CertStore, KvVersion, KV_PREFIX};
+use self::certificates::{CertState, IssuerView, Kinds};
+use self::certs::{CertStore, KV_PREFIX};
 use self::control::Control;
-use self::issuer::IssuerStatus;
 use self::routes::{RouteSpec, RouteTable, Target, ValueKey};
 use crate::apps::{AppContext, AppFuture};
 use crate::prelude::*;
@@ -51,73 +54,74 @@ use crate::structs::AppExtensionValue;
 pub const REFRESH_EVERY: Duration = Duration::from_secs(2);
 /// How many services are resolved at once.
 pub const REFRESH_CONCURRENCY: usize = 16;
-/// How often the app's KV (certificates, replicas, issuer status) is read.
+/// How often the app's KV (certificate bundles) and its own replicas are
+/// read.
 pub const SYNC_EVERY: Duration = Duration::from_secs(10);
-/// How often the issuer runs when nothing changes.
-pub const ISSUE_EVERY: Duration = Duration::from_secs(60);
-/// A replica record older than this is not shown.
-pub const REPLICA_STALE: Duration = Duration::from_secs(120);
-/// Replica records, by allocation.
-pub const REPLICA_PREFIX: &str = "legion/apps/ingress/replicas/";
-/// HTTP-01 answers looked up in KV at once by one replica, so a flood of
-/// unknown tokens cannot become a flood of reads.
-pub const CHALLENGE_LOOKUPS: usize = 4;
+/// How often every routed host's DNS is checked.
+pub const DNS_EVERY: Duration = Duration::from_secs(60);
+/// How many routed hosts are looked up at once.
+pub const DNS_CONCURRENCY: usize = 16;
 /// How long open connections get to finish when the app stops.
 pub const STOP_GRACE: Duration = Duration::from_secs(8);
-
-/// The ACME part of the app's config.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcmeConfig {
-    pub enabled: bool,
-    /// The directory URL (aliases resolved).
-    pub directory: String,
-    pub email: Option<String>,
-    pub trust_roots: Option<String>,
-}
 
 /// The app's config (`legion app config get ingress`), with defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngressConfig {
-    pub acme: AcmeConfig,
+    /// Ask the cert manager for a certificate for every routed host its
+    /// Issuer can prove. Default true.
+    pub certificates: bool,
+    /// The `certs/Issuer` that issues them. Default `ingress`, which the app
+    /// keeps itself from `acme`.
+    pub issuer: String,
+    /// The default Issuer's ACME server (`letsencrypt`,
+    /// `letsencrypt-staging`, or a directory URL) and contact.
+    pub acme_server: String,
+    pub acme_email: Option<String>,
     pub redirect_https: bool,
+    /// The app that owns the certificate kinds (`certs`; tests install the
+    /// cert manager under another name).
+    pub kinds: Kinds,
 }
 
 impl IngressConfig {
     /// Read the config the manifest's schema already checked.
     pub fn from_value(value: &Value) -> R<IngressConfig> {
         let acme = value.get("acme").cloned().unwrap_or_else(|| json!({}));
-        let text = |field: &str| {
-            acme.get(field)
+        let text = |value: &Value, field: &str| {
+            value
+                .get(field)
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         };
+        let issuer =
+            text(value, "issuer").unwrap_or_else(|| certificates::DEFAULT_ISSUER.to_string());
+        crate::structs::app_object::validate_object_name(&issuer)
+            .map_err(|err| anyhow!("issuer: {err}"))?;
+        let acme_server = text(&acme, "server").unwrap_or_else(|| "letsencrypt".to_string());
+        if !matches!(acme_server.as_str(), "letsencrypt" | "letsencrypt-staging")
+            && !acme_server.starts_with("https://")
+        {
+            bail!(
+                "acme.server {acme_server:?} is not `letsencrypt`, `letsencrypt-staging`, or an https:// directory URL"
+            );
+        }
         Ok(IngressConfig {
-            acme: AcmeConfig {
-                enabled: acme.get("enabled").and_then(Value::as_bool).unwrap_or(true),
-                directory: acme::directory_url(text("directory").as_deref())?,
-                email: text("email"),
-                trust_roots: text("trustRoots"),
-            },
+            certificates: value
+                .get("certificates")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            issuer,
+            acme_server,
+            acme_email: text(&acme, "email"),
             redirect_https: value
                 .get("redirectHttps")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
+            kinds: Kinds::default(),
         })
     }
-}
-
-/// One replica's record, for the "Listening on" list.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReplicaRecord {
-    /// The node address serving ports 80 and 443.
-    pub address: String,
-    pub http_port: u16,
-    pub https_port: u16,
-    /// Unix seconds.
-    pub seen_at: i64,
 }
 
 /// How the route watch is doing.
@@ -134,13 +138,15 @@ pub struct State {
     pub config: IngressConfig,
     table: RwLock<Arc<RouteTable>>,
     pub certs: Arc<CertStore>,
-    control: RwLock<Option<Arc<dyn Control>>>,
-    /// HTTP-01 answers this replica published.
-    challenges: Mutex<HashMap<String, String>>,
-    challenge_lookups: tokio::sync::Semaphore,
     watch: Mutex<WatchStatus>,
-    issuer: Mutex<Option<IssuerStatus>>,
-    replicas: Mutex<BTreeMap<String, ReplicaRecord>>,
+    /// The certs/Issuer as last read: its thumbprint answers HTTP-01.
+    issuer: Mutex<Option<IssuerView>>,
+    /// Each routed host's certificate, as the views show it.
+    cert_states: Mutex<BTreeMap<String, CertState>>,
+    /// Where the replicas run, from the ingress's own catalog service.
+    edge: Mutex<Vec<edge::EdgeAddress>>,
+    /// Each routed host's DNS, as this node resolves it.
+    dns: Mutex<BTreeMap<String, edge::DnsCheck>>,
     /// Bumped when the routes change, so endpoints and certificates follow
     /// at once instead of on their next tick. A watch, not a `Notify`: a
     /// loop busy when the routes change still sees it on its next wait.
@@ -154,12 +160,11 @@ impl State {
             config,
             table: RwLock::new(Arc::new(RouteTable::default())),
             certs: Arc::new(CertStore::default()),
-            control: RwLock::new(None),
-            challenges: Mutex::new(HashMap::new()),
-            challenge_lookups: tokio::sync::Semaphore::new(CHALLENGE_LOOKUPS),
             watch: Mutex::new(WatchStatus::default()),
             issuer: Mutex::new(None),
-            replicas: Mutex::new(BTreeMap::new()),
+            cert_states: Mutex::new(BTreeMap::new()),
+            edge: Mutex::new(Vec::new()),
+            dns: Mutex::new(BTreeMap::new()),
             routes_changed: tokio::sync::watch::channel(0).0,
             stop: tokio::sync::watch::channel(false).0,
         })
@@ -198,33 +203,47 @@ impl State {
         }
     }
 
-    pub fn issuer_status(&self) -> Option<IssuerStatus> {
+    /// The certs/Issuer as last read.
+    pub fn issuer(&self) -> Option<IssuerView> {
         self.issuer.lock().ok().and_then(|issuer| issuer.clone())
     }
 
-    pub(crate) fn set_issuer_status(&self, status: IssuerStatus) {
-        if let Ok(mut issuer) = self.issuer.lock() {
-            *issuer = Some(status);
+    pub(crate) fn set_issuer(&self, issuer: IssuerView) {
+        if let Ok(mut current) = self.issuer.lock() {
+            *current = Some(issuer);
         }
     }
 
-    /// Live replicas, by allocation.
-    pub fn replicas(&self) -> BTreeMap<String, ReplicaRecord> {
-        let now = chrono::Utc::now().timestamp();
-        self.replicas
+    /// The thumbprint HTTP-01 answers carry, once the Issuer reports one.
+    pub fn thumbprint(&self) -> Option<String> {
+        self.issuer().and_then(|issuer| issuer.thumbprint)
+    }
+
+    /// Each routed host's certificate state.
+    pub fn cert_states(&self) -> BTreeMap<String, CertState> {
+        self.cert_states
             .lock()
-            .map(|replicas| {
-                replicas
-                    .iter()
-                    .filter(|(_, record)| now - record.seen_at <= REPLICA_STALE.as_secs() as i64)
-                    .map(|(id, record)| (id.clone(), record.clone()))
-                    .collect()
-            })
+            .map(|states| states.clone())
             .unwrap_or_default()
     }
 
-    fn control(&self) -> Option<Arc<dyn Control>> {
-        self.control.read().ok().and_then(|control| control.clone())
+    pub(crate) fn set_cert_states(&self, states: BTreeMap<String, CertState>) {
+        if let Ok(mut current) = self.cert_states.lock() {
+            *current = states;
+        }
+    }
+
+    /// Where the replicas run: what DNS should point at.
+    pub fn edge(&self) -> Vec<edge::EdgeAddress> {
+        self.edge
+            .lock()
+            .map(|edge| edge.clone())
+            .unwrap_or_default()
+    }
+
+    /// Each routed host's DNS check.
+    pub fn dns(&self) -> BTreeMap<String, edge::DnsCheck> {
+        self.dns.lock().map(|dns| dns.clone()).unwrap_or_default()
     }
 
     /// Whether the app is stopping.
@@ -234,42 +253,6 @@ impl State {
 
     fn stopped(&self) -> tokio::sync::watch::Receiver<bool> {
         self.stop.subscribe()
-    }
-
-    pub(crate) fn publish_challenge(&self, token: &str, answer: &str) {
-        if let Ok(mut challenges) = self.challenges.lock() {
-            challenges.insert(token.to_string(), answer.to_string());
-        }
-    }
-
-    pub(crate) fn withdraw_challenge(&self, token: &str) {
-        if let Ok(mut challenges) = self.challenges.lock() {
-            challenges.remove(token);
-        }
-    }
-
-    /// The HTTP-01 answer for `token`: this replica's own, else the shared
-    /// board in KV.
-    pub async fn challenge(&self, token: &str) -> Option<String> {
-        if !acme::valid_token(token) {
-            return None;
-        }
-        if let Some(answer) = self
-            .challenges
-            .lock()
-            .ok()
-            .and_then(|challenges| challenges.get(token).cloned())
-        {
-            return Some(answer);
-        }
-        let control = self.control()?;
-        let _permit = self.challenge_lookups.try_acquire().ok()?;
-        control
-            .kv_get(&format!("{}{token}", issuer::CHALLENGE_PREFIX))
-            .await
-            .ok()
-            .flatten()
-            .map(|(answer, _)| answer)
     }
 
     /// A one-line summary for `/healthz`.
@@ -477,35 +460,21 @@ async fn refresh_endpoints(state: Arc<State>, control: Arc<dyn Control>) {
     }
 }
 
-/// Follow the app's KV: certificate bundles, the issuer's status, and the
-/// replicas' records; and keep this replica's record fresh.
-async fn sync_kv(
+/// Follow the app's KV (certificate bundles: the operator's, and the ones
+/// the cert manager writes for the ingress), and, with `edge_service`, where
+/// the replicas run and whether each routed host's DNS points there: every
+/// [`DNS_EVERY`], and at once for a host not checked yet or when the
+/// replicas' addresses change.
+async fn follow_kv_and_edge(
     state: Arc<State>,
     control: Arc<dyn Control>,
-    me: Option<(String, ReplicaRecord)>,
+    edge_service: Option<String>,
 ) {
     let mut stop = state.stopped();
-    let mut versions: HashMap<String, i64> = HashMap::new();
-    let mut last_record = 0i64;
+    let mut routes = state.routes_changed.subscribe();
+    let mut last_dns: Option<std::time::Instant> = None;
     while !state.stopping() {
         let now = chrono::Utc::now().timestamp();
-        if let Some((id, record)) = &me {
-            if now - last_record >= (REPLICA_STALE.as_secs() / 4) as i64 {
-                let record = ReplicaRecord {
-                    seen_at: now,
-                    ..record.clone()
-                };
-                if let Ok(text) = serde_json::to_string(&record) {
-                    match control
-                        .kv_put(&format!("{REPLICA_PREFIX}{id}"), &text)
-                        .await
-                    {
-                        Ok(()) => last_record = now,
-                        Err(err) => debug!("Writing the replica record: {err:#}"),
-                    }
-                }
-            }
-        }
         match control.kv_list(KV_PREFIX).await {
             Ok(listing) => {
                 let fetch = |key: String| {
@@ -516,81 +485,101 @@ async fn sync_kv(
                 if changed > 0 {
                     info!(changed, "Ingress certificates changed");
                 }
-                follow_records(&state, &control, &listing, &mut versions).await;
             }
             Err(err) => debug!("Listing the ingress's KV: {err:#}"),
         }
+        if let Some(service) = &edge_service {
+            let mut edge_moved = false;
+            match control.resolve(service).await {
+                Ok(endpoints) => {
+                    let edge = edge::edge_addresses(&endpoints);
+                    if let Ok(mut current) = state.edge.lock() {
+                        edge_moved = *current != edge;
+                        *current = edge;
+                    }
+                }
+                Err(err) => debug!("Resolving the ingress's own replicas: {err:#}"),
+            }
+            let hosts: Vec<String> = state
+                .table()
+                .served_hosts()
+                .into_iter()
+                .filter(|host| !host.starts_with("*."))
+                .collect();
+            let unchecked = {
+                let dns = state.dns();
+                hosts.iter().any(|host| !dns.contains_key(host))
+            };
+            if edge_moved || unchecked || last_dns.is_none_or(|at| at.elapsed() >= DNS_EVERY) {
+                last_dns = Some(std::time::Instant::now());
+                let edge_ips = edge::edge_ips(&state.edge()).await;
+                let checks: BTreeMap<String, edge::DnsCheck> = futures::stream::iter(hosts)
+                    .map(|host| async move {
+                        let resolved = edge::resolve(&host).await;
+                        (host, resolved)
+                    })
+                    .buffer_unordered(DNS_CONCURRENCY)
+                    .map(|(host, resolved)| {
+                        let check = edge::judge(&resolved, &edge_ips);
+                        (host, check)
+                    })
+                    .collect()
+                    .await;
+                if let Ok(mut current) = state.dns.lock() {
+                    *current = checks;
+                }
+            }
+        }
         tokio::select! {
             _ = tokio::time::sleep(SYNC_EVERY) => {}
+            _ = routes.changed() => {}
             _ = stop.changed() => break,
         }
     }
-    if let Some((id, _)) = me {
-        let _ = control.kv_delete(&format!("{REPLICA_PREFIX}{id}")).await;
-    }
 }
 
-/// Read the issuer status and replica records whose versions changed.
-async fn follow_records(
-    state: &State,
-    control: &Arc<dyn Control>,
-    listing: &[KvVersion],
-    versions: &mut HashMap<String, i64>,
-) {
-    let mut present = std::collections::HashSet::new();
-    for entry in listing {
-        let wanted = entry.key == issuer::STATUS_KEY || entry.key.starts_with(REPLICA_PREFIX);
-        if !wanted {
-            continue;
-        }
-        present.insert(entry.key.clone());
-        if versions.get(&entry.key) == Some(&entry.version) {
-            continue;
-        }
-        let Ok(Some((value, version))) = control.kv_get(&entry.key).await else {
-            continue;
-        };
-        versions.insert(entry.key.clone(), version);
-        if entry.key == issuer::STATUS_KEY {
-            if let Ok(status) = serde_json::from_str::<IssuerStatus>(&value) {
-                state.set_issuer_status(status);
-            }
-        } else if let Ok(record) = serde_json::from_str::<ReplicaRecord>(&value) {
-            let id = entry.key[REPLICA_PREFIX.len()..].to_string();
-            if let Ok(mut replicas) = state.replicas.lock() {
-                replicas.insert(id, record);
-            }
-        }
-    }
-    versions.retain(|key, _| present.contains(key));
-    if let Ok(mut replicas) = state.replicas.lock() {
-        replicas.retain(|id, _| present.contains(&format!("{REPLICA_PREFIX}{id}")));
-    }
-}
-
-/// Run the issuer until stopped, then give its lock back.
-async fn run_issuer(state: Arc<State>, control: Arc<dyn Control>, owner: String) {
+/// Keep the ingress's certificates until stopped, then give the lock back:
+/// a pass every [`certificates::PASS_EVERY`] and whenever the routes change,
+/// and the Issuer re-read every [`certificates::THUMBPRINT_EVERY`] until
+/// its thumbprint is known, so HTTP-01 challenges are answered as soon as
+/// the cert manager registers its account.
+async fn run_certificates(state: Arc<State>, control: Arc<dyn Control>, owner: String) {
     let mut stop = state.stopped();
     let mut routes = state.routes_changed.subscribe();
-    let mut issuer = issuer::Issuer::new(control, state.clone(), owner);
-    // Let the first route snapshot and certificate sync land first.
-    tokio::select! {
-        _ = tokio::time::sleep(Duration::from_secs(3)) => {}
-        _ = stop.changed() => return,
-    }
+    let mut keeper = certificates::Certificates::new(control, state.clone(), owner);
+    let mut last_pass: Option<std::time::Instant> = None;
+    let mut routes_moved = false;
     while !state.stopping() {
-        routes.mark_unchanged();
-        issuer.pass().await;
+        if routes_moved || last_pass.is_none_or(|at| at.elapsed() >= certificates::PASS_EVERY) {
+            routes_moved = false;
+            keeper.pass().await;
+            last_pass = Some(std::time::Instant::now());
+        } else if state.config.certificates && state.thumbprint().is_none() {
+            keeper.read_issuer().await;
+            if state.thumbprint().is_some() {
+                // The account is registered: ask for the Certificates that
+                // waited for it now, not on the next pass.
+                routes_moved = true;
+                continue;
+            }
+        }
+        let wait = if state.config.certificates && state.thumbprint().is_none() {
+            certificates::THUMBPRINT_EVERY
+        } else {
+            certificates::PASS_EVERY
+        };
         tokio::select! {
-            _ = tokio::time::sleep(ISSUE_EVERY) => {}
+            _ = tokio::time::sleep(wait) => {}
             _ = routes.changed() => {
                 // Let a burst of route changes settle into one pass.
                 tokio::time::sleep(Duration::from_secs(2)).await;
+                routes.mark_unchanged();
+                routes_moved = true;
             }
             _ = stop.changed() => break,
         }
     }
-    issuer.release().await;
+    keeper.release().await;
 }
 
 /// Answer the validate call: a value whose host and path another job's
@@ -637,18 +626,14 @@ pub fn validate_values(
                             .push(format!("{host}{} is also routed by {other} in this job", spec.path));
                     }
                 }
-                if state.config.acme.enabled
-                    && !host.starts_with("*.")
-                    && !routes::publicly_issuable(host)
-                {
-                    result.warnings.push(format!(
-                        "{host} gets no automatic certificate (no public CA issues for it); it is served over HTTP unless an operator bundle under legion/apps/ingress/certs/ covers it"
-                    ));
-                }
-                if host.starts_with("*.") {
-                    result.warnings.push(format!(
-                        "{host} needs an operator bundle for HTTPS: automatic certificates cover exact names only"
-                    ));
+                if state.config.certificates {
+                    if let Some(issuer) = state.issuer() {
+                        if let Err(why) = issuer.proves(host) {
+                            result.warnings.push(format!(
+                                "{host} gets no automatic certificate ({why}); it is served over HTTP unless an operator bundle under legion/apps/ingress/certs/ covers it"
+                            ));
+                        }
+                    }
                 }
             }
             result
@@ -720,19 +705,17 @@ impl Ingress {
         })
     }
 
-    /// Start following Legion through `control`: routes, endpoints, KV, and
-    /// (with `issue`) the certificate issuer. `me` is this replica's id and
-    /// record for the views.
+    /// Start following Legion through `control`: routes, endpoints, KV,
+    /// (with `edge_service`) the ingress's own replicas and its routes' DNS,
+    /// and (with `issue`) the certificates the cert manager keeps for the
+    /// routes. `owner` names this replica on the certificates lock.
     pub fn connect(
         &mut self,
         control: Arc<dyn Control>,
         owner: String,
-        me: Option<(String, ReplicaRecord)>,
+        edge_service: Option<String>,
         issue: bool,
     ) {
-        if let Ok(mut slot) = self.state.control.write() {
-            *slot = Some(control.clone());
-        }
         self.tasks.push(tokio::spawn(watch_routes(
             self.state.clone(),
             control.clone(),
@@ -741,19 +724,22 @@ impl Ingress {
             self.state.clone(),
             control.clone(),
         )));
-        self.tasks.push(tokio::spawn(sync_kv(
+        self.tasks.push(tokio::spawn(follow_kv_and_edge(
             self.state.clone(),
             control.clone(),
-            me,
+            edge_service,
         )));
         if issue {
-            self.tasks
-                .push(tokio::spawn(run_issuer(self.state.clone(), control, owner)));
+            self.tasks.push(tokio::spawn(run_certificates(
+                self.state.clone(),
+                control,
+                owner,
+            )));
         }
     }
 
     /// Stop: the listeners close, open connections get [`STOP_GRACE`], and
-    /// the issuer gives its lock back.
+    /// the certificates lock is given back.
     pub async fn stop(self) {
         let _ = self.state.stop.send(true);
         for task in self.tasks {
@@ -809,8 +795,8 @@ async fn run_body(mut context: AppContext) -> R<()> {
         app = context.name(),
         http = %ingress.http,
         https = ?ingress.https,
-        acme = state.config.acme.enabled,
-        directory = %state.config.acme.directory,
+        certificates = state.config.certificates,
+        issuer = %state.config.issuer,
         "The ingress is listening"
     );
     let connection = loop {
@@ -835,17 +821,12 @@ async fn run_body(mut context: AppContext) -> R<()> {
             .ok()
             .filter(|id| !id.trim().is_empty())
             .unwrap_or_else(|| format!("{:016x}", rand::random::<u64>()));
-        let address = std::env::var("LEGION_IP_HTTP")
-            .ok()
-            .filter(|address| !address.trim().is_empty())
-            .unwrap_or_else(|| ingress.http.ip().to_string());
-        let record = ReplicaRecord {
-            address,
-            http_port: ingress.http.port(),
-            https_port: ingress.https.map(|address| address.port()).unwrap_or(0),
-            seen_at: 0,
-        };
-        ingress.connect(control, format!("alloc-{id}"), Some((id, record)), true);
+        ingress.connect(
+            control,
+            format!("alloc-{id}"),
+            Some(edge::SERVICE.to_string()),
+            true,
+        );
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
             tokio::select! {
@@ -866,19 +847,25 @@ mod tests {
     #[test]
     fn the_config_reads_with_defaults() {
         let config = IngressConfig::from_value(&json!({})).unwrap();
-        assert!(config.acme.enabled);
-        assert_eq!(config.acme.directory, acme::LETS_ENCRYPT);
+        assert!(config.certificates);
+        assert_eq!(config.issuer, certificates::DEFAULT_ISSUER);
+        assert_eq!(config.acme_server, "letsencrypt");
         assert!(config.redirect_https);
+        assert_eq!(config.kinds.certificate(), "certs/Certificate");
         let config = IngressConfig::from_value(&json!({
-            "acme": { "enabled": false, "directory": "letsencrypt-staging", "email": " ops@example.com " },
+            "certificates": false,
+            "issuer": "letsencrypt-dns",
+            "acme": { "server": "letsencrypt-staging", "email": " ops@example.com " },
             "redirectHttps": false,
         }))
         .unwrap();
-        assert!(!config.acme.enabled);
-        assert_eq!(config.acme.directory, acme::LETS_ENCRYPT_STAGING);
-        assert_eq!(config.acme.email.as_deref(), Some("ops@example.com"));
+        assert!(!config.certificates);
+        assert_eq!(config.issuer, "letsencrypt-dns");
+        assert_eq!(config.acme_server, "letsencrypt-staging");
+        assert_eq!(config.acme_email.as_deref(), Some("ops@example.com"));
         assert!(!config.redirect_https);
-        assert!(IngressConfig::from_value(&json!({ "acme": { "directory": "ftp://x" } })).is_err());
+        assert!(IngressConfig::from_value(&json!({ "acme": { "server": "ftp://x" } })).is_err());
+        assert!(IngressConfig::from_value(&json!({ "issuer": "Not A Name" })).is_err());
     }
 
     fn value(job: &str, service: &str, effective: Value) -> AppExtensionValue {
@@ -944,6 +931,14 @@ mod tests {
         )
         .unwrap()];
         state.set_table(RouteTable::compile(&taken, &mut backends));
+        // An ACME Issuer over HTTP-01: it cannot prove `.internal` names.
+        state.set_issuer(certificates::IssuerView::from_object(
+            "ingress",
+            &control::ObjectView {
+                spec: json!({ "namespaces": ["legion-system"], "acme": { "http01": {} } }),
+                ..Default::default()
+            },
+        ));
         let call_value =
             |effective: Value, service: &str| crate::structs::extensions::ValidateCallValue {
                 point: crate::structs::spec_fields::ExtensionPoint::Service,

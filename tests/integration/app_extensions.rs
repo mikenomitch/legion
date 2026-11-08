@@ -1811,7 +1811,10 @@ async fn an_upgrade_that_drops_a_used_point_needs_force_test() -> R<()> {
 /// submit even while the app is disabled (with a warning that the app was
 /// not asked), and its values reach the ingress's own identity over
 /// `WatchAppExtensions`. The app's grant covers everything it calls: the
-/// catalog, its own KV, and its issuer lock, and no one else's KV.
+/// catalog (its own service included, for where to point DNS), its own KV
+/// and certificates lock, a `certs/Certificate` per host in legion-system
+/// written under its own KV prefix, and its own `certs/Issuer`; and no one
+/// else's KV or Issuer.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_bundled_ingress_routes_reach_its_identity_test() -> R<()> {
     let fx = fixture().await?;
@@ -1932,7 +1935,7 @@ async fn the_bundled_ingress_routes_reach_its_identity_test() -> R<()> {
     fx.svc
         .put_kv(req(
             PutKvRequest {
-                key: "legion/apps/ingress/replicas/1".into(),
+                key: "legion/apps/ingress/certs/probe".into(),
                 value: "{}".into(),
                 value_type: KvValueType::String as i32,
                 ..Default::default()
@@ -1952,7 +1955,7 @@ async fn the_bundled_ingress_routes_reach_its_identity_test() -> R<()> {
     fx.svc
         .acquire_kv_lock(req(
             AcquireKvLockRequest {
-                key: legion::apps::ingress::issuer::LOCK_KEY.into(),
+                key: legion::apps::ingress::certificates::LOCK_KEY.into(),
                 lock_id: Some("a".repeat(32)),
                 owner: Some("test".into()),
                 ttl_seconds: 60,
@@ -1975,5 +1978,60 @@ async fn the_bundled_ingress_routes_reach_its_identity_test() -> R<()> {
         .await
         .expect_err("another app's KV");
     assert_eq!(denied.code(), Code::PermissionDenied);
+
+    // Its own replicas, for "Point DNS here".
+    fx.svc
+        .resolve_service(req(
+            ResolveServiceRequest {
+                service: legion::apps::ingress::edge::SERVICE.into(),
+                include_unhealthy: true,
+            },
+            &token,
+        ))
+        .await?;
+    // Its certificates, through the cert manager: seeded with it, its kinds
+    // installed as the reconciler's pass installs them.
+    fx.svc
+        .sync_object_kinds_for("certs")
+        .map_err(|status| anyhow!("{}", status.message()))?;
+    use legion::apps::ingress::certificates::{
+        certificate_document, default_issuer_document, Kinds,
+    };
+    let kinds = Kinds::default();
+    let apply = |document: Value| {
+        let token = token.clone();
+        let svc = fx.svc.clone();
+        async move {
+            svc.apply_object(req(
+                ApplyObjectRequest {
+                    object_json: document.to_string(),
+                    ..Default::default()
+                },
+                &token,
+            ))
+            .await
+        }
+    };
+    apply(default_issuer_document(
+        &kinds,
+        "letsencrypt",
+        Some("ops@example.com"),
+    ))
+    .await?;
+    apply(certificate_document(&kinds, "ingress", "shop.example.com")).await?;
+    let denied = apply(json!({
+        "kind": "certs/Issuer",
+        "name": "corp-ca",
+        "spec": { "selfSigned": {} },
+    }))
+    .await
+    .expect_err("an Issuer that is not its own");
+    assert_eq!(denied.code(), Code::PermissionDenied, "{denied:?}");
+    let mut elsewhere = certificate_document(&kinds, "ingress", "shop.example.com");
+    elsewhere["namespace"] = json!("default");
+    let denied = apply(elsewhere)
+        .await
+        .expect_err("a Certificate outside legion-system");
+    assert_eq!(denied.code(), Code::PermissionDenied, "{denied:?}");
     Ok(())
 }

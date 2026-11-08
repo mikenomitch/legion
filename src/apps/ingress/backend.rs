@@ -171,6 +171,8 @@ pub struct CatalogEndpoint {
     pub node_id: String,
     pub healthy: bool,
     pub mesh_tls: bool,
+    /// The node's public address, when its worker has one (empty if not).
+    pub public_address: String,
 }
 
 /// One routed service.
@@ -385,6 +387,7 @@ mod tests {
                 node_id: "n1".into(),
                 healthy: true,
                 mesh_tls: false,
+                public_address: String::new(),
             })
             .collect();
         backend.update(&catalog);
@@ -403,6 +406,7 @@ mod tests {
                 node_id: "n1".into(),
                 healthy: true,
                 mesh_tls: false,
+                public_address: String::new(),
             },
             CatalogEndpoint {
                 host: "10.0.0.2".into(),
@@ -411,6 +415,7 @@ mod tests {
                 node_id: "n2".into(),
                 healthy: false,
                 mesh_tls: false,
+                public_address: String::new(),
             },
         ];
         catalog.push(CatalogEndpoint {
@@ -420,6 +425,7 @@ mod tests {
             node_id: "n3".into(),
             healthy: true,
             mesh_tls: true,
+            public_address: String::new(),
         });
         backend.update(&catalog);
         let after = backend.endpoints();

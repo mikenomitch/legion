@@ -180,11 +180,18 @@ Issuer.
 
 The CA fetches `http://<name>/.well-known/acme-challenge/<token>` on port
 80, and expects `<token>.<thumbprint>`, where the thumbprint is the
-Issuer's ACME account's. Legion has no cluster edge that knows which node a
-name points at, so the cert manager does not try to answer itself. Instead,
-because the thumbprint is public, **one stateless responder answers every
-challenge**, for every name, with no secret and no list of pending
-challenges:
+Issuer's ACME account's. The cert manager does not answer itself: it does
+not know which node a name points at. Because the thumbprint is public,
+**one stateless responder answers every challenge**, for every name, with
+no secret and no list of pending challenges.
+
+**With the bundled [ingress](ingress.md), there is nothing to run.** The
+ingress holds port 80 where your names point, answers every challenge for
+the Issuer it uses, and asks for a Certificate per routed host itself
+([HTTPS](ingress.md#https)). The responder below is for names the ingress
+does not serve.
+
+Without the ingress, run the responder:
 
 ```console
 $ legion cert http01 --issuer letsencrypt --listen 0.0.0.0:80
@@ -456,7 +463,7 @@ Hint: the kind requires it of whoever writes its objects (`legion object explain
 
 ```nickel
 { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/certs/*"] },
-{ resources = ["kv"], actions = ["read", "write"], paths = ["*"], via = "objects" },
+{ resources = ["kv"], actions = ["read", "write"], paths = ["*", "legion/apps/*"], via = "objects" },
 ```
 
 Its own credential reaches only its own KV prefix (the ACME account keys).
@@ -466,7 +473,11 @@ Certificate's keys within what that Certificate's writer was checked for, an
 Issuer's CA and tokens within what the Issuer's writer was checked for. So a
 Certificate can never make the app write a key its writer could not, and
 the app holds no standing access to any secret. The `*` does not reach the
-reserved `legion/` prefix.
+reserved `legion/` prefix, so `legion/apps/*` is named too: an app can ask
+for a certificate in its own private KV prefix (the bundled
+[ingress](ingress.md) keeps its certificates under
+`legion/apps/ingress/issued/`), and since only that app holds its prefix,
+only its Certificates can send the cert manager there.
 
 The CA key is read for the Issuer, not for the Certificate: a Certificate's
 writer never needs (and never gets) access to the CA key to have a
@@ -519,10 +530,10 @@ The app's config takes no fields: everything lives on the objects.
 - **No DNS self-check.** The app waits `propagationDelay` and then asks the
   CA, rather than checking the record itself first. A provider that is slow
   to publish needs a longer delay.
-- **HTTP-01 needs a responder you run.** Nothing in Legion knows which nodes
-  a name points at, so HTTP-01 works only where port 80 reaches a `legion
-  cert http01` responder (or a server answering with the thumbprint).
-  TLS-ALPN-01 is not supported.
+- **HTTP-01 needs something on port 80.** HTTP-01 works only where port 80
+  reaches the bundled [ingress](ingress.md), a `legion cert http01`
+  responder, or a server answering with the thumbprint. TLS-ALPN-01 is not
+  supported.
 - **Certificates are requested by objects, not by jobs.** There is no
   jobspec key that requests a certificate for a port (cert-manager's
   ingress-shim): apply a Certificate, and name its key in the job.

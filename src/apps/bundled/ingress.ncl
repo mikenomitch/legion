@@ -39,6 +39,11 @@ let host_name = {
           { name = "api" },
         ],
       },
+      # The replicas, in the catalog: `legion service resolve
+      # legion-system/ingress` lists every node the ingress answers on, with
+      # its public address (LEGION_WORKER_PUBLIC_ADDRESS) when it has one.
+      # The app reads the same list for its "Point DNS here" block.
+      service = { name = "ingress", port = "http", meta = { protocol = "http" } },
       checks = [
         {
           type = "health",
@@ -53,14 +58,23 @@ let host_name = {
     },
   },
   # Exactly what the app calls: ResolveService for every routed service, in
-  # any tenant namespace (job:read; it reads endpoints, never changes a
-  # job), and its own KV under the reserved legion/apps/ingress/: operator
-  # certificate bundles, the certificates and ACME account it keeps, HTTP-01
-  # answers, its replicas' addresses, and the issuer lock. WatchAppExtensions
-  # is app-plane: the manager answers it for this app's identity alone.
+  # any tenant namespace, and for its own (job:read; it reads endpoints,
+  # never changes a job); its own KV under the reserved legion/apps/ingress/ (operator
+  # certificate bundles, the bundles the cert manager issues for it, its
+  # replicas' addresses, and its lock); and the cert manager's objects: the
+  # certs/Certificate it keeps for each routed host, in legion-system only,
+  # every certs/Issuer to read (its thumbprint answers HTTP-01), and the one
+  # Issuer it keeps itself, named `ingress`. A Certificate's `requires` asks
+  # its writer for kv read and write on the key it names, which this grant
+  # holds for legion/apps/ingress/ alone. WatchAppExtensions is app-plane:
+  # the manager answers it for this app's identity alone.
   permissions = [
     { resources = ["job"], actions = ["read"], namespaces = ["*"] },
+    { resources = ["job"], actions = ["read"], namespaces = ["legion-system"], names = ["ingress"] },
     { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/ingress/*"] },
+    { resources = ["object"], actions = ["read", "write"], namespaces = ["legion-system"], kinds = ["certs/Certificate"] },
+    { resources = ["object"], actions = ["read"], namespaces = ["*"], kinds = ["certs/Issuer"] },
+    { resources = ["object"], actions = ["write"], namespaces = ["*"], kinds = ["certs/Issuer"], names = ["ingress"] },
   ],
   # The route: `service = { port = "http", ingress = { host = "…" } }`.
   extensions = [
@@ -120,26 +134,26 @@ let host_name = {
       type = "object",
       additionalProperties = false,
       properties = {
+        certificates = {
+          type = "boolean",
+          description = "Ask the cert manager (the bundled certs app) for a certificate for every routed host its Issuer can prove. Default true. Set false behind a load balancer that terminates TLS.",
+        },
+        issuer = {
+          type = "string",
+          description = "The certs/Issuer that issues them. Default `ingress`, an ACME Issuer this app keeps from `acme` (HTTP-01, answered on port 80). Name another (a DNS-01 Issuer for wildcard hosts, a ca Issuer for internal names) to use it instead; it must list legion-system in its namespaces.",
+        },
         acme = {
           type = "object",
           additionalProperties = false,
-          description = "Automatic certificates for routed hosts, from an ACME CA over HTTP-01 on port 80.",
+          description = "The `ingress` Issuer's ACME settings; ignored when `issuer` names another. Creating that Issuer agrees to the CA's terms of service.",
           properties = {
-            enabled = {
-              type = "boolean",
-              description = "Order certificates for routed hosts. Default true: enabling the app agrees to the CA's terms of service. Set false behind a load balancer that terminates TLS.",
-            },
-            directory = {
+            server = {
               type = "string",
               description = "`letsencrypt` (the default), `letsencrypt-staging`, or an ACME directory URL (https://).",
             },
             email = {
               type = "string",
               description = "The account's contact address. Optional.",
-            },
-            trustRoots = {
-              type = "string",
-              description = "Extra PEM root certificates to trust when talking to the directory: a private ACME CA such as step-ca or Pebble.",
             },
           },
         },
@@ -151,11 +165,11 @@ let host_name = {
     },
     default = {},
   },
-  # Where the app sends its account key's signatures and which CA it trusts:
-  # changing either changes who can obtain certificates for the cluster's
-  # hosts, so it needs the app's whole grant.
+  # Which CA issues the certificates for the cluster's public hosts:
+  # changing it changes who can obtain them, so it needs the app's whole
+  # grant.
   codeFields = [
-    "/acme/directory",
-    "/acme/trustRoots",
+    "/issuer",
+    "/acme/server",
   ],
 }

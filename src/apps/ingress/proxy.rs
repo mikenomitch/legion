@@ -41,7 +41,7 @@ pub const MAX_ATTEMPTS: usize = 3;
 /// The header that names the ingress's own errors.
 pub const ERROR_HEADER: &str = "legion-ingress-error";
 /// Where ACME HTTP-01 challenges are answered.
-pub const CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
+pub const CHALLENGE_PREFIX: &str = crate::apps::certs::http01::CHALLENGE_PREFIX;
 
 /// Request headers that describe one hop, never forwarded (RFC 9110 §7.6.1).
 const HOP_BY_HOP: [&str; 8] = [
@@ -274,7 +274,7 @@ pub async fn handle(
 ) -> Response<ProxyBody> {
     let path = request.uri().path().to_string();
     if !tls && path.starts_with(CHALLENGE_PREFIX) {
-        return answer_challenge(&state, &path[CHALLENGE_PREFIX.len()..]).await;
+        return answer_challenge(&state, request.method().as_str(), &path);
     }
     let Some(host) = request_host(&request) else {
         return refusal(
@@ -518,12 +518,16 @@ fn respond(
     )
 }
 
-/// Answer an ACME HTTP-01 challenge from the board every replica shares.
-async fn answer_challenge(state: &State, token: &str) -> Response<ProxyBody> {
-    match state.challenge(token).await {
-        Some(answer) => plain(StatusCode::OK, "application/octet-stream", answer),
-        None => plain(StatusCode::NOT_FOUND, "text/plain", "no such challenge\n"),
-    }
+/// Answer an ACME HTTP-01 challenge for the Issuer the ingress uses:
+/// `<token>.<thumbprint>`, from the account's public thumbprint, as the
+/// cert manager's own responder does. Every replica answers every token
+/// with no shared state; until the thumbprint is known, `503`.
+fn answer_challenge(state: &State, method: &str, path: &str) -> Response<ProxyBody> {
+    let thumbprint = state.thumbprint();
+    let answer =
+        crate::apps::certs::http01::answer(method, path, None, thumbprint.as_deref(), false);
+    let status = StatusCode::from_u16(answer.status).unwrap_or(StatusCode::NOT_FOUND);
+    plain(status, "text/plain", answer.body)
 }
 
 /// How each listener serves connections.
