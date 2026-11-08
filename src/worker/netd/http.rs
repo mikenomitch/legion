@@ -1561,7 +1561,7 @@ async fn attempt_request(
             } else if target.port == default_port {
                 format!("[{}]", target.host)
             } else {
-                format!("{}:{}", target.host, target.port)
+                crate::structs::hostport::join(&target.host, target.port)
             }
         }
         None => host_header.unwrap_or(addr).to_string(),

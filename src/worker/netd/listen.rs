@@ -38,6 +38,11 @@ pub enum ListenAddr {
     /// A Unix socket: the host end of a sandbox guest's vsock port, which
     /// the VMM connects the guest's streams for that port to.
     Unix(PathBuf),
+    /// Every address of the host on this port, both families (an ingress
+    /// port with no explicit bind; mesh-control-path plan §6.5): `[::]`
+    /// with `IPV6_V6ONLY` off, so one socket takes IPv4 and IPv6, or
+    /// `0.0.0.0` when the host has no IPv6.
+    AnyAddress(u16),
 }
 
 impl ListenAddr {
@@ -54,6 +59,7 @@ impl ListenAddr {
                 crate::worker::netd::netns::bind_tcp(netns.clone(), *addr).await?,
             )),
             ListenAddr::Unix(path) => Ok(Listener::Unix(bind_unix(path)?)),
+            ListenAddr::AnyAddress(port) => Ok(Listener::Tcp(bind_any_address(*port).await?)),
         }
     }
 
@@ -65,7 +71,7 @@ impl ListenAddr {
             ListenAddr::Tcp { netns, addr } => Ok(Some(
                 crate::worker::netd::netns::bind_udp(netns.clone(), *addr).await?,
             )),
-            ListenAddr::Unix(_) => Ok(None),
+            ListenAddr::Unix(_) | ListenAddr::AnyAddress(_) => Ok(None),
         }
     }
 
@@ -73,7 +79,7 @@ impl ListenAddr {
     pub fn unix_path(&self) -> Option<&Path> {
         match self {
             ListenAddr::Unix(path) => Some(path),
-            ListenAddr::Tcp { .. } => None,
+            ListenAddr::Tcp { .. } | ListenAddr::AnyAddress(_) => None,
         }
     }
 }
@@ -87,8 +93,55 @@ impl std::fmt::Display for ListenAddr {
                 addr,
             } => write!(f, "{addr} in {}", netns.display()),
             ListenAddr::Unix(path) => write!(f, "{}", path.display()),
+            ListenAddr::AnyAddress(port) => write!(f, "[::]:{port} (IPv4 and IPv6)"),
         }
     }
+}
+
+/// Bind every address on `port`, IPv4 and IPv6 on one socket, or IPv4 only
+/// when the host has no IPv6 (the socket cannot be made, or `[::]` cannot be
+/// bound while `0.0.0.0` can).
+async fn bind_any_address(port: u16) -> R<TcpListener> {
+    match bind_dual_stack(port) {
+        Ok(listener) => Ok(listener),
+        Err(v6) => {
+            let v4 = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
+            let listener = crate::worker::netd::netns::bind_tcp(None, v4)
+                .await
+                .with_context(|| format!("bind [::]:{port} failed too: {v6}"))?;
+            debug!(port, error = %v6, "No IPv6 on this host; listening on IPv4 only");
+            Ok(listener)
+        }
+    }
+}
+
+fn bind_dual_stack(port: u16) -> io::Result<TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v6()?;
+    socket.set_reuseaddr(true)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let off: libc::c_int = 0;
+        // SAFETY: a valid socket descriptor, and a pointer to a c_int that
+        // lives across the call, with its size.
+        let rc = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &off as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    socket.bind(SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        port,
+    ))?;
+    socket.listen(1024)
 }
 
 fn bind_unix(path: &Path) -> R<UnixListener> {
@@ -120,6 +173,9 @@ impl Listener {
         match self {
             Listener::Tcp(listener) => {
                 let (stream, peer) = listener.accept().await?;
+                // An IPv4 client of a dual-stack socket arrives as
+                // `::ffff:a.b.c.d`; policy and logs see `a.b.c.d`.
+                let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
                 Ok((Stream::Tcp(stream), Some(peer)))
             }
             Listener::Unix(listener) => {
@@ -286,5 +342,30 @@ mod tests {
         client.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"pong");
         unix_task.abort();
+    }
+
+    /// Mesh-control-path plan §6.5: an ingress port with no explicit bind
+    /// takes IPv4 and, where the host has it, IPv6, and an IPv4 client is
+    /// seen as IPv4, not as a mapped IPv6 address.
+    #[tokio::test]
+    async fn any_address_takes_both_families_and_canonicalizes_peers_test() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listener = ListenAddr::AnyAddress(port).bind().await.unwrap();
+        let v4 = tokio::spawn(async move { TcpStream::connect(("127.0.0.1", port)).await });
+        let (_, peer) = listener.accept().await.unwrap();
+        let peer = peer.expect("a TCP peer");
+        assert_eq!(peer.ip(), std::net::IpAddr::from([127, 0, 0, 1]), "{peer}");
+        let _ = v4.await;
+        // IPv6 only where the host has it (CI containers often do not).
+        if std::net::TcpListener::bind("[::1]:0").is_ok() {
+            let v6 = tokio::spawn(async move { TcpStream::connect(("::1", port)).await });
+            let (_, peer) = listener.accept().await.unwrap();
+            assert!(peer.expect("a TCP peer").is_ipv6());
+            let _ = v6.await;
+        }
     }
 }

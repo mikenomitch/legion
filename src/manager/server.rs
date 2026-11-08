@@ -15045,11 +15045,10 @@ fn parse_test_target(
             return (Some(parsed.host), ip, parsed.port, path);
         }
     }
-    let (host, port) = match target.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => {
-            (host.to_string(), port.parse().unwrap_or(0))
-        }
-        _ => (target.to_string(), 0),
+    let (host, port) = match crate::structs::hostport::split(target) {
+        Some((host, port)) => (host.to_string(), port),
+        // A bare name or IP, IPv6 included, with no port.
+        None => (crate::structs::hostport::host_of(target).to_string(), 0),
     };
     let ip = host.parse().ok();
     (Some(host.to_ascii_lowercase()), ip, port, None)

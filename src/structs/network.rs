@@ -1450,8 +1450,9 @@ pub struct UpstreamTarget {
 }
 
 impl UpstreamTarget {
+    /// `host:port`, with an IPv6 host in brackets.
     pub fn addr(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        crate::structs::hostport::join(&self.host, self.port)
     }
 }
 
@@ -1580,7 +1581,10 @@ impl AllocUpstream {
     /// `<vip>:<canonical port>` when a VIP was assigned — what
     /// `<key>.svc.legion` resolves to.
     pub fn vip_address(&self) -> Option<String> {
-        Some(format!("{}:{}", self.vip.as_ref()?, self.canonical_port?))
+        Some(crate::structs::hostport::join(
+            self.vip.as_ref()?,
+            self.canonical_port?,
+        ))
     }
 }
 

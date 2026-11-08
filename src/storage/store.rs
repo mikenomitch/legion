@@ -338,25 +338,13 @@ fn node_public_address(config_attrs: &Value) -> Option<String> {
 }
 
 /// Extract the host portion of a node's advertised `workerAddress` config
-/// attribute (for example `http://10.0.0.5:4848` -> `10.0.0.5`).
+/// attribute (`http://10.0.0.5:4848` -> `10.0.0.5`,
+/// `http://[fd00::5]:4848` -> `fd00::5`). An IPv6 host comes back without
+/// brackets; whoever joins it with a port brackets it again
+/// (`structs::hostport`).
 fn worker_address_host(config_attrs: &Value) -> Option<String> {
     let address = config_attrs.as_object()?.get("workerAddress")?.as_str()?;
-    let without_scheme = address
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(address);
-    let host = without_scheme
-        .split('/')
-        .next()
-        .unwrap_or(without_scheme)
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(without_scheme);
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
+    crate::structs::hostport::url_host(address).map(str::to_string)
 }
 
 /// Allocations per node, each node's vector shared by refcount: the few

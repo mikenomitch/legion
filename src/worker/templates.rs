@@ -261,7 +261,9 @@ pub fn render(source: &str, context: &TemplateContext<'_>) -> R<String> {
 }
 
 fn render_body(body: &[Token], endpoint: &Endpoint) -> R<String> {
-    let (address, port) = match endpoint.addr.rsplit_once(':') {
+    // `.address` is the bare host: an IPv6 one comes without brackets, so a
+    // template writing `{{ .address }}:{{ .port }}` must bracket it itself.
+    let (address, port) = match crate::structs::hostport::split(&endpoint.addr) {
         Some((host, port)) => (host.to_string(), port.to_string()),
         None => (endpoint.addr.clone(), String::new()),
     };

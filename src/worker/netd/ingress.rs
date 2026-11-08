@@ -302,10 +302,12 @@ impl IngressListeners {
     }
 
     async fn start(&self, spec: IngressSpec) {
-        let listen = ListenAddr::host(SocketAddr::new(
-            spec.bind.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            spec.host_port,
-        ));
+        // No explicit bind: every address, IPv4 and IPv6 (mesh-control-path
+        // plan §6.5).
+        let listen = match spec.bind {
+            Some(ip) => ListenAddr::host(SocketAddr::new(ip, spec.host_port)),
+            None => ListenAddr::AnyAddress(spec.host_port),
+        };
         let key = (spec.allocation_id, spec.label.clone());
         match listen.bind().await {
             Ok(listener) => {

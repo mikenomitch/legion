@@ -105,7 +105,7 @@ impl Listener {
         self.running()
             && match self.spec.listen_addr() {
                 ListenAddr::Unix(path) => path.exists(),
-                ListenAddr::Tcp { .. } => true,
+                ListenAddr::Tcp { .. } | ListenAddr::AnyAddress(_) => true,
             }
     }
 }
