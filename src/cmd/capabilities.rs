@@ -50,9 +50,9 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "job.info",
-            cli: "legion job info <NAME>",
+            cli: "legion job info <NAME> [--index REVISION [--wait SECONDS]] [--consistent]",
             grpc: Some("Manager/GetJobInfo"),
-            summary: "Inspect a single job's current state.",
+            summary: "Inspect a single job's current state, its spec `version`, and the `revision` the answer reflects. --index blocks until the job changes after that revision (a blocking query); --consistent reads through the leader.",
             mutates: false,
             read_only_safe: true,
         },
@@ -230,9 +230,9 @@ pub fn catalog() -> Vec<Capability> {
         // --- Jobs: write ---
         Capability {
             name: "job.run",
-            cli: "legion job run <PATH>",
+            cli: "legion job run <PATH> [--expected-version N]",
             grpc: Some("Manager/RunJob"),
-            summary: "Submit or update a job. Supports --wait, --idempotency-key, and --allow-unknown-fields.",
+            summary: "Submit or update a job. Supports --wait, --idempotency-key, --allow-unknown-fields, and --expected-version (compare-and-set on the job's spec version; 0 = must not exist; a lost race is Aborted naming the current version).",
             mutates: true,
             read_only_safe: false,
         },
@@ -1041,10 +1041,11 @@ pub fn catalog() -> Vec<Capability> {
         // --- KV ---
         Capability {
             name: "kv.get",
-            cli: "legion kv get <KEY>",
+            cli: "legion kv get <KEY> [--index REVISION [--wait SECONDS]] [--consistent]",
             grpc: Some("Manager/GetKv"),
             summary: "Read a value from the KV store. A missing key is a `NotFound` error \
-                 (non-zero exit), so `kv get || kv put` works.",
+                 (non-zero exit), so `kv get || kv put` works. --index blocks until the key \
+                 changes after that revision; --consistent reads through the leader.",
             mutates: false,
             read_only_safe: true,
         },
@@ -1717,6 +1718,23 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion usage [--namespaces NS] [--by namespace|job|submitter|hour] [--since 7d] | legion namespace usage <NS>",
             grpc: Some("Manager/GetUsage"),
             summary: "Time-integrated reserved usage (CPU core-hours, memory GiB-hours, cores, allocation-hours, custom resources) per namespace, job, or submitting token.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        // --- Revisions and watches (revisions-and-watches plan) ---
+        Capability {
+            name: "job.watch",
+            cli: "legion job watch [NAME] [--allocations [--node NODE]] [--from REVISION] [--timeout SECONDS]",
+            grpc: Some("Manager/Watch"),
+            summary: "Stream each change to a job (status, versions, allocations) or to its allocations as it commits, resuming after a revision with --from. A revision older than the manager's journal is a ResyncRequired error: read again and watch from the read's revision. NDJSON with --json.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "kv.watch",
+            cli: "legion kv watch [PREFIX] [--from REVISION] [--timeout SECONDS]",
+            grpc: Some("Manager/Watch"),
+            summary: "Stream each write or delete of a KV key under a prefix as it commits, resuming after a revision with --from. NDJSON with --json.",
             mutates: false,
             read_only_safe: true,
         },

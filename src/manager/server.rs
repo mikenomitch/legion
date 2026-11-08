@@ -149,6 +149,12 @@ mod scaling_rpcs;
 mod session_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
+// `PlanJobReply.diff` (revisions-and-watches plan §9).
+mod plan_diff;
+// Blocking reads and `Manager.Watch` (revisions-and-watches plan).
+#[cfg(test)]
+mod revision_rpcs_test;
+mod watch_rpcs;
 mod work_stream;
 pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};
 pub(crate) use scaling_rpcs::scaling_replica_counts;
@@ -157,6 +163,7 @@ pub use snapshot_rpcs::{
     checkpoint_part_keys, expire_snapshots, PartKeyUse, CHECKPOINT_CAPABILITY,
 };
 pub use suspend_rpcs::{idle_sweep, settle_stalled_resumes, IdleSweepOutcome, IdleSweeper};
+pub use watch_rpcs::{CONSISTENCY_HEADER, MAX_READ_WAIT, MIN_REVISION_HEADER, WAIT_HEADER};
 
 /// The delegated exec keys as last read, their version, and when.
 type CachedExecKeys = (std::time::Instant, String, Vec<crate::structs::ExecKey>);
@@ -2495,8 +2502,11 @@ impl ManagerDaemonService {
         namespace: Option<&str>,
         unknown_field_mode: UnknownFieldMode,
         app_warnings: Vec<String>,
+        // `RunJobRequest.expected_version`: compare-and-set on the job's
+        // latest version, checked in the entry that writes the new one.
+        expected_version: Option<i64>,
     ) -> Result<SubmittedJob, Status> {
-        self.submit_rendered_job_from(
+        self.submit_rendered_job_from_checked(
             identity,
             js,
             subs,
@@ -2507,6 +2517,7 @@ impl ManagerDaemonService {
             SubmitOrigin::Principal,
             unknown_field_mode,
             app_warnings,
+            expected_version,
         )
     }
 
@@ -2680,7 +2691,7 @@ impl ManagerDaemonService {
         &self,
         identity: &AclIdentity,
         js: &str,
-        mut subs: Vec<Submission>,
+        subs: Vec<Submission>,
         // Explicit eval-queue override (`--priority`/`--asap`). `None` lets
         // the job's priority band set the queue position, which is the
         // default and the point of having one field mean both things.
@@ -2697,6 +2708,52 @@ impl ManagerDaemonService {
         // calls (`ask_apps_to_validate`).
         app_warnings: Vec<String>,
     ) -> Result<SubmittedJob, Status> {
+        self.submit_rendered_job_from_checked(
+            identity,
+            js,
+            subs,
+            priority,
+            force_reschedule,
+            template,
+            namespace,
+            origin,
+            unknown_field_mode,
+            app_warnings,
+            None,
+        )
+    }
+
+    /// [`Self::submit_rendered_job_from`] with compare-and-set on the job's
+    /// latest version (`RunJobRequest.expected_version`; revisions-and-
+    /// watches plan §9). Only a principal's own submit takes one.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_rendered_job_from_checked(
+        &self,
+        identity: &AclIdentity,
+        js: &str,
+        mut subs: Vec<Submission>,
+        priority: Option<i64>,
+        force_reschedule: bool,
+        template: Option<&JobTemplateProvenance>,
+        namespace: Option<&str>,
+        origin: SubmitOrigin,
+        unknown_field_mode: UnknownFieldMode,
+        app_warnings: Vec<String>,
+        expected_version: Option<i64>,
+    ) -> Result<SubmittedJob, Status> {
+        if expected_version.is_some()
+            && (!matches!(origin, SubmitOrigin::Principal) || identity.acting_for.is_some())
+        {
+            return Err(Status::invalid_argument(
+                "expected_version is only taken on a principal's own submit, not on an app's \
+                 submit or one acting for an object",
+            ));
+        }
+        if expected_version.is_some_and(|version| version < 0) {
+            return Err(Status::invalid_argument(
+                "expected_version must be 0 (the job must not exist) or a stored version",
+            ));
+        }
         if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
             subs.push(Submission {
                 path: "job.rendered.json".into(),
@@ -2747,12 +2804,13 @@ impl ManagerDaemonService {
                     crate::structs::app::ManagedBy::for_object(actor),
                     Some(&unknown_fields),
                 ),
-                None => self.store.handle_job_submit_as(
+                None => self.store.handle_job_submit_checked(
                     &config,
                     &subs,
                     template,
                     &identity.principal,
                     Some(&unknown_fields),
+                    expected_version,
                 ),
             },
             SubmitOrigin::App {
@@ -3154,6 +3212,8 @@ impl ManagerDaemonService {
                 warnings: warnings_from_message(&message),
                 message,
                 deduplicated: true,
+                version: 0,
+                revision: self.store.current_revision_string(),
             }));
         }
 
@@ -3167,7 +3227,14 @@ impl ManagerDaemonService {
             inner.namespace.as_deref(),
             UnknownFieldMode::from_allow(inner.allow_unknown_fields),
             app_warnings,
+            inner.expected_version,
         )?;
+        // The version the job is at now, for the caller's next
+        // compare-and-set.
+        let version = self
+            .store
+            .latest_job_version(&submitted.job_name)
+            .unwrap_or_default();
 
         let message = submitted.message_with_warnings();
         // The lookup above only catches a duplicate that arrived after the
@@ -3198,6 +3265,8 @@ impl ManagerDaemonService {
             warnings: warnings_from_message(&message),
             message,
             deduplicated,
+            version,
+            revision: self.store.current_revision_string(),
         }))
     }
 
@@ -5459,6 +5528,7 @@ impl Manager for ManagerDaemonService {
                 inner.namespace.as_deref(),
                 UnknownFieldMode::from_allow(inner.allow_unknown_fields),
                 app_warnings,
+                None,
             )?;
             info!(
                 template = %template.name,
@@ -5503,7 +5573,11 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             self.job_read_scope(&request.get_ref().name),
         )?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
         let name = request.into_inner().name;
+        let revision = self
+            .prepare_read(&directives, watch_rpcs::ReadScope::Job(name.clone()))
+            .await?;
 
         let mut job = self.store.get_job_with_status(&name).map_err(|e| {
             self.job_lookup_error(&identity, &name, map_store_error("Error getting job", e))
@@ -5550,6 +5624,7 @@ impl Manager for ManagerDaemonService {
             managed_by,
             unknown_fields,
             extensions,
+            revision,
         };
 
         Ok(Response::new(reply))
@@ -6271,6 +6346,14 @@ impl Manager for ManagerDaemonService {
             .as_ref()
             .map(|existing| artifact_pin_diffs(existing, &config))
             .unwrap_or_default();
+        // Field by field, what the submit would change in the stored spec
+        // (revisions-and-watches plan §9, review AI5).
+        let diff = match existing_config.as_ref() {
+            Some(existing) if !existing.is_same_as(&config) => {
+                self.plan_field_diff(&identity, existing, &config)
+            }
+            _ => Vec::new(),
+        };
 
         let (
             plan,
@@ -6475,6 +6558,7 @@ impl Manager for ManagerDaemonService {
                 })
                 .collect(),
             extensions: self.job_extension_values(&config),
+            diff,
         };
 
         Ok(Response::new(reply))
@@ -6703,9 +6787,13 @@ impl Manager for ManagerDaemonService {
     ) -> Result<Response<ListJobsReply>, Status> {
         let identity =
             self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
         let request = request.into_inner();
         let selection = crate::structs::namespace::NamespaceSelection::parse(&request.namespaces)
             .map_err(Status::invalid_argument)?;
+        let revision = self
+            .prepare_read(&directives, watch_rpcs::ReadScope::Jobs)
+            .await?;
         let query = normalize_query(request.query);
         let sort_by = request.sort_by.unwrap_or_else(|| "updated_at".to_string());
         let sort_desc = request
@@ -6813,6 +6901,7 @@ impl Manager for ManagerDaemonService {
             status_counts,
             elsewhere_count,
             elsewhere_namespaces,
+            revision,
         }))
     }
 
@@ -8019,7 +8108,14 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             AclScope::job(&request.get_ref().job_id),
         )?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
         let inner = request.into_inner();
+        let revision = self
+            .prepare_read(
+                &directives,
+                watch_rpcs::ReadScope::Job(inner.job_id.clone()),
+            )
+            .await?;
         let group = inner.group.filter(|group| !group.trim().is_empty());
 
         let mut suspend = self
@@ -8124,6 +8220,7 @@ impl Manager for ManagerDaemonService {
             next_session_page_token: listing.next_page_token,
             session_count: listing.count,
             sessions_by_node: listing.by_node,
+            revision,
         }))
     }
 
@@ -8914,17 +9011,25 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         acl::enforce_worker_plane(&identity)?;
         crate::manager::telemetry::metrics().heartbeats_total.inc();
-        let req = request.into_inner();
-        let id = req.id;
+        let mut req = request.into_inner();
+        let id = std::mem::take(&mut req.id);
         acl::enforce_node_binding(&identity, &id)?;
-        let provisional_claims = req.provisional_claims;
-        // Checkpoint outcomes first: a failed restore also fails its
-        // allocation in `failed_allocations` below, and the instance's
-        // restore source must be cleared before that reschedules it, or the
-        // replacement would try the same restore again.
-        snapshot_rpcs::apply_snapshot_reports(&self.store, &id, &req.snapshot_reports);
+        let provisional_claims = std::mem::take(&mut req.provisional_claims);
 
-        // Offloaded, not called inline. In steady state this is now cheap —
+        // Everything this beat reports that can write the store runs on the
+        // blocking pool, in one hop, in the order it always ran (ST5,
+        // revisions-and-watches plan §8): checkpoint outcomes first (a
+        // failed restore also fails its allocation in `failed_allocations`,
+        // and the instance's restore source must be cleared before that
+        // reschedules it, or the replacement would try the same restore
+        // again), then the heartbeat itself, then failures, terminations,
+        // health, volume outcomes, and pressure actions. Each of those can
+        // make a replicated write, and a write parks its thread for the whole
+        // quorum round: inline, they held a runtime worker each, so a burst
+        // of reporting nodes starved every other handler on the manager.
+        //
+        // The heartbeat update was the first to move off the runtime.
+        // In steady state it is now cheap —
         // one read-model lookup and one map write, no commit and no fsync
         // (docs/node-liveness.md) — but the call is still BLOCKING on the
         // paths that do commit: a `lost -> active` transition, and the
@@ -8939,48 +9044,46 @@ impl Manager for ManagerDaemonService {
         // batches at size 1 and defeats the group commit entirely
         // (HEARTBEAT_BATCH_MAX is 128). Measured on gp3 EBS before the
         // offload: 86 heartbeats/sec, 17% of the 2s cadence, host idle.
-        {
+        let (retry_failed_allocations, retry_terminated_allocations) = {
             let store = self.store.clone();
-            let heartbeat_id = id.clone();
-            tokio::task::spawn_blocking(move || store.update_node_heartbeat(heartbeat_id))
-                .await
-                .map_err(|e| Status::internal(format!("heartbeat task failed: {e}")))?
-                .map_err(|e| map_store_error("Error updating node heartbeat", e))?;
-        }
-
-        let retry_failed_allocations = handle_failed_allocations(
-            &self.store,
-            &self.allocation_failures,
-            &id,
-            &req.failed_allocations,
-        );
-        let retry_terminated_allocations =
-            handle_terminated_allocations(&self.store, &id, &req.terminated_allocations);
-        if let Err(err) =
-            update_allocation_health_snapshots(&self.store, &id, &req.allocation_health)
-        {
-            error!(
-                node_id = %id,
-                error = ?err,
-                "Error updating allocation health snapshots"
-            );
-        }
-
-        // Volume outcomes flow manager-ward here: workers own the drivers, the
-        // manager owns the state machine (see docs/volumes.md).
-        apply_volume_reports(&self.store, &id, &req.volume_reports);
-
-        // Before the desired set is built, so an allocation the worker just
-        // evicted for memory pressure is already gone from this reply and is
-        // not handed straight back to it.
-        if let Err(err) = handle_pressure_actions(
-            &self.store,
-            &self.allocation_failures,
-            &id,
-            &req.pressure_actions,
-        ) {
-            error!(node_id = %id, error = ?err, "Error handling pressure actions");
-        }
+            let failures = Arc::clone(&self.allocation_failures);
+            let node_id = id.clone();
+            let snapshot_reports = std::mem::take(&mut req.snapshot_reports);
+            let failed = std::mem::take(&mut req.failed_allocations);
+            let terminated = std::mem::take(&mut req.terminated_allocations);
+            let health = std::mem::take(&mut req.allocation_health);
+            let volume_reports = std::mem::take(&mut req.volume_reports);
+            let pressure_actions = std::mem::take(&mut req.pressure_actions);
+            tokio::task::spawn_blocking(move || -> R<(Vec<i64>, Vec<i64>)> {
+                snapshot_rpcs::apply_snapshot_reports(&store, &node_id, &snapshot_reports);
+                store.update_node_heartbeat(node_id.clone())?;
+                let retry_failed = handle_failed_allocations(&store, &failures, &node_id, &failed);
+                let retry_terminated = handle_terminated_allocations(&store, &node_id, &terminated);
+                if let Err(err) = update_allocation_health_snapshots(&store, &node_id, &health) {
+                    error!(
+                        node_id = %node_id,
+                        error = ?err,
+                        "Error updating allocation health snapshots"
+                    );
+                }
+                // Volume outcomes flow manager-ward here: workers own the
+                // drivers, the manager owns the state machine (see
+                // docs/volumes.md).
+                apply_volume_reports(&store, &node_id, &volume_reports);
+                // Before the desired set is built, so an allocation the
+                // worker just evicted for memory pressure is already gone
+                // from this reply and is not handed straight back to it.
+                if let Err(err) =
+                    handle_pressure_actions(&store, &failures, &node_id, &pressure_actions)
+                {
+                    error!(node_id = %node_id, error = ?err, "Error handling pressure actions");
+                }
+                Ok((retry_failed, retry_terminated))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("heartbeat task failed: {e}")))?
+            .map_err(|e| map_store_error("Error updating node heartbeat", e))?
+        };
 
         // Elastic envelope resizes the node asked for (docs/session-mode.md,
         // "Elastic envelopes"). Before the desired set is built, so a reply
@@ -9011,11 +9114,16 @@ impl Manager for ManagerDaemonService {
             .map(|reported| self.store.work_log().check_heartbeat(&id, reported))
             .unwrap_or_default();
         let (desired_allocations, feed_allocations) = if stream.via_stream {
-            let held = self.store.work_log().held_payloads(&id, |allocation| {
-                !allocation.task_connect.is_empty()
-                    || !allocation.task_network.is_empty()
-                    || !allocation.network.is_empty()
-            });
+            let held = self.store.work_log().held_payloads(
+                &id,
+                |allocation| {
+                    !allocation.task_connect.is_empty()
+                        || !allocation.task_network.is_empty()
+                        || !allocation.network.is_empty()
+                },
+                // After a resume, the payloads it did not resend.
+                |missing| work_stream::load_held_payloads(&self.store, &id, missing),
+            );
             (Vec::new(), held)
         } else {
             let desired = build_desired_allocations(&self.store, &id, &req.allocation_ids)
@@ -10776,6 +10884,10 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             AclScope::any(),
         )?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
+        let revision = self
+            .prepare_read(&directives, watch_rpcs::ReadScope::Allocations)
+            .await?;
         let ledger = self
             .store
             .get_ledger()
@@ -10828,7 +10940,7 @@ impl Manager for ManagerDaemonService {
             None => true,
         });
 
-        let reply: GetLedgerReply = GetLedgerReply { nodes };
+        let reply: GetLedgerReply = GetLedgerReply { nodes, revision };
 
         Ok(Response::new(reply))
     }
@@ -11605,7 +11717,10 @@ impl Manager for ManagerDaemonService {
             reconcile_kv_changes(&self.store, &[(req.key.clone(), false)])?;
         }
 
-        Ok(Response::new(PutKvReply { entry: Some(entry) }))
+        Ok(Response::new(PutKvReply {
+            entry: Some(entry),
+            revision: self.store.current_revision_string(),
+        }))
     }
 
     #[instrument(skip_all)]
@@ -11616,7 +11731,11 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             AclScope::path(&request.get_ref().key),
         )?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
         let req = request.into_inner();
+        let revision = self
+            .prepare_read(&directives, watch_rpcs::ReadScope::Key(req.key.clone()))
+            .await?;
         let entry = if req.metadata_only {
             self.store.get_kv_metadata(&req.key)
         } else {
@@ -11643,7 +11762,11 @@ impl Manager for ManagerDaemonService {
             })
             .collect();
 
-        Ok(Response::new(GetKvReply { entry, references }))
+        Ok(Response::new(GetKvReply {
+            entry,
+            references,
+            revision,
+        }))
     }
 
     /// Resolves an artifact credential from KV for a worker about to fetch.
@@ -11713,7 +11836,14 @@ impl Manager for ManagerDaemonService {
     ) -> Result<Response<ListKvReply>, Status> {
         let identity =
             self.check_acl(&request, AclResource::Kv, AclAction::Read, AclScope::any())?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
         let req = request.into_inner();
+        let revision = self
+            .prepare_read(
+                &directives,
+                watch_rpcs::ReadScope::Prefix(req.prefix.clone()),
+            )
+            .await?;
         // Values only on request: browsing key names should not decrypt and
         // ship every secret in the prefix.
         let entries = if req.include_values {
@@ -11748,7 +11878,11 @@ impl Manager for ManagerDaemonService {
             Vec::new()
         };
 
-        Ok(Response::new(ListKvReply { entries, locks }))
+        Ok(Response::new(ListKvReply {
+            entries,
+            locks,
+            revision,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -11772,6 +11906,7 @@ impl Manager for ManagerDaemonService {
 
         Ok(Response::new(DeleteKvReply {
             message: "kv entry deleted".to_string(),
+            revision: self.store.current_revision_string(),
         }))
     }
 
@@ -12586,6 +12721,17 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::DeleteObjectRequest>,
     ) -> Result<Response<crate::structs::DeleteObjectReply>, Status> {
         self.delete_object_rpc(request).await
+    }
+
+    type WatchStream = ReceiverStream<Result<crate::structs::WatchEvent, Status>>;
+
+    // ACL: `job:read` or `kv:read`, coarse here and per change in the
+    // handler (revisions-and-watches plan §3).
+    async fn watch(
+        &self,
+        request: Request<crate::structs::WatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        self.watch_rpc(request).await
     }
 
     type WatchObjectsStream = ReceiverStream<Result<crate::structs::ObjectEvent, Status>>;
@@ -17094,6 +17240,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?;
 
@@ -17176,6 +17323,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?;
 
@@ -17237,6 +17385,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?;
 
@@ -17294,6 +17443,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?;
         Ok(())
@@ -18811,6 +18961,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?;
 
@@ -20499,6 +20650,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: Some("off-runtime-1".into()),
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?
             .into_inner();
@@ -20530,6 +20682,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
         };
 

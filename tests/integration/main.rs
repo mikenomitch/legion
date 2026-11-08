@@ -99,6 +99,7 @@ mod raft_write_path;
 mod ratify_throughput_measure;
 mod resource_scoring;
 mod restore_placement_indexed;
+mod revisions_watch;
 mod rollout_integration;
 mod sandbox_bridge_placement;
 mod scaling_inputs;

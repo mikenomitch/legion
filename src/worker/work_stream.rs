@@ -19,6 +19,14 @@
 //! A message can also push checkpoint work (`checkpoint_requests`). That is
 //! not part of the mirror: it is handed to the caller to start at once, and
 //! the heartbeat's full checkpoint set stays the record.
+//!
+//! **Resume** (revisions-and-watches plan §7): the mirror keeps the
+//! `revision` of the last message it applied, across a dropped stream, and a
+//! reconnect sends it. A manager that cannot replay but still knows what
+//! changed on the node since then answers with one `resumed_from` message
+//! carrying only those changes, applied on top of the mirror. A resume
+//! that does not continue from the mirror's revision is refused: the stream
+//! is dropped and reopened with no position, which gets a full resync.
 
 use crate::prelude::*;
 use crate::storage::work_log::WorkDigest;
@@ -47,6 +55,9 @@ pub struct WorkMirror {
     /// A resync has been applied on the current stream, so the mirror is the
     /// manager's desired set and the heartbeat may report it.
     live: bool,
+    /// The `revision` of the last message applied, kept across a dropped
+    /// stream for the reconnect to resume from. Empty: nothing to resume.
+    revision: String,
 }
 
 /// Shared between the stream task and the heartbeat loop.
@@ -70,6 +81,9 @@ pub struct Applied {
     /// Endpoint sets a push-only message carried (mesh-control-path plan
     /// §6.1), for the datapath to apply now. Not part of the mirror.
     pub endpoint_feed: Option<crate::structs::EndpointFeed>,
+    /// The message was a resume that does not continue from this mirror's
+    /// revision: the stream must be reopened with no position.
+    pub resume_refused: bool,
 }
 
 impl WorkMirror {
@@ -96,9 +110,22 @@ impl WorkMirror {
             self.epoch = message.epoch;
             self.seq = message.seq;
             self.live = true;
+            self.revision = message.revision.clone();
             return applied;
         }
-        if !self.live || message.epoch != self.epoch || message.seq != self.seq + 1 {
+        if !message.resumed_from.is_empty() {
+            // A resume continues from the revision this mirror last applied,
+            // whatever epoch that came from; anything else would apply
+            // changes to a set they were not computed against.
+            if self.revision.is_empty() || self.revision != message.resumed_from {
+                applied.resume_refused = true;
+                return applied;
+            }
+            self.epoch = message.epoch;
+            self.seq = message.seq.saturating_sub(1);
+            self.live = true;
+            applied.reconcile = true;
+        } else if !self.live || message.epoch != self.epoch || message.seq != self.seq + 1 {
             return applied;
         }
         for allocation in &message.upserts {
@@ -121,7 +148,20 @@ impl WorkMirror {
             self.stops.push(stop.clone());
         }
         self.seq = message.seq;
+        self.revision = message.revision.clone();
         applied
+    }
+
+    /// The revision a reconnect resumes from: the last message applied,
+    /// kept across a dropped stream. Empty when there is nothing to resume.
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    /// Forget the revision, so the next stream asks for a full resync (a
+    /// resume was refused).
+    pub fn forget_revision(&mut self) {
+        self.revision.clear();
     }
 
     /// The position and digest a heartbeat reports, when the mirror is live.
@@ -216,13 +256,17 @@ where
     F: Fn(Applied),
     A: Fn(WorkRequest) -> WorkRequest,
 {
-    let (last_epoch, last_seq) = mirror.lock().unwrap_or_else(|p| p.into_inner()).position();
+    let ((last_epoch, last_seq), last_revision) = {
+        let mirror = mirror.lock().unwrap_or_else(|p| p.into_inner());
+        (mirror.position(), mirror.revision().to_string())
+    };
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamWorkRequest>(64);
     tx.send(StreamWorkRequest {
         frame: Some(stream_work_request::Frame::Open(StreamWorkOpen {
             node_id: node_id.to_string(),
             last_epoch,
             last_seq,
+            last_revision,
         })),
     })
     .await
@@ -245,6 +289,16 @@ where
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .apply(&message);
+        if applied.resume_refused {
+            mirror
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .forget_revision();
+            return Err(tonic::Status::aborted(
+                "the manager resumed from a revision this worker did not apply; reopening for a \
+                 full resync",
+            ));
+        }
         // Acked once applied, so a reconnect resumes after it.
         let _ = tx
             .send(StreamWorkRequest {
@@ -286,8 +340,61 @@ mod work_stream_test {
                 .collect(),
             digest: String::new(),
             checkpoint_requests: Vec::new(),
+            revision: format!("r{seq}"),
+            resumed_from: String::new(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_resume_applies_on_top_of_the_mirror_only_from_its_revision() {
+        let mut mirror = WorkMirror::default();
+        mirror.apply(&message(1, true, &[1, 2], &[]));
+        mirror.apply(&message(2, false, &[3], &[]));
+        assert_eq!(mirror.revision(), "r2");
+        mirror.mark_down();
+        assert_eq!(mirror.position(), (0, 0), "no replay position while down");
+        assert_eq!(mirror.revision(), "r2", "the revision outlives the stream");
+
+        // A new manager (another epoch) resumes from r2: 1 stopped, 4 new.
+        let mut resume = message(1, false, &[4], &[1]);
+        resume.epoch = 99;
+        resume.resumed_from = "r2".into();
+        resume.revision = "r9".into();
+        let applied = mirror.apply(&resume);
+        assert!(!applied.resume_refused);
+        assert!(applied.reconcile);
+        assert_eq!(
+            applied
+                .added
+                .iter()
+                .map(|a| a.allocation_id)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        let ids: Vec<i64> = mirror
+            .desired()
+            .iter()
+            .map(|allocation| allocation.allocation_id)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 4]);
+        let state = mirror.state().expect("live after a resume");
+        assert_eq!((state.epoch, state.seq), (99, 1));
+        assert_eq!(state.digest, WorkDigest::of([2, 3, 4]).render());
+        assert_eq!(mirror.revision(), "r9");
+        // Deltas continue in the new epoch.
+        let mut next = message(2, false, &[5], &[]);
+        next.epoch = 99;
+        mirror.apply(&next);
+        assert_eq!(mirror.desired().len(), 4);
+
+        // A resume from a revision the mirror did not apply is refused.
+        let mut stale = message(1, false, &[], &[]);
+        stale.epoch = 100;
+        stale.resumed_from = "r1".into();
+        assert!(mirror.apply(&stale).resume_refused);
+        mirror.forget_revision();
+        assert_eq!(mirror.revision(), "");
     }
 
     #[test]

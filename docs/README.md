@@ -198,6 +198,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   but capped, new work waits behind a backlog). Covers what to read, what
   the neighboring metric rules out, and what to change.
 - [Event Stream](event-stream.md): scheduler events as history and live tail.
+- [Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md):
+  the revision on every job, allocation, and KV read; blocking reads
+  (`--index`), `legion job watch` / `legion kv watch` with resume, linearizable
+  and read-your-writes consistency, job compare-and-set, and plan diffs.
 - [Streaming Persistence](persistence-streaming.md): WAL shipping and
   lease-fenced failover.
 - [Running Raft](raft-operations.md): leader election, failover, membership.

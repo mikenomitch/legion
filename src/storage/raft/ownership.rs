@@ -395,6 +395,10 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // (raft-write-path plan §6.3, `raft::speculation`): this node's own
     // bookkeeping, written outside every changeset session.
     ("raft_speculative", Owner::Internal),
+    // The `local_disk` revision counter's reserved bound (revisions-and-
+    // watches plan §1). Node-local bookkeeping like `raft_applied`: raft
+    // mode derives revisions from the applied markers and never writes it.
+    ("store_revision", Owner::Internal),
 ];
 
 /// Tables classified above that do not exist in the schema YET. Tolerated by

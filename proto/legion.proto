@@ -136,6 +136,10 @@ service Manager {
   // blocked job waits for (`Job.blocked`), and the replacements of failed
   // allocations still waiting out their reschedule backoff
   // (`Job.reschedule_backoffs`).
+  //
+  // Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+  // `x-legion-consistency` request headers and returns `revision` (see
+  // "Blocking reads" above `WatchKind`).
   rpc GetJobInfo (GetJobInfoRequest) returns (GetJobInfoReply);
 
   // Lists rollouts, optionally filtered by job and active status.
@@ -515,6 +519,10 @@ service Manager {
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
 
   // Lists jobs known by the manager.
+  //
+  // Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+  // `x-legion-consistency` request headers and returns `revision` (see
+  // "Blocking reads" above `WatchKind`).
   rpc ListJobs (ListJobsRequest) returns (ListJobsReply);
 
   // === NAMESPACES ===
@@ -1151,6 +1159,10 @@ service Manager {
   // from the session index of this manager and every peer: `durable =
   // false`, `mode = "session"`. `complete` says whether every node that can
   // run sessions has reported, and `as_of` when the index was read.
+  //
+  // Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+  // `x-legion-consistency` request headers and returns `revision` (see
+  // "Blocking reads" above `WatchKind`).
   rpc ListInstances (ListInstancesRequest) returns (ListInstancesReply);
 
   // Returns one stateful instance by id.
@@ -1706,13 +1718,21 @@ service Manager {
   //   allocations that left the desired set with why. A placement reaches the
   //   worker one network round trip after it commits, whatever the heartbeat
   //   cadence.
+  // - **Resume.** A worker whose last message came from another epoch (this
+  //   manager process is not the one it last streamed from, as after a
+  //   failover or a restart) sends the `revision` of that message as
+  //   `open.last_revision`. When this manager's journal still covers it for
+  //   the node, the first message has `resumed_from` set and carries only the
+  //   allocations that changed on the node since that revision, as upserts
+  //   and stops, instead of the whole set (revisions-and-watches plan, ST3).
   // - **Full resync.** A message with `resync = true` carries the node's whole
   //   desired set and replaces what the worker holds. It is the first message
-  //   on a stream that cannot resume: a new `epoch` (this manager process is
-  //   not the one the worker last streamed from, as after a failover or a
-  //   restart), a `last_seq` ahead of the manager's, or a `last_seq` older
-  //   than the messages the manager still keeps. It also follows a heartbeat
-  //   whose digest disagreed with the manager's (`HeartbeatReply.work_resync`).
+  //   on a stream that can neither replay nor resume: a new `epoch` with no
+  //   `last_revision`, or one older than the journal (a manager restarted,
+  //   or more than 256 changes on the node since), a `last_seq` ahead of the
+  //   manager's, or a `last_seq` older than the messages the manager still
+  //   keeps. It also follows a heartbeat whose digest disagreed with the
+  //   manager's (`HeartbeatReply.work_resync`).
   // - **Checkpoint work.** A snapshot of the node entering a state that is
   //   work for it (a capture, a delete, a publish), or a warm queued for it,
   //   is pushed in `checkpoint_requests` on the next message, so the node
@@ -1726,7 +1746,8 @@ service Manager {
   // carries its allocation changes only, never its `checkpoint_requests`.
   // Acked messages are pruned. The log is held in the manager's memory
   // only: the committed allocation rows are the durable record, so a new
-  // manager process resyncs instead of replaying.
+  // manager process resumes from the worker's revision (or resyncs) instead
+  // of replaying.
   //
   // Any manager serves the stream, leader or follower, from its own
   // replica of the store.
@@ -2078,6 +2099,10 @@ service Manager {
   rpc DeleteExecKey (DeleteExecKeyRequest) returns (DeleteExecKeyReply);
 
   // Returns node + allocation view of cluster state (the "ledger").
+  //
+  // Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+  // `x-legion-consistency` request headers and returns `revision` (see
+  // "Blocking reads" above `WatchKind`).
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
 
   // Returns config snapshots stored by manager instances.
@@ -2240,6 +2265,10 @@ service Manager {
   rpc PutKv (PutKvRequest) returns (PutKvReply);
 
   // Gets one KV entry by key.
+  //
+  // Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+  // `x-legion-consistency` request headers and returns `revision` (see
+  // "Blocking reads" above `WatchKind`).
   rpc GetKv (GetKvRequest) returns (GetKvReply);
 
   // Lists KV entries by prefix, and with `include_locks` the unexpired
@@ -2247,6 +2276,10 @@ service Manager {
   //
   // ACL: `kv:read`, gated before anything is read; entries and locks whose
   // keys the caller cannot read are left out.
+  //
+  // Blocking read: takes the `x-legion-min-revision`, `x-legion-wait`, and
+  // `x-legion-consistency` request headers and returns `revision` (see
+  // "Blocking reads" above `WatchKind`).
   rpc ListKv (ListKvRequest) returns (ListKvReply);
 
   // Deletes one KV entry by key.
@@ -3533,6 +3566,50 @@ service Manager {
   // measured consumption, and is accumulated by the status-lane leader
   // every `governance.usage.interval`; the current hour is partial.
   rpc GetUsage (GetUsageRequest) returns (GetUsageReply);
+
+  // ── Revisions and watches (revisions-and-watches plan) ─────────────────
+
+  // Watches jobs, allocations, or KV keys for changes
+  // (docs/watches-and-blocking-queries.md).
+  //
+  // The first message is always a progress event (`progress = true`)
+  // carrying the revision the watch starts from. After that, each message
+  // carries the changes that committed since the last one (`changes`), and
+  // the `revision` to resume from: a client that reconnects with
+  // `from_revision` set to the last `revision` it received gets every change
+  // after it and nothing before it. With no change for 30 seconds, another
+  // progress event carries the current revision.
+  //
+  // Each change names the object (`kind`, `key`, and for jobs and
+  // allocations the job and namespace), whether it was deleted, the revision
+  // it changed at, and the object as it reads when the message is sent:
+  // `Job` (with the derived status) for jobs, `KvEntry` (value included) for
+  // KV, `WatchAllocation` for allocations. Several changes to one object
+  // between two messages are sent once. A job counts as changed when its
+  // row, its versions, its allocations, or its task outcomes change: what
+  // `GetJobInfo` reads.
+  //
+  // Resuming: when `from_revision` is older than this manager's journal (it
+  // keeps the newest 65,536 changes, in memory, from when the process
+  // started), the first and only message has `resync_required = true` and
+  // `oldest_revision`, and the stream ends. The client lists again (the
+  // list's `revision` is where to watch from) and watches from there, like a
+  // Kubernetes watch answered `410 Gone`. A raft snapshot install on the
+  // serving manager, or a projection failure, ends every open watch the same
+  // way.
+  //
+  // Any manager serves a watch from its own replica; revisions mean the same
+  // thing on every manager, so a watch can resume on another one.
+  //
+  // ACL: `job:read` (jobs, allocations) or `kv:read` (KV) with any scope to
+  // open; each change is then filtered to what the caller may read (the
+  // job's scope, or the key's path), so a narrow token sees only its own
+  // objects.
+  //
+  // Errors:
+  // - InvalidArgument: `kind` is unset; `from_revision` is not a revision.
+  // - PermissionDenied: the caller holds no read on the kind.
+  rpc Watch (WatchRequest) returns (stream WatchEvent);
 }
 
 // Request payload for WorkerPreRegister.
@@ -3998,6 +4075,20 @@ message RunJobRequest {
   // record of the version it matched. A manager that predates this field
   // ignores it and drops every unknown key silently.
   bool allow_unknown_fields = 7;
+
+  // Compare-and-set on the job's spec version (`Job.version`): the submit
+  // writes only when the job's latest version is exactly this. `0` means
+  // "the job must not exist" (create only). Unset: no check, as before.
+  //
+  // Checked inside the same replicated entry that writes the new version,
+  // so two writers racing on one version cannot both win. A mismatch writes
+  // nothing and fails with ABORTED naming the current version ("job web is
+  // at version 7, not 6: it changed since you read it"), with a hint to read
+  // it again (`legion job info`) and resubmit on top of it. A resubmit of an
+  // unchanged spec with a matching version succeeds without a new version.
+  // An idempotent retry (same `idempotency_key`) returns the recorded reply
+  // without checking again.
+  optional int64 expected_version = 8;
 }
 
 // Reply payload for RunJob.
@@ -4048,6 +4139,16 @@ message RunJobReply {
   //
   // A `deduplicated` reply rebuilds this list from the recorded `message`.
   repeated string warnings = 3;
+
+  // The job's spec version after the submit: the new version, or the
+  // current one when the spec was unchanged. Pass it as `expected_version`
+  // on the next submit to make that one compare-and-set. 0 on a replayed
+  // (`deduplicated`) reply.
+  int64 version = 4;
+
+  // The revision at which the submit is visible on the manager that
+  // answered (docs/watches-and-blocking-queries.md).
+  string revision = 5;
 }
 
 // One declared job-template variable.
@@ -4344,6 +4445,13 @@ message GetJobInfoReply {
   // it or still pending. Values are visible to anyone with `job:read`, so
   // they never hold secrets.
   repeated JobExtensionValue extensions = 5;
+
+  // The revision this answer reflects (docs/watches-and-blocking-queries.md):
+  // this manager's applied position when it read. Opaque: pass it back as
+  // the `x-legion-min-revision` request header to wait for the next change
+  // (see "Blocking reads" above `WatchKind`), or as
+  // `WatchRequest.from_revision` to watch from here.
+  string revision = 6;
 }
 
 // Where a jobspec extension value is written: the group and task for a
@@ -4913,6 +5021,14 @@ message PlanJobReply {
   // The plan does not check a key's `requires` or ask the app; a submit
   // does.
   repeated JobExtensionValue extensions = 11;
+
+  // What the submit would change in the job's stored spec, field by field
+  // (like `kubectl diff` or Nomad's `job plan`): one entry per path that was
+  // added, removed, or changed, in path order. Empty for a new job (nothing
+  // to compare against; `matches_existing` is false) and for an unchanged
+  // spec (`same_content`). Values a KV reference rendered, for a key the
+  // caller cannot read, are redacted.
+  repeated JobFieldChange diff = 12;
 }
 
 // The effective autoscaling policy of one task in a plan.
@@ -7930,6 +8046,13 @@ message ListInstancesReply {
 
   // `session_count` by node id.
   map<string, uint64> sessions_by_node = 7;
+
+  // The revision this answer reflects (docs/watches-and-blocking-queries.md):
+  // this manager's applied position when it read. Opaque: pass it back as
+  // the `x-legion-min-revision` request header to wait for the next change
+  // (see "Blocking reads" above `WatchKind`), or as
+  // `WatchRequest.from_revision` to watch from here.
+  string revision = 8;
 }
 
 // Request payload for PromoteInstance.
@@ -8968,6 +9091,12 @@ message Job {
   // The namespace the job lives in (docs/namespaces.md). `default` for a
   // job whose `id` has no namespace segment.
   string namespace = 9;
+
+  // The job's spec version: the `version` of its latest config, raised by
+  // every submit that changes the spec (an unchanged resubmit does not).
+  // 0 for a job with no config yet. `RunJobRequest.expected_version` takes
+  // this value for compare-and-set.
+  int64 version = 10;
 }
 
 // What a blocked job waits for.
@@ -9030,6 +9159,13 @@ message ListJobsReply {
   // looking like the jobs are gone. Zero when the request selected `*`.
   uint32 elsewhere_count = 6;
   uint32 elsewhere_namespaces = 7;
+
+  // The revision this answer reflects (docs/watches-and-blocking-queries.md):
+  // this manager's applied position when it read. Opaque: pass it back as
+  // the `x-legion-min-revision` request header to wait for the next change
+  // (see "Blocking reads" above `WatchKind`), or as
+  // `WatchRequest.from_revision` to watch from here.
+  string revision = 8;
 }
 
 // Request payload for IssueWorkloadIdentityToken.
@@ -9719,6 +9855,14 @@ message StreamWorkOpen {
   // replays everything after it when it still holds those messages, and
   // resyncs otherwise.
   uint64 last_seq = 3;
+
+  // The `StreamWorkReply.revision` of the last message the worker applied,
+  // or empty. A manager that cannot replay (`last_epoch` is not its own:
+  // a restart, a failover, another manager) but whose journal still covers
+  // this revision for the node resumes instead of resyncing: one message
+  // with `resumed_from` set carrying only what changed on the node since.
+  // Older than the journal, or empty: a full resync, as before.
+  string last_revision = 20;
 }
 
 // Acknowledges every `StreamWork` message up to `seq`, so the manager can
@@ -9732,7 +9876,7 @@ message StreamWorkAck {
 message StreamWorkReply {
   // The manager process's delivery epoch: a random non-zero value chosen
   // when the manager starts. Positions from another epoch cannot be
-  // resumed.
+  // replayed (a resume continues from `revision` instead).
   uint64 epoch = 1;
 
   // This message's position in the node's sequence. Starts at 1 and grows
@@ -9796,6 +9940,22 @@ message StreamWorkReply {
   // are unset, the worker neither moves its position nor acknowledges it,
   // and the manager never replays it.
   bool push_only = 9;
+
+  // The revision this message reflects: the node's desired set after
+  // applying it includes every committed change up to this revision. A
+  // worker keeps the revision of the last message it applied and sends it as
+  // `StreamWorkOpen.last_revision` when it reconnects.
+  string revision = 20;
+
+  // Set on a resume (docs/architecture-managers-workers.md, "Delivery"):
+  // the `last_revision` this message continues from. Not a resync: it
+  // starts this manager's epoch at `seq` 1 and carries, as `upserts` and
+  // `stops`, only the allocations that changed on the node after
+  // `resumed_from`. A worker applies it on top of what it holds only when
+  // `resumed_from` is the revision it last applied; otherwise it drops the
+  // stream and reconnects with no position, which gets a full resync.
+  // `digest` is the node's whole desired set after the message, as always.
+  string resumed_from = 21;
 }
 
 // One finished (or refused-after-verification) direct exec session.
@@ -11588,6 +11748,13 @@ message GetLedgerRequest {
 message GetLedgerReply {
   // Ledger rows keyed by node.
   repeated LedgerNode nodes = 1;
+
+  // The revision this answer reflects (docs/watches-and-blocking-queries.md):
+  // this manager's applied position when it read. Opaque: pass it back as
+  // the `x-legion-min-revision` request header to wait for the next change
+  // (see "Blocking reads" above `WatchKind`), or as
+  // `WatchRequest.from_revision` to watch from here.
+  string revision = 2;
 }
 
 // Snapshot of one manager node's stored manager config.
@@ -12462,6 +12629,10 @@ message PutKvReply {
   // Includes incremented `version` and normalized `value`.
   // Manager sets this on successful responses.
   KvEntry entry = 1;
+
+  // The revision at which the write is visible on the manager that answered
+  // (and, after a forwarded write, on the follower that forwarded it).
+  string revision = 2;
 }
 
 // Request payload for GetKv.
@@ -12497,6 +12668,13 @@ message GetKvReply {
   // than the real set. Returned even when `entry` is unset, so a reference
   // to a key that was deleted is still visible.
   repeated KvJobReference references = 2;
+
+  // The revision this answer reflects (docs/watches-and-blocking-queries.md):
+  // this manager's applied position when it read. Opaque: pass it back as
+  // the `x-legion-min-revision` request header to wait for the next change
+  // (see "Blocking reads" above `WatchKind`), or as
+  // `WatchRequest.from_revision` to watch from here.
+  string revision = 3;
 }
 
 // One place a job's config reads a KV key (GetKvReply.references).
@@ -12550,6 +12728,13 @@ message ListKvReply {
   // each with its `owner`, `acquired_at` and `expires_at` and an empty
   // `lock_id`. A lock's key need not have an entry.
   repeated KvLock locks = 2;
+
+  // The revision this answer reflects (docs/watches-and-blocking-queries.md):
+  // this manager's applied position when it read. Opaque: pass it back as
+  // the `x-legion-min-revision` request header to wait for the next change
+  // (see "Blocking reads" above `WatchKind`), or as
+  // `WatchRequest.from_revision` to watch from here.
+  string revision = 3;
 }
 
 // Request payload for DeleteKv.
@@ -12576,6 +12761,10 @@ message DeleteKvReply {
   //
   // Current manager reply value: `"kv entry deleted"`.
   string message = 1;
+
+  // The revision at which the delete is visible on the manager that
+  // answered. See `PutKvReply.revision`.
+  string revision = 2;
 }
 
 // Request payload for PatchKv.
@@ -18978,4 +19167,185 @@ message GetUsageReply {
   // The resolved window, RFC3339.
   string since = 2;
   string until = 3;
+
+// ── Revisions and watches (revisions-and-watches plan;
+//    docs/watches-and-blocking-queries.md) ─────────────────────────────────
+
+// Blocking reads and read consistency (docs/watches-and-blocking-queries.md).
+//
+// GetJobInfo, ListJobs, ListInstances, GetLedger, GetKv, and ListKv take
+// three optional request headers (gRPC metadata, like Nomad's `?index=` and
+// `?wait=` query parameters), and return the `revision` their answer
+// reflects:
+//
+// - `x-legion-min-revision: <revision>`: wait until an object the read would
+//   return changed at a revision after this one, then answer with the
+//   current state and its `revision`. When nothing changes within the wait,
+//   answer anyway with the current state and revision: compare revisions to
+//   tell. A revision older than the manager's journal (it keeps the newest
+//   65,536 changes in memory, from when the process started) answers at
+//   once, since the manager cannot tell what changed. A revision ahead of
+//   this manager's replica (taken from a newer manager) waits for this
+//   replica to catch up first. What counts as "would return": GetJobInfo,
+//   the job's row, versions, allocations, and task outcomes; ListJobs, any
+//   job's; ListInstances, the job's; GetLedger, any allocation; GetKv, the
+//   key; ListKv, any key under the prefix. A malformed revision is
+//   INVALID_ARGUMENT.
+// - `x-legion-wait: <seconds>`: how long a blocking read waits. Default and
+//   maximum 300 (5 minutes, Nomad's default); ignored without
+//   `x-legion-min-revision`.
+// - `x-legion-consistency: linearizable`: the answer includes every write
+//   committed before the read began, whichever manager took it. The leader
+//   confirms its leadership with a quorum and catches up before reading; a
+//   follower answers with the not-the-leader rejection, which the
+//   leader-forward layer replays on the leader. Costs a quorum round trip.
+//   `default` (or no header) answers from this manager's replica, which can
+//   trail the leader by the replication delay; writes made through this
+//   manager are always visible, since a follower that forwards a write waits
+//   for its own replica to apply it before replying. `local_disk` managers
+//   are always linearizable. Any other value is INVALID_ARGUMENT.
+//
+// A revision is opaque: one number in `single` topology and `local_disk`
+// mode (`"4812"`), three dot-separated numbers under `lanes`
+// (`"4812.90211.120034"`, the Control, Scheduler, and Status groups' applied
+// indexes). Pass it back exactly as received.
+
+// What a `Watch` watches.
+enum WatchKind {
+  WATCH_KIND_UNSPECIFIED = 0;
+  // Jobs: a job's row, versions, allocations, or task outcomes.
+  WATCH_KIND_JOB = 1;
+  // Allocation rows.
+  WATCH_KIND_ALLOCATION = 2;
+  // KV keys.
+  WATCH_KIND_KV = 3;
+}
+
+// Request payload for Watch.
+message WatchRequest {
+  // What to watch. Required.
+  WatchKind kind = 1;
+
+  // Jobs and allocations: only objects of jobs in this namespace. Empty:
+  // every namespace the caller can read.
+  string namespace = 2;
+
+  // Jobs and allocations: only this job (its name, or `namespace/name`).
+  // Empty: every job.
+  string job = 3;
+
+  // Allocations: only allocations on this node. Empty: every node.
+  string node_id = 4;
+
+  // KV: only keys under this prefix (a plain string prefix, as `ListKv`).
+  // Empty: every key.
+  string prefix = 5;
+
+  // Resume after this revision: every matching change after it is sent,
+  // nothing at or before it. Empty: start from now (the first progress
+  // event says where). See the RPC comment for a revision older than the
+  // manager's journal.
+  string from_revision = 6;
+}
+
+// One message on a `Watch` stream.
+message WatchEvent {
+  // Resume from here: every matching change at or before this revision has
+  // been sent on this stream (in this message or an earlier one).
+  string revision = 1;
+
+  // The changes since the previous message, oldest first, one per object.
+  repeated WatchChange changes = 2;
+
+  // `from_revision` is older than this manager can serve: list again and
+  // watch from the list's revision. The stream ends after this message.
+  bool resync_required = 3;
+
+  // With `resync_required`: the oldest revision this manager can serve
+  // changes after.
+  string oldest_revision = 4;
+
+  // A keep-alive with no changes: the first message on every stream, and
+  // one every 30 seconds without a change. `revision` is current.
+  bool progress = 5;
+}
+
+// One changed object on a `Watch` stream.
+message WatchChange {
+  // The object's kind.
+  WatchKind kind = 1;
+
+  // The object's key: the job id (`namespace/name`, or the bare name in
+  // `default`), the allocation id in decimal, or the KV key.
+  string key = 2;
+
+  // Jobs and allocations: the job id.
+  string job = 3;
+
+  // Jobs and allocations: the job's namespace.
+  string namespace = 4;
+
+  // Allocations: the node it is on.
+  string node_id = 5;
+
+  // Allocations: the allocation id.
+  int64 allocation_id = 6;
+
+  // The object no longer exists (deleted, or a job destroyed). The payload
+  // fields below are unset.
+  bool deleted = 7;
+
+  // Where the newest change to this object in this message committed: the
+  // raft index of the group it committed in, written as a revision with only
+  // that group's component set (under `single` and `local_disk`, just the
+  // index). For ordering and display; resume from `WatchEvent.revision`,
+  // never from this.
+  string revision = 8;
+
+  // Jobs: the job as `GetJobInfo` reads it when the message is sent
+  // (derived status, `version`).
+  optional Job job_info = 9;
+
+  // KV: the entry, value included, as `GetKv` reads it when the message is
+  // sent.
+  optional KvEntry kv = 10;
+
+  // Allocations: the allocation as it reads when the message is sent.
+  optional WatchAllocation allocation = 11;
+}
+
+// An allocation, as a watch reports it.
+message WatchAllocation {
+  int64 id = 1;
+  // The allocation's status (`pending`, `running`, `complete`, `failed`, ...).
+  string status = 2;
+  string node_id = 3;
+  // The job id and the job config (version) the allocation runs.
+  string job_id = 4;
+  string job_config_id = 5;
+  // The task's name.
+  string task_name = 6;
+  // The stable instance it fulfills, for stateful tasks.
+  optional string instance_id = 7;
+}
+
+// One path that differs between a job's stored spec and a planned one
+// (`PlanJobReply.diff`).
+message JobFieldChange {
+  // The dotted path, with list elements by index and named tasks by name:
+  // `tasks.web.resources.memory`, `tasks.web.env.LOG_LEVEL`, `priority`.
+  string path = 1;
+
+  // `added`, `removed`, or `changed`.
+  string change = 2;
+
+  // The stored value as JSON; empty when added.
+  string old_json = 3;
+
+  // The planned value as JSON; empty when removed.
+  string new_json = 4;
+
+  // The value came from a KV key the caller cannot read, so `old_json` and
+  // `new_json` are left empty.
+  bool redacted = 5;
 }

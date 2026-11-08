@@ -32,6 +32,13 @@
 //!
 //! **Authorization** is the leader's: the caller's bearer credential travels
 //! with the request, and the leader runs the same ACL check the follower did.
+//!
+//! **Read-after-write** (revisions-and-watches plan §5). The leader stamps
+//! its reply to a forwarded request with its applied position
+//! ([`APPLIED_REVISION_HEADER`]), which covers the write it just made. The
+//! follower holds the reply until its own replica has applied that far
+//! (up to [`READ_YOUR_WRITES_WAIT`]), so a client that writes through a
+//! follower and then reads from it sees its write.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -69,6 +76,15 @@ const MAX_BUFFERED_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 
 /// How long a forwarded request may take end to end.
 const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Response header the leader stamps on its reply to a forwarded request:
+/// its applied revision after handling it (revisions-and-watches plan §5).
+pub const APPLIED_REVISION_HEADER: &str = "x-legion-applied-revision";
+
+/// How long a follower holds a forwarded write's reply waiting for its own
+/// replica to apply the write. Past it the reply is returned anyway: the
+/// write committed, and only this follower's next read may not show it yet.
+pub const READ_YOUR_WRITES_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Tower layer that forwards not-the-leader rejections to the leader.
 #[derive(Clone)]
@@ -146,10 +162,23 @@ where
         let Some(node_id) = self.node_id.clone() else {
             return Box::pin(self.inner.call(req));
         };
-        if !forwardable_path(req.uri().path())
-            || req.headers().contains_key(FORWARDED_BY_HEADER)
-            || self.store.leads_every_raft_lane()
-        {
+        if req.headers().contains_key(FORWARDED_BY_HEADER) {
+            // A request a follower forwarded here: answer it, and say how far
+            // this replica had applied once it did, so the follower can wait
+            // for its own replica to get there before replying.
+            let store = self.store.clone();
+            let call = self.inner.call(req);
+            return Box::pin(async move {
+                let mut response = call.await?;
+                if let Ok(value) = HeaderValue::from_str(&store.current_revision_string()) {
+                    response
+                        .headers_mut()
+                        .insert(APPLIED_REVISION_HEADER, value);
+                }
+                Ok(response)
+            });
+        }
+        if !forwardable_path(req.uri().path()) || self.store.leads_every_raft_lane() {
             return Box::pin(self.inner.call(req));
         }
         // The readied service runs this request; a fresh clone takes its
@@ -187,6 +216,26 @@ where
             match forward(&store, &node_id, &leader, replay_head, bytes).await {
                 Ok(response) => {
                     debug!(%method, %leader, "Forwarded a write to the raft leader");
+                    // Read-after-write: hold the reply until this replica
+                    // has applied what the leader had when it answered.
+                    let applied = response
+                        .headers()
+                        .get(APPLIED_REVISION_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|text| crate::storage::revisions::Revision::parse(text).ok());
+                    if let Some(applied) = applied {
+                        if !store
+                            .wait_for_revision(&applied, READ_YOUR_WRITES_WAIT)
+                            .await
+                        {
+                            debug!(
+                                %method,
+                                revision = %applied,
+                                "This replica did not apply a forwarded write in time; replying \
+                                 anyway"
+                            );
+                        }
+                    }
                     Ok(response)
                 }
                 Err(err) => {

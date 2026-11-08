@@ -4384,23 +4384,33 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       sibling-lane snapshot install)
       ([calls #9](calls/raft-write-path-plan_calls.md) ·
       `src/storage/data_migrations.rs`).
-- [ ] **No revision, watch, or blocking query for core objects**
-      ([review ST2](architecture-review-2026-11-07.md)). Reads carry no index, event IDs can go backwards after a
-      failover, the journal keeps 10k rows, follower-forwarded writes don't
-      wait for local apply, and there is no watch on jobs, allocations, or KV
-      (`WatchObjects` polls and resends a snapshot with no resume version).
-      Return a revision on every reply, add `min_index`/wait reads, derive
-      event IDs from the log, and give `WatchObjects` a resume version. Needs
-      a plan.
-- [ ] **A manager restart forces a full worker resync** ([review ST3](architecture-review-2026-11-07.md)):
-      StreamWork positions hang off a random per-process epoch
-      (`work_log.rs`), so a failover at 10k–50k nodes rebuilds every desired
-      set at once. Base positions on replicated row versions.
-- [ ] **The heartbeat handler still runs blocking store work inline**
-      ([review ST5](architecture-review-2026-11-07.md)): `handle_failed_allocations`,
-      `handle_terminated_allocations`, and
-      `update_allocation_health_snapshots` can make raft writes on a runtime
-      worker; only `update_node_heartbeat` is offloaded.
+- [ ] **`WatchObjects` on the revision journal** (deferred from
+      [revisions-and-watches-plan.md](plans/revisions-and-watches-plan.md),
+      [calls #11](calls/revisions-and-watches-plan_calls.md)): app object
+      watches still poll a fingerprint about once a second and resend a full
+      snapshot on reconnect, with no resume version. Record `app_object`
+      changes in the journal and give `WatchObjectsRequest` a resume revision.
+- [ ] **A manager restart empties its revision journal**
+      ([plan](plans/revisions-and-watches-plan.md),
+      [calls #2](calls/revisions-and-watches-plan_calls.md)): watches and
+      worker streams that reconnect to a restarted manager relist or resync
+      (other managers still serve resumes). A persisted modify revision per
+      row (or replaying the retained raft log tail into the journal at start)
+      would let a restarted manager resume them too.
+- [ ] **Watches on more kinds**: nodes, rollouts, and evals have no watch
+      or blocking read ([plan non-goals](plans/revisions-and-watches-plan.md)).
+- [ ] **`--index` on list commands**: `legion job list`, `legion kv list`,
+      and `legion ledger` print a bare list in `--json`, so they do not take
+      `--index` yet; the RPCs (`ListJobs`, `ListKv`, `GetLedger`) do
+      ([docs](../docs/watches-and-blocking-queries.md#known-limitations)).
+- [ ] **Instance-only changes in `local_disk` mode**: the `local_disk`
+      projection records `instance` rows only through their allocations, so
+      an instance-only change does not wake a blocking `ListInstances`
+      (`READ_MODEL_TABLES` in `src/storage/raft/capture.rs`).
+- [ ] **Make `Store::replicated` async** (the rest of
+      [review ST5](architecture-review-2026-11-07.md)): the heartbeat's
+      writes now run on the blocking pool, but every replicated write still
+      parks a thread for its quorum round.
 
 ## Job types
 
@@ -5317,9 +5327,6 @@ this" work:
 - [ ] An agent can easily configure a worker to talk to a manager
 - [ ] An agent can search the registry and find jobs worth installing and running
 
-- [ ] **`legion_job_run` has no wait** ([review AI4](architecture-review-2026-11-07.md)): the rest of the
-      MCP finding shipped (see Done); the job-run wait option belongs with
-      the job compare-and-set work (AI5) and its RPC changes.
 - [ ] **Audit records from a follower that leads no raft lane are not
       journaled** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) #5): such a manager answers its own denials and
       validation errors, and their records go to the `audit` tracing target
@@ -5342,10 +5349,11 @@ this" work:
       loopback only, and every caller acts as the server's token. Elicitation
       is stdio-only until SSE lands; remote use needs MCP's OAuth flow or a
       per-request Legion token pass-through.
-- [ ] **Compare-and-set and a field diff for jobs** ([review AI5](architecture-review-2026-11-07.md)):
-      `RunJobRequest` has no `expected_version`, so two agents silently
-      overwrite each other, and `PlanJobReply` has no field-level diff.
-      Objects, ScaleTask, and app records already have CAS.
+- [ ] **An intent layer above jobs** ([review AI5](architecture-review-2026-11-07.md)): nothing like
+      "serve model X at p99 < 200 ms" (KServe, Knative); app object kinds are
+      the natural place. Out of scope of
+      [revisions-and-watches-plan.md](plans/revisions-and-watches-plan.md),
+      which shipped AI5's compare-and-set and plan diff.
 
 ## Embedding
 
@@ -6932,6 +6940,27 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
 [plan](plans/persistence-plan.md) · [docs](../docs/persistence-streaming.md), [raft-operations.md](../docs/raft-operations.md)
 
 - [x] Streaming SQLite replication, Litestream-style, with optional lease failover
+- [x] **Revisions, watches, and blocking queries for jobs, allocations, and
+      KV** ([review ST2](architecture-review-2026-11-07.md); plan:
+      [revisions-and-watches-plan.md](plans/revisions-and-watches-plan.md);
+      docs: [watches-and-blocking-queries.md](../docs/watches-and-blocking-queries.md)).
+      A revision (each raft group's applied index; a persisted counter in
+      `local_disk`) on job, allocation, and KV reads and writes; blocking reads
+      (`x-legion-min-revision`/`x-legion-wait`, `--index/--wait`);
+      `Manager.Watch` with resume and resync-required (`legion job watch`,
+      `legion kv watch`, MCP `legion_watch`); event ids that never go
+      backwards across a failover; a follower that forwards a write waits for
+      its own apply before replying; opt-in linearizable reads
+      (`x-legion-consistency`, `--consistent`). Deferred items are above.
+- [x] **A failover no longer resyncs every worker**
+      ([review ST3](architecture-review-2026-11-07.md); plan §7): `StreamWork`
+      messages carry a revision, and a worker reconnecting to another manager
+      resumes with only what changed on its node since
+      ([docs](../docs/architecture-managers-workers.md#delivery)).
+- [x] **The heartbeat's report writes run off the runtime**
+      ([review ST5](architecture-review-2026-11-07.md); plan §8): failures,
+      terminations, health, volume, and pressure reports run on the blocking
+      pool in one hop, in their old order.
 - [x] **The manager's own identity for state replication** (2026-10-12). The
       WAL replica, the takeover restore and the lease share one credential
       path: `persistence.streaming.credentials` keys, or the platform chain
@@ -7932,7 +7961,15 @@ calls: [device-model-and-plugin-seams-plan_calls.md](calls/device-model-and-plug
       negotiation, annotations, `outputSchema`/`structuredContent`,
       elicitation for approvals, Streamable HTTP on loopback, and a tool (or
       a recorded exclusion) for every user-facing RPC, enforced by a test.
-      The job-run wait is open.
+      The job-run wait shipped with the job compare-and-set (next entry).
+- [x] **Compare-and-set and a field diff for jobs**
+      ([review AI5](architecture-review-2026-11-07.md); plan:
+      [revisions-and-watches-plan.md](plans/revisions-and-watches-plan.md) §9;
+      docs: [watches-and-blocking-queries.md](../docs/watches-and-blocking-queries.md#compare-and-set-on-jobs)):
+      `RunJobRequest.expected_version` / `legion job run --expected-version`
+      (ABORTED naming the current version), `Job.version`,
+      `PlanJobReply.diff` in `legion job plan`, and MCP `legion_job_run`
+      `expected_version` and `wait_seconds`.
 
 ## UI
 

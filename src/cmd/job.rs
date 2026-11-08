@@ -48,6 +48,17 @@ pub fn config() -> Command {
         .arg(allow_unknown_fields_flag())
         .arg(namespace_flag())
         .arg(json_flag())
+        .arg(
+            Arg::new("expected-version")
+                .long("expected-version")
+                .value_name("VERSION")
+                .value_parser(value_parser!(i64))
+                .help(
+                    "Submit only if the job is at this spec version (`version` in `job info \
+                     --json`); 0 means it must not exist. Fails, writing nothing, when another \
+                     submit landed first",
+                ),
+        )
         .args(config_var_args());
 
     let stop_cmd = Command::new("stop")
@@ -189,7 +200,8 @@ pub fn config() -> Command {
                 .required(true),
         )
         .arg(namespace_flag())
-        .arg(json_flag());
+        .arg(json_flag())
+        .args(crate::cmd::watch::read_flags());
 
     let plan_cmd = Command::new("plan")
         .about("Preview which nodes allocations would land on")
@@ -364,6 +376,7 @@ pub fn config() -> Command {
         .arg_required_else_help(true)
         .subcommand(run_cmd)
         .subcommand(info_cmd)
+        .subcommand(crate::cmd::watch::job_watch_cmd())
         .subcommand(plan_cmd)
         .subcommand(validate_cmd)
         .subcommand(schema_cmd)
@@ -1315,6 +1328,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("destroy", matches)) => destroy_job(matches).await,
         Some(("list", matches)) => list_jobs(matches).await,
         Some(("info", matches)) => get_info(matches).await,
+        Some(("watch", matches)) => crate::cmd::watch::job_watch(matches).await,
         Some(("plan", matches)) => plan_job(matches).await,
         Some(("validate", matches)) => validate_job(matches).await,
         Some(("schema", matches)) => job_schema(matches).await,
@@ -2219,6 +2233,13 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         if !reply.message.is_empty() {
             println!("{}", reply.message);
         }
+        // What the submit would change, field by field.
+        if !reply.diff.is_empty() {
+            println!("Changes to the stored spec:");
+            for change in &reply.diff {
+                println!("  {}", plan_diff_line(change));
+            }
+        }
         for warning in &reply.warnings {
             println!("warning: {warning}");
         }
@@ -2431,6 +2452,31 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
+/// One line of `legion job plan`'s diff: `~ tasks.web.count: 2 → 3`,
+/// `+ tasks.cron: {…}`, `- tasks.old.env.X: "y"`.
+fn plan_diff_line(change: &crate::structs::JobFieldChange) -> String {
+    let cut = |text: &str| {
+        if text.chars().count() > 80 {
+            format!("{}…", text.chars().take(79).collect::<String>())
+        } else {
+            text.to_string()
+        }
+    };
+    if change.redacted {
+        return format!("~ {}: changed (from a KV key you cannot read)", change.path);
+    }
+    match change.change.as_str() {
+        "added" => format!("+ {}: {}", change.path, cut(&change.new_json)),
+        "removed" => format!("- {}: {}", change.path, cut(&change.old_json)),
+        _ => format!(
+            "~ {}: {} → {}",
+            change.path,
+            cut(&change.old_json),
+            cut(&change.new_json)
+        ),
+    }
+}
+
 #[instrument(skip_all)]
 async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
@@ -2470,6 +2516,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         idempotency_key,
         namespace,
         allow_unknown_fields: arg_matches.get_flag("allow-unknown-fields"),
+        expected_version: arg_matches.get_one::<i64>("expected-version").copied(),
     });
 
     let reply =
@@ -2492,6 +2539,8 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
             "message": reply.message,
             "deduplicated": reply.deduplicated,
             "warnings": reply.warnings,
+            "version": reply.version,
+            "revision": reply.revision,
             "wait": wait_result,
         }));
     } else {
@@ -3009,9 +3058,10 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
         arg_matches,
         arg_matches.get_one::<String>("name").context("need name")?,
     )?;
-    let request = tonic::Request::new(GetJobInfoRequest {
+    let mut request = tonic::Request::new(GetJobInfoRequest {
         name: job_name.clone(),
     });
+    crate::cmd::watch::apply_read_flags(&mut request, arg_matches)?;
     let response = output::resolve(
         format,
         "failed to fetch job info",
@@ -3050,6 +3100,9 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
                     Value::Array(reply.extensions.iter().map(extension_value_json).collect()),
                 );
             }
+            // What `--index` takes to wait for the next change
+            // (docs/watches-and-blocking-queries.md).
+            object.insert("revision".into(), json!(reply.revision));
         }
         print_json(&value);
     } else {

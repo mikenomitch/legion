@@ -470,6 +470,7 @@ start:
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
   [Network Handlers](docs/network-handlers.md) ·
   [Network Plugins](docs/network-plugins.md) · [KV Store](docs/kv-store.md) ·
+  [Watches & Blocking Queries](docs/watches-and-blocking-queries.md) ·
   [Exec & Actions](docs/exec-and-actions.md) · [The Cluster CA](docs/cluster-ca.md) ·
   [Cert Manager](docs/cert-manager.md)
 - **Sharing a cluster:** [Namespaces](docs/namespaces.md) ·

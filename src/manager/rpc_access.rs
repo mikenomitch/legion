@@ -244,6 +244,10 @@ pub const RPC_ACCESS: &[(&str, Access)] = &[
     ("DecideApproval", Access::Protected("approval", "write")),
     ("GetCallerCapabilities", Access::Open),
     ("GetUsage", Access::Protected("namespace", "read")),
+    // Revisions and watches (revisions-and-watches plan): gated as `job:read`
+    // before the stream opens (a KV watch checks `kv:read` instead) and
+    // filtered per change after.
+    ("Watch", Access::Protected("job", "read")),
 ];
 
 /// The access row for `rpc`, if this manager classifies it.

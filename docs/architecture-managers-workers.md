@@ -640,15 +640,33 @@ whatever the heartbeat cadence:
   when the worker opened it, so no per-delta certificate check applies),
   and runs its reconcile at once for a
   stop or a changed payload. It acks each message it applied.
-- **Full resync.** A worker the manager cannot continue gets its whole
-  desired set once, in place of what it holds, then deltas. That happens
-  when the position the worker reconnects with is from another manager
-  process (a failover, a manager restart, a different manager), is ahead of
-  the manager's, or is older than the messages the manager still holds. A
-  manager also resyncs every worker streaming from it after it installs a
-  raft snapshot, or when it cannot tell which allocations a committed change
-  touched. Such a failure never fails the change itself, which has already
-  committed.
+- **Resume.** Every message carries the
+  [revision](watches-and-blocking-queries.md#revisions) its contents
+  reflect, and the worker keeps the revision of the last message it applied
+  across a dropped stream. A worker that reconnects to another manager
+  process (a failover, a different manager) sends it. When that manager's
+  revision journal still holds every allocation change on the node since
+  then (the newest 256 per node, from when the manager started), it waits
+  for its own replica to catch up to the revision (up to 5 seconds) and
+  sends **one resume message**: only the allocations that changed since, as
+  upserts and stops, on top of what the worker holds, and the digest of the
+  node's whole set. Revisions are raft log positions, so they mean the same
+  thing on every manager. The manager then knows the node's allocation ids
+  but not every payload; the heartbeat's connect and policy feeds read the
+  ones they need the first time they need them. A worker applies a resume
+  only when it continues from the revision it last applied; otherwise it
+  reopens the stream with no position and gets a full resync.
+- **Full resync.** A worker the manager can neither replay to nor resume
+  gets its whole desired set once, in place of what it holds, then deltas.
+  That happens when the worker sends no revision (a fresh worker process),
+  when its revision is older than the manager's journal (the manager
+  restarted since, or more than 256 changes landed on the node), when its
+  position is ahead of the manager's or older than the messages the manager
+  still holds, or when the manager did not catch up to the worker's revision
+  in time. A manager also resyncs every worker streaming from it after it
+  installs a raft snapshot, or when it cannot tell which allocations a
+  committed change touched. Such a failure never fails the change itself,
+  which has already committed.
 - **Replay.** A worker that reconnects to the same manager process with a
   position it still holds gets the messages after it, in order. Nothing is
   lost and nothing is applied twice.
@@ -659,8 +677,11 @@ whatever the heartbeat cadence:
 - **Any manager serves it.** The delivery log is memory on the manager the
   worker streams from, fed by the changeset projection every manager runs on
   its own replica. A leader failover disturbs only the streams attached to
-  the manager that died: their workers reconnect and resync once; workers
-  streaming from a surviving manager keep their position.
+  the manager that died: their workers reconnect to a survivor and resume
+  from their revision (one message with what changed since); workers
+  streaming from a surviving manager keep their position. A manager that
+  restarts comes back with an empty journal, so workers that reconnect to
+  it resync once.
 - **Checkpoint work.** When a snapshot row of the node commits in a state
   that is work for it (a capture for a suspend, fork, or snapshot, a
   publish, a reclaim), or a warm is queued for it, the next message pushes

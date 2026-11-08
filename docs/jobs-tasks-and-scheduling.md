@@ -905,6 +905,26 @@ Job config unchanged; no update needed (the job is running; use --force-reschedu
 job, so a finished batch job runs again and a job that could not be placed
 gets another attempt.
 
+### Watching a job's status
+
+`legion job watch web` prints the job each time anything its status reads
+changes (its versions, allocations, or task outcomes), and
+`legion job info web --index <revision>` waits for the next such change. See
+[Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md).
+
+## Job Versions and Compare-and-Set
+
+`Job.version` is the job's spec version: the version of its latest config,
+raised by every submit that changes the spec. An unchanged resubmit, a
+stop, a status change, and a scale (`legion job scale`) leave it alone.
+`legion job run --expected-version N` submits only when the job is still at
+version `N` (`0`: only if it does not exist yet), checked in the same write
+that stores the new version, so two people or agents editing one job cannot
+silently overwrite each other; the loser gets `ABORTED` naming the current
+version and writes nothing. `legion job plan` lists, field by field, what a
+submit would change in the stored spec. See
+[Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md#compare-and-set-on-jobs).
+
 ## Job Timestamps: `created_at` and `updated_at`
 
 Every job has two timestamps, both unix seconds on the wire (`Job.created_at`,

@@ -267,19 +267,26 @@ See `proto/legion.proto` for the authoritative message documentation.
   event live. The event is still in the journal, and any cursor read
   (`--after-id`, a reconnect, `ListEvents`) returns it. The journal is the
   complete record, and the live tail is not.
-- **ID ordering is per manager process, not per wall clock.** The timestamp
-  bits come from the minting leader's clock, and the tie-breaking high-water
-  mark lives in process memory. After a failover to a manager whose clock is
-  behind the old leader's, new IDs can sort BELOW an existing `after_id`
-  cursor until the new leader's clock passes the old one's. A poller holding
-  a high cursor will miss that window's events (they are in the journal,
-  below the cursor). If your consumer cares about gaps, re-read a cursor range
-  after you see a leadership change (`legion raft history`), or treat the
-  journal, queried by time, as the source of truth. Run managers under NTP.
-  The window is as long as the clock skew.
+- **IDs never go backwards, even across a failover.** Each manager keeps a
+  per-lane high-water mark, and never mints an ID at or below it. The mark
+  rises with every ID it mints and with every committed event it applies
+  from the replicated log, and it is seeded from the journal when the
+  manager starts. A new leader applies everything committed before it starts
+  writing (it confirms its term with a quorum first), so its first ID sorts
+  above every ID the old leader committed, even when its clock is behind the
+  old leader's. A poller holding a high `after_id` misses nothing after a
+  leadership change. (Before this, a failover to a manager with a slower
+  clock could mint IDs below an existing cursor for as long as the clock
+  skew.) The timestamp bits are still the minting leader's clock, so IDs
+  still sort roughly by time; they are not raft revisions
+  ([Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md)
+  is the revision-based way to follow jobs, allocations, and KV keys).
 - The journal is bounded. It keeps the newest ~10,000 events and prunes older
-  rows during inserts. The stream is for observability and is not an audit
-  log. Durable history belongs in the state store itself (jobs, rollouts,
+  rows during inserts (each manager prunes its own copy). How long that is
+  depends on the event rate: at 100 events a second it is under two minutes,
+  so a poller that falls further behind than that loses the oldest events it
+  had not read. The stream is for observability and is not an audit log.
+  Durable history belongs in the state store itself (jobs, rollouts,
   rollout events).
 - Events have no foreign keys, so they can outlive the objects they describe.
   For example, a `job.destroyed` event survives the deletion of the job row.

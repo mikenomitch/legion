@@ -319,6 +319,10 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("DecideApproval", Plane::Protected("approval:write")),
         ("GetCallerCapabilities", Plane::Open),
         ("GetUsage", Plane::Protected("namespace:read (per item)")),
+        // Revisions and watches (revisions-and-watches plan): a job watch is
+        // `job:read` (a KV watch `kv:read`), gated with any scope before the
+        // stream opens and filtered per change after.
+        ("Watch", Plane::Protected("job:read")),
     ]
 }
 
@@ -2100,6 +2104,17 @@ async fn call_endpoint(
             .get_usage(req(GetUsageRequest::default(), token))
             .await
             .map(|_| ()),
+        // Revisions and watches (revisions-and-watches plan).
+        "Watch" => svc
+            .watch(req(
+                WatchRequest {
+                    kind: WatchKind::Job as i32,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         other => {
             panic!("endpoint_table contains `{other}` but call_endpoint has no builder for it")
         }
@@ -3574,6 +3589,7 @@ async fn host_level_jobs_need_the_host_grant_test() -> R<()> {
                     force_reschedule: false,
                     idempotency_key: None,
                     allow_unknown_fields: Default::default(),
+                    expected_version: None,
                 },
                 Some(&secret),
             ))
@@ -3683,6 +3699,7 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
                     force_reschedule: false,
                     idempotency_key: None,
                     allow_unknown_fields: Default::default(),
+                    expected_version: None,
                 },
                 Some(&secret),
             ))
@@ -3947,6 +3964,7 @@ async fn star_policies_do_not_reach_legion_system_or_legion_kv_test() -> R<()> {
                     force_reschedule: false,
                     idempotency_key: None,
                     allow_unknown_fields: false,
+                    expected_version: None,
                 },
                 Some(&secret),
             ))
@@ -4072,6 +4090,7 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
                     force_reschedule: false,
                     idempotency_key: None,
                     allow_unknown_fields: Default::default(),
+                    expected_version: None,
                 },
                 Some(&token),
             ))
@@ -4155,6 +4174,7 @@ async fn upstream_credential_needs_kv_read_on_the_path() -> R<()> {
                     force_reschedule: false,
                     idempotency_key: None,
                     allow_unknown_fields: Default::default(),
+                    expected_version: None,
                 },
                 Some(&token),
             ))

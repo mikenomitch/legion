@@ -436,8 +436,17 @@ fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_info",
-            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`), and `deadline` (Unix seconds, 0 for none) when its `placementTimeout` fails the job if it is still short. A gang job with status `failed` (timed out, or failed by its `onMemberLoss`) places nothing until it is run again (docs/gang-scheduling.md). With `scale:read`, `scalingInputs` adds one entry per task with request vs usage, cluster-wide: ready/placed/desired/unplaced replicas, measured CPU (MHz, utilization against the reservation, per-replica histogram) and memory, requests per second, error ratio, and latency into a service the task backs (internal callers only), whether a rollout is active, and `freshness.state` (`current`, `missing`, `resyncing`; act only on `current`) (docs/autoscaling.md, \"Scaling inputs\").",
-            input_schema: name_arg_schema,
+            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`), and `deadline` (Unix seconds, 0 for none) when its `placementTimeout` fails the job if it is still short. A gang job with status `failed` (timed out, or failed by its `onMemberLoss`) places nothing until it is run again (docs/gang-scheduling.md). With `scale:read`, `scalingInputs` adds one entry per task with request vs usage, cluster-wide: ready/placed/desired/unplaced replicas, measured CPU (MHz, utilization against the reservation, per-replica histogram) and memory, requests per second, error ratio, and latency into a service the task backs (internal callers only), whether a rollout is active, and `freshness.state` (`current`, `missing`, `resyncing`; act only on `current`) (docs/autoscaling.md, \"Scaling inputs\"). The reply carries `revision` (and the job's spec `version`): pass it back as `min_revision` to wait, up to `wait_seconds` (default and max 300), until the job changes after it (a blocking query; docs/watches-and-blocking-queries.md).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Job name." },
+                    "min_revision": { "type": "string", "description": "Wait until the job (its row, versions, allocations, or task outcomes) changes after this revision (a `revision` from an earlier reply), then answer." },
+                    "wait_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "How long `min_revision` waits (default and max 300). On timeout the current state is returned; compare `revision` to tell." }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
             mutates: false,
         },
         ToolDef {
@@ -1232,19 +1241,41 @@ fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_run",
-            description: "Submit or update a job from a rendered jobspec (JSON). Mutating.",
+            description: "Submit or update a job from a rendered jobspec (JSON). Mutating. With expected_version, compare-and-set: refused (Aborted, naming the current version) when another submit landed first. With wait_seconds, waits until the job is up (running, complete, scheduled, idle) or failed, and returns that.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." },
                     "force_reschedule": { "type": "boolean", "description": "Reschedule even if unchanged." },
+                    "expected_version": { "type": "integer", "minimum": 0, "description": "Submit only if the job is at this spec version (the `version` legion_job_status or a previous legion_job_run returned); 0 means the job must not exist. A mismatch writes nothing and fails with Aborted naming the current version: read the job again and resubmit on top of it." },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "description": "After submitting, wait up to this many seconds (max 300) for the job's rollout to finish and its status to read running/complete/scheduled/idle (success) or failed/stopped; the result's `wait` says which, or `settled: false` on timeout. Default 0: return at once." },
                     "allow_unknown_fields": { "type": "boolean", "description": "Accept keys Legion does not know (default false: each one is an error naming it and the closest known key). When true, keys on the job, a task, a volume, a port, or a service are kept as pending and the rest are dropped; each is listed in `warnings`." }
                 },
                 "required": ["spec_json"],
                 "additionalProperties": false
             }),
             mutates: true,
+        },
+        // ── Revisions and watches (revisions-and-watches plan) ──────────
+        ToolDef {
+            name: "legion_watch",
+            description: "Wait (bounded) for the next changes to jobs, allocations, or KV keys and return them, with the revision to pass as from_revision next time. Read-only. Without from_revision it starts from now; with one it returns every change after it at once if there are any. A from_revision older than the manager's journal fails with ResyncRequired: read the objects again and watch from the read's revision.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["job", "allocation", "kv"], "description": "What to watch. A job changes when its row, versions, allocations, or task outcomes do." },
+                    "job": { "type": "string", "description": "Jobs and allocations: only this job." },
+                    "namespace": { "type": "string", "description": "Jobs and allocations: only jobs in this namespace (and resolves a bare `job` in it)." },
+                    "node_id": { "type": "string", "description": "Allocations: only this node." },
+                    "prefix": { "type": "string", "description": "KV: only keys under this prefix." },
+                    "from_revision": { "type": "string", "description": "Return changes after this revision (from a previous call, or a read's `revision`)." },
+                    "wait_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "How long to wait for a change (default 30, max 300). On timeout `changes` is empty and `revision` is current." }
+                },
+                "required": ["kind"],
+                "additionalProperties": false
+            }),
+            mutates: false,
         },
         ToolDef {
             name: "legion_job_stop",
@@ -1911,8 +1942,24 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_job_info" => {
             let name = job_arg(&args, "name")?;
             let mut client = connect().await?;
-            let mut reply =
-                grpc(client.get_job_info(GetJobInfoRequest { name: name.clone() })).await?;
+            let mut request = tonic::Request::new(GetJobInfoRequest { name: name.clone() });
+            // A blocking query (revisions-and-watches plan §2).
+            if let Some(revision) = opt_str_arg(&args, "min_revision") {
+                let metadata = request.metadata_mut();
+                metadata.insert(
+                    crate::manager::server::MIN_REVISION_HEADER,
+                    revision
+                        .parse()
+                        .map_err(|_| format!("min_revision {revision:?} is not a revision"))?,
+                );
+                if let Some(wait) = args.get("wait_seconds").and_then(Value::as_u64) {
+                    metadata.insert(
+                        crate::manager::server::WAIT_HEADER,
+                        wait.to_string().parse().expect("digits are ascii"),
+                    );
+                }
+            }
+            let mut reply = grpc(client.get_job_info(request)).await?;
             // Request vs usage, as `legion job info` shows it; left out when
             // the caller lacks `scale:read` (docs/autoscaling.md).
             if let (Some(object), Some(usage)) = (
@@ -3016,25 +3063,9 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.delete_job_template(DeleteJobTemplateRequest { name })).await
         }
-        "legion_job_run" => {
-            let spec_json = str_arg(&args, "spec_json")?;
-            let idempotency_key = opt_str_arg(&args, "idempotency_key");
-            let force_reschedule = args
-                .get("force_reschedule")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let mut client = connect().await?;
-            grpc(client.run_job(RunJobRequest {
-                parsed_jobspec: spec_json,
-                submissions: vec![],
-                priority: None,
-                force_reschedule,
-                idempotency_key,
-                namespace: opt_str_arg(&args, "namespace"),
-                allow_unknown_fields: allow_unknown_fields_arg(&args),
-            }))
-            .await
-        }
+        "legion_job_run" => job_run_tool(args).await,
+        // ── Revisions and watches (revisions-and-watches plan) ──────────
+        "legion_watch" => watch_tool(args).await,
         "legion_job_stop" => {
             let name = job_arg(&args, "name")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
@@ -3498,6 +3529,107 @@ async fn gitops_sync_tool(args: Value) -> Result<Value, String> {
         report
     };
     serde_json::to_value(report).map_err(|err| err.to_string())
+}
+
+/// `legion_job_run`: submit (compare-and-set with `expected_version`), then
+/// with `wait_seconds` wait, with blocking reads, until the job settles
+/// (revisions-and-watches plan §9).
+async fn job_run_tool(args: Value) -> Result<Value, String> {
+    let spec_json = str_arg(&args, "spec_json")?;
+    let namespace = opt_str_arg(&args, "namespace");
+    let mut client = connect().await?;
+    let mut value = grpc(
+        client.run_job(RunJobRequest {
+            parsed_jobspec: spec_json.clone(),
+            submissions: vec![],
+            priority: None,
+            force_reschedule: args
+                .get("force_reschedule")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            namespace: namespace.clone(),
+            allow_unknown_fields: allow_unknown_fields_arg(&args),
+            expected_version: args.get("expected_version").and_then(Value::as_i64),
+        }),
+    )
+    .await?;
+    let wait = args
+        .get("wait_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(crate::manager::server::MAX_READ_WAIT.as_secs());
+    if wait > 0 {
+        let name = serde_json::from_str::<Value>(&spec_json)
+            .ok()
+            .and_then(|spec| spec.get("name").and_then(Value::as_str).map(str::to_string))
+            .ok_or_else(|| "the jobspec names no job to wait for".to_string())?;
+        let (declared, bare) = crate::structs::namespace::split_job_id(&name);
+        let job = crate::structs::namespace::job_id(namespace.as_deref().unwrap_or(declared), bare);
+        value["wait"] = crate::cmd::watch::wait_for_job_settled(
+            &mut client,
+            &job,
+            std::time::Duration::from_secs(wait),
+        )
+        .await?;
+    }
+    Ok(value)
+}
+
+/// `legion_watch`: wait, bounded, for the next changes to jobs,
+/// allocations, or KV keys after a revision, and return them with the
+/// revision to pass next time (revisions-and-watches plan §3).
+async fn watch_tool(args: Value) -> Result<Value, String> {
+    use crate::structs::{WatchKind, WatchRequest};
+    let kind = match str_arg(&args, "kind")?.as_str() {
+        "job" => WatchKind::Job,
+        "allocation" => WatchKind::Allocation,
+        "kv" => WatchKind::Kv,
+        other => return Err(format!("kind {other:?} is not job, allocation, or kv")),
+    };
+    let wait = std::time::Duration::from_secs(
+        args.get("wait_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .clamp(1, crate::manager::server::MAX_READ_WAIT.as_secs()),
+    );
+    let mut client = connect().await?;
+    let mut stream = client
+        .watch(WatchRequest {
+            kind: kind as i32,
+            namespace: opt_str_arg(&args, "namespace").unwrap_or_default(),
+            job: opt_str_arg(&args, "job").unwrap_or_default(),
+            node_id: opt_str_arg(&args, "node_id").unwrap_or_default(),
+            prefix: opt_str_arg(&args, "prefix").unwrap_or_default(),
+            from_revision: opt_str_arg(&args, "from_revision").unwrap_or_default(),
+        })
+        .await
+        .map_err(|status| status_error(&status))?
+        .into_inner();
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut revision = String::new();
+    let mut changes = Vec::new();
+    loop {
+        let next = match tokio::time::timeout_at(deadline, stream.message()).await {
+            Ok(next) => next.map_err(|status| status_error(&status))?,
+            Err(_) => None,
+        };
+        let Some(event) = next else { break };
+        if event.resync_required {
+            let err = crate::cmd::watch::resync_error(&event);
+            return Err(serde_json::to_string(&err).unwrap_or(err.message));
+        }
+        revision = event.revision.clone();
+        if !event.changes.is_empty() {
+            changes.extend(event.changes);
+            break;
+        }
+    }
+    Ok(json!({
+        "revision": revision,
+        "changes": changes,
+        "timedOut": changes.is_empty(),
+    }))
 }
 
 /// `legion_object_apply`: apply, then (with `wait`) wait for the app to

@@ -148,6 +148,18 @@ reloads the whole cache on every write, so never set it in production. It does
 not cover raft replicas, which apply lanes concurrently and have no quiet point
 to compare at.
 
+## Revisions and the change journal
+
+Every read of a job, an allocation, or a KV key returns the manager's
+**revision**: its applied position (each raft group's applied index, from
+`raft_applied`, which commits with the rows; in `local_disk` mode a counter
+persisted in blocks in `store_revision`). The same projection that keeps the
+read model current records, per committed entry, which jobs, allocations,
+and KV keys it changed, at which revision, in an in-memory journal of the
+newest 65,536 changes per manager. Blocking reads, `Manager.Watch`, and
+`StreamWork` resume are built on it. See
+[Watches, Revisions, and Blocking Queries](watches-and-blocking-queries.md).
+
 ## Key Tables
 
 Main tables (see migrations):
@@ -295,7 +307,13 @@ Server-side backups work in every mode: `legion state backup` (a
   worker-plane writes per operation (`docs/multi-raft.md` § "Non-leader
   write redirects and forwarding"); when the leader is unreachable from the
   manager that received the write, it fails with the leader hint rather than
-  being retried elsewhere.
+  being retried elsewhere. A forwarded client write's reply waits (up to 5
+  seconds) for the forwarding manager to apply the write itself, so the
+  client's next read there sees it.
+- The revision journal is memory, per manager, and bounded: a manager
+  restart empties it, so watches and worker streams that reconnect to that
+  manager relist or resync
+  ([watches-and-blocking-queries.md](watches-and-blocking-queries.md#the-journal-and-its-window)).
 - Managers dial each other's raft transport over TLS, under one key every
   manager derives from the shared cluster secret, and authenticate each
   call with that secret. All managers hold the same key, so the transport

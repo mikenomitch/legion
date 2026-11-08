@@ -2594,6 +2594,18 @@ fn migration_list() -> Vec<M<'static>> {
         DROP TABLE IF EXISTS approval_request;
         DROP TABLE IF EXISTS audit_event;",
         ),
+        // Revisions and watches (revisions-and-watches plan §1): the
+        // `local_disk` revision counter's reserved bound, so a restart
+        // resumes above every revision already handed out. One row, written
+        // only in `local_disk` mode; raft mode derives revisions from
+        // `raft_applied` and never writes it (ownership: Internal).
+        M::up(
+            "CREATE TABLE IF NOT EXISTS store_revision (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            reserved INTEGER NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS store_revision;"),
     ]
 }
 

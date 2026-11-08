@@ -84,6 +84,9 @@ mod endpoint_ops;
 // speculative-batch recovery, replicated data migrations
 // (raft-write-path plan).
 mod raft_write_path;
+// Revisions and watches: where a revision comes from, and how the
+// projection feeds the change journal (revisions-and-watches plan).
+mod revision_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -183,6 +186,10 @@ pub struct JobSubmitRequest {
     /// What `allow_unknown_fields` kept and dropped, recorded on the
     /// version (`job_config.meta.unknownFields`).
     pub unknown_fields: Option<UnknownFieldsRecord>,
+    /// Compare-and-set on the job's latest version
+    /// (`RunJobRequest.expected_version`; 0 = must not exist), checked in
+    /// the entry that writes the version.
+    pub expected_version: Option<i64>,
 }
 
 /// One eval to enqueue, for the batched [`Store::enqueue_evals`].
@@ -1493,6 +1500,14 @@ pub struct Store {
     // invalidated by the changeset projection on every replica, read by
     // the heartbeat's endpoint feed and the work stream's pushes.
     endpoint_index: Arc<crate::storage::endpoint_index::EndpointIndex>,
+    // The change journal behind blocking reads, `Watch`, and `StreamWork`
+    // resume (revisions-and-watches plan): fed by the changeset projection
+    // on every replica, like the work log. See `store/revision_ops.rs`.
+    revisions: Arc<crate::storage::revisions::RevisionHub>,
+    // Whether revisions are raft applied indexes (raft persistence) rather
+    // than the `local_disk` counter. A plain flag, so the engine's own store
+    // clones, which carry a placeholder driver, still know.
+    raft_revisions: bool,
     // Eval claims as leader memory (sandbox-scaling plan, Phase 1): which
     // evals this manager's eval workers hold. A claim writes nothing; see
     // `store/eval_claims.rs`.
@@ -2034,6 +2049,48 @@ const SEED_TASK_STATUSES_SQL: &str =
 // 22nd century (i64::MAX >> 21 ms ≈ year 2109).
 const EVENT_ID_SEQ_BITS: u32 = 18;
 
+/// Per-residue (per-lane) high-water mark of `scheduler_event` ids: the
+/// largest id this process minted or saw committed. Minting never goes at
+/// or below it (`Store::next_scheduler_event_id`), and the projection raises
+/// it from every committed event (`Store::raise_event_id_floor`), so ids
+/// increase per lane across a failover as well as within a process.
+static EVENT_ID_HIGH_WATER: [std::sync::atomic::AtomicI64; Lane::ID_STRIDE as usize] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; Lane::ID_STRIDE as usize];
+
+/// The operator-facing sentence for a lost `RunJob` compare-and-set,
+/// shaped like `ApplyObject`'s: what the job is at, and how to recover.
+fn job_version_conflict(job: &str, current: i64, expected: i64) -> String {
+    if expected == 0 {
+        format!(
+            "job {job} already exists (version {current}); expected_version 0 creates only\n\
+             Hint: read it (legion job info {job}) and resubmit with --expected-version {current}"
+        )
+    } else if current == 0 {
+        format!(
+            "job {job} does not exist, and expected_version {expected} names a stored version\n\
+             Hint: pass --expected-version 0 to create it"
+        )
+    } else {
+        format!(
+            "job {job} is at version {current}, not {expected}: it changed since you read it\n\
+             Hint: read it again (legion job info {job}) and resubmit on top of it with \
+             --expected-version {current}"
+        )
+    }
+}
+
+/// What the work-log projection resolved from one committed changeset, for
+/// the revision journal ([`Store::record_revision_changes`]).
+#[derive(Debug, Default)]
+struct WorkChanges {
+    /// `(node, allocation)` pairs the changeset changed.
+    pairs: Vec<(String, i64)>,
+    /// Nodes whose allocation changes could not be named.
+    unknown_nodes: Vec<String>,
+    /// No change could be attributed to a node at all.
+    unattributed: bool,
+}
+
 // NOTE: This will become a general interface for all storage backends
 
 /// Columns `QueryStateStore` reads as NULL: private key material, password
@@ -2210,6 +2267,8 @@ impl Store {
             )),
             work_log: Arc::new(crate::storage::work_log::WorkLog::new()),
             endpoint_index: Arc::new(crate::storage::endpoint_index::EndpointIndex::new()),
+            revisions: Arc::new(crate::storage::revisions::RevisionHub::new()),
+            raft_revisions: raft_enabled,
             eval_claims: Arc::new(std::sync::Mutex::new(eval_claims::EvalClaims::default())),
             capacity_events: Arc::new(std::sync::Mutex::new(
                 blocked_evals::CapacityEvents::default(),
@@ -2246,6 +2305,10 @@ impl Store {
         // reads work from the first request. A root key that is missing here
         // locks KV, loudly, and never stops the manager (docs/kv-encryption.md).
         store.load_keyring_at_start();
+
+        // Open the change journal at the revision the store is at now,
+        // before the raft engine replays any entry into it.
+        store.start_revisions();
 
         // Raft mode: start the engine AFTER migrations (the state machines
         // apply into the migrated DB) and BEFORE this store is handed to
@@ -2617,9 +2680,10 @@ impl Store {
     /// user table except the ones that legitimately differ between healthy
     /// replicas (plan §7-C2):
     ///
-    /// - `raft_applied` (applied marker legitimately lags on followers) and
-    ///   `raft_cluster` (node-local identity stamp) — raft bookkeeping,
-    ///   never replicated;
+    /// - `raft_applied` (applied marker legitimately lags on followers),
+    ///   `raft_cluster` (node-local identity stamp), `raft_speculative` (the
+    ///   leader's undo records), and `store_revision` (the `local_disk`
+    ///   revision counter) — node-local bookkeeping, never replicated;
     /// - `scheduler_event` / `idempotency_record` / `audit_event` —
     ///   commutative tables pruned locally per node (JC-28), so their
     ///   retained windows differ.
@@ -2639,8 +2703,8 @@ impl Store {
                 "SELECT name FROM sqlite_master
                  WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
                    AND name NOT IN ('raft_applied', 'raft_cluster', 'raft_speculative',
-                                    'scheduler_event', 'idempotency_record',
-                                    'audit_event')
+                                    'store_revision', 'scheduler_event',
+                                    'idempotency_record', 'audit_event')
                  ORDER BY name;",
             )?;
             let rows = stmt.query_map([], |row| row.get(0))?;
@@ -7222,6 +7286,13 @@ impl Store {
             blocked: None,
             // Overlaid by GetJobInfo (`Store::reschedule_holds_for_job`).
             reschedule_backoffs: Vec::new(),
+            // The latest config's version (`JOB_SELECT_ATTRS`); absent from
+            // the upsert's RETURNING, which reads as 0 until the next read.
+            version: row
+                .get::<_, Option<i64>>(6)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
         };
 
         Ok(job)
@@ -10544,12 +10615,33 @@ impl Store {
         granted_by: &str,
         unknown_fields: Option<&UnknownFieldsRecord>,
     ) -> R<JobSubmitOutcome> {
-        self.handle_job_submit_inner(
+        self.handle_job_submit_checked(config, subs, template, granted_by, unknown_fields, None)
+    }
+
+    /// [`Self::handle_job_submit_as`] with compare-and-set on the job's
+    /// latest version (`RunJobRequest.expected_version`; revisions-and-
+    /// watches plan §9): the submit writes only when the job's latest
+    /// config is at exactly `expected_version` (0: the job must not exist),
+    /// checked inside the Control-lane entry that writes the new version, so
+    /// two racing writers cannot both win. A mismatch is
+    /// [`StorageError::Aborted`] naming the current version, and writes
+    /// nothing. `None` checks nothing.
+    pub fn handle_job_submit_checked(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+        granted_by: &str,
+        unknown_fields: Option<&UnknownFieldsRecord>,
+        expected_version: Option<i64>,
+    ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner_checked(
             config,
             subs,
             template,
             crate::storage::acl_store::GrantSource::Submitter(granted_by.to_string()),
             unknown_fields,
+            expected_version,
         )
     }
 
@@ -10636,12 +10728,25 @@ impl Store {
         grant: crate::storage::acl_store::GrantSource,
         unknown_fields: Option<&UnknownFieldsRecord>,
     ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner_checked(config, subs, template, grant, unknown_fields, None)
+    }
+
+    fn handle_job_submit_inner_checked(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+        grant: crate::storage::acl_store::GrantSource,
+        unknown_fields: Option<&UnknownFieldsRecord>,
+        expected_version: Option<i64>,
+    ) -> R<JobSubmitOutcome> {
         let request = JobSubmitRequest {
             config: config.clone(),
             subs: subs.to_vec(),
             template: template.cloned(),
             grant,
             unknown_fields: unknown_fields.filter(|record| !record.is_empty()).cloned(),
+            expected_version,
         };
         // A submit raised from INSIDE another op's capture must stay part of
         // that capture (`replicated` short-circuits there); routing it
@@ -10657,6 +10762,7 @@ impl Store {
                 template,
                 grant,
                 unknown_fields,
+                expected_version,
             } = request;
             self.replicated(Lane::Control, "handle_job_submit", move |s| {
                 s.handle_job_submit_apply(
@@ -10665,6 +10771,7 @@ impl Store {
                     template.as_ref(),
                     &grant,
                     unknown_fields.as_ref(),
+                    expected_version,
                 )
             })?
         } else {
@@ -10934,11 +11041,19 @@ impl Store {
         template: Option<&JobTemplateProvenance>,
         grant: &crate::storage::acl_store::GrantSource,
         unknown_fields: Option<&UnknownFieldsRecord>,
+        expected_version: Option<i64>,
     ) -> R<JobSubmitOutcome> {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
-        let (outcome, staged) =
-            self.handle_job_submit_tx(&tx, config, subs, template, grant, unknown_fields)?;
+        let (outcome, staged) = self.handle_job_submit_tx(
+            &tx,
+            config,
+            subs,
+            template,
+            grant,
+            unknown_fields,
+            expected_version,
+        )?;
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))?;
         drop(conn);
@@ -10998,6 +11113,7 @@ impl Store {
                 request.template.as_ref(),
                 &request.grant,
                 request.unknown_fields.as_ref(),
+                request.expected_version,
             ) {
                 Ok((outcome, staged)) => {
                     if let Err(err) = tx.execute_batch("RELEASE legion_submit_item;") {
@@ -11051,6 +11167,7 @@ impl Store {
                         request.template.as_ref(),
                         &request.grant,
                         request.unknown_fields.as_ref(),
+                        request.expected_version,
                     )
                 }),
             ];
@@ -11076,6 +11193,7 @@ impl Store {
                                 request.template.as_ref(),
                                 &request.grant,
                                 request.unknown_fields.as_ref(),
+                                request.expected_version,
                             )
                         })
                     })
@@ -11151,6 +11269,7 @@ impl Store {
     /// `latest_job_config_tx`). Stages events but does not publish them and
     /// does not commit — the caller does both, which is what lets the batch
     /// runner wrap each request in its own savepoint inside one commit.
+    #[allow(clippy::too_many_arguments)]
     fn handle_job_submit_tx(
         &self,
         tx: &Connection,
@@ -11159,6 +11278,7 @@ impl Store {
         template: Option<&JobTemplateProvenance>,
         grant: &crate::storage::acl_store::GrantSource,
         unknown_fields: Option<&UnknownFieldsRecord>,
+        expected_version: Option<i64>,
     ) -> R<(JobSubmitOutcome, Vec<SchedulerEventRecord>)> {
         let config = self.normalize_job_config(config)?;
         // The app reconciler's submit is compare-and-set on the app record
@@ -11182,7 +11302,22 @@ impl Store {
         let mut last_versions_id: Option<String> = None;
         let mut was_update = false;
 
-        if let Some(latest_job_config) = self.latest_job_config_tx(tx, &config.name)? {
+        let latest_job_config = self.latest_job_config_tx(tx, &config.name)?;
+        // Compare-and-set (`RunJobRequest.expected_version`), against the
+        // version this same entry reads, before anything is written.
+        if let Some(expected) = expected_version {
+            let current = latest_job_config
+                .as_ref()
+                .map(|latest| i64::from(latest.version.unwrap_or(0)))
+                .unwrap_or(0);
+            if current != expected {
+                return Err(StorageError::Aborted {
+                    message: job_version_conflict(&config.name, current, expected),
+                }
+                .into());
+            }
+        }
+        if let Some(latest_job_config) = latest_job_config {
             // if latest_job_config is deep equal to config, return unchanged
             if latest_job_config.is_same_as(&config) {
                 let job_config_id = latest_job_config.id();
@@ -12233,6 +12368,8 @@ impl Store {
         }
         self.work_log.resync_all();
         self.endpoint_index.mark_all();
+        // Rows changed under the journal too: every watch resyncs.
+        self.reset_revisions();
         if keyring {
             self.keyring_rows_changed();
         }
@@ -12789,16 +12926,27 @@ impl Store {
         }
         self.note_capacity_events(capacity_nodes);
 
-        // Tell the work delivery log which allocations moved, on every
-        // replica and in every mode, after the read model reflects them.
-        // Infallible by design: see `note_work_changes`.
-        self.note_work_changes(
+        // Tell the work delivery log which allocations moved, and the
+        // revision journal what this entry changed, on every replica and in
+        // every mode, after the read model reflects them. Both are resolved
+        // against the DB first and published together under the journal's
+        // publish lock, so a `StreamWork` message tagged with the journal's
+        // position, or a worker resuming here, never sees one without the
+        // other (revisions-and-watches plan §7). Infallible by design: see
+        // `note_work_changes` and `prepare_revision_record`.
+        let work = self.note_work_changes(
             &alloc_delta,
             &refresh_nodes,
             &changed_instances,
             &changed_volume_jobs,
             &changed_volume_ids,
         );
+        let record = self.prepare_revision_record(bytes, &work);
+        {
+            let _publishing = self.revisions.publishing();
+            self.publish_work_changes(&work, &refresh_nodes);
+            self.publish_revision_record(record, &work);
+        }
         self.note_checkpoint_changes(checkpoint_nodes, checkpoint_reread_ids);
         // The endpoint index (mesh-control-path plan §6.1), likewise on
         // every replica and never failing; free while no node consumes a
@@ -12809,8 +12957,14 @@ impl Store {
             return Ok(());
         }
 
-        // Publish committed scheduler events in id order.
+        // Publish committed scheduler events in id order. Each committed id
+        // also raises this process's minting floor, so if this replica leads
+        // next, its first id sorts above every id the old leader committed,
+        // whatever its clock says (revisions-and-watches plan §4).
         event_ids.sort_unstable();
+        for &id in &event_ids {
+            Self::raise_event_id_floor(id);
+        }
         for &id in &event_ids {
             let record = {
                 let conn = self.read_connection()?;
@@ -12869,6 +13023,11 @@ impl Store {
     /// the same entry cleanly. The work log is a node-local delivery cache
     /// that a resync rebuilds, so a lookup failure resyncs every streaming
     /// node instead.
+    ///
+    /// The resolved changes are returned for the revision journal, which
+    /// keeps them per node whether or not anyone streams from this manager:
+    /// a worker that reconnects here from another manager resumes from them
+    /// (revisions-and-watches plan §7).
     fn note_work_changes(
         &self,
         delta: &AllocationDelta,
@@ -12876,13 +13035,10 @@ impl Store {
         changed_instances: &HashSet<String>,
         changed_volume_jobs: &HashSet<String>,
         changed_volume_ids: &HashSet<String>,
-    ) {
-        if !self.work_log.has_nodes() {
-            return;
-        }
+    ) -> WorkChanges {
+        let mut work = WorkChanges::default();
         if !delta.usable {
-            self.work_log
-                .resync_nodes(refresh_nodes.iter().map(String::as_str));
+            work.unknown_nodes = refresh_nodes.iter().cloned().collect();
         }
         match self.work_changes(
             delta,
@@ -12890,17 +13046,35 @@ impl Store {
             changed_volume_jobs,
             changed_volume_ids,
         ) {
-            Ok(changes) => self
-                .work_log
-                .note_changes(changes.iter().map(|(node, id)| (node.as_str(), *id))),
+            Ok(changes) => work.pairs = changes,
             Err(err) => {
                 warn!(
                     error = ?err,
                     "Failed resolving a committed changeset's allocation changes for the work \
                      stream; resyncing every streaming node"
                 );
-                self.work_log.resync_all();
+                work.unattributed = true;
             }
+        }
+        work
+    }
+
+    /// The memory half of [`Self::note_work_changes`]: mark what `work`
+    /// resolved in the work log (a full resync for nodes it could not
+    /// name). Called under the revision journal's publish lock.
+    fn publish_work_changes(&self, work: &WorkChanges, refresh_nodes: &BTreeSet<String>) {
+        if !self.work_log.has_nodes() {
+            return;
+        }
+        if !work.unknown_nodes.is_empty() {
+            self.work_log
+                .resync_nodes(refresh_nodes.iter().map(String::as_str));
+        }
+        if work.unattributed {
+            self.work_log.resync_all();
+        } else {
+            self.work_log
+                .note_changes(work.pairs.iter().map(|(node, id)| (node.as_str(), *id)));
         }
     }
 
@@ -13117,13 +13291,8 @@ impl Store {
     /// `max(id) + 1`) for the same instant — an existing journal's cursor
     /// never has to go backwards.
     fn next_scheduler_event_id() -> i64 {
-        use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
-        /// Per-residue high-water mark enforcing strict monotonicity per
-        /// lane (see above). One slot per possible residue.
-        static LAST: [AtomicI64; Lane::ID_STRIDE as usize] =
-            [const { AtomicI64::new(0) }; Lane::ID_STRIDE as usize];
-
         let residue = Self::event_id_residue();
         let seq = SEQ.get_or_init(|| AtomicU64::new(rand::random::<u64>()));
         let sequence = seq.fetch_add(1, Ordering::Relaxed) & ((1u64 << EVENT_ID_SEQ_BITS) - 1);
@@ -13132,7 +13301,7 @@ impl Store {
             | ((sequence as i64) << Lane::ID_STRIDE_BITS)
             | residue;
 
-        let slot = &LAST[residue as usize];
+        let slot = &EVENT_ID_HIGH_WATER[residue as usize];
         let mut previous = slot.load(Ordering::Relaxed);
         loop {
             // Advancing by a whole stride keeps the residue (and therefore
@@ -13147,6 +13316,22 @@ impl Store {
                 Err(actual) => previous = actual,
             }
         }
+    }
+
+    /// Raise the minting floor of `id`'s lane to `id`: the next id minted
+    /// for that lane in this process sorts above it. Fed every committed
+    /// event id by the projection (and the journal's newest ids at start),
+    /// which is what keeps ids from going backwards across a failover: a new
+    /// leader applies everything committed before it captures, so its floor
+    /// is above every id the old leader committed (revisions-and-watches
+    /// plan §4; docs/event-stream.md).
+    pub(crate) fn raise_event_id_floor(id: i64) {
+        use std::sync::atomic::Ordering;
+        if id <= 0 {
+            return;
+        }
+        let residue = id.rem_euclid(Lane::ID_STRIDE) as usize;
+        EVENT_ID_HIGH_WATER[residue].fetch_max(id, Ordering::Relaxed);
     }
 
     /// Whether an event id lands on the opportunistic journal-prune
@@ -22325,6 +22510,7 @@ mod tests {
                 template: None,
                 grant: crate::storage::acl_store::GrantSource::CarryForward,
                 unknown_fields: None,
+                expected_version: None,
             },
             JobSubmitRequest {
                 config: v2,
@@ -22332,6 +22518,7 @@ mod tests {
                 template: None,
                 grant: crate::storage::acl_store::GrantSource::CarryForward,
                 unknown_fields: None,
+                expected_version: None,
             },
         ];
         let results = store.handle_job_submits_apply(&batch);
@@ -22362,6 +22549,7 @@ mod tests {
             template: None,
             grant: crate::storage::acl_store::GrantSource::CarryForward,
             unknown_fields: None,
+            expected_version: None,
         };
         let fresh = JobSubmitRequest {
             config: JobConfig {
@@ -22381,6 +22569,7 @@ mod tests {
             template: None,
             grant: crate::storage::acl_store::GrantSource::CarryForward,
             unknown_fields: None,
+            expected_version: None,
         };
         let results = store.handle_job_submits_apply(&[unchanged, fresh]);
         assert!(matches!(
