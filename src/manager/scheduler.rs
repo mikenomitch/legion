@@ -1125,6 +1125,9 @@ struct TaskPlan<'a> {
     /// looked up by this job id and the task's group and name instead.
     /// Looked up by the positional id, they were another job's pins.
     positional_job_id: Option<String>,
+    /// The task's desired replica count in this plan: what scales the
+    /// automatic anti-affinity penalty ([`anti_affinity_penalty`]).
+    desired_count: u32,
 }
 
 impl TaskPlan<'_> {
@@ -1259,6 +1262,8 @@ struct PlanScoringCache {
     /// This task's locality scores, kept for nodes outside `states` and for
     /// the policy-plugin path. `None` skips the term.
     locality: Option<Arc<crate::storage::content_index::LocalityScores>>,
+    /// The task's desired replica count, for [`anti_affinity_penalty`].
+    desired_count: u32,
 }
 
 impl PlanScoringCache {
@@ -1278,6 +1283,7 @@ impl PlanScoringCache {
         planned_task_allocations: &HashMap<String, Vec<i64>>,
         resource_ledger: &ResourceLedger,
         task_request: &ResourceRequest,
+        desired_count: u32,
     ) -> Self {
         let group_name = task_id_to_group.get(&task_id).cloned();
         let affinity = TaskAffinityCache::new(task_config, task_name_to_id);
@@ -1354,6 +1360,7 @@ impl PlanScoringCache {
             common_demand,
             group_name,
             locality: None,
+            desired_count: desired_count.max(1),
         }
     }
 
@@ -2952,6 +2959,7 @@ impl<'a> Scheduler<'a> {
                 namespace,
                 positional_job_id,
             )?;
+            plan.desired_count = desired_count.max(needed).max(1);
 
             let base_eligible = plan.base_eligible.clone();
             if let Some(per_key) = per_key {
@@ -3903,6 +3911,7 @@ impl<'a> Scheduler<'a> {
             distinct_tracker,
             index_usage,
             positional_job_id: positional_job_id.map(str::to_owned),
+            desired_count: needed.max(1),
         })
     }
 
@@ -3958,6 +3967,7 @@ impl<'a> Scheduler<'a> {
             planned_task_allocations,
             resource_ledger,
             &plan.task_request,
+            plan.desired_count,
         );
         // Content locality: computed once per task, from the in-memory
         // location index. Skipped (no cost beyond walking the task's
@@ -4120,6 +4130,7 @@ impl<'a> Scheduler<'a> {
                     planned_task_allocations,
                     resource_ledger,
                     &plan.task_request,
+                    plan.desired_count,
                 );
                 scoring_cache.apply_locality(&candidates, locality.as_ref());
                 eligible = Self::eligible_nodes(
@@ -6516,15 +6527,10 @@ fn score_node_with_cache(
     let affinity_score = state
         .map(|s| s.base_affinity + scoring_cache.affinity.colocation_score(s))
         .unwrap_or_else(|| affinity_set.score(node));
-    let anti_affinity_penalty = state
-        .map(|s| s.same_task_allocations.max(s.same_group_allocations) as f64)
-        .unwrap_or_else(|| {
-            if scoring_cache.group_name.is_some() {
-                1.0
-            } else {
-                0.0
-            }
-        });
+    let collisions = state
+        .map(|s| s.same_task_allocations.max(s.same_group_allocations))
+        .unwrap_or_else(|| usize::from(scoring_cache.group_name.is_some()));
+    let anti_affinity_penalty = anti_affinity_penalty(collisions, scoring_cache.desired_count);
     let locality_score = match state {
         Some(state) => state.locality,
         None => scoring_cache
@@ -6537,6 +6543,26 @@ fn score_node_with_cache(
         + weights.bin_pack * bin_pack_score
         - weights.automatic_anti_affinity * anti_affinity_penalty
         + weights.locality * locality_score
+}
+
+/// The automatic anti-affinity penalty for a node already holding
+/// `collisions` allocations of this task (or its group), before
+/// `weights.automatic_anti_affinity`: `(collisions + 1) / desired`, and 0
+/// for a node holding none — the shape of Nomad's job anti-affinity.
+///
+/// Scaling by the task's count is what lets both rules hold at once: a
+/// two- or three-replica service spreads (the penalty, 0.2 x 2/3 for a
+/// first collision at the default weight, outweighs the few hundredths of
+/// utilization a small replica adds), while a twenty-replica batch task
+/// under `bin_pack` packs (0.2 x 2/20 is less than one replica's share of a
+/// node). A flat per-collision penalty spread every task, which cost
+/// many-replica plans their density and the apply a node-row recheck per
+/// extra node (docs/scheduler-and-eval-loop.md, "Scoring").
+fn anti_affinity_penalty(collisions: usize, desired_count: u32) -> f64 {
+    if collisions == 0 {
+        return 0.0;
+    }
+    (collisions as f64 + 1.0) / f64::from(desired_count.max(1))
 }
 
 fn score_nodes_with_cache<'a>(
@@ -6974,11 +7000,13 @@ mod tests {
         let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
 
         assert_eq!(outcome.allocations.len(), 2);
-        // One delta per node the reschedule placed on. Resource scoring
-        // weighs two small replicas lightly against the automatic
-        // anti-affinity penalty, so they may land on one node or on two
-        // (docs/scheduler-and-eval-loop.md, "Scoring"); under count-based
-        // scoring they always stacked onto node-a.
+        // One delta per node the reschedule placed on. The task has three
+        // replicas, so a collision costs 0.2 x 2/3 under the count-scaled
+        // anti-affinity penalty, more than the ~0.03 of an 8 GiB node one
+        // 256 MiB replica adds: the first replica goes to node-b, and the
+        // second ties between the two nodes (docs/scheduler-and-eval-loop.md,
+        // "Scoring"). Count-based scoring stacked both onto node-a; a
+        // many-replica task still packs (`bin_pack_packs_many_replicas_and_spreads_few`).
         let placed_on: HashSet<&str> = outcome
             .allocations
             .iter()
@@ -7921,6 +7949,58 @@ mod tests {
         Ok(())
     }
 
+    /// The anti-affinity penalty scales with the task's count: none without
+    /// a collision, `(collisions + 1) / count` with one, so a small service's
+    /// replicas pay more per collision than a large batch task's.
+    #[test]
+    fn anti_affinity_penalty_scales_with_the_desired_count() {
+        assert_eq!(anti_affinity_penalty(0, 3), 0.0);
+        assert!((anti_affinity_penalty(1, 2) - 1.0).abs() < 1e-12);
+        assert!((anti_affinity_penalty(1, 20) - 0.1).abs() < 1e-12);
+        assert!((anti_affinity_penalty(4, 20) - 0.25).abs() < 1e-12);
+        assert!(anti_affinity_penalty(1, 3) > anti_affinity_penalty(1, 20));
+        assert_eq!(
+            anti_affinity_penalty(2, 0),
+            3.0,
+            "a zero count reads as one"
+        );
+    }
+
+    /// Under `bin_pack` a many-replica task packs onto a node again, while a
+    /// small one still spreads (review SCH4 follow-up).
+    #[test]
+    fn bin_pack_packs_many_replicas_and_spreads_few() -> R<()> {
+        let nodes_used = |count: u32| -> R<usize> {
+            let store = setup_store_with_scheduler("bin_pack", None)?;
+            for index in 0..6 {
+                store.insert_node(make_node_msg(&format!("node-{index}"), json!({})))?;
+            }
+            let job_config_id = submit_job(
+                &store,
+                "packing",
+                vec![TaskConfig {
+                    count: TaskCount::new(count),
+                    resources: json!({ "memory": 256, "cpu": 100 }),
+                    ..TaskConfig::new("worker", "noop")
+                }],
+            )?;
+            let placements = Scheduler::new(&store)?.plan_only(&job_config_id, PlanMode::Fresh)?;
+            assert_eq!(placements.len(), count as usize);
+            Ok(placements
+                .iter()
+                .map(|placement| placement.node_id.as_str())
+                .collect::<HashSet<_>>()
+                .len())
+        };
+        assert_eq!(
+            nodes_used(20)?,
+            1,
+            "twenty small replicas pack onto one node"
+        );
+        assert_eq!(nodes_used(3)?, 3, "three replicas spread");
+        Ok(())
+    }
+
     /// Two identical, empty nodes score identically under the cached
     /// scorer, and the scores are utilization (not min-max of counts, which
     /// was 0 for every node when all were equal).
@@ -7986,6 +8066,7 @@ mod tests {
             &planned_task_allocations,
             &resource_ledger,
             &request,
+            2,
         );
 
         let eligible = Scheduler::eligible_nodes(
@@ -8273,6 +8354,7 @@ mod tests {
             &planned_task_allocations,
             &ledger,
             &request,
+            1,
         );
 
         assert!(cache.can_fit_task_request(&nodes[0]));

@@ -789,7 +789,7 @@ The score is the policy's term times its weight, plus the other terms:
 score = affinities × weights.affinities
       + bin_pack term × weights.bin_pack            (1 under bin_pack, else 0)
       + spread term × weights.spread                (1 under spread, else 0)
-      - same-task allocations on the node × weights.automatic_anti_affinity (0.2)
+      - anti-affinity × weights.automatic_anti_affinity (0.2)
       + content locality × weights.locality
 ```
 
@@ -808,12 +808,29 @@ The balance term breaks near-ties toward the node whose resources fill
 evenly, so a node is less likely to be left with memory and no CPU, or the
 reverse.
 
-Because a small task moves a node's utilization by a few hundredths, the
-automatic anti-affinity penalty (0.2 per allocation of the same task already
-on the node) usually outweighs packing for replicas of one task. Under
-`bin_pack` a service's replicas therefore land on different busy nodes rather
-than on one. Set `schedulerSettings.weights.automatic_anti_affinity = 0` to
-stack them.
+The **anti-affinity** term is scaled by the task's replica count, the shape
+of Nomad's job anti-affinity:
+
+```text
+collisions    = allocations of this task (or its group) already on the node,
+                counting the ones this plan placed
+anti-affinity = 0                                  when collisions = 0
+              = (collisions + 1) / desired count   otherwise
+```
+
+A replica of a small service moves a node's utilization by a few hundredths,
+so how the two terms trade off depends on the count:
+
+- **A few replicas spread.** For three replicas a first collision costs
+  0.2 × 2/3 ≈ 0.13, more than the packing gain of one more small replica, so
+  under `bin_pack` too they land on different nodes.
+- **Many replicas pack.** For twenty, a first collision costs 0.2 × 2/20 =
+  0.02, less than one replica's share of a typical node, so `bin_pack` fills
+  a node with them before starting the next, and `spread` still spreads them
+  (its term already prefers the emptier node).
+
+Set `schedulerSettings.weights.automatic_anti_affinity = 0` to stack replicas
+whatever their count, or raise it to spread larger tasks.
 
 Scheduling plugins are not affected: their context still carries allocation
 counts and no capacity ([plugin system](plugin-system.md)).
