@@ -998,6 +998,9 @@ pub struct WorkerTaskManager {
     /// resize controller, by the envelope's local key (elastic-session-
     /// envelopes plan §6.2). Admission reads the room from here.
     envelope_sizes: HashMap<i64, crate::worker::envelope_elastic::EnvelopeSize>,
+    /// Device plugins and the last device report (docs/devices.md). A task
+    /// with assigned devices is granted them here before `prepare()`.
+    devices: Arc<crate::devices::plugin::DeviceManager>,
 }
 
 /// A session task's spec, as its envelope's payload carried it.
@@ -1029,6 +1032,7 @@ impl WorkerTaskManager {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| alloc_root.clone());
         Self {
+            devices: Arc::new(crate::devices::plugin::DeviceManager::default()),
             registry: TaskPluginRegistry::new(),
             instances: HashMap::new(),
             allocations: HashMap::new(),
@@ -1429,6 +1433,16 @@ impl WorkerTaskManager {
                 .with_content_store_target(content_store_target)
                 .with_egress_guard(egress),
         );
+    }
+
+    /// Sets the node's device plugins and static devices (docs/devices.md).
+    pub fn configure_devices(&mut self, devices: Arc<crate::devices::plugin::DeviceManager>) {
+        self.devices = devices;
+    }
+
+    /// The node's device side, for the node-check loop's re-fingerprint.
+    pub fn device_manager(&self) -> Arc<crate::devices::plugin::DeviceManager> {
+        self.devices.clone()
     }
 
     /// Sets the node content store. Call before [`Self::configure_artifacts`],
@@ -3715,6 +3729,16 @@ impl WorkerTaskManager {
                     task.name
                 )
             })?;
+        // Devices the scheduler assigned (docs/devices.md): the plugin's
+        // `allocate` runs here, before `prepare()`, so a task never starts
+        // without the devices it was placed for. A failure fails the
+        // allocation and the manager reschedules it.
+        // `task.resources` is the payload's `task_resources`, whose
+        // `devices` carry this allocation's assignment.
+        let device_grant = self
+            .devices
+            .grant(&task.resources)
+            .with_context(|| format!("failed to allocate the devices of task {}", task.name))?;
 
         let plugin = self
             .registry
@@ -3730,6 +3754,10 @@ impl WorkerTaskManager {
             .context("Task instance missing")?;
         instance.log_dir = Some(log_dir);
         instance.resource_assignment = assignment;
+        // Host-process runtimes read the env from `extra_env`; isolating
+        // runtimes apply `devices` (env included) themselves.
+        instance.extra_env.extend(device_grant.env);
+        instance.devices = device_grant.edits;
         if self
             .volume_specs
             .get(&allocation.id)

@@ -49,6 +49,7 @@ mod certs;
 mod cli_closed_pipe;
 mod config_jobs;
 mod content_locality;
+mod devices;
 mod edge_boot_integration;
 mod eval_loop;
 mod eval_regen_failover;

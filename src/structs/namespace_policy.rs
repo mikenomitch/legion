@@ -74,7 +74,7 @@ pub struct NamespacePolicy {
 }
 
 /// One band's cap. Each dimension is optional; an unset one is uncapped.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QuotaLimit {
     /// CPU in MHz, the unit of `resources.cpu`.
@@ -91,6 +91,11 @@ pub struct QuotaLimit {
     /// Exclusive cores (`resources.cores`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cores: Option<f64>,
+    /// Devices (`resources.devices`), by device name: `{ "nvidia/gpu" = 8 }`.
+    /// A request is charged against every key it could be served under, so
+    /// `gpu` counts against `nvidia/gpu` (docs/devices.md, "Quota").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub devices: BTreeMap<String, f64>,
 }
 
 /// Pool rules: every task's pool must match `allowed`; a task whose permit
@@ -238,6 +243,15 @@ impl NamespacePolicy {
                 if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
                     return Err(format!(
                         "{what}: quota.{band}.{dimension} must be a non-negative number"
+                    ));
+                }
+            }
+            for (device, value) in &limit.devices {
+                crate::devices::DeviceName::parse(device)
+                    .map_err(|err| format!("{what}: quota.{band}.devices: {err:#}"))?;
+                if !value.is_finite() || *value < 0.0 {
+                    return Err(format!(
+                        "{what}: quota.{band}.devices.{device} must be a non-negative number"
                     ));
                 }
             }

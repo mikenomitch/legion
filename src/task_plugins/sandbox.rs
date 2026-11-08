@@ -1727,6 +1727,8 @@ impl SandboxTaskPlugin {
                         .intersect(oci_bundle::default_capabilities()),
                     rlimits: oci_bundle::default_rlimits(),
                 },
+                // Admission refuses devices on sandboxes (no VFIO yet).
+                devices: &crate::devices::cdi::NO_EDITS,
             },
         )?;
         let mut cmd = Command::new(binary);
@@ -1806,6 +1808,17 @@ impl TaskPlugin for SandboxTaskPlugin {
     /// that disagrees with the size `resources` imply is a warning this
     /// release (a future release rejects it).
     fn check_resources(&self, task: &TaskConfig) -> R<Vec<String>> {
+        // No device passthrough into the microVM yet (docs/devices.md,
+        // "Limitations"): a GPU sandbox would boot without its GPU.
+        if crate::devices::request_specs(&task.resources).is_ok_and(|specs| !specs.is_empty()) {
+            bail!(
+                "task {} asks for resources.devices, but sandbox tasks cannot use devices yet \
+                 (there is no VFIO passthrough into the microVM). Run it as a `container` task \
+                 (gVisor or Kata through config.runtimeClass if it needs isolation), or drop \
+                 resources.devices",
+                task.name
+            );
+        }
         let Ok(config) = SandboxTaskConfig::from_value(&task.config) else {
             // `validate_config` reports the parse error with its own message.
             return Ok(Vec::new());

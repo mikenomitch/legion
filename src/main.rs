@@ -73,6 +73,7 @@ async fn main() -> R<()> {
         Some(("guest-agent", sub_matches)) => cmd::guest_agent::handle(sub_matches).await?,
         Some(("guest-resume", sub_matches)) => cmd::guest_resume::handle(sub_matches).await?,
         Some(("volume", sub_matches)) => cmd::volume::handle(sub_matches).await?,
+        Some(("device", sub_matches)) => cmd::device::handle(sub_matches).await?,
         Some(("snapshot", sub_matches)) => cmd::snapshot::handle(sub_matches).await?,
         Some(("state", sub_matches)) => cmd::state::handle(sub_matches).await?,
         Some(("raft", sub_matches)) => cmd::raft::handle(sub_matches).await?,

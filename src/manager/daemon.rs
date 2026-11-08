@@ -4099,12 +4099,18 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 .fence_list_every()
                 .with_context(|| format!("invalid sessions config in worker config {path_str}"))?;
         }
-        // The top-level `content` and `contentStore` blocks ride in the
-        // artifacts payload (see `WorkerArtifactsPayload`).
+        if let Some(devices) = wcp.devices.as_ref() {
+            devices
+                .validate()
+                .with_context(|| format!("invalid devices config in worker config {path_str}"))?;
+        }
+        // The top-level `content`, `contentStore`, `sessions`, and `devices`
+        // blocks ride in the artifacts payload (see `WorkerArtifactsPayload`).
         let artifacts = if wcp.artifacts.is_none()
             && wcp.content.is_none()
             && wcp.content_store.is_none()
             && wcp.sessions.is_none()
+            && wcp.devices.is_none()
         {
             String::new()
         } else {
@@ -4113,6 +4119,7 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                 content: wcp.content.clone(),
                 content_store: wcp.content_store.clone(),
                 sessions: wcp.sessions.clone(),
+                devices: wcp.devices.clone(),
             })?
         };
 

@@ -115,6 +115,16 @@ impl ConstraintSet {
             .find(|rule| !rule.matches(node, None))
             .map(Rule::describe)
     }
+
+    /// Every rule against a flat attribute map instead of a node: the
+    /// device model's per-instance constraints (`resources.devices[].
+    /// constraints`, docs/devices.md). `distinct` has no tracker here, so it
+    /// only needs the key to be present.
+    pub fn is_satisfied_by_attrs(&self, attrs: &serde_json::Map<String, Value>) -> bool {
+        self.rules
+            .iter()
+            .all(|rule| rule.matches_attrs(attrs, None))
+    }
 }
 
 /// The node config attribute holding the namespaces a node accepts (its
@@ -299,6 +309,24 @@ impl AffinitySet {
             }
         }
 
+        if total == 0.0 {
+            0.0
+        } else {
+            matched / total
+        }
+    }
+
+    /// [`Self::score`] over a flat attribute map: how well one device
+    /// instance matches a device request's `affinities` (docs/devices.md).
+    pub fn score_attrs(&self, attrs: &serde_json::Map<String, Value>) -> f64 {
+        let mut matched = 0.0;
+        let mut total = 0.0;
+        for rule in &self.rules {
+            total += rule.multiplier.abs();
+            if rule.matches_attrs(attrs, None) {
+                matched += rule.multiplier;
+            }
+        }
         if total == 0.0 {
             0.0
         } else {

@@ -712,6 +712,17 @@ pub fn catalog() -> Vec<Capability> {
             mutates: false,
             read_only_safe: true,
         },
+        // --- Devices and plugin seams (device-model-and-plugin-seams plan) ---
+        Capability {
+            name: "device.plugin.test",
+            cli: "legion device plugin test -- <COMMAND...>",
+            grpc: None,
+            summary: "Run the legion-device/1 conformance checks against a device plugin \
+                 locally (fingerprint twice, allocate one instance per group). No manager \
+                 needed. A node's devices show in `legion node info`.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Rollouts ---
         Capability {
             name: "rollout.list",

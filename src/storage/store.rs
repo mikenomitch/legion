@@ -38,6 +38,8 @@ mod envelope_ops;
 pub use envelope_ops::{EnvelopeResizeOutcome, EnvelopeResizeRequest};
 mod snapshot_ops;
 mod suspend_ops;
+// Device assignment at allocation insert (docs/devices.md).
+mod device_ops;
 // The job status GetJobInfo/ListJobs report, derived from the workload.
 mod job_status_ops;
 // Reschedule backoff: the failed-allocation removal op, its holds, and the
@@ -6232,7 +6234,7 @@ impl Store {
                     .instance_id
                     .as_deref()
                     .or(target_instance.as_deref());
-                let allocation = self.insert_allocation_with_data(
+                let allocation = match self.insert_allocation_with_data(
                     tx,
                     node_id,
                     task_id,
@@ -6240,17 +6242,39 @@ impl Store {
                     &state.resources,
                     network.as_ref(),
                     bind_instance,
-                )?;
-                allocations.push(allocation);
-                candidate_ranks.push(rank);
+                ) {
+                    Ok(allocation) => allocation,
+                    // The node cannot serve the task's devices any more:
+                    // one more "the world moved" class, like a port.
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::devices::DevicesUnavailable>()
+                            .is_some() =>
+                    {
+                        if first_skip_reason.is_none() {
+                            first_skip_reason = Some(format!("{error:#}"));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 // Debit the bound node so later placements in the SAME plan
                 // see the reduced pool — the in-tx mirror of the planner's
-                // ledger consume.
+                // ledger consume. A task with devices debits the row as
+                // written, which names the exact ids it was assigned.
                 if let (Some(request), Some(pool)) =
                     (request.as_ref(), free_pools.get_mut(node_id.as_str()))
                 {
-                    pool.consume(request);
+                    if request.devices.is_empty() {
+                        pool.consume(request);
+                    } else if let Ok(row) =
+                        self.resource_policy.usage_request(&allocation.resources)
+                    {
+                        pool.consume(&row);
+                    }
                 }
+                allocations.push(allocation);
+                candidate_ranks.push(rank);
                 if let Some(tracker) = state.distinct.as_mut() {
                     tracker.insert_from_node(node);
                 }
@@ -6658,6 +6682,20 @@ impl Store {
                 pool_usage.remove(allocation.node_id.as_str());
                 continue;
             };
+            // A task with devices was written with its assignment, which
+            // the task's own request does not carry: count the row.
+            if !request.devices.is_empty() {
+                match self.resource_policy.usage_request(&allocation.resources) {
+                    Ok(row) => snapshot.total.add(&row),
+                    Err(_) => {
+                        pool_usage.remove(allocation.node_id.as_str());
+                        continue;
+                    }
+                }
+                snapshot.count += 1;
+                snapshot.id_sum += allocation.id;
+                continue;
+            }
             snapshot.total.add(request);
             snapshot.count += 1;
             snapshot.id_sum += allocation.id;
@@ -14444,6 +14482,10 @@ impl Store {
         // every other placement path uses.
         target_instance: Option<&str>,
     ) -> R<Allocation> {
+        // Devices first, before anything is written: a node that cannot
+        // serve them fails the insert with nothing to roll back.
+        let assigned_resources = self.assign_devices_tx(tx, node_id, resources)?;
+        let resources = assigned_resources.as_ref().unwrap_or(resources);
         let network_json = network.map(to_string).transpose()?;
         // Stateful tasks: pick (or re-materialize) the instance this
         // allocation will fulfill before writing the row, so the binding is

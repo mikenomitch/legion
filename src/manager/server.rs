@@ -9271,9 +9271,20 @@ impl Manager for ManagerDaemonService {
         let id = req.id;
         acl::enforce_node_binding(&identity, &id)?;
 
+        // A changed device report (docs/devices.md) can free capacity a
+        // pending job is waiting for: a repaired GPU, a new card.
+        let devices_changed = crate::devices::report_changed(
+            self.store.cached_node(&id).ok().flatten().as_deref(),
+            &req.health_checks,
+        );
         self.store
             .update_node_health_checks(&id, &req.health_checks)
             .map_err(|e| map_store_error("Error updating node health checks", e))?;
+        if devices_changed {
+            if let Err(err) = self.store.request_capacity_reconcile() {
+                warn!(node_id = %id, error = %err, "Failed to queue the capacity pass after a device change");
+            }
+        }
 
         let reply = HealthCheckReply {
             message: "ack".into(),
@@ -14258,7 +14269,12 @@ fn derive_node_health(value: &Value) -> Option<bool> {
         Value::Object(map) => {
             let mut seen = false;
             let mut all_ok = true;
-            for entry in map.values() {
+            // The device report (docs/devices.md) rides the health checks;
+            // an unhealthy GPU is that device's state, not the node's.
+            for (_, entry) in map
+                .iter()
+                .filter(|(key, _)| key.as_str() != crate::devices::REPORT_KEY)
+            {
                 if let Some(ok) = derive_node_health(entry) {
                     seen = true;
                     all_ok &= ok;

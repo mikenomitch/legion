@@ -462,6 +462,10 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             )
         });
     let sessions_config = parse_sessions_payload(&config.artifacts);
+    // Device plugins, static devices, and CDI dirs (docs/devices.md).
+    let device_manager = Arc::new(crate::devices::plugin::DeviceManager::new(
+        parse_devices_payload(&config.artifacts),
+    ));
     let session_manifests = build_session_manifests(
         content_store_target.as_ref(),
         Arc::new(ManagerCredentialSource::new(
@@ -573,6 +577,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         }
         manager.load_builtin_plugins();
         manager.configure_volumes(&name, host_volumes);
+        manager.configure_devices(device_manager.clone());
         // Before `configure_artifacts`, which hands the store to the stager.
         manager.configure_content_store(content_store.clone());
         manager.configure_content_publishing(content_publishing);
@@ -752,7 +757,24 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let plugins = task_manager.lock().expect("task manager").plugin_handles();
     let readiness =
         tokio::task::spawn_blocking(move || crate::task_plugins::readiness_of(&plugins)).await?;
-    let health_checks = run_health_checks(config.additional_node_checks.clone(), Some(readiness));
+    let mut health_checks =
+        run_health_checks(config.additional_node_checks.clone(), Some(readiness));
+    // The first device report rides the registration, so a GPU node is
+    // schedulable for GPU work from its first moment (docs/devices.md).
+    if device_manager.is_configured() {
+        let devices = device_manager.clone();
+        let report = tokio::task::spawn_blocking(move || devices.fingerprint()).await?;
+        info!(
+            groups = report.groups.len(),
+            instances = report
+                .groups
+                .iter()
+                .map(|group| group.instances.len())
+                .sum::<usize>(),
+            "Devices fingerprinted"
+        );
+        health_checks.insert(crate::devices::REPORT_KEY.into(), report.to_value());
+    }
 
     // Resolved before `config` is picked apart below (the helper borrows
     // the whole struct).
@@ -1947,6 +1969,22 @@ fn parse_sessions_payload(raw: &str) -> crate::structs::WorkerSessionsConfig {
         .ok()
         .and_then(|payload| payload.sessions)
         .unwrap_or_default()
+}
+
+/// The worker config's `devices` block, from the artifacts payload it rides
+/// in (none when absent or unreadable: an unreadable block is logged, and
+/// the node reports no devices rather than refusing to start).
+fn parse_devices_payload(raw: &str) -> crate::devices::plugin::WorkerDevicesConfig {
+    if raw.trim().is_empty() {
+        return Default::default();
+    }
+    match serde_json::from_str::<crate::structs::WorkerArtifactsPayload>(raw) {
+        Ok(payload) => payload.devices.unwrap_or_default(),
+        Err(err) => {
+            warn!(error = %err, "Invalid worker devices config; this node reports no devices");
+            Default::default()
+        }
+    }
 }
 
 /// The session manifests in the worker's `contentStore`, when one is
@@ -3741,13 +3779,25 @@ async fn start_node_checks(
         // task-manager lock (and with it the heartbeat) for as long as it
         // hung (see `readiness_of`).
         let checks_data = {
-            let plugins = task_manager.lock().expect("task manager").plugin_handles();
+            let (plugins, devices) = {
+                let manager = task_manager.lock().expect("task manager");
+                (manager.plugin_handles(), manager.device_manager())
+            };
             let additional = additional_node_checks.clone();
             tokio::task::spawn_blocking(move || {
-                run_health_checks(
+                let mut checks = run_health_checks(
                     additional,
                     Some(crate::task_plugins::readiness_of(&plugins)),
-                )
+                );
+                // Device inventory and health, re-checked every pass
+                // (docs/devices.md, "Health").
+                if devices.is_configured() {
+                    checks.insert(
+                        crate::devices::REPORT_KEY.into(),
+                        devices.fingerprint().to_value(),
+                    );
+                }
+                checks
             })
             .await?
         };

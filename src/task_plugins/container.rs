@@ -1309,6 +1309,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                         netns: gated_netns.as_deref(),
                         security,
                         policy: &policy,
+                        devices: &instance.devices,
                     },
                 )?;
                 if let Some(range) = id_map {

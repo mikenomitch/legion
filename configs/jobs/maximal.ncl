@@ -730,6 +730,31 @@
             resources = {
                 cpu = 500,
                 memory = 256,
+                # Devices (docs/devices.md): whole devices from the node's
+                # device plugins or `devices.static`. The task sees the ids
+                # it got as LEGION_DEVICE_<NAME>_IDS, plus whatever env the
+                # plugin adds (CUDA_VISIBLE_DEVICES for nvidia).
+                devices = [
+                    {
+                        # `type`, `vendor/type`, or `vendor/type/model`.
+                        name = "nvidia/gpu",
+                        # Default 1. All from one device group (one model).
+                        count = 2,
+                        # The task constraint syntax, over the device's
+                        # attributes (the group's, then the instance's) plus
+                        # vendor, type, model, and id.
+                        constraints = [
+                            { key = "memoryMiB", operator = ">=", value = 40000 },
+                        ],
+                        # Prefer devices; picks devices on the node, never
+                        # the node. Within a group Legion already keeps a
+                        # request inside one peerGroup (NVLink), then one
+                        # numaNode, when it can.
+                        affinities = [
+                            { key = "computeCapability", value = "9.0", multiplier = 1 },
+                        ],
+                    },
+                ],
             },
             constraints = [
                 {

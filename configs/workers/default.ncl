@@ -233,4 +233,32 @@
     # Off by default: with it on, any client that can reach port 4848 and
     # holds a ticket for this node can open the session the ticket names.
     # exec = { direct = true },
+    # Devices (docs/devices.md): GPUs and other whole devices a task can ask
+    # for with resources.devices. Absent: this node has no devices.
+    # devices = {
+    #     # Device plugins (protocol legion-device/1): commands the worker
+    #     # runs at start and on every node-check pass (30s) to discover
+    #     # devices and their health, and at task start to allocate them.
+    #     plugins = {
+    #         nvidia = {
+    #             command = ["/opt/legion/plugins/devices/nvidia/legion-device-nvidia"],
+    #             # Passed to the plugin as `config` on every request.
+    #             # config = {},
+    #             # How long one call may run. Default 10s.
+    #             # timeout = "10s",
+    #         },
+    #     },
+    #     # Devices declared by hand, for hardware no plugin reports.
+    #     static = [
+    #         {
+    #             vendor = "xilinx", type = "fpga", model = "u250",
+    #             attributes = { memoryMiB = 65536 },
+    #             # `cdi` names the device in a CDI spec under cdiSpecDirs,
+    #             # whose container edits a container task then gets.
+    #             instances = [{ id = "0", cdi = "xilinx.com/fpga=0" }],
+    #         },
+    #     ],
+    #     # Where CDI spec files (JSON) are read. Default:
+    #     cdiSpecDirs = ["/etc/cdi", "/var/run/cdi"],
+    # },
 }

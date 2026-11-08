@@ -2996,6 +2996,11 @@ pub struct WorkerConfigAlt {
     /// capability set.
     #[serde(default)]
     pub container: Option<WorkerContainerConfig>,
+    /// Devices on workers of this type: plugins that discover them, devices
+    /// declared by hand, and where CDI specs live (docs/devices.md). Absent
+    /// means no devices.
+    #[serde(default)]
+    pub devices: Option<crate::devices::plugin::WorkerDevicesConfig>,
 }
 
 /// Worker-type `container` block. Carried to the worker as JSON in
@@ -3453,6 +3458,11 @@ pub struct WorkerArtifactsPayload {
     /// act on the session manifests the `contentStore` holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions: Option<WorkerSessionsConfig>,
+    /// The top-level `devices` block (docs/devices.md), riding the same
+    /// payload for the same reason: device plugins, static devices, and CDI
+    /// spec dirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devices: Option<crate::devices::plugin::WorkerDevicesConfig>,
 }
 
 /// A worker's `sessions` block (docs/session-mode.md, "No split brain").
