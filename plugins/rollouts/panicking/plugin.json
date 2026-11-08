@@ -1,0 +1,5 @@
+{
+  "kind": "rollouts",
+  "name": "panicking",
+  "legionApiVersion": 3
+}

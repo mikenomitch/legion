@@ -960,6 +960,9 @@ pub struct Metrics {
     /// `legion_leader_forwards_total{lane,op,outcome}` (docs/metrics.md,
     /// "Raft")
     pub leader_forwards_total: Arc<CounterVec>,
+    /// `legion_plugin_panics_total{kind,name}` (docs/plugin-system.md,
+    /// "Panics and quarantine")
+    pub plugin_panics_total: Arc<CounterVec>,
     /// `legion_read_model_drift_repaired_total{source}`
     pub read_model_drift_repaired_total: Arc<CounterVec>,
     /// `legion_read_model_external_writes_total`
@@ -1825,6 +1828,14 @@ impl Metrics {
             series: Series::new(),
         });
 
+        let plugin_panics_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_plugin_panics_total",
+                help: "Dylib plugin calls that panicked, by plugin kind (scheduling, rollouts, node_checks, artifacts) and name. The panic was contained and the plugin quarantined until this process restarts; any non-zero value needs the plugin fixed or removed.",
+                labels: &["kind", "name"],
+            },
+            series: Series::new(),
+        });
         let leader_forwards_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_leader_forwards_total",
@@ -1934,6 +1945,7 @@ impl Metrics {
             Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_recovered_total) as Arc<dyn RenderMetric>,
             Arc::clone(&leader_forwards_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&plugin_panics_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_drift_repaired_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_external_writes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
@@ -2145,6 +2157,7 @@ impl Metrics {
             nodes_marked_lost_total,
             nodes_recovered_total,
             leader_forwards_total,
+            plugin_panics_total,
             read_model_drift_repaired_total,
             read_model_external_writes_total,
             liveness_tracked_nodes,

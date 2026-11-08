@@ -813,6 +813,13 @@ these families can tell you which is the case.
   A steady `ok` rate on a follower is normal (workers heartbeat to whichever
   manager they dialed); a `failed` rate means those reports are not landing.
   Recorded on the forwarding manager.
+- **`legion_plugin_panics_total{kind,name}`** (counter): dylib plugin calls
+  that panicked (`kind` is `scheduling`, `rollouts`, `node_checks`, or
+  `artifacts`). The panic was contained and the plugin quarantined until the
+  process restarts: a quarantined scheduling plugin places with `bin_pack`,
+  a rollout strategy fails its resolves, a fetcher fails its fetches, and a
+  node check shows as a failing health check. Any non-zero value needs the
+  plugin fixed or removed (docs/plugin-system.md, "Panics and quarantine").
 
 The gauge series refresh on the node-status-checker tick, on leaders and
 followers alike. The histograms and the op counter are recorded at the

@@ -14266,6 +14266,17 @@ fn derive_node_health(value: &Value) -> Option<bool> {
                 None
             }
         }
+        // A typed node-check report (`{ status, message, attributes }`,
+        // docs/plugin-system.md "Node checks"): its status decides, and
+        // its message is prose, not a verdict.
+        Value::Object(map)
+            if matches!(
+                map.get("status").and_then(Value::as_str),
+                Some("pass" | "warn" | "fail")
+            ) =>
+        {
+            Some(map.get("status").and_then(Value::as_str) != Some("fail"))
+        }
         Value::Object(map) => {
             let mut seen = false;
             let mut all_ok = true;
@@ -20289,6 +20300,20 @@ mod tests {
                 "container": "fail"
             }
         });
+        assert_eq!(derive_node_health(&checks), Some(false));
+    }
+
+    /// Typed node-check reports decide by `status`, and the device report
+    /// never counts (docs/devices.md, docs/plugin-system.md).
+    #[test]
+    fn derive_node_health_reads_typed_reports_and_skips_devices_test() {
+        let checks = json!({
+            "disk": { "status": "warn", "message": "/var has 30% free, an error-free disk" },
+            "devices": { "groups": [{ "instances": [{ "id": "g", "healthy": false,
+                                                      "healthDetail": "fail" }] }] },
+        });
+        assert_eq!(derive_node_health(&checks), Some(true));
+        let checks = json!({ "disk": { "status": "fail", "message": "/var has 5% free" } });
         assert_eq!(derive_node_health(&checks), Some(false));
     }
 

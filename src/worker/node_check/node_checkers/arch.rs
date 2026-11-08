@@ -9,10 +9,6 @@ impl NodeChecker for ArchNodeChecker {
         "arch"
     }
 
-    fn has_fingerprinter(&self) -> bool {
-        true
-    }
-
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("arch".into(), Value::String(ARCH.to_string()));

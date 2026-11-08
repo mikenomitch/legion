@@ -9,10 +9,6 @@ impl NodeChecker for OSNodeChecker {
         "os"
     }
 
-    fn has_fingerprinter(&self) -> bool {
-        true
-    }
-
     fn fingerprint(&self) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("os".into(), Value::String(OS.into()));
