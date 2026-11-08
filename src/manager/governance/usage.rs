@@ -8,9 +8,11 @@
 //!
 //! - `cpu_mhz` (MHz-seconds), `memory_mib` (MiB-seconds), `cores`
 //!   (core-seconds), `allocations` (allocation-seconds);
+//! - `device:<group>` (instance-seconds) for each device group an
+//!   allocation was assigned (docs/devices.md), so GPU-hours are
+//!   `device:nvidia/gpu/<model>` / 3600;
 //! - `resource:<name>` for every other numeric reservation key (custom
-//!   resources; devices once they are modeled), so a new resource is
-//!   accounted without a schema change.
+//!   resources), so a new resource is accounted without a schema change.
 //!
 //! This integrates *reservations*, not measured consumption: an idle task
 //! reserving 4 cores is charged 4 cores. The accumulator keeps its last-tick
@@ -43,6 +45,13 @@ pub fn dimensions(resources: &Value) -> BTreeMap<String, f64> {
     let Some(object) = resources.as_object() else {
         return out;
     };
+    // Assigned devices count by instance, under their group.
+    for (_, assignment) in crate::devices::assignments(resources) {
+        if !assignment.ids.is_empty() {
+            *out.entry(format!("device:{}", assignment.device))
+                .or_default() += assignment.ids.len() as f64;
+        }
+    }
     for (key, value) in object {
         let amount = match (key.as_str(), value) {
             ("cores", Value::Array(cores)) => cores.len() as f64,
@@ -176,6 +185,24 @@ mod usage_test {
         assert_eq!(dims["allocations"], 1.0);
         assert!(!dims.contains_key("resource:memoryMax"));
         assert!(!dims.contains_key("resource:label"));
+    }
+
+    /// Assigned devices are accounted per instance under their group, and an
+    /// unassigned request (a jobspec's copy) charges nothing.
+    #[test]
+    fn dimensions_count_assigned_device_instances_test() {
+        let dims = dimensions(&json!({
+            "memory": 64,
+            "devices": [
+                { "name": "nvidia/gpu", "count": 2,
+                  "assigned": { "device": "nvidia/gpu/A100", "ids": ["GPU-0", "GPU-1"] } },
+                { "name": "fake/accel", "count": 1 }
+            ]
+        }));
+        assert_eq!(dims["device:nvidia/gpu/A100"], 2.0);
+        assert_eq!(dims["memory_mib"], 64.0);
+        assert!(!dims.keys().any(|key| key.starts_with("device:fake")));
+        assert!(!dims.contains_key("resource:devices"));
     }
 
     #[test]

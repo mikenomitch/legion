@@ -352,8 +352,11 @@ These are not implemented yet:
 - **No microVM passthrough**: `sandbox` tasks cannot use devices (no VFIO).
 - **No device cgroup for `exec`**: an `exec` task can open any device node;
   the assignment tells it which to use, it does not stop it using others.
-- **Topology is per node**: gangs and multi-node jobs are not placed by
-  NVLink, rack, or network locality.
+- **Device topology is per node**: assignment keeps one allocation's
+  devices inside one NVLink/peer group and NUMA node, but device attributes
+  are not node attributes, so a gang cannot be kept inside an NVLink domain
+  that spans nodes. A gang *can* be kept inside one rack or other
+  node-attribute domain with [`gang.topology`](gang-scheduling.md#topology).
 - **Preemption ignores devices** when choosing victims, and the autoscaler's
   node shapes do not model devices.
 - **YAML CDI specs** are not read.

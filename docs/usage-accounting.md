@@ -33,10 +33,12 @@ allocation not yet `complete` or `failed` — and adds each one's
 | `memory_mib` | MiB-seconds | `memoryGibHours` |
 | `cores` | core-seconds | `coresHours` (exclusive cores) |
 | `allocations` | allocation-seconds | `allocationHours` |
+| `device:<group>` | instance-seconds | `otherHours["device:<group>"]` — each [device](devices.md) group the allocation was assigned, counted per instance, so a two-GPU task accrues two GPU-hours an hour |
 | `resource:<name>` | unit-seconds | `otherHours[<name>]` — every other numeric reservation key, such as a custom resource |
 
-New resource kinds (devices and GPUs included, once they are modeled) are
-accounted as `resource:<name>` without a schema change.
+A new numeric resource kind is accounted as `resource:<name>`, and a new
+device group as `device:<group>`, without a schema change. A device request
+that was never assigned (the jobspec's copy) charges nothing.
 
 **This is reserved usage, not measured consumption**: a task that reserves
 4 cores and idles is charged 4 cores, which is what capacity planning and

@@ -5261,8 +5261,11 @@ artifacts, volumes, node checks. Still to build:
       selection does not free devices on purpose, and node-group shapes in
       `GetCapacityDemand` carry no devices, so a pending GPU job asks for no
       GPU node.
-- [ ] **Devices: topology across nodes.** Gangs and multi-node jobs are not
-      placed by NVLink domain, rack, or network locality (review AI7).
+- [ ] **Devices: topology across nodes.** `gang.topology` (review AI7,
+      [placement plan](plans/placement-and-commit-cost-plan.md)) keeps a gang
+      inside one value of a node attribute such as `rack`, but device
+      attributes (NVLink/peer group) are not node attributes, so a gang
+      cannot yet be kept inside one NVLink domain that spans nodes.
 - [ ] **Devices: show device usage** in `legion namespace get`, the
       `legion_namespace_reserved_*` gauges, and `legion node usage`.
 - [ ] **Devices: read YAML CDI specs** (needs a YAML dependency;

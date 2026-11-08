@@ -18963,8 +18963,11 @@ message UsageSummary {
   // Allocation-hours (one allocation held for one hour = 1).
   double allocation_hours = 9;
 
-  // Every other numeric resource dimension, in unit-hours, keyed by name
-  // (custom resources; devices once modeled).
+  // Every other resource dimension, in unit-hours. A custom numeric
+  // resource is keyed by its name (`gpu_slots`); an assigned device group
+  // is keyed `device:<vendor>/<type>/<model>` and counts instance-hours, so
+  // `device:nvidia/gpu/A100-SXM4-80GB` is that model's GPU-hours
+  // (docs/devices.md).
   map<string, double> other_hours = 10;
 }
 
