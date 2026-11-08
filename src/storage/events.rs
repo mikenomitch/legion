@@ -735,9 +735,10 @@ pub mod drafts {
     }
 
     /// `allocation.reschedule_exhausted` — a failed allocation found its
-    /// task's move budget spent (`move_count` moves inside `move_period`):
-    /// the task is not moved again, and the job is marked failed (a
-    /// `job.failed` event follows).
+    /// move budget spent (`move_count` moves inside `move_period`): it is
+    /// not moved again. With `stopped_instance`, the budget was a keyed
+    /// instance's own and only that instance is stopped; otherwise the job
+    /// is marked failed (a `job.failed` event follows).
     pub fn allocation_reschedule_exhausted(
         allocation: &Allocation,
         task_name: &str,
@@ -2894,6 +2895,7 @@ impl EventRecorder<'_> {
         self.emit(drafts::allocation_reschedule_deferred(hold));
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn allocation_reschedule_exhausted(
         self,
         allocation: &Allocation,

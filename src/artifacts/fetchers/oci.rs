@@ -540,9 +540,12 @@ const CACHE_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(600)
 /// it for the image's digest or its tag. In memory only, because the key
 /// holds an unsalted hash of the credential, and a restarted worker simply
 /// asks the registry again.
-static CACHE_GRANTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<(String, String, [u8; 32]), std::time::Instant>>,
-> = std::sync::LazyLock::new(Default::default);
+static CACHE_GRANTS: std::sync::LazyLock<std::sync::Mutex<CacheGrants>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// `(digest, repository, credential fingerprint)` -> when the registry
+/// answered.
+type CacheGrants = std::collections::HashMap<(String, String, [u8; 32]), std::time::Instant>;
 
 fn grant_key(digest: &str, repository: &str, auth: &RegistryAuth) -> (String, String, [u8; 32]) {
     (
