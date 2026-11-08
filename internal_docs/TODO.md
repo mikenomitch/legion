@@ -3439,6 +3439,10 @@ Plan: [rollout-strategy-plugins](../docs/rollout-strategy-plugins.md) · docs: [
 
 - [ ] **Rollout plugins have one hook** ([review PLG5](architecture-review-2026-11-07.md)): `resolve` only,
       with no step, analysis, or abort hooks (Argo Rollouts, Flagger).
+      Evaluated with the device-model work and deferred: it changes the
+      rollout state machine and needs a plan
+      ([calls 24](calls/device-model-and-plugin-seams-plan_calls.md#24-job-mutation-a-secrets-provider-rollout-hooks-and-controller-side-volumes-are-deferred)).
+      The strategy library is also still loaded on every resolve.
 
 ## Artifacts
 
@@ -3496,11 +3500,18 @@ Plan: [artifact-system-plan.md](plans/artifact-system-plan.md) · docs: [artifac
 - [ ] Artifact staging on Windows: hardlink/reflink fallbacks, path semantics,
       image consumption (see *Windows support pass*)
 
-- [ ] **Model weights do not fit the artifact cache** ([review AI6](architecture-review-2026-11-07.md)): the
-      node cache class is clamped to 1–20 GiB by default (smaller than one
-      70B checkpoint), ORAS layers are not cached, and there is no
-      peer-to-peer distribution or lazy loading (Dragonfly, Spegel,
-      SOCI/Nydus). Size the cache for models, and plan P2P and lazy load.
+- [ ] **Peer-to-peer artifact distribution and lazy loading** ([review AI6](architecture-review-2026-11-07.md)).
+      The cache is model-sized and ORAS layers are cached (Done,
+      Artifacts), but a hundred nodes starting one model each download it
+      from the registry (Dragonfly, Spegel), and a task waits for every
+      layer (SOCI, Nydus). The content index already knows which nodes hold
+      what; peer serving needs worker-to-worker auth and a peer-first fetch
+      path. Needs a plan
+      ([calls 22](calls/device-model-and-plugin-seams-plan_calls.md#22-p2p-distribution-lazy-loading-and-resumable-fetches-are-deferred)).
+- [ ] **Resumable fetches and a stall timeout.** A download that fails
+      partway starts over, and the 2-hour default deadline is the only
+      guard against a stalled one
+      ([calls 15](calls/device-model-and-plugin-seams-plan_calls.md#15-the-fetch-defaults-grow-to-1-tib-and-2-hours-there-is-no-stall-timeout)).
 
 ## Stateful & volumes
 
@@ -5166,29 +5177,68 @@ artifacts, volumes, node checks. Still to build:
       names `legion` instead of `legion-rs` and lacks `ring`. The other plugin
       lockfiles probably do too.
 
-- [ ] **Panic containment for dylib plugins** ([review PLG1](architecture-review-2026-11-07.md)): no plugin call
-      is wrapped in `catch_unwind`, and scheduling and rollout plugins run in
-      the manager. Contain now; for the stable ABI above, the WASM layer
-      network plugins already use (`src/wasm/`) is the candidate for
-      in-manager hooks, and exec or gRPC for task runtimes and fetchers.
-- [ ] **A device model: GPUs effectively do not work** ([review PLG2](architecture-review-2026-11-07.md)).
-      Devices come only from static config, nothing hands assigned IDs to the
-      task (no `CUDA_VISIBLE_DEVICES` or CDI anywhere), containers deny all
-      devices, the microVM has no VFIO, there is no device health or
-      topology, and quota cannot cap devices. A device-plugin seam that
-      fingerprints, returns CDI specs on allocate, reports health and
-      topology, and adds quota dimensions; MIG and fractional sharing after.
-      Needs a plan.
-- [ ] **Admission policy on jobs** ([review PLG4](architecture-review-2026-11-07.md)): object kinds have CEL
-      `rules`, but jobspecs pass no operator-defined policy. Reuse the `cel`
-      evaluator as namespace- or cluster-scoped job rules, run in
-      `job validate`, `job plan`, and `job run` (K8s
-      `ValidatingAdmissionPolicy`).
+- [ ] **Panic containment for task runtime dylibs** ([review PLG1](architecture-review-2026-11-07.md)).
+      Scheduling, rollout, node-check, and fetcher plugins are contained
+      and quarantined (Done, Plugin surface); `TaskPlugin` (~40 methods)
+      is not, so a panicking dylib task runtime still kills its worker
+      ([calls 21](calls/device-model-and-plugin-seams-plan_calls.md#21-task-runtime-dylibs-are-not-contained-wasm-and-out-of-process-plugins-are-deferred)).
+      The review's direction: task runtimes out of process.
+- [ ] **In-manager plugin hooks on the WASM layer** ([review PLG1](architecture-review-2026-11-07.md)):
+      scheduling and rollout hooks are contained dylibs now, but a plugin
+      that corrupts memory or loops still takes the manager down. The
+      fuel-bounded WASM layer network plugins use (`src/wasm/`) is the
+      candidate; artifact fetchers out of process (exec). Needs a plan.
+- [ ] **A quarantined plugin stays off until restart.** No command lifts a
+      quarantine, and `legion_plugin_panics_total` is the only cluster-wide
+      view of manager-side quarantines (workers report theirs in health
+      checks). A `legion plugin status` read surface would help.
+- [ ] **Devices: VFIO passthrough for `sandbox`** ([review PLG2](architecture-review-2026-11-07.md)).
+      Sandboxes refuse `resources.devices` at submit; cloud-hypervisor
+      supports VFIO, Firecracker does not
+      ([calls 20](calls/device-model-and-plugin-seams-plan_calls.md#20-sandboxes-refuse-devices-at-submit-mig-mps-and-dra-are-deferred)).
+- [ ] **Devices: MIG, MPS, time slicing, and DRA-style shared claims.** A
+      device is assigned whole; a plugin can report MIG instances as their
+      own group today.
+- [ ] **Devices: verify on real hardware.** The `nvidia` plugin's parsing
+      is tested against a stub `nvidia-smi`, and the OCI device entries
+      against generated specs only. Run a GPU job end to end (exec and
+      container, with and without `--cdi`) on a real NVIDIA node, under runc
+      and crun, with the default user namespace
+      ([devices.md](../docs/devices.md#what-has-been-verified)).
+- [ ] **Devices: a device cgroup for `exec`** (cgroup v2 device-control
+      eBPF), so an `exec` task can open only its assigned devices
+      ([calls 16](calls/device-model-and-plugin-seams-plan_calls.md#16-exec-tasks-get-device-env-not-a-device-cgroup)).
+- [ ] **Devices: preemption and the autoscaler ignore them.** Victim
+      selection does not free devices on purpose, and node-group shapes in
+      `GetCapacityDemand` carry no devices, so a pending GPU job asks for no
+      GPU node.
+- [ ] **Devices: topology across nodes.** Gangs and multi-node jobs are not
+      placed by NVLink domain, rack, or network locality (review AI7).
+- [ ] **Devices: show device usage** in `legion namespace get`, the
+      `legion_namespace_reserved_*` gauges, and `legion node usage`.
+- [ ] **Devices: read YAML CDI specs** (needs a YAML dependency;
+      [calls 6](calls/device-model-and-plugin-seams-plan_calls.md#6-container-edits-are-cdis-containeredits-verbatim-only-json-cdi-specs-are-read)).
+- [ ] **Devices: streaming health** (a long-running plugin, gRPC like
+      Kubernetes' `ListAndWatch`) if 30-second detection is too slow
+      ([calls 4](calls/device-model-and-plugin-seams-plan_calls.md#4-device-plugins-are-exec--json-legion-device1-not-grpc-sockets-or-dylibs)).
+- [ ] **Devices for edge-started work.** Boot tickets and sessions start
+      work the scheduler did not place, so a task that asks for devices
+      fails there ("has no assignment").
+- [ ] **Job mutation policies** ([review PLG4](architecture-review-2026-11-07.md)): `jobRules` validate
+      (Done); nothing can default or rewrite a job (K8s
+      `MutatingAdmissionPolicy`). Needs a plan
+      ([calls 24](calls/device-model-and-plugin-seams-plan_calls.md#24-job-mutation-a-secrets-provider-rollout-hooks-and-controller-side-volumes-are-deferred)).
+- [ ] **`job validate` checks job rules only with `acl:read`.** Most job
+      authors get a warning instead; `job plan` checks them
+      ([calls 19](calls/device-model-and-plugin-seams-plan_calls.md#19-job-validate-checks-job-rules-only-when-it-can-read-the-policies)).
 - [ ] **A secrets provider seam** ([review PLG4](architecture-review-2026-11-07.md)): secrets come from KV plus
       workload identity only, and autoscaler plugin config has no secret
       references.
-- [ ] **Node checks dlopen on every pass** ([review PLG5](architecture-review-2026-11-07.md)) and return an
-      untyped `Map` (`worker/node_check.rs`).
+- [ ] **Runtime classes: verify gVisor and Kata.** No `runsc` or Kata
+      runtime has run Legion's bundles; their device passthrough (gVisor
+      `nvproxy`, Kata VFIO) is not wired to devices, and Windows and an
+      out-of-process runtime API are out of scope
+      ([task-runtime-container.md](../docs/task-runtime-container.md#runtime-classes)).
 
 ## Agent surfaces
 
@@ -6236,6 +6286,16 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 [plan](plans/artifact-system-plan.md) · [docs](../docs/artifacts.md)
 
+- [x] **Model weights fit the artifact cache** ([review AI6](architecture-review-2026-11-07.md), 2026-11-08):
+      `content.budgets.artifacts` defaults to 50% of the disk with a 1 GiB
+      floor and no ceiling (was 10% clamped to 20 GiB), a share can be
+      bounded with `{ share, max, min }`, ORAS layers are cached per layer
+      digest (copied in and out, so a task cannot change the cached
+      weights), and the fetch defaults grew to 1 TiB and 2 hours. P2P,
+      lazy loading, and resumable fetches stay open (Artifacts, above)
+      ([plan](plans/device-model-and-plugin-seams-plan.md) ·
+      [docs](../docs/artifacts.md#oras-layers) ·
+      calls 5, 14, 15 in [device-model-and-plugin-seams-plan_calls.md](calls/device-model-and-plugin-seams-plan_calls.md))
 - [x] Grab container images (`oci://` fetcher + ORAS mediaType)
 - [x] Auth for fetching (KV credentials via `GetArtifactCredential` + cluster
       `artifacts.auth` matchers)
@@ -7615,6 +7675,54 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       ([plan](plans/job-status-plan.md) ·
       [docs](../docs/jobs-tasks-and-scheduling.md#job-status) ·
       calls: [job-status-plan_calls.md](calls/job-status-plan_calls.md))
+
+## Plugin surface
+
+Plan: [device-model-and-plugin-seams-plan.md](plans/device-model-and-plugin-seams-plan.md) ·
+calls: [device-model-and-plugin-seams-plan_calls.md](calls/device-model-and-plugin-seams-plan_calls.md)
+
+- [x] **A device model: GPUs work** ([review PLG2](architecture-review-2026-11-07.md), 2026-11-08). Device
+      plugins speak `legion-device/1` (exec + JSON: `fingerprint`,
+      `allocate`), configured in a worker type's `devices` block next to
+      `devices.static` and `cdiSpecDirs`; the report (groups, instances,
+      health, NUMA/peer-group attributes) rides the node-check report and
+      re-checks every 30 s; jobs ask with `resources.devices = [{ name,
+      count, constraints, affinities }]`; the store assigns ids at
+      allocation insert, inside one NVLink peer group or NUMA node when it
+      can, and records them on the allocation; the worker allocates through
+      the plugin and CDI specs, the container runtime writes device nodes,
+      cgroup allow rules, mounts, hooks, and env into the bundle, and `exec`
+      gets `LEGION_DEVICE_<NAME>_IDS` plus the plugin's env; unhealthy
+      instances are never assigned; namespace quota caps devices by name;
+      `legion node info`, the `legion_node_devices` MCP tool, and `legion
+      device plugin test`. Reference `nvidia` and `fake` plugins under
+      `plugins/devices/`. Not run on real GPUs; the deferrals are open under
+      Plugin surface ([docs](../docs/devices.md))
+- [x] **Panic containment for scheduling, rollout, node-check, and fetcher
+      plugins** ([review PLG1](architecture-review-2026-11-07.md), 2026-11-08). `legion::export_*!` contains each
+      method inside the plugin (a host-side `catch_unwind` cannot catch a
+      `cdylib`'s panic), the host reads a C-ABI panic probe after every
+      call, and a panicking plugin is quarantined until restart, logged,
+      and counted in `legion_plugin_panics_total`; a quarantined scheduling
+      plugin places with `bin_pack`. Plugin API version 3. Task runtime
+      dylibs and the WASM move stay open
+      ([docs](../docs/plugin-system.md#panics-and-quarantine))
+- [x] **Node checks load once and report typed results** ([review PLG5](architecture-review-2026-11-07.md), 2026-11-08):
+      a plugin is loaded on first use and reused, a load failure is a
+      failing check, and `health_check` returns `{ status, message,
+      attributes }` ([docs](../docs/plugin-system.md#3-node-check-plugins))
+- [x] **OCI runtime classes** ([review PLG3](architecture-review-2026-11-07.md), 2026-11-08): worker
+      types declare `container.runtimeClasses` (gVisor, Kata, ...), nodes
+      advertise the ones that answer `--version`, tasks pick one with
+      `config.runtimeClass` and place only where it is, and the privilege
+      floor is applied, dropped under `isolatesRoot`, or refused per class.
+      Not run under real gVisor or Kata
+      ([docs](../docs/task-runtime-container.md#runtime-classes))
+- [x] **Job rules** ([review PLG4](architecture-review-2026-11-07.md), 2026-11-08): namespace policies take CEL
+      `jobRules`, checked at `job run`, `job plan`, and (with `acl:read`)
+      `job validate`, with the policy and rule named; `--dry-run` lists
+      existing jobs a new rule would refuse. Mutation and a secrets
+      provider stay open ([docs](../docs/namespaces.md#job-rules))
 
 ## Agent surfaces
 

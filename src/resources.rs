@@ -535,6 +535,56 @@ mod tests {
         }
     }
 
+    /// Devices (docs/devices.md): a node's healthy instances are capacity, a
+    /// task's unassigned request fits and debits ids, an allocation row's
+    /// assigned ids are held, and a released unhealthy id does not return.
+    #[test]
+    fn devices_fit_debit_and_hold_test() -> R<()> {
+        let mut node = node_with_attrs(json!({}));
+        node.health_checks = json!({ "devices": { "groups": [{
+            "vendor": "fake", "type": "gpu", "model": "f1",
+            "instances": [
+                { "id": "g0", "attributes": { "peerGroup": "a" } },
+                { "id": "g1", "attributes": { "peerGroup": "a" } },
+                { "id": "g2", "healthy": false },
+            ],
+        }]}});
+        let policy = usage_test_policy();
+        let mut pool = ResourcePool::from_node(&node)?;
+        let two = request(json!({ "devices": [{ "name": "gpu", "count": 2 }] }));
+        let three = request(json!({ "devices": [{ "name": "gpu", "count": 3 }] }));
+        assert!(pool.can_fit(&two));
+        assert!(!pool.can_fit(&three), "g2 is unhealthy");
+        pool.consume(&two);
+        assert!(!pool.can_fit(&request(json!({ "devices": [{ "name": "gpu" }] }))));
+
+        // An allocation row holds its assigned ids.
+        let held = json!({ "memory": 64, "devices": [{ "name": "gpu", "count": 1,
+            "assigned": { "device": "fake/gpu/f1", "plugin": "fake", "ids": ["g1"] } }] });
+        let free = ResourcePool::free_from_rows(&node, [(1, &held)], &policy);
+        let assigned = free
+            .assign_devices(&two.devices)
+            .map(|assigned| assigned.len());
+        assert_eq!(assigned, None, "only g0 is free");
+        let one = request(json!({ "devices": [{ "name": "fake/gpu" }] }));
+        let picked = free.assign_devices(&one.devices).expect("g0 fits");
+        assert_eq!(picked[0].1.ids, vec!["g0".to_string()]);
+
+        // Releasing a victim's unhealthy device does not make it free.
+        let mut free = free;
+        free.release(&policy.usage_request(&json!({ "devices": [{ "name": "gpu",
+            "assigned": { "device": "fake/gpu/f1", "ids": ["g1", "g2"] } }] }))?);
+        assert!(free.can_fit(&two));
+        assert!(!free.can_fit(&three));
+
+        // A node without devices fits no device request.
+        let plain = ResourcePool::from_node(&node_with_attrs(json!({})))?;
+        assert!(!plain.can_fit(&two));
+        // A worker type may not declare devices as custom resources.
+        assert!(validate_node_resources(&json!({ "devices": [] })).is_err());
+        Ok(())
+    }
+
     /// `(physical - reservedResources) x ratio`, for memory and CPU MHz,
     /// never for cores. Junk ratios read as 1.0.
     #[test]
@@ -1214,9 +1264,30 @@ impl ResourcePool {
                     }
                 }
                 ResourceValue::Items(items) => {
+                    // A victim's device that turned unhealthy is not handed
+                    // back: it was never free capacity (docs/devices.md).
+                    let healthy =
+                        name.strip_prefix(crate::devices::POOL_KEY_PREFIX)
+                            .and_then(|group_id| {
+                                let inventory = self.devices.as_ref()?;
+                                let group = inventory.groups.iter().find(|g| g.id() == group_id)?;
+                                Some(
+                                    group
+                                        .instances
+                                        .iter()
+                                        .filter(|instance| instance.healthy)
+                                        .map(|instance| instance.id.clone())
+                                        .collect::<HashSet<String>>(),
+                                )
+                            });
                     if let Some(ResourceValue::Items(available)) = self.values.get_mut(name) {
                         for item in items {
-                            available.insert(item.clone());
+                            if healthy
+                                .as_ref()
+                                .is_none_or(|healthy| healthy.contains(item))
+                            {
+                                available.insert(item.clone());
+                            }
                         }
                     }
                 }

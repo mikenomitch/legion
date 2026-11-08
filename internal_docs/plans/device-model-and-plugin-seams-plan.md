@@ -267,10 +267,11 @@ resources = {
   constraints.
 - **Assignment** happens in `insert_allocation_with_data`, inside the apply
   transaction, against committed rows: the allocation's stored `resources`
-  carries `devices[i].assigned = { device, plugin, ids }`. The chosen IDs
-  prefer, in order: one `peerGroup`, one `numaNode`, higher affinity, then
-  instance order — best fit (the smallest sufficient domain) to limit
-  fragmentation.
+  carries `devices[i].assigned = { device, plugin, ids }`. Within a group
+  the chosen ids stay inside one `peerGroup`, else one `numaNode`, when they
+  fit; among the domains that fit, higher affinity wins, then the smallest
+  (best fit, to limit fragmentation), then instance order. (Built that way;
+  the first draft put locality above affinity, see calls 10.)
 - Device affinities choose devices on the node, not the node: node scoring
   is unchanged.
 
@@ -303,9 +304,13 @@ cpu and memory.
 ### 6.6 Visibility
 
 - `legion node info` prints a Devices section (group, instance, health,
-  taken by allocation).
+  attributes, failing plugins). Which allocation holds an instance is not
+  shown there (the node record has no allocations); `legion ledger` shows
+  each allocation's resources, assignment included.
 - The allocation JSON carries the assignment in `resources.devices`.
-- `job plan` reports the unplaced reason (no node with the devices).
+- The MCP tool `legion_node_devices` returns the device reports.
+- `job plan` reports the unplaced reason (no node with the devices) as it
+  reports any capacity shortfall.
 
 ### 6.7 AI6: model-scale cache
 
@@ -382,13 +387,19 @@ attributes }`.
 
 1. **Devices core** — model, protocol, fake + nvidia plugins, worker
    fingerprint and report, scheduler feasibility and assignment, allocate,
-   env, OCI application, quota, visibility, docs. *Status: see the calls doc
-   and TODO.*
+   env, OCI application, quota, visibility, docs. *Built 2026-11-08; not run
+   on real GPUs or a real OCI runtime with devices.*
 2. **AI6** — budget default and object form, ORAS layer cache, defaults.
-3. **PLG1** — containment and quarantine.
-4. **PLG5** — node-check cache and typed reports.
-5. **PLG3** — runtime classes.
-6. **PLG4** — job rules.
+   *Built 2026-11-08. P2P, lazy loading, resumable fetches deferred.*
+3. **PLG1** — containment and quarantine. *Built 2026-11-08 for
+   scheduling, rollout, node-check, and fetcher plugins; task runtime
+   dylibs and the WASM move deferred.*
+4. **PLG5** — node-check cache and typed reports. *Built 2026-11-08.
+   Rollout hooks and controller-side volumes deferred.*
+5. **PLG3** — runtime classes. *Built 2026-11-08; not run under gVisor or
+   Kata.*
+6. **PLG4** — job rules. *Built 2026-11-08. Mutation and a secrets
+   provider deferred.*
 
 Each phase ships alone.
 

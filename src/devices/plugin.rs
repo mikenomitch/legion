@@ -395,6 +395,9 @@ impl DeviceManager {
             grant.edits.merge(registry.resolve(&cdi_names)?);
         }
         grant.edits.validate()?;
+        // OCI needs each node's type and numbers; a node missing from the
+        // host means the device is not usable here.
+        grant.edits.resolve_device_nodes()?;
         for (key, value) in grant.edits.env_map() {
             grant.env.insert(key, value);
         }

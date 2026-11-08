@@ -79,8 +79,9 @@ Devices:
 ```
 
 With `-j`, the same report is at `healthChecks.devices` of the node JSON
-(`{ "groups": [...], "plugins": { "<name>": { "status", "error", "groups" } } }`),
-which is also what the MCP `legion_node_info` tool returns.
+(`{ "groups": [...], "plugins": { "<name>": { "status", "error", "groups" } } }`).
+The MCP tool `legion_node_devices` returns that report for one node or for
+every node that has devices.
 
 ## Asking for devices
 
@@ -130,6 +131,9 @@ one device. The ids are recorded on the allocation itself:
   }]
 }
 ```
+
+`legion ledger` (and `-j`) prints every allocation's resources per node,
+assignments included, which is how to see which job holds which GPU.
 
 Within a group, in order of preference:
 
