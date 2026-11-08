@@ -3,9 +3,10 @@
 //!
 //! This module holds the *capture seam*: the types and thread-local context
 //! that let a store mutation run inside a SQLite-session capture savepoint on
-//! the proposing node, be rolled back locally, and later be applied —
-//! byte-identically — on every node's state machine once the changeset
-//! commits through raft. The phase A-1 engine plugs into this seam via
+//! the proposing node and later be applied — byte-identically — on every
+//! node's state machine once the changeset commits through raft (the
+//! proposer keeps its own copy under `single` instead of rolling it back;
+//! see [`speculation`]). The phase A-1 engine plugs into this seam via
 //! [`ReplicationHandle`]; its transport half lives here too ([`types`] for
 //! the openraft type config, [`network`] for the outbound client,
 //! [`server`] for the inbound `RaftTransport` tonic service, wired together
@@ -23,6 +24,7 @@ pub(crate) mod quorum;
 // signature so multi-node in-process tests can mount the transport on their
 // own listeners.
 pub mod server;
+pub(crate) mod speculation;
 pub(crate) mod state_machine;
 pub(crate) mod types;
 

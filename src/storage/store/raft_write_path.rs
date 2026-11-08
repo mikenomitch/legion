@@ -4,14 +4,58 @@
 //! - the **purge barrier** ([`Store::sync_state_db_to_disk`]): the state DB
 //!   runs `synchronous = NORMAL`, and the raft log store calls this before
 //!   every purge so the applied marker a purge relies on is durable first
-//!   (plan §6.1).
+//!   (plan §6.1);
+//! - **replicated data migrations** ([`Store::run_data_migrations`], plan
+//!   §6.5; the steps themselves are in `storage::data_migrations`).
 
 use std::path::Path;
 
 use crate::prelude::*;
+use crate::storage::raft::Lane;
 use crate::storage::store::Store;
 
 impl Store {
+    /// Run every pending data step as ONE replicated control-lane op: the
+    /// steps' rewrites and their `data_migration` records ride a single raft
+    /// entry, so every replica applies the same rows at one log index
+    /// (`storage::data_migrations` module docs). Pending is read inside the
+    /// capture, so a step runs exactly once cluster-wide. Returns the ids
+    /// that ran (none when nothing was pending). In raft mode this must run
+    /// on the control-lane leader, and only once every voter can apply the
+    /// result — the driver's data-migration task checks both.
+    pub fn run_data_migrations(&self) -> R<Vec<String>> {
+        self.replicated(Lane::Control, "run_data_migrations", |store| {
+            let mut conn = store.write_connection()?;
+            let tx = Store::write_tx(&mut conn)?;
+            let ran = crate::storage::data_migrations::run_pending_on(&tx)?;
+            tx.commit()?;
+            Ok(ran.into_iter().map(str::to_string).collect())
+        })
+    }
+
+    /// How many data steps this replica has not applied yet.
+    pub(crate) fn data_migrations_pending(&self) -> R<usize> {
+        let conn = self.read_connection()?;
+        Ok(crate::storage::data_migrations::pending_on(&conn)?.len())
+    }
+
+    /// Startup: a local store runs its pending data steps now (it is the
+    /// only replica, so there is no log position to agree on). Under raft
+    /// the driver's data-migration task runs them on the control-lane
+    /// leader instead. Logs failures; never fails startup.
+    pub(crate) fn run_data_migrations_at_start(&self) {
+        // A streaming standby does not write; its primary migrates the
+        // database it ships.
+        if self.raft_mode() || self.persistence_driver.write_refusal().is_some() {
+            return;
+        }
+        match self.run_data_migrations() {
+            Ok(ran) if ran.is_empty() => {}
+            Ok(ran) => info!(steps = ?ran, "Ran data migrations"),
+            Err(err) => warn!(error = ?err, "Data migrations failed; they retry at the next start"),
+        }
+    }
+
     /// Make every transaction committed to the state DB so far durable:
     /// fsync its WAL, its main file, and the directory holding them.
     ///

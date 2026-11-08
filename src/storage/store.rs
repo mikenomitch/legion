@@ -2198,6 +2198,11 @@ impl Store {
         };
         store.liveness.configure(config.liveness.settings());
 
+        // Undo speculative raft batches a crash left behind, before the read
+        // model is built and before the raft engine reads the applied marker
+        // (raft-write-path plan §6.3).
+        crate::storage::raft::speculation::recover(&store)?;
+
         store.refresh_read_model()?;
 
         // Unwrap whatever data keys the (migrated) store already holds, so
@@ -2220,6 +2225,11 @@ impl Store {
         // only when it leads and every voter can apply the new table (the
         // upgrade gate), otherwise the daemon's keyring loop retries.
         store.initialize_keyring_at_start();
+
+        // Data steps (raft-write-path plan §6.5): a local store runs any
+        // pending ones now; under raft the control-lane leader runs them
+        // through the log once every voter can apply them.
+        store.run_data_migrations_at_start();
 
         Store::spawn_wal_checkpointer(Arc::downgrade(&store.checkpoint_conn));
 
@@ -2590,7 +2600,7 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT name FROM sqlite_master
                  WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-                   AND name NOT IN ('raft_applied', 'raft_cluster',
+                   AND name NOT IN ('raft_applied', 'raft_cluster', 'raft_speculative',
                                     'scheduler_event', 'idempotency_record')
                  ORDER BY name;",
             )?;
@@ -2864,6 +2874,8 @@ impl Store {
         let mut conn = self.write_connection()?;
         migrations.to_version(&mut conn, 0)?;
         migrations.to_latest(&mut conn)?;
+        // Empty tables: no data step has anything to migrate.
+        crate::storage::data_migrations::mark_all_done(&conn)?;
         drop(conn);
         self.refresh_read_model()?;
         // The keyring rows went with the tables: reload (now empty) and
@@ -2879,7 +2891,13 @@ impl Store {
         let migrations = get_migrations();
         let mut conn = Self::lock_conn(conn, "migration")?;
         info!("Running migrations");
+        let fresh: i64 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
         migrations.to_latest(&mut conn)?;
+        // A brand-new database has no rows for any data step to migrate:
+        // record them all as done (`storage::data_migrations` module docs).
+        if fresh == 0 {
+            crate::storage::data_migrations::mark_all_done(&conn)?;
+        }
 
         Ok(migrations)
     }
@@ -3238,6 +3256,10 @@ impl Store {
                 .with_context(|| format!("failed running VACUUM INTO {}", dest.display()))?;
             Ok(applied_index)
         })?;
+        // A leader's in-flight speculative batches are committed rows in the
+        // state DB; revert them in the copy so the backup is committed state
+        // only (raft-write-path plan §6.3).
+        crate::storage::raft::speculation::scrub_image(&dest)?;
         let bytes = std::fs::metadata(&dest)
             .with_context(|| format!("backup file {} missing after vacuum", dest.display()))?
             .len();
@@ -3305,6 +3327,10 @@ impl Store {
         let _ = std::fs::remove_file(&staged);
         std::fs::copy(backup, &staged)
             .with_context(|| format!("failed copying backup to {}", staged.display()))?;
+        // A raw copy of a raft leader's state DB (rather than a `state
+        // backup`, which is already scrubbed) can hold in-flight speculative
+        // batches: revert them, so only committed state is restored.
+        crate::storage::raft::speculation::scrub_image(&staged)?;
         {
             let conn = Connection::open(&staged)
                 .with_context(|| format!("failed opening staged restore {}", staged.display()))?;
@@ -22260,7 +22286,7 @@ mod tests {
         // Read-only connections have to be configured against a database that
         // already exists, so make it with the write path first.
         let writer = Connection::open(&path)?;
-        Store::configure_connection(&writer, false, false)?;
+        Store::configure_connection(&writer, false)?;
         let cached: i64 = writer.query_row("PRAGMA cache_size;", [], |r| r.get(0))?;
         assert_eq!(
             cached, SQLITE_CACHE_SIZE_KIB,
@@ -22268,7 +22294,7 @@ mod tests {
         );
 
         let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        Store::configure_connection(&reader, true, false)?;
+        Store::configure_connection(&reader, true)?;
         let cached: i64 = reader.query_row("PRAGMA cache_size;", [], |r| r.get(0))?;
         assert_eq!(
             cached, SQLITE_CACHE_SIZE_KIB,

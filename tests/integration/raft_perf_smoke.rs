@@ -145,6 +145,7 @@ fn raft_single_node_put_kv_latency_smoke() -> R<()> {
     // fast as they can. This is the shape that exposes capture-mutex /
     // pipeline-queue contention: all callers funnel into the single capture
     // seam, so per-op latency here includes queueing behind peers.
+    let entries_before_burst = store.raft_applied_entries()?;
     let burst_started = Instant::now();
     let handles: Vec<_> = (0..BURST_THREADS)
         .map(|thread_idx| {
@@ -194,13 +195,33 @@ fn raft_single_node_put_kv_latency_smoke() -> R<()> {
             .value,
         "v"
     );
+    // Sequential ops commit one entry each; the concurrent burst shares
+    // entries (group commit, raft-write-path plan §6.2), so it only has to
+    // advance the index and read back.
     let status_after = store.raft_status().context("status after writes")?;
     assert!(
-        status_after.applied_index >= status.applied_index + (SEQUENTIAL_OPS + burst_ops) as u64,
-        "applied index must advance by at least one entry per op ({} -> {})",
+        status_after.applied_index > status.applied_index + SEQUENTIAL_OPS as u64,
+        "applied index must advance by at least one entry per sequential op plus the burst \
+         ({} -> {})",
         status.applied_index,
         status_after.applied_index
     );
+    let burst_entries = store.raft_applied_entries()? - entries_before_burst;
+    println!(
+        "raft_perf_smoke burst entries={burst_entries} ops={burst_ops} \
+         ops_per_entry={:.2}",
+        burst_ops as f64 / burst_entries.max(1) as f64
+    );
+    for thread_idx in 0..BURST_THREADS {
+        let key = format!("smoke/burst/{thread_idx}/{}", BURST_OPS_PER_THREAD - 1);
+        assert_eq!(
+            store
+                .get_kv(&key)?
+                .context("every burst write must be readable")?
+                .value,
+            "b"
+        );
+    }
 
     assert!(
         seq_p99 < MAX_P99_MS,

@@ -90,6 +90,7 @@ mod raft_seam;
 mod raft_snapshot_recovery;
 mod raft_topology_stamp;
 mod raft_upgrade_bootstrap;
+mod raft_write_path;
 mod ratify_throughput_measure;
 mod restore_placement_indexed;
 mod rollout_integration;
