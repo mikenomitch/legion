@@ -531,7 +531,7 @@ mod preemption_test {
         values.insert("memory".to_string(), ResourceValue::Amount(memory));
         ResourcePool {
             values,
-            capacity: Default::default(),
+            ..Default::default()
         }
     }
 

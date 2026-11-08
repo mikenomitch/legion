@@ -7,6 +7,7 @@ pub mod app_view;
 pub mod boot_ticket;
 pub mod capabilities;
 pub mod cert;
+pub mod device;
 pub mod docs;
 pub mod events;
 pub mod exec;
@@ -93,6 +94,7 @@ fn base_cli() -> Command {
         .subcommand(guest_agent::config())
         .subcommand(guest_resume::config())
         .subcommand(volume::config())
+        .subcommand(device::config())
         .subcommand(snapshot::config())
         .subcommand(state::config())
         .subcommand(raft::config())

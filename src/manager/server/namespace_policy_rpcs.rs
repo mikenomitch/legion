@@ -100,6 +100,12 @@ fn static_rules(policy: &PolicyObject) -> Vec<(&'static str, PolicyObject)> {
             p.host_volumes = policy.host_volumes.clone()
         }));
     }
+    // A dry run lists the existing jobs a new rule would refuse.
+    if !policy.job_rules.is_empty() {
+        rules.push(only("jobRules", &|p| {
+            p.job_rules = policy.job_rules.clone()
+        }));
+    }
     rules
 }
 

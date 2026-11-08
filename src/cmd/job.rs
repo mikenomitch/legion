@@ -712,6 +712,23 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
         |_| Vec::new(),
     ));
     warnings.extend(crate::task_plugins::container_security_warnings(&config));
+    // Namespace policy job rules (docs/namespaces.md, "Job rules"), when this
+    // caller can read the policies. `job plan` and `job run` always check
+    // them, on the manager.
+    match job_rules_refusal(arg_matches, &rendered, &config).await {
+        Ok(None) => {}
+        Ok(Some(refusal)) => {
+            let (message, hint) = crate::cmd::helpers::split_hint(&refusal);
+            return Err(output::fail_local(
+                format,
+                CliError::local("FailedPrecondition", message, hint),
+            ));
+        }
+        Err(why) => warnings.push(format!(
+            "namespace policy job rules were not checked ({why}); `legion job plan` checks \
+             them"
+        )),
+    }
 
     if format.is_json() {
         output::print_success(&json!({
@@ -745,6 +762,54 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     }
 
     Ok(())
+}
+
+/// `job validate`'s check of namespace policy `jobRules` (PLG4): the
+/// refusal the manager would give, `None` when the job passes, or why the
+/// rules could not be read (no manager, or no `acl:read`).
+async fn job_rules_refusal(
+    matches: &ArgMatches,
+    rendered: &str,
+    config: &JobConfig,
+) -> Result<Option<String>, String> {
+    let mut client = connect_manager_client()
+        .await
+        .map_err(|err| format!("no manager: {err:#}"))?;
+    let reply = client
+        .list_namespace_policies(crate::structs::ListNamespacePoliciesRequest {})
+        .await
+        .map_err(|status| status.message().to_string())?
+        .into_inner();
+    let policies: Vec<crate::structs::namespace_policy::NamespacePolicy> = reply
+        .policies
+        .iter()
+        .filter_map(|policy| serde_json::from_str(&policy.object_json).ok())
+        .collect();
+    // The namespace the submit would use: the jobspec's own, else -n, else
+    // `default`.
+    let declared = serde_json::from_str::<Value>(rendered)
+        .ok()
+        .and_then(|spec| {
+            spec.get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    spec.get("name")
+                        .and_then(Value::as_str)
+                        .and_then(|name| name.split_once('/'))
+                        .map(|(namespace, _)| namespace.to_string())
+                })
+        });
+    let namespace = declared
+        .or_else(|| crate::cmd::helpers::active_namespace(matches))
+        .unwrap_or_else(|| crate::structs::namespace::DEFAULT_NAMESPACE.to_string());
+    let mut job = config.clone();
+    job.name = crate::structs::namespace::job_id(
+        &namespace,
+        crate::structs::namespace::job_name(&config.name),
+    );
+    let governing = crate::structs::namespace_policy::governing(&policies, &namespace);
+    Ok(crate::structs::namespace_policy::check_job_rules(&governing, &job).err())
 }
 
 /// One extension value as `job info -j` shows it: the proto, with its JSON

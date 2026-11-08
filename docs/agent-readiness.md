@@ -76,6 +76,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_node_list` | no | List worker nodes. Each carries `heartbeatSource` (see the freshness note below). |
 | `legion_node_cadence` | no | Check whether the fleet is keeping up with its heartbeat cadence. Returns the freshness ratio, lost window, sustainable fleet size, and the `heartbeatSeconds` to set if it is falling behind ([heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md)). |
 | `legion_node_usage` | no | One node's memory and CPU: capacity, reservations, and measured usage per allocation (current and peak memory, CPU, idle seconds). Also the node's oversubscription ratio and memory pressure status, and each allocation's place in the pressure order (`pressure_rank`, `pressure_steps`): which allocations a short node would stop first. Use it to compare reservations with real use before resizing a job ([resource-enforcement.md](resource-enforcement.md#memory-pressure)). |
+| `legion_node_devices` | no | The devices nodes report ([devices.md](devices.md)): per node, each device group (`vendor/type/model`, attributes such as `memoryMiB` and `driver`) with its instances (`id`, `healthy`, `healthDetail`, `numaNode`, `peerGroup`), and each device plugin's last status. Omit `node_id` for every node with devices. Use it before asking for `resources.devices`, and to see why a GPU job is pending (unhealthy or taken instances). An allocation's assigned ids are in its `resources.devices[].assigned`. |
 | `legion_node_usage_list` | no | Memory and CPU for many nodes in one call (`ListNodeUsage`): per node, capacity with the oversubscription ratio, reservations, measured use, and memory pressure status, plus CPU `cores` and `usedMillicores` (filled even where the platform reports no clock speed). Per-allocation rows only with `include_allocations`. Empty `node_ids` means every node, up to 500. Use it to find tight or pressured nodes before drilling in with `legion_node_usage` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
 | `legion_node_content` | no | What one node holds for content locality: the content it advertises to the manager's location index (digest, bytes, holder count, and the snapshot and part role it belongs to), whether its worker can publish and checkpoint, and its snapshots with `parts_here` of `parts_total`. `index_reported: false` means no content report reached this manager. Use it to see why placement preferred a node, or whether a node is warm for a snapshot before a resume or fork ([artifacts.md](artifacts.md)). |
 | `legion_scaling_demand` | no | How many nodes of each node-group template the pending work needs (`GetCapacityDemand`): the replicas the scheduler left unplaced, packed onto copies of each template with the scheduler's own rules. Per template, `nodes`, `replicas`, requested vs offered CPU and memory, and `refusals` with the rule; plus `unfittable` replicas no template can host (a jobspec problem, not capacity) and `awaiting_scheduler` jobs not tried yet. Needs `node:read`; names only jobs you can read ([Capacity demand](autoscaling.md#capacity-demand)). |
@@ -274,7 +275,12 @@ legion app extensions --json
 
 `job validate` runs the same validation the manager applies on submit
 (`validate_job_config`), so an agent can fix mistakes before touching the
-cluster. The schema includes the built-in task-runtime config schemas (`exec`,
+cluster. It also checks the governing namespace policies' `jobRules` (CEL
+house rules such as "no `:latest` images") when the caller can read the
+policies, refusing with the policy and rule named (`namespace policy
+'house-rules' jobRules[0]: ...`); otherwise it warns that they were not
+checked, and `job plan` checks them on the manager
+([namespaces.md](namespaces.md#job-rules)). The schema includes the built-in task-runtime config schemas (`exec`,
 `container`, …) under `taskRuntimes`, derived from the typed Rust structs.
 
 **The schema is the cluster's.** With a manager reachable, `job schema`,

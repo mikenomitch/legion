@@ -1625,6 +1625,19 @@ fn tool_defs() -> Vec<ToolDef> {
             }),
             mutates: true,
         },
+        // --- Devices (device-model-and-plugin-seams plan) ---
+        ToolDef {
+            name: "legion_node_devices",
+            description: "Show the devices (GPUs, FPGAs, ...) nodes report: per node, each device group (`vendor/type/model`, attributes such as memoryMiB and driver) with its instances (id, `healthy`, `healthDetail`, attributes such as numaNode and peerGroup), and each device plugin's last status. Unhealthy instances are never assigned. Ask for devices in a job with `resources.devices = [{ name = \"nvidia/gpu\", count = 2 }]`; an allocation's assigned ids are in its `resources.devices[].assigned` (docs/devices.md). Omit `node_id` for every node that reports devices.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "One node; omit for all." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
     ]
 }
 
@@ -3291,6 +3304,13 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             }))
             .await
         }
+        // Devices (device-model-and-plugin-seams plan).
+        "legion_node_devices" => {
+            let only = opt_str_arg(&args, "node_id");
+            let mut client = connect().await?;
+            let reply = grpc(client.get_nodes(GetNodesRequest::default())).await?;
+            Ok(node_devices_reply(&reply, only.as_deref()))
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -3657,6 +3677,35 @@ fn decode_node_attrs(mut reply: Value) -> Value {
     reply
 }
 
+/// `legion_node_devices`: each node's device report (docs/devices.md), from
+/// a `GetNodes` reply. Nodes with no devices are left out unless asked for
+/// by id.
+fn node_devices_reply(reply: &Value, only: Option<&str>) -> Value {
+    let nodes: Vec<Value> = reply
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            let id = node.get("id").and_then(Value::as_str)?;
+            if only.is_some_and(|only| only != id) {
+                return None;
+            }
+            let report = node
+                .get("healthChecks")
+                .and_then(Value::as_str)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|checks| checks.get(crate::devices::REPORT_KEY).cloned());
+            match (report, only) {
+                (Some(report), _) => Some(json!({ "id": id, "devices": report })),
+                (None, Some(_)) => Some(json!({ "id": id, "devices": { "groups": [] } })),
+                (None, None) => None,
+            }
+        })
+        .collect();
+    json!({ "nodes": nodes })
+}
+
 /// `legion_scaling_demand`'s templates, as `GetCapacityDemand` takes them.
 fn demand_templates(args: &Value) -> Result<Vec<crate::structs::NodeGroupTemplate>, String> {
     let items = args
@@ -3936,6 +3985,35 @@ mod tests {
         let cli = serde_json::to_value(crate::structs::Node::from(node)).expect("serialize");
         assert_eq!(cli["configAttrs"]["workerAddress"], "https://10.0.0.5:4848");
         assert_eq!(cli["dynamicAttrs"]["rack"], "r1");
+    }
+
+    /// `legion_node_devices` (docs/devices.md) lifts each node's device
+    /// report out of its health checks.
+    #[test]
+    fn node_devices_tool_reports_each_nodes_devices_test() {
+        let gpu = crate::structs::NodeMsg {
+            id: "gpu-1".into(),
+            health_checks: json!({ "disk": "pass", "devices": { "groups": [
+                { "vendor": "nvidia", "type": "gpu", "model": "A100", "instances": [{ "id": "GPU-0" }] },
+            ]}})
+            .to_string(),
+            ..Default::default()
+        };
+        let plain = crate::structs::NodeMsg {
+            id: "cpu-1".into(),
+            health_checks: "{}".into(),
+            ..Default::default()
+        };
+        let reply = serde_json::to_value(crate::structs::GetNodesReply {
+            nodes: vec![gpu, plain],
+            ..Default::default()
+        })
+        .expect("serialize");
+        let all = node_devices_reply(&reply, None);
+        assert_eq!(all["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(all["nodes"][0]["devices"]["groups"][0]["model"], "A100");
+        let one = node_devices_reply(&reply, Some("cpu-1"));
+        assert_eq!(one["nodes"][0]["devices"]["groups"], json!([]));
     }
 
     #[test]

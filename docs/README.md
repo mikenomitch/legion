@@ -60,6 +60,9 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Resource Enforcement](resource-enforcement.md): enforcing declared `memory`,
   `cores`, and `cpu` on Linux with hard memory limits, exclusive pinned
   cores, proportional CPU weight, and the interface runtimes adopt.
+- [Devices: GPUs and Other Hardware](devices.md): device plugins
+  (`legion-device/1`), `resources.devices` requests, topology-aware
+  assignment, CDI container edits, device health, and device quota.
 - [Job Templates](job-templates.md): reusable, versioned job specs with typed
   variables, guided submission, and template-scoped delegation.
 - [Artifacts](artifacts.md): declaring, fetching, verifying, and staging inputs.

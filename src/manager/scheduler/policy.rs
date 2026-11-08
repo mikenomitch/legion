@@ -16,7 +16,7 @@ use crate::structs::config::DEF_SCHEDULER_AUTO_ANTI_AFFINITY_WEIGHT;
 /// as one satisfied affinity.
 pub const DEF_SCHEDULER_LOCALITY_WEIGHT: f64 = 1.0;
 use crate::structs::{Node, TaskConfig};
-use libloading::{Library, Symbol};
+use libloading::Library;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use serde_json::Value;
@@ -63,7 +63,7 @@ impl SchedulerWeights {
 }
 
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SchedulingContext<'a> {
     pub eligible_nodes: Vec<&'a Node>,
     pub task: &'a TaskConfig,
@@ -416,6 +416,63 @@ fn task_colocation_preferences(affinities: &Value) -> Vec<(&str, f64)> {
     }
 }
 
+// ── Panic containment for scheduling plugins (PLG1; docs/plugin-system.md,
+// "Panics and quarantine") ──
+
+/// A dylib policy's methods run under its own `catch_unwind`. Generic, so
+/// `legion::export_scheduling_policy!` compiles this impl into the plugin.
+impl<T: SchedulingPolicy> SchedulingPolicy for crate::plugin_runtime::containment::Contained<T> {
+    fn name(&self) -> &'static str {
+        crate::plugin_runtime::containment::contained("name", || "panicked", || self.0.name())
+    }
+
+    fn select_node<'a>(&self, ctx: SchedulingContext<'a>) -> Option<&'a Node> {
+        crate::plugin_runtime::containment::contained(
+            "select_node",
+            || None,
+            || self.0.select_node(ctx),
+        )
+    }
+}
+
+/// The host's side of a dylib policy: every call is guarded, and a policy
+/// that panics (or was quarantined earlier) hands the placement to
+/// `bin_pack`, so a plugin bug degrades placement quality instead of
+/// failing every placement in the cluster.
+struct GuardedPolicy {
+    name: String,
+    /// What the plugin's `name()` answered at load (its own static, alive
+    /// as long as the library is).
+    reported_name: &'static str,
+    inner: Box<dyn SchedulingPolicy>,
+    probe: crate::plugin_runtime::containment::PanicProbe,
+    fallback: BinPackPolicy,
+}
+
+impl SchedulingPolicy for GuardedPolicy {
+    fn name(&self) -> &'static str {
+        self.reported_name
+    }
+
+    fn select_node<'a>(&self, ctx: SchedulingContext<'a>) -> Option<&'a Node> {
+        let attempt = ctx.clone();
+        match crate::plugin_runtime::containment::guard(
+            "scheduling",
+            &self.name,
+            "select_node",
+            Some(&self.probe),
+            || self.inner.select_node(attempt),
+        ) {
+            Ok(choice) => choice,
+            Err(err) => {
+                // Logged once per quarantine at error; per placement at debug.
+                debug!(policy = %self.name, error = %format!("{err:#}"), "Scheduling plugin unavailable; placing with bin_pack");
+                self.fallback.select_node(ctx)
+            }
+        }
+    }
+}
+
 #[instrument(err, skip_all)]
 pub fn load_policy(name: &str) -> R<(Option<Library>, Box<dyn SchedulingPolicy>)> {
     match name {
@@ -429,11 +486,23 @@ pub fn load_policy(name: &str) -> R<(Option<Library>, Box<dyn SchedulingPolicy>)
             unsafe {
                 let lib =
                     crate::plugin_runtime::open_plugin_library("scheduling", other, &paths.dylib)?;
-                let policy = {
-                    let func: Symbol<unsafe extern "C" fn() -> Box<dyn SchedulingPolicy>> =
-                        lib.get(b"get")?;
-                    func()
-                };
+                let (inner, probe) = crate::plugin_runtime::contained_constructor::<
+                    dyn SchedulingPolicy,
+                >("scheduling", other, &lib)?;
+                let reported_name = crate::plugin_runtime::containment::guard(
+                    "scheduling",
+                    other,
+                    "name",
+                    Some(&probe),
+                    || inner.name(),
+                )?;
+                let policy: Box<dyn SchedulingPolicy> = Box::new(GuardedPolicy {
+                    name: other.to_string(),
+                    reported_name,
+                    inner,
+                    probe,
+                    fallback: BinPackPolicy,
+                });
                 Ok((Some(lib), policy))
             }
         }

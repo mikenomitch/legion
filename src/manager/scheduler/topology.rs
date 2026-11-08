@@ -225,13 +225,14 @@ mod topology_test {
     fn pool(memory: f64) -> Arc<ResourcePool> {
         Arc::new(ResourcePool {
             values: HashMap::from([("memory".to_string(), ResourceValue::Amount(memory))]),
-            capacity: Default::default(),
+            ..Default::default()
         })
     }
 
     fn request(memory: f64) -> ResourceRequest {
         ResourceRequest {
             values: HashMap::from([("memory".to_string(), ResourceValue::Amount(memory))]),
+            devices: Vec::new(),
         }
     }
 
@@ -333,6 +334,7 @@ mod topology_test {
         assert_eq!(replicas_fit(&free, &request(8192.0), 10), 0);
         let cpu = ResourceRequest {
             values: HashMap::from([("cpu".to_string(), ResourceValue::Amount(100.0))]),
+            devices: Vec::new(),
         };
         assert_eq!(
             replicas_fit(&free, &cpu, 10),

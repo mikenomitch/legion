@@ -84,7 +84,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Some(entry) => {
                         let path = entry.path();
-                        if path.is_dir() {
+                        // Only Rust plugins build here: exec plugins (device,
+                        // keyring, cluster CA) are scripts with no crate.
+                        if path.is_dir() && path.join("Cargo.toml").is_file() {
                             let plugin_name = path
                                 .file_name()
                                 .map(|name| name.to_string_lossy().to_string())

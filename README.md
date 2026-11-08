@@ -456,7 +456,8 @@ start:
   [Autoscaling Plugins](docs/autoscaling-plugins.md) ·
   [Gang Scheduling](docs/gang-scheduling.md) ·
   [Task Supervision](docs/task-supervision.md) ·
-  [Resource Enforcement](docs/resource-enforcement.md)
+  [Resource Enforcement](docs/resource-enforcement.md) ·
+  [Devices and GPUs](docs/devices.md)
 - **Sandboxes:** [Sandbox Runtime](docs/task-runtime-sandbox.md) ·
   [Running Agent Sandboxes](docs/guides/agent-sandboxes.md) ·
   [Sandboxes at Scale](docs/sandboxes-at-scale.md) ·

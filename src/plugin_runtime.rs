@@ -3,7 +3,7 @@ use libloading::Library;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-pub const PLUGIN_API_VERSION: u32 = 2;
+pub const PLUGIN_API_VERSION: u32 = 3;
 
 // Defines `PLUGIN_BUILD_INFO`: rustc version and commit, this crate's name
 // and version, target triple, and panic strategy (see build.rs).
@@ -110,8 +110,116 @@ macro_rules! declare_plugin_abi {
         pub extern "C" fn legion_plugin_abi_build_info() -> *const ::std::os::raw::c_char {
             $crate::plugin_runtime::PLUGIN_BUILD_INFO.as_ptr()
         }
+
+        // The panic probe (docs/plugin-system.md, "Panics and quarantine"):
+        // the host asks after every call whether this dylib's own
+        // `catch_unwind` caught a panic.
+        #[no_mangle]
+        pub extern "C" fn legion_plugin_take_panic() -> *mut ::std::os::raw::c_char {
+            $crate::plugin_runtime::containment::take_recorded_panic_c()
+        }
+
+        /// # Safety
+        ///
+        /// `ptr` must come from `legion_plugin_take_panic` in this dylib.
+        #[no_mangle]
+        pub unsafe extern "C" fn legion_plugin_free_panic(ptr: *mut ::std::os::raw::c_char) {
+            $crate::plugin_runtime::containment::free_recorded_panic_c(ptr)
+        }
     };
 }
+
+/// Export a rollout strategy plugin: the ABI fingerprint, the panic probe,
+/// and the contained constructor the host loads
+/// (`legion_contained_get`). Every method of the value runs under the
+/// plugin's own `catch_unwind`.
+///
+/// ```ignore
+/// legion::export_rollout_strategy!(SlowStart);
+/// ```
+#[macro_export]
+macro_rules! export_rollout_strategy {
+    ($value:expr) => {
+        $crate::declare_plugin_abi!();
+
+        #[no_mangle]
+        pub extern "C" fn legion_contained_get(
+        ) -> Box<dyn $crate::manager::rollout_strategy::RolloutStrategyPlugin> {
+            Box::new($crate::plugin_runtime::containment::Contained($value))
+        }
+    };
+}
+
+/// [`export_rollout_strategy!`] for a scheduling policy plugin.
+#[macro_export]
+macro_rules! export_scheduling_policy {
+    ($value:expr) => {
+        $crate::declare_plugin_abi!();
+
+        #[no_mangle]
+        pub extern "C" fn legion_contained_get(
+        ) -> Box<dyn $crate::manager::scheduler::SchedulingPolicy> {
+            Box::new($crate::plugin_runtime::containment::Contained($value))
+        }
+    };
+}
+
+/// [`export_rollout_strategy!`] for a node-check plugin.
+#[macro_export]
+macro_rules! export_node_checker {
+    ($value:expr) => {
+        $crate::declare_plugin_abi!();
+
+        #[no_mangle]
+        pub extern "C" fn legion_contained_get() -> Box<dyn $crate::worker::node_check::NodeChecker>
+        {
+            Box::new($crate::plugin_runtime::containment::Contained($value))
+        }
+    };
+}
+
+/// [`export_rollout_strategy!`] for an artifact fetcher plugin.
+#[macro_export]
+macro_rules! export_artifact_fetcher {
+    ($value:expr) => {
+        $crate::declare_plugin_abi!();
+
+        #[no_mangle]
+        pub extern "C" fn legion_contained_get() -> Box<dyn $crate::artifacts::ArtifactFetcher> {
+            Box::new($crate::plugin_runtime::containment::Contained($value))
+        }
+    };
+}
+
+/// Resolve a contained plugin's constructor and probe from an opened
+/// library: the value (built by `legion_contained_get`) and its
+/// [`containment::PanicProbe`]. A plugin that exports only the old `get`
+/// is refused with the fix.
+///
+/// # Safety
+///
+/// `lib` must have passed [`open_plugin_library`], and `T` must be the
+/// trait object the plugin's `export_*!` macro returns.
+pub unsafe fn contained_constructor<T: ?Sized>(
+    kind: &str,
+    name: &str,
+    lib: &Library,
+) -> R<(Box<T>, containment::PanicProbe)> {
+    let probe = containment::PanicProbe::from_library(kind, name, lib)?;
+    let constructor = lib
+        .get::<unsafe extern "C" fn() -> Box<T>>(containment::CONTAINED_GET_SYMBOL)
+        .map_err(|_| {
+            anyhow!(
+                "{kind} plugin {name} exports no `legion_contained_get`: it predates panic \
+                 containment. Replace its `get` function with `legion::export_*!` for its kind \
+                 (for example `legion::export_rollout_strategy!(MyStrategy)`) and rebuild it \
+                 (see docs/plugin-system.md, \"Panics and quarantine\")"
+            )
+        })?;
+    Ok((constructor(), probe))
+}
+
+pub mod containment;
 
 /// Opens a plugin dylib and refuses it unless its ABI fingerprint matches
 /// this binary's (see [`PLUGIN_ABI_FINGERPRINT`]). Every dylib loader goes

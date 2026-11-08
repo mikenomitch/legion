@@ -17,13 +17,23 @@ We chose this approach because it is:
 
 The main trade-off of in-process plugins is weaker reliability and isolation:
 
-- **Plugin panics can terminate the host process** (manager/worker) if not contained.
+- **Plugin panics can terminate the host process** (manager/worker) if not
+  contained. Scheduling, rollout, node-check, and artifact-fetcher plugins
+  are contained and quarantined (see [Panics and
+  quarantine](#panics-and-quarantine)); task runtime plugins are not yet.
 - **Memory safety and ABI mistakes are dangerous** because dynamic loading requires unsafe FFI boundaries.
 - **Version drift can break loading** if plugin and host disagree on API expectations.
 
 To reduce this risk, Legion validates plugin manifests (kind, name, API version)
 and checks each library's [build fingerprint](#build-fingerprint-required-for-dynamic-plugins)
 before it calls any plugin code.
+
+Plugins that talk to hardware or external systems are **exec plugins**
+instead: a separate program per call, JSON on stdin and stdout. Device
+plugins ([docs/devices.md](devices.md)), volume drivers
+([docs/volumes.md](volumes.md)), the keyring and cluster CA `exec`
+providers, and the autoscaler's plugins work this way. A crash or a hang
+costs one call.
 
 ## How Plugin Loading Works
 
@@ -64,7 +74,7 @@ Example:
 {
   "kind": "tasks",
   "name": "noop",
-  "legionApiVersion": 2
+  "legionApiVersion": 3
 }
 ```
 
@@ -91,6 +101,7 @@ struct breaks every prebuilt library, whatever the category.
 
 | Version | Change |
 | --- | --- |
+| 3 | Scheduling, rollout, node-check, and artifact-fetcher plugins export `legion_contained_get` through `legion::export_*!` instead of `get` ([Panics and quarantine](#panics-and-quarantine)). `NodeChecker` lost `has_fingerprinter`/`has_health_check`, and `health_check` returns `Option<NodeCheckReport>`. `TaskInstance` gained `devices`. |
 | 2 | `TaskRuntime` renamed to `TaskInstance` and `RuntimeVolume` to `MountedVolume`. `TaskInstance` gained `volumes`. |
 | 1 | Initial. |
 
@@ -112,19 +123,19 @@ toolchain, or whose own `Cargo.lock` resolves `serde_json` to a different
 version or turns on `serde_json/preserve_order`, would otherwise load fine and
 then corrupt memory.
 
-Every plugin exports a fingerprint of the build it came from, next to its `get`
-constructor:
+Every plugin exports a fingerprint of the build it came from, next to its
+constructor. Scheduling, rollout, node-check, and artifact-fetcher plugins
+get both from one macro per kind:
 
 ```rust
-legion::declare_plugin_abi!();
-
-#[no_mangle]
-pub extern "C" fn get() -> Box<dyn SchedulingPolicy> { Box::new(MyPolicy) }
+legion::export_scheduling_policy!(MyPolicy::new());   // or export_rollout_strategy!,
+                                                       // export_node_checker!,
+                                                       // export_artifact_fetcher!
 ```
 
-Task plugins call `legion::declare_task_plugin_abi!()` instead, which includes
-it. Before it calls `get`, the host compares the plugin's fingerprint with its
-own and refuses the plugin when they differ:
+Task plugins call `legion::declare_task_plugin_abi!()` and export `get`
+themselves. Before it calls the constructor, the host compares the plugin's
+fingerprint with its own and refuses the plugin when they differ:
 
 ```text
 scheduling plugin random was built differently from this legion binary and cannot be
@@ -154,8 +165,53 @@ Known limitations:
   trusted to agree on layout. That holds for the same compiler, crate
   versions, and features, but a dependency change that keeps every probed
   type's size and alignment while reordering fields would get past it.
-- Plugins still run in-process. Rollout strategy plugins run inside the
-  manager, so a buggy one can crash it.
+- Plugins still run in-process. A panic is contained (below), but a plugin
+  that corrupts memory, loops forever, or calls `abort` still takes its host
+  with it.
+
+### Panics and quarantine
+
+A plugin is a `cdylib` with its own copy of the Rust standard library, so a
+panic that unwinds out of it into Legion is a foreign exception and aborts
+the process. Legion therefore catches it on the plugin's side:
+
+- `legion::export_*!` wraps the plugin's value so that every trait method
+  runs under the plugin's own `catch_unwind`. A panic is recorded and the
+  method returns a neutral answer: an error where it returns a `Result`.
+- After every call the host asks the plugin, through a C-ABI probe
+  (`legion_plugin_take_panic`), whether it panicked. If it did, the call
+  fails with `<kind> plugin <name> panicked in \`<method>\` (<message>); it
+  is quarantined until this process restarts`, and the plugin is
+  **quarantined**: Legion does not call it again until the process
+  restarts. Later calls fail fast with `<kind> plugin <name> is quarantined:
+  it panicked earlier (...)`.
+
+What a quarantine means per kind:
+
+| Kind | Runs in | While quarantined |
+| --- | --- | --- |
+| Scheduling policy | Manager | Placements use `bin_pack` |
+| Rollout strategy | Manager | Resolving a rollout that names it fails |
+| Node check | Worker | It reports a failing check, so the node reads as unhealthy |
+| Artifact fetcher | Worker | Fetches of its scheme fail, and the allocation with them |
+
+Every quarantine is logged at `error` (`Plugin panicked; quarantining it
+until this process restarts`) and counted in
+`legion_plugin_panics_total{kind,name}` ([docs/metrics.md](metrics.md)). A
+worker also lists its quarantined plugins under `plugins` in its health
+checks (`legion node info -j`, `healthChecks.plugins`), which marks the node
+unhealthy.
+
+Known limitations:
+
+- **Task runtime plugins are not contained yet.** Their trait has about 40
+  methods; a panicking `noop`-style plugin still takes the worker down.
+- A panic **inside the exported constructor** itself cannot be caught (it
+  is an `extern "C"` function) and aborts. The macros keep it to one
+  allocation.
+- Both sides need `panic = "unwind"`; the fingerprint already refuses a
+  plugin built with a different panic strategy.
+- A quarantine ends only with a restart. There is no command to lift it.
 
 ## Plugin Types Implemented Today
 
@@ -193,9 +249,43 @@ Purpose: extend worker fingerprinting and node health checks.
   - kitchen-sink fingerprint
   - disk health checks
 - Dynamic example plugin:
-  - `example` (`plugins/node_checks/example/`)
+  - `example` (`plugins/node_checks/example/`), named in a worker type's
+    `additionalNodeChecks`
 
-Entry trait: `NodeChecker` in `src/worker/node_check.rs`.
+Entry trait: `NodeChecker` in `src/worker/node_check.rs`:
+
+```rust
+pub trait NodeChecker: Send + Sync {
+    fn name(&self) -> &'static str;
+    /// Static facts, merged into the node's fingerprint attributes at registration.
+    fn fingerprint(&self) -> Map<String, Value> { Map::new() }
+    /// Run every node-check pass (30 seconds).
+    fn health_check(&self) -> Option<NodeCheckReport> { None }
+}
+
+pub struct NodeCheckReport {
+    pub status: CheckStatus,              // Pass | Warn | Fail
+    pub message: String,                  // "/var has 5% free"
+    pub attributes: Map<String, Value>,   // {"lowestFreePercent": 5}
+}
+```
+
+A report is stored as `healthChecks.<check name> = { "status", "message",
+"attributes" }`. `warn` keeps the node healthy; `fail` marks it unhealthy.
+The built-in `disk` check warns when the fullest disk has under 50% free and
+fails under 20%. A node-check plugin is loaded **once** per worker process
+and reused on every pass. A plugin that cannot load is reported as a failing
+check (`plugin failed to load: ...`) and not retried until the worker
+restarts.
+
+## Device Plugins
+
+Purpose: discover GPUs and other devices, report their health and topology,
+and hand an assigned device to a task. Device plugins are exec plugins, not
+dylibs: any program that speaks `legion-device/1` (`fingerprint`,
+`allocate`) on stdin and stdout, configured in a worker type's
+`devices.plugins`. See [docs/devices.md](devices.md), which also covers the
+shipped `nvidia` and `fake` plugins and `legion device plugin test`.
 
 ## 4) Rollout Strategy Plugins
 
@@ -225,10 +315,10 @@ Entry trait: `ArtifactFetcher` in `src/artifacts/fetcher.rs`.
 Contract details (everything else follows the common pattern above):
 
 - Directory layout: `plugins/artifacts/<scheme>/` with a `plugin.json` of
-  `{"kind": "artifacts", "name": "<scheme>", "legionApiVersion": 2}` and the
+  `{"kind": "artifacts", "name": "<scheme>", "legionApiVersion": 3}` and the
   dylib at `plugins/artifacts/<scheme>/target/release/lib<scheme>.<ext>`.
-- Exported symbol: `get() -> Box<dyn ArtifactFetcher>` (the usual `get`
-  constructor, returning the fetcher trait object).
+- Exported constructor: `legion::export_artifact_fetcher!(MyFetcher)`, which
+  also contains its panics (see [Panics and quarantine](#panics-and-quarantine)).
 - The trait is **blocking**. `fetch` streams bytes into an `ArtifactSink`,
   which hashes, counts, and enforces size limits. Fetchers run on worker
   staging threads, never the async runtime, and a blocking trait keeps the

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Instant;
 
-use libloading::{Library, Symbol};
+use libloading::Library;
 use url::Url;
 
 use crate::artifacts::stage::ArtifactSink;
@@ -324,6 +324,69 @@ pub trait ArtifactFetcher: Send + Sync {
     fn fetch(&self, req: &FetchRequest<'_>, sink: &mut ArtifactSink) -> R<FetchedArtifact>;
 }
 
+// ── Panic containment for fetcher plugins (PLG1; docs/plugin-system.md,
+// "Panics and quarantine") ──
+
+/// A dylib fetcher's methods run under its own `catch_unwind`. Generic, so
+/// `legion::export_artifact_fetcher!` compiles this impl into the plugin.
+impl<T: ArtifactFetcher> ArtifactFetcher for crate::plugin_runtime::containment::Contained<T> {
+    fn schemes(&self) -> &'static [&'static str] {
+        let none: &'static [&'static str] = &[];
+        crate::plugin_runtime::containment::contained("schemes", || none, || self.0.schemes())
+    }
+
+    fn resolve(&self, req: &FetchRequest<'_>) -> R<Option<ResolvedIdentity>> {
+        crate::plugin_runtime::containment::contained(
+            "resolve",
+            || Err(anyhow!("the artifact fetcher panicked")),
+            || self.0.resolve(req),
+        )
+    }
+
+    fn fetch(&self, req: &FetchRequest<'_>, sink: &mut ArtifactSink) -> R<FetchedArtifact> {
+        crate::plugin_runtime::containment::contained(
+            "fetch",
+            || Err(anyhow!("the artifact fetcher panicked")),
+            || self.0.fetch(req, sink),
+        )
+    }
+}
+
+/// The worker's side of a dylib fetcher: every call guarded, so a panic
+/// fails that fetch (and quarantines the plugin) instead of the worker.
+struct GuardedFetcher {
+    name: String,
+    schemes: &'static [&'static str],
+    inner: Box<dyn ArtifactFetcher>,
+    probe: crate::plugin_runtime::containment::PanicProbe,
+}
+
+impl ArtifactFetcher for GuardedFetcher {
+    fn schemes(&self) -> &'static [&'static str] {
+        self.schemes
+    }
+
+    fn resolve(&self, req: &FetchRequest<'_>) -> R<Option<ResolvedIdentity>> {
+        crate::plugin_runtime::containment::guard_r(
+            "artifacts",
+            &self.name,
+            "resolve",
+            Some(&self.probe),
+            || self.inner.resolve(req),
+        )
+    }
+
+    fn fetch(&self, req: &FetchRequest<'_>, sink: &mut ArtifactSink) -> R<FetchedArtifact> {
+        crate::plugin_runtime::containment::guard_r(
+            "artifacts",
+            &self.name,
+            "fetch",
+            Some(&self.probe),
+            || self.inner.fetch(req, sink),
+        )
+    }
+}
+
 struct LoadedFetcher {
     fetcher: Arc<dyn ArtifactFetcher>,
     /// Keeps the dylib mapped for as long as the registry (and therefore any
@@ -405,16 +468,29 @@ impl FetcherRegistry {
             .with_context(|| format!("invalid artifact fetcher plugin manifest for {scheme}"))?;
         // SAFETY: identical dylib-loading contract as task-runtime plugins; the
         // plugin must export `get() -> Box<dyn ArtifactFetcher>`.
+        crate::plugin_runtime::containment::check_quarantine("artifacts", scheme)?;
         unsafe {
             let lib =
                 crate::plugin_runtime::open_plugin_library("artifacts", scheme, &paths.dylib)?;
-            let fetcher: Arc<dyn ArtifactFetcher> = {
-                let func: Symbol<unsafe extern "C" fn() -> Box<dyn ArtifactFetcher>> =
-                    lib.get(b"get")?;
-                Arc::from(func())
-            };
+            let (inner, probe) = crate::plugin_runtime::contained_constructor::<dyn ArtifactFetcher>(
+                "artifacts",
+                scheme,
+                &lib,
+            )?;
+            let schemes = crate::plugin_runtime::containment::guard(
+                "artifacts",
+                scheme,
+                "schemes",
+                Some(&probe),
+                || inner.schemes(),
+            )?;
+            let fetcher: Arc<dyn ArtifactFetcher> = Arc::new(GuardedFetcher {
+                name: scheme.to_string(),
+                schemes,
+                inner,
+                probe,
+            });
             let index = self.fetchers.len();
-            let schemes = fetcher.schemes();
             if !schemes.contains(&scheme) {
                 bail!(
                     "artifact fetcher plugin {scheme} reports schemes {schemes:?}, which do \

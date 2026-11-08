@@ -3020,6 +3020,11 @@ pub struct WorkerConfigAlt {
     /// capability set.
     #[serde(default)]
     pub container: Option<WorkerContainerConfig>,
+    /// Devices on workers of this type: plugins that discover them, devices
+    /// declared by hand, and where CDI specs live (docs/devices.md). Absent
+    /// means no devices.
+    #[serde(default)]
+    pub devices: Option<crate::devices::plugin::WorkerDevicesConfig>,
 }
 
 /// Worker-type `container` block. Carried to the worker as JSON in
@@ -3036,6 +3041,14 @@ pub struct WorkerContainerConfig {
     /// not add any.
     #[serde(default)]
     pub allow_caps: Option<Vec<String>>,
+    /// OCI runtime classes beyond the node's default runtime, by name
+    /// (docs/task-runtime-container.md, "Runtime classes"): gVisor, Kata, or
+    /// any runtime with runc's command line. A task picks one with
+    /// `config.runtimeClass`; the node advertises the ones whose runtime
+    /// answers `--version`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub runtime_classes:
+        std::collections::BTreeMap<String, crate::task_plugins::runtime_class::RuntimeClassConfig>,
 }
 
 impl WorkerContainerConfig {
@@ -3330,9 +3343,9 @@ pub const DEF_ARTIFACT_FETCH_PARALLELISM: usize = 4;
 /// Default per-artifact fetch attempts before the allocation fails.
 pub const DEF_ARTIFACT_FETCH_ATTEMPTS: u32 = 3;
 /// Default overall fetch deadline per artifact.
-pub const DEF_ARTIFACT_FETCH_TIMEOUT: &str = "10m";
+pub const DEF_ARTIFACT_FETCH_TIMEOUT: &str = "2h";
 /// Default per-artifact size cap (also bounds decompression).
-pub const DEF_ARTIFACT_MAX_SIZE: &str = "50GiB";
+pub const DEF_ARTIFACT_MAX_SIZE: &str = "1TiB";
 
 /// Worker-level artifact settings (worker config `artifacts` block). The
 /// cache plan later adds a sibling `cache` block under the same key.
@@ -3381,10 +3394,48 @@ pub struct WorkerContentConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerContentBudgets {
-    /// Cached artifacts. Default 10% of the disk, clamped to 1..20 GiB.
-    pub artifacts: Option<String>,
+    /// Cached artifacts (model weights included). Default 50% of the disk,
+    /// at least 1 GiB, no ceiling.
+    pub artifacts: Option<ContentBudget>,
     /// Checkpoint parts. Default 20% of the disk, clamped to 2..200 GiB.
-    pub snapshots: Option<String>,
+    pub snapshots: Option<ContentBudget>,
+}
+
+/// One `content.budgets` entry: a size or share as text (`"50GiB"`,
+/// `"20%"`), or a share with bounds: `{ share = "60%", max = "4TiB",
+/// min = "10GiB" }`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum ContentBudget {
+    Text(String),
+    Share {
+        share: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<String>,
+    },
+}
+
+impl From<&str> for ContentBudget {
+    fn from(text: &str) -> Self {
+        ContentBudget::Text(text.to_string())
+    }
+}
+
+impl ContentBudget {
+    fn spec(&self) -> R<crate::content_store::BudgetSpec> {
+        match self {
+            ContentBudget::Text(raw) => crate::content_store::BudgetSpec::parse(raw),
+            ContentBudget::Share { share, min, max } => {
+                crate::content_store::BudgetSpec::share_within(
+                    share,
+                    min.as_deref(),
+                    max.as_deref(),
+                )
+            }
+        }
+    }
 }
 
 impl WorkerContentConfig {
@@ -3401,25 +3452,27 @@ impl WorkerContentConfig {
             return Ok(None);
         }
         let budgets = self.budgets.clone().unwrap_or_default();
-        let budget = |class: &str, raw: Option<&str>, default: BudgetSpec| -> R<BudgetSpec> {
-            match raw {
-                None => Ok(default),
-                Some(raw) => BudgetSpec::parse(raw).with_context(|| {
-                    format!(
-                        "invalid content.budgets.{class} {raw:?} (expected a size such as \
-                         \"20GiB\" or a share of the disk such as \"20%\")"
-                    )
-                }),
-            }
-        };
+        let budget =
+            |class: &str, raw: Option<&ContentBudget>, default: BudgetSpec| -> R<BudgetSpec> {
+                match raw {
+                    None => Ok(default),
+                    Some(raw) => raw.spec().with_context(|| {
+                        format!(
+                            "invalid content.budgets.{class} {raw:?} (expected a size such as \
+                             \"20GiB\", a share of the disk such as \"20%\", or a bounded share \
+                             such as {{ share = \"50%\", max = \"2TiB\" }})"
+                        )
+                    }),
+                }
+            };
         let artifacts = budget(
             "artifacts",
-            budgets.artifacts.as_deref(),
+            budgets.artifacts.as_ref(),
             DEF_CONTENT_ARTIFACTS_BUDGET,
         )?;
         let snapshots = budget(
             "snapshots",
-            budgets.snapshots.as_deref(),
+            budgets.snapshots.as_ref(),
             DEF_CONTENT_SNAPSHOTS_BUDGET,
         )?;
         // Shares of one disk cannot add up past all of it. Defaults count,
@@ -3477,6 +3530,11 @@ pub struct WorkerArtifactsPayload {
     /// act on the session manifests the `contentStore` holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions: Option<WorkerSessionsConfig>,
+    /// The top-level `devices` block (docs/devices.md), riding the same
+    /// payload for the same reason: device plugins, static devices, and CDI
+    /// spec dirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devices: Option<crate::devices::plugin::WorkerDevicesConfig>,
 }
 
 /// A worker's `sessions` block (docs/session-mode.md, "No split brain").
@@ -3525,8 +3583,8 @@ impl Default for WorkerArtifactFetchConfigFull {
         WorkerArtifactFetchConfigFull {
             parallelism: DEF_ARTIFACT_FETCH_PARALLELISM,
             attempts: DEF_ARTIFACT_FETCH_ATTEMPTS,
-            timeout_secs: 600,
-            max_artifact_size_bytes: 50 * 1024 * 1024 * 1024,
+            timeout_secs: 2 * 3600,
+            max_artifact_size_bytes: 1 << 40,
             allowed_schemes: DEF_ARTIFACT_ALLOWED_SCHEMES
                 .iter()
                 .map(|s| s.to_string())
@@ -3704,20 +3762,20 @@ mod tests {
         let small = on(8 * GIB)?;
         assert_eq!(
             (small.artifacts, small.snapshots),
-            (GIB, 2 * GIB),
-            "the floors"
+            (4 * GIB, 2 * GIB),
+            "half the disk for artifacts, the snapshots floor"
         );
         let mid = on(100 * GIB)?;
         assert_eq!(
             (mid.artifacts, mid.snapshots),
-            (10 * GIB, 20 * GIB),
+            (50 * GIB, 20 * GIB),
             "the shares"
         );
         let big = on(4096 * GIB)?;
         assert_eq!(
             (big.artifacts, big.snapshots),
-            (20 * GIB, 200 * GIB),
-            "the caps"
+            (2048 * GIB, 200 * GIB),
+            "artifacts uncapped (model scale), the snapshots cap"
         );
         assert_eq!(
             defaults.config_for(Some(1024 * GIB))?,
@@ -3793,7 +3851,11 @@ mod tests {
         assert_eq!(settings.budgets.snapshots.percent(), Some(50.0));
         let sized = settings.config_for(Some(1000 * GIB))?;
         assert_eq!(sized.budgets.snapshots, 500 * GIB);
-        assert_eq!(sized.budgets.artifacts, 20 * GIB, "default artifacts cap");
+        assert_eq!(
+            sized.budgets.artifacts,
+            500 * GIB,
+            "default artifacts share"
+        );
         assert_eq!(BudgetSpec::parse(" 12.5% ")?.resolve(800), 100);
 
         let err = |config: WorkerContentConfig| format!("{:#}", config.resolve().unwrap_err());
@@ -3819,6 +3881,18 @@ mod tests {
             with(Some("90%"), Some("50GiB")).resolve().is_ok(),
             "a fixed size is no share"
         );
+        // A bounded share: the object form (AI6, an operator's ceiling).
+        let bounded: WorkerContentConfig = serde_json::from_str(
+            r#"{"budgets":{"artifacts":{"share":"60%","max":"100GiB","min":"10GiB"}}}"#,
+        )?;
+        let sized = bounded
+            .resolve()?
+            .expect("enabled")
+            .config_for(Some(1000 * GIB))?;
+        assert_eq!(sized.budgets.artifacts, 100 * GIB, "the ceiling");
+        let bad: WorkerContentConfig =
+            serde_json::from_str(r#"{"budgets":{"artifacts":{"share":"60GiB"}}}"#)?;
+        assert!(err(bad).contains("content.budgets.artifacts"));
         Ok(())
     }
 
@@ -4105,7 +4179,11 @@ mod tests {
         let defaults = WorkerArtifactsConfig::default().fetch_with_defaults()?;
         assert_eq!(defaults.parallelism, DEF_ARTIFACT_FETCH_PARALLELISM);
         assert_eq!(defaults.attempts, DEF_ARTIFACT_FETCH_ATTEMPTS);
-        assert_eq!(defaults.timeout_secs, 600);
+        assert_eq!(
+            defaults.timeout_secs,
+            2 * 3600,
+            "model-scale downloads fit the default"
+        );
         assert!(!defaults.allowed_schemes.contains(&"http".to_string()));
 
         let config: WorkerArtifactsConfig = serde_json::from_value(serde_json::json!({

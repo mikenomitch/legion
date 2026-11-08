@@ -2623,7 +2623,7 @@ impl ManagerDaemonService {
 
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
-            Status::invalid_argument(format!("Error validating task configs: {e}"))
+            Status::invalid_argument(format!("Error validating task configs: {e:#}"))
         })?;
         // `autoscale` against the cluster's scaling defaults and namespace
         // policies, as they stand now (docs/autoscaling.md).
@@ -6229,7 +6229,7 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Namespace policy refused the job", e))?;
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
-            Status::invalid_argument(format!("Error validating task configs: {e}"))
+            Status::invalid_argument(format!("Error validating task configs: {e:#}"))
         })?;
         let autoscale_plans = self.validate_autoscale(&config)?;
         self.validate_identity_sub_templates(&config)?;
@@ -9284,9 +9284,20 @@ impl Manager for ManagerDaemonService {
         let id = req.id;
         acl::enforce_node_binding(&identity, &id)?;
 
+        // A changed device report (docs/devices.md) can free capacity a
+        // pending job is waiting for: a repaired GPU, a new card.
+        let devices_changed = crate::devices::report_changed(
+            self.store.cached_node(&id).ok().flatten().as_deref(),
+            &req.health_checks,
+        );
         self.store
             .update_node_health_checks(&id, &req.health_checks)
             .map_err(|e| map_store_error("Error updating node health checks", e))?;
+        if devices_changed {
+            if let Err(err) = self.store.request_capacity_reconcile() {
+                warn!(node_id = %id, error = %err, "Failed to queue the capacity pass after a device change");
+            }
+        }
 
         let reply = HealthCheckReply {
             message: "ack".into(),
@@ -14268,10 +14279,26 @@ fn derive_node_health(value: &Value) -> Option<bool> {
                 None
             }
         }
+        // A typed node-check report (`{ status, message, attributes }`,
+        // docs/plugin-system.md "Node checks"): its status decides, and
+        // its message is prose, not a verdict.
+        Value::Object(map)
+            if matches!(
+                map.get("status").and_then(Value::as_str),
+                Some("pass" | "warn" | "fail")
+            ) =>
+        {
+            Some(map.get("status").and_then(Value::as_str) != Some("fail"))
+        }
         Value::Object(map) => {
             let mut seen = false;
             let mut all_ok = true;
-            for entry in map.values() {
+            // The device report (docs/devices.md) rides the health checks;
+            // an unhealthy GPU is that device's state, not the node's.
+            for (_, entry) in map
+                .iter()
+                .filter(|(key, _)| key.as_str() != crate::devices::REPORT_KEY)
+            {
                 if let Some(ok) = derive_node_health(entry) {
                     seen = true;
                     all_ok &= ok;
@@ -19994,6 +20021,20 @@ mod tests {
                 "container": "fail"
             }
         });
+        assert_eq!(derive_node_health(&checks), Some(false));
+    }
+
+    /// Typed node-check reports decide by `status`, and the device report
+    /// never counts (docs/devices.md, docs/plugin-system.md).
+    #[test]
+    fn derive_node_health_reads_typed_reports_and_skips_devices_test() {
+        let checks = json!({
+            "disk": { "status": "warn", "message": "/var has 30% free, an error-free disk" },
+            "devices": { "groups": [{ "instances": [{ "id": "g", "healthy": false,
+                                                      "healthDetail": "fail" }] }] },
+        });
+        assert_eq!(derive_node_health(&checks), Some(true));
+        let checks = json!({ "disk": { "status": "fail", "message": "/var has 5% free" } });
         assert_eq!(derive_node_health(&checks), Some(false));
     }
 

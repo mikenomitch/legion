@@ -335,6 +335,11 @@ Worker task manager flow:
    bundled `noop` dylib if it is present.
 2. On allocation start:
    - resolve plugin by `task.runtime`
+   - allocate the task's assigned devices through their device plugins
+     ([docs/devices.md](devices.md)): their env goes into
+     `TaskInstance.extra_env` (`LEGION_DEVICE_<NAME>_IDS`, `CUDA_VISIBLE_DEVICES`),
+     and all their container edits (env, device nodes, mounts, hooks) into
+     `TaskInstance.devices`, for a runtime that isolates its workload to apply
    - run `prepare` then `start`
 3. On reconciliation stop:
    - write the stop notice, then call `stop_with`
@@ -351,6 +356,20 @@ exits (see [Task Supervision](task-supervision.md)). Plugins control the
 runtime's start and stop behavior.
 
 ## Built-in and Bundled Runtimes
+
+What each runtime does with devices (`resources.devices`) and runtime
+classes:
+
+| Runtime | Devices | Runtime classes |
+| --- | --- | --- |
+| `exec` | Env only (no device cgroup) | — |
+| `container` | Device nodes, cgroup allow rules, mounts, hooks, env (Linux) | ✅ `config.runtimeClass` (Linux) |
+| `sandbox` | Refused at submit (no VFIO passthrough yet) | — |
+| `noop` and dylib runtimes | Env in `extra_env`; edits in `TaskInstance.devices` to apply or ignore | — |
+
+A dylib task runtime is **not** panic-contained yet (see
+[docs/plugin-system.md](plugin-system.md#panics-and-quarantine)): a panic in
+one takes the worker down.
 
 See per-runtime docs:
 

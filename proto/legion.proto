@@ -3653,7 +3653,10 @@ message WorkerRegisterRequest {
   // JSON object string of node fingerprint attributes collected on worker.
   string fingerprint_attrs = 4;
 
-  // JSON object/string with current worker health-check results.
+  // JSON object/string with current worker health-check results. The
+  // reserved key `devices` carries the node's first device report, so a GPU
+  // node can take device requests from registration on (see
+  // `HealthCheckRequest.health_checks` and docs/devices.md).
   string health_checks = 5;
 
   // Manager-populated defaults on registration (not client-provided):
@@ -10680,7 +10683,19 @@ message HealthCheckRequest {
   // `HeartbeatRequest.id`).
   string id = 1;
 
-  // JSON-encoded node health-check payload.
+  // JSON-encoded node health-check payload: an object of check name to
+  // result (`"pass"`, a bool, or a nested object of those).
+  //
+  // The reserved key `devices` carries the node's device report instead
+  // (docs/devices.md): `{ "groups": [<device group>, ...], "plugins": {
+  // "<name>": { "status": "ok"|"error", "error", "groups" } } }`, where a
+  // group is `{ vendor, type, model, plugin, attributes, instances: [{ id,
+  // healthy, healthDetail, attributes, cdi }] }`. The scheduler reads each
+  // group's healthy instances as assignable devices; `devices` never counts
+  // toward the node's own health. A worker with no device plugins and no
+  // static devices omits the key. The worker re-sends the report on every
+  // pass; the manager writes only a payload that changed, and a changed
+  // `devices` report re-checks jobs waiting for capacity.
   string health_checks = 2;
 }
 
@@ -14491,6 +14506,12 @@ message TaskAllocation {
   // limits, since a guest that ignores the reservation the scheduler made on
   // its behalf can overcommit the node. Runtimes that run host processes
   // (`exec`) ignore it; enforcement there needs cgroups/jobobjects.
+  //
+  // One exception to "as declared": `devices` is this allocation's copy, so
+  // each request carries the instances the store assigned it
+  // (`devices[i].assigned = { device, plugin, ids }`, docs/devices.md). The
+  // worker allocates exactly those through the device plugin before the
+  // task starts, and fails the allocation when a request has no assignment.
   //
   // Empty string when the task declares no resources.
   string task_resources = 16;
@@ -18339,10 +18360,14 @@ message NamespacePolicy {
 
   // The whole object as normalized JSON, exactly as `legion namespace
   // policy apply -f` reads it: `name`, `description`, `namespaces`,
-  // `quota` (band -> `{ cpu (MHz), memory (MiB), cores }`), `maxJobs`,
-  // `maxNamespaces`, `pools { allowed, default }`, `runtimes`,
-  // `hostVolumes`. An unset allowlist allows everything; an empty one
-  // allows nothing. Memory written as a size (`"128Gi"`) is stored as MiB.
+  // `quota` (band -> `{ cpu (MHz), memory (MiB), cores, devices }`, where
+  // `devices` maps a device name such as `nvidia/gpu` to a count, see
+  // docs/devices.md "Quota"), `maxJobs`, `maxNamespaces`, `pools { allowed,
+  // default }`, `runtimes`, `hostVolumes`, `jobRules` (CEL rules every job
+  // in the governed namespaces must satisfy at `RunJob` and `PlanJob`: `[{
+  // rule, message }]`, see docs/namespaces.md "Job rules"). An unset
+  // allowlist allows everything; an empty one allows nothing. Memory
+  // written as a size (`"128Gi"`) is stored as MiB.
   string object_json = 3;
 
   // Free-form description from the object.

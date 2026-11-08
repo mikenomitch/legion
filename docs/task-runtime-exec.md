@@ -171,6 +171,7 @@ verified on macOS hardware).
 | Exit reporting / restart policy | ✅ (see [Task Supervision](task-supervision.md)) |
 | Artifacts | ✅ (File/Tree + interpolation + env) |
 | Exec / interactive PTY | ✅ / ✅, host-level (see [docs/exec-and-actions.md](exec-and-actions.md)) |
+| Devices (`resources.devices`) | ✅ env only: `LEGION_DEVICE_<NAME>_IDS` and the device plugin's env (`CUDA_VISIBLE_DEVICES`). No device cgroup: the process can open any device node, and the ids say which to use (see [docs/devices.md](devices.md)) |
 
 Exec runs a sibling host process with the task's env and working directory.
 Because that is a process on the host (even under landlock), it carries the
