@@ -161,8 +161,9 @@ struct UpstreamShared {
     /// shared as an `Arc` so the accept path never copies the list.
     endpoints: Arc<Mutex<Arc<Vec<Endpoint>>>>,
     /// Live connection count per endpoint address, for load-aware strategies.
-    /// Entries are removed at zero so the map stays bounded by live endpoints.
-    inflight: Arc<Mutex<HashMap<String, usize>>>,
+    /// Pruned to the endpoint list when it changes
+    /// (`balance::prune_inflight`).
+    inflight: Arc<Mutex<crate::worker::balance::InflightCounts>>,
     /// Parsed external destination, when this upstream has one.
     target: Option<UpstreamTarget>,
     /// Policy, denial ledger, and TLS shared by every listener.
@@ -1831,7 +1832,7 @@ impl UpstreamShared {
     }
 
     fn inflight(&self) -> HashMap<String, usize> {
-        lock(&self.inflight).clone()
+        crate::worker::balance::inflight_snapshot(&lock(&self.inflight))
     }
 }
 
@@ -2050,7 +2051,8 @@ impl UpstreamForwarder {
             endpoints = endpoints.len(),
             "Updated upstream endpoints"
         );
-        *lock(&shared.endpoints) = Arc::new(endpoints);
+        crate::worker::balance::prune_inflight(&shared.inflight, &endpoints);
+        *held = endpoints;
     }
 
     /// The upstreams whose listener is currently bound. Diagnostics: an
@@ -2834,31 +2836,13 @@ where
 
 /// Keeps one endpoint's in-flight count accurate for the lifetime of a
 /// connection attempt, however it ends (dial error, timeout, copy error, or a
-/// clean close).
-struct InflightGuard {
-    shared: Arc<UpstreamShared>,
-    addr: String,
-}
+/// clean close). Holds the count itself, not the address, so a connection
+/// allocates nothing for it (`balance::acquire_inflight`).
+struct InflightGuard;
 
 impl InflightGuard {
-    fn acquire(shared: &Arc<UpstreamShared>, addr: &str) -> Self {
-        *lock(&shared.inflight).entry(addr.to_string()).or_insert(0) += 1;
-        InflightGuard {
-            shared: shared.clone(),
-            addr: addr.to_string(),
-        }
-    }
-}
-
-impl Drop for InflightGuard {
-    fn drop(&mut self) {
-        let mut inflight = lock(&self.shared.inflight);
-        if let Some(count) = inflight.get_mut(&self.addr) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                inflight.remove(&self.addr);
-            }
-        }
+    fn acquire(shared: &Arc<UpstreamShared>, addr: &str) -> crate::worker::balance::InflightGuard {
+        crate::worker::balance::acquire_inflight(&shared.inflight, addr)
     }
 }
 

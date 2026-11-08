@@ -195,7 +195,7 @@ pub struct HttpSettings {
     pub context: Arc<ForwarderContext>,
     pub balancer: Arc<dyn Balancer>,
     pub endpoints: Arc<Mutex<Arc<Vec<Endpoint>>>>,
-    pub inflight: Arc<Mutex<HashMap<String, usize>>>,
+    pub inflight: Arc<Mutex<crate::worker::balance::InflightCounts>>,
     /// Idle upstream connections, reused across requests.
     pool: Arc<ConnPool>,
     /// Where the allocation's access log lives (`<logs>/<alloc>/net-access.log`).
@@ -246,7 +246,7 @@ impl HttpSettings {
         context: Arc<ForwarderContext>,
         balancer: Arc<dyn Balancer>,
         endpoints: Arc<Mutex<Arc<Vec<Endpoint>>>>,
-        inflight: Arc<Mutex<HashMap<String, usize>>>,
+        inflight: Arc<Mutex<crate::worker::balance::InflightCounts>>,
         log_dir: Option<PathBuf>,
     ) -> Self {
         let timeout = config
@@ -450,38 +450,8 @@ impl HttpSettings {
 
     /// Count one request in flight to `addr` until the guard drops, so
     /// load-aware strategies see HTTP-mode load too.
-    fn in_flight(self: &Arc<Self>, addr: &str) -> InFlight {
-        *self
-            .inflight
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(addr.to_string())
-            .or_insert(0) += 1;
-        InFlight {
-            settings: self.clone(),
-            addr: addr.to_string(),
-        }
-    }
-}
-
-struct InFlight {
-    settings: Arc<HttpSettings>,
-    addr: String,
-}
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        let mut inflight = self
-            .settings
-            .inflight
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if let Some(count) = inflight.get_mut(&self.addr) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                inflight.remove(&self.addr);
-            }
-        }
+    fn in_flight(self: &Arc<Self>, addr: &str) -> crate::worker::balance::InflightGuard {
+        crate::worker::balance::acquire_inflight(&self.inflight, addr)
     }
 }
 
@@ -2171,7 +2141,10 @@ mod tests {
             "one upstream connection"
         );
         // Nothing is left counted as in flight once the replies are back.
-        assert!(settings.inflight.lock().unwrap().is_empty());
+        assert!(
+            crate::worker::balance::inflight_snapshot(&settings.inflight.lock().unwrap())
+                .is_empty()
+        );
     }
 
     /// A pooled connection the upstream has since closed is never handed
