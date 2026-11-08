@@ -951,7 +951,11 @@ How to use it:
         and the obvious suspect is plan-apply conflict
         ([plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md)).
         Measure `legion_plan_apply_total{outcome}` across a paced/burst
-        pair before drawing a conclusion.
+        pair before drawing a conclusion. The 2026-11-07 review (SCH3) named
+        a likelier cause: claims and enqueues did work that grew with queue
+        depth, under the claims mutex and inside the enqueue write. That is
+        fixed ([plan](plans/placement-and-commit-cost-plan.md)); re-measure
+        the paced/burst pair before looking further.
   - [ ] `configs/manager.ncl` pins `evalThreads = 4` explicitly, so it has
         to move with the default.
 - [x] **The eval loop no longer blocks tokio worker threads on quorum
@@ -1982,31 +1986,46 @@ How to use it:
       by regeneration, which runs on raft leadership acquisition. Found while
       fixing audit SC3.
 
-- [ ] **`plan_submission` rows are never deleted** ([review SCH2](architecture-review-2026-11-07.md)).
-      Nothing in `src/` prunes the table, and each row carries every
-      placement's 8 ranked candidates as JSON, through the raft log and every
-      snapshot: ~86M rows a day at 1k plans/s. Delete on apply, keep only
-      rejected or sampled plans, or keep the table out of replicated state.
-- [ ] **Claiming evals gets slower as the queue grows** ([review SCH3](architecture-review-2026-11-07.md)).
-      Every claim runs `COUNT(*)` over pending evals
-      (`eval_claims.rs` → `pending_eval_count_tx`), and the subsume query's
-      `COALESCE(job_id,'')` defeats the `job_id` index, both under the claims
-      mutex. On a schema copy at 50k pending evals: ~140 ms per batch of 16.
-      Likely part of "burst submission costs throughput" above. Store `''`
-      and index, keep the count in memory, or use an in-memory broker.
-- [ ] **`bin_pack` and `spread` score allocation counts, not resources**
-      ([review SCH4](architecture-review-2026-11-07.md)). `assigned_count`, min-max normalized over a possibly
-      truncated candidate list (`scheduler.rs` `cached_load_bounds`,
-      `policy.rs`), so a 32-CPU allocation weighs the same as a 0.1-CPU one.
-      Score the dominant-resource fraction from
-      `NodeScoringState.common_resources` (Nomad BestFit, K8s
-      `MostAllocated`/`BalancedAllocation`), and fix the docs' "fullness".
-- [ ] **The plan apply writes placements as JSON and reads them back**
-      ([review SCH5](architecture-review-2026-11-07.md)): INSERT, SELECT from `plan_submission`, re-parse, plus a
-      node-row SELECT and attribute parse per candidate tried, all inside the
-      serialized commit. Pass the struct through and read nodes from the read
-      model. Add to the suspects of "Make plan-commit cost flat in fleet
-      size" above.
+- [ ] **The plan apply still parses each attempted node row**
+      ([review SCH5](architecture-review-2026-11-07.md), the half that did not ship;
+      [plan](plans/placement-and-commit-cost-plan.md) §6.2, [calls](calls/placement-and-commit-cost-plan_calls.md) #2). The JSON round trip of the plan itself is
+      gone, but every candidate the bind walk tries still costs a node-row
+      SELECT and an attribute-JSON parse (memoized per plan). Borrowing the
+      read model's `Arc<Node>` "guarded by the node epoch" is not sound: the
+      read model is patched after commit, so it can say "available" while
+      the row says "draining" — the window the re-read exists to close.
+      Sound design: hash the row's raw attribute bytes inside the
+      transaction and compare against the read model node's attributes
+      re-serialized into the same keyed hasher; reuse the `Arc<Node>` on a
+      match. Measure serialize+hash against parse at 10k nodes first.
+- [ ] **Gangs ignore spot-interruption notices** ([review AI7](architecture-review-2026-11-07.md);
+      [calls](calls/placement-and-commit-cost-plan_calls.md) #8). A reclaim reaches a gang only as a node loss or drain
+      after the fact, and `onMemberLoss` applies then. Wants an
+      "interruption pending" node condition set from IMDS by the worker or
+      from the ASG lifecycle hook by the `aws-asg` plugin, which restarts
+      the node's gangs ahead of the loss and keeps fresh gangs off it.
+      Needs its own plan (checkpoint story included).
+- [ ] **Multi-level gang topology** ([plan](plans/placement-and-commit-cost-plan.md) §11). `topology` names one
+      attribute; a `preferred` gang that fits no rack spans the fewest racks
+      with no preference for one zone. Kueue-style levels (`keys = ["rack",
+      "zone"]`) when someone asks. Also at most eight domains are tried per
+      plan, so a gang that fits only by preemption may miss the domain where
+      it would have ([calls](calls/placement-and-commit-cost-plan_calls.md) #5).
+- [ ] **`bin_pack` now spreads a task's replicas, and that costs plan
+      throughput** ([plan §12](plans/placement-and-commit-cost-plan.md),
+      [calls #1](calls/placement-and-commit-cost-plan_calls.md)). With
+      utilization scoring, a small task moves a node's score by a few
+      hundredths, so the fixed 0.2-per-allocation automatic anti-affinity
+      penalty outweighs packing and replicas land on different nodes. Plans
+      then touch more nodes and the apply pays per node: 8-15% fewer evals/s
+      in the many-replica SLO scenarios (equal with the penalty at 0).
+      Options: scale the penalty by the task's count like Nomad's job
+      anti-affinity, and/or land the SCH5 node-row item above.
+- [ ] **`legion_eval_queue_depth` lags up to a second on a deep queue**
+      ([calls](calls/placement-and-commit-cost-plan_calls.md) #6). Above `evalThreads × 16` pending, the claim path
+      refreshes it from a full count at most once a second. A `kind` label
+      (already wanted, see diagnosing-scheduler-performance.md) would want
+      the same treatment.
 - [ ] **One capture mutex serializes every lane, and every write runs
       twice** ([review SCH1](architecture-review-2026-11-07.md)). `CAPTURE_MUTEX` (`raft/capture.rs`) and one
       SQLite write connection are shared by all lanes, so `lanes` overlaps
@@ -2030,14 +2049,6 @@ How to use it:
 - [ ] **Usage-aware placement and a descheduler** ([review SCH7](architecture-review-2026-11-07.md)): stated as
       limitations in resource-enforcement.md and preemption-and-eviction.md,
       with no item until now.
-- [ ] **Gang placement ignores topology and spot interruption**
-      ([review AI7](architecture-review-2026-11-07.md)): no rack, NVLink-domain, or network-locality preference,
-      and nothing reacts to interruption notices (core or `aws-asg`).
-      Kueue topology-aware scheduling is the comparison.
-- [ ] **Info-level logs on every plan and claim** ([review SCH8](architecture-review-2026-11-07.md)):
-      `scheduler.rs` "Starting scheduler plan_and_apply" and the applied
-      line, "Claimed evals" in `eval_claims.rs`, and one per submit in
-      `structs/eval.rs`. AGENTS.md wants `debug` for per-iteration logs.
 - [ ] **`NEXT_UP.md` leads with August throughput** ([review SCH9](architecture-review-2026-11-07.md)): 80.35/s
       at 5k from 2026-08-04, against 905/s at 5k and 327/s at 50k in
       [benchmarks.md](../docs/benchmarks.md). For whoever owns the current
@@ -5752,6 +5763,35 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **Placement quality and commit cost** (2026-11-08, [plan](plans/placement-and-commit-cost-plan.md) · [calls](calls/placement-and-commit-cost-plan_calls.md)).
+      Review findings SCH2, SCH3, SCH4, SCH5 (part), SCH8, AI7 (part).
+  - [x] **`plan_submission` is bounded** ([review SCH2](architecture-review-2026-11-07.md)): applied plans
+        write no row, rejected plans keep one, staged rows are deleted by
+        the apply that consumes them, every insert trims an id window of
+        1,000, and the scheduler-lane leader sweeps history and orphaned
+        staged rows on startup and leadership
+        ([docs](../docs/scheduler-and-eval-loop.md#plan-records)).
+  - [x] **Claims cost O(batch), not O(queue)** ([review SCH3](architecture-review-2026-11-07.md)): `IS` instead
+        of `COALESCE` in the duplicate lookup, two partial indexes over
+        pending evals, `+ready_at` planner steering, a count capped at the
+        fair share's saturation, and a rate-limited queue-depth gauge;
+        query plans pinned by a test. 116 ms → under 1 ms per batch of 16
+        at 50k pending ([docs](../docs/scheduler-and-eval-loop.md#eval-queue-semantics)).
+  - [x] **`bin_pack`/`spread` score requested resources against capacity**
+        ([review SCH4](architecture-review-2026-11-07.md)): dominant utilization after placing plus a
+        balanced-allocation tie-break, absolute per node, so truncated
+        candidate lists no longer change a node's score
+        ([docs](../docs/scheduler-and-eval-loop.md#scoring)).
+  - [x] **The apply consumes the plan in memory** ([review SCH5](architecture-review-2026-11-07.md), first
+        half): no JSON serialize, INSERT, SELECT, and re-parse inside the
+        commit. The node-row half is open above.
+  - [x] **Per-plan and per-claim logs at debug** ([review SCH8](architecture-review-2026-11-07.md)), with
+        one info line for a plan slower than a second.
+  - [x] **Topology-aware gang placement** ([review AI7](architecture-review-2026-11-07.md), first half):
+        `gang.topology = { key, mode = "required" | "preferred" }`, whole
+        domains tried best fit first, reported by `job plan` and the
+        blocked-job report ([docs](../docs/gang-scheduling.md#topology)).
+        Spot interruption is open above.
 - [x] **Gang scheduling, Phase 1** (2026-10-17,
       [#48](https://github.com/mikenomitch/legion/pull/48),
       [plan](plans/gang-scheduling-plan.md) as revised ·
