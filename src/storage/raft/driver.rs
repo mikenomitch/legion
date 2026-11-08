@@ -8,15 +8,21 @@
 //! executes replicated store mutations:
 //!
 //! ```text
-//! caller (any thread) ── job ──▶ pipeline thread:
-//!     capture_mutation(store, f)         # savepoint + session, rolled back
-//!     raft.client_write(StoreCommand)    # quorum commit; local apply done
-//!     reply(value)                       # caller unblocks: read-your-writes
+//! caller (any thread) ── job ──▶ pipeline thread (drains every queued job):
+//!     capture_batch(store, ops)          # one savepoint, one per op; rolled
+//!                                        # back, or committed + undo record
+//!                                        # under `single` (speculation)
+//!     raft.client_write(StoreCommand)    # ONE entry for the batch; quorum
+//!                                        # commit; local apply done
+//!     reply(value) to every op           # callers unblock: read-your-writes
 //! ```
 //!
 //! Because the pipeline thread serializes capture → propose → local-apply
 //! per lane, every capture runs against the applied result of the previous
-//! operation — the ordering invariant changeset replication depends on.
+//! entry — the ordering invariant changeset replication depends on. Ops
+//! that queue while an entry is in flight share the next one (group commit,
+//! raft-write-path plan §6.2); under `single` the leader keeps its captured
+//! batch and its state machine skips re-applying it (§6.3, `speculation`).
 //!
 //! # Runtime ownership and shutdown
 //!
@@ -60,15 +66,17 @@ use crate::storage::persistence::{
     PersistenceDriver, PersistenceRole, PersistenceStatus, RaftCommandOutcome, RaftHistoryEvent,
     RaftLaneStatus, RaftStatus,
 };
+use crate::storage::raft::capture::{BatchEnd, BatchItem, CapturedBatch};
 use crate::storage::raft::log_store::RaftLogStore;
 use crate::storage::raft::network::{ChannelPool, RaftTransportNetworkFactory};
+use crate::storage::raft::speculation::SpeculationLedger;
 use crate::storage::raft::state_machine::StoreStateMachine;
 use crate::storage::raft::types::{
     encode_node_addr, fnv1a64, node_addr_host_port, split_node_addr, TypeConfig,
 };
 use crate::storage::raft::{
-    capture, quorum, Lane, RaftJoinHandler, RaftTransportRegistry, ReplicatedOp, ReplicationHandle,
-    StoreCommand, RAFT_CLUSTER_SECRET_METADATA_KEY,
+    capture, quorum, Lane, Proposal, RaftJoinHandler, RaftTransportRegistry, ReplicatedOp,
+    ReplicationHandle, StoreCommand, RAFT_CLUSTER_SECRET_METADATA_KEY,
 };
 use crate::storage::store::Store;
 use crate::structs::{
@@ -651,12 +659,10 @@ impl NotRaftLeader {
 
 /// A replicated mutation queued to a lane's pipeline thread.
 struct PipelineJob {
-    /// The lane the *operation* was classified as (metadata carried in the
-    /// proposed `StoreCommand`; in `single` topology it may differ from the
-    /// group actually carrying it).
-    lane: Lane,
-    op: &'static str,
-    f: ReplicatedOp,
+    /// The op: its body, its name, and the lane it was classified as (in
+    /// `single` topology that may differ from the group carrying it; the
+    /// ownership guard checks the op's own lane).
+    item: BatchItem,
     reply: std_mpsc::Sender<R<Box<dyn Any + Send>>>,
     /// When the submitter enqueued this job, so the pipeline thread can
     /// record how long it queued (`legion_raft_pipeline_wait_seconds`).
@@ -1720,21 +1726,7 @@ impl MultiRaftDriver {
         let Some(metrics) = Self::control_metrics(engine) else {
             return vec!["(control lane not started)".to_string()];
         };
-        let membership = metrics.membership_config.membership().clone();
-        let mut behind: Vec<String> = membership
-            .voter_ids()
-            .filter(|id| {
-                if *id == self.raft_id {
-                    crate::storage::migrations::schema_version() < required
-                } else {
-                    !matches!(engine.pool.schema_version_of(*id), Some(version) if version >= required)
-                }
-            })
-            .map(|id| member_name(&metrics, id))
-            .collect();
-        behind.sort();
-        behind.dedup();
-        behind
+        voters_behind(&metrics, self.raft_id, &engine.pool, required)
     }
 
     /// Test hook for the upgrade gate: forget what `peer` advertised, as if
@@ -1766,6 +1758,89 @@ impl MultiRaftDriver {
 
 /// `0.0.0.0`/`::` binds are not dialable; advertise loopback instead (single
 /// -node dev posture — real deployments set `raft.advertiseAddr`).
+/// The voters of the group `metrics` describes whose advertised schema
+/// version is below `required` — this node by its own build, a peer by what
+/// it last stamped on a transport reply (a peer not heard from yet counts as
+/// behind). Sorted names.
+fn voters_behind(
+    metrics: &RaftMetrics<NodeId, BasicNode>,
+    self_id: NodeId,
+    pool: &ChannelPool,
+    required: u32,
+) -> Vec<String> {
+    let membership = metrics.membership_config.membership().clone();
+    let mut behind: Vec<String> = membership
+        .voter_ids()
+        .filter(|id| {
+            if *id == self_id {
+                crate::storage::migrations::schema_version() < required
+            } else {
+                !matches!(pool.schema_version_of(*id), Some(version) if version >= required)
+            }
+        })
+        .map(|id| member_name(metrics, id))
+        .collect();
+    behind.sort();
+    behind.dedup();
+    behind
+}
+
+/// How often the data-migration task re-checks while steps are pending.
+const DATA_MIGRATION_POLL: Duration = Duration::from_secs(2);
+
+/// Runs pending data steps through the log (raft-write-path plan §6.5): on
+/// every manager, while this replica has steps pending, the control-group
+/// leader proposes `run_data_migrations` once every voter advertises this
+/// build's schema version (so every replica has the columns the steps
+/// write). Followers learn the result by applying the entry; the task ends
+/// once nothing is pending here. `store` must share the replication handle
+/// (a [`Store::forward_executor_clone`]), so the op goes through the real
+/// pipeline.
+async fn data_migration_loop(raft: Raft, raft_id: NodeId, pool: Arc<ChannelPool>, store: Store) {
+    let mut waiting_logged = false;
+    loop {
+        let probe = store.clone();
+        let pending = tokio::task::spawn_blocking(move || probe.data_migrations_pending()).await;
+        match pending {
+            Ok(Ok(0)) => return,
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                debug!(error = %err, "Could not read pending data migrations; retrying");
+            }
+            // The runtime is shutting down.
+            Err(_) => return,
+        }
+        let metrics = raft.metrics().borrow().clone();
+        if metrics.state == ServerState::Leader {
+            let behind = voters_behind(
+                &metrics,
+                raft_id,
+                &pool,
+                crate::storage::migrations::schema_version(),
+            );
+            if behind.is_empty() {
+                let runner = store.clone();
+                match tokio::task::spawn_blocking(move || runner.run_data_migrations()).await {
+                    Ok(Ok(ran)) if !ran.is_empty() => {
+                        info!(steps = ?ran, "Ran data migrations through the raft log");
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) if NotRaftLeader::in_chain(&err) => {}
+                    Ok(Err(err)) => warn!(error = ?err, "Data migrations failed; retrying"),
+                    Err(_) => return,
+                }
+            } else if !waiting_logged {
+                waiting_logged = true;
+                info!(
+                    managers = ?behind,
+                    "Data migrations wait until every voter runs this build's schema"
+                );
+            }
+        }
+        tokio::time::sleep(DATA_MIGRATION_POLL).await;
+    }
+}
+
 fn normalize_advertise_addr(manager_addr: &str) -> String {
     match manager_addr.rsplit_once(':') {
         Some(("0.0.0.0" | "::" | "[::]", port)) => format!("127.0.0.1:{port}"),
@@ -1957,54 +2032,113 @@ fn not_leader_from_metrics(metrics: &RaftMetrics<NodeId, BasicNode>) -> NotRaftL
     }
 }
 
-/// One replicated mutation, executed on the lane's pipeline thread:
-/// capture (rolled back locally) → propose → wait for quorum commit +
-/// local apply (`client_write` resolves only after this node's state
-/// machine applied the entry, so the caller gets read-your-writes).
-#[allow(clippy::too_many_arguments)]
-fn execute_replicated(
-    store: &Store,
-    raft: &Raft,
-    handle: &tokio::runtime::Handle,
-    lane: Lane,
-    op: &'static str,
+/// Most ops one group-commit batch takes (raft-write-path plan §6.2). Ops
+/// queued behind an in-flight entry share the next entry's capture, quorum
+/// round trip, log fsync and apply; the cap keeps one batch's capture (which
+/// holds the capture mutex) short.
+const GROUP_COMMIT_MAX_OPS: usize = 64;
+
+/// Changeset bytes after which a batch takes no more ops. With
+/// [`MAX_PAYLOAD_ENTRIES`] entries per append-entries RPC, 128 KiB entries
+/// keep a worst-case replication batch near the few MiB the 250 ms
+/// append-entries deadline was calibrated for (see the heartbeat notes at the
+/// top of this file). The op that crosses the budget is still included, so
+/// one large op is never split or refused.
+const GROUP_COMMIT_MAX_BYTES: usize = 128 * 1024;
+
+/// The op name of the empty entry a pipeline proposes to resolve a
+/// speculative batch whose proposal outcome it does not know.
+const SPECULATION_FLUSH_OP: &str = "speculation_flush";
+
+/// What a group's pipeline thread works with, built once at engine start.
+struct PipelineContext {
+    /// Detached store clone ([`Store::raft_engine_clone`]).
+    store: Store,
+    raft: Raft,
+    handle: tokio::runtime::Handle,
+    /// The raft group this thread proposes to.
+    group: Lane,
     single_topology: bool,
-    pool: &ChannelPool,
+    pool: Arc<ChannelPool>,
+    /// Set under `single`: commit each batch locally before proposing it, so
+    /// the leader executes every write once (raft-write-path plan §6.3).
+    speculation: Option<Arc<SpeculationLedger>>,
+    /// This node's raft id, the `node` of every `Proposal` it makes.
+    raft_id: NodeId,
+}
+
+/// The typed not-a-leader rejection for `op`, built from the group's current
+/// metrics.
+fn not_leader_rejection(
+    op: &str,
+    lane_label: Option<&str>,
+    metrics: &RaftMetrics<NodeId, BasicNode>,
+) -> anyhow::Error {
+    let context = match lane_label {
+        Some(lane) => format!("raft op {op} must run on the {lane} lane's leader"),
+        None => format!("raft op {op} must run on the leader"),
+    };
+    anyhow::Error::new(NotRaftLeader {
+        lane: lane_label.map(str::to_owned),
+        ..not_leader_from_metrics(metrics)
+    })
+    .context(context)
+}
+
+/// One group-commit batch on the group's pipeline thread (raft-write-path
+/// plan §6.2): check leadership, capture every op in one capture (each
+/// isolated in its own savepoint, with the ownership and mixed-version
+/// guards run per op), propose ONE entry carrying the combined changeset,
+/// wait for quorum commit and the local apply (`client_write` resolves only
+/// after this node's state machine applied the entry, so every caller gets
+/// read-your-writes), and answer every op.
+///
+/// Under `single` the batch is committed locally before the proposal, with
+/// an undo record (speculation, plan §6.3), and the state machine skips
+/// re-applying it when the entry comes back.
+///
+/// Returns one result per executed op (in order) and the ops the byte
+/// budget deferred to the next batch.
+fn execute_batch(
+    ctx: &PipelineContext,
     caught_up_term: &mut Option<u64>,
-    f: ReplicatedOp,
-) -> R<Box<dyn Any + Send>> {
+    items: Vec<BatchItem>,
+) -> (Vec<R<Box<dyn Any + Send>>>, Vec<BatchItem>) {
+    // Under `lanes` the rejection names the group (= the op's lane); under
+    // `single` every lane rides the one group, so no lane is named.
+    let lane_label = (!ctx.single_topology).then(|| ctx.group.wire_name());
+    // Engine metrics label: the raft GROUP the ops commit through
+    // (docs/metrics.md, Raft).
+    let metric_lane = ctx.group.wire_name();
+    let telemetry = crate::manager::telemetry::metrics();
+    let reject_all = |items: Vec<BatchItem>,
+                      outcome: &'static str,
+                      error: &dyn Fn(&'static str) -> anyhow::Error|
+     -> (Vec<R<Box<dyn Any + Send>>>, Vec<BatchItem>) {
+        let results = items
+            .iter()
+            .map(|item| {
+                telemetry
+                    .raft_ops_total
+                    .inc(&[metric_lane, item.op, outcome]);
+                Err(error(item.op))
+            })
+            .collect();
+        (results, Vec::new())
+    };
+
     // Reject non-leader proposals BEFORE opening a capture: `client_write`
     // would reject them anyway (ForwardToLeader), but only after this
     // follower ran a full capture — an open capture savepoint that blocks
-    // (and before the capture/apply mutual exclusion, could destroy) the
-    // committed entries this node is concurrently applying from the leader.
-    // A leadership loss between this check and `client_write` still
+    // the committed entries this node is concurrently applying from the
+    // leader. A leadership loss between this check and `client_write` still
     // surfaces as the same typed error through `map_write_error`.
-    let lane_label = (!single_topology).then(|| lane.wire_name());
-    // Engine metrics label: the raft GROUP the op commits through — under
-    // `single` topology every lane rides the one `control` group, so its
-    // capture/propose latency is that group's (docs/metrics.md, Raft).
-    let metric_lane = if single_topology {
-        Lane::Control.wire_name()
-    } else {
-        lane.wire_name()
-    };
-    let telemetry = crate::manager::telemetry::metrics();
     let term = {
-        let metrics = raft.metrics().borrow().clone();
+        let metrics = ctx.raft.metrics().borrow().clone();
         if metrics.state != ServerState::Leader {
-            telemetry
-                .raft_ops_total
-                .inc(&[metric_lane, op, "not_leader"]);
-            let context = match lane_label {
-                Some(lane) => format!("raft op {op} must run on the {lane} lane's leader"),
-                None => format!("raft op {op} must run on the leader"),
-            };
-            return Err(anyhow::Error::new(NotRaftLeader {
-                lane: lane_label.map(str::to_owned),
-                ..not_leader_from_metrics(&metrics)
-            })
-            .context(context));
+            return reject_all(items, "not_leader", &|op| {
+                not_leader_rejection(op, lane_label, &metrics)
+            });
         }
         metrics.current_term
     };
@@ -2019,102 +2153,223 @@ fn execute_replicated(
     // only after everything before it. Once per term: later captures in the
     // same term are already ordered after it by this pipeline thread.
     if *caught_up_term != Some(term) {
-        if let Err(err) = handle.block_on(raft.ensure_linearizable()) {
+        if let Err(err) = ctx.handle.block_on(ctx.raft.ensure_linearizable()) {
             let not_leader = matches!(
                 err,
                 RaftError::APIError(CheckIsLeaderError::ForwardToLeader(_))
             );
-            telemetry.raft_ops_total.inc(&[
-                metric_lane,
-                op,
-                if not_leader { "not_leader" } else { "error" },
-            ]);
             if not_leader {
-                let context = match lane_label {
-                    Some(lane) => format!("raft op {op} must run on the {lane} lane's leader"),
-                    None => format!("raft op {op} must run on the leader"),
-                };
-                let metrics = raft.metrics().borrow().clone();
-                return Err(anyhow::Error::new(NotRaftLeader {
-                    lane: lane_label.map(str::to_owned),
-                    ..not_leader_from_metrics(&metrics)
-                })
-                .context(context));
+                let metrics = ctx.raft.metrics().borrow().clone();
+                return reject_all(items, "not_leader", &|op| {
+                    not_leader_rejection(op, lane_label, &metrics)
+                });
             }
-            return Err(anyhow!(
-                "raft op {op}: this leader could not confirm its leadership or catch up on \
-                 earlier terms before capturing ({err}); retry shortly"
-            ));
+            let rendered = err.to_string();
+            return reject_all(items, "error", &|op| {
+                anyhow!(
+                    "raft op {op}: this leader could not confirm its leadership or catch up on \
+                     earlier terms before capturing ({rendered}); retry shortly"
+                )
+            });
         }
         *caught_up_term = Some(term);
     }
+
+    // Speculation: never capture on top of a batch whose fate is unknown.
+    // A successful proposal resolves its batch before `client_write`
+    // returns, so the ledger is normally empty here. It is not only after a
+    // failed proposal (a leadership change, which the new term's blank entry
+    // resolves by undoing it — `ensure_linearizable` above waited for that)
+    // or a batch whose proposal never happened. An empty entry flushes both:
+    // anything this leader appended earlier applies first (matching its
+    // batch), and the empty entry then undoes whatever is left.
+    if let Some(ledger) = &ctx.speculation {
+        if !ledger.is_empty(ctx.group) {
+            let flush = StoreCommand {
+                lane: ctx.group,
+                ops: vec![SPECULATION_FLUSH_OP.to_string()],
+                changeset: Vec::new(),
+                proposal: None,
+                schema_version: crate::storage::migrations::schema_version(),
+            };
+            let flushed = ctx.handle.block_on(ctx.raft.client_write(flush));
+            if let Err(err) = flushed {
+                *caught_up_term = None;
+                return reject_all(items, "error", &|op| {
+                    map_write_error(op, lane_label, err.clone())
+                        .context("an earlier write on this lane is still unresolved")
+                });
+            }
+            if !ledger.is_empty(ctx.group) {
+                return reject_all(items, "error", &|op| {
+                    anyhow!(
+                        "raft op {op}: an earlier speculative write on the {} group is still \
+                         unresolved; retry shortly",
+                        ctx.group.wire_name()
+                    )
+                });
+            }
+        }
+    }
+
+    let names: Vec<(Lane, &'static str)> = items.iter().map(|item| (item.lane, item.op)).collect();
+    let speculation = ctx
+        .speculation
+        .as_deref()
+        .map(|ledger| (ledger, ledger.next_seq()));
+    let end = match speculation {
+        Some((ledger, seq)) => BatchEnd::Speculate {
+            ledger,
+            group: ctx.group,
+            seq,
+        },
+        None => BatchEnd::RollBack,
+    };
+    // Per-op guards, run inside the capture on each op's own changeset, so a
+    // violating op rolls back alone:
+    // - the capture-time single-writer ownership guard (plan §7-C2, JC-26):
+    //   every table the changeset touches must be writable by an op on the
+    //   op's lane, in every topology;
+    // - the mixed-version guard (R2): refuse a write that a member on an
+    //   older schema could not apply, instead of letting it skip the rows.
+    let single_topology = ctx.single_topology;
+    let mut check = |lane: Lane, op: &'static str, changeset: &[u8]| -> R<()> {
+        if changeset.is_empty() {
+            return Ok(());
+        }
+        crate::storage::raft::ownership::verify_changeset_ownership(
+            op,
+            lane,
+            single_topology,
+            changeset,
+        )?;
+        check_members_can_apply(&ctx.raft, &ctx.pool, op, changeset)
+    };
     let capture_started = std::time::Instant::now();
-    let captured = capture::capture_mutation(store, lane, f);
+    let captured =
+        capture::capture_batch(&ctx.store, items, GROUP_COMMIT_MAX_BYTES, &mut check, end);
     let capture_elapsed = capture_started.elapsed();
     telemetry
         .raft_capture_seconds
         .observe(&[metric_lane], capture_elapsed.as_secs_f64());
-    let (value, changeset) = match captured {
+    let CapturedBatch {
+        mut results,
+        wrote,
+        changeset,
+        deferred,
+        committed,
+    } = match captured {
         Ok(captured) => captured,
-        Err(error) => {
-            telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
-            return Err(error);
+        Err(err) => {
+            // The capture itself failed (the write connection); the ops are
+            // gone with it, and the pipeline answers each with an error.
+            error!(group = metric_lane, error = ?err, "replicated batch capture failed");
+            for &(_, op) in &names {
+                telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
+            }
+            return (Vec::new(), Vec::new());
         }
     };
+
     if changeset.is_empty() {
-        // The mutation touched no rows (e.g. an idempotent no-op): there is
-        // no effect to replicate and nothing another replica could apply, so
-        // skip the raft entry entirely.
-        telemetry.raft_ops_total.inc(&[metric_lane, op, "empty"]);
-        return Ok(value);
+        // The batch touched no rows (idempotent no-ops, or every op failed):
+        // there is no effect to replicate, so no raft entry.
+        for (&(_, op), result) in names.iter().zip(&results) {
+            let outcome = if result.is_ok() { "empty" } else { "error" };
+            telemetry.raft_ops_total.inc(&[metric_lane, op, outcome]);
+        }
+        return (results, deferred);
     }
-    // Capture-time single-writer ownership guard (plan §7-C2, JC-26): every
-    // table this changeset touches must be writable by an op on this lane.
-    // A violation fails the op HERE — before proposal — in every topology
-    // (phase C-2 flipped `OWNERSHIP_GUARD_ENFORCES`, ending the `single`
-    // topology's warn-only grace window).
-    crate::storage::raft::ownership::verify_changeset_ownership(
-        op,
-        lane,
-        single_topology,
-        &changeset,
-    )?;
-    // Mixed-version guard (R2): refuse a write that a member on an older
-    // schema could not apply, instead of letting it skip the rows silently.
-    if let Err(err) = check_members_can_apply(raft, pool, op, &changeset) {
-        telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
-        return Err(err);
-    }
+
+    let entry_ops: Vec<String> = names
+        .iter()
+        .zip(&wrote)
+        .filter(|(_, wrote)| **wrote)
+        .map(|((_, op), _)| (*op).to_string())
+        .collect();
+    telemetry
+        .raft_entry_ops
+        .observe(&[metric_lane], entry_ops.len() as f64);
+    let proposal = match (committed, speculation) {
+        (true, Some((_, seq))) => {
+            telemetry
+                .raft_speculation_total
+                .inc(&[metric_lane, "committed"]);
+            Some(Proposal {
+                node: ctx.raft_id,
+                seq,
+            })
+        }
+        _ => None,
+    };
     let command = StoreCommand {
-        lane,
-        op: op.to_string(),
+        lane: names.first().map(|(lane, _)| *lane).unwrap_or(ctx.group),
+        ops: entry_ops,
         changeset,
+        proposal,
+        schema_version: crate::storage::migrations::schema_version(),
     };
     let propose_started = std::time::Instant::now();
-    let write_result = handle.block_on(raft.client_write(command));
+    let write_result = ctx.handle.block_on(ctx.raft.client_write(command));
     let propose_elapsed = propose_started.elapsed();
     telemetry
         .raft_propose_apply_seconds
         .observe(&[metric_lane], propose_elapsed.as_secs_f64());
     match write_result {
-        Ok(_) => telemetry.raft_ops_total.inc(&[metric_lane, op, "applied"]),
+        Ok(_) => {
+            for ((&(_, op), result), &wrote) in names.iter().zip(&results).zip(&wrote) {
+                let outcome = match (result.is_ok(), wrote) {
+                    (true, true) => "applied",
+                    (true, false) => "empty",
+                    (false, _) => "error",
+                };
+                telemetry.raft_ops_total.inc(&[metric_lane, op, outcome]);
+            }
+        }
         Err(err) => {
-            telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
-            return Err(map_write_error(op, lane_label, err));
+            // Every op of the batch fails with the proposal: their effects
+            // were one entry (and an op whose own changeset was empty may
+            // have read what the others wrote). Force the next batch to
+            // re-confirm leadership first.
+            *caught_up_term = None;
+            // A speculative batch is undone now rather than whenever another
+            // leader's entry reaches this node: a deposed leader must not
+            // serve rows that may never commit for as long as a partition
+            // lasts. Safe even if the entry commits after all (`speculation::
+            // undo_outstanding`). If the undo itself fails, the batch stays
+            // outstanding and the next apply or the flush resolves it.
+            if let (true, Some(ledger)) = (committed, ctx.speculation.as_deref()) {
+                if let Err(undo) = crate::storage::raft::speculation::undo_outstanding(
+                    &ctx.store, ledger, ctx.group,
+                ) {
+                    error!(
+                        group = metric_lane,
+                        error = ?undo,
+                        "failed undoing a speculative batch after its proposal failed"
+                    );
+                }
+            }
+            for (&(_, op), result) in names.iter().zip(results.iter_mut()) {
+                telemetry.raft_ops_total.inc(&[metric_lane, op, "error"]);
+                if result.is_ok() {
+                    *result = Err(map_write_error(op, lane_label, err.clone()));
+                }
+            }
         }
     }
-    // Per-lane bottleneck trace: one debug line per replicated op with the
-    // phase split (local capture vs propose→quorum→apply), so a slow lane
-    // can be attributed without a profiler. Kept at debug — the histograms
-    // above are the steady-state signal.
+    // Per-lane bottleneck trace: one debug line per entry with the phase
+    // split (local capture vs propose→quorum→apply), so a slow lane can be
+    // attributed without a profiler. Kept at debug — the histograms above
+    // are the steady-state signal.
     debug!(
         lane = metric_lane,
-        op,
+        ops = names.len(),
+        speculative = committed,
         capture_ms = capture_elapsed.as_millis() as u64,
         propose_apply_ms = propose_elapsed.as_millis() as u64,
-        "replicated op committed"
+        "replicated batch committed"
     );
-    Ok(value)
+    (results, deferred)
 }
 
 /// Fail when a raft member that advertises an older schema version than
@@ -2175,51 +2430,43 @@ fn check_members_can_apply(raft: &Raft, pool: &ChannelPool, op: &str, changeset:
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn pipeline_loop(
-    store: Store,
-    raft: Raft,
-    handle: tokio::runtime::Handle,
-    group: Lane,
-    single_topology: bool,
-    pool: Arc<ChannelPool>,
-    jobs: std_mpsc::Receiver<PipelineJob>,
-) {
-    let group_label = group.wire_name();
+/// A group's pipeline thread (JC-3): drains every queued op into a batch
+/// (up to [`GROUP_COMMIT_MAX_OPS`]), runs it through [`execute_batch`], and
+/// answers each caller. Ops the byte budget deferred head the next batch, so
+/// callers are still served in submission order.
+fn pipeline_loop(ctx: PipelineContext, jobs: std_mpsc::Receiver<PipelineJob>) {
+    let group_label = ctx.group.wire_name();
     let telemetry = crate::manager::telemetry::metrics();
     // The last term in which this node's state machine was confirmed caught
-    // up on every earlier term (see `execute_replicated`).
+    // up on every earlier term (see `execute_batch`).
     let mut caught_up_term: Option<u64> = None;
-    while let Ok(job) = jobs.recv() {
-        let PipelineJob {
-            lane,
-            op,
-            f,
-            reply,
-            queued_at,
-        } = job;
-        telemetry.raft_pipeline_depth.add(&[group_label], -1);
-        telemetry
-            .raft_pipeline_wait_seconds
-            .observe(&[group_label], queued_at.elapsed().as_secs_f64());
-        // A panic inside a captured store-method body must not kill the
-        // pipeline thread: `capture_mutation` already rolled the capture
-        // savepoint back before resuming the unwind, so the store is
-        // consistent — convert the panic into an error reply and keep
-        // serving (a dead pipeline thread would silently fail every later
-        // write on this lane).
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            execute_replicated(
-                &store,
-                &raft,
-                &handle,
-                lane,
-                op,
-                single_topology,
-                &pool,
-                &mut caught_up_term,
-                f,
-            )
+    let mut pending: VecDeque<PipelineJob> = VecDeque::new();
+    loop {
+        if pending.is_empty() {
+            match jobs.recv() {
+                Ok(job) => pending.push_back(job),
+                Err(_) => break,
+            }
+        }
+        while pending.len() < GROUP_COMMIT_MAX_OPS {
+            match jobs.try_recv() {
+                Ok(job) => pending.push_back(job),
+                Err(_) => break,
+            }
+        }
+        let take = pending.len().min(GROUP_COMMIT_MAX_OPS);
+        let started = std::time::Instant::now();
+        let mut items = Vec::with_capacity(take);
+        let mut waiting = Vec::with_capacity(take);
+        for job in pending.drain(..take) {
+            items.push(job.item);
+            waiting.push((job.reply, job.queued_at));
+        }
+        // A panic outside the per-op capture (which already turns an op's
+        // panic into that op's error) must not kill the pipeline thread: a
+        // dead pipeline would silently fail every later write on this group.
+        let (results, deferred) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_batch(&ctx, &mut caught_up_term, items)
         }))
         .unwrap_or_else(|panic| {
             let message = panic
@@ -2228,21 +2475,130 @@ fn pipeline_loop(
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "non-string panic payload".to_string());
             error!(
-                op,
+                group = group_label,
                 panic = %message,
-                "replicated store operation panicked; capture was rolled back and the \
-                 pipeline thread continues"
+                "replicated batch panicked outside its ops; the pipeline thread continues"
             );
-            Err(anyhow!("replicated store op {op} panicked: {message}"))
+            (Vec::new(), Vec::new())
         });
-        // A dropped receiver just means the caller went away; the operation
-        // is already committed (or failed) either way.
-        let _ = reply.send(result);
+        let mut waiting = waiting.into_iter();
+        for result in results {
+            let Some((reply, queued_at)) = waiting.next() else {
+                break;
+            };
+            telemetry.raft_pipeline_depth.add(&[group_label], -1);
+            telemetry.raft_pipeline_wait_seconds.observe(
+                &[group_label],
+                started.saturating_duration_since(queued_at).as_secs_f64(),
+            );
+            // A dropped receiver just means the caller went away; the
+            // operation is already committed (or failed) either way.
+            let _ = reply.send(result);
+        }
+        let mut requeue = Vec::with_capacity(deferred.len());
+        for item in deferred {
+            if let Some((reply, queued_at)) = waiting.next() {
+                requeue.push(PipelineJob {
+                    item,
+                    reply,
+                    queued_at,
+                });
+            }
+        }
+        // Ops a failed batch lost (a capture that could not start, a panic
+        // outside the ops): answer them rather than leave callers blocked.
+        for (reply, _) in waiting {
+            telemetry.raft_pipeline_depth.add(&[group_label], -1);
+            let _ = reply.send(Err(anyhow!(
+                "the replicated batch carrying this op failed before the op ran; retry"
+            )));
+        }
+        for job in requeue.into_iter().rev() {
+            pending.push_front(job);
+        }
     }
     debug!(
-        group = group.wire_name(),
+        group = group_label,
         "raft replication pipeline thread exiting"
     );
+}
+
+// ── log retention (raft-write-path plan §6.6) ────────────────────────────
+
+/// How often a group's retention task looks for a new snapshot to purge
+/// behind, and refreshes `legion_raft_log_retained_seconds`.
+const LOG_RETENTION_POLL: Duration = Duration::from_secs(2);
+
+/// Purges a group's log behind each new snapshot down to its newest
+/// `retain_bytes` bytes, and reports how far back the retained log reaches.
+///
+/// openraft's own purge is disabled (`max_in_snapshot_log_to_keep =
+/// u64::MAX`): it only knows an entry count, and Legion's entries range from
+/// hundreds of bytes to megabytes, so a count bounds neither the disk the
+/// tail takes nor how long it lasts. The purge goes through
+/// `trigger().purge_log`, so it passes the state-DB purge barrier like every
+/// other purge, never reaches past the snapshot, and waits for in-flight
+/// replication of the entries it removes. The scan runs on the blocking pool
+/// on its own read-only connection to the log, so appends never wait on it.
+async fn log_retention_loop(lane: Lane, raft: Raft, log: RaftLogStore, retain_bytes: u64) {
+    let telemetry = crate::manager::telemetry::metrics();
+    // The snapshot index this task last purged behind: one scan per new
+    // snapshot, not per poll.
+    let mut handled_snapshot: Option<u64> = None;
+    loop {
+        tokio::time::sleep(LOG_RETENTION_POLL).await;
+        let metrics = raft.metrics().borrow().clone();
+        let snapshot = metrics.snapshot.map(|log_id| log_id.index);
+        let purged = metrics.purged.map(|log_id| log_id.index).unwrap_or(0);
+        let scan_for = snapshot.filter(|index| handled_snapshot != Some(*index));
+        let probe = log.clone();
+        let scanned = tokio::task::spawn_blocking(move || -> R<(Option<i64>, Option<u64>)> {
+            let oldest = probe.oldest_appended_ms()?;
+            let point = match scan_for {
+                Some(_) => probe.retention_purge_point(retain_bytes)?,
+                None => None,
+            };
+            Ok((oldest, point))
+        })
+        .await;
+        let (oldest, point) = match scanned {
+            Ok(Ok(found)) => found,
+            Ok(Err(err)) => {
+                warn!(lane = lane.wire_name(), error = %err, "Raft log retention scan failed");
+                continue;
+            }
+            // The runtime is shutting down.
+            Err(_) => return,
+        };
+        let now_ms = (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        let retained_secs = oldest.map(|ms| (now_ms - ms).max(0) / 1_000).unwrap_or(0);
+        telemetry
+            .raft_log_retained_seconds
+            .set(&[lane.wire_name()], retained_secs);
+        let Some(snapshot_index) = scan_for else {
+            continue;
+        };
+        handled_snapshot = Some(snapshot_index);
+        let Some(point) = point else {
+            continue;
+        };
+        let upto = point.min(snapshot_index);
+        if upto <= purged {
+            continue;
+        }
+        match raft.trigger().purge_log(upto).await {
+            Ok(()) => debug!(
+                lane = lane.wire_name(),
+                upto, snapshot_index, retain_bytes, "Purging raft log behind the retained tail"
+            ),
+            // Fatal: the raft core is gone (shutdown or a storage error it
+            // already reported); nothing left to retain.
+            Err(err) => {
+                debug!(lane = lane.wire_name(), error = %err, "Raft log retention stopping");
+                return;
+            }
+        }
+    }
 }
 
 // ── join client (fresh node with a join token, plan §A4) ─────────────────
@@ -3698,11 +4054,14 @@ impl PersistenceDriver for MultiRaftDriver {
         // openraft's own (weaker) `validate()` below.
         //
         // Snapshots + compaction (plan §A5 / §7-C3): every lane snapshots
-        // after `raft.snapshotEntries` applied entries and purges its log
-        // behind the snapshot, keeping a tail of `snapshot_entries / 2`
-        // (clamped to [1, 1000]) entries so a slightly-behind follower
-        // catches up by cheap log replay instead of a full snapshot install;
-        // anything older is served by the snapshot. The snapshot's SCOPE
+        // after `raft.snapshotEntries` applied entries. How much log stays
+        // behind the snapshot is NOT openraft's entry count any more
+        // (raft-write-path plan §6.6): `max_in_snapshot_log_to_keep` is
+        // `u64::MAX`, which disables openraft's own purge, and
+        // `log_retention_loop` purges behind each new snapshot down to the
+        // newest `raft.logRetainBytes` bytes, so a slightly-behind follower
+        // catches up by cheap log replay instead of a full snapshot install
+        // however large or small the entries are. The snapshot's SCOPE
         // depends on topology: `single` builds whole-DB `VACUUM INTO`
         // images; `lanes` builds table-scoped dumps of each lane's owned
         // tables (sound because single-writer table ownership is enforced at
@@ -3714,7 +4073,7 @@ impl PersistenceDriver for MultiRaftDriver {
         };
         let snapshot_entries = self.cfg.snapshot_entries.max(1);
         let snapshot_policy = SnapshotPolicy::LogsSinceLast(snapshot_entries);
-        let max_in_snapshot_log_to_keep = (snapshot_entries / 2).clamp(1, 1000);
+        let max_in_snapshot_log_to_keep = u64::MAX;
         let raft_config = Arc::new(
             openraft::Config {
                 cluster_name: cluster_id.clone(),
@@ -3758,15 +4117,36 @@ impl PersistenceDriver for MultiRaftDriver {
             .map(|lane| (*lane, Arc::new(std::sync::atomic::AtomicBool::new(false))))
             .collect();
         let quiet_window = quiet_start_window(self.cfg.election_timeout_max_ms);
+        // Speculative leader execution (raft-write-path plan §6.3): `single`
+        // only. Under `lanes` three pipelines share one database, and one
+        // lane's capture could read another lane's in-flight speculative rows
+        // (`speculation` module docs).
+        let speculation: Option<Arc<SpeculationLedger>> =
+            (lanes_list.len() == 1).then(|| Arc::new(SpeculationLedger::new()));
 
         // Raft::new / initialize are async; drive them on the (brand-new)
         // engine runtime from a scoped thread so this works whether
         // start_storage was called from sync or async context.
         let bring_up = async {
             let mut lanes: HashMap<Lane, Raft> = HashMap::new();
+            let mut log_stores: HashMap<Lane, RaftLogStore> = HashMap::new();
             let mut had_any_state = false;
             for lane in lanes_list.iter().copied() {
-                let log_store = RaftLogStore::open(&data_dir, lane)?;
+                // The purge barrier (raft-write-path plan §6.1): the state DB
+                // runs synchronous=NORMAL, so every purge first fsyncs it.
+                let barrier_store = engine_store.clone();
+                let barrier: crate::storage::raft::log_store::PurgeBarrier = Arc::new(move || {
+                    let synced = barrier_store.sync_state_db_to_disk();
+                    crate::manager::telemetry::metrics()
+                        .raft_state_syncs_total
+                        .inc(&[
+                            lane.wire_name(),
+                            if synced.is_ok() { "ok" } else { "error" },
+                        ]);
+                    synced
+                });
+                let log_store = RaftLogStore::open(&data_dir, lane)?.with_purge_barrier(barrier);
+                log_stores.insert(lane, log_store.clone());
                 let mut log_probe = log_store.clone();
                 let had_state = openraft::storage::RaftLogStorage::get_log_state(&mut log_probe)
                     .await
@@ -3774,13 +4154,16 @@ impl PersistenceDriver for MultiRaftDriver {
                     .last_log_id
                     .is_some();
                 had_any_state |= had_state;
-                let state_machine = StoreStateMachine::new(
+                let mut state_machine = StoreStateMachine::new(
                     lane,
                     engine_store.clone(),
                     data_dir.join(lane.wire_name()).join("snapshots"),
                     snapshot_scope,
                 )
                 .with_apply_pause(self.apply_paused.clone());
+                if let Some(ledger) = &speculation {
+                    state_machine = state_machine.with_speculation(ledger.clone(), raft_id);
+                }
                 let network =
                     RaftTransportNetworkFactory::new(lane, cluster_secret.clone(), pool.clone());
                 let raft = Raft::new(
@@ -4011,9 +4394,9 @@ impl PersistenceDriver for MultiRaftDriver {
                 }
                 lanes.insert(lane, raft);
             }
-            Ok::<_, anyhow::Error>((lanes, had_any_state))
+            Ok::<_, anyhow::Error>((lanes, log_stores, had_any_state))
         };
-        let (lanes, had_any_state) = std::thread::scope(|scope| {
+        let (lanes, log_stores, had_any_state) = std::thread::scope(|scope| {
             let handle = handle.clone();
             scope
                 .spawn(move || handle.block_on(bring_up))
@@ -4055,6 +4438,20 @@ impl PersistenceDriver for MultiRaftDriver {
             ));
         }
 
+        // Log retention by bytes (raft-write-path plan §6.6): openraft's own
+        // purge is off (`max_in_snapshot_log_to_keep = u64::MAX`), so every
+        // group purges behind its snapshots here.
+        for (lane, raft) in &lanes {
+            if let Some(log_store) = log_stores.get(lane) {
+                handle.spawn(log_retention_loop(
+                    *lane,
+                    raft.clone(),
+                    log_store.clone(),
+                    self.cfg.log_retain_bytes,
+                ));
+            }
+        }
+
         // Co-located lane leadership (JC-40): under a multi-lane topology,
         // the control-lane leader campaigns for the lanes it does not lead
         // until one node leads all three. Not spawned under `single` (one
@@ -4074,24 +4471,20 @@ impl PersistenceDriver for MultiRaftDriver {
         let mut senders: HashMap<Lane, std_mpsc::Sender<PipelineJob>> = HashMap::new();
         for (lane, raft) in &lanes {
             let (tx, rx) = std_mpsc::channel::<PipelineJob>();
-            let thread_store = store.raft_engine_clone();
-            let thread_raft = raft.clone();
-            let thread_handle = handle.clone();
-            let thread_pool = pool.clone();
             let group = *lane;
+            let ctx = PipelineContext {
+                store: store.raft_engine_clone(),
+                raft: raft.clone(),
+                handle: handle.clone(),
+                group,
+                single_topology,
+                pool: pool.clone(),
+                speculation: speculation.clone(),
+                raft_id: self.raft_id,
+            };
             std::thread::Builder::new()
                 .name(format!("raft-pipeline-{}", group.wire_name()))
-                .spawn(move || {
-                    pipeline_loop(
-                        thread_store,
-                        thread_raft,
-                        thread_handle,
-                        group,
-                        single_topology,
-                        thread_pool,
-                        rx,
-                    )
-                })
+                .spawn(move || pipeline_loop(ctx, rx))
                 .context("failed spawning raft pipeline thread")?;
             senders.insert(group, tx);
         }
@@ -4106,9 +4499,7 @@ impl PersistenceDriver for MultiRaftDriver {
             telemetry.raft_pipeline_depth.add(&[group.wire_name()], 1);
             sender
                 .send(PipelineJob {
-                    lane,
-                    op,
-                    f,
+                    item: BatchItem { lane, op, f },
                     reply: reply_tx,
                     queued_at: std::time::Instant::now(),
                 })
@@ -4131,6 +4522,19 @@ impl PersistenceDriver for MultiRaftDriver {
         // Arm the write_connection bypass guard LAST: from here on every
         // mutation must flow through replicated() or the apply path (JC-14).
         store.set_raft_mode(true);
+
+        // Data steps run through the log (raft-write-path plan §6.5). The
+        // task holds a forward-executor clone: it proposes through the real
+        // pipeline but holds no reference to this driver, so it never keeps
+        // the engine alive (it dies with the engine runtime).
+        if let Some(control) = lanes.get(&Lane::Control) {
+            handle.spawn(data_migration_loop(
+                control.clone(),
+                self.raft_id,
+                pool.clone(),
+                store.forward_executor_clone(),
+            ));
+        }
 
         // A fresh node holding a join token enrolls itself (plan §A4): dial
         // the leader's `RaftTransport.Join` until it admits this node as a

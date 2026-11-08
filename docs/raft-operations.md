@@ -20,9 +20,15 @@ minority of managers loses no committed write.
   entry, every manager (the leader included) applies the same bytes to its
   local state DB. Replicas apply effects rather than re-running code, so
   they cannot diverge.
-- Nothing is visible anywhere, even on the leader, before quorum commit.
-  Callers get their reply only after the local apply, so read-your-writes
-  holds on the leader.
+- Callers get their reply only after quorum commit and the local apply, so
+  read-your-writes holds on the leader, and nothing is visible on a
+  follower before quorum commit. Writes queued behind an in-flight entry
+  are committed together in the next one (group commit). Under the default
+  `single` topology the leader commits a batch locally just before
+  proposing it (so it runs each write once) and reverts it if the entry
+  does not commit, so for that one round trip a direct SQL read on the
+  leader can see it; the scheduler's view, events and the worker stream
+  only ever see committed entries. See docs/multi-raft.md, "The write path".
 - **Any manager accepts any request.** Every manager serves reads from its
   local replica. A write that reaches a follower is forwarded by that
   follower to the leader, and the leader's reply comes back unchanged, so
@@ -77,6 +83,10 @@ The minimal shape:
 - `snapshotEntries`: the number of applied entries between whole-DB
   snapshots (default 10000). The raft log is compacted behind each
   snapshot.
+- `logRetainBytes`: how much raft log (in bytes, per group) is kept behind
+  each snapshot, default 256 MiB. A restarted manager whose position is
+  still in the kept log catches up by replay; one that fell further behind
+  receives a full snapshot. See "Log retention" below.
 
 For the full field-by-field reference (including `clusterSecret`,
 `dataDir`, and `forceNewCluster`), see `docs/multi-raft.md`.
@@ -368,8 +378,25 @@ leader or a follower.
   and pipeline depth. See `docs/metrics.md` for the full list.
 - **Snapshots and compaction:** these are automatic. Legion takes a
   whole-DB snapshot every `raft.snapshotEntries` applied entries and purges
-  the log behind it. Lagging followers and new joiners catch up by snapshot
-  install. There is no manual compaction, and you don't need one.
+  the log behind it down to `raft.logRetainBytes`. Followers within the
+  kept log catch up by replay; anyone further behind, and every new joiner,
+  catches up by snapshot install. There is no manual compaction, and you
+  don't need one.
+- **Log retention:** size `raft.logRetainBytes` by time, not by bytes:
+  `legion_raft_log_retained_seconds{lane}` is the age of the oldest entry
+  still in the log, i.e. how long a manager can be down and still rejoin by
+  replay at the current write rate. If a rolling restart or a planned
+  maintenance window takes longer than that, raise the budget; a follower
+  that falls past it pays a full snapshot install (the whole state copied
+  over the network and swapped in), which is far slower and blocks writes
+  on that follower while it installs. The cost of a larger budget is disk:
+  up to `logRetainBytes` per raft group (three groups under `lanes`).
+- **Durability and fsyncs:** each raft entry costs one fsync, the raft log
+  append. The state DB runs `synchronous=NORMAL` and is fsynced once per
+  log purge instead (the purge barrier; `legion_raft_state_syncs_total`), so
+  a power loss can roll it back to an earlier applied index but never below
+  what the log still holds, and the restart re-applies the difference. A
+  disk that lies about fsync breaks this, as it breaks any raft log.
 - **Backup and restore:** use `legion state backup` (leader-only in raft
   mode) and `legion start manager --restore-from <backup>`. See
   `docs/upgrades.md`.
@@ -419,7 +446,8 @@ conflict. The recovery paths, best first:
    the leader's log is compacted beyond the entry it cannot apply. A
    snapshot happens automatically every `raft.snapshotEntries` applied
    writes. On a quiet cluster, generate write traffic, or temporarily lower
-   `snapshotEntries` on the leader and restart it.
+   `snapshotEntries` and `logRetainBytes` on the leader (the log keeps
+   `logRetainBytes` behind each snapshot, 256 MiB by default) and restart it.
 2. **Rebuild the member.** Remove it (`remove-member`), wipe its
    `raft.dataDir` AND `store.sqlite`, and re-join it with a fresh token. It
    comes back through snapshot install.

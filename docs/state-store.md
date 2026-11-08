@@ -11,10 +11,43 @@ The default file path is `<data dir>/store.sqlite`, where the data dir is
 Startup (`Store::start_storage`):
 
 - opens writable connection
-- runs migrations (`src/storage/migrations.rs`)
+- runs schema migrations (`src/storage/migrations.rs`)
 - creates read-only connection pool
-- enables WAL mode and foreign keys on write connection
+- enables WAL mode (`synchronous = NORMAL`) and foreign keys on write
+  connection
+- undoes any speculative raft batch a crash left behind (raft mode, see
+  [multi-raft.md](multi-raft.md#the-write-path-group-commit-and-single-execution))
 - initializes in-memory scheduling read model cache
+- runs pending data migrations (`local_disk`; under raft, the leader runs
+  them through the log — see "Schema and data migrations" below)
+
+## Schema and data migrations
+
+Migrations come in two kinds, and they run differently.
+
+**Schema steps** (`src/storage/migrations.rs`) create and change tables:
+`CREATE TABLE`/`INDEX`, `ADD COLUMN`, table rebuilds that copy every row
+(`INSERT INTO new SELECT … FROM old`), and constant seed rows. Every manager
+runs them locally at startup. Their result does not depend on when a
+manager runs them, so replicas that migrate at different moments still
+agree. The schema version a manager advertises to its raft peers is the
+number of schema steps it knows.
+
+**Data steps** (`src/storage/data_migrations.rs`) rewrite existing rows: a
+backfill of a new column, a cleanup of rows an old build left. Their
+result does depend on which rows exist when they run, so they never run
+locally on a raft replica. Instead the control-lane leader runs every
+pending data step as **one replicated write**, and records each in the
+replicated `data_migration` table in the same raft entry. Every manager
+applies the same rewritten rows at the same log index, and a step runs
+exactly once cluster-wide. The leader waits until every voter advertises
+its own schema version, so every manager has the columns the step writes.
+Under `local_disk` there is one copy of the data, and pending steps run at
+startup. A brand-new database records every step as done (it has no rows
+to migrate).
+
+A schema step may not contain `UPDATE … SET` or `DELETE FROM`; a unit test
+(`schema_migrations_carry_no_data_steps`) enforces it.
 
 ## Connection Model
 
@@ -214,12 +247,18 @@ durable the writes are:
 - **`streaming`**: Litestream-style WAL shipping to object storage with
   lease-fenced failover. See `docs/persistence-streaming.md`.
 - **`raft`**: quorum-replicated writes. Every mutating store method routes
-  through `Store::replicated()`. Its row-level effects are captured as a
-  SQLite session changeset on the leader (and rolled back locally),
-  committed through openraft, and applied byte-identically on every
-  manager, so replicas cannot diverge. The read-model cache and event
-  stream are built from the committed changeset at apply time. Followers
-  get both without extra work, and nothing is visible before quorum commit.
+  through `Store::replicated()`. Writes queued together are captured as one
+  batch on the leader, each in its own savepoint, and their row-level
+  effects (SQLite session changesets, combined) are committed through
+  openraft as one entry and applied byte-identically on every manager, so
+  replicas cannot diverge. Under the default `single` topology the leader
+  keeps its captured batch (committed locally with an undo record) instead
+  of rolling it back and applying it again; under `lanes` it rolls back and
+  applies on commit. The read-model cache and event stream are built from
+  the committed changeset at apply time. Followers get both without extra
+  work, and the cache and streams never see a write before quorum commit
+  (a direct SQL read on the leader can, for one round trip — see
+  [multi-raft.md](multi-raft.md#the-write-path-group-commit-and-single-execution)).
   The cache update is a delta. The changeset names which allocation rows
   changed, so the cache patches those rows instead of reloading every
   touched node's allocation list. The cost of a commit follows the size of

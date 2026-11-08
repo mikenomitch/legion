@@ -74,6 +74,10 @@ mod forget_ops;
 // Endpoint-index invalidation from committed changesets (mesh-control-path
 // plan §6.1).
 mod endpoint_ops;
+// The replicated write path's store-side half: the purge barrier's fsync,
+// speculative-batch recovery, replicated data migrations
+// (raft-write-path plan).
+mod raft_write_path;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -1408,10 +1412,6 @@ pub struct Store {
     // Replication pipeline handle, installed by the raft engine at start
     // (phase A-1). Until it is set, `replicated()` in raft mode errors.
     replication: Arc<OnceLock<ReplicationHandle>>,
-    // Whether the write connection runs at `synchronous = FULL` (raft mode —
-    // see `configure_connection`); remembered so snapshot install reopens
-    // the connection with the same durability level.
-    durable_sync: bool,
     // Two-sweep observation grace for the status-lane orphan sweeps
     // (adversarial finding F2, 2026-07-28): an orphan is only DELETED after
     // being observed by two consecutive sweeps, so a freshly failed-over
@@ -2111,7 +2111,7 @@ impl Store {
         let keyring = Keyring::from_config(&config.encryption, &config.store_path)?;
         let cluster_ca = crate::manager::cluster_ca::ClusterCa::from_config(&config.cluster_ca)?;
 
-        let write_conn = Store::create_write_conn(&db_path, raft_enabled)?;
+        let write_conn = Store::create_write_conn(&db_path)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
         let read_conns = Store::create_read_pool(&db_path, config.eval_threads)?;
         let checkpoint_conn: MemSafeConn = Arc::new(Mutex::new(Connection::open(&db_path)?));
@@ -2145,7 +2145,6 @@ impl Store {
                 crate::structs::network::sandbox_gated_by_default(),
             )),
             replication: Arc::new(OnceLock::new()),
-            durable_sync: raft_enabled,
             node_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
             allocation_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
             plan_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
@@ -2195,6 +2194,11 @@ impl Store {
         };
         store.liveness.configure(config.liveness.settings());
 
+        // Undo speculative raft batches a crash left behind, before the read
+        // model is built and before the raft engine reads the applied marker
+        // (raft-write-path plan §6.3).
+        crate::storage::raft::speculation::recover(&store)?;
+
         store.refresh_read_model()?;
 
         // Unwrap whatever data keys the (migrated) store already holds, so
@@ -2217,6 +2221,11 @@ impl Store {
         // only when it leads and every voter can apply the new table (the
         // upgrade gate), otherwise the daemon's keyring loop retries.
         store.initialize_keyring_at_start();
+
+        // Data steps (raft-write-path plan §6.5): a local store runs any
+        // pending ones now; under raft the control-lane leader runs them
+        // through the log once every voter can apply them.
+        store.run_data_migrations_at_start();
 
         Store::spawn_wal_checkpointer(Arc::downgrade(&store.checkpoint_conn));
 
@@ -2587,7 +2596,7 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT name FROM sqlite_master
                  WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-                   AND name NOT IN ('raft_applied', 'raft_cluster',
+                   AND name NOT IN ('raft_applied', 'raft_cluster', 'raft_speculative',
                                     'scheduler_event', 'idempotency_record')
                  ORDER BY name;",
             )?;
@@ -2789,10 +2798,10 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
-    fn create_write_conn(db_path: &Path, durable_sync: bool) -> R<MemSafeConn> {
+    fn create_write_conn(db_path: &Path) -> R<MemSafeConn> {
         let final_path = db_path.to_str().context("Error parsing store path")?;
         let conn = Connection::open(final_path)?;
-        Self::configure_connection(&conn, false, durable_sync)?;
+        Self::configure_connection(&conn, false)?;
         Ok(Arc::new(Mutex::new(conn)))
     }
 
@@ -2800,27 +2809,26 @@ impl Store {
     fn create_readonly_conn(db_path: &Path) -> R<MemSafeConn> {
         let final_path = db_path.to_str().context("Error parsing store path")?;
         let conn = Connection::open_with_flags(final_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        Self::configure_connection(&conn, true, false)?;
+        Self::configure_connection(&conn, true)?;
         conn.pragma_update(None, "query_only", "ON")?;
         Ok(Arc::new(Mutex::new(conn)))
     }
 
-    /// `durable_sync` (raft mode) runs the write connection at
-    /// `synchronous = FULL` instead of `NORMAL`. Raft purges its log behind
-    /// snapshots, so the "state is recoverable from the log" argument that
-    /// justifies NORMAL for local_disk does not hold past the purge horizon:
-    /// after a power loss, an applied marker that regressed below
-    /// `last_purged_log_id` (WAL not yet checkpointed) would make openraft's
-    /// startup reapply fail permanently — a bricked node. FULL makes every
-    /// applied entry fsync before it is acknowledged, so the marker can
-    /// never regress past durable state.
-    fn configure_connection(conn: &Connection, read_only: bool, durable_sync: bool) -> R<()> {
+    /// The write connection runs `synchronous = NORMAL` in every mode: a
+    /// commit is in the WAL but not yet fsynced, so a power loss can roll the
+    /// state DB back to an earlier commit. Raft mode tolerates that because
+    /// the state is recoverable from the log — up to the log's purge
+    /// horizon. Past it, an applied marker that regressed below
+    /// `last_purged_log_id` would make openraft's startup reapply fail for
+    /// good, so the raft log store fsyncs the state DB
+    /// ([`Store::sync_state_db_to_disk`]) before every purge: one fsync per
+    /// purge instead of one per entry (raft-write-path plan §6.1).
+    fn configure_connection(conn: &Connection, read_only: bool) -> R<()> {
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
 
         if !read_only {
             conn.pragma_update(None, "journal_mode", "WAL")?;
-            let synchronous = if durable_sync { "FULL" } else { "NORMAL" };
-            conn.pragma_update(None, "synchronous", synchronous)?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
         }
 
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -2862,6 +2870,8 @@ impl Store {
         let mut conn = self.write_connection()?;
         migrations.to_version(&mut conn, 0)?;
         migrations.to_latest(&mut conn)?;
+        // Empty tables: no data step has anything to migrate.
+        crate::storage::data_migrations::mark_all_done(&conn)?;
         drop(conn);
         self.refresh_read_model()?;
         // The keyring rows went with the tables: reload (now empty) and
@@ -2877,7 +2887,13 @@ impl Store {
         let migrations = get_migrations();
         let mut conn = Self::lock_conn(conn, "migration")?;
         info!("Running migrations");
+        let fresh: i64 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
         migrations.to_latest(&mut conn)?;
+        // A brand-new database has no rows for any data step to migrate:
+        // record them all as done (`storage::data_migrations` module docs).
+        if fresh == 0 {
+            crate::storage::data_migrations::mark_all_done(&conn)?;
+        }
 
         Ok(migrations)
     }
@@ -3236,6 +3252,10 @@ impl Store {
                 .with_context(|| format!("failed running VACUUM INTO {}", dest.display()))?;
             Ok(applied_index)
         })?;
+        // A leader's in-flight speculative batches are committed rows in the
+        // state DB; revert them in the copy so the backup is committed state
+        // only (raft-write-path plan §6.3).
+        crate::storage::raft::speculation::scrub_image(&dest)?;
         let bytes = std::fs::metadata(&dest)
             .with_context(|| format!("backup file {} missing after vacuum", dest.display()))?
             .len();
@@ -3303,6 +3323,10 @@ impl Store {
         let _ = std::fs::remove_file(&staged);
         std::fs::copy(backup, &staged)
             .with_context(|| format!("failed copying backup to {}", staged.display()))?;
+        // A raw copy of a raft leader's state DB (rather than a `state
+        // backup`, which is already scrubbed) can hold in-flight speculative
+        // batches: revert them, so only committed state is restored.
+        crate::storage::raft::speculation::scrub_image(&staged)?;
         {
             let conn = Connection::open(&staged)
                 .with_context(|| format!("failed opening staged restore {}", staged.display()))?;
@@ -3423,7 +3447,7 @@ impl Store {
 
         // Step 3: reopen against the new file.
         let new_write = Connection::open(&*self.db_path)?;
-        Self::configure_connection(&new_write, false, self.durable_sync)?;
+        Self::configure_connection(&new_write, false)?;
         *write_guard = new_write;
         // `data_version` is per connection: the new one starts its own count.
         *self
@@ -3433,7 +3457,7 @@ impl Store {
         for guard in read_guards.iter_mut() {
             let conn =
                 Connection::open_with_flags(&*self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            Self::configure_connection(&conn, true, false)?;
+            Self::configure_connection(&conn, true)?;
             conn.pragma_update(None, "query_only", "ON")?;
             **guard = conn;
         }
@@ -22276,7 +22300,7 @@ mod tests {
         // Read-only connections have to be configured against a database that
         // already exists, so make it with the write path first.
         let writer = Connection::open(&path)?;
-        Store::configure_connection(&writer, false, false)?;
+        Store::configure_connection(&writer, false)?;
         let cached: i64 = writer.query_row("PRAGMA cache_size;", [], |r| r.get(0))?;
         assert_eq!(
             cached, SQLITE_CACHE_SIZE_KIB,
@@ -22284,7 +22308,7 @@ mod tests {
         );
 
         let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        Store::configure_connection(&reader, true, false)?;
+        Store::configure_connection(&reader, true)?;
         let cached: i64 = reader.query_row("PRAGMA cache_size;", [], |r| r.get(0))?;
         assert_eq!(
             cached, SQLITE_CACHE_SIZE_KIB,
@@ -22375,28 +22399,38 @@ mod tests {
         );
     }
 
-    /// Adversarial regression (durability past the purge horizon): in raft
-    /// mode the state DB must run `synchronous = FULL` — raft purges its log
-    /// behind snapshots, so a power loss regressing the applied marker below
-    /// `last_purged_log_id` (possible under NORMAL until a WAL checkpoint)
-    /// would brick the node at startup reapply. local_disk keeps NORMAL.
+    /// Durability past the purge horizon (raft-write-path plan §6.1): the
+    /// state DB runs `synchronous = NORMAL` in every mode — one fsync per
+    /// entry is the raft log's — and the durability the old `FULL` setting
+    /// bought is the purge barrier's job: `sync_state_db_to_disk` must make
+    /// every committed transaction durable on demand. Pinned here for the
+    /// connection level; the barrier-before-purge ordering is pinned in
+    /// `raft::log_store` and end to end in `raft::driver`.
     #[test]
-    fn durable_sync_runs_write_connection_at_synchronous_full() -> R<()> {
+    fn state_db_runs_normal_and_syncs_on_demand() -> R<()> {
         let dir = tempfile::tempdir()?;
 
-        let normal = Connection::open(dir.path().join("normal.sqlite"))?;
-        Store::configure_connection(&normal, false, false)?;
-        let level: i64 = normal.query_row("PRAGMA synchronous;", [], |r| r.get(0))?;
-        assert_eq!(level, 1, "local_disk keeps synchronous=NORMAL");
-
-        let full = Connection::open(dir.path().join("full.sqlite"))?;
-        Store::configure_connection(&full, false, true)?;
-        let level: i64 = full.query_row("PRAGMA synchronous;", [], |r| r.get(0))?;
+        let conn = Connection::open(dir.path().join("state.sqlite"))?;
+        Store::configure_connection(&conn, false)?;
+        let level: i64 = conn.query_row("PRAGMA synchronous;", [], |r| r.get(0))?;
         assert_eq!(
-            level, 2,
-            "raft-mode write connections must run synchronous=FULL so the applied marker \
-             never regresses past the purged log horizon on power loss"
+            level, 1,
+            "the state DB runs synchronous=NORMAL in every mode"
         );
+        drop(conn);
+
+        // The barrier works against a live store with an open WAL: every
+        // file it names exists and fsyncs without error, and it is cheap
+        // enough to call per purge.
+        let store = setup_store()?;
+        store.put_kv("sync/probe", "v", KvValueType::String, None, None)?;
+        assert!(store.state_db_path().with_extension("sqlite-wal").exists());
+        store.sync_state_db_to_disk()?;
+        // A missing WAL (fully checkpointed and removed) is not an error.
+        let bare = tempfile::tempdir()?;
+        let path = bare.path().join("store.sqlite");
+        Connection::open(&path)?.execute_batch("CREATE TABLE t (x);")?;
+        raft_write_path::sync_state_files(&path)?;
         Ok(())
     }
 

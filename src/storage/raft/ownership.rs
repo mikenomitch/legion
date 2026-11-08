@@ -235,6 +235,10 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // A standalone policy's action intent: compare-and-set writes beside
     // the policy they act for.
     ("scaling_action", Owner::Lane(Lane::Control)),
+    // Data steps that have run (raft-write-path plan §6.5): written only by
+    // `run_data_migrations`, a control-lane op, in the same entry as the
+    // rows the step rewrote (every data step touches control tables only).
+    ("data_migration", Owner::Lane(Lane::Control)),
     // ── scheduler lane: placement + rollout progression ──────────────────
     ("allocation", Owner::Lane(Lane::Scheduler)),
     ("allocation_epoch", Owner::Lane(Lane::Scheduler)),
@@ -371,6 +375,10 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // ── raft-internal bookkeeping ────────────────────────────────────────
     ("raft_applied", Owner::Internal),
     ("raft_cluster", Owner::Internal),
+    // Undo records of the leader's speculatively committed batches
+    // (raft-write-path plan §6.3, `raft::speculation`): this node's own
+    // bookkeeping, written outside every changeset session.
+    ("raft_speculative", Owner::Internal),
 ];
 
 /// Tables classified above that do not exist in the schema YET. Tolerated by

@@ -2071,12 +2071,24 @@ pub struct RaftPersistenceConfig {
     pub expected_voters: Option<u32>,
     /// Log entries between snapshots (compaction threshold, default 10000,
     /// applied PER RAFT GROUP). A snapshot is built every this-many applied
-    /// entries and the raft log is purged behind it (a tail of
-    /// `snapshotEntries / 2`, capped at 1000, is kept for cheap follower
-    /// catch-up). `single` topology builds whole-DB `VACUUM INTO` images;
-    /// `lanes` topology builds per-lane table-scoped dumps with the same
-    /// policy per lane.
+    /// entries; how much log is kept behind it is `logRetainBytes`.
+    /// `single` topology builds whole-DB `VACUUM INTO` images; `lanes`
+    /// topology builds per-lane table-scoped dumps with the same policy per
+    /// lane.
     pub snapshot_entries: Option<u64>,
+    /// Bytes of raft log each group keeps behind its latest snapshot,
+    /// default [`DEF_RAFT_LOG_RETAIN_BYTES`] (256 MiB). After every snapshot
+    /// the log is purged down to its newest entries totalling at most this
+    /// many bytes; entries no snapshot covers yet are never purged. A
+    /// follower whose log position is still inside the retained log catches
+    /// up by replay; one that fell further behind receives a full snapshot,
+    /// which is far more expensive (it copies the whole state). So this is
+    /// the knob for "how long can a manager be down and rejoin cheaply":
+    /// `legion_raft_log_retained_seconds` reports the window it buys at the
+    /// current write rate. Bytes rather than entries because entries range
+    /// from hundreds of bytes to megabytes; the budget bounds disk use per
+    /// group whatever the workload. `0` keeps nothing behind the snapshot.
+    pub log_retain_bytes: Option<u64>,
     /// Explicit override for re-stamping a state DB onto a NEW raft cluster
     /// identity. The state DB is stamped with its cluster id at first engine
     /// start; a later start whose derived cluster id differs (e.g. the raft
@@ -2171,6 +2183,7 @@ impl Default for RaftPersistenceConfig {
             join_token: None,
             expected_voters: None,
             snapshot_entries: None,
+            log_retain_bytes: None,
             force_new_cluster: Some(false),
             heartbeat_interval_ms: None,
             election_timeout_min_ms: None,
@@ -2184,6 +2197,11 @@ pub const DEF_RAFT_TOPOLOGY: &str = "single";
 /// Default snapshot/compaction threshold: applied log entries between
 /// whole-DB snapshots in `single` topology (plan §A5).
 pub const DEF_RAFT_SNAPSHOT_ENTRIES: u64 = 10_000;
+/// Default bytes of raft log kept behind each snapshot, per group
+/// (`raft.logRetainBytes`, raft-write-path plan §6.6). 256 MiB holds tens of
+/// thousands of typical entries — minutes of history at a heavy write rate —
+/// for a bounded, predictable amount of disk.
+pub const DEF_RAFT_LOG_RETAIN_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default leader heartbeat interval (`raft.heartbeatIntervalMs`).
 ///
@@ -2441,6 +2459,9 @@ pub struct RaftPersistenceConfigFull {
     /// optional in the Full config — unset means "no expectation declared".
     pub expected_voters: Option<u32>,
     pub snapshot_entries: u64,
+    /// Bytes of log kept behind each snapshot, per group. See
+    /// [`RaftPersistenceConfig::log_retain_bytes`].
+    pub log_retain_bytes: u64,
     pub force_new_cluster: bool,
     /// Leader heartbeat interval, ms. See
     /// [`RaftPersistenceConfig::heartbeat_interval_ms`].
@@ -2467,6 +2488,7 @@ impl Default for RaftPersistenceConfigFull {
             join_token: None,
             expected_voters: None,
             snapshot_entries: DEF_RAFT_SNAPSHOT_ENTRIES,
+            log_retain_bytes: DEF_RAFT_LOG_RETAIN_BYTES,
             force_new_cluster: false,
             heartbeat_interval_ms: DEF_RAFT_HEARTBEAT_INTERVAL_MS,
             election_timeout_min_ms: DEF_RAFT_ELECTION_TIMEOUT_MIN_MS,
@@ -2778,6 +2800,7 @@ impl RaftPersistenceConfig {
             join_token: self.join_token.clone(),
             expected_voters: self.expected_voters,
             snapshot_entries: self.snapshot_entries.unwrap_or(DEF_RAFT_SNAPSHOT_ENTRIES),
+            log_retain_bytes: self.log_retain_bytes.unwrap_or(DEF_RAFT_LOG_RETAIN_BYTES),
             force_new_cluster: self.force_new_cluster.unwrap_or(false),
             heartbeat_interval_ms: self
                 .heartbeat_interval_ms
@@ -2882,6 +2905,7 @@ impl From<RaftPersistenceConfigFull> for RaftPersistenceConfig {
             join_token: value.join_token,
             expected_voters: value.expected_voters,
             snapshot_entries: Some(value.snapshot_entries),
+            log_retain_bytes: Some(value.log_retain_bytes),
             force_new_cluster: Some(value.force_new_cluster),
             heartbeat_interval_ms: Some(value.heartbeat_interval_ms),
             election_timeout_min_ms: Some(value.election_timeout_min_ms),
