@@ -4,8 +4,12 @@
 
 Status: **IN EXECUTION** — written 2026-11-08 to close findings AI2, AI3, AI4
 and AI9 of [`architecture-review-2026-11-07.md`](../architecture-review-2026-11-07.md)
-("AI readiness"). What shipped and what was deferred is recorded per phase in
-§8; the deferred list is mirrored in `internal_docs/TODO.md` ("Agent surfaces").
+("AI readiness"). Phases 1–8 shipped together. Deliberately deferred (open in
+`internal_docs/TODO.md`, "Agent surfaces" and "Observability"): journaling
+on a follower that leads no raft lane (needs a raft forward op), an external
+audit sink, inline narrowing for child tokens, multi-party approvals,
+cluster-wide limits and enforcing budgets, MCP HTTP SSE/sessions/auth, and
+the `legion_job_run` wait (owned by the AI5 work).
 
 Public docs: [`docs/audit-journal.md`](../../docs/audit-journal.md),
 [`docs/approvals-and-rate-limits.md`](../../docs/approvals-and-rate-limits.md),
@@ -254,8 +258,9 @@ governance.rateLimit = {
 A token bucket per accessor (or principal for JWT callers) on writes,
 evaluated in `enforce`. Exceeding it returns `RESOURCE_EXHAUSTED` with code
 `RATE_LIMITED`, `retryable: true`, and `details.retryAfterMs`. A token can
-carry its own limit (`legion acl token create --write-rate 5/s`). Limits are
-per manager (in memory); documented.
+carry its own limit (`legion acl token create --child --write-rate 5/s`);
+other tokens are named in `overrides` by accessor. Limits are per manager
+(in memory); documented.
 
 ### 6.5 Token lifetimes and child tokens
 
@@ -322,8 +327,8 @@ policy `budget` checked against these rollups.
 
 - Proto: `ListAuditEvents`, `ListApprovals`, `GetApproval`, `DecideApproval`,
   `CreateChildToken`, `GetCallerCapabilities`, `GetUsage` in one block.
-  `CreateAclTokenRequest` gains `write_rate`; `AclTokenInfo` gains
-  `parent_accessor_id`, `expires_in_seconds`.
+  `AclTokenInfo` gains `parent_accessor_id`. (`CreateAclTokenRequest` was
+  to gain `write_rate`; dropped, see calls #7.)
 - Config: `acl.tokenDefaultTtl`, `acl.childTokenDefaultTtl`,
   `acl.childTokenMaxTtl`; a new `governance` block (`audit`, `approvals`,
   `rateLimit`, `usage`).

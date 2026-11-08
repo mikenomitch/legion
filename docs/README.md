@@ -149,6 +149,14 @@ Plans, roadmaps, to-do lists, and development notes live in
   outside the store, wrapped data keys inside it, rotation, backups, and
   what to do when a key is missing.
 - [Auth & ACLs](auth-and-acls.md): tokens, policies, scopes, and enforcement.
+  Token lifetimes and child tokens for sub-agents.
+- [Audit Journal](audit-journal.md): the durable, replicated record of every
+  write and denial: accessor, principal, on-behalf-of chain, target, request
+  digest, idempotency key, approval, and outcome.
+- [Approvals and Rate Limits](approvals-and-rate-limits.md): human-approval
+  gates for chosen writes, and per-token write rate limits.
+- [Usage Accounting](usage-accounting.md): reserved CPU, memory, cores and
+  custom resources integrated over time per namespace, job, and submitter.
 - [Namespaces](namespaces.md): name and permission scopes for jobs (not an
   isolation boundary), qualified ids, `-n`/`LEGION_NAMESPACE`, delegated
   creation, crossing namespaces in the mesh, and namespace policies (aggregate

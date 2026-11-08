@@ -715,6 +715,23 @@ $ legion namespace policy get payments      # limits, aggregate and per-namespac
 $ legion namespace policy delete payments
 ```
 
+## Usage over time
+
+A namespace's charged usage is what it holds now. What it used over time —
+reserved CPU core-hours, memory GiB-hours, cores, allocation-hours and any
+custom resource, in hourly buckets — is [usage accounting](usage-accounting.md):
+
+```bash
+legion namespace usage team-a --since 7d            # one namespace
+legion namespace usage team-a --by job --since 24h  # per job
+legion usage --namespaces 'team-*' --by submitter   # per submitting token
+```
+
+Rows are shown per namespace the caller can `namespace:read`; per-job and
+per-submitter rows also need `job:read`. It integrates reservations, not
+measured use, and is the basis future namespace budgets will be checked
+against.
+
 ## The UI
 
 - **Detail routes carry the namespace as a path segment**:

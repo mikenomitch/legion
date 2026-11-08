@@ -30,7 +30,8 @@ The features below map onto those needs.
 ## 1. MCP server (`legion mcp serve`)
 
 [MCP](https://modelcontextprotocol.io) is the standard way to expose tools to LLM
-agents. Legion ships its own MCP server, which speaks JSON-RPC 2.0 over stdio.
+agents. Legion ships its own MCP server: MCP **2025-06-18** over stdio, or
+over Streamable HTTP on loopback.
 
 ```bash
 # Read-only tools only (default — safe for exploration):
@@ -38,7 +39,47 @@ legion mcp serve
 
 # Also expose mutating tools (run / stop / destroy):
 legion mcp serve --allow-write
+
+# Streamable HTTP instead of stdio (loopback only): POST http://127.0.0.1:8765/mcp
+legion mcp serve --http 127.0.0.1:8765
 ```
+
+**Protocol.** The server implements 2025-06-18 and negotiates down: a
+client that asks for `2025-03-26` or `2024-11-05` in `initialize` gets that
+version and only what it defines. On 2025-06-18:
+
+- every tool has **annotations** derived from its metadata — `readOnlyHint`
+  (not `mutates`), `destructiveHint` (mutating tools that destroy, delete,
+  stop, revoke, drain, uninstall, restart, …), `idempotentHint` (reads,
+  declarative writes, and any tool taking `idempotency_key`),
+  `openWorldHint` (tools that reach outside the cluster: gitops sync, app
+  install/upgrade) — plus a `title`;
+- every tool declares an **`outputSchema`**, Legion's envelope, and every
+  result carries it as **`structuredContent`**: `{ok: true, data}` or
+  `{ok: false, error: {code, message, hint, retryable, details}}`. The same
+  JSON is also the text content, for older clients;
+- mutating tools take an **`approval_id`** argument for writes an
+  [approval gate](approvals-and-rate-limits.md) held. A client that
+  declares the **`elicitation`** capability gets the gate as a prompt: the
+  server shows its user the pending request and the `legion approval
+  approve` command an approver runs, and retries when the user chooses
+  "Retry now". Without elicitation the tool returns `APPROVAL_REQUIRED` and
+  the agent retries with `approval_id`.
+
+**Streamable HTTP.** `--http ADDR` serves `POST /mcp` with one JSON-RPC
+message per request and answers `application/json` (requests) or `202`
+(notifications). It opens no SSE streams and keeps no sessions (`GET` and
+`DELETE` are `405`), so elicitation is stdio-only. It binds loopback
+addresses only and refuses non-loopback `Origin` headers: the transport has
+no client authentication of its own, and every caller acts with the
+server's Legion token. The `MCP-Protocol-Version` header picks the version
+(default `2025-03-26`, per the spec).
+
+**Coverage.** Every user-facing Manager RPC has a tool, or a recorded reason
+it has none (`Login`, the `WatchScalingPolicies` stream, `GetStateBackup`,
+`RewrapRootKey`, `ResetKeyring`, `GetAppPage`); a unit test parses the
+proto and fails when an RPC has neither
+([`src/cmd/mcp_tools.rs`](../src/cmd/mcp_tools.rs)).
 
 To configure it in an MCP client (for example Claude Desktop or Claude Code), add
 a stdio server with command `legion` and args `["mcp", "serve"]`. The server
@@ -52,7 +93,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 
 | Tool | Mutates | Purpose |
 | --- | --- | --- |
-| `legion_capabilities` | no | List the operation catalog. |
+| `legion_capabilities` | no | List the operation catalog, each entry marked `allowed`, `partial` (with the namespaces), `denied`, `open`, or `local` for this server's token when a manager is reachable (`GetCallerCapabilities`). `static: true` skips the manager. |
 | `legion_job_list` | no | List jobs, optionally only those in one `status`. The reply's `statusCounts` gives per-status totals. `namespaces` selects names or globs (`["*"]` for every namespace this token can read; omitted means `default`), and `elsewhereCount` says how many jobs a narrow selection left out. |
 | `legion_namespace_list` | no | The [namespaces](namespaces.md) this token can see, with job counts. |
 | `legion_namespace_get` | no | One namespace: what it holds, its charged usage, the namespace policies governing it with each limit and aggregate, and (with `acl:read`) the ACL rules that reach it. |
@@ -152,8 +193,25 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_exec_key_delete` | **yes** | Delete a delegated exec key; workers drop it and end its sessions on their next heartbeat. Needs `acl:write`. Supports `idempotency_key`. |
 | `legion_exec_ticket_mint` | **yes** | Mint an exec ticket for [direct exec](exec-and-actions.md#direct-exec): one session, on the worker running the target, with no manager on the data path. Authorized like `legion_exec_run` (or `legion_action_run` for an action ticket); writes nothing to the cluster. Returns the ticket, the worker address, the node name to verify, and the cluster CA. Single use, 60s to redeem by default. |
 
-Tool errors come back in-band (`result.isError = true` with a text payload),
-following MCP convention. Transport and protocol errors use JSON-RPC `error`.
+The one-to-one RPC tools ([`src/cmd/mcp_tools.rs`](../src/cmd/mcp_tools.rs))
+take the request message's fields as snake_case arguments (`proto/legion.proto`
+documents each):
+
+| Area | Tools (mutating in **bold**) |
+| --- | --- |
+| Jobs and rollouts | `legion_job_spec_history`, `legion_job_spec_by_config`, `legion_rollout_get`, `legion_rollout_events`, **`legion_rollout_advance`**, **`legion_rollout_stop`** |
+| KV | `legion_kv_get`, `legion_kv_list`, `legion_kv_lock_get`, **`legion_kv_put`**, **`legion_kv_patch`**, **`legion_kv_delete`**, **`legion_kv_lock_acquire`**, **`legion_kv_lock_renew`**, **`legion_kv_lock_release`** |
+| ACL | `legion_acl_policy_list`, `legion_acl_policy_get`, `legion_acl_token_list`, `legion_acl_user_list`, `legion_acl_auth_methods`, **`legion_acl_policy_upsert`**, **`legion_acl_policy_delete`**, **`legion_acl_token_create`**, **`legion_acl_token_create_child`**, **`legion_acl_token_delete`**, **`legion_acl_user_upsert`**, **`legion_acl_user_delete`**, **`legion_acl_grant_revoke`** |
+| Governance | `legion_audit_list`, `legion_approval_list`, `legion_approval_get`, `legion_usage`, **`legion_approval_decide`** |
+| Apps | `legion_app_ui_extensions`, **`legion_app_install`**, **`legion_app_upgrade`**, **`legion_app_uninstall`**, **`legion_app_set_enabled`**, **`legion_app_update_settings`**, **`legion_app_set_config`**, **`legion_app_invoke_action`** |
+| Events | `legion_events_stream` — a bounded read of the live `StreamEvents` stream: up to `max_events` after `after_id`, waiting at most `timeout_seconds` |
+| Scaling | `legion_scaling_inputs`, `legion_scaling_defaults_get`, **`legion_scaling_defaults_apply`** |
+| Operator | `legion_raft_status`, `legion_raft_history`, `legion_manager_configs`, `legion_observability`, **`legion_raft_command`**, **`legion_raft_join_token`**, **`legion_keyring_rewrap_kv`**, **`legion_node_restart_worker`**, **`legion_node_update_dynamic`** |
+| Networking, state, snapshots, join tokens | `legion_net_policy_get`, `legion_state_saved_query_list`, `legion_join_token_list`, **`legion_net_policy_delete`**, **`legion_net_plugin_delete`**, **`legion_state_saved_query_upsert`**, **`legion_state_saved_query_delete`**, **`legion_snapshot_alias_delete`**, **`legion_join_token_create`**, **`legion_join_token_delete`** |
+
+Tool errors come back in-band (`result.isError = true`, with the error
+envelope as `structuredContent` on 2025-06-18), following MCP convention.
+Transport and protocol errors use JSON-RPC `error`.
 
 The transport sends one JSON message per line. In MCP mode Legion routes all
 console logs to stderr, so stdout carries only the protocol stream. Every
@@ -191,7 +249,7 @@ command lacks the flag (`every_command_accepts_json` in
 
 ```json
 { "ok": true,  "data": <command-specific value> }
-{ "ok": false, "error": { "code": "...", "message": "...", "hint": "...", "retryable": true|false } }
+{ "ok": false, "error": { "code": "...", "message": "...", "hint": "...", "retryable": true|false, "details": { ... } } }
 ```
 
 An agent checks `ok` once and never has to scrape prose. The error `code`
@@ -202,7 +260,13 @@ exec, logs, or restart call. Its hint points at `legion node info <node>`,
 which shows the manager's reachability probe for that node. `OVERLOADED`
 (retryable) comes from `legion sandbox start` when the edge node is shedding
 starts because ratification is behind. Back off before retrying, as
-[edge-boot.md](edge-boot.md#overload) describes.
+[edge-boot.md](edge-boot.md#overload) describes. `APPROVAL_REQUIRED` (not
+retryable as is) means an [approval gate](approvals-and-rate-limits.md) held
+the write: `details.approvalId` names the request; retry the identical call
+with `--approval <id>` once someone else approved it. `APPROVAL_INVALID`
+means the presented approval cannot be used (the message says why).
+`RATE_LIMITED` (retryable) carries `details.retryAfterMs`. `details` appears
+only on typed errors that have them.
 `retryable` tells the agent whether retrying the same request may succeed. It is
 true for `Unavailable`, `DeadlineExceeded`, `Aborted`, and `ResourceExhausted`.
 Commands exit non-zero on failure.
@@ -254,6 +318,43 @@ Returns the catalog of agent-callable operations, each marked with `mutates`
 and `readOnlySafe`. The CLI and the MCP `tools/list` share this one catalog.
 Keep it in sync when you add operations
 ([`src/cmd/capabilities.rs`](../src/cmd/capabilities.rs)).
+
+`--mine` asks the manager what **this token** may do (`GetCallerCapabilities`)
+and marks each entry `allowed` (everywhere), `partial` (in some namespaces or
+targets; `namespaces` lists them for namespaced resources), `denied`, `open`
+(needs no permission), or `local` (no RPC behind it), with the
+`permission` it needs — so an agent plans with what it holds instead of
+learning by failing:
+
+```bash
+legion capabilities --mine --json
+# {"ok":true,"data":{"principal":"ci-agent","capabilities":[
+#   {"name":"job.list","access":"partial","permission":"job:read","namespaces":["team-*"],...},
+#   {"name":"job.destroy","access":"denied","permission":"job:write",...}, ...]}}
+```
+
+## 3a. Governance: credentials, approvals, limits, audit, usage
+
+Agents should run with narrow, expiring credentials, and operators should be
+able to see and bound what they do:
+
+- **Tokens expire by default** (client tokens 30 days, at most 90), and an
+  agent hands a sub-agent a **child token** — a subset of its own policies,
+  expiring no later than it, revoked with it — without `acl:write`:
+  `legion acl token create --child --name sub --policy kv-team --ttl 30m`
+  ([auth-and-acls.md](auth-and-acls.md#child-tokens)).
+- **Approval gates** hold configured writes (`destroy job in prod`, `acl:write`)
+  for a human; the agent gets `APPROVAL_REQUIRED` with an approval id and
+  retries with `--approval` once approved
+  ([approvals-and-rate-limits.md](approvals-and-rate-limits.md)).
+- **Rate limits** per token answer `RATE_LIMITED` with `retryAfterMs`.
+- The **audit journal** records every write and denial with the accessor,
+  principal, on-behalf-of chain, target, request digest, idempotency key,
+  approval and outcome (`legion audit list`, MCP `legion_audit_list`;
+  [audit-journal.md](audit-journal.md)).
+- **Usage accounting** answers "how much did this agent's jobs reserve this
+  week" (`legion usage --by submitter`, MCP `legion_usage`;
+  [usage-accounting.md](usage-accounting.md)).
 
 ## 4. Authoring jobs: schema + validate
 
