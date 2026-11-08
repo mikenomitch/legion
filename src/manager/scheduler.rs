@@ -3227,7 +3227,6 @@ impl<'a> Scheduler<'a> {
                                 }
                             }
                         }
-                        drop(try_on);
                         let result = match accepted {
                             Some(attempt) => attempt,
                             // Preferred never waits for topology: anywhere.

@@ -3621,9 +3621,13 @@ static CONTENT_ADVERTISER: std::sync::LazyLock<
     Mutex<crate::worker::content_report::ContentAdvertiser>,
 > = std::sync::LazyLock::new(|| Mutex::new(Default::default()));
 
-/// The trust bundle (pins) a pending CA-rotation re-issue is for, and when
-/// it is due (`refresh_node_identity`, mesh-control-path plan §6.7).
-static ROTATION_DUE: std::sync::LazyLock<Mutex<Option<(Vec<String>, std::time::Instant)>>> =
+/// A pending CA-rotation re-issue: the trust bundle (pins) it is for, and
+/// when it is due.
+type RotationDue = Option<(Vec<String>, std::time::Instant)>;
+
+/// The pending CA-rotation re-issue, if any (`refresh_node_identity`,
+/// mesh-control-path plan §6.7).
+static ROTATION_DUE: std::sync::LazyLock<Mutex<RotationDue>> =
     std::sync::LazyLock::new(Default::default);
 
 /// Capability a worker that streams its work advertises at registration.

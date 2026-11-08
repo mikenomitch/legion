@@ -376,6 +376,10 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
+/// The per-op ownership guard `capture_batch` runs on each op's changeset:
+/// `(lane, op name, changeset)`, failing the op on a violation.
+pub(crate) type OwnershipCheck<'a> = dyn FnMut(Lane, &'static str, &[u8]) -> R<()> + 'a;
+
 /// Group commit's capture (raft-write-path plan §6.2): run a batch of ops in
 /// ONE capture savepoint, each in its own nested savepoint with its own
 /// session, and combine their changesets into one.
@@ -405,7 +409,7 @@ pub(crate) fn capture_batch(
     store: &Store,
     items: Vec<BatchItem>,
     max_bytes: usize,
-    check: &mut dyn FnMut(Lane, &'static str, &[u8]) -> R<()>,
+    check: &mut OwnershipCheck<'_>,
     end: BatchEnd<'_>,
 ) -> R<CapturedBatch> {
     let _capture_lock = capture_lock();

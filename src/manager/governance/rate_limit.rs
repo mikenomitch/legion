@@ -26,11 +26,15 @@ struct Bucket {
     last: Instant,
 }
 
+/// A token's own write-rate override, `(rate per second, burst)`, cached
+/// with when it was read.
+type CachedTokenLimit = (Instant, Option<(f64, u32)>);
+
 /// The per-manager rate limiter.
 #[derive(Default)]
 pub struct RateLimiter {
     buckets: Mutex<HashMap<String, Bucket>>,
-    token_limits: Mutex<HashMap<String, (Instant, Option<(f64, u32)>)>>,
+    token_limits: Mutex<HashMap<String, CachedTokenLimit>>,
 }
 
 /// Parses a `write_rate` spec: `<n>/s`, `<n>/s,burst=<m>`, `<n>/m`.

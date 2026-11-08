@@ -126,10 +126,13 @@ struct LoadedCheck {
     _lib: Library,
 }
 
+/// A loaded plugin, or why it failed to load.
+type LoadResult = Result<Arc<LoadedCheck>, String>;
+
 /// Plugins by name: loaded on first use, then reused. A load failure is
 /// remembered too, so a missing plugin is reported every pass without being
 /// retried (and re-logged) every pass; a worker restart retries it.
-static LOADED: LazyLock<Mutex<HashMap<String, Result<Arc<LoadedCheck>, String>>>> =
+static LOADED: LazyLock<Mutex<HashMap<String, LoadResult>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn loaded(name: &str) -> Result<Arc<LoadedCheck>, String> {

@@ -423,12 +423,13 @@ pub fn has_unassigned(resources: &Value) -> bool {
         })
 }
 
+/// Device ids an allocation already holds, as `(pool key, ids)` pairs.
+pub type HeldDevices = Vec<(String, Vec<String>)>;
+
 /// What a request's parsed `resources.devices` contributes to the
 /// scheduler's resource math: assigned ids as items under their group's
 /// [`pool_key`], and unassigned requests as demands.
-pub fn parse_for_scheduling(
-    resources: &Value,
-) -> R<(Vec<DeviceDemand>, Vec<(String, Vec<String>)>)> {
+pub fn parse_for_scheduling(resources: &Value) -> R<(Vec<DeviceDemand>, HeldDevices)> {
     let mut demands = Vec::new();
     let mut held = Vec::new();
     for (index, spec) in request_specs(resources)?.into_iter().enumerate() {
