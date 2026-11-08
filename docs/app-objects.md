@@ -2,17 +2,22 @@
 
 An [app](apps.md) can declare **object kinds**: new kinds of thing people
 write to Legion, the way Kubernetes CRDs add resources to its API. The
-`gitops` app declares `Repo`; people apply Repos; gitops watches them,
-deploys what each names, and reports back on each one.
+examples on this page use `deployer`, an example app
+([`configs/apps/example-app.ncl`](../configs/apps/example-app.ncl)) that
+declares `Repo`; people apply Repos; deployer watches them, deploys what
+each names, and reports back on each one. Legion's bundled
+[gitops](gitops.md) app works this way: its `gitops/Repo` kind is a real
+one, and the bundled [autoscaler](#a-worked-example-the-autoscaler) owns
+two more.
 
 ```console
 $ legion object kinds
 KIND         SCOPE       ACCESS                                     STATE   DESCRIPTION
-gitops/Repo  namespaced  object (+ job:write on what spec.jobs names)  active  A git repository gitops deploys jobs from into this namespace.
+deployer/Repo  namespaced  object (+ job:write on what spec.jobs names)  active  A git repository deployer deploys jobs from into this namespace.
 
 $ legion object apply -f repo.ncl --wait
-gitops/Repo team-a/storefront: created (generation 1, spec version 41)
-gitops/Repo team-a/storefront: Ready (Synced: at 3f9a1c2)
+deployer/Repo team-a/storefront: created (generation 1, spec version 41)
+deployer/Repo team-a/storefront: Ready (Synced: at 3f9a1c2)
 
 $ legion object list repos -n team-a
 NAME        STATUS  AGE  BRANCH  COMMIT
@@ -48,7 +53,7 @@ A manifest's `kinds` lists them. The shipped example,
 kinds = [
   {
     name = "Repo",
-    description = "A git repository gitops deploys jobs from into this namespace.",
+    description = "A git repository deployer deploys jobs from into this namespace.",
     scope = "namespaced",
     schema = {
       type = "object",
@@ -83,7 +88,7 @@ kinds = [
 
 | Field | Meaning |
 | --- | --- |
-| `name` | PascalCase and singular: a capital letter, then letters and digits, at most 63. The kind's full name is `<app>/<name>` (`gitops/Repo`). |
+| `name` | PascalCase and singular: a capital letter, then letters and digits, at most 63. The kind's full name is `<app>/<name>` (`deployer/Repo`). |
 | `description` | One line, shown by `legion object kinds` and `explain`. |
 | `scope` | `namespaced` (the default) or `cluster`. A cluster-scoped object has no namespace. |
 | `schema` | JSON Schema (draft 7) for the spec: an object schema, at most 64 KiB, local `$ref`s only. **Closed by default**: a subschema with `properties` and neither `additionalProperties` nor `patternProperties` refuses fields it does not name, so a typo is an error, not a silently ignored field. Set `additionalProperties` to open one. `allOf`, `anyOf`, `oneOf`, `not`, and `if`/`then`/`else` branches are left open. |
@@ -113,10 +118,10 @@ install prompt lists each kind with what writing it takes:
 
 ```text
 Kinds:
-  gitops/Repo            namespaced; written with object:write on gitops/Repo, and job:write on what spec.jobs names; 1 validation rule; checked by the app (advisory); deletes wait up to 10m for the app
+  deployer/Repo            namespaced; written with object:write on deployer/Repo, and job:write on what spec.jobs names; 1 validation rule; checked by the app (advisory); deletes wait up to 10m for the app
 ```
 
-Two apps may both declare `Repo`: they are different kinds, `gitops/Repo`
+Two apps may both declare `Repo`: they are different kinds, `deployer/Repo`
 and `reposync/Repo`.
 
 ## Objects
@@ -126,7 +131,7 @@ An object file holds one object or a list of them
 
 ```nickel
 {
-  kind = "gitops/Repo",           # always qualified: <app>/<Kind>
+  kind = "deployer/Repo",           # always qualified: <app>/<Kind>
   name = "storefront",            # a DNS label: lowercase, digits, '-'; at most 63
   namespace = "team-a",           # namespaced kinds; default -n, then $LEGION_NAMESPACE, then `default`
   labels = { team = "storefront" },
@@ -170,13 +175,13 @@ in the same replicated write that creates an object.
 
 ```console
 $ legion object apply -f repo.ncl --dry-run
-gitops/Repo team-a/storefront: would change (generation 3 → 4); dry run, nothing written
+deployer/Repo team-a/storefront: would change (generation 3 → 4); dry run, nothing written
   spec.branch: "main" → "release"
   spec.deployKey: changed (redacted)
 
 $ legion object apply -f repo.ncl --expected-version 117
-Error: gitops/Repo team-a/storefront is at spec version 118, not 117: it changed since you read it
-Hint: read it again (legion object get gitops/Repo team-a/storefront) and apply on top of it
+Error: deployer/Repo team-a/storefront is at spec version 118, not 117: it changed since you read it
+Hint: read it again (legion object get deployer/Repo team-a/storefront) and apply on top of it
 ```
 
 An apply runs, in order: the kind lookup; `write` on the kind's access
@@ -199,23 +204,23 @@ stored either way; `--wait` only says whether the app has caught up.
 
 ```console
 $ legion object get repo storefront -n team-a
-gitops/Repo team-a/storefront (valid)  Ready (Synced: at 3f9a1c2)
+deployer/Repo team-a/storefront (valid)  Ready (Synced: at 3f9a1c2)
 uid 812  generation 4 (observed 4)  spec version 118
 labels: team=storefront
 created by alice 3d ago; updated by bob 2h ago
 authority (checked against bob): job:write in team-a on storefront (from spec.jobs); job:write in team-a on storefront-worker (from spec.jobs)
 spec:
   { "branch": "release", "deployKey": "<redacted>", ... }
-status (reported by gitops 40s ago):
+status (reported by deployer 40s ago):
   Accepted=true
   Ready=true (Synced): at 3f9a1c2
   fields: {"commit":"3f9a1c2","jobs":2}
 
 $ legion object list -A                # every kind, every namespace you can read
 $ legion object list repos -l team=storefront
-$ legion object explain gitops/Repo
+$ legion object explain deployer/Repo
 $ legion object explain repo.spec.branch
-gitops/Repo.spec.branch: string, default "main"
+deployer/Repo.spec.branch: string, default "main"
   The branch to deploy.
 ```
 
@@ -224,7 +229,7 @@ gitops/Repo.spec.branch: string, default "main"
 has it, and otherwise list the candidates:
 
 ```text
-Error: "repo" names 2 kinds: gitops/Repo, reposync/Repo; name one
+Error: "repo" names 2 kinds: deployer/Repo, reposync/Repo; name one
 ```
 
 An object's name may be written `namespace/name`. `writeOnly` values read
@@ -256,8 +261,8 @@ globs over `<app>/<Kind>`:
 
 ```nickel
 [
-  { resources = ["object"], actions = ["read", "write"], namespaces = ["team-a"], kinds = ["gitops/Repo"] },
-  { resources = ["object"], actions = ["read"], namespaces = ["*"], kinds = ["gitops/*"] },
+  { resources = ["object"], actions = ["read", "write"], namespaces = ["team-a"], kinds = ["deployer/Repo"] },
+  { resources = ["object"], actions = ["read"], namespaces = ["*"], kinds = ["deployer/*"] },
 ]
 ```
 
@@ -312,8 +317,8 @@ A pointer naming a list resolves to one permission per value (at most 64
 per object). The refusal names what is missing:
 
 ```text
-Error: writing gitops/Repo team-a/api needs job:write in team-a on api (from spec.jobs), which your token does not hold
-Hint: the kind requires it of whoever writes its objects (`legion object explain gitops/Repo`); have someone who holds it make the change
+Error: writing deployer/Repo team-a/api needs job:write in team-a on api (from spec.jobs), which your token does not hold
+Hint: the kind requires it of whoever writes its objects (`legion object explain deployer/Repo`); have someone who holds it make the change
 ```
 
 What was checked is stored on the object as its **authority**: the
@@ -440,7 +445,7 @@ allocations, with the writer as the viewer, the way the
 
 ```json
 {
-  "kind": "gitops/Repo", "namespace": "team-a", "name": "storefront",
+  "kind": "deployer/Repo", "namespace": "team-a", "name": "storefront",
   "operation": "update",
   "spec": { "url": "https://github.com/acme/deploy", "deployKey": "..." },
   "effective": { "url": "https://github.com/acme/deploy", "branch": "main", "deployKey": "..." },
@@ -450,11 +455,11 @@ allocations, with the writer as the viewer, the way the
 ```
 
 The app answers `{ "errors": [...], "warnings": [...] }`: errors refuse the
-apply (`the gitops app refused it: ...`), warnings come back with the reply.
+apply (`the deployer app refused it: ...`), warnings come back with the reply.
 
 The call **fails open**: an app that is disabled, unreachable, slower than 2
 seconds, or answers anything but `200` lets the write through with a
-warning (`gitops/Repo team-a/storefront was not checked by the gitops app
+warning (`deployer/Repo team-a/storefront was not checked by the deployer app
 (...)`). It is a convenience, never a control: a writer can make it time
 out. Anything that must refuse a write belongs in the schema, `immutable`,
 `rules`, or `requires`. Apps answer it with `UiRegistry::object_validate`
@@ -513,7 +518,7 @@ The summary's detail is the condition's reason and message.
 
 ```console
 $ legion object delete repo storefront -n team-a
-gitops/Repo team-a/storefront: deleting; the gitops app has until its cleanup deadline (10m) to release it (`--now` skips the cleanup)
+deployer/Repo team-a/storefront: deleting; the deployer app has until its cleanup deadline (10m) to release it (`--now` skips the cleanup)
 $ legion object delete repo storefront -n team-a --wait     # until it is gone
 $ legion object delete repo storefront -n team-a --now      # skip the cleanup
 ```
@@ -614,12 +619,17 @@ context.start_reconciler(
   exponential backoff (1 second, doubling, at most 5 minutes); an `Err` is
   reported as `Ready=false` with reason `ReconcileFailed`.
 - The outcome becomes the `Accepted` and `Ready` conditions and the status
-  `fields` (`ready`, `not_ready`, `rejected`, `accepted`, plus
-  `with_condition`, `because`, `with_fields`, `requeue_after`), written
-  with the generation the handler saw, **only when they differ** from what
-  is stored.
+  `fields` (`ready`, `not_ready`, `rejected`, `accepted`, `progressing`,
+  plus `with_condition`, `because`, `with_fields`, `requeue_after`),
+  written with the generation the handler saw, **only when they differ**
+  from what is stored. `progressing` is `Ready=unknown` with a reason: the
+  object reads `Pending`, which `--wait` keeps waiting through, for work
+  still under way (gitops reports a rollout this way).
 - A **deleting** object goes to the `on_cleanup` handler instead, and is
   released when it returns `Ok`; without a handler it is released at once.
+- `wake(receiver)` reconciles an object at once when its uid arrives on a
+  channel, as a change to it would: for the app's own triggers (gitops's
+  Sync now action). A uid the loop does not hold is ignored.
 - `shards(count, mine)` reconciles a static subset of the objects;
   `shards_from(selection)` follows a subset that moves (a
   `tokio::sync::watch` channel of `ShardSelection`, as lease-based shards
@@ -637,9 +647,9 @@ them.
 ## Acting for an object
 
 `requires` checks a Repo's author when the Repo is written. Without more,
-gitops would then deploy it with its own grant, which has to reach every
+deployer would then deploy it with its own grant, which has to reach every
 namespace any Repo could target: the grant, not the author, would bound
-what gitops does. Acting for the object closes that gap. The app names the
+what deployer does. Acting for the object closes that gap. The app names the
 object it is working on, and the manager holds the call to what that
 object's writer was checked for.
 
@@ -649,12 +659,12 @@ An app's call names one of its objects in `legion-for-object`, beside its
 own credential:
 
 ```text
-legion-for-object: gitops/Repo/team-a/storefront#812@4
+legion-for-object: deployer/Repo/team-a/storefront#812@4
 ```
 
 The value is `<app>/<Kind>/<namespace>/<name>#<uid>@<generation>`; a
 cluster kind's object has an empty namespace
-(`autoscaler/NodeGroup//workers#17@3`). The call runs as **`gitops for Repo
+(`autoscaler/NodeGroup//workers#17@3`). The call runs as **`deployer for Repo
 team-a/storefront`**:
 
 - its allow rules are the object's **recorded authority**, the concrete
@@ -673,13 +683,13 @@ $ legion object get repo storefront -n team-a
 authority (checked against alice): job:write in team-a on storefront (from spec.jobs); job:write in team-a on storefront-worker (from spec.jobs)
 ```
 
-So gitops, acting for `team-a/storefront`, may write `team-a/storefront`
+So deployer, acting for `team-a/storefront`, may write `team-a/storefront`
 and `team-a/storefront-worker` at band `normal`, and nothing else: not
 `team-a/billing`, nothing in `team-b`, not a host-level job, not a read of
 the job (unless the kind requires one), not KV. Anything else is:
 
 ```text
-PermissionDenied: permission denied: job:write is outside what gitops for Repo team-a/storefront holds
+PermissionDenied: permission denied: job:write is outside what deployer for Repo team-a/storefront holds
 Hint: an app acting for an object holds only the permissions the object's writer was checked for (its recorded authority, `legion object get`), within the app's own grant; re-applying the object as someone who holds more records more
 ```
 
@@ -710,22 +720,22 @@ A manifest permission may say `via = "objects"`:
 permissions = [
   { resources = ["job"], actions = ["read"], namespaces = ["team-*"] },
   { resources = ["job"], actions = ["write"], namespaces = ["*"], via = "objects" },
-  { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/gitops/*"] },
+  { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/deployer/*"] },
 ],
 ```
 
 Such a rule is part of the app's grant **only when it acts for one of its
 objects**, where it is intersected with that object's authority. The app's
-own credential cannot use it at all: gitops above writes no job on its
+own credential cannot use it at all: deployer above writes no job on its
 own, anywhere. The install prompt says so:
 
 ```text
-gitops 0.2.0 runs its own code (1 artifact) on your managers, as its own unprivileged user,
+deployer 0.2.0 runs its own code (1 artifact) on your managers, as its own unprivileged user,
 in legion-system, and asks for:
   job       read          namespaces: team-*
   job       write         namespaces: *; only for its objects (bounded by each object's recorded authority)
-  kv        read, write   paths: legion/apps/gitops/*
-  (rules marked "only for its objects" hold only while gitops acts for one of its gitops/Repo objects, and only as far as that object's writer was checked for: gitops writes them only where an object's author could)
+  kv        read, write   paths: legion/apps/deployer/*
+  (rules marked "only for its objects" hold only while deployer acts for one of its deployer/Repo objects, and only as far as that object's writer was checked for: deployer writes them only where an object's author could)
 ```
 
 The installer must hold a `via` rule like any other permission, and
@@ -768,22 +778,22 @@ job asks for one, is recorded in the object-scoped principal's name.
 ```console
 $ legion job status storefront -n team-a
 ...
-managed by gitops for Repo team-a/storefront; gitops will likely write back a version you submit
+managed by deployer for Repo team-a/storefront; deployer will likely write back a version you submit
 ```
 
 `GetJobInfo.managed_by.object` carries the reference
-(`gitops/Repo/team-a/storefront#812`), and `legion job status -j` shows it
+(`deployer/Repo/team-a/storefront#812`), and `legion job status -j` shows it
 as `managedBy.object` with its `label`. A person may still submit over
 such a job, with no `--force`: the namespace's owner can always take a job
 over, as in an incident. The submit replaces the version and its stamp,
 and says who will likely write it back:
 
 ```text
-warning: team-a/storefront was managed by gitops for Repo team-a/storefront; this version replaces it, and gitops will likely write the job back on its next reconcile
+warning: team-a/storefront was managed by deployer for Repo team-a/storefront; this version replaces it, and deployer will likely write the job back on its next reconcile
 ```
 
 Other writes made for an object are not stamped; their audit records and
-events carry the principal (`gitops for Repo team-a/storefront`). An
+events carry the principal (`deployer for Repo team-a/storefront`). An
 object the app writes while acting for another object is `managedBy` the
 app.
 
@@ -937,7 +947,7 @@ objects in one pass converges on retry.
 | You see | Why | What to do |
 | --- | --- | --- |
 | `KIND_NOT_INSTALLED` (retryable) | no installed app declares the kind | install the app, or retry once it is |
-| `kind "Repo" must be qualified with its app: kind = "gitops/Repo"` | files and the API take `<app>/<Kind>` | qualify it |
+| `kind "Repo" must be qualified with its app: kind = "deployer/Repo"` | files and the API take `<app>/<Kind>` | qualify it |
 | `"repo" names 2 kinds` | a short name more than one app declares | name the kind in full |
 | `spec.x: unknown field` | the schema is closed | fix the field; `legion object explain` lists them |
 | `spec.url is immutable` | an update changed an `immutable` pointer | delete and recreate |
@@ -945,14 +955,14 @@ objects in one pass converges on retry.
 | `... (rules[2] could not be evaluated: no such key: max)` | a rule read a field the spec does not have | set the field, or ask the app's author to guard it with `has()` |
 | `... ran past its 10 ms budget, so the write is refused` | a rule is too expensive for this spec (usually nested comprehensions over a large list) | make the list shorter, or ask the app's author for a cheaper rule |
 | `PermissionDenied ... needs job:write ...` | the kind's `requires` | have someone who holds it write the object |
-| `... is managed by the gitops app` | the app wrote it | `--force` to change it anyway |
+| `... is managed by the deployer app` | the app wrote it | `--force` to change it anyway |
 | `... is being deleted` | its cleanup window is running | wait (`delete --wait`), then apply |
 | `ABORTED ... changed since you read it` | `--expected-version` is stale | read it again and re-apply |
 | `RESOURCE_EXHAUSTED ... maxObjects` | the kind is full | delete objects, or raise `maxObjects` in the app |
-| `... was not checked by the gitops app (...)` (warning) | the validate call failed open | nothing: the write went through; check the app |
+| `... was not checked by the deployer app (...)` (warning) | the validate call failed open | nothing: the write went through; check the app |
 | summary `Stale` | the app is disabled or not healthy | `legion app status <app>` |
 | summary `Pending` that stays | the app has not reported on this generation | `legion app logs <app>` |
-| `... is outside what gitops for Repo team-a/x holds` | the app acted for an object beyond its recorded authority (or the app's grant) | re-apply the object as someone who holds what it needs, or widen the kind's `requires` |
+| `... is outside what deployer for Repo team-a/x holds` | the app acted for an object beyond its recorded authority (or the app's grant) | re-apply the object as someone who holds what it needs, or widen the kind's `requires` |
 | `legion-for-object: ... is not an app's` / `acts only for its own objects` | the header came from a person, a management token, or another app | only the owning app's own credential names its objects |
 | `legion-for-object: ... no object has uid N` | the object was deleted (or recreated with a new uid) | act for the current object; the watch carries its uid |
 | `--authority-lapsed` lists an object | its writer lost a right or their token | re-apply it as someone who holds it, or delete it |
@@ -1003,5 +1013,7 @@ objects in one pass converges on retry.
   with a `requires` on `kv:read`.
 - **The status lane may lag the spec**: on a follower, a status can
   briefly describe an older generation; `observedGeneration` says which.
-- **No web UI for objects yet**; the CLI, API, and MCP cover them.
+- **No generic web UI for objects yet**; the CLI, API, and MCP cover them,
+  and an app can draw its own objects in its views (gitops's GitOps page
+  does).
 - **The framework is Rust only.** Other apps use the RPCs directly.

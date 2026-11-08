@@ -1,7 +1,7 @@
 # An object of the example app's `Repo` kind (configs/apps/example-app.ncl;
-# docs/app-objects.md). With gitops installed:
+# docs/app-objects.md). With deployer installed:
 #
-#   legion object explain gitops/Repo          # the kind's fields
+#   legion object explain deployer/Repo          # the kind's fields
 #   legion object apply -f configs/apps/example-repo.ncl --dry-run
 #   legion object apply -f configs/apps/example-repo.ncl --wait
 #   legion object get repo storefront -n team-a
@@ -10,7 +10,7 @@
 # `<app>/<Kind>`, so a file means the same thing on every cluster. `status`
 # is the app's to write, never the file's.
 {
-  kind = "gitops/Repo",
+  kind = "deployer/Repo",
   name = "storefront",
   # Default: -n, then $LEGION_NAMESPACE, then `default`.
   namespace = "team-a",

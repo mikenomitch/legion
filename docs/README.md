@@ -163,6 +163,12 @@ Plans, roadmaps, to-do lists, and development notes live in
   custom resources): the manifest's `kinds`, `legion object`, the `object`
   ACL resource and `requires`, status and the summary, bounded cleanup on
   delete, and the reconcile loop apps use.
+- [GitOps](gitops.md): deploy jobs from git with the bundled gitops app.
+  A Repo (`legion gitops add`) deploys every jobspec in a repository's
+  path into its namespace and keeps it deployed: what a sync does, drift,
+  prune, status, deploying from CI with `legion gitops sync --wait`,
+  private repositories, and why gitops can deploy no more than a Repo's
+  writer could.
 - [Workload Identity (OIDC)](workload-identity.md): short-lived, verifiable task
   identity for external providers.
 - [Exec & Actions](exec-and-actions.md): running commands inside a workload,

@@ -1093,6 +1093,7 @@ fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::
             total_bytes: 512 * 1024 * 1024,
             allocation_id,
             local_suspension: false,
+            local_suspension_reason: String::new(),
             pause_ms: 0,
             manifest_url: String::new(),
         };

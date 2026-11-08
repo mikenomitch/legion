@@ -27,6 +27,7 @@
 
 pub mod autoscaler;
 pub mod autoscaler_ui;
+pub mod gitops;
 pub mod objects;
 pub mod ui;
 
@@ -69,12 +70,20 @@ pub struct BundledApp {
 /// Every bundled app. The first Control leader seeds a record for each
 /// (enabled unless the manager config's `apps` block says otherwise), with
 /// its manifest's permissions granted by `legion:bootstrap`.
-pub const BUNDLED: &[BundledApp] = &[BundledApp {
-    name: "autoscaler",
-    manifest_source: include_str!("bundled/autoscaler.ncl"),
-    body: autoscaler::run,
-    generated: Some(autoscaler::objects::fill_manifest),
-}];
+pub const BUNDLED: &[BundledApp] = &[
+    BundledApp {
+        name: "autoscaler",
+        manifest_source: include_str!("bundled/autoscaler.ncl"),
+        body: autoscaler::run,
+        generated: Some(autoscaler::objects::fill_manifest),
+    },
+    BundledApp {
+        name: "gitops",
+        manifest_source: include_str!("bundled/gitops.ncl"),
+        body: gitops::run,
+        generated: None,
+    },
+];
 
 /// The bundled manifests, evaluated and validated once.
 fn evaluated() -> &'static Result<Vec<AppManifest>, String> {
@@ -680,7 +689,8 @@ mod tests {
         assert_eq!(manifest.placement, crate::structs::app::Placement::Managers);
         assert_eq!(manifest.job["priority"], "critical");
         assert!(is_bundled("autoscaler"));
-        assert!(!is_bundled("gitops"));
+        assert!(is_bundled("gitops"));
+        assert!(!is_bundled("deployer"));
     }
 
     #[test]

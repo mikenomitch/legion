@@ -200,6 +200,32 @@ fn object_list_schema() -> Value {
     })
 }
 
+fn gitops_status_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "One Repo's name (or namespace/name). Omit to list Repos." },
+            "namespace": { "type": "string", "description": "The Repo's namespace (default `default`)." },
+            "namespaces": { "type": "array", "items": { "type": "string" }, "description": "When listing: namespaces or globs; [\"*\"] for every namespace you can read. Default: `default`." }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn gitops_sync_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "The Repo's name (or namespace/name)." },
+            "namespace": { "type": "string", "description": "The Repo's namespace (default `default`)." },
+            "wait": { "type": "boolean", "description": "Also wait until the commit is deployed and every job's rollout has finished (summary Ready); fails when the Repo reads NotReady or Rejected. Default false: return once gitops has synced." },
+            "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 3600, "description": "How long to wait in all (default 300)." }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
 fn object_ref_schema() -> Value {
     json!({
         "type": "object",
@@ -346,6 +372,18 @@ fn tool_defs() -> Vec<ToolDef> {
             name: "legion_object_apply",
             description: "Create or update an object of an installed kind. The manager checks the spec against the kind's closed schema (unknown fields fail with a did-you-mean), its immutable fields and CEL rules (every failing rule named), checks what writing it requires of you (fail-closed), and asks the app's validator (advice only). Run with dry_run first to see the diff. wait returns once the app has reconciled the new generation.",
             input_schema: object_apply_schema,
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_gitops_status",
+            description: "GitOps Repos (docs/gitops.md): with name, one Repo; without, every Repo in the namespaces. Each carries its repository url, ref, path, interval, the manager's summary (Ready; Pending while a rollout runs or before the first sync; NotReady: FetchFailed|RenderFailed|ApplyFailed|RolloutFailed|PruneFailed|Suspended|...; Rejected; Stale when gitops is not running) with its detail, the deployed commit and its subject, the latest commit seen (differs from commit while it cannot be deployed), and jobs: every job the Repo deployed, with its file, state (deployed, progressing, failed, stopped, pending) and detail.",
+            input_schema: gitops_status_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_gitops_sync",
+            description: "Sync a GitOps Repo now: gitops resolves its ref, renders the commit, and deploys what changed (nothing at all if any file fails to render or any job is refused). Sets the Repo's gitops/sync label, so it needs what writing the Repo needs, and records the caller as its authorizer. Returns once gitops has synced; with wait, once the commit is deployed and healthy (fails on NotReady or Rejected). To create a Repo, use legion_object_apply with kind gitops/Repo (legion_object_kinds shows its schema).",
+            input_schema: gitops_sync_schema,
             mutates: true,
         },
         ToolDef {
@@ -1871,6 +1909,8 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .map(decode_object_json)
         }
         "legion_object_apply" => object_apply_tool(args).await,
+        "legion_gitops_status" => gitops_status_tool(args).await,
+        "legion_gitops_sync" => gitops_sync_tool(args).await,
         "legion_object_delete" => {
             let mut client = connect().await?;
             grpc(client.delete_object(crate::structs::DeleteObjectRequest {
@@ -3407,6 +3447,80 @@ where
     }
 }
 
+/// A Repo's namespace and name from `name` (`ns/name`) or `namespace`.
+fn gitops_target(args: &Value) -> Result<(String, String), String> {
+    let name = str_arg(args, "name")?;
+    Ok(match name.split_once('/') {
+        Some((namespace, name)) => (namespace.to_string(), name.to_string()),
+        None => (opt_str_arg(args, "namespace").unwrap_or_default(), name),
+    })
+}
+
+fn status_error(status: &tonic::Status) -> String {
+    let err = CliError::from_status("request failed", status);
+    serde_json::to_string(&err).unwrap_or_else(|_| status.message().to_string())
+}
+
+/// `legion_gitops_status`: one Repo, or every Repo in the namespaces.
+async fn gitops_status_tool(args: Value) -> Result<Value, String> {
+    let mut client = connect().await?;
+    if args.get("name").is_some() {
+        let (namespace, name) = gitops_target(&args)?;
+        let object = crate::cmd::gitops::get_repo(&mut client, &namespace, &name)
+            .await
+            .map_err(|status| status_error(&status))?;
+        return serde_json::to_value(crate::cmd::gitops::RepoReport::of(&object))
+            .map_err(|err| err.to_string());
+    }
+    let namespaces: Vec<String> = args
+        .get("namespaces")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let repos = crate::cmd::gitops::list_repos(&mut client, namespaces)
+        .await
+        .map_err(|status| status_error(&status))?;
+    Ok(json!({ "repos": repos }))
+}
+
+/// `legion_gitops_sync`: request a sync, wait for gitops to handle it, and
+/// (with `wait`) for the commit to deploy, as `legion gitops sync` does.
+async fn gitops_sync_tool(args: Value) -> Result<Value, String> {
+    let (namespace, name) = gitops_target(&args)?;
+    let timeout = std::time::Duration::from_secs(
+        args.get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(300)
+            .clamp(1, 3600),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let mut client = connect().await?;
+    let token = crate::cmd::gitops::request_sync(&mut client, &namespace, &name)
+        .await
+        .map_err(|status| status_error(&status))?;
+    let report =
+        crate::cmd::gitops::wait_handled(&mut client, &namespace, &name, &token, deadline).await?;
+    let report = if args.get("wait").and_then(Value::as_bool).unwrap_or(false) {
+        crate::cmd::gitops::wait_settled(
+            &mut client,
+            &namespace,
+            &name,
+            deadline,
+            crate::cmd::output::OutputFormat::Json,
+        )
+        .await?
+    } else {
+        report
+    };
+    serde_json::to_value(report).map_err(|err| err.to_string())
+}
+
 /// `legion_object_apply`: apply, then (with `wait`) wait for the app to
 /// reconcile the new generation, as `legion object apply --wait` does.
 async fn object_apply_tool(args: Value) -> Result<Value, String> {
@@ -3861,6 +3975,8 @@ mod tests {
         }
         assert!(!read.contains(&"legion_object_apply"));
         assert!(!read.contains(&"legion_object_delete"));
+        assert!(read.contains(&"legion_gitops_status"));
+        assert!(!read.contains(&"legion_gitops_sync"));
         let write: Vec<&str> = available_tools(true).iter().map(|t| t.name).collect();
         assert!(write.contains(&"legion_object_apply"));
         assert!(write.contains(&"legion_object_delete"));

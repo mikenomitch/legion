@@ -34,13 +34,13 @@ $ legion app logs autoscaler -f
 $ legion app config get autoscaler
 $ legion app set autoscaler --placement any
 $ legion app disable autoscaler
-$ legion app install ./gitops.ncl
+$ legion app install ./deployer.ncl
 ```
 
 ## Bundled and installed apps
 
-**Bundled apps** are compiled into the `legion` binary. Today there is one,
-`autoscaler`. The first manager to lead a new cluster's control plane
+**Bundled apps** are compiled into the `legion` binary. Today there are
+two, `autoscaler` and `gitops`. The first manager to lead a new cluster's control plane
 **seeds** a record for each bundled app, enabled, with its manifest's
 permissions granted by `legion:bootstrap`, and the app starts with nothing
 configured. A bundled app runs the node's own binary: its job's command is
@@ -84,6 +84,18 @@ the sidebar, a panel on every autoscaled job's page, a badge on each
 autoscaled task, and a node-group panel on node pages
 ([autoscaling.md, "In the UI"](autoscaling.md#in-the-ui)).
 
+**gitops** ([gitops.md](gitops.md)) deploys the jobspecs in git
+repositories and keeps them deployed. Its manifest declares one [object
+kind](app-objects.md), `gitops/Repo` (a repository URL, a ref, a path, an
+interval; namespaced, governed by `object`, and requiring `job:read` and
+`job:write` on the jobs a Repo may deploy, host-level only with
+`hostLevel`, and `kv:read` on the keys it names). Its grant is all `via =
+"objects"`: its own credential can do nothing, and every call it makes acts
+for a Repo, within what that Repo's writer was checked for. Its config takes
+`allowFileUrls` (default off). Its UI is a GitOps page in the sidebar, a
+panel on every job a Repo deployed, and a Sync now action. `legion gitops
+add|status|sync` is its CLI.
+
 **Installed apps** come from a manifest file or URL (`legion app install`).
 They carry their own `version`, run their own code (an artifact or an image,
 like any job), and can be upgraded and uninstalled.
@@ -113,7 +125,7 @@ A manifest is Nickel or JSON. Unknown fields are errors.
 
 ```nickel
 {
-  name = "gitops",                       # the app, and its job: legion-system/gitops
+  name = "deployer",                       # the app, and its job: legion-system/deployer
   description = "Deploys jobs from git repositories.",
   version = "0.2.0",                     # required for installed apps
   placement = "managers",                # managers (default) | workers | any
@@ -122,15 +134,15 @@ A manifest is Nickel or JSON. Unknown fields are errors.
     task = {
       name = "sync",
       runtime = "exec",
-      artifacts = ["https://example.com/gitops/0.2.0/legion-gitops-linux-amd64.tar.gz"],
-      config = { command = ["./legion-gitops"] },
+      artifacts = ["https://example.com/deployer/0.2.0/legion-deployer-linux-amd64.tar.gz"],
+      config = { command = ["./legion-deployer"] },
       resources = { cpu = 200, memory = 128 },
     },
   },
   permissions = [                        # the grant the app asks for
     { resources = ["job"], actions = ["read", "write"], namespaces = ["team-*"] },
     { resources = ["template"], actions = ["read"] },
-    { resources = ["kv"], actions = ["read"], paths = ["legion/apps/gitops/*"] },
+    { resources = ["kv"], actions = ["read"], paths = ["legion/apps/deployer/*"] },
   ],
   ui = { ... },                          # pages, panels, badges, actions, sandboxed pages (Views and actions)
   extensions = [ ... ],                  # jobspec keys (Jobspec extensions)
@@ -229,15 +241,15 @@ false` on every manager, `managers` placement has nowhere to run, and
 ### Installing
 
 ```console
-$ legion app install https://example.com/gitops/0.2.0/app.ncl
-gitops 0.2.0 runs its own code (1 artifact) on your managers, as its own unprivileged user,
+$ legion app install https://example.com/deployer/0.2.0/app.ncl
+deployer 0.2.0 runs its own code (1 artifact) on your managers, as its own unprivileged user,
 in legion-system, and asks for:
   job       read, write   namespaces: team-*
   template  read
-  kv        read          paths: legion/apps/gitops/*
-UI: a GitOps page, a Sync panel on job pages, one action (Sync now, needs job:write)
+  kv        read          paths: legion/apps/deployer/*
+UI: a Deployer page, a Sync panel on job pages, one action (Sync now, needs job:write)
 Your token holds all of these. Grant them and install? [y/N] y
-installed gitops 0.2.0; job legion-system/gitops starting
+installed deployer 0.2.0; job legion-system/deployer starting
 ```
 
 `install` takes a file (`.ncl` or `.json`) or an `http(s)` URL. A URL is
@@ -258,7 +270,7 @@ job submit checks a job's `permissions`
 record in the installer's name:
 
 ```text
-Error: app gitops 0.2.0 asks for job:write in team-*, which your token does not hold
+Error: app deployer 0.2.0 asks for job:write in team-*, which your token does not hold
 Hint: have someone who holds it do this, or ask for it to be granted to you
 ```
 
@@ -305,7 +317,7 @@ whose source cannot be reached right now is `Unavailable`: retry.
 says so before you approve, because the new app's grant may reach them:
 
 ```text
-1 KV key under legion/apps/gitops/ was left by an earlier install of an app named gitops; this app takes it over (`legion app uninstall --purge` removes an app's keys).
+1 KV key under legion/apps/deployer/ was left by an earlier install of an app named deployer; this app takes it over (`legion app uninstall --purge` removes an app's keys).
 ```
 
 A bundled app's name cannot be installed, and an installed name cannot be
@@ -318,13 +330,13 @@ stopped job an uninstall leaves is still the app's, so reinstalling works.
 ### Upgrading
 
 ```console
-$ legion app upgrade gitops ./gitops-0.3.0.ncl
-gitops 0.3.0 runs its own code (1 artifact) on your managers, as its own unprivileged user, ...
+$ legion app upgrade deployer ./deployer-0.3.0.ncl
+deployer 0.3.0 runs its own code (1 artifact) on your managers, as its own unprivileged user, ...
 Permission changes:
   + net       read
   - template  read
 Approve the new permissions and upgrade? [y/N] y
-upgraded gitops 0.2.0 → 0.3.0
+upgraded deployer 0.2.0 → 0.3.0
 ```
 
 A new manifest is new code running with the grant, so upgrading needs
@@ -350,10 +362,10 @@ they are the operator's, and the manifest's are only where an install
 starts. The prompt says so when they differ:
 
 ```text
-Keeps replicas 1 (this version's default is 3; `legion app set gitops --replicas 3` takes it).
+Keeps replicas 1 (this version's default is 3; `legion app set deployer --replicas 3` takes it).
 ```
 
-**An upgrade that does not take.** `upgraded gitops 0.2.0 → 0.3.0` means the
+**An upgrade that does not take.** `upgraded deployer 0.2.0 → 0.3.0` means the
 record holds the new manifest. Whether the new version runs is the app's
 status ([Status](#status)): `upgrading` while the previous version still
 serves, `degraded: upgrade failing: …` when the new version's rollout failed
@@ -417,8 +429,8 @@ admission too) and say what would change, without changing it.
 ### Uninstalling
 
 ```console
-$ legion app uninstall gitops
-uninstalled gitops; job legion-system/gitops stopped and 3 grant(s) revoked (`legion job destroy legion-system/gitops` removes the job)
+$ legion app uninstall deployer
+uninstalled deployer; job legion-system/deployer stopped and 3 grant(s) revoked (`legion job destroy legion-system/deployer` removes the job)
 ```
 
 Uninstall disables the app, stops its job, revokes the job's grants (its
@@ -438,8 +450,8 @@ replicated entry as the record; it needs `kv:write` on that prefix besides
 told about leftover keys in its prompt, since its grant may reach them.
 
 ```console
-$ legion app uninstall gitops --purge
-uninstalled gitops; job legion-system/gitops stopped and 3 grant(s) revoked (`legion job destroy legion-system/gitops` removes the job); deleted 4 KV key(s) under legion/apps/gitops/
+$ legion app uninstall deployer --purge
+uninstalled deployer; job legion-system/deployer stopped and 3 grant(s) revoked (`legion job destroy legion-system/deployer` removes the job); deleted 4 KV key(s) under legion/apps/deployer/
 ```
 
 **A record that does not decode** (`legion app list` shows it `corrupt`) is
@@ -776,7 +788,7 @@ print in the terminal
 person sees on a panel, an agent can read.
 
 ```console
-$ legion app view gitops job web
+$ legion app view deployer job web
 Sync
 
   Commit: 3f9a1c2   Synced: 2m ago   Drift: none (ok)
@@ -798,8 +810,8 @@ An app declares where its views appear in its manifest's `ui` block:
 ```nickel
 ui = {
   port = "api",                                          # the task port views are served on (default "api")
-  nav  = [{ title = "GitOps", icon = "gitBranch", view = "repos" }],
-  overview = [{ title = "GitOps sync", view = "summary" }],
+  nav  = [{ title = "Deployer", icon = "gitBranch", view = "repos" }],
+  overview = [{ title = "Deployer sync", view = "summary" }],
   job  = [{ title = "Sync", view = "job-sync",
             permission = { resource = "job", action = "read" } }],
   task = [{ badge = "task-source", permission = { resource = "job", action = "read" } }],
@@ -914,7 +926,7 @@ A view is a JSON object:
   is a document over 512 KiB. Growing the block set is a Legion release.
 
 The manager validates every answer before the SPA, the CLI, or MCP sees it,
-so a misbehaving app shows an error naming the problem (`app gitops answered
+so a misbehaving app shows an error naming the problem (`app deployer answered
 view "repos" with something Legion does not render: block 2 (chart): unknown
 variant ...`), never a broken page.
 
@@ -1175,7 +1187,7 @@ asks the viewer before every call that changes something.
 ui = {
   port = "api",
   pages = [
-    { name = "console", title = "GitOps console", icon = "gitBranch",
+    { name = "console", title = "Deployer console", icon = "gitBranch",
       rpcs = ["ListJobs", "GetJobInfo", "RunJob"],
       permission = { resource = "job", action = "read" } },
   ],
@@ -1192,7 +1204,7 @@ ui = {
 | `permission` | `{ resource, action }`: who sees the page, checked as the viewer on any scope, like a `nav` view. Without one, `app:read` on the app suffices. |
 
 An app declares at most 8 pages. The install and upgrade prompts list each
-page with its `rpcs` (`UI: a GitOps console page (sandboxed; calls ListJobs,
+page with its `rpcs` (`UI: a Deployer console page (sandboxed; calls ListJobs,
 GetJobInfo, RunJob as the viewer)`), so whoever installs the app sees what
 its pages may do with a viewer's access.
 
@@ -1232,7 +1244,7 @@ holds:
   An RPC added to Legion later is refused until it is classified.
 
 ```
-error: app gitops: ui.pages[0]: page "console": RPC "CreateAclToken" returns a credential or the cluster's secrets, which a page must never hold
+error: app deployer: ui.pages[0]: page "console": RPC "CreateAclToken" returns a credential or the cluster's secrets, which a page must never hold
 ```
 
 **A page is bounded by its installer.** A page calls its RPCs as whoever
@@ -1312,7 +1324,7 @@ confirmations waiting), or the gRPC status in snake case
 
 ```html
 <!doctype html>
-<title>GitOps console</title>
+<title>Deployer console</title>
 <ul id="jobs"></ul>
 <script>
   legion.call('ListJobs', {}).then((reply) => {
@@ -1326,7 +1338,7 @@ confirmations waiting), or the gRPC status in snake case
 ```
 
 **Every write asks.** The SPA, not the page, draws the confirmation, outside
-the frame, naming the app, the RPC, and its target: `gitops wants to run
+the frame, naming the app, the RPC, and its target: `deployer wants to run
 RunJob on team-a/web as you`, with the request below. The page waits for the
 answer; nothing is sent until the viewer says yes.
 
@@ -1709,8 +1721,8 @@ framework answers that every value passes.
 
 ## Object kinds
 
-An app can also own **kinds of object**: `gitops` declares `Repo`, people
-apply Repos with `legion object apply`, and gitops watches them, deploys
+An app can also own **kinds of object**: `deployer` declares `Repo`, people
+apply Repos with `legion object apply`, and deployer watches them, deploys
 what each names, and reports each one's status. The bundled autoscaler's
 scaling policies and node groups are objects of its kinds
 ([App Objects, "A worked example"](app-objects.md#a-worked-example-the-autoscaler)). A manifest declares them in
@@ -1739,7 +1751,7 @@ permissions = [
 ],
 ```
 
-so gitops writes jobs only where a Repo's author could, and the jobs it
+so deployer writes jobs only where a Repo's author could, and the jobs it
 writes are stamped with the Repo. The framework's reconcile handlers get
 that client by default (`request.client()`, with `request.app_client()`
 for the app's own), and `context.client_for(&object)` makes one anywhere
@@ -1757,7 +1769,7 @@ The app's tasks get, in their environment:
 | `LEGION_ADDR`, `LEGION_SECRETS_DIR`, `LEGION_IDENTITY_TOKEN_FILE` | the allocation's API socket and token, authenticated as the app's `legion` identity, when workload identity is on ([The API socket](workload-identity.md#control-plane-identity)) |
 | `LEGION_ADDR_API`, `LEGION_PORT_API` | the app's `api` port, when its task declares one |
 
-So `legion kv get legion/apps/gitops/state` inside the task just works,
+So `legion kv get legion/apps/deployer/state` inside the task just works,
 with the app's grant and no token handling. To act as a viewer from an
 action, the app's calls add the action's assertion in
 `legion-on-behalf-of` ([Acting as the viewer](#acting-as-the-viewer)); to

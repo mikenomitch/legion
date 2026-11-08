@@ -9,19 +9,19 @@
 #
 # Installing needs `app:write` on the app's name and every permission listed
 # under `permissions`: you can grant only what you hold. The app reconciler
-# then keeps `legion-system/gitops` running from this manifest, your settings
+# then keeps `legion-system/deployer` running from this manifest, your settings
 # (`legion app set`), and your config (`legion app config set`).
 {
-  # The app's name, and its job's: legion-system/gitops. Lowercase letters,
+  # The app's name, and its job's: legion-system/deployer. Lowercase letters,
   # digits and '-', starting with a letter, at most 40.
-  name = "gitops",
+  name = "deployer",
   description = "Deploys jobs from git repositories.",
   # Required for an installed app. Bundled apps carry none.
   version = "0.2.0",
 
   # Where it runs by default: managers (their system workers; the default),
   # workers, or any. The operator can move it with `legion app set
-  # gitops --placement workers`.
+  # deployer --placement workers`.
   placement = "managers",
   # Each task's count by default (1-32).
   replicas = 1,
@@ -40,11 +40,11 @@
       # The app's own code, fetched like any job's artifact. Pin a checksum.
       artifacts = [
         {
-          source = "https://example.com/gitops/0.2.0/legion-gitops-linux-amd64.tar.gz",
+          source = "https://example.com/deployer/0.2.0/legion-deployer-linux-amd64.tar.gz",
           checksum = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
         },
       ],
-      config = { command = ["./legion-gitops"] },
+      config = { command = ["./legion-deployer"] },
       resources = { cpu = 200, memory = 128 },
       # The app's HTTP port: health, and the views and actions below
       # (`ui.port`). Not a catalog service: the worker delivers the
@@ -69,7 +69,7 @@
   # socket with this grant, when workloadIdentity.enabled is on.
   permissions = [
     { resources = ["job"], actions = ["read"], namespaces = ["team-*"] },
-    # `via = "objects"`: gitops writes jobs only while it acts for one of its
+    # `via = "objects"`: deployer writes jobs only while it acts for one of its
     # Repos (`legion-for-object`), and the manager holds each such call to
     # what that Repo's author was checked for when they applied it (the
     # Repo's recorded authority; see `requires` below). Its own credential
@@ -81,21 +81,21 @@
     { resources = ["template"], actions = ["read"] },
     # Apps keep their state under the reserved `legion/` KV prefix, which a
     # plain `*` path never reaches.
-    { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/gitops/*"] },
+    { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/deployer/*"] },
   ],
 
   # UI registrations (docs/apps.md, "Views and actions"). The SPA draws the
   # app's declarative views (legion-view/1 JSON) in these slots, and
-  # `legion app view gitops job web` prints them. The manager checks each
+  # `legion app view deployer job web` prints them. The manager checks each
   # entry's `permission` as the viewer, on the job, task, or node in context,
   # before it asks the app anything; a viewer without it sees nothing.
   ui = {
     # The port label the app serves views and actions on (default "api").
     port = "api",
     # A page in the sidebar's Apps section. No context: views only.
-    nav = [{ title = "GitOps", icon = "gitBranch", view = "repos" }],
+    nav = [{ title = "Deployer", icon = "gitBranch", view = "repos" }],
     # A card on the cluster overview.
-    overview = [{ title = "GitOps sync", view = "summary" }],
+    overview = [{ title = "Deployer sync", view = "summary" }],
     # A panel on job pages, for viewers holding job:read on that job.
     job = [
       { title = "Sync", view = "job-sync", permission = { resource = "job", action = "read" } },
@@ -105,7 +105,7 @@
     # Buttons a view's `actions` block can show. Pressed on a job, task, or
     # node (never in nav or overview), checked as the viewer, audited as
     # `app.action`, and confirmed first when the permission is a write.
-    # gitops answers `sync-now` by acting for the Repo that deploys the job:
+    # deployer answers `sync-now` by acting for the Repo that deploys the job:
     # acting as the viewer is bounded by its own grant, which (job:write
     # being `via = "objects"`) writes no job.
     actions = [
@@ -131,7 +131,7 @@
     pages = [
       {
         name = "console",
-        title = "GitOps console",
+        title = "Deployer console",
         icon = "gitBranch",
         rpcs = ["ListJobs", "GetJobInfo", "RunJob"],
         permission = { resource = "job", action = "read" },
@@ -142,18 +142,18 @@
   # Jobspec keys the app adds (docs/apps.md, "Jobspec extensions"): one key
   # per extension point (job, group, task, volume, port, service; `task`
   # and `group` count as one). Job authors write them where they belong
-  # (configs/apps/example-app-job.ncl), or as `apps.gitops` at the same
+  # (configs/apps/example-app-job.ncl), or as `apps.deployer` at the same
   # point. Each value is checked against its schema at submit, stored as
   # written, and read back with the schema's defaults filled; the app reads
   # its values with WatchAppExtensions. Install refuses a key that is a core
   # field at its point or another installed app's key there (rename it with
-  # `legion app install --key job.gitops=<key>`), a schema with a remote
+  # `legion app install --key job.deployer=<key>`), a schema with a remote
   # $ref, and an example that fails its own schema.
   extensions = [
     {
       point = "job",
-      key = "gitops",
-      description = "Where this job came from, and whether gitops keeps it in sync.",
+      key = "deployer",
+      description = "Where this job came from, and whether deployer keeps it in sync.",
       schema = {
         type = "object",
         additionalProperties = false,
@@ -196,13 +196,13 @@
   # (configs/apps/example-repo.ncl); the manager checks each against its
   # schema and what writing it requires of the writer, and stores it; the
   # app watches them (WatchObjects), does the work, and reports status. The
-  # kind's name is `gitops/Repo`; `legion object get repo storefront` works
+  # kind's name is `deployer/Repo`; `legion object get repo storefront` works
   # while no other app declares a Repo.
   kinds = [
     {
       # PascalCase, singular. Reserved: Legion's own nouns (job, node, ...).
       name = "Repo",
-      description = "A git repository gitops deploys jobs from into this namespace.",
+      description = "A git repository deployer deploys jobs from into this namespace.",
       # `namespaced` (the default) or `cluster`.
       scope = "namespaced",
       # The spec's JSON Schema. Closed by default: a field it does not name
@@ -250,8 +250,8 @@
       # What writing (or deleting) a Repo also needs of its writer, scoped
       # from the object: write on the jobs it names (`/spec/jobs`; every job
       # when it names none) in its namespace. What was checked is recorded
-      # on the Repo as its authority, and bounds what gitops can do for it:
-      # a Repo can never make gitops deploy more than its author could.
+      # on the Repo as its authority, and bounds what deployer can do for it:
+      # a Repo can never make deployer deploy more than its author could.
       requires = [
         { resource = "job", actions = ["write"], name = "/spec/jobs" },
       ],
@@ -268,7 +268,7 @@
           path = "/spec/deployKey",
         },
       ],
-      # A delete waits up to this long for gitops to clean up (and release
+      # A delete waits up to this long for deployer to clean up (and release
       # the object); then the object is removed anyway.
       cleanup = "10m",
       # At most this many Repos (default 10,000).

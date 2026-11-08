@@ -97,6 +97,7 @@ pub const RESERVED_KIND_NOUNS: &[&str] = &[
     "execkey",
     "execticket",
     "extension",
+    "gitops",
     "grant",
     "group",
     "guestagent",
@@ -1706,6 +1707,15 @@ pub fn resolve_requirements(
             (None, None)
         };
         for action in &requirement.actions {
+            // A band is what a submit claims: only a `job:write` scope
+            // carries one. A read never does, and a band on a read
+            // permission would make its authority rule (`bands = [...]`)
+            // match no read at all.
+            let band = if action.trim() == "write" {
+                band.clone()
+            } else {
+                None
+            };
             for namespace in &namespaces {
                 for name in &names {
                     for path in &paths {
@@ -2732,6 +2742,23 @@ mod app_object_tests {
                 .as_deref(),
             Some("*")
         );
+
+        // Only a write claims a band: a read's scope never carries one, so
+        // a band on a recorded read would match no read at all.
+        let mut reader = decl("Repo");
+        reader.requires = vec![KindRequirement {
+            resource: "job".into(),
+            actions: vec!["read".into(), "write".into()],
+            ..Default::default()
+        }];
+        let reader = kind("gitops", reader);
+        let resolved =
+            resolve_requirements(&reader, &doc(json!({ "url": "x" })), "team-a").expect("both");
+        assert_eq!(resolved[0].action, "read");
+        assert_eq!(resolved[0].band, None);
+        assert!(resolved[0].scope().band.is_none());
+        assert_eq!(resolved[1].action, "write");
+        assert_eq!(resolved[1].band.as_deref(), Some("normal"));
     }
 
     #[test]
@@ -2983,7 +3010,7 @@ mod app_object_tests {
         let decls = manifest_kinds(&manifest).expect("kinds");
         validate_kind_decls(&decls).expect("valid kinds");
         let kind = InstalledKind::new(
-            "gitops",
+            "deployer",
             decls[0].clone(),
             "digest",
             KindState::Active,
@@ -2991,7 +3018,7 @@ mod app_object_tests {
             true,
         )
         .expect("compiles");
-        assert_eq!(kind.qualified(), "gitops/Repo");
+        assert_eq!(kind.qualified(), "deployer/Repo");
         let object: Value = serde_json::from_str(
             &crate::config_lang::eval_file(format!("{root}/configs/apps/example-repo.ncl"))
                 .expect("the object evaluates"),
@@ -2999,7 +3026,7 @@ mod app_object_tests {
         .expect("JSON");
         let documents = parse_object_documents(&object).expect("documents");
         let input = parse_object_input(&documents[0]).expect("an object");
-        assert_eq!(input.kind, "gitops/Repo");
+        assert_eq!(input.kind, "deployer/Repo");
         let effective = kind.check_spec(&input.spec).expect("the spec passes");
         assert_eq!(effective["branch"], "main");
         // Its rule: a deploy key needs an SSH URL.
