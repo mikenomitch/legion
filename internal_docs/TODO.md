@@ -514,7 +514,7 @@ How to use it:
 | [#58](https://github.com/mikenomitch/legion/pull/58) | Park: the workload says when it is waiting, and its node suspends it | Plan [park-plan.md](plans/park-plan.md); Phases 1–2, entries under "Park" above and in Done |
 | [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after adversarial security and correctness reviews | All three plans SHIPPED; their items, and both hardening passes, are checked off and in Done; the reviews' open and design-level items are under *Ecosystem apps* |
 | branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phases O1-O4 | Builds on #60; O1-O4 are checked off and in Done; the deferrals and follow-ups are open under Ecosystem apps |
-| branch `claude/dreamy-thompson-fuodyz` | GitOps: the bundled `gitops` app, `legion gitops`, its views | Plan [gitops-plan.md](plans/gitops-plan.md); G1-G3 checked off and in Done; follow-ups open under *Ecosystem apps* |
+| [#66](https://github.com/mikenomitch/legion/pull/66) | GitOps: the bundled `gitops` app, `legion gitops`, its views | Plan [gitops-plan.md](plans/gitops-plan.md); G1-G3 checked off and in Done; follow-ups open under *Ecosystem apps* |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -6572,8 +6572,9 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
 
 ## Ecosystem apps
 
-- [x] **GitOps: the bundled `gitops` app** (2026-11-07, branch
-      `claude/dreamy-thompson-fuodyz`; [plan](plans/gitops-plan.md) ·
+- [x] **GitOps: the bundled `gitops` app** (2026-11-07, in flight in
+      [#66](https://github.com/mikenomitch/legion/pull/66);
+      [plan](plans/gitops-plan.md) ·
       [calls](calls/gitops-plan_calls.md) · docs:
       [gitops.md](../docs/gitops.md), [apps.md](../docs/apps.md),
       [agent-readiness.md](../docs/agent-readiness.md)). Was "GitOps helper —
