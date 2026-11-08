@@ -5153,6 +5153,10 @@ plan.
         only; a check from outside the cluster (or the CA's view) would
         catch split-horizon surprises
         ([calls 8](calls/ingress-app-plan_calls.md)).
+  - [ ] **Seed an app onto a named pool.** `apps.<name>` in the manager
+        config takes `placement` but no `pool`, so seeding the ingress onto
+        workers lands it in `default`; an edge pool needs `legion app set
+        --pool` afterwards ([docs](../docs/ingress.md#moving-it-to-worker-nodes)).
   - [ ] **Check bundled apps' keys offline.** `legion job validate` without
         a manager reports `ingress` as not checked, though its schema is
         compiled into the binary.

@@ -30,7 +30,9 @@ NAME     VERSION  SOURCE   STATUS   PLACEMENT  REPLICAS  UI        DETAIL
 ingress  0.1.0    bundled  running  managers   1/1       nav, job  on legion-system-x8f2k1qz
 ```
 
-It runs on a manager by default, listening on ports 80 and 443.
+It runs on a manager by default, listening on ports 80 and 443. That is
+the quickest way to start. For a site with real traffic, move it to worker
+nodes of its own ([Moving it to worker nodes](#moving-it-to-worker-nodes)).
 
 **2. Route a service.** Add `ingress` to the service block and run the
 job:
@@ -184,7 +186,7 @@ $ legion app set ingress --placement workers --pool edge --replicas 4
 
 | Setting | Default | |
 | --- | --- | --- |
-| placement | `managers` | The managers' [system workers](architecture-managers-workers.md#the-system-worker). Right for clusters whose managers face the internet. |
+| placement | `managers` | The managers' [system workers](architecture-managers-workers.md#the-system-worker): nothing to set up, and right for small sites. For real traffic, use `workers` ([Moving it to worker nodes](#moving-it-to-worker-nodes)). |
 | replicas | `1` | One per node. Point DNS at every node that runs one (round-robin `A` records, or a cloud load balancer across them). |
 | resources | 500 MHz, 256 MiB | `legion app set ingress --cpu 2000 --memory 512`. On managers, it shares the system worker's lend (`systemWorker.resources`, 1000 MHz and 1024 MiB by default) with the other bundled apps. |
 
@@ -198,10 +200,9 @@ $ legion app set ingress --placement workers --pool edge --replicas 4
 cgroup caps the ingress, the cert manager, and the other bundled apps
 together at `systemWorker.resources`, one CPU by default. That is plenty
 for a small site and for TLS handshakes at a modest rate, but a busy site
-will hit it, and the proxy then slows rather than fails. For real traffic,
-run it on edge workers (`--placement workers --pool edge`) with
-`--cpu`/`--memory` to match, or raise `systemWorker.resources` on the
-managers.
+will hit it, and the proxy then slows rather than fails. Move it to worker
+nodes ([below](#moving-it-to-worker-nodes)), or, if it must stay on the
+managers, raise `systemWorker.resources` there.
 
 To seed it on for every new cluster, set it in the manager config:
 
@@ -209,6 +210,102 @@ To seed it on for every new cluster, set it in the manager config:
 # configs/manager.ncl
 apps = { ingress = { enabled = true } },
 ```
+
+### Moving it to worker nodes
+
+The ingress starts on the managers because every cluster has them. For a
+site with real traffic, give it worker nodes of its own, an **edge pool**,
+and move it there. It takes four steps, and nothing about your routes or
+certificates changes.
+
+**1. Declare an edge worker type** in the manager's `workerConfigPath`
+directory ([Configuration](configuration-language.md)). Its nodes must
+accept the `legion-system` namespace, where the ingress runs:
+
+```nickel
+# configs/workers/edge.ncl
+{
+  workerType = "edge",
+  pool = "edge",
+  # Only Legion's own jobs, so tenant work never competes with the proxy.
+  # ["*", "legion-*"] would let tenant jobs share these nodes too.
+  namespaces = ["legion-system"],
+}
+```
+
+**2. Join the edge nodes** with a token for that type. Give each worker
+its public address, so the ingress can tell you where to point DNS:
+
+```console
+$ legion join-token create --type edge --ttl 1h
+$ LEGION_WORKER_PUBLIC_ADDRESS=203.0.113.20 legion join <token>   # on each edge node
+```
+
+**3. Move the ingress.** This takes `operator:write` as well as
+`app:write`, because the edge nodes will hold the ingress's token and serve
+its certificates' private keys ([Placement](apps.md#placement)):
+
+```console
+$ legion app set ingress --placement workers --pool edge --replicas 2 --cpu 2000 --memory 512
+$ legion app status ingress        # PLACEMENT workers, REPLICAS 2/2 once both run
+```
+
+The reconciler resubmits the ingress's job as a normal rollout: replicas
+start on the edge nodes, and the ones on the managers stop. Static ports
+keep one replica per node, so `--replicas` can be at most the number of
+edge nodes. Certificates live in KV, so the new replicas serve them within
+10 seconds, and nothing is re-issued.
+
+**4. Repoint DNS** at the edge nodes:
+
+```console
+$ legion service resolve legion-system/ingress
+ADDRESS        PUBLIC           ALLOC  NODE    HEALTHY  STATUS
+10.0.5.11:80   203.0.113.20:80  31     edge-1  yes      running
+10.0.5.12:80   203.0.113.21:80  32     edge-2  yes      running
+```
+
+Until the records change, clients that still resolve the managers'
+addresses reach nothing. Lower the records' TTL ahead of the move, or keep
+DNS pointed at a load balancer and change its targets instead. The Ingress
+page's DNS column turns back to `points here` as the new records reach the
+ingress's resolver.
+
+On a new cluster you can seed it straight onto workers with
+`apps = { ingress = { enabled = true, placement = "workers" } }` in the
+manager config. Seeding has no pool setting, so that lands it in the
+`default` pool; move it to an edge pool with `legion app set` as above.
+
+**Why worker nodes perform better.**
+
+- **No shared ceiling.** On a manager, the ingress runs inside the system
+  worker's lend: a hard kernel cap (`cpu.max` and `memory.max`, 1000 MHz
+  and 1024 MiB by default) that it shares with the cert manager, the
+  autoscaler, and GitOps. Past the cap the proxy is throttled, however idle
+  the rest of the machine is. On a worker, `--cpu` is a proportional weight
+  ([Resource enforcement](resource-enforcement.md)), not a cap: the
+  ingress can burst onto every idle core, and under contention it still gets
+  its share. This matters most for HTTPS, where every new connection's
+  handshake is a public-key signature, so the handshake rate grows with the
+  cores the proxy can use.
+- **The control plane stays fast, and so does the proxy.** A manager also
+  runs the Raft log, the scheduler, and the state store. A traffic spike on
+  the same host competes with them for CPU, memory bandwidth, and the
+  network card, which slows scheduling and heartbeats. A burst of
+  scheduling work in turn adds latency to every proxied request. Separate
+  nodes keep each from slowing the other.
+- **It scales out without touching quorum.** Managers come in small odd
+  numbers sized for consensus, and adding one to add proxy capacity also
+  adds a Raft voter. Edge workers are ordinary nodes: each one you add
+  brings its own CPU, network card, and connection table, and `--replicas`
+  spreads the ingress across them.
+- **Right-sized machines in the right place.** Edge nodes can be
+  network-optimized machines in a public subnet, while the managers stay
+  small and private. Managers then never need to accept internet traffic.
+
+What it costs: more machines to run and patch, nodes that hold the
+ingress's token and TLS keys (so choose ones you trust as you trust your
+managers), and DNS that points at the edge nodes rather than the managers.
 
 ### Where to point DNS
 

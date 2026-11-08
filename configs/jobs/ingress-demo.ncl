@@ -9,8 +9,10 @@
 #   curl -H 'Host: demo.example.com' http://<node>/api/        # the API, /api stripped
 #   legion app view ingress nav                                # routes, endpoints, certificates
 #
-# Point demo.example.com at the ingress's nodes and it is served over HTTPS
-# with a Let's Encrypt certificate, and plain HTTP redirects to it.
+# Point demo.example.com where `legion service resolve legion-system/ingress`
+# says (the Ingress page's "Point DNS here" shows the same), and the cert
+# manager gets it a Let's Encrypt certificate: it is served over HTTPS, and
+# plain HTTP redirects to it.
 {
     name = "ingress-demo",
     tasks = [
