@@ -37,6 +37,22 @@ use legion::structs::{
 };
 use tonic::transport::Channel;
 
+/// `LEGION_TEST_TRACE=1 RUST_LOG=legion=debug` installs a stderr subscriber
+/// (as tests/integration/raft_lanes.rs does), so journal restarts and watch
+/// resyncs are visible when a test here fails.
+fn init_trace() {
+    if std::env::var("LEGION_TEST_TRACE").is_err() {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    });
+}
+
 fn wait_for(timeout: Duration, what: &str, mut probe: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -161,6 +177,7 @@ fn start_node(
 }
 
 fn start_cluster(root: &std::path::Path) -> R<Vec<TestNode>> {
+    init_trace();
     let a = start_node(root, "mgr-a", true, None)?;
     let (token, _expires) = a.store().issue_raft_join_token("test")?;
     let b = start_node(root, "mgr-b", false, Some(token.clone()))?;

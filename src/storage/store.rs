@@ -1468,6 +1468,10 @@ pub struct Store {
     // resume (revisions-and-watches plan): fed by the changeset projection
     // on every replica, like the work log. See `store/revision_ops.rs`.
     revisions: Arc<crate::storage::revisions::RevisionHub>,
+    // Whether revisions are raft applied indexes (raft persistence) rather
+    // than the `local_disk` counter. A plain flag, so the engine's own store
+    // clones, which carry a placeholder driver, still know.
+    raft_revisions: bool,
     // Eval claims as leader memory (sandbox-scaling plan, Phase 1): which
     // evals this manager's eval workers hold. A claim writes nothing; see
     // `store/eval_claims.rs`.
@@ -2228,6 +2232,7 @@ impl Store {
             )),
             work_log: Arc::new(crate::storage::work_log::WorkLog::new()),
             revisions: Arc::new(crate::storage::revisions::RevisionHub::new()),
+            raft_revisions: raft_enabled,
             eval_claims: Arc::new(std::sync::Mutex::new(eval_claims::EvalClaims::default())),
             capacity_events: Arc::new(std::sync::Mutex::new(
                 blocked_evals::CapacityEvents::default(),

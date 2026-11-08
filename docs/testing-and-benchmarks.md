@@ -647,10 +647,17 @@ sandbox-scaling work bought:
 - `tests/integration/work_stream.rs` covers `Manager.StreamWork`: delivery within a
   round trip with no heartbeat, replay after a dropped stream, resync on
   another epoch or a gap, a sub-KiB steady heartbeat, a leader kill on a
-  3-manager raft cluster, and checkpoint work (a suspend's capture, the
+  3-manager raft cluster (the worker whose manager died resumes on a
+  survivor from its revision, with no full resync), and checkpoint work (a suspend's capture, the
   reclaim after a resume) pushed with no heartbeat and never replayed. `LEGION_MEASURE_STREAM_ALLOCS=10000 cargo test
   --release --test integration work_stream::a_streaming_heartbeat -- --nocapture` is the
   10,000-allocation heartbeat measurement.
+- `tests/integration/revisions_watch.rs` covers revisions on a 3-manager raft
+  cluster: read-after-write through a follower, a linearizable read on a
+  follower, a blocking read woken by a write through the leader, revisions
+  that keep growing across a leader kill, a watch resumed on another manager,
+  and `resync_required` from a restarted one
+  ([watches-and-blocking-queries.md](watches-and-blocking-queries.md)).
 - `tests/integration/blocked_evals.rs` covers blocked evals: wake by pool, by freed
   capacity, escaped, an unblock during the running eval, one blocked eval
   per job, and a scheduler-lane failover that replays a missed wake.

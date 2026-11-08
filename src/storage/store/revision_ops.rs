@@ -51,12 +51,12 @@ impl Store {
     }
 
     /// Whether revisions come from raft applied markers (raft persistence)
-    /// rather than the `local_disk` counter. Known before the engine starts.
+    /// rather than the `local_disk` counter. From the configured
+    /// persistence, not the driver: the engine's own clones (state
+    /// machines, the forward executor) hold a placeholder driver
+    /// ([`Store::raft_engine_clone`]), and they are the ones projecting.
     fn revisions_from_raft(&self) -> bool {
-        self.persistence_driver
-            .as_any()
-            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
-            .is_some()
+        self.raft_revisions
     }
 
     /// Open the journal at this store's current revision, and seed the
@@ -196,10 +196,16 @@ impl Store {
     /// resyncs, and every node's resume window closes. After a snapshot
     /// install replaced rows under the projection, or a projection failure.
     pub(crate) fn reset_revisions(&self) {
-        let at = self
-            .current_revision()
-            .unwrap_or_else(|_| self.revisions.recorded());
-        self.revisions.reset(at.max(&self.revisions.recorded()));
+        let at = match self.current_revision() {
+            Ok(at) => at,
+            Err(err) => {
+                debug!(error = ?err, "Could not read the revision to restart the journal at");
+                self.revisions.recorded()
+            }
+        };
+        let at = at.max(&self.revisions.recorded());
+        debug!(at = %at, "Restarting the revision journal");
+        self.revisions.reset(at);
     }
 
     /// Resolve what one committed changeset adds to the journal: the jobs,
@@ -291,6 +297,13 @@ impl Store {
                 if work.unattributed {
                     self.revisions.forget_nodes(Revision([index; 3]));
                 }
+                tracing::trace!(
+                    group,
+                    index,
+                    changes = changes.len(),
+                    nodes = work.pairs.len(),
+                    "Recording committed changes in the revision journal"
+                );
                 self.revisions.record(
                     group,
                     index,

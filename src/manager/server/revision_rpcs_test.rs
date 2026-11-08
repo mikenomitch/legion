@@ -377,7 +377,25 @@ fn run_job_compare_and_set_wins_loses_and_creates_only() -> R<()> {
 
 #[test]
 fn plan_job_lists_the_fields_a_submit_would_change() -> R<()> {
-    let (_store, manager) = setup()?;
+    let (store, manager) = setup()?;
+    // A node to plan onto: a plan with nowhere to place is an error.
+    store.insert_node(NodeMsg {
+        id: "plan-node".into(),
+        pool: "default".into(),
+        status: "ready".into(),
+        availability: "available".into(),
+        config_attrs: json!({ "node_id": "plan-node", "maxAllocations": 50, "resources": {} })
+            .to_string(),
+        fingerprint_attrs: json!({
+            "memory_total": (8u64 * 1024 * 1024 * 1024).to_string(),
+            "cpus": { "cpu-1": { "frequency": 2000.0 }, "cpu-2": { "frequency": 2000.0 } },
+        })
+        .to_string(),
+        dynamic_attrs: "{}".into(),
+        health_checks: "{}".into(),
+        last_heartbeat: String::new(),
+        heartbeat_source: String::new(),
+    })?;
     let rt = runtime();
     rt.block_on(async {
         manager.run_job(run(spec(1), None)).await.expect("create");

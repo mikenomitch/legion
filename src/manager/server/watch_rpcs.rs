@@ -339,6 +339,13 @@ impl ManagerDaemonService {
                     // The journal rolled past this watcher, or restarted
                     // under it (a snapshot install): it cannot be told what
                     // it missed, so it relists.
+                    debug!(
+                        missed,
+                        generation,
+                        now = batch.generation,
+                        last_seq,
+                        "Watch must resync"
+                    );
                     let event = WatchEvent {
                         revision: watch.position.render(),
                         changes: Vec::new(),
