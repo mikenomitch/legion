@@ -1805,3 +1805,380 @@ async fn an_upgrade_that_drops_a_used_point_needs_force_test() -> R<()> {
     assert_eq!(find(&info.extensions, "task", "slaTier")?.state, "orphaned");
     Ok(())
 }
+
+/// The bundled ingress's key (docs/ingress.md): seeding registers it on
+/// every cluster, so `service.ingress` is checked against its schema at
+/// submit even while the app is disabled (with a warning that the app was
+/// not asked), and its values reach the ingress's own identity over
+/// `WatchAppExtensions`. The app's grant covers everything it calls: the
+/// catalog (its own service included, for where to point DNS), its own KV
+/// and certificates lock, a `certs/Certificate` per host in legion-system
+/// written under its own KV prefix, and its own `certs/Issuer`; and no one
+/// else's KV or Issuer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_bundled_ingress_routes_reach_its_identity_test() -> R<()> {
+    let fx = fixture().await?;
+    let reconciler = AppReconciler::new(
+        fx.svc.clone(),
+        ReconcilerSettings {
+            seed: BTreeMap::new(),
+            own_build: BuildMarker {
+                version: "0.1.0".into(),
+                build_id: "a".into(),
+            },
+        },
+    );
+    assert!(reconciler.seed()?.contains(&"ingress".to_string()));
+    let shop = json!({
+        "name": "shop",
+        "tasks": [{
+            "name": "web",
+            "runtime": "exec",
+            "config": { "command": ["sleep", "3600"] },
+            "resources": { "cpu": 100, "memory": 64 },
+            "network": { "ports": [{ "name": "http" }] },
+            "service": {
+                "port": "http",
+                "ingress": { "host": ["shop.example.com", "www.shop.example.com"], "path": "/store" },
+            },
+        }],
+    });
+    let reply = fx.run(&shop).await?;
+    assert!(
+        reply
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not checked by the ingress app (disabled)")),
+        "{:?}",
+        reply.warnings
+    );
+
+    // The schema still decides, app or no app.
+    for (name, ingress, expect) in [
+        ("bad-host", json!({ "host": "not a host" }), "ingress"),
+        ("no-host", json!({ "path": "/" }), "host"),
+        (
+            "bad-path",
+            json!({ "host": "a.example.com", "path": "api" }),
+            "path",
+        ),
+        (
+            "extra",
+            json!({ "host": "a.example.com", "tls": true }),
+            "tls",
+        ),
+    ] {
+        let mut bad = shop.clone();
+        bad["name"] = json!(name);
+        bad["tasks"][0]["service"]["ingress"] = ingress;
+        let err = fx.run(&bad).await.expect_err(name);
+        assert!(err.message().contains(expect), "{name}: {}", err.message());
+    }
+
+    fx.svc
+        .set_app_enabled(req(
+            SetAppEnabledRequest {
+                name: "ingress".into(),
+                enabled: true,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    // A bundled app runs the node's own binary, so it waits for a node that
+    // reports the build it was rendered for.
+    let mut manager = node(MGR_NODE, "legion-system", true);
+    manager.dynamic_attrs =
+        json!({ "capabilities": [], "buildVersion": "0.1.0", "buildId": "a" }).to_string();
+    fx.store.insert_node(manager)?;
+    fx.start_app("ingress").await?;
+    let token = fx.app_token("ingress")?;
+    let mut stream = fx
+        .svc
+        .watch_app_extensions(req(WatchAppExtensionsRequest::default(), &token))
+        .await?
+        .into_inner();
+    let first = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await?
+        .context("a first message")??;
+    assert!(first.snapshot);
+    assert_eq!(first.upserts.len(), 1, "{:#?}", first.upserts);
+    let value = &first.upserts[0];
+    assert_eq!(
+        (
+            value.job_id.as_str(),
+            value.point.as_str(),
+            value.key.as_str()
+        ),
+        ("shop", "service", "ingress")
+    );
+    let path = value.path.clone().unwrap_or_default();
+    assert_eq!((path.task.as_str(), path.service.as_str()), ("web", "web"));
+    assert_eq!(
+        parsed(&value.effective_json),
+        json!({ "host": ["shop.example.com", "www.shop.example.com"], "path": "/store", "stripPath": false })
+    );
+    let spec = legion::apps::ingress::spec_of(value);
+    assert!(spec.active, "{spec:?}");
+    assert_eq!(spec.target.service_ref(), "web");
+
+    // What the app calls, with its own grant.
+    fx.svc
+        .resolve_service(req(
+            ResolveServiceRequest {
+                service: "web".into(),
+                include_unhealthy: true,
+            },
+            &token,
+        ))
+        .await?;
+    fx.svc
+        .put_kv(req(
+            PutKvRequest {
+                key: "legion/apps/ingress/certs/probe".into(),
+                value: "{}".into(),
+                value_type: KvValueType::String as i32,
+                ..Default::default()
+            },
+            &token,
+        ))
+        .await?;
+    fx.svc
+        .list_kv(req(
+            ListKvRequest {
+                prefix: "legion/apps/ingress/".into(),
+                ..Default::default()
+            },
+            &token,
+        ))
+        .await?;
+    fx.svc
+        .acquire_kv_lock(req(
+            AcquireKvLockRequest {
+                key: legion::apps::ingress::certificates::LOCK_KEY.into(),
+                lock_id: Some("a".repeat(32)),
+                owner: Some("test".into()),
+                ttl_seconds: 60,
+                force: false,
+            },
+            &token,
+        ))
+        .await?;
+    let denied = fx
+        .svc
+        .put_kv(req(
+            PutKvRequest {
+                key: "legion/apps/autoscaler/x".into(),
+                value: "{}".into(),
+                value_type: KvValueType::String as i32,
+                ..Default::default()
+            },
+            &token,
+        ))
+        .await
+        .expect_err("another app's KV");
+    assert_eq!(denied.code(), Code::PermissionDenied);
+
+    // Its own replicas, for "Point DNS here".
+    fx.svc
+        .resolve_service(req(
+            ResolveServiceRequest {
+                service: legion::apps::ingress::edge::SERVICE.into(),
+                include_unhealthy: true,
+            },
+            &token,
+        ))
+        .await?;
+    // Its certificates, through the cert manager: seeded with it, its kinds
+    // installed as the reconciler's pass installs them.
+    fx.svc
+        .sync_object_kinds_for("certs")
+        .map_err(|status| anyhow!("{}", status.message()))?;
+    use legion::apps::ingress::certificates::{
+        certificate_document, default_issuer_document, Kinds,
+    };
+    let kinds = Kinds::default();
+    let apply = |document: Value| {
+        let token = token.clone();
+        let svc = fx.svc.clone();
+        async move {
+            svc.apply_object(req(
+                ApplyObjectRequest {
+                    object_json: document.to_string(),
+                    ..Default::default()
+                },
+                &token,
+            ))
+            .await
+        }
+    };
+    apply(default_issuer_document(
+        &kinds,
+        "letsencrypt",
+        Some("ops@example.com"),
+    ))
+    .await?;
+    apply(certificate_document(&kinds, "ingress", "shop.example.com")).await?;
+    let denied = apply(json!({
+        "kind": "certs/Issuer",
+        "name": "corp-ca",
+        "spec": { "selfSigned": {} },
+    }))
+    .await
+    .expect_err("an Issuer that is not its own");
+    assert_eq!(denied.code(), Code::PermissionDenied, "{denied:?}");
+    let mut elsewhere = certificate_document(&kinds, "ingress", "shop.example.com");
+    elsewhere["namespace"] = json!("default");
+    let denied = apply(elsewhere)
+        .await
+        .expect_err("a Certificate outside legion-system");
+    assert_eq!(denied.code(), Code::PermissionDenied, "{denied:?}");
+    Ok(())
+}
+
+/// Per-node replicas (docs/apps.md, "Settings"; per-node plan §8): the
+/// bundled ingress seeds per-node and places one allocation on every
+/// manager and none on a worker; the app reads `running` once each is
+/// healthy; a fixed count switches it back; and the API refuses a request
+/// that sets both or says neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_per_node_app_runs_one_on_every_eligible_node_test() -> R<()> {
+    let fx = fixture().await?;
+    // Three managers on the build the app is rendered for.
+    for id in [MGR_NODE, "mgr-2", "mgr-3"] {
+        let mut manager = node(id, "legion-system", true);
+        manager.dynamic_attrs =
+            json!({ "capabilities": [], "buildVersion": "0.1.0", "buildId": "a" }).to_string();
+        fx.store.insert_node(manager)?;
+    }
+    let reconciler = AppReconciler::new(
+        fx.svc.clone(),
+        ReconcilerSettings {
+            seed: BTreeMap::new(),
+            own_build: BuildMarker {
+                version: "0.1.0".into(),
+                build_id: "a".into(),
+            },
+        },
+    );
+    assert!(reconciler.seed()?.contains(&"ingress".to_string()));
+    fx.svc
+        .set_app_enabled(req(
+            SetAppEnabledRequest {
+                name: "ingress".into(),
+                enabled: true,
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    fx.start_app("ingress").await?;
+
+    let job = "legion-system/ingress";
+    let config_id = fx.store.get_job_config(job)?.id();
+    let tasks = fx.store.get_task_configs_for_job_config(&config_id)?;
+    let count = &tasks.first().context("a task")?.1.count;
+    assert_eq!((count.num, count.per.as_deref()), (1, Some("id")));
+    let allocations = fx.store.allocs_for_job(job)?;
+    let mut nodes: Vec<&str> = allocations.iter().map(|a| a.node_id.as_str()).collect();
+    nodes.sort();
+    assert_eq!(
+        nodes,
+        [MGR_NODE, "mgr-2", "mgr-3"],
+        "one per manager, none on {NODE}"
+    );
+
+    let app = |fx: &Fixture| {
+        let svc = fx.svc.clone();
+        let admin = fx.admin.clone();
+        async move {
+            svc.get_app(req(
+                GetAppRequest {
+                    name: "ingress".into(),
+                },
+                &admin,
+            ))
+            .await
+            .map(|reply| reply.into_inner().app.unwrap_or_default())
+        }
+    };
+    let before = app(&fx).await?;
+    assert_eq!(before.desired, 3, "{before:?}");
+    assert_ne!(before.status, "running", "nothing healthy yet");
+    let settings = before.settings.clone().unwrap_or_default();
+    assert!(settings.per_node);
+    assert_eq!(settings.replicas, 0);
+    for allocation in &allocations {
+        fx.store.upsert_allocation_health_snapshots(
+            &allocation.node_id,
+            &[AllocationHealth {
+                allocation_id: allocation.id,
+                healthy: true,
+                status: "running".into(),
+                artifact_states: None,
+            }],
+        )?;
+    }
+    let after = app(&fx).await?;
+    assert_eq!(
+        (after.status.as_str(), after.running, after.desired),
+        ("running", 3, 3),
+        "{after:?}"
+    );
+
+    // Both, or neither: refused.
+    let both = fx
+        .svc
+        .update_app_settings(req(
+            UpdateAppSettingsRequest {
+                name: "ingress".into(),
+                replicas: Some(2),
+                per_node: Some(true),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("replicas and per_node");
+    assert_eq!(both.code(), Code::InvalidArgument);
+    let neither = fx
+        .svc
+        .update_app_settings(req(
+            UpdateAppSettingsRequest {
+                name: "ingress".into(),
+                per_node: Some(false),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await
+        .expect_err("per_node = false alone");
+    assert!(
+        neither.message().contains("set replicas instead"),
+        "{neither:?}"
+    );
+
+    // Back to a fixed count.
+    fx.svc
+        .update_app_settings(req(
+            UpdateAppSettingsRequest {
+                name: "ingress".into(),
+                replicas: Some(1),
+                ..Default::default()
+            },
+            &fx.admin,
+        ))
+        .await?;
+    let mut reconciler = reconciler;
+    let outcome = reconciler.reconcile_app("ingress").await;
+    assert!(
+        matches!(&outcome, legion::manager::apps::PassOutcome::Submitted { action, .. }
+            if action == "settings changed (replicas per-node → 1)"),
+        "{outcome:?}"
+    );
+    let config_id = fx.store.get_job_config(job)?.id();
+    let tasks = fx.store.get_task_configs_for_job_config(&config_id)?;
+    let count = &tasks.first().context("a task")?.1.count;
+    assert_eq!((count.num, count.per.as_deref()), (1, None));
+    Ok(())
+}

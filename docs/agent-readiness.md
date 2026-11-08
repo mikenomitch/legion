@@ -142,7 +142,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_net_policy_apply` | **yes** | Create or replace a network policy object. `dry_run` validates and lists affected allocations without writing. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_acl_grants_list` | no | Job grants: what each job version's `legion` identity was granted at submit (inline `permissions` and `policies`), who granted it, and whether it was revoked (`include_revoked`). `job` narrows to one job's canonical id. Needs `acl:read`. Revoking is `legion acl grants revoke` on the CLI, not an MCP tool. |
-| `legion_app_list` | no | Installed [apps](apps.md) (Legion's add-ons): each app's version, source, status (`running`, `degraded`, `pending`, `stopped`, with `statusDetail` saying why), placement, replicas running against desired (`running`, `desired`), the nodes it runs on, and its UI slots. Needs `app:read`; the list is filtered by the `names` selector. |
+| `legion_app_list` | no | Installed [apps](apps.md) (Legion's add-ons): each app's version, source, status (`running`, `degraded`, `pending`, `stopped`, with `statusDetail` saying why), placement, replicas running against desired (`running`, `desired`; for a per-node app, `settings.perNode` is true and `desired` is what the scheduler placed, one per eligible node), the nodes it runs on, and its UI slots. Needs `app:read`; the list is filtered by the `names` selector. |
 | `legion_app_status` | no | One app (`app`): its record (`manifest`, `settings`, `config`), its grant (`grant.rules`, who approved it), its job's status, the app reconciler's last action and error (`reconcile`), its build marker and what it waits for (`reconcile.markerReason`), and `notes` (no system worker, workload identity off). Changing an app (install, config, settings) is `legion app` on the CLI, not an MCP tool. |
 | `legion_app_view` | no | One of an app's declarative views ([Apps: Views and actions](apps.md#views-and-actions)): what its panel on a job, task, or node page, its sidebar page, or its overview card shows a person, as JSON. Takes `app`, `slot` (`nav`, `overview`, `job`, `task`, `node`), the slot's context (`job` with `namespace`, `task`, `group`, `node`), and optionally `view`. Returns `document` (the validated `legion-view/1` blocks), `actions` (each with `allowed` and `mutating`), and which allocation answered. Checked as the caller: `app:read` and the view's declared permission on the context, before the app is asked. The same data as `legion app view -j`. Actions are not run over MCP. |
 | `legion_object_kinds` | no | The object kinds installed apps declare ([App Objects](app-objects.md)), with each kind's spec and status JSON Schemas (decoded), examples, CEL `rules` (each with its message, path, and whether it is a transition rule), scope, access, `requires`, immutable fields, cleanup window, and state, so an agent can write a valid object. Takes optional `app`. |
@@ -998,7 +998,39 @@ Every refusal uses the standard error envelope, with `retryable` and a
 `manager_unavailable`). `legion instance get -j` shows the task's `wake`
 block and, while the instance runs, its `endpoints`.
 
-## 6d. Reading what an app's panel shows (`legion app view`)
+## 6d. Putting a service on a public hostname (the ingress)
+
+An agent that deploys a web service for someone makes it reachable by
+adding one key to the service block, `ingress = { host = "shop.example.com"
+}` ([ingress.md](ingress.md)), and submitting. Everything it needs to check
+is structured:
+
+- **At submit** (`legion job validate` with a manager, `legion job run`,
+  `PlanJob`), a malformed value is an error naming the field, and the
+  running ingress refuses a host and path another job serves. A warning
+  says when a name gets no automatic certificate, or when the ingress is
+  disabled and so did not check (`legion app enable ingress`, an `app:write`
+  call, turns it on).
+- **Where DNS should point** is `legion service resolve
+  legion-system/ingress -j`: each replica's `address` and, when its worker
+  has one, `publicAddress`. `legion app view ingress nav -j` carries the
+  same under "Point DNS here", and each route's DNS as the ingress sees it
+  (`points here`, `points to <ips>`, `no record`).
+- **After deploy**, `legion app view ingress job <job> -j` returns the job's
+  routes: each URL, its service's healthy and total endpoints, its DNS, its
+  certificate's state (`cert manager, 89d left`, `requested`, `waiting for
+  issuer`, the cert manager's failure reason such as `IssueFailed`, or
+  `HTTP only`), and any problem. `legion app view ingress nav -j` is the
+  whole page. The certificate itself is a Certificate in `legion-system`
+  (`legion object list certificates -n legion-system -j`), with the cert
+  manager's full status.
+- **Its own errors** use the standard envelope with a `Legion-Ingress-Error`
+  header (`no_route`, `no_endpoint`, `bad_gateway`, `upstream_timeout`), and
+  `retryable` with `Retry-After` where waiting helps. An agent polling for a
+  new site should treat `no_endpoint` as "not healthy yet" and `no_route` as
+  "the route has not reached the ingress yet, or was refused".
+
+## 6e. Reading what an app's panel shows (`legion app view`)
 
 Apps add panels to the UI as declarative views, never as code
 ([Apps: Views and actions](apps.md#views-and-actions)). The same views are
@@ -1047,7 +1079,7 @@ They are for people: `legion app view <app>` lists them, and
 tool, because an agent cannot run a page. Everything a page does is an
 ordinary Manager RPC an agent can call itself.
 
-## 6e. Parking itself (`$LEGION_PARK_SOCKET`)
+## 6f. Parking itself (`$LEGION_PARK_SOCKET`)
 
 The surfaces above are for an agent driving Legion from outside. An agent
 running *inside* a sandbox has one too: a task whose `suspend` block sets

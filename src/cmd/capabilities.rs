@@ -1299,7 +1299,7 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "app.set",
-            cli: "legion app set <APP> [--replicas N] [--placement managers|workers|any] [--pool POOL] [--cpu MHZ] [--memory MIB] [--dry-run]",
+            cli: "legion app set <APP> [--replicas N|per-node] [--placement managers|workers|any] [--pool POOL] [--cpu MHZ] [--memory MIB] [--dry-run]",
             grpc: Some("Manager/UpdateAppSettings"),
             summary: "Change an app's settings (the only way to change its job's count or placement: direct writes to an app's job are refused); its job rolls with them. --dry-run checks without changing.",
             mutates: true,

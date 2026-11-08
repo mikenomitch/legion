@@ -57,7 +57,18 @@ pub struct ExecCapabilities {
     /// the single entry `all`.
     #[serde(default)]
     pub drop: Vec<String>,
+    /// Capabilities a task that runs as another `user` keeps after the
+    /// switch, as ambient capabilities that survive `exec`. Only
+    /// `net_bind_service` may be named: it lets the task bind ports below
+    /// 1024 without root, and every other capability is a path to root.
+    /// Linux only; elsewhere it is accepted and does nothing (macOS lets any
+    /// user bind those ports).
+    #[serde(default)]
+    pub add: Vec<String>,
 }
+
+/// The one capability `capabilities.add` may name.
+pub const ADDABLE_CAPABILITY: &str = "net_bind_service";
 
 impl ExecHardeningConfig {
     /// Reject what the kernel would only reject at start: a bad umask, an
@@ -81,8 +92,43 @@ impl ExecHardeningConfig {
                     bail!("exec hardening: unknown capability `{name}`");
                 }
             }
+            let addable = capability_bit(ADDABLE_CAPABILITY);
+            for name in &capabilities.add {
+                let Some(bit) = capability_bit(name) else {
+                    bail!("exec hardening: unknown capability `{name}`");
+                };
+                if Some(bit) != addable {
+                    bail!(
+                        "exec hardening: capabilities.add may name only {ADDABLE_CAPABILITY}, \
+                         which lets a task bind ports below 1024 without root; {name:?} would \
+                         make it root-equivalent"
+                    );
+                }
+                if capabilities_to_drop(capabilities, cap_last_cap()).contains(&bit) {
+                    bail!(
+                        "exec hardening: capabilities {name:?} is both dropped and added; \
+                         a dropped capability cannot be kept"
+                    );
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The capability bits the task keeps after its user switch
+    /// (`capabilities.add`), validated: only [`ADDABLE_CAPABILITY`].
+    pub fn capabilities_to_keep(&self) -> Vec<i32> {
+        let addable = capability_bit(ADDABLE_CAPABILITY);
+        let mut bits: Vec<i32> = self
+            .capabilities
+            .iter()
+            .flat_map(|capabilities| capabilities.add.iter())
+            .filter_map(|name| capability_bit(name))
+            .filter(|bit| Some(*bit) == addable)
+            .collect();
+        bits.sort_unstable();
+        bits.dedup();
+        bits
     }
 
     /// Whether anything here needs privileges the task itself must not have —
@@ -90,10 +136,9 @@ impl ExecHardeningConfig {
     /// so it happens *after* the privileged steps.
     pub fn needs_privileged_setup(&self) -> bool {
         self.private_tmp
-            || self
-                .capabilities
-                .as_ref()
-                .is_some_and(|capabilities| !capabilities.drop.is_empty())
+            || self.capabilities.as_ref().is_some_and(|capabilities| {
+                !capabilities.drop.is_empty() || !capabilities.add.is_empty()
+            })
     }
 }
 
@@ -273,11 +318,13 @@ mod exec_isolation_test {
     fn drop_all_expands_to_every_capability() {
         let all = ExecCapabilities {
             drop: vec!["all".into()],
+            ..Default::default()
         };
         assert_eq!(capabilities_to_drop(&all, 40).len(), 41);
 
         let some = ExecCapabilities {
             drop: vec!["CAP_NET_RAW".into(), "sys_admin".into()],
+            ..Default::default()
         };
         assert_eq!(capabilities_to_drop(&some, 40), vec![13, 21]);
     }
@@ -299,6 +346,7 @@ mod exec_isolation_test {
         let bad_cap = ExecHardeningConfig {
             capabilities: Some(ExecCapabilities {
                 drop: vec!["cap_teleport".into()],
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -309,12 +357,42 @@ mod exec_isolation_test {
             private_tmp: true,
             capabilities: Some(ExecCapabilities {
                 drop: vec!["all".into()],
+                ..Default::default()
             }),
             umask: Some("0027".into()),
             nice: Some(5),
         };
         assert!(good.validate().is_ok());
         assert_eq!(parse_umask("0027").expect("umask"), 0o27);
+    }
+
+    /// `add` takes `net_bind_service` alone, in any spelling, and never
+    /// together with a drop that removes it.
+    #[test]
+    fn only_net_bind_service_can_be_added() {
+        let adding = |add: &[&str], drop: &[&str]| ExecHardeningConfig {
+            capabilities: Some(ExecCapabilities {
+                add: add.iter().map(|name| name.to_string()).collect(),
+                drop: drop.iter().map(|name| name.to_string()).collect(),
+            }),
+            ..Default::default()
+        };
+        let ok = adding(&["CAP_NET_BIND_SERVICE"], &["net_raw"]);
+        ok.validate().expect("net_bind_service may be added");
+        assert_eq!(ok.capabilities_to_keep(), vec![10]);
+        assert!(ok.needs_privileged_setup());
+
+        let err = adding(&["sys_admin"], &[]).validate().unwrap_err();
+        assert!(
+            err.to_string().contains("may name only net_bind_service"),
+            "{err}"
+        );
+        assert!(adding(&["cap_teleport"], &[]).validate().is_err());
+        let err = adding(&["net_bind_service"], &["all"])
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("both dropped and added"), "{err}");
+        assert!(adding(&[], &[]).capabilities_to_keep().is_empty());
     }
 
     #[test]

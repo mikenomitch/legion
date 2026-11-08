@@ -277,10 +277,35 @@ config = {
 - `capabilities.drop` takes capability names with or without the `CAP_` prefix
   (`CAP_NET_RAW`, `net_raw`), case-insensitively, or the single entry `all`.
   Unknown names are rejected at submit by `legion job validate`.
+- `capabilities.add` keeps one capability across the switch to `user`:
+  `net_bind_service`, so a task that is not root can bind ports below 1024.
+  It is the only name `add` takes, because every other capability is a path
+  to root, and it may not be combined with a drop that removes it
+  (`drop = ["all"]` included):
+
+  ```nickel
+  config = {
+    command = ["/usr/local/bin/proxy"],
+    user = "proxy",
+    hardening = { capabilities = { add = ["net_bind_service"] } },
+  }
+  ```
+
+  ```text
+  Error: exec hardening: capabilities.add may name only net_bind_service, which lets a task bind ports below 1024 without root; "sys_admin" would make it root-equivalent
+  ```
+
+  Legion keeps the permitted set through the user switch, cuts every set to
+  exactly the kept capability, and raises it as ambient, so the program the
+  task runs holds `CAP_NET_BIND_SERVICE` and nothing else. If any step
+  fails, the task fails to start. The [ingress](ingress.md) uses it to bind
+  ports 80 and 443 as its own unprivileged user. A task that runs as root
+  already holds every capability, so `add` changes nothing for it. On macOS,
+  any user may bind those ports, and `add` is accepted and ignored.
 - `privateTmp` and capability drops need privileges the task must not keep,
   so they run before Legion switches to `user`. The order is: join cgroup →
-  private `/tmp` → drop capabilities → switch user → `no_new_privs` → `umask`
-  and `nice` → Landlock → `exec`.
+  private `/tmp` → drop capabilities → switch user (keeping `add`) →
+  `no_new_privs` → `umask` and `nice` → Landlock → `exec`.
 - A worker without `CAP_SYS_ADMIN` or `CAP_SETPCAP` can't do the privileged
   steps. In that case the task fails to start instead of running with less
   confinement than you asked for.

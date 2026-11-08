@@ -162,9 +162,12 @@ pub fn config() -> Command {
                 .arg(
                     Arg::new("replicas")
                         .long("replicas")
-                        .value_name("N")
-                        .value_parser(clap::value_parser!(u32))
-                        .help("Copies of each task, 1-32"),
+                        .value_name("N|per-node")
+                        .value_parser(crate::structs::app::Replicas::parse)
+                        .help(
+                            "Copies of each task, 1-32, or per-node: one on every node the \
+                             placement and pool allow",
+                        ),
                 )
                 .arg(
                     Arg::new("placement")
@@ -588,11 +591,15 @@ async fn status(matches: &ArgMatches) -> R<()> {
     );
     println!("  Version:    {}", app.version);
     if let Some(settings) = &app.settings {
-        let mut line = format!(
-            "{}, {} replica(s)",
-            placement_label(&app),
-            settings.replicas
-        );
+        let mut line = if settings.per_node {
+            format!("{}, one per node", placement_label(&app))
+        } else {
+            format!(
+                "{}, {} replica(s)",
+                placement_label(&app),
+                settings.replicas
+            )
+        };
         if let Some(cpu) = settings.cpu {
             line.push_str(&format!(", cpu {cpu} MHz"));
         }
@@ -774,9 +781,15 @@ async fn config_set(matches: &ArgMatches) -> R<()> {
 async fn set(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let name = name_of(matches);
+    let replicas = matches
+        .get_one::<crate::structs::app::Replicas>("replicas")
+        .copied();
     let request = UpdateAppSettingsRequest {
         name,
-        replicas: matches.get_one::<u32>("replicas").copied(),
+        replicas: replicas.and_then(crate::structs::app::Replicas::count),
+        per_node: replicas
+            .filter(|replicas| replicas.is_per_node())
+            .map(|_| true),
         placement: matches.get_one::<String>("placement").cloned(),
         cpu: matches.get_one::<u64>("cpu").copied(),
         memory: matches.get_one::<u64>("memory").copied(),
@@ -785,6 +798,7 @@ async fn set(matches: &ArgMatches) -> R<()> {
         dry_run: matches.get_flag("dry-run"),
     };
     if request.replicas.is_none()
+        && request.per_node.is_none()
         && request.placement.is_none()
         && request.cpu.is_none()
         && request.memory.is_none()

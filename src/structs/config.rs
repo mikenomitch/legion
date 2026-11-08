@@ -176,9 +176,13 @@ pub struct AppSeedConfig {
     /// `managers`, `workers`, or `any`. Default: the manifest's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<String>,
-    /// Replicas. Default: the manifest's.
+    /// Replicas: a number, or `"per-node"`. Default: the manifest's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub replicas: Option<u32>,
+    pub replicas: Option<crate::structs::app::Replicas>,
+    /// The worker pool for `workers` and `any` placement. Default
+    /// `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     /// The app's initial config, validated against its schema. Default: the
     /// manifest's.
     #[serde(default, skip_serializing_if = "Option::is_none")]

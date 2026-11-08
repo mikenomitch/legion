@@ -1842,8 +1842,11 @@ Limits: TCP only. The task sees the datapath as the peer. Legion does not
 pass the original peer to the task (no PROXY header and no forwarding
 headers). The original peer appears in the access log and in `net.denied`
 events, and an ingress `proxy` hop receives it in the PROXY v2 header. There
-is one listener per advertised port per allocation. The cluster edge and per-tag routing on ingress are not part of
-this feature.
+is one listener per advertised port per allocation. Per-tag routing on
+ingress is not part of this feature. The cluster edge, public hostnames
+routed to services over HTTP and HTTPS, is the bundled
+[ingress app](ingress.md), which reaches a task's port like any other
+client, through this chain.
 
 ### Ingress into a sandbox
 

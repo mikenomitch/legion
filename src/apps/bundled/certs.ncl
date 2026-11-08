@@ -39,12 +39,16 @@
   # EAB key. `via = "objects"` means its own credential can touch none of
   # them, and acting for an object it holds only what that object's writer
   # was checked for (the kinds' `requires`, below), so a Certificate can
-  # never make it write a key its writer could not. WatchObjects,
+  # never make it write a key its writer could not. `*` does not reach the
+  # reserved legion/ keys, so `legion/apps/*` is named too: an app that
+  # writes a Certificate into its own private prefix (the ingress keeps
+  # its certificates under legion/apps/ingress/issued/) gets it there, and
+  # no one else can, since only that app holds the key. WatchObjects,
   # UpdateObjectStatus, and ReleaseObject are app-plane for its own kinds
   # and need no rule.
   permissions = [
     { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/certs/*"] },
-    { resources = ["kv"], actions = ["read", "write"], paths = ["*"], via = "objects" },
+    { resources = ["kv"], actions = ["read", "write"], paths = ["*", "legion/apps/*"], via = "objects" },
   ],
   kinds = [
     {

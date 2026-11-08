@@ -286,6 +286,7 @@ async fn seeded() -> R<(Fixture, AppReconciler)> {
             "autoscaler".to_string(),
             "certs".to_string(),
             "gitops".to_string(),
+            "ingress".to_string(),
         ]
     );
     let outcome = reconciler.reconcile_app("autoscaler").await;
@@ -320,6 +321,7 @@ async fn seeding_happens_once_test() -> R<()> {
             "autoscaler".to_string(),
             "certs".to_string(),
             "gitops".to_string(),
+            "ingress".to_string(),
         ]
     );
     let record = fx.app("autoscaler")?;
@@ -351,6 +353,35 @@ async fn seeding_happens_once_test() -> R<()> {
     assert!(later.seed()?.is_empty());
     assert!(fx.app("autoscaler")?.enabled);
     assert_eq!(fx.events("app.installed")?.len(), installed);
+    Ok(())
+}
+
+/// The ingress is seeded disabled, because it takes ports 80 and 443, and
+/// the manager config's `apps.ingress.enabled` seeds it on. Its key is
+/// registered either way, so a job may set `ingress` before it runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ingress_is_seeded_disabled_unless_the_config_says_otherwise_test() -> R<()> {
+    let fx = fixture()?;
+    fx.reconciler(marker("0.1.0", "a")).seed()?;
+    let record = fx.app("ingress")?;
+    assert!(!record.enabled, "the ingress waits for `legion app enable`");
+    assert_eq!(record.grant.granted_by, BOOTSTRAP_PRINCIPAL);
+    assert!(
+        fx.app("autoscaler")?.enabled && fx.app("certs")?.enabled && fx.app("gitops")?.enabled,
+        "the other bundled apps still start on"
+    );
+
+    let on = fixture()?;
+    let mut seed = BTreeMap::new();
+    seed.insert(
+        "ingress".to_string(),
+        AppSeedConfig {
+            enabled: Some(true),
+            ..Default::default()
+        },
+    );
+    on.reconciler_seeded(marker("0.1.0", "a"), seed).seed()?;
+    assert!(on.app("ingress")?.enabled, "the seed-time override applied");
     Ok(())
 }
 
@@ -1785,7 +1816,10 @@ async fn a_record_that_does_not_decode_breaks_nothing_else_test() -> R<()> {
     // Only the removed record is seeded again; the other bundled apps
     // still have theirs.
     assert_eq!(reconciler.seed()?, vec!["autoscaler".to_string()]);
-    assert_eq!(fx.app("autoscaler")?.settings.replicas, 1);
+    assert_eq!(
+        fx.app("autoscaler")?.settings.replicas,
+        legion::structs::app::Replicas::Count(1)
+    );
     Ok(())
 }
 

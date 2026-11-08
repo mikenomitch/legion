@@ -64,6 +64,9 @@ pub struct AppJobAllocations {
     pub previous: u32,
     /// Allocations not yet complete or failed (pending and running).
     pub live: u32,
+    /// Live allocations of the job's latest version: what the scheduler
+    /// placed for it, healthy or not. A per-node app's desired count.
+    pub latest_live: u32,
     /// The nodes running them, sorted.
     pub nodes: Vec<String>,
 }
@@ -721,6 +724,9 @@ impl Store {
         for row in rows {
             let (healthy, node, latest) = row?;
             counts.live += 1;
+            if latest != 0 {
+                counts.latest_live += 1;
+            }
             if healthy != 0 {
                 if latest != 0 {
                     counts.running += 1;

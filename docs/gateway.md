@@ -7,6 +7,10 @@ instance accepts connections, and then forwards it. A sandbox that sleeps
 after three idle minutes still answers its preview link a moment later, and
 nobody has to call `legion instance start` first.
 
+To put a *service* on a public hostname, with load balancing and automatic
+HTTPS, use the [ingress](ingress.md) instead. The gateway is for keyed
+instances that sleep.
+
 The gateway keeps no state of its own. It asks the manager where an instance
 is and resumes it with `StartInstance`, so you can run as many gateways as
 you like behind a load balancer and restart any of them at any time.

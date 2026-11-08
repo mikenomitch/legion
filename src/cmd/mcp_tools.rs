@@ -315,8 +315,8 @@ rpc_tools! {
         "Enable or disable an installed app.",
         props(&[("name", "string", "App."), ("enabled", "boolean", "Enable (true) or disable (false)."), ("dry_run", "boolean", "Report only."), ("idempotency_key", "string", "Retry-safety key.")], &["name", "enabled"]);
     "legion_app_update_settings" => "UpdateAppSettings", update_app_settings(UpdateAppSettingsRequest), true,
-        "Change an app's replicas, placement, resources, or pool.",
-        props(&[("name", "string", "App."), ("replicas", "integer", "Replicas."), ("placement", "string", "Placement."), ("cpu", "integer", "CPU MHz."), ("memory", "integer", "Memory MiB."), ("pool", "string", "Node pool."), ("dry_run", "boolean", "Report only."), ("idempotency_key", "string", "Retry-safety key.")], &["name"]);
+        "Change an app's replicas (a count, or one per node with per_node), placement, resources, or pool.",
+        props(&[("name", "string", "App."), ("replicas", "integer", "A fixed number of replicas, 1-32; turns per-node off."), ("per_node", "boolean", "true: one replica on every node the placement and pool allow. Not with replicas; false alone is refused."), ("placement", "string", "Placement."), ("cpu", "integer", "CPU MHz."), ("memory", "integer", "Memory MiB."), ("pool", "string", "Node pool."), ("dry_run", "boolean", "Report only."), ("idempotency_key", "string", "Retry-safety key.")], &["name"]);
     "legion_app_set_config" => "SetAppConfig", set_app_config(SetAppConfigRequest), true,
         "Replace an app's config.",
         props(&[("name", "string", "App."), ("config_json", "string", "Config as JSON."), ("dry_run", "boolean", "Report only."), ("idempotency_key", "string", "Retry-safety key.")], &["name", "config_json"]);

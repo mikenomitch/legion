@@ -1,7 +1,7 @@
 # Apps
 
-An **app** is one of Legion's add-ons: the autoscaler, and whatever you
-install from a manifest. It is three things:
+An **app** is one of Legion's add-ons: the autoscaler, the ingress, and
+whatever you install from a manifest. It is three things:
 
 1. a **job** in the reserved `legion-system` namespace;
 2. a **grant**: what that job's `legion` identity may do in Legion
@@ -26,8 +26,9 @@ makes it an app is around the job.
 
 ```console
 $ legion app list
-NAME        VERSION  SOURCE   STATUS   PLACEMENT  REPLICAS  UI   DETAIL
-autoscaler  0.1.0    bundled  running  managers   1/1       -    on legion-system-x8f2k1qz
+NAME        VERSION  SOURCE   STATUS   PLACEMENT  REPLICAS  UI                    DETAIL
+autoscaler  0.1.0    bundled  running  managers   1/1       nav, job, task, node  on legion-system-x8f2k1qz
+ingress     0.1.0    bundled  stopped  managers   0/0       nav, job              disabled
 
 $ legion app status autoscaler
 $ legion app logs autoscaler -f
@@ -40,10 +41,13 @@ $ legion app install ./deployer.ncl
 ## Bundled and installed apps
 
 **Bundled apps** are compiled into the `legion` binary. Today there are
-three: `autoscaler`, `certs`, and `gitops`. The first manager to lead a new cluster's control plane
-**seeds** a record for each bundled app, enabled, with its manifest's
+four, `autoscaler`, `certs`, `gitops`, and `ingress`. The first manager to
+lead a new cluster's control plane **seeds** a record for each bundled app, with its manifest's
 permissions granted by `legion:bootstrap`, and the app starts with nothing
-configured. A bundled app runs the node's own binary: its job's command is
+configured. The autoscaler, certs, and gitops are seeded enabled. The ingress is seeded
+disabled, because it takes ports 80 and 443 on the nodes it runs on:
+`legion app enable ingress` turns it on, or `apps.ingress.enabled = true`
+in the manager config seeds it on ([Seeding](#seeding-and-the-manager-config)). A bundled app runs the node's own binary: its job's command is
 `legion:self app run <name>` (see [Inside an app](#inside-an-app)), so it is
 always the same build as the node that runs it, with nothing to download.
 
@@ -104,12 +108,36 @@ as Let's Encrypt, a private CA kept in KV, or self-signed) and
 certificate goes to), each requiring of its writer `kv` access to every
 key it names. Its grant is `kv` read and write under its reserved
 `legion/apps/certs/` (one ACME account key per Issuer), and `kv` read and
-write on `*` with `via = "objects"`: every other key it reads or writes, it
-does acting for the object that names it, so its own credential can touch
-no user key at all. It runs one replica and takes no config. Its UI is a
+write on `*` and `legion/apps/*` with `via = "objects"`: every other key it
+reads or writes, it does acting for the object that names it, so its own
+credential can touch no user key at all, and it reaches another app's
+private prefix only for that app's own Certificates (the ingress keeps its
+certificates that way). It runs one replica and takes no config. Its UI is a
 Certificates page in the sidebar and a card on the cluster overview.
 `legion cert renew` re-issues a certificate now, and `legion cert http01`
 is the stateless HTTP-01 responder it pairs with.
+
+The **ingress** routes public hostnames to services
+([ingress.md](ingress.md)). Its manifest declares one jobspec key,
+`ingress` on a task's `service` block (`{ host, path, stripPath }`), with
+`validate = true` so the running app refuses a host and path another job
+already serves. It reads the values over `WatchAppExtensions`, resolves each
+routed service's endpoints, and proxies on ports 80 and 443. Its task keeps
+`CAP_NET_BIND_SERVICE` through `hardening.capabilities.add`, so it binds
+those ports as its own uid. It gets certificates from the cert manager: one
+`certs/Certificate` in `legion-system` per routed host its Issuer can prove,
+written under its reserved `legion/apps/ingress/`, with HTTP-01 answered on
+port 80 from the Issuer's account thumbprint and one writer per cluster by a
+KV lock. Unless its config names another Issuer it keeps its own, `ingress`
+(Let's Encrypt, HTTP-01, for `legion-system` only). Its job declares the
+catalog service `legion-system/ingress`, which it reads back to show where
+DNS should point. Its grant is `job:read` in every namespace (the catalog)
+and on its own job, `kv` read and write under `legion/apps/ingress/`,
+`certs/Certificate` read and write in `legion-system`, `certs/Issuer` read,
+and `certs/Issuer` write on `ingress` alone. Its config takes
+`certificates`, `issuer`, `acme` (`server`, `email`; `issuer` and
+`acme.server` are code fields), and `redirectHttps`. Its UI is an Ingress
+page in the sidebar and a panel on the page of each job it routes.
 
 **Installed apps** come from a manifest file or URL (`legion app install`).
 They carry their own `version`, run their own code (an artifact or an image,
@@ -122,17 +150,23 @@ A manager config may set seed-time settings for bundled apps:
 ```nickel
 # configs/manager.ncl
 apps = {
-  autoscaler = { enabled = false },   # also: placement, replicas, config
+  autoscaler = { enabled = false },   # also: placement, pool, replicas, config
+  # The ingress on an edge pool from the start, one per edge node.
+  ingress = { enabled = true, placement = "workers", pool = "edge", replicas = "per-node" },
 },
 ```
+
+`enabled` defaults to the app's own seed default: `true` for the
+autoscaler, certs, and gitops, `false` for the ingress.
 
 The block is read **only when a bundled app's record is first seeded**.
 Managers can disagree about their config, and the record is the single
 source of truth afterwards, so later edits do nothing; a manager that finds
 the block for an app that already exists logs that it was not applied. Use
 `legion app` from then on. A `config` that does not match the app's schema,
-or a bad `placement` or `replicas`, is logged and replaced with the
-manifest's default.
+or a bad `placement`, `pool`, or `replicas`, is logged and replaced with
+the manifest's default. A `pool` with `managers` placement is one of those:
+apps on managers run on their system workers.
 
 ## The manifest
 
@@ -144,7 +178,7 @@ A manifest is Nickel or JSON. Unknown fields are errors.
   description = "Deploys jobs from git repositories.",
   version = "0.2.0",                     # required for installed apps
   placement = "managers",                # managers (default) | workers | any
-  replicas = 1,                          # default 1, at most 32
+  replicas = 1,                          # default 1, at most 32; or "per-node"
   job = {                                # a jobspec, minus name and namespace
     task = {
       name = "sync",
@@ -181,7 +215,7 @@ complete example with comments.
 | `description` | One line. |
 | `version` | Required for an installed app, any non-blank string without spaces; a bundled manifest has none. |
 | `placement` | Where the app runs by default ([Placement](#placement)). |
-| `replicas` | Each task's `count` by default. |
+| `replicas` | How many copies of each task run by default: a number (1-32), or `"per-node"` for one on every node the placement and pool allow ([Replicas](#replicas)). |
 | `job` | A jobspec without `name` or `namespace`, which Legion sets. Must define `task` or `tasks`, and parse as a jobspec. An `exec` task may not set `user`, and nothing in it may be host-level besides the `exec` runtime itself ([Trust model](#trust-model)). |
 | `permissions` | ACL rules in the shape `legion acl policy apply` takes: what the app's `legion` identity asks to be granted. A rule with `via = "objects"` holds only while the app acts for one of its objects, within that object's recorded authority; its own credential cannot use it, and an app with no `kinds` may not ask for one ([App Objects: Acting for an object](app-objects.md#acting-for-an-object)). The installer must hold every rule, `via` ones included. |
 | `ui` | UI registrations: the slots the app's views appear in, the actions they offer, the port they are served on, and the refresh interval ([Views and actions](#views-and-actions)). Unknown fields are errors. |
@@ -198,7 +232,8 @@ The reconciler renders the app's job from the record, as a pure function of
 it (and, for a bundled app, the build marker):
 
 - the manifest's `job`, named `legion-system/<app>`;
-- every task's `count` is the app's `replicas`;
+- every task's `count` is the app's `replicas`, or
+  `{ num = 1, per = "id" }` for per-node;
 - the placement becomes each task's `permit`, constraints, and affinities
   (below), replacing the manifest's permit and adding to its constraints;
 - `resources` from `legion app set --cpu/--memory` override each task's;
@@ -431,6 +466,7 @@ $ legion app disable autoscaler     # stops the job; keeps the record, config, a
 $ legion app enable autoscaler
 ```
 
+`--replicas` takes a number or `per-node` ([Replicas](#replicas)).
 `--pool` picks the worker pool for `workers` and `any` placement. Changing
 `--placement` or `--pool` needs `operator:write` as well as `app:write`
 ([Placement](#placement)); replicas and resources need only `app:write`.
@@ -598,6 +634,38 @@ term: it tries everything once.
   or 429 fails the submit with `Unavailable`, which backs off and retries
   like any other failure; a reference that does not resolve (a tag that
   does not exist, refused credentials) is still a refusal.
+
+### Replicas
+
+`replicas` is how many copies of each of the app's tasks run:
+
+- **A number, 1 to 32.** That many, wherever the scheduler places them.
+  Right for an app whose replicas share work, such as the autoscaler's
+  shards.
+- **`per-node`.** One on every node the app's placement and pool allow,
+  following nodes as they join and leave: the job's tasks get
+  `count = { num = 1, per = "id" }`. Right for an app that serves the node
+  it runs on. The [ingress](ingress.md) defaults to it: on managers, one
+  per manager; on an edge pool, one per edge node.
+
+```console
+$ legion app set ingress --replicas per-node
+ingress: settings changed (replicas 1 → per-node)
+$ legion app status ingress
+  Settings:   managers, one per node
+```
+
+A per-node app's desired count is what the scheduler placed for its job's
+latest version, and it reads `running` when every one of those is healthy.
+A node where it should run but could not be placed (a port another job
+holds, no room) is not in that count: `legion job info legion-system/<app>`
+says why it is blocked. There is no cap on per-node replicas; the pool
+bounds them, so per-node with `workers` on a shared pool, or with `any`,
+runs a copy on every such node.
+
+Over the API, `UpdateAppSettings` takes `per_node = true` for per-node and
+`replicas` for a number. Setting both, or `per_node = false` alone, is
+refused. `AppSettingsInfo` reports `per_node`, with `replicas` 0.
 
 ### Status
 
@@ -1833,7 +1901,7 @@ manager cannot decode), from the leading manager ([Metrics](metrics.md)).
 | `legion app logs <app> [-f] [--stream S] [--tail]` | `legion job logs legion-system/<app>` |
 | `legion app config get <app>`, `config schema <app>` | `GetApp` |
 | `legion app config set <app> -f <file> [--dry-run]` | `SetAppConfig` |
-| `legion app set <app> [--replicas N] [--placement P] [--pool P] [--cpu MHZ] [--memory MIB] [--dry-run]` | `UpdateAppSettings` |
+| `legion app set <app> [--replicas N\|per-node] [--placement P] [--pool P] [--cpu MHZ] [--memory MIB] [--dry-run]` | `UpdateAppSettings` |
 | `legion app enable <app>`, `disable <app>` `[--dry-run]` | `SetAppEnabled` |
 | `legion app install <file|url> [--config F] [--yes] [--dry-run] [--key P.K=NEW]` | `InstallApp` |
 | `legion app upgrade <app> <file|url> [--config F] [--yes] [--force] [--dry-run]` (`--force` also to drop a kind that has objects) | `UpgradeApp` |
@@ -1959,7 +2027,8 @@ them, and which allocation answered. The MCP server exposes
   scratch.
 - **No rollback verb.** The record keeps only the installed manifest: to go
   back, `legion app upgrade` with the previous manifest file.
-- **An app's job is not autoscaled.** Its count is the app's `replicas`;
+- **An app's job is not autoscaled.** Its count is the app's `replicas`
+  (a number, or one per node);
   `ScaleTask` on it is refused, the autoscaler's included.
 - **Reverting is gone; refusing replaced it.** A tool that syncs
   `legion-system` jobs directly gets `FailedPrecondition` for installed

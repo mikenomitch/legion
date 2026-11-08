@@ -574,7 +574,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#68](https://github.com/mikenomitch/legion/pull/68) | Fixes for the 2026-11-07 architecture review: the raft write path (group commit, one execution per entry, data migrations in the log, a raft log tail sized by bytes), placement and commit cost, the mesh control path, revisions and watches, the device model and plugin seams, and agent governance (audit journal, child tokens, approvals, rate limits, usage, MCP 2025-06-18) | Six plans, each with a calls doc; their items are checked off and in Done, the deferrals are open under their areas, and per-finding status is in the review doc. AI8 (microVM isolation) was not attempted |
+| [#65](https://github.com/mikenomitch/legion/pull/65) | The bundled ingress: `service.ingress` routes, a proxy on 80/443, automatic HTTPS through the cert manager, where to point DNS, and exec `capabilities.add` | Plan [ingress-app-plan.md](plans/ingress-app-plan.md); Phases 1–2 in Done (Ecosystem apps), Phase 3 open under "Ingress" |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
 | [#37](https://github.com/mikenomitch/legion/pull/37) | An appearance picker with built-in themes and custom colors | UI only |
@@ -4028,8 +4028,6 @@ Still unplanned, and not covered by the plan:
 - [ ] CNI, or a custom networking plugin that can speak CNI
 - [ ] Networking fingerprinters (so service discovery can pick a datapath per node)
 - [ ] Port forwarding
-- [ ] Cluster-edge ingress load balancer. The plan's ingress is node-local,
-      in front of one allocation; a cluster edge is separate work
 - [x] A KV-held client CA for mutual ingress: shipped as
       `network.ports[].tls.clients.ca = { kv }` in
       [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md) S5
@@ -4039,8 +4037,10 @@ Still unplanned, and not covered by the plan:
       The ACME client itself shipped in the cert manager
       ([cert-manager.md](../docs/cert-manager.md)), which answers HTTP-01
       through the stateless `legion cert http01` responder
-      ([calls 3](calls/cert-manager-plan_calls.md)). Only worth it once the
-      cluster edge above exists.
+      ([calls 3](calls/cert-manager-plan_calls.md)). The bundled ingress
+      answers it for the hosts it routes
+      ([ingress.md](../docs/ingress.md#automatic-certificates)); this item
+      is what is left: a task's own TLS port with no ingress in front.
 
 Credential injection: [egress-credential-injection-plan.md](plans/egress-credential-injection-plan.md)
 · calls: [egress-credential-injection-plan_calls.md](calls/egress-credential-injection-plan_calls.md)
@@ -5181,7 +5181,6 @@ plan.
         `service.concurrency` once netd attributes ingress requests, keyed
         and `count.per` autoscaling, consolidation, predictive and vertical
         strategies, WASM strategies.
-- [ ] Ingress proxy / load balancer (also listed under *Networking*)
 - [ ] **GitOps follow-ups** (the bundled app shipped; see Done:
       [plan](plans/gitops-plan.md) · [calls](calls/gitops-plan_calls.md) ·
       docs: [gitops.md](../docs/gitops.md)). Deliberately deferred, each a
@@ -5212,7 +5211,73 @@ plan.
         would make every preflight complete.
   - [ ] With ACLs off nothing is stamped, so two Repos that define one job
         flip it between them instead of one being refused.
-- [ ] Ingress proxy / load balancer (also listed under *Networking*)
+- [ ] **Ingress** ([#65](https://github.com/mikenomitch/legion/pull/65)):
+      [plan](plans/ingress-app-plan.md) (IN EXECUTION; Phases 1 and 2 in
+      Done) · [calls](calls/ingress-app-plan_calls.md) · docs:
+      [ingress.md](../docs/ingress.md). Phase 3 and what building it
+      uncovered:
+  - [ ] **Watch the catalog instead of polling it.** The ingress resolves
+        every routed service every 2 seconds; a `WatchServices` stream
+        (also *Service discovery & the mesh*: "A watchable catalog") would
+        route a new instance within a heartbeat and drop the polling load
+        ([calls 9](calls/ingress-app-plan_calls.md)).
+  - [ ] **Per-namespace host ownership**: `domains = [{ namespaces, hosts }]`
+        in the app config, enforced by the validate call and at serve. Today
+        the first claim wins, so on a shared cluster any job author can
+        claim (and get a certificate for) an unclaimed name DNS points at
+        the ingress ([calls 13](calls/ingress-app-plan_calls.md);
+        [docs](../docs/ingress.md#security)).
+  - [ ] **HTTP/2 and gRPC to services** (`meta.protocol = "h2c"` or
+        `"grpc"`); services get HTTP/1.1 only
+        ([calls 12](calls/ingress-app-plan_calls.md)).
+  - [ ] **Metrics and an access log**: request counts, latency, and status
+        per route on the `api` port, and an NDJSON access log like the
+        datapath's.
+  - [ ] **Wake on request through the ingress**: resume a suspended keyed
+        instance or scale a service from zero on a request (the
+        autoscaler's reserved `wake` source; the gateway does it for keyed
+        instances by id today).
+  - [ ] **TCP and TLS passthrough routes** (SNI-routed, no termination).
+  - [ ] **HSTS**, opt-in per route or in the app config.
+  - [ ] **IPv6 listeners.** The proxy binds `0.0.0.0` only.
+  - [ ] **No gap on upgrade.** A rolling update releases ports 80 and 443
+        before the new replica binds them (static ports stop the old
+        holder first), so each node stops answering for a few seconds.
+        Socket activation, the worker holding the listener across task
+        restarts, would close it
+        ([calls 2](calls/ingress-app-plan_calls.md), alternative b).
+  - [ ] **Issue for the ingress against a real CA once.** CI runs the
+        cert manager issuing for the ingress against the cert manager's fake
+        ACME CA, which validates HTTP-01 through the ingress
+        (`certs::the_ingress_serves_what_the_cert_manager_issues_for_it_test`).
+        Neither has been run against Pebble or Let's Encrypt staging.
+  - [ ] **A load benchmark.** Requests per second and p99 latency through
+        the proxy, plain and TLS, against a trivial backend, on one CPU (the
+        system worker's default lend) and on a dedicated node, so the docs'
+        sizing advice has numbers behind it.
+  - [ ] **A connection limit.** Nothing caps concurrent client connections
+        or the TLS handshake rate; under a flood the app's memory ceiling
+        is the limit. A per-replica `maxConnections` in the config, with a
+        `503` past it.
+  - [ ] **Multi-replica first registration.** Each replica polls the
+        Issuer's thumbprint every 5 s until it has it, so for a few seconds
+        after a new Issuer registers, a challenge reaching another replica
+        gets `503` and the cert manager backs off 5 minutes
+        ([calls 7](calls/ingress-app-plan_calls.md)). Watching the Issuer
+        (`WatchObjects` for a non-owner) would close it.
+  - [ ] **The DNS check is from the ingress's node** and covers exact names
+        only; a check from outside the cluster (or the CA's view) would
+        catch split-horizon surprises
+        ([calls 8](calls/ingress-app-plan_calls.md)).
+  - [ ] **A per-node app's count misses nodes it could not place on.** Its
+        desired count is what the scheduler placed, so a node where a port
+        is taken reads as nothing missing in `legion app status`; only
+        `legion job info` shows the block
+        ([calls 3](calls/app-per-node-replicas-plan_calls.md)). Surfacing the
+        job's blocked placements in the app's status would close it.
+  - [ ] **Check bundled apps' keys offline.** `legion job validate` without
+        a manager reports `ingress` as not checked, though its schema is
+        compiled into the binary.
 - [ ] **Cert manager follow-ups.** Phase 1 shipped (see Done, Ecosystem
       apps): [plan](plans/cert-manager-plan.md) ·
       [calls](calls/cert-manager-plan_calls.md) ·
@@ -5562,6 +5627,16 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 ## Cross-cutting
 
+- [ ] **Nickel evaluation has no memory or step bound.** A record field
+      that names itself (`host = { oneOf = [host] }`, where the author meant
+      an outer `let host`) evaluates forever and exhausts memory instead of
+      failing. Found while writing the ingress's manifest, where it took
+      down the unit-test process. `config_lang::eval_sandboxed` evaluates
+      bundled manifests in the manager and the CLI evaluates every jobspec
+      and installed manifest the same way, so a bad file (or one fetched
+      from a URL by `legion app install`) can exhaust the CLI's or a
+      manager's memory. A step budget or a deep-eval depth limit would turn
+      it into an error.
 - [ ] **AWS spot-check re-run (2026-10-12): open papercuts.** Found on the
       rig, not fixed on `spot-check/fixes-2026-10-12`
       ([findings](launch-spot-check-findings.md#re-run-2026-10-12)).
@@ -7105,7 +7180,7 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
 
 ## Ecosystem apps
 
-- [x] **GitOps: the bundled `gitops` app** (2026-11-07, in flight in
+- [x] **GitOps: the bundled `gitops` app** (2026-11-07, merged in
       [#66](https://github.com/mikenomitch/legion/pull/66);
       [plan](plans/gitops-plan.md) ·
       [calls](calls/gitops-plan_calls.md) · docs:
@@ -7133,7 +7208,85 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
   - [x] Found on the way: a kind's `requires` with `job:read` recorded a
         band on the read, so the authority rule matched no read at all;
         reads carry no band now (`resolve_requirements`).
-- [x] **Cert manager built in** (2026-11-07, in flight in
+- [x] **Ingress, Phases 1 and 2: routes on services and automatic HTTPS**
+      (2026-11-07, certificates reworked onto the cert manager 2026-11-08;
+      [plan](plans/ingress-app-plan.md) ·
+      [calls](calls/ingress-app-plan_calls.md) · docs:
+      [ingress.md](../docs/ingress.md), [apps.md](../docs/apps.md),
+      [cert-manager.md](../docs/cert-manager.md#http-01),
+      [task-supervision.md](../docs/task-supervision.md#process-hardening)).
+      Closes *Networking*'s "Cluster-edge ingress load balancer".
+  - [x] The bundled `ingress` app (`src/apps/bundled/ingress.ncl`,
+        `src/apps/ingress/`), seeded **disabled** (`BundledApp.seed_enabled`;
+        `apps.ingress.enabled` in the manager config seeds it on), placed on
+        managers, one replica per node by static ports 80 and 443.
+  - [x] `service.ingress = { host, path, stripPath }`: a `service`-point
+        jobspec key with `validate = true`; the running app refuses a host
+        and path another job serves and warns about names no public CA
+        issues for.
+  - [x] The proxy: a per-request hyper server (HTTP/1.1, HTTP/2 by ALPN or
+        prior knowledge), routes by exact host then `*.` parent, longest
+        path prefix first; power-of-two-choices balancing; pooled HTTP/1.1
+        to services; retries only requests that never left; WebSocket and
+        HTTP/1.1 upgrades; `X-Forwarded-For/-Proto/-Host`; the standard
+        error envelope with `Legion-Ingress-Error`; graceful drain on stop.
+  - [x] Endpoints from `ResolveService` every 2 s and on route changes,
+        filtered to the declaring job and task; fail static; mesh-only
+        endpoints reported.
+  - [x] HTTPS by SNI from KV: operator bundles under
+        `legion/apps/ingress/certs/` (winning) and the cert manager's under
+        `legion/apps/ingress/issued/<name>`; the `308` redirect.
+  - [x] Certificates from the cert manager
+        ([calls 1](calls/ingress-app-plan_calls.md); plan §6.7): one
+        `certs/Certificate` in `legion-system` per routed host the Issuer
+        can prove, dropped with its route; HTTP-01 answered on port 80 from
+        the Issuer's thumbprint (`certs::http01::answer`); new Certificates
+        wait for an HTTP-01 Issuer's account
+        ([calls 7](calls/ingress-app-plan_calls.md)); a default `ingress`
+        Issuer kept from `acme { server, email }`, or any Issuer named in
+        `issuer` (DNS-01 for wildcards, `ca` for internal names); one writer
+        by KV lock. The first build's in-tree RFC 8555 client was removed
+        before merge.
+  - [x] The cert manager's `via = "objects"` KV rule names `legion/apps/*`,
+        so it writes an app's private prefix for that app's own
+        Certificates ([calls 4](calls/ingress-app-plan_calls.md)).
+  - [x] Where to point DNS ([calls 8](calls/ingress-app-plan_calls.md);
+        plan §6.8): the ingress's job declares `legion-system/ingress`, so
+        `legion service resolve legion-system/ingress` lists its addresses
+        (public first); the page's **Point DNS here** block, and a DNS
+        column checking each routed host from the ingress's node.
+  - [x] The Ingress page (sidebar) and a job panel, filtered to the
+        viewer's namespaces; `/healthz` with route and certificate counts.
+  - [x] `hardening.capabilities.add = ["net_bind_service"]` on `exec`
+        tasks: an ambient `CAP_NET_BIND_SERVICE`, and nothing else, kept
+        across the switch to `user`
+        ([calls 2](calls/ingress-app-plan_calls.md)).
+  - [x] Tests: unit tests per module; `tests/integration/ingress.rs` (the
+        real proxy against loopback backends: routing, h2, balancing and
+        retries, upgrades, SNI and redirects; a Certificate per host, a
+        named Issuer, HTTP-01 from the thumbprint, the DNS check);
+        `certs::the_ingress_serves_what_the_cert_manager_issues_for_it_test`
+        (the real cert manager issuing for the ingress, HTTP-01 validated
+        through it); `app_extensions::the_bundled_ingress_routes_reach_its_identity_test`
+        (the key at submit, the watch, the app's grant on KV, its own
+        service, Certificates, and its Issuer); the seeding tests.
+- [x] **Per-node replicas for apps; the ingress on every node it is placed
+      on** (2026-11-08, on the ingress PR
+      [#65](https://github.com/mikenomitch/legion/pull/65);
+      [plan](plans/app-per-node-replicas-plan.md) ·
+      [calls](calls/app-per-node-replicas-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md#replicas),
+      [ingress.md](../docs/ingress.md#where-it-runs)).
+  - [x] `replicas` takes a number or `"per-node"` in a manifest, `legion app
+        set --replicas`, and the seed config; per-node renders
+        `count = { num = 1, per = "id" }`; `UpdateAppSettings` and
+        `AppSettingsInfo` gain `per_node`; a per-node app's desired count is
+        what the scheduler placed for its latest version.
+  - [x] The seed config takes `pool` (`apps.ingress = { placement =
+        "workers", pool = "edge" }`).
+  - [x] The ingress defaults to per-node: every manager, or every node of
+        its edge pool.
+- [x] **Cert manager built in** (2026-11-07, merged in
       [#64](https://github.com/mikenomitch/legion/pull/64);
       [plan](plans/cert-manager-plan.md) ·
       [calls](calls/cert-manager-plan_calls.md) · docs:

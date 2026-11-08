@@ -35892,7 +35892,7 @@ export class ListAppsReply extends Message<ListAppsReply> {
  */
 export class AppSettingsInfo extends Message<AppSettingsInfo> {
   /**
-   * Copies of each task. 1-32.
+   * Copies of each task, 1-32. 0 when `per_node` is set.
    *
    * @generated from field: uint32 replicas = 1;
    */
@@ -35927,6 +35927,18 @@ export class AppSettingsInfo extends Message<AppSettingsInfo> {
    */
   pool?: string;
 
+  /**
+   * One copy of each task on every node the placement and pool allow
+   * (`replicas = "per-node"` in a manifest, `legion app set --replicas
+   * per-node`), following nodes as they join and leave: the job's tasks get
+   * `count = { num = 1, per = "id" }`. `replicas` is 0 then, and the app's
+   * `desired` count is the allocations the scheduler placed (docs/apps.md,
+   * "Settings").
+   *
+   * @generated from field: bool per_node = 6;
+   */
+  perNode = false;
+
   constructor(data?: PartialMessage<AppSettingsInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -35940,6 +35952,7 @@ export class AppSettingsInfo extends Message<AppSettingsInfo> {
     { no: 3, name: "cpu", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
     { no: 4, name: "memory", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
     { no: 5, name: "pool", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "per_node", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppSettingsInfo {
@@ -39717,6 +39730,9 @@ export class UpdateAppSettingsRequest extends Message<UpdateAppSettingsRequest> 
   name = "";
 
   /**
+   * A fixed number of copies of each task, 1-32. Setting it turns
+   * per-node off.
+   *
    * @generated from field: optional uint32 replicas = 2;
    */
   replicas?: number;
@@ -39764,6 +39780,16 @@ export class UpdateAppSettingsRequest extends Message<UpdateAppSettingsRequest> 
    */
   dryRun = false;
 
+  /**
+   * `true` runs one copy of each task on every node the placement and pool
+   * allow (`legion app set --replicas per-node`). Set `replicas` instead to
+   * go back to a fixed number; `false` alone is refused, since it does not
+   * say how many.
+   *
+   * @generated from field: optional bool per_node = 9;
+   */
+  perNode?: boolean;
+
   constructor(data?: PartialMessage<UpdateAppSettingsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -39780,6 +39806,7 @@ export class UpdateAppSettingsRequest extends Message<UpdateAppSettingsRequest> 
     { no: 6, name: "pool", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 7, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 8, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 9, name: "per_node", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpdateAppSettingsRequest {

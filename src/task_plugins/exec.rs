@@ -774,6 +774,12 @@ fn configure_linux_process_options(
     let options = options.clone();
     let task_name = task_name.to_string();
     let allocation_id = *allocation_id;
+    // Computed before the fork: nothing in the child allocates for it.
+    let keep_capabilities = options
+        .hardening
+        .as_ref()
+        .map(ExecHardeningConfig::capabilities_to_keep)
+        .unwrap_or_default();
     unsafe {
         cmd.pre_exec(move || {
             // Ordered by privilege: everything that needs the worker's
@@ -837,7 +843,16 @@ fn configure_linux_process_options(
             // 4. Become the task user, now that the privileged work is done.
             //    Supplementary groups go first: without `setgroups`, the
             //    task would keep every group the worker belongs to.
+            //    `capabilities.add` keeps its one capability across the
+            //    switch: KEEPCAPS holds the permitted set through `setuid`,
+            //    then the sets are cut to exactly the kept bits and raised as
+            //    ambient, which survives `exec` of a plain binary.
             if let Some(ref user) = options.user {
+                if !keep_capabilities.is_empty()
+                    && libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if libc::setgroups(0, std::ptr::null()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -846,6 +861,9 @@ fn configure_linux_process_options(
                 }
                 if libc::setuid(user.uid) != 0 {
                     return Err(std::io::Error::last_os_error());
+                }
+                if !keep_capabilities.is_empty() {
+                    keep_only_capabilities(&keep_capabilities)?;
                 }
             }
 
@@ -886,6 +904,65 @@ fn configure_linux_process_options(
             .unwrap_or_default(),
         "Configured Linux process options for exec task"
     );
+    Ok(())
+}
+
+/// After the user switch, cut the permitted, effective, and inheritable
+/// sets to exactly `bits` and raise each as an ambient capability, so the
+/// task's `exec` keeps them and nothing else (`capabilities.add`). Runs in
+/// the forked child; any failure fails the start rather than leave the task
+/// with more than it asked for.
+#[cfg(target_os = "linux")]
+fn keep_only_capabilities(bits: &[i32]) -> std::io::Result<()> {
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+    let mut data = [CapData::default(); 2];
+    for &bit in bits {
+        let (word, mask) = ((bit / 32) as usize, 1u32 << (bit % 32));
+        if word >= data.len() {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        data[word].effective |= mask;
+        data[word].permitted |= mask;
+        data[word].inheritable |= mask;
+    }
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    // SAFETY: capset reads one header and two data words, both owned here.
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for &bit in bits {
+        // SAFETY: plain prctl calls on this process.
+        if unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_RAISE as libc::c_ulong,
+                bit as libc::c_ulong,
+                0,
+                0,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    // SAFETY: as above. `exec` clears KEEPCAPS anyway; this is tidiness.
+    unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 0, 0, 0, 0) };
     Ok(())
 }
 
@@ -1257,6 +1334,59 @@ mod tests {
             !read_as(mine, &secrets[1])?,
             "an app reads another app's token"
         );
+        Ok(())
+    }
+
+    /// Run as root, `capabilities.add = ["net_bind_service"]` leaves a task
+    /// switched to an unprivileged uid holding exactly that capability
+    /// (effective, permitted, inheritable, and ambient), and a task without
+    /// it holds none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_added_capability_is_the_only_one_a_switched_task_holds() -> R<()> {
+        // SAFETY: a trivial libc getter.
+        if unsafe { libc::geteuid() } != 0 {
+            return Ok(()); // switching users takes root
+        }
+        let caps_of = |add: Vec<String>| -> R<std::collections::BTreeMap<String, u64>> {
+            let uid = crate::structs::app::APP_UID_BASE + 4400;
+            let options = ExecLinuxOptions {
+                hardening: Some(ExecHardeningConfig {
+                    capabilities: Some(crate::task_plugins::exec_isolation::ExecCapabilities {
+                        add,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                user: Some(lookup_user(&uid.to_string())?),
+                ..Default::default()
+            };
+            let mut cmd = Command::new("cat");
+            cmd.arg("/proc/self/status");
+            configure_linux_process_options(&mut cmd, &options, &0, "caps")?;
+            let output = cmd.output()?;
+            assert!(output.status.success(), "{output:?}");
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(key, _)| key.starts_with("Cap"))
+                .map(|(key, value)| {
+                    (
+                        key.to_string(),
+                        u64::from_str_radix(value.trim(), 16).unwrap_or(u64::MAX),
+                    )
+                })
+                .collect())
+        };
+        let kept = caps_of(vec!["net_bind_service".into()])?;
+        let bind = 1u64 << 10;
+        for set in ["CapEff", "CapPrm", "CapInh", "CapAmb"] {
+            assert_eq!(kept.get(set), Some(&bind), "{set}: {kept:?}");
+        }
+        let plain = caps_of(Vec::new())?;
+        for set in ["CapEff", "CapPrm", "CapAmb"] {
+            assert_eq!(plain.get(set), Some(&0), "{set}: {plain:?}");
+        }
         Ok(())
     }
 

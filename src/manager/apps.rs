@@ -193,6 +193,18 @@ pub fn task_count(record: &AppRecord) -> u32 {
     count.max(1)
 }
 
+/// How many allocations app `record` should run. A fixed count is
+/// `replicas × tasks`. A per-node app runs what the scheduler placed for
+/// its latest version, one per eligible node (at least one: an app placed
+/// nowhere is not running); the scheduler, not the reconciler, decides
+/// which nodes are eligible (per-node plan calls entry 3).
+pub fn desired_allocations(record: &AppRecord, allocations: &AppJobAllocations) -> u32 {
+    match record.settings.replicas.count() {
+        Some(count) => count.saturating_mul(task_count(record)),
+        None => allocations.latest_live.max(1),
+    }
+}
+
 /// An app's status, as `legion app list` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppStatusView {
@@ -237,8 +249,7 @@ impl AppJobState {
         self.version
             .as_ref()
             .is_some_and(|version| !version.is_stopped() && !version.is_failed())
-            && self.allocations.running
-                >= record.settings.replicas.saturating_mul(task_count(record))
+            && self.allocations.running >= desired_allocations(record, &self.allocations)
     }
 }
 
@@ -260,7 +271,7 @@ pub fn derive_status(
             desired: 0,
         };
     }
-    let desired = record.settings.replicas.saturating_mul(task_count(record));
+    let desired = desired_allocations(record, &job.allocations);
     if !record.state.last_error.is_empty() {
         return AppStatusView {
             status: "degraded",
@@ -360,8 +371,9 @@ pub fn derive_status(
     }
 }
 
-/// The record a bundled app is seeded with: its manifest's defaults, the
-/// manager config's `apps.<name>` overrides, and its permissions granted by
+/// The record a bundled app is seeded with: its manifest's defaults, enabled
+/// as its [`crate::apps::BundledApp::seed_enabled`] says, the manager
+/// config's `apps.<name>` overrides, and its permissions granted by
 /// `legion:bootstrap` (calls entry 17).
 pub fn seed_record(
     manifest: &crate::structs::app::AppManifest,
@@ -370,9 +382,12 @@ pub fn seed_record(
     let now = now_rfc3339();
     let mut settings = AppSettings::from_manifest(manifest);
     let mut config = manifest.default_config();
-    let mut enabled = true;
+    // A bundled app says whether it starts on: the autoscaler does, the
+    // ingress (which takes ports 80 and 443) waits for `legion app enable`.
+    let default_enabled = crate::apps::seeds_enabled(&manifest.name);
+    let mut enabled = default_enabled;
     if let Some(seed) = seed {
-        enabled = seed.enabled.unwrap_or(true);
+        enabled = seed.enabled.unwrap_or(default_enabled);
         if let Some(placement) = &seed.placement {
             match Placement::parse(placement) {
                 Ok(placement) => settings.placement = placement,
@@ -390,6 +405,18 @@ pub fn seed_record(
                 Ok(()) => settings = candidate,
                 Err(err) => {
                     warn!(app = %manifest.name, "apps.{}.replicas: {err}; using the manifest's", manifest.name)
+                }
+            }
+        }
+        if let Some(pool) = &seed.pool {
+            let candidate = AppSettings {
+                pool: Some(pool.trim().to_string()),
+                ..settings.clone()
+            };
+            match candidate.validate() {
+                Ok(()) => settings = candidate,
+                Err(err) => {
+                    warn!(app = %manifest.name, "apps.{}.pool: {err}; using the default pool", manifest.name)
                 }
             }
         }
@@ -1498,6 +1525,7 @@ mod tests {
                 running,
                 previous,
                 live: running + previous,
+                latest_live: running,
                 nodes: Vec::new(),
             },
             rollout: rollout.map(|status| (status.to_string(), "health deadline".to_string())),
@@ -1544,6 +1572,89 @@ mod tests {
         let view = derive_status(&held, &job("active", 1, 0, None), None);
         assert_eq!(view.status, "degraded");
         assert!(view.detail.starts_with("upgrade held: "));
+    }
+
+    /// A per-node app wants what the scheduler placed for its latest
+    /// version, one per eligible node, and runs when every one of them is
+    /// healthy (per-node plan §6.3, calls entry 3).
+    #[test]
+    fn a_per_node_app_wants_what_the_scheduler_placed() {
+        let manifest = crate::apps::bundled_manifest("ingress").expect("bundled");
+        let mut record = seed_record(manifest, None);
+        assert_eq!(
+            record.settings.replicas,
+            crate::structs::app::Replicas::PerNode,
+            "the ingress seeds per-node"
+        );
+        record.enabled = true;
+        let job = |running: u32, latest_live: u32| AppJobState {
+            version: Some(AppJobVersion {
+                status: "running".into(),
+                version: 1,
+                job_config_id: "jc-1".into(),
+                managed_by: None,
+                submitted_by: None,
+            }),
+            allocations: AppJobAllocations {
+                running,
+                previous: 0,
+                live: latest_live,
+                latest_live,
+                nodes: Vec::new(),
+            },
+            rollout: None,
+        };
+        // Three managers, three placed, all healthy.
+        let all = job(3, 3);
+        assert_eq!(derive_status(&record, &all, None).desired, 3);
+        assert_eq!(derive_status(&record, &all, None).status, "running");
+        assert!(all.healthy(&record));
+        // A fourth node joined: its replica is placed but not healthy yet.
+        let joining = job(3, 4);
+        assert_eq!(derive_status(&record, &joining, None).desired, 4);
+        assert_ne!(derive_status(&record, &joining, None).status, "running");
+        assert!(!joining.healthy(&record));
+        // Placed nowhere: not running, whatever the count reads.
+        let none = job(0, 0);
+        assert_eq!(derive_status(&record, &none, None).desired, 1);
+        assert!(!none.healthy(&record));
+        // A fixed count still multiplies by the tasks.
+        record.settings.replicas = crate::structs::app::Replicas::Count(2);
+        assert_eq!(derive_status(&record, &job(2, 2), None).desired, 2);
+    }
+
+    /// The manager config can seed an app per-node on a named pool
+    /// (per-node plan calls entry 5); a pool with managers placement is
+    /// refused with a warning and the default kept.
+    #[test]
+    fn the_seed_takes_per_node_and_a_pool() {
+        use crate::structs::app::{Placement, Replicas};
+        let manifest = crate::apps::bundled_manifest("autoscaler").expect("bundled");
+        let seed = AppSeedConfig {
+            enabled: Some(true),
+            placement: Some("workers".into()),
+            replicas: Some(Replicas::PerNode),
+            pool: Some("edge".into()),
+            config: None,
+        };
+        let record = seed_record(manifest, Some(&seed));
+        assert_eq!(record.settings.placement, Placement::Workers);
+        assert_eq!(record.settings.replicas, Replicas::PerNode);
+        assert_eq!(record.settings.pool.as_deref(), Some("edge"));
+
+        let on_managers = AppSeedConfig {
+            pool: Some("edge".into()),
+            ..Default::default()
+        };
+        let record = seed_record(manifest, Some(&on_managers));
+        assert_eq!(record.settings.pool, None, "managers placement has no pool");
+
+        // The config file spells it as people type it.
+        let parsed: AppSeedConfig = serde_json::from_value(
+            json!({ "enabled": true, "placement": "workers", "pool": "edge", "replicas": "per-node" }),
+        )
+        .expect("parses");
+        assert_eq!(parsed.replicas, Some(Replicas::PerNode));
     }
 
     #[test]

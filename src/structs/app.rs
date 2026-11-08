@@ -138,8 +138,138 @@ fn empty_object() -> Value {
     json!({})
 }
 
-fn default_replicas() -> u32 {
-    1
+/// How `replicas` spells "one on every node": `replicas = "per-node"`.
+pub const PER_NODE: &str = "per-node";
+
+/// How many copies of an app run (docs/apps.md, "Settings"): a fixed number
+/// of each task, or one on every node the app's placement and pool allow.
+/// Written as a number or `"per-node"` in a manifest, the manager config's
+/// seed, and `legion app set --replicas`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replicas {
+    /// This many copies of each task, 1 to [`MAX_APP_REPLICAS`].
+    Count(u32),
+    /// One copy of each task on every node the placement and pool allow,
+    /// following nodes as they join and leave: the job's
+    /// `count = { num = 1, per = "id" }`.
+    PerNode,
+}
+
+impl Default for Replicas {
+    fn default() -> Self {
+        Replicas::Count(1)
+    }
+}
+
+impl Replicas {
+    /// Parse `3` or `per-node`.
+    pub fn parse(text: &str) -> Result<Replicas, String> {
+        let text = text.trim();
+        if text == PER_NODE {
+            return Ok(Replicas::PerNode);
+        }
+        text.parse::<u32>()
+            .map(Replicas::Count)
+            .map_err(|_| format!("replicas: {text:?} is not a number or `{PER_NODE}`"))
+    }
+
+    /// A count is 1 to [`MAX_APP_REPLICAS`]; per-node is bounded by the pool.
+    pub fn validate(self) -> Result<(), String> {
+        match self {
+            Replicas::Count(count) if count == 0 || count > MAX_APP_REPLICAS => Err(format!(
+                "replicas must be 1 to {MAX_APP_REPLICAS}, or {PER_NODE}; to stop an app, disable it"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn is_per_node(self) -> bool {
+        self == Replicas::PerNode
+    }
+
+    /// The fixed count, or `None` for per-node.
+    pub fn count(self) -> Option<u32> {
+        match self {
+            Replicas::Count(count) => Some(count),
+            Replicas::PerNode => None,
+        }
+    }
+
+    /// Every task's `count` in the app's job.
+    pub fn job_count(self) -> Value {
+        match self {
+            Replicas::Count(count) => json!(count),
+            Replicas::PerNode => json!({ "num": 1, "per": "id" }),
+        }
+    }
+}
+
+impl std::fmt::Display for Replicas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Replicas::Count(count) => write!(f, "{count}"),
+            Replicas::PerNode => f.write_str(PER_NODE),
+        }
+    }
+}
+
+impl Serialize for Replicas {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Replicas::Count(count) => serializer.serialize_u32(*count),
+            Replicas::PerNode => serializer.serialize_str(PER_NODE),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Replicas {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ReplicasVisitor;
+        impl serde::de::Visitor<'_> for ReplicasVisitor {
+            type Value = Replicas;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a whole number or \"{PER_NODE}\"")
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Replicas, E> {
+                u32::try_from(value)
+                    .map(Replicas::Count)
+                    .map_err(|_| E::custom(format!("replicas {value} is too large")))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Replicas, E> {
+                u32::try_from(value)
+                    .map(Replicas::Count)
+                    .map_err(|_| E::custom(format!("replicas {value} is not a whole number")))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Replicas, E> {
+                if value.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&value) {
+                    Ok(Replicas::Count(value as u32))
+                } else {
+                    Err(E::custom(format!("replicas {value} is not a whole number")))
+                }
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Replicas, E> {
+                Replicas::parse(value).map_err(E::custom)
+            }
+        }
+        deserializer.deserialize_any(ReplicasVisitor)
+    }
+}
+
+impl JsonSchema for Replicas {
+    fn schema_name() -> String {
+        "Replicas".to_string()
+    }
+
+    fn json_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        serde_json::from_value(json!({
+            "description": "Copies of each task (1-32), or \"per-node\": one on every node the placement and pool allow.",
+            "oneOf": [
+                { "type": "integer", "minimum": 1, "maximum": MAX_APP_REPLICAS },
+                { "const": PER_NODE },
+            ],
+        }))
+        .unwrap_or(schemars::schema::Schema::Bool(true))
+    }
 }
 
 /// One `codeFields` entry: a JSON pointer into the app's config whose value
@@ -204,9 +334,11 @@ pub struct AppManifest {
     /// `any`. The operator can change it (`legion app set --placement`).
     #[serde(default)]
     pub placement: Placement,
-    /// How many copies run by default (each task's `count`). Default 1.
-    #[serde(default = "default_replicas")]
-    pub replicas: u32,
+    /// How many copies run by default: a number (each task's `count`), or
+    /// `"per-node"` (one on every node the placement and pool allow).
+    /// Default 1.
+    #[serde(default)]
+    pub replicas: Replicas,
     /// A jobspec fragment: everything but `name` and `namespace`, which
     /// Legion sets. Its `task` or `tasks` are the app's.
     #[schemars(with = "serde_json::Map<String, Value>")]
@@ -475,11 +607,8 @@ impl AppManifest {
             }
             (None, true) => {}
         }
-        if self.replicas == 0 || self.replicas > MAX_APP_REPLICAS {
-            return Err(format!(
-                "app {}: `replicas` must be 1 to {MAX_APP_REPLICAS}",
-                self.name
-            ));
+        if let Err(err) = self.replicas.validate() {
+            return Err(format!("app {}: `replicas`: {err}", self.name));
         }
         self.validate_job()?;
         let rules = serde_json::to_string(&self.permissions).map_err(|err| err.to_string())?;
@@ -807,7 +936,7 @@ pub struct AppResources {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
-    pub replicas: u32,
+    pub replicas: Replicas,
     pub placement: Placement,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<AppResources>,
@@ -834,11 +963,7 @@ impl AppSettings {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.replicas == 0 || self.replicas > MAX_APP_REPLICAS {
-            return Err(format!(
-                "replicas must be 1 to {MAX_APP_REPLICAS}; to stop an app, disable it"
-            ));
-        }
+        self.replicas.validate()?;
         if let Some(resources) = &self.resources {
             if resources.cpu == Some(0) || resources.memory == Some(0) {
                 return Err("resources.cpu and resources.memory must be at least 1".into());
@@ -1375,7 +1500,8 @@ pub struct RenderedApp {
 ///
 /// - the manifest's `job`, with its name and namespace forced
 ///   (`legion-system/<app>`);
-/// - `replicas` becomes every task's `count`;
+/// - `replicas` becomes every task's `count` (`{ num = 1, per = "id" }` for
+///   per-node);
 /// - placement becomes the permit and the constraints or affinity (§6.2);
 /// - `settings.resources` overrides each task's CPU and memory;
 /// - exec tasks run as the app's own uid and gid ([`AppRecord::uid`]);
@@ -1416,7 +1542,7 @@ pub fn render_app_job(record: &AppRecord, ctx: RenderContext<'_>) -> Result<Rend
     let grant_rules = serde_json::to_value(&record.grant.rules).map_err(|err| err.to_string())?;
 
     for_each_task(&mut job, |task| {
-        task.insert("count".into(), json!(record.settings.replicas));
+        task.insert("count".into(), record.settings.replicas.job_count());
         task.insert("permit".into(), permit.clone());
 
         let mut constraints = rules_as_array(task.get("constraints"));
@@ -2008,10 +2134,71 @@ mod app_tests {
         assert!(err.contains("no uid"), "{err}");
     }
 
+    /// `replicas` is a number or `per-node`, in every spelling a person or
+    /// a stored record uses (per-node plan §6.1).
+    #[test]
+    fn replicas_are_a_number_or_per_node() {
+        assert_eq!(Replicas::parse("3"), Ok(Replicas::Count(3)));
+        assert_eq!(Replicas::parse(" per-node "), Ok(Replicas::PerNode));
+        let err = Replicas::parse("two").expect_err("not a number");
+        assert!(err.contains("is not a number or `per-node`"), "{err}");
+        // Stored records and manifests: a number, or the string.
+        assert_eq!(
+            serde_json::from_value::<Replicas>(json!(2)).expect("number"),
+            Replicas::Count(2)
+        );
+        assert_eq!(
+            serde_json::from_value::<Replicas>(json!(1.0)).expect("a whole float"),
+            Replicas::Count(1)
+        );
+        assert_eq!(
+            serde_json::from_value::<Replicas>(json!("per-node")).expect("string"),
+            Replicas::PerNode
+        );
+        assert!(serde_json::from_value::<Replicas>(json!(1.5)).is_err());
+        assert!(serde_json::from_value::<Replicas>(json!("all")).is_err());
+        assert_eq!(
+            serde_json::to_value(Replicas::PerNode).unwrap(),
+            json!("per-node")
+        );
+        assert_eq!(serde_json::to_value(Replicas::Count(4)).unwrap(), json!(4));
+        assert_eq!(Replicas::PerNode.to_string(), "per-node");
+        // A count is bounded; per-node is bounded by the pool.
+        assert!(Replicas::Count(0).validate().is_err());
+        assert!(Replicas::Count(MAX_APP_REPLICAS + 1).validate().is_err());
+        assert!(Replicas::Count(MAX_APP_REPLICAS).validate().is_ok());
+        assert!(Replicas::PerNode.validate().is_ok());
+        // A manifest says it too.
+        let per_node = manifest(json!({ "replicas": "per-node" }));
+        assert_eq!(per_node.replicas, Replicas::PerNode);
+        per_node.validate(false).expect("a per-node manifest");
+    }
+
+    /// Per-node renders the daemonset count on every task, and a change to
+    /// it reads in words.
+    #[test]
+    fn per_node_renders_one_per_node() {
+        let mut record = record(manifest(json!({})));
+        record.settings.replicas = Replicas::PerNode;
+        let rendered = render_app_job(&record, NO_MARKER).expect("renders");
+        assert_eq!(
+            rendered.jobspec["task"]["count"],
+            json!({ "num": 1, "per": "id" })
+        );
+        let before = AppSettings {
+            replicas: Replicas::Count(1),
+            ..record.settings.clone()
+        };
+        assert_eq!(
+            before.describe_change(&record.settings),
+            "settings changed (replicas 1 → per-node)"
+        );
+    }
+
     #[test]
     fn render_forces_identity_placement_user_config_and_count() {
         let mut record = record(manifest(json!({})));
-        record.settings.replicas = 3;
+        record.settings.replicas = Replicas::Count(3);
         record.config = json!({ "repos": ["git@example.com:a.git"] });
         let rendered = render_app_job(&record, NO_MARKER).expect("renders");
         let job = &rendered.jobspec;
