@@ -516,25 +516,49 @@ impl Store {
     /// on an instance counts only while that instance is still unbound
     /// (an explicit start or a targeted placement may have bound it since),
     /// and an instance counts once however many holds it has.
+    ///
+    /// Holds are matched by the task's (group, name) across every config of
+    /// the job, not by task config id: a failure on the version a rollout is
+    /// replacing still owes its backoff, so the new version's replacement
+    /// of that task waits it out too. Matching by id gave a crash-looping
+    /// task one undelayed retry per rollout.
     pub(crate) fn held_replacements_for_job_config(
         &self,
         job_config_id: &str,
     ) -> R<HashMap<i64, u32>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT h.task_config_id, \
+            "SELECT t.id, \
                     COUNT(DISTINCT COALESCE(h.instance_id, 'alloc:' || h.allocation_id)) \
-             FROM reschedule_hold h \
-             WHERE h.job_config_id = ?1 AND h.not_before_unix > ?2 \
+             FROM task_config t \
+             INNER JOIN reschedule_hold h ON h.job_id = t.job_id \
+               AND h.group_name = t.group_name AND h.task_name = t.name \
+             WHERE t.job_config_id = ?1 AND h.not_before_unix > ?2 \
                AND (h.instance_id IS NULL OR EXISTS (\
                    SELECT 1 FROM instance i WHERE i.instance_id = h.instance_id \
                    AND i.current_alloc_id IS NULL AND i.state IN ('pending', 'rescheduling'))) \
-             GROUP BY h.task_config_id;",
+             GROUP BY t.id;",
         )?;
         let rows = stmt.query_map(params![job_config_id, Self::now_unix()], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?))
         })?;
         Ok(Self::collect_rows(rows)?.into_iter().collect())
+    }
+
+    /// When the job's soonest active hold lapses (unix seconds), if any
+    /// hold is active: when a rollout waiting on held replacements should
+    /// look again.
+    pub(crate) fn next_reschedule_hold_lapse(&self, job_id: &str) -> R<Option<i64>> {
+        let conn = self.read_connection()?;
+        let lapse = conn
+            .prepare_cached(
+                "SELECT MIN(not_before_unix) FROM reschedule_hold \
+                 WHERE job_id = ?1 AND not_before_unix > ?2;",
+            )?
+            .query_row(params![job_id, Self::now_unix()], |row| {
+                row.get::<_, Option<i64>>(0)
+            })?;
+        Ok(lapse)
     }
 
     /// The job's active holds (replacements still waiting out their

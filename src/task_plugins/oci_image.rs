@@ -65,6 +65,31 @@ pub(crate) fn record_staged_layout(
     }
 }
 
+/// The worker's host guard, registered when its artifact settings arrive
+/// ([`crate::worker::task_manager::WorkerTaskManager::configure_artifacts`]), so a
+/// runtime-side image pull is judged like a staged `oci://` artifact. `None`
+/// outside a worker.
+static PULL_EGRESS: std::sync::RwLock<
+    Option<std::sync::Arc<crate::structs::host_guard::HostGuard>>,
+> = std::sync::RwLock::new(None);
+
+/// Registers (or, with `None`, clears) the host guard [`pull_layout`] judges
+/// registries with.
+pub(crate) fn set_pull_egress_guard(
+    guard: Option<std::sync::Arc<crate::structs::host_guard::HostGuard>>,
+) {
+    *PULL_EGRESS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = guard;
+}
+
+fn pull_egress_guard() -> Option<std::sync::Arc<crate::structs::host_guard::HostGuard>> {
+    PULL_EGRESS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// Pulls `image` into an on-disk OCI layout via the shared `oci://` fetcher
 /// (anonymous), returning the layout root. Used when no image artifact was
 /// staged for the task — neither a low-level OCI instance nor a microVM can
@@ -73,7 +98,19 @@ pub(crate) fn record_staged_layout(
 /// Goes through the worker's node content store when it has one, so a
 /// second allocation of the same image on this node downloads nothing (a
 /// tag costs one `HEAD` request to check it has not moved).
+///
+/// The registry is judged by the worker's host guard first (the same check a
+/// staged `oci://` artifact gets), so an image reference cannot point the
+/// worker at loopback or the cloud metadata service.
 pub(crate) fn pull_layout(image: &str, dest_root: &Path) -> R<PathBuf> {
+    pull_layout_guarded(image, dest_root, pull_egress_guard())
+}
+
+fn pull_layout_guarded(
+    image: &str,
+    dest_root: &Path,
+    egress: Option<std::sync::Arc<crate::structs::host_guard::HostGuard>>,
+) -> R<PathBuf> {
     use crate::artifacts::fetcher::{ArtifactFetcher, FetchLimits, FetchRequest, FetchedPayload};
     use crate::artifacts::fetchers::OciFetcher;
     use crate::artifacts::stage::ArtifactSink;
@@ -81,7 +118,10 @@ pub(crate) fn pull_layout(image: &str, dest_root: &Path) -> R<PathBuf> {
 
     let source = ArtifactSpec::oci_image(image).source;
     let parsed = parse_artifact_source(&source)?;
-    let limits = FetchLimits::default();
+    let limits = FetchLimits {
+        egress,
+        ..FetchLimits::default()
+    };
     let request = FetchRequest {
         scheme: &parsed.scheme,
         url: &parsed.url,
@@ -155,6 +195,32 @@ pub(crate) fn apple_load_image(oci_layout: &Path, reference: &str) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runtime-side pull (no staged image artifact) is judged by the
+    /// worker's host guard: an image on a loopback or metadata registry is
+    /// refused before any connection, as a staged `oci://` artifact is.
+    #[test]
+    fn a_runtime_image_pull_is_judged_by_the_host_guard_test() -> R<()> {
+        use crate::structs::host_guard::{HostGuard, HostGuardConfig};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let guard = std::sync::Arc::new(HostGuard::new(&HostGuardConfig::default())?);
+        for image in [
+            format!("127.0.0.1:{port}/lib/img:v1"),
+            "169.254.169.254/lib/img:v1".to_string(),
+        ] {
+            let dir = tempfile::tempdir()?;
+            let err = pull_layout_guarded(&image, dir.path(), Some(guard.clone()))
+                .expect_err("a guarded registry is refused");
+            assert!(
+                format!("{err:#}").contains("host guard"),
+                "{image}: {err:#}"
+            );
+        }
+        assert!(listener.accept().is_err(), "refused before any connection");
+        Ok(())
+    }
 
     #[test]
     fn staged_layout_reads_and_records_state() {

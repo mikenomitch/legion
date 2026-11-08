@@ -745,6 +745,9 @@ struct PreemptionPass {
     /// How many victims this plan has already taken from each task, so
     /// disruption floors bind across placements.
     taken_by_task: HashMap<i64, u32>,
+    /// Each victim task's allocation count across the fleet, counted once
+    /// per plan when its first candidate loads: the floor's denominator.
+    fleet_running: HashMap<i64, u32>,
     /// Why candidates were rejected, accumulated for the placement error.
     rejected: preemption::IneligibleTally,
     /// How many placements ran a preemption pass at all.
@@ -780,6 +783,7 @@ impl PreemptionPass {
             victims: Vec::new(),
             observed: Vec::new(),
             taken_by_task: HashMap::new(),
+            fleet_running: HashMap::new(),
             rejected: preemption::IneligibleTally::default(),
             considered: 0,
             pool_blocked: false,
@@ -810,12 +814,28 @@ impl PreemptionPass {
             index.entry((*node_id).to_string()).or_default();
         }
         let rows = store.preemption_victim_metadata(&missing)?;
-        // The floor is measured against the task's live allocation count
-        // across the fleet, not just this node's share.
-        let mut running_by_task: HashMap<i64, u32> = HashMap::new();
-        for row in &rows {
-            *running_by_task.entry(row.task_config_id).or_default() += 1;
+        // The floor is measured against the task's allocation count across
+        // the fleet, not against the rows on the nodes this pass loaded: a
+        // task that also runs on nodes outside the pass would otherwise read
+        // as smaller than it is, and `minAvailable` would bind tighter than
+        // documented. One indexed count per task not already counted in
+        // this plan; the plan's own evictions are `taken_by_task`.
+        let uncounted: Vec<i64> = rows
+            .iter()
+            .map(|row| row.task_config_id)
+            .filter(|task_id| !self.fleet_running.contains_key(task_id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        if !uncounted.is_empty() {
+            let counts = store.allocation_counts_for_tasks(&uncounted)?;
+            for task_id in uncounted {
+                self.fleet_running
+                    .insert(task_id, counts.get(&task_id).copied().unwrap_or(0));
+            }
         }
+        let running_by_task = &self.fleet_running;
+        let index = self.by_node.get_or_insert_with(HashMap::new);
         let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
         for row in rows {
             // An allocation whose resources will not parse is skipped rather
@@ -11364,6 +11384,57 @@ mod tests {
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    /// Regression (AWS spot check, 2026-10-12): the floor was measured
+    /// against the victim task's allocations on the nodes the pass loaded,
+    /// not across the fleet, so a task that also ran on a node outside the
+    /// pass read as smaller than it was and `minAvailable` bound tighter
+    /// than documented.
+    #[test]
+    fn the_disruption_floor_counts_the_whole_fleet_test() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        small_node(&store, "node-b")?;
+        // Four allocations, two per node, floor of 50% -> two may be taken.
+        let tool = submit_banded(
+            &store,
+            "internal-tool",
+            Band::Low,
+            4,
+            Some(crate::structs::DisruptionConfig {
+                min_available: Some(json!("50%")),
+                unknown_fields: Default::default(),
+            }),
+        )?;
+        let placed = Scheduler::new(&store)?.plan_and_apply(&tool, PlanMode::Fresh)?;
+        assert_eq!(placed.allocations.len(), 4);
+        assert_eq!(store.allocs_for_node("node-b")?.len(), 2);
+        age_allocations(&store)?;
+        // node-b leaves the candidate set, but its two allocations still
+        // count toward the floor.
+        store.set_node_availability("node-b", "drained")?;
+
+        let api = submit_banded(&store, "api", Band::High, 2, None)?;
+        let outcome = Scheduler::new(&store)?.plan_and_apply(&api, PlanMode::Fresh)?;
+        assert_eq!(
+            outcome.allocations.len(),
+            2,
+            "4 running against a floor of 2 leaves 2 to take: {:?}",
+            outcome.unplaced
+        );
+        assert_eq!(outcome.evictions.len(), 2);
+        let tool_left = store
+            .allocs_for_job("internal-tool")?
+            .into_iter()
+            .filter(|allocation| allocation.node_id == "node-b")
+            .count();
+        assert_eq!(tool_left, 2, "the floor still holds across the fleet");
+        assert!(store
+            .allocs_for_node("node-a")?
+            .iter()
+            .all(|a| a.job_id == "api"));
         Ok(())
     }
 

@@ -356,9 +356,10 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // restarted (or crash-looping) during a partition cannot keep them
     // running past their window.
     let boot_store = boot_state_store(name_override);
+    let (stop_boot_fence, boot_fence_stopped) = tokio::sync::watch::channel(false);
     let boot_fence = boot_store
         .clone()
-        .map(|store| tokio::spawn(run_boot_fence(store)));
+        .map(|store| tokio::spawn(run_boot_fence(store, boot_fence_stopped)));
 
     // Every connection to a manager is TLS verified against the join
     // token's CA pin, from the first byte of the first one, before the join
@@ -397,10 +398,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let pre_register_res =
         pre_register_until_reachable(&client, &managers, worker_type, &credentials).await?;
     // The manager answered, so restore (below) and then the in-process
-    // watchdog take over. Stopped before the restore so the two never act on
-    // the same process at once.
+    // watchdog take over. Stopped, and waited for, before the restore so the
+    // two never act on the same process at once and the restore sees every
+    // fence the boot fence recorded (an abort would leave a tick's blocking
+    // half running).
     if let Some(boot_fence) = boot_fence {
-        boot_fence.abort();
+        let _ = stop_boot_fence.send(true);
+        let _ = boot_fence.await;
     }
     let pre_register_reply = pre_register_res.into_inner();
     // The `iss` this node's tickets carry, from the manager rather than
@@ -3021,6 +3025,21 @@ async fn heartbeat_tick(
             net_policies: reply.net_policies.clone(),
         }))
         .await;
+        // Once per start, on this first acknowledged reply: the gated
+        // namespaces of allocations that died while the worker was down are
+        // nobody's, and restore never learned about them.
+        if netd.orphan_sweep_pending() {
+            let held: std::collections::HashSet<i64> = {
+                let manager = task_manager.lock().expect("task manager");
+                manager
+                    .allocations_snapshot()
+                    .into_iter()
+                    .chain(manager.draining_ids())
+                    .chain(manager.terminating_ids())
+                    .collect()
+            };
+            netd.sweep_orphan_namespaces(held).await;
+        }
         // Config-file templates, rendered from the same feed; written before
         // any launch below so a task starts with its files in place.
         apply_templates(task_manager, netd, &reply).await;
@@ -3840,11 +3859,16 @@ fn boot_state_store(name_override: Option<&str>) -> Option<WorkerStateStore> {
 
 /// The self-fence for the stretch of boot before this process has reached
 /// its manager: once a second, kill restored stateful allocations whose
-/// window the persisted silence exceeds. Exits at once when no contact was
-/// ever recorded (nothing to measure from); otherwise runs until the caller
-/// aborts it.
-async fn run_boot_fence(store: WorkerStateStore) {
+/// window the persisted silence exceeds, and record them for the restore to
+/// report (`WorkerStateStore::record_boot_fenced`). Exits at once when no
+/// contact was ever recorded (nothing to measure from); otherwise runs until
+/// `stop` turns true, finishing the tick in progress first.
+async fn run_boot_fence(store: WorkerStateStore, mut stop: tokio::sync::watch::Receiver<bool>) {
     loop {
+        // A dropped sender (the boot path returned early) stops it too.
+        if *stop.borrow() || stop.has_changed().is_err() {
+            return;
+        }
         let Some(since_last_contact) =
             store.since_last_manager_contact(std::time::SystemTime::now())
         else {
@@ -3868,7 +3892,10 @@ async fn run_boot_fence(store: WorkerStateStore) {
             Err(err) => warn!(error = ?err, "Boot self-fence task failed"),
             Ok(Ok(_)) => {}
         }
-        tokio::time::sleep(SELF_FENCE_CHECK_INTERVAL).await;
+        tokio::select! {
+            _ = tokio::time::sleep(SELF_FENCE_CHECK_INTERVAL) => {}
+            _ = stop.changed() => {}
+        }
     }
 }
 
@@ -4850,7 +4877,8 @@ mod tests {
         // The previous process last heard from its manager two minutes ago.
         store.record_manager_contact(std::time::SystemTime::now() - Duration::from_secs(120))?;
 
-        let fence = tokio::spawn(run_boot_fence(store));
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let fence = tokio::spawn(run_boot_fence(store.clone(), stopped));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             // Reap the zombie: this test process is still the task's parent.
@@ -4864,7 +4892,18 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        fence.abort();
+        // Stopping waits out the tick, so the record is on disk after it.
+        let _ = stop.send(true);
+        tokio::time::timeout(Duration::from_secs(5), fence).await??;
+        let recorded = store.boot_fenced();
+        let reason = recorded
+            .get(&61)
+            .expect("the fence is recorded for the restore");
+        assert!(
+            reason.starts_with("self-fenced: worker lost manager contact"),
+            "{reason}"
+        );
+        assert!(reason.contains("fenced at worker boot"), "{reason}");
         Ok(())
     }
 
@@ -4874,7 +4913,8 @@ mod tests {
     async fn boot_fence_without_a_contact_record_does_nothing() -> R<()> {
         let temp_dir = TempDir::new()?;
         let store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
-        tokio::time::timeout(Duration::from_secs(1), run_boot_fence(store)).await?;
+        let (_stop, stopped) = tokio::sync::watch::channel(false);
+        tokio::time::timeout(Duration::from_secs(1), run_boot_fence(store, stopped)).await?;
         Ok(())
     }
 

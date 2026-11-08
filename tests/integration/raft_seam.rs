@@ -163,6 +163,8 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "stop_keyed_instance",
     "update_rollout_config_json",
     "update_rollout_status",
+    "cancel_rollout",
+    "prune_node_alloc_usage_orphans",
     "upsert_instance",
     // Volumes: the `volume` table is scheduler-owned (its lifecycle is bound
     // to the scheduler-owned `instance`, and the reclaim reaper drives its
@@ -211,6 +213,9 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
 /// `enqueue_eval_after_delay` with a zero delay, so it has no lane, no
 /// closure, and no op name of its own.)
 const DELEGATED_BODIES: &[&str] = &[
+    // Composes `remove_allocs_for_job_config_apply` (for a revert) and
+    // `update_rollout_status_apply` in one scheduler-lane changeset.
+    "cancel_rollout",
     "clear_job_restart_request",
     // The eval loop's batched terminal write: its closure loops
     // `apply_eval_completion` (a switch over `complete_eval_impl` /
@@ -365,6 +370,8 @@ fn lane_for(method: &str) -> Lane {
         | "stop_keyed_instance"
         | "update_rollout_config_json"
         | "update_rollout_status"
+        | "cancel_rollout"
+        | "prune_node_alloc_usage_orphans"
         | "upsert_instance"
         | "delete_volume"
         | "mark_volume_destroyed"

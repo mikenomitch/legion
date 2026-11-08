@@ -1502,9 +1502,10 @@ because there is no guest address to collide on.
 Before resuming the guest, the restore waits up to 5 seconds for the egress
 proxy socket (`vsock.sock_1080`). It is normally there already: the node
 binds it before it launches the restore, whether the start arrived on a
-heartbeat, a `PostWork` push, or the work stream. A start that arrived
-outside a heartbeat also triggers one right away, which brings the
-allocation's policy, resolver, and upstream listeners. Until that policy
+heartbeat, a `PostWork` push, or the work stream. For a start that arrived
+outside a heartbeat it binds the resolver and upstream listeners then too,
+and triggers a heartbeat right away, which brings the allocation's policy.
+Until that policy
 lands, the proxy resets each connection. If the socket never appears, the
 guest resumes anyway with no working door (each connection is reset), the
 allocation reports `net_capture_unavailable`, and `legion net doctor` names

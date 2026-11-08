@@ -45,7 +45,7 @@ use crate::worker::netd::handlers::{
 use crate::worker::netd::metrics as net_metrics;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -965,12 +965,8 @@ async fn handle(
             RequestBody::streaming(body)
         }
     } else {
-        match Limited::new(body, exchange.body_cap() as usize)
-            .collect()
-            .await
-        {
-            Ok(collected) => {
-                let mut bytes = collected.to_bytes();
+        match handlers::read_capped(body, exchange.body_cap()).await {
+            Ok(handlers::CappedBody::Whole(mut bytes)) => {
                 match exchange.body(&mut bytes).await {
                     ExchangeOutcome::Continue | ExchangeOutcome::Proxy(_) => {}
                     ExchangeOutcome::Deny { source, reason } => {
@@ -1031,9 +1027,10 @@ async fn handle(
                 }
                 RequestBody::buffered(bytes)
             }
-            Err(err) => {
-                // Over the cap, or the client went away mid-body.
-                debug!(upstream = %settings.key, error = %err, "A body hop could not buffer the request body");
+            Ok(handlers::CappedBody::Over(prefix, rest)) => {
+                // Over the cap: a body hop that fails closed refuses it; when
+                // every body hop fails open (`onError = "allow"`), it goes
+                // on unread, streamed once, as if no hop read bodies.
                 if let Some(source) = exchange.body_unreadable_denied_by() {
                     net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                     note_edge_denied(&settings);
@@ -1045,13 +1042,19 @@ async fn handle(
                         Some("request body exceeds the body hop's maxBytes"),
                     );
                 }
+                debug!(
+                    upstream = %settings.key,
+                    cap = exchange.body_cap(),
+                    "Request body is over the body hops' maxBytes and they fail open; streaming it unread"
+                );
+                RequestBody::streaming_after(prefix, rest)
+            }
+            Err(err) => {
+                // The client went away mid-body.
+                debug!(upstream = %settings.key, error = %err, "Failed to read request body");
                 return error_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!(
-                        "request body is larger than {} bytes, the most this route's body hops \
-                         read (their maxBytes)",
-                        exchange.body_cap()
-                    ),
+                    StatusCode::BAD_REQUEST,
+                    "failed to read request body".into(),
                 );
             }
         }
@@ -1079,17 +1082,27 @@ async fn handle(
             authority,
             headers: handlers::legion_headers(&settings.context, &hop_facts),
         };
-        let outcome = attempt_request(
-            &settings,
-            &target.addr,
-            &parts,
-            &mut request_body,
-            host_header.as_deref(),
-            Some(&hand),
-            None,
-            &injected,
-        )
-        .await;
+        // The request may carry an injected credential, or be bound for a
+        // TLS origin this node would have encrypted to: it leaves the node
+        // only over the mesh. A mesh endpoint is dialed with mTLS wherever
+        // it runs (its port refuses plaintext); a plain endpoint is used
+        // only on this node.
+        let outcome = match hand_off_route(&target) {
+            Ok(mesh) => {
+                attempt_request(
+                    &settings,
+                    &target.addr,
+                    &parts,
+                    &mut request_body,
+                    host_header.as_deref(),
+                    Some(&hand),
+                    mesh.as_ref(),
+                    &injected,
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        };
         return match outcome {
             Ok(response) => {
                 let status = response.status();
@@ -1479,6 +1492,33 @@ struct HandOff {
     headers: Vec<(String, String)>,
 }
 
+/// How an HTTP hand-off reaches its proxy: over the mesh (the endpoint to
+/// dial with mTLS) when the proxy's port is a mesh port, in plaintext when
+/// it is on this node, and not at all when it is a plain endpoint on
+/// another node. The hand-off carries any injected credential and, for a
+/// TLS origin, what the task trusted this node to encrypt, so it never
+/// crosses the network in plaintext.
+fn hand_off_route(target: &ProxyTarget) -> Result<Option<Endpoint>, AttemptError> {
+    if let Some(node_id) = target.mesh_node.as_ref() {
+        return Ok(Some(Endpoint {
+            addr: target.addr.clone(),
+            allocation_id: 0,
+            node_id: node_id.clone(),
+            tags: Vec::new(),
+            mesh_tls: true,
+        }));
+    }
+    if target.remote {
+        return Err(AttemptError::Connect(format!(
+            "endpoint {} is on another node and not on the mesh; an HTTP hand-off \
+             leaves the node only over the mesh (set `mesh = true` on the proxy's \
+             service, or use `local = true`)",
+            target.addr
+        )));
+    }
+    Ok(None)
+}
+
 /// Dial `addr`, send the request, and return the response with its body
 /// streamed through. `hand_off` sends it to a proxy instead of the origin;
 /// `mesh` dials a mesh endpoint with this node's certificate and names the
@@ -1619,18 +1659,15 @@ impl RequestBody {
     fn streaming_after(prefix: Bytes, incoming: Incoming) -> Self {
         let counter = Arc::new(AtomicU64::new(0));
         let seen = Arc::clone(&counter);
-        let body = Prefixed {
-            prefix: (!prefix.is_empty()).then_some(prefix),
-            rest: incoming,
-        }
-        .map_frame(move |frame| {
-            if let Some(data) = frame.data_ref() {
-                seen.fetch_add(data.len() as u64, Ordering::Relaxed);
-            }
-            frame
-        })
-        .map_err(|err| -> handlers::BoxError { Box::new(err) })
-        .boxed();
+        let body = Prefixed::new(prefix, incoming)
+            .map_frame(move |frame| {
+                if let Some(data) = frame.data_ref() {
+                    seen.fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+                frame
+            })
+            .map_err(|err| -> handlers::BoxError { Box::new(err) })
+            .boxed();
         RequestBody {
             kind: BodyKind::Streaming(Some(body)),
             counter,
@@ -1685,9 +1722,18 @@ impl RequestBody {
 
 /// A body that yields bytes already read, then the rest of the client's
 /// stream.
-struct Prefixed {
+pub(super) struct Prefixed {
     prefix: Option<Bytes>,
     rest: Incoming,
+}
+
+impl Prefixed {
+    pub(super) fn new(prefix: Bytes, rest: Incoming) -> Self {
+        Prefixed {
+            prefix: (!prefix.is_empty()).then_some(prefix),
+            rest,
+        }
+    }
 }
 
 impl hyper::body::Body for Prefixed {
@@ -2758,6 +2804,231 @@ mod integration {
         assert!(format!("{:?}", SecretValue::new("sk-live-1")).contains("redacted"));
     }
 
+    /// A "proxy task": answers every request with its request line and the
+    /// credential it received, and counts the connections it accepted.
+    async fn start_forward_proxy() -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    let auth = head
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                        .unwrap_or_default()
+                        .to_string();
+                    let body = format!("proxy saw {line} | {auth}");
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    /// An HTTP hand-off carries the injected credential, so it leaves the
+    /// node only over the mesh: a mesh endpoint of the proxy's service on
+    /// another node is dialed with mTLS and receives the request; a plain
+    /// endpoint on another node is never dialed (`502`); a plain endpoint on
+    /// this node is used in plaintext.
+    #[tokio::test]
+    async fn proxy_hand_offs_cross_nodes_only_over_the_mesh_test() {
+        use crate::manager::mesh_ca::{generate_ca, issue_node_cert};
+        use crate::worker::balance::Endpoint;
+        use crate::worker::forwarder::PortTermination;
+        use crate::worker::netd::ingress::{IngressListeners, IngressSpec, TaskDial};
+        use crate::worker::netd::tls::MeshIdentity;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let (ca_pem, ca_key) = generate_ca().unwrap();
+        let (a_cert, a_key, a_exp) = issue_node_cert(&ca_pem, &ca_key, "node-a").unwrap();
+        let (b_cert, b_key, b_exp) = issue_node_cert(&ca_pem, &ca_key, "node-b").unwrap();
+
+        // Node B runs the proxy as a `mesh = true` service: the datapath
+        // owns the advertised port and terminates mTLS in front of it.
+        let (proxy_private, proxy_hits) = start_forward_proxy().await;
+        let mesh_port = free_port().await;
+        let cache_b = Arc::new(NetPolicyCache::new());
+        // `allow = ["*/*"]`: the consumer here has no workload identity to
+        // name, and who may call is not what this test is about.
+        let anyone = vec!["*/*".to_string()];
+        let effective = merge_policies(
+            &[],
+            InlinePolicy {
+                mesh: Some(true),
+                callers: &anyone,
+                owner: "filter",
+                ..Default::default()
+            },
+        );
+        let hash = effective.hash.clone();
+        cache_b.apply_assignments(&[AllocNetPolicy {
+            allocation_id: 40,
+            policy_hash: hash.clone(),
+        }]);
+        cache_b.insert_body(&hash, effective).unwrap();
+        let context_b = Arc::new(
+            ForwarderContext::new(cache_b, Arc::new(Denials::new())).with_node_id("node-b".into()),
+        );
+        context_b
+            .set_mesh_identity(
+                MeshIdentity::from_pem("node-b", &b_cert, &b_key, &ca_pem, b_exp).unwrap(),
+            )
+            .unwrap();
+        let ingress = IngressListeners::new(context_b);
+        ingress
+            .sync(&[IngressSpec {
+                allocation_id: 40,
+                label: "http".into(),
+                host_port: mesh_port,
+                private_port: proxy_private,
+                dial: TaskDial::Loopback { netns: None },
+                bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                termination: Some(PortTermination::Mesh),
+            }])
+            .await;
+
+        // Node A: an HTTP-mode upstream with a credential and a proxy hop.
+        let (origin, origin_hits) = start_origin(0).await;
+        // Everything here is on loopback, which the host guard refuses; an
+        // operator `allow` entry opens exactly these ports.
+        let guard = crate::structs::host_guard::HostGuard::new(
+            &crate::structs::host_guard::HostGuardConfig {
+                allow: vec![
+                    format!("127.0.0.1:{origin}"),
+                    format!("127.0.0.1:{mesh_port}"),
+                    format!("127.0.0.1:{proxy_private}"),
+                ],
+                deny: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let context_a = Arc::new(
+            ForwarderContext::new(Arc::new(NetPolicyCache::new()), Arc::new(Denials::new()))
+                .with_node_id("node-a".into())
+                .with_host_guard(Arc::new(guard)),
+        );
+        context_a
+            .set_mesh_identity(
+                MeshIdentity::from_pem("node-a", &a_cert, &a_key, &ca_pem, a_exp).unwrap(),
+            )
+            .unwrap();
+        let forwarder = UpstreamForwarder::with_context(context_a.clone());
+        let port = free_port().await;
+        let credentials: Vec<UpstreamCredential> = serde_json::from_value(serde_json::json!([
+            { "header": "authorization", "prefix": "Bearer ", "from": { "kv": "secrets/openai" } },
+        ]))
+        .unwrap();
+        let proxy_hop: crate::structs::hops::HopConfig =
+            serde_json::from_value(serde_json::json!({ "proxy": { "service": "filter" } }))
+                .unwrap();
+        forwarder
+            .sync(&[UpstreamSpec {
+                allocation_id: 9,
+                service: "openai".into(),
+                local_port: Some(port),
+                http_protocol: false,
+                balance: "round_robin".into(),
+                to: Some(format!("http://127.0.0.1:{origin}")),
+                http: None,
+                handlers: vec![proxy_hop],
+                credentials,
+                ca: None,
+                vip: None,
+                canonical_port: None,
+                attachment: crate::worker::netd::attach::Attachment::Host,
+            }])
+            .await;
+        context_a.set_credential(
+            9,
+            "openai",
+            "authorization",
+            "secrets/openai",
+            1,
+            SecretValue::new("sk-live-1"),
+        );
+        let endpoint = |addr: String, node: &str, mesh_tls: bool| Endpoint {
+            addr,
+            allocation_id: 40,
+            node_id: node.into(),
+            tags: Vec::new(),
+            mesh_tls,
+        };
+        let send = "GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n";
+
+        // The proxy on node B over the mesh: absolute form, credential in.
+        context_a.set_handler_endpoints(
+            9,
+            "filter",
+            vec![endpoint(format!("127.0.0.1:{mesh_port}"), "node-b", true)],
+        );
+        let (status, _, body) = request(port, send).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains(&format!(
+                "proxy saw GET http://127.0.0.1:{origin}/v1/models HTTP/1.1"
+            )),
+            "{body}"
+        );
+        assert!(body.contains("Bearer sk-live-1"), "{body}");
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 1);
+
+        // The same proxy as a plain endpoint on node B: never dialed.
+        context_a.set_handler_endpoints(
+            9,
+            "filter",
+            vec![endpoint(
+                format!("127.0.0.1:{proxy_private}"),
+                "node-b",
+                false,
+            )],
+        );
+        let (status, _, body) = request(port, send).await;
+        assert_eq!(status, 502, "{body}");
+        assert!(body.contains("not on the mesh"), "{body}");
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 1, "no plaintext dial");
+
+        // A plain endpoint on this node stays plaintext on the host.
+        context_a.set_handler_endpoints(
+            9,
+            "filter",
+            vec![endpoint(
+                format!("127.0.0.1:{proxy_private}"),
+                "node-a",
+                false,
+            )],
+        );
+        let (status, _, body) = request(port, send).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("Bearer sk-live-1"), "{body}");
+        assert_eq!(proxy_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(origin_hits.load(Ordering::SeqCst), 0, "the proxy answers");
+    }
+
     /// A gated sandbox reaches its upstream over the VMM's vsock host
     /// socket, and the same listener state injects the credential there, so
     /// the key stays out of the guest and its memory checkpoints.
@@ -3123,10 +3394,11 @@ mod integration {
     }
 
     /// A body hop reads at most its `maxBytes`. Over it, a hop that fails
-    /// closed denies and one that fails open answers `413` naming the cap;
-    /// the upstream sees neither request.
+    /// closed denies, and so does a chain with any such hop; when every
+    /// body hop fails open, the body goes on unread, whole (the part read
+    /// for the cap and the rest), and no hop judges it.
     #[tokio::test]
-    async fn a_body_over_a_body_hops_cap_is_refused_test() {
+    async fn a_body_over_a_body_hops_cap_is_refused_unless_every_hop_fails_open_test() {
         let (origin, hits) = start_counting_origin().await;
         let dlp = |on_error: &str| -> crate::structs::hops::HopConfig {
             serde_json::from_value(serde_json::json!({
@@ -3137,12 +3409,34 @@ mod integration {
         };
         let (_open, port) = http_upstream(origin, serde_json::json!({}), vec![dlp("allow")]).await;
         let (status, _, body) = request(port, &post("/upload", 4096)).await;
-        assert_eq!(status, 413, "{body}");
-        assert!(body.contains("larger than 1024 bytes"), "{body}");
+        assert_eq!((status, body.as_str()), (200, "read=4096"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // Unread means unchecked: a match past the cap is not seen.
+        let secret = format!("{}sk-abcdefghijkl", "a".repeat(2048));
+        let raw = format!(
+            "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{secret}",
+            secret.len()
+        );
+        let (status, _, _) = request(port, &raw).await;
+        assert_eq!(status, 200);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
         let (_closed, port) = http_upstream(origin, serde_json::json!({}), vec![dlp("deny")]).await;
         let (status, _, _) = request(port, &post("/upload", 4096)).await;
         assert_eq!(status, 403);
-        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the origin");
+        let (_mixed, mixed_port) = http_upstream(
+            origin,
+            serde_json::json!({}),
+            vec![dlp("allow"), dlp("deny")],
+        )
+        .await;
+        let (status, _, _) = request(mixed_port, &post("/upload", 4096)).await;
+        assert_eq!(status, 403);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "no refused body reached the origin"
+        );
         // Within the cap, the hop reads it and it goes on.
         let (status, _, body) = request(port, &post("/upload", 100)).await;
         assert_eq!((status, body.as_str()), (200, "read=100"));

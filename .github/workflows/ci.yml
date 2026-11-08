@@ -235,6 +235,8 @@ jobs:
               # The generated client in ui/src/gen is derived from the proto;
               # a proto change must regenerate it (see the drift check).
               - 'proto/legion.proto'
+              # The ACL parity cases the UI's mirror is checked against.
+              - 'tests/fixtures/acl_parity_cases.json'
 
       - name: Install Node
         if: steps.changes.outputs.ui == 'true'
@@ -268,6 +270,11 @@ jobs:
         if: steps.changes.outputs.ui == 'true'
         working-directory: ui
         run: npm run build
+
+      - name: Unit tests (ACL parity with the manager)
+        if: steps.changes.outputs.ui == 'true'
+        working-directory: ui
+        run: npm run test:unit
 
   scheduler-benchmark-gate:
     name: Scheduler Benchmark Gate

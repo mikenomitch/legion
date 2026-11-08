@@ -2246,6 +2246,10 @@ export class RunJobTemplateReply extends Message<RunJobTemplateReply> {
   /**
    * True when replayed from a previously recorded idempotent result.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 2;
    */
   deduplicated = false;
@@ -3857,6 +3861,14 @@ export class StopRolloutRequest extends Message<StopRolloutRequest> {
    * When true, remove allocations for the rollout target config and re-schedule from
    * the rollout source config (when present).
    *
+   * The rollout is marked `cancelled` and the target config's allocations are
+   * removed in one write, before the source config is re-placed, so no later
+   * rollout tick can place the target version again. If re-placing the source
+   * config then fails (no capacity, a lost conflict race), the call still
+   * succeeds: a `job_reschedule` retry of the source config is queued, and the
+   * reply's `message` and the rollout's `message` say so. An error from the
+   * call means nothing changed; retry it.
+   *
    * @generated from field: bool revert = 2;
    */
   revert = false;
@@ -3908,7 +3920,11 @@ export class StopRolloutRequest extends Message<StopRolloutRequest> {
  */
 export class StopRolloutReply extends Message<StopRolloutReply> {
   /**
-   * Human-readable stop/revert message.
+   * Human-readable stop/revert message: the rollout's own status message.
+   * `Rollout stopped` or `Rollout stopped and reverted`, extended with the
+   * failure and the queued retry when a revert could not re-place the
+   * previous version. For a rollout that was already terminal, its existing
+   * message (nothing was changed).
    *
    * @generated from field: string message = 1;
    */
@@ -5151,6 +5167,10 @@ export class StopJobReply extends Message<StopJobReply> {
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 2;
    */
   deduplicated = false;
@@ -5462,6 +5482,10 @@ export class ScaleTaskReply extends Message<ScaleTaskReply> {
   /**
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -8650,6 +8674,10 @@ export class ApplyScalingDefaultsReply extends Message<ApplyScalingDefaultsReply
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 6;
    */
   deduplicated = false;
@@ -10839,6 +10867,10 @@ export class PauseScalingReply extends Message<PauseScalingReply> {
    * True when replayed from a recorded result for the request's
    * `idempotency_key`.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 2;
    */
   deduplicated = false;
@@ -10958,6 +10990,10 @@ export class DestroyJobReply extends Message<DestroyJobReply> {
   /**
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -11113,6 +11149,10 @@ export class CreateInstanceReply extends Message<CreateInstanceReply> {
   /**
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -11320,6 +11360,10 @@ export class CreateInstancesReply extends Message<CreateInstancesReply> {
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 2;
    */
   deduplicated = false;
@@ -11432,6 +11476,10 @@ export class DestroyInstanceReply extends Message<DestroyInstanceReply> {
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 2;
    */
   deduplicated = false;
@@ -11535,6 +11583,10 @@ export class StopInstanceReply extends Message<StopInstanceReply> {
   /**
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -11678,6 +11730,10 @@ export class StartInstanceReply extends Message<StartInstanceReply> {
   /**
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -11832,6 +11888,10 @@ export class SuspendInstanceReply extends Message<SuspendInstanceReply> {
   /**
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 5;
    */
@@ -12022,6 +12082,10 @@ export class ForkInstanceReply extends Message<ForkInstanceReply> {
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 7;
    */
   deduplicated = false;
@@ -12151,6 +12215,10 @@ export class ReplaceInstanceReply extends Message<ReplaceInstanceReply> {
   /**
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -13606,6 +13674,10 @@ export class PromoteInstanceReply extends Message<PromoteInstanceReply> {
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 6;
    */
   deduplicated = false;
@@ -14092,6 +14164,10 @@ export class CreateSnapshotReply extends Message<CreateSnapshotReply> {
    * `idempotency_key` rather than applied fresh. The snapshot is then the one
    * the original call created, in whatever state it has reached since.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 2;
    */
   deduplicated = false;
@@ -14408,6 +14484,10 @@ export class DeleteSnapshotReply extends Message<DeleteSnapshotReply> {
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 2;
    */
   deduplicated = false;
@@ -14526,6 +14606,10 @@ export class RestoreInstanceReply extends Message<RestoreInstanceReply> {
   /**
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 3;
    */
@@ -14658,6 +14742,10 @@ export class SetSnapshotAliasReply extends Message<SetSnapshotAliasReply> {
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 4;
    */
   deduplicated = false;
@@ -14767,6 +14855,10 @@ export class DeleteSnapshotAliasReply extends Message<DeleteSnapshotAliasReply> 
   /**
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -14917,6 +15009,10 @@ export class WarmSnapshotReply extends Message<WarmSnapshotReply> {
   /**
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 6;
    */
@@ -16111,6 +16207,10 @@ export class DeleteVolumeReply extends Message<DeleteVolumeReply> {
 
   /**
    * True when an idempotency key replayed a previous call.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 3;
    */
@@ -23737,6 +23837,10 @@ export class SetNodeAvailabilityReply extends Message<SetNodeAvailabilityReply> 
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 3;
    */
   deduplicated = false;
@@ -23849,6 +23953,10 @@ export class ForgetNodeReply extends Message<ForgetNodeReply> {
    * True when replayed from a recorded result for the request's
    * `idempotency_key` rather than applied fresh; the counts below are 0
    * then.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -26214,6 +26322,10 @@ export class RotateDataKeyReply extends Message<RotateDataKeyReply> {
   /**
    * True when a previous call with the same idempotency key already
    * rotated and this reply is its recorded outcome.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 3;
    */
@@ -30460,6 +30572,10 @@ export class StartSessionReply extends Message<StartSessionReply> {
    * True when an idempotent retry found the session already running here,
    * or a `resume_id` found it running here.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 4;
    */
   deduplicated = false;
@@ -32292,6 +32408,10 @@ export class CreateExecKeyReply extends Message<CreateExecKeyReply> {
 
   /**
    * True when this answered a retry of an earlier create.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -35777,6 +35897,10 @@ export class RevokeGrantReply extends Message<RevokeGrantReply> {
    * True when `idempotency_key` matched an earlier call, whose reply this
    * is.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 3;
    */
   deduplicated = false;
@@ -37972,6 +38096,10 @@ export class ApplyObjectReply extends Message<ApplyObjectReply> {
   /**
    * True when `idempotency_key` matched an earlier call.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 7;
    */
   deduplicated = false;
@@ -38361,6 +38489,10 @@ export class DeleteObjectReply extends Message<DeleteObjectReply> {
   /**
    * True when `idempotency_key` matched an earlier call.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 2;
    */
   deduplicated = false;
@@ -38747,6 +38879,10 @@ export class UpdateObjectStatusReply extends Message<UpdateObjectStatusReply> {
   /**
    * True when `idempotency_key` matched an earlier call.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 3;
    */
   deduplicated = false;
@@ -38874,6 +39010,10 @@ export class ReleaseObjectReply extends Message<ReleaseObjectReply> {
 
   /**
    * True when `idempotency_key` matched an earlier call.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -39105,6 +39245,10 @@ export class InstallAppReply extends Message<InstallAppReply> {
 
   /**
    * True when `idempotency_key` matched an earlier call.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 3;
    */
@@ -39357,6 +39501,10 @@ export class UpgradeAppReply extends Message<UpgradeAppReply> {
   /**
    * True when `idempotency_key` matched an earlier call.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 5;
    */
   deduplicated = false;
@@ -39528,6 +39676,10 @@ export class UninstallAppReply extends Message<UninstallAppReply> {
   /**
    * True when `idempotency_key` matched an earlier call.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 3;
    */
   deduplicated = false;
@@ -39683,6 +39835,10 @@ export class SetAppEnabledReply extends Message<SetAppEnabledReply> {
 
   /**
    * True when `idempotency_key` matched an earlier call.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 3;
    */
@@ -39847,6 +40003,10 @@ export class UpdateAppSettingsReply extends Message<UpdateAppSettingsReply> {
   /**
    * True when `idempotency_key` matched an earlier call.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 3;
    */
   deduplicated = false;
@@ -39973,6 +40133,10 @@ export class SetAppConfigReply extends Message<SetAppConfigReply> {
 
   /**
    * True when `idempotency_key` matched an earlier call.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 4;
    */
@@ -40726,6 +40890,10 @@ export class InvokeAppActionReply extends Message<InvokeAppActionReply> {
 
   /**
    * True when `idempotency_key` matched an earlier call.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 3;
    */
@@ -42076,6 +42244,10 @@ export class IssueBootTicketReply extends Message<IssueBootTicketReply> {
   /**
    * True when this reply replayed an earlier mint for the same idempotency
    * key rather than minting a new ticket.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 5;
    */
@@ -44573,8 +44745,9 @@ export class UpsertNetPluginRequest extends Message<UpsertNetPluginRequest> {
   objectJson = "";
 
   /**
-   * When set, validate (including every referencing policy's config against
-   * the new schema) and report what would be stored, but write nothing.
+   * When set, validate (including every referencing policy's and running
+   * job's config against the new schema) and report what would be stored,
+   * but write nothing.
    *
    * @generated from field: bool dry_run = 2;
    */
@@ -44636,6 +44809,10 @@ export class UpsertNetPluginReply extends Message<UpsertNetPluginReply> {
   /**
    * True when `idempotency_key` matched an earlier call; nothing was
    * written and `plugin` is that call's result as currently stored.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -46699,6 +46876,10 @@ export class DeleteNamespaceReply extends Message<DeleteNamespaceReply> {
    * True when this reply was replayed from an earlier request with the same
    * `idempotency_key`.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 4;
    */
   deduplicated = false;
@@ -47337,6 +47518,10 @@ export class ApplyNamespacePolicyReply extends Message<ApplyNamespacePolicyReply
    * True when this reply was replayed from an earlier request with the same
    * `idempotency_key`.
    *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
    * @generated from field: bool deduplicated = 4;
    */
   deduplicated = false;
@@ -47437,6 +47622,10 @@ export class DeleteNamespacePolicyReply extends Message<DeleteNamespacePolicyRep
   /**
    * True when this reply was replayed from an earlier request with the same
    * `idempotency_key`.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */
@@ -48418,6 +48607,10 @@ export class DecideApprovalReply extends Message<DecideApprovalReply> {
   /**
    * True when this reply was replayed from an earlier request with the same
    * `idempotency_key`.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
    *
    * @generated from field: bool deduplicated = 2;
    */

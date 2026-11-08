@@ -990,7 +990,7 @@ impl ManagerDaemonService {
             delegation = %delegated,
             "App action ran"
         );
-        let reply = InvokeAppActionReply {
+        let mut reply = InvokeAppActionReply {
             message,
             view_json: view
                 .map(|view| serde_json::to_string(&view).unwrap_or_default())
@@ -1003,18 +1003,32 @@ impl ManagerDaemonService {
             // returned. Returning it (a not-the-leader answer after a
             // leadership change, say) would have the leader-forward layer
             // run the action again on the new leader.
-            if let Err(err) = self.store.idempotency_record(
+            match self.store.idempotency_record(
                 &idempotency_key,
                 "invoke_app_action",
                 &serde_json::to_string(&reply).unwrap_or_default(),
             ) {
-                warn!(
+                Ok(true) => {}
+                // A concurrent call with the same key recorded first, and
+                // this one ran the action too: an action is the app's
+                // code, so it cannot be taken back. The reply is this
+                // run's own, marked so the caller knows the key was taken.
+                Ok(false) => {
+                    reply.deduplicated = true;
+                    warn!(
+                        app = %name,
+                        action = %action_name,
+                        "A concurrent call with the same idempotency key also ran this app \
+                         action; it ran twice"
+                    );
+                }
+                Err(err) => warn!(
                     app = %name,
                     action = %action_name,
                     error = %format!("{err:#}"),
                     "The app action ran, but its idempotency key was not recorded; a retry with \
                      the same key runs it again"
-                );
+                ),
             }
         }
         Ok(Response::new(reply))

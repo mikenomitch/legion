@@ -585,7 +585,7 @@ changed, and its time and fuel, so an agent writing a plugin can check it
 before anything is applied. `legion_net_plugin_list`,
 `legion_net_plugin_describe`, and `legion_net_plugin_status` are read-only.
 `legion_net_plugin_apply` mutates, takes `dry_run` (which re-checks every
-policy that uses the plugin) and an `idempotency_key`, and is gated behind
+policy and running job that uses the plugin) and an `idempotency_key`, and is gated behind
 `--allow-write`.
 
 ```bash
@@ -684,12 +684,30 @@ operation again. Keys recorded by a manager older than this scoping no longer
 match after an upgrade, so a retry that spans the upgrade runs again.
 
 Concurrent requests with the same key are a different case from a retry. Both
-miss the recorded result, so the record decides which one wins. `job run`
-handles this: one caller is told it was first, and the other gets the winner's
-message with `deduplicated: true`. Known limitation: the other mutating RPCs
-(`job stop`, `job destroy`, `job scale`, the `instance` verbs) still report
-`deduplicated: false` to both sides of such a race. Sequential retries, the main
-use for the key, work correctly on all of them.
+miss the recorded result, so the record decides which one wins: exactly one
+caller is told it was first (`deduplicated: false`), and the other gets
+`deduplicated: true`. What the loser is handed depends on the operation:
+
+- **Writes that commit with their record** (`instance create`, `stop`,
+  `start`, `destroy`, `fork`, `suspend` and `promote`, `snapshot create`,
+  `boot-ticket issue`): the loser's write is rolled back, so the key never
+  yields two instances, snapshots, or tickets, and the loser gets the
+  winner's reply, exactly as a later retry would.
+- **Operations that converge** (`job run`, `job stop`, `job destroy`, `job
+  scale`, `instance replace` and `restore`, deletes, `node` availability, app
+  settings, object writes, and the like): the loser's repeat changed nothing
+  the winner had not, and it gets the winner's recorded reply where the reply
+  is a message (`job stop`), or its own reply flagged `deduplicated` where
+  the reply describes current state.
+- **An exec key** (`exec-key create`): the loser's key is deleted and the
+  winner's returned.
+- **Operations that cannot be taken back** (`keyring rotate`, an app
+  action): both ran. The loser gets its own reply with `deduplicated: true`,
+  and the manager logs a warning. For `keyring rotate` the reply names the
+  key that is active now.
+
+Sequential retries, the main use for the key, replay the recorded reply on
+every keyed RPC.
 
 [Sessions](session-mode.md) keep no record. A create on a session task with
 a key derives the session id from it, so a retry on any manager finds the

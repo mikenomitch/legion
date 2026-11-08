@@ -25,6 +25,7 @@ pub mod guest_resume;
 mod microvm;
 mod oci_bundle;
 mod oci_image;
+pub(crate) use oci_image::set_pull_egress_guard;
 pub mod resource_enforcement;
 pub mod rootfs_cache;
 pub mod runtime_class;

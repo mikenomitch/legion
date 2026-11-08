@@ -2006,6 +2006,45 @@ impl UpstreamForwarder {
         }
     }
 
+    /// Bind `specs`' listeners now, ahead of the next [`Self::sync`],
+    /// leaving every other listener alone: the launch path's half of the
+    /// reconcile, for a gated task delivered by push or the work stream
+    /// (`Netd::bind_launch`). A listener already serving exactly its spec is
+    /// kept, a stale one is replaced. The next `sync` keeps these when its
+    /// desired set carries the same specs and stops them otherwise, so the
+    /// heartbeat stays the owner.
+    pub async fn ensure(&self, specs: &[UpstreamSpec]) {
+        let mut stopped: Vec<JoinHandle<()>> = Vec::new();
+        let mut pending: Vec<(UpstreamSpec, Arc<UpstreamShared>)> = Vec::new();
+        {
+            let mut listeners = lock(&self.listeners);
+            for spec in specs {
+                let key = spec.key();
+                match listeners.get(&key) {
+                    Some(listener) if listener.spec == *spec && listener.is_running() => {}
+                    Some(listener) if listener.spec == *spec => {
+                        pending.push((spec.clone(), listener.shared.clone()));
+                    }
+                    _ => {
+                        if let Some(mut old) = listeners.remove(&key) {
+                            stopped.extend(old.task.take());
+                            stopped.extend(old.vip_task.take());
+                        }
+                        let shared = Arc::new(UpstreamShared::new(spec, self.context.clone()));
+                        pending.push((spec.clone(), shared));
+                    }
+                }
+            }
+        }
+        for task in stopped {
+            task.abort();
+            let _ = task.await;
+        }
+        for (spec, shared) in pending {
+            self.start_listener(spec, shared).await;
+        }
+    }
+
     /// Replace the endpoint set one listener balances across.
     ///
     /// Called for every listener the endpoint feed binds, after a heartbeat

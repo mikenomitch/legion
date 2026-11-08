@@ -23,6 +23,7 @@
 
 use crate::prelude::*;
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -308,6 +309,112 @@ pub fn gate_is_shut(allocation_id: i64) -> bool {
     gate_marker(allocation_id).exists()
 }
 
+/// The allocation ids of every `legion-<id>` namespace under `dir`
+/// ([`NETNS_DIR`]). Anything else there (an operator's `ip netns add`, a
+/// name that does not parse) is not Legion's and is not listed.
+pub fn namespace_ids_in(dir: &Path) -> Vec<i64> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<i64> = entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_prefix("legion-")?
+                .parse::<i64>()
+                .ok()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Which of the namespaces found on disk are orphans: not in `keep` (the
+/// acknowledged desired set, the allocations the task manager holds, and the
+/// namespaces this datapath made), and not a provisional allocation's (a
+/// negative local key the manager has not ratified yet).
+pub fn orphaned_namespaces(
+    on_disk: impl IntoIterator<Item = i64>,
+    keep: &HashSet<i64>,
+) -> Vec<i64> {
+    on_disk
+        .into_iter()
+        .filter(|id| *id > 0 && !keep.contains(id))
+        .collect()
+}
+
+/// Whether any process under `proc_root` (`/proc`) is inside the namespace
+/// mounted at `path`: a `/proc/<pid>/ns/net` that resolves to the same
+/// nsfs inode. A pid whose namespace cannot be read for any reason but
+/// having exited counts as inside, so a sweep never removes a namespace it
+/// cannot prove is empty.
+pub fn namespace_in_use(path: &Path, proc_root: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(target) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let is_pid = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()));
+        if !is_pid {
+            continue;
+        }
+        match std::fs::metadata(entry.path().join("ns/net")) {
+            Ok(ns) if ns.dev() == target.dev() && ns.ino() == target.ino() => return true,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// Remove the gated namespaces under [`NETNS_DIR`] that no allocation in
+/// `keep` owns and no process is inside: the namespaces of allocations that
+/// died while the worker was down, which [`crate::worker::netd::Netd`]'s
+/// restore never learns about. Returns how many were removed. A namespace a
+/// process is still inside is left and logged: it may be another worker's on
+/// the same host, or a task nothing tracks, and the operator decides.
+pub fn sweep_orphans(keep: &HashSet<i64>) -> usize {
+    let mut removed = 0;
+    for allocation_id in orphaned_namespaces(namespace_ids_in(Path::new(NETNS_DIR)), keep) {
+        let path = netns_path(allocation_id);
+        if namespace_in_use(&path, Path::new("/proc")) {
+            warn!(
+                allocation_id,
+                path = %path.display(),
+                "Gated network namespace has no allocation on this worker but a process is \
+                 still inside it; leaving it (another worker's, or a task nothing tracks)"
+            );
+            continue;
+        }
+        match destroy(allocation_id) {
+            Ok(()) => {
+                removed += 1;
+                let _ = set_gate(allocation_id, false);
+                debug!(allocation_id, "Removed orphaned gated network namespace");
+            }
+            Err(err) => {
+                warn!(allocation_id, error = ?err, "Failed to remove orphaned gated network namespace")
+            }
+        }
+    }
+    if removed > 0 {
+        info!(
+            removed,
+            "Removed gated network namespaces of allocations that died while the worker was down"
+        );
+    }
+    removed
+}
+
 /// Whether the current process can manage namespaces here: Linux, root, and
 /// `/proc` mounted. Tests skip themselves otherwise.
 pub fn can_manage_netns() -> bool {
@@ -320,6 +427,63 @@ pub fn can_manage_netns() -> bool {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    /// Only `legion-<id>` entries are Legion's; an operator's own
+    /// namespaces and unparseable names are never listed.
+    #[test]
+    fn namespace_ids_in_lists_only_legion_namespaces_test() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "legion-7",
+            "legion-12",
+            "legion--3",
+            "legion-x",
+            "blue",
+            "legion-",
+        ] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        assert_eq!(namespace_ids_in(dir.path()), vec![-3, 7, 12]);
+        assert!(namespace_ids_in(&dir.path().join("missing")).is_empty());
+    }
+
+    /// The finding: a gated allocation that died while the worker was down
+    /// kept its namespace forever, because restore only knows survivors.
+    /// The sweep removes what nothing keeps, and never a provisional key.
+    #[test]
+    fn orphaned_namespaces_are_the_ones_nothing_keeps_test() {
+        let keep: HashSet<i64> = [7, 9].into_iter().collect();
+        assert_eq!(orphaned_namespaces([-3, 7, 8, 9, 12], &keep), vec![8, 12]);
+        assert!(orphaned_namespaces([7, 9], &keep).is_empty());
+        assert_eq!(orphaned_namespaces([1], &HashSet::new()), vec![1]);
+    }
+
+    /// A namespace some process is still inside (the same inode behind
+    /// `/proc/<pid>/ns/net`) is in use; one nobody points at is not.
+    #[test]
+    fn namespace_in_use_matches_by_inode_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("legion-1");
+        let empty = dir.path().join("legion-2");
+        std::fs::write(&held, b"").unwrap();
+        std::fs::write(&empty, b"").unwrap();
+        let proc_root = dir.path().join("proc");
+        let ns = proc_root.join("4242/ns");
+        std::fs::create_dir_all(&ns).unwrap();
+        std::os::unix::fs::symlink(&held, ns.join("net")).unwrap();
+        // Not a pid, so never looked at.
+        std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+        std::os::unix::fs::symlink(&empty, proc_root.join("self/ns/net")).unwrap();
+        // A pid that exited between the listing and the stat.
+        std::fs::create_dir_all(proc_root.join("4343")).unwrap();
+
+        assert!(namespace_in_use(&held, &proc_root));
+        assert!(!namespace_in_use(&empty, &proc_root));
+        // Already gone: nothing to be inside.
+        assert!(!namespace_in_use(&dir.path().join("legion-3"), &proc_root));
+        // No readable process table: cannot prove it is empty.
+        assert!(namespace_in_use(&empty, &dir.path().join("no-proc")));
+    }
 
     #[tokio::test]
     async fn listener_bound_inside_a_namespace_is_unreachable_from_the_host() {

@@ -307,7 +307,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_webhook_speaks_httpreq_test() -> R<()> {
-        let calls: Arc<StdMutex<Vec<(String, Value, Option<String>)>>> = Arc::default();
+        type Calls = Arc<StdMutex<Vec<(String, Value, Option<String>)>>>;
+        let calls: Calls = Arc::default();
         let calls_in = calls.clone();
         let url = serve_http(move |exchange: Exchange| {
             calls_in.lock().unwrap().push((

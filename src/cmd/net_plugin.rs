@@ -90,7 +90,7 @@ pub fn config() -> Command {
                     Arg::new("dry-run")
                         .long("dry-run")
                         .action(ArgAction::SetTrue)
-                        .help("Validate (and re-check the policies that use it) without writing"),
+                        .help("Validate (and re-check the policies and running jobs that use it) without writing"),
                 )
                 .arg(
                     Arg::new("idempotency-key")

@@ -133,6 +133,9 @@ pub struct Netd {
     /// departures are torn down. A namespace that outlives a worker restart
     /// is found again by path.
     namespaces: Mutex<HashSet<i64>>,
+    /// Whether the once-per-start sweep of orphaned gated namespaces
+    /// ([`Self::sweep_orphan_namespaces`]) has run.
+    orphans_swept: std::sync::atomic::AtomicBool,
     /// The node's endpoint feed: bindings and the sets they name.
     feed: Mutex<EndpointFeedState>,
 }
@@ -148,6 +151,7 @@ impl Netd {
             last_state_hash: Mutex::new(0),
             last: Mutex::new(DesiredNetwork::default()),
             namespaces: Mutex::new(HashSet::new()),
+            orphans_swept: std::sync::atomic::AtomicBool::new(false),
             feed: Mutex::new(EndpointFeedState::default()),
         }
     }
@@ -393,27 +397,67 @@ impl Netd {
         });
     }
 
-    /// Bind a gated sandbox's egress proxy before its launch, for the
+    /// Bind a gated allocation's datapath before its launch, for the
     /// delivery routes that start a task without a heartbeat: a `PostWork`
     /// push and a `StreamWork` delta (`WorkerDaemonService::accept_work`).
     /// A heartbeat's [`NetdInput::Desired`] binds its own deliveries before
-    /// the reconcile starts them. Without this, a restored guest would wait
-    /// the full `DATAPATH_WAIT` (5 s) for a socket only the next heartbeat
-    /// binds.
+    /// the reconcile starts them. Without this a pushed gated task ran with
+    /// no egress proxy, resolver, or upstream listeners until the next
+    /// heartbeat, and a restored guest waited the full `DATAPATH_WAIT` (5 s)
+    /// for a socket only that heartbeat bound.
     ///
-    /// The spec is the one [`specs::proxy_specs`] builds, so the next
-    /// desired set's sync keeps the listener as its own. Until that desired
-    /// set lands the policy, the proxy fails closed. `None` for anything but
-    /// a gated sandbox (a gated container or exec task gets its namespace,
-    /// and the proxy inside it, from the heartbeat). Otherwise whether the
-    /// proxy is serving: a bind that fails is logged, and the restore then
-    /// resumes fail-closed.
+    /// For a gated `container` or `exec` task the namespace is created
+    /// first (idempotent, the same call the task start makes), since its
+    /// listeners bind inside it. Then the egress proxy, the resolver, and
+    /// the upstream listeners are bound from the specs [`specs`] builds for
+    /// the heartbeat's desired set, so the next sync keeps them as its own;
+    /// and any endpoint set the feed already holds is applied. Until a
+    /// desired set lands the policy, the proxy and upstreams fail closed.
+    ///
+    /// `None` for an allocation that is not gated. Otherwise whether the
+    /// egress proxy is serving: a bind that fails is logged, and the task
+    /// starts fail-closed (a restore resumes fail-closed).
     pub async fn bind_launch(&self, allocation: &TaskAllocation) -> Option<bool> {
-        let spec = specs::proxy_specs(std::slice::from_ref(allocation), &self.alloc_root)
-            .pop()
-            .filter(|spec| spec.attachment.guest_vsock().is_some())?;
-        let proxies = self.forwarder.proxies()?;
-        Some(proxies.ensure(spec).await)
+        let one = std::slice::from_ref(allocation);
+        let root = self.alloc_root.as_path();
+        let proxy = specs::proxy_specs(one, root).pop()?;
+        if let Some(allocation_id) = specs::gated_namespace_ids(one, root).pop() {
+            if crate::worker::netd::netns::platform_supports_netns()
+                && !crate::worker::netd::netns::netns_exists(allocation_id)
+            {
+                let created = tokio::task::spawn_blocking(move || {
+                    crate::worker::netd::netns::create(allocation_id)
+                })
+                .await;
+                match created {
+                    Ok(Ok(path)) => {
+                        info!(allocation_id, path = %path.display(), "Created gated network namespace for a pushed allocation")
+                    }
+                    Ok(Err(err)) => {
+                        // The task start retries the create and refuses to
+                        // run without it; nothing can bind inside it here.
+                        warn!(allocation_id, error = ?err, "Failed to create gated network namespace ahead of launch");
+                        return Some(false);
+                    }
+                    Err(err) => {
+                        warn!(allocation_id, error = ?err, "Namespace creation task panicked");
+                        return Some(false);
+                    }
+                }
+            }
+        }
+        let serving = match self.forwarder.proxies() {
+            Some(proxies) => proxies.ensure(proxy).await,
+            None => false,
+        };
+        if let Some(dns) = self.forwarder.dns() {
+            dns.ensure(&specs::dns_specs(one, root)).await;
+        }
+        self.forwarder
+            .ensure(&specs::upstream_specs(one, root))
+            .await;
+        self.apply_endpoints();
+        Some(serving)
     }
 
     /// Replay the persisted inputs for the allocations in `live` (the ones
@@ -473,6 +517,59 @@ impl Netd {
             "Restored the datapath from disk ahead of the first heartbeat"
         );
         restored
+    }
+
+    /// Whether [`Self::sweep_orphan_namespaces`] is still to run, so the
+    /// caller gathers what it keeps only once.
+    pub fn orphan_sweep_pending(&self) -> bool {
+        crate::worker::netd::netns::platform_supports_netns()
+            && !self.orphans_swept.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Remove the gated namespaces of allocations that died while the
+    /// worker was down. [`Self::restore`] only knows the allocations that
+    /// survived, and [`Self::apply_desired`] only tears down namespaces it
+    /// made, so without this their `/var/run/netns/legion-<id>` mounts stay
+    /// forever. Runs once, on the first acknowledged heartbeat (after its
+    /// desired set is applied); later calls return 0.
+    ///
+    /// `keep` is what the worker holds (the task manager's allocations,
+    /// including any a push or the work stream launched ahead of the
+    /// heartbeat); the last desired set and this datapath's own namespaces
+    /// are kept too. A namespace a process is still inside is never removed
+    /// (see [`crate::worker::netd::netns::sweep_orphans`]).
+    ///
+    /// [`Self::orphan_sweep_pending`] says whether the sweep is still to
+    /// run, so the caller gathers `keep` only once.
+    pub async fn sweep_orphan_namespaces(&self, mut keep: HashSet<i64>) -> usize {
+        if !crate::worker::netd::netns::platform_supports_netns()
+            || self
+                .orphans_swept
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return 0;
+        }
+        keep.extend(
+            self.namespaces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .copied(),
+        );
+        keep.extend(
+            self.last
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .desired
+                .iter()
+                .map(|allocation| allocation.allocation_id),
+        );
+        tokio::task::spawn_blocking(move || crate::worker::netd::netns::sweep_orphans(&keep))
+            .await
+            .unwrap_or_else(|err| {
+                warn!(error = ?err, "Orphaned namespace sweep panicked");
+                0
+            })
     }
 
     async fn apply_desired(&self, mut input: DesiredNetwork) {
@@ -1155,11 +1252,19 @@ mod tests {
             netd.bind_launch(&allocation(8, "sandbox", "host")).await,
             None
         );
-        assert_eq!(
-            netd.bind_launch(&allocation(7, "container", "gated")).await,
-            None,
-            "a gated container's proxy binds inside its namespace, on the heartbeat"
-        );
+        // A gated container's datapath binds at launch too, inside its
+        // namespace, which needs root (without it, the bind fails and the
+        // start refuses on its own namespace error).
+        let container_id = 7_900_000 + i64::from(std::process::id() % 10_000);
+        let container = netd
+            .bind_launch(&allocation(container_id, "container", "gated"))
+            .await;
+        if crate::worker::netd::netns::can_manage_netns() {
+            assert_eq!(container, Some(true));
+            crate::worker::netd::netns::destroy(container_id)?;
+        } else {
+            assert!(container.is_some(), "a gated container is bound at launch");
+        }
 
         let socket = crate::worker::netd::attach::guest_socket(
             &crate::task_plugins::sandbox_dir_for(&root.path().join("9")),
@@ -1182,6 +1287,79 @@ mod tests {
             socket.exists(),
             "the next launch binds a removed socket again"
         );
+        Ok(())
+    }
+
+    /// The finding: a gated task delivered by push or the work stream had
+    /// only its egress proxy bound at launch (and only a sandbox), so its
+    /// resolver and upstream listeners waited for the next heartbeat. The
+    /// launch path now binds all three, from the same specs the heartbeat
+    /// builds, and the heartbeat that lists the allocation keeps them.
+    #[tokio::test]
+    async fn a_pushed_gated_task_binds_its_whole_datapath_at_launch_test() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        let root = TempDir::new()?;
+        let context = Arc::new(ForwarderContext::new(
+            Arc::new(NetPolicyCache::new()),
+            Arc::new(Denials::new()),
+        ));
+        let netd = Netd::new(
+            Arc::new(
+                UpstreamForwarder::with_context(context.clone())
+                    .with_proxies(Arc::new(crate::worker::netd::proxy::EgressProxies::new(
+                        context.clone(),
+                    )))
+                    .with_dns(Arc::new(crate::worker::netd::dns::NetDns::new(
+                        context,
+                        Vec::new(),
+                    ))),
+            ),
+            root.path().to_path_buf(),
+        );
+        let local_port = free_port().await;
+        let pushed = TaskAllocation {
+            allocation_id: 12,
+            job_id: "web".into(),
+            task_name: "box".into(),
+            task_runtime: "sandbox".into(),
+            task_config: json!({ "image": "a" }).to_string(),
+            task_connect: json!({ "upstreams": [{ "to": "db" }] }).to_string(),
+            network: json!({
+                "mode": "gated",
+                "upstreams": [{ "key": "db", "localPort": local_port, "balance": "least_conn" }]
+            })
+            .to_string(),
+            ..Default::default()
+        };
+        assert_eq!(netd.bind_launch(&pushed).await, Some(true));
+
+        let dir = crate::task_plugins::sandbox_dir_for(&root.path().join("12"));
+        let sockets = [
+            ("egress proxy", crate::worker::netd::proxy::PROXY_PORT),
+            ("resolver", crate::worker::netd::dns::DNS_PORT),
+            ("upstream", local_port),
+        ]
+        .map(|(what, port)| (what, crate::worker::netd::attach::guest_socket(&dir, port)));
+        let mut bound = Vec::new();
+        for (what, socket) in &sockets {
+            let inode = std::fs::metadata(socket)
+                .map(|meta| meta.ino())
+                .with_context(|| format!("the {what} is bound at launch"))?;
+            bound.push(inode);
+        }
+
+        netd.send(NetdInput::Desired(DesiredNetwork {
+            desired: vec![pushed],
+            ..Default::default()
+        }))
+        .await;
+        for ((what, socket), inode) in sockets.iter().zip(bound) {
+            assert_eq!(
+                std::fs::metadata(socket)?.ino(),
+                inode,
+                "the heartbeat keeps the launch path's {what}"
+            );
+        }
         Ok(())
     }
 }

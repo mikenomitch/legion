@@ -252,16 +252,35 @@ impl Store {
         self.audit_lane().is_some()
     }
 
-    /// Appends a batch of audit records as one replicated entry. Fails with
-    /// the typed not-the-leader error in raft mode when this manager leads no
-    /// lane; the governance writer then logs the batch instead.
+    /// Appends a batch of audit records as one replicated entry, on a lane
+    /// this manager leads. A raft manager that leads no lane forwards the
+    /// batch to the status-lane leader
+    /// (`ForwardableLaneWrite::AppendAudit`); when that cannot complete (no
+    /// leader known, unreachable) it fails, and the governance writer logs
+    /// the batch to the `audit` tracing target instead.
     pub fn append_audit_events(&self, records: Vec<AuditRecord>) -> R<()> {
         if records.is_empty() {
             return Ok(());
         }
         let Some(lane) = self.audit_lane() else {
-            bail!("this manager leads no raft lane, so it cannot journal audit records");
+            let refusal = anyhow!(
+                "this manager leads no raft lane, so it cannot journal audit records itself"
+            );
+            return self.forward_after_rejection::<()>(
+                crate::storage::raft::forward::ForwardableLaneWrite::AppendAudit { records },
+                refusal,
+            );
         };
+        self.append_audit_events_on(lane, records)
+    }
+
+    /// [`Self::append_audit_events`] on a given lane, never forwarded: what
+    /// a forwarded `AppendAudit` runs on the lane leader, whose
+    /// not-the-leader answer rides back to the origin.
+    pub(crate) fn append_audit_events_on(&self, lane: Lane, records: Vec<AuditRecord>) -> R<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
         self.replicated(lane, "append_audit_events", move |s| {
             let conn = s.write_connection()?;
             let mut stmt = conn.prepare_cached(&format!(

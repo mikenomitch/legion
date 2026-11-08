@@ -150,12 +150,13 @@ impl<'a> AutoModeFacts<'a> {
     /// a node whose default is one. A dev backend (Apple `container`, an
     /// OCI runtime) has no vsock to the datapath.
     pub fn runs_microvm(&self) -> bool {
+        use crate::structs::checkpoint::SandboxVmm;
         match self.hypervisor.map(str::to_ascii_lowercase).as_deref() {
-            Some("firecracker" | "fc" | "cloud-hypervisor" | "cloudhypervisor" | "ch") => true,
+            Some(selected) if SandboxVmm::parse(selected).is_some() => true,
             Some("dev") => false,
             _ => self
                 .node_vmm
-                .is_none_or(|vmm| matches!(vmm, "firecracker" | "cloud-hypervisor")),
+                .is_none_or(|vmm| SandboxVmm::parse(vmm).is_some()),
         }
     }
 }

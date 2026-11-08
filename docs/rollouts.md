@@ -166,8 +166,15 @@ rollout left behind instead of the latest config:
   new version first. If the previous version then cannot be placed back (no
   capacity, a lost conflict race), a `job_reschedule` for the previous
   version is queued 5 seconds out. An automatic rollback still ends the
-  rollout `failed`. A `StopRollout` with `revert` returns the error and
-  leaves the rollout in its current status, so retry the stop. Reconciliation tops up
+  rollout `failed`. A `StopRollout` with `revert` ends the rollout
+  `cancelled` and removes the new version in one write, before it re-places
+  the previous version, so no later tick can find the rollout live and place
+  the new version again. If the re-placement then fails, the stop still
+  succeeds: the rollout's message (and the reply's) reads `Rollout stopped
+  and reverted; the new version is removed, but re-placing the previous
+  version failed (<error>), so a job_reschedule retry is queued`, and the
+  same text is a `warn` rollout event. If the stop itself fails, nothing
+  changed and it can be retried. Reconciliation tops up
   the previous version, for example after a node loss. It never re-places the
   rolled-back version.
 - **Failed after replacing everything**: only the new version runs, and
@@ -216,6 +223,17 @@ A replacement whose `dependsOn` is not met yet (a batch step of the new
 version that has not exited) is not capacity blocked. The group waits with
 `Group <g> waiting for dependencies of <task> to finish`, the capacity
 timeout does not run, and the dependency's exit queues the next tick.
+
+A replacement of an allocation that failed, on this version or on the one
+being replaced, waits out that failure's reschedule backoff
+([jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md), "Manager-side
+move logic"). It is not capacity blocked either: the group waits with
+`Group <g> waiting for <task> (<n>) to wait out a reschedule backoff`, the
+capacity timeout does not run, and the group looks again when the soonest
+hold lapses (at most every 30s). Time spent waiting still counts toward
+`healthyDeadline`, which is measured from the step's start, so a backoff
+longer than the deadline makes the step miss it once the replacement is
+placed.
 
 ### Static ports and surge
 
@@ -287,7 +305,13 @@ Core flow:
 6. Allocation dispatch and task status updates run after successful placement.
 7. Old allocations are retired according to replacement mode and lifecycle rules.
 8. Rollout status/events/runtime JSON are persisted.
-9. Next delayed `rollout_tick` is enqueued when rollout must continue.
+9. Next delayed `rollout_tick` is enqueued when rollout must continue. A
+   tick that only waited (for health, capacity, a dependency, or a backoff)
+   and changed nothing (status, message, and step state as it found them)
+   instead puts its own eval back to pending for the delay. Such a no-op tick
+   writes no `eval.completed` and no `eval.enqueued` event, so a rollout that
+   waits a long time does not fill the event stream with a pair per poll;
+   the rollout's own event log already records only changes.
 
 Eval handler paths:
 

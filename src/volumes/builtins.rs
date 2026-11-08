@@ -7,7 +7,7 @@
 //!
 //! | Driver | Node-local | Summary |
 //! | --- | --- | --- |
-//! | `local-dir` | yes | A directory under the worker's state dir. The default. |
+//! | `local-dir` | yes | A directory under the worker's state dir (`local-volumes/`). The default. |
 //! | `host` | yes | Claims an operator-declared host path by name. |
 //! | `nfs` | **no** | Mounts an NFS export; instances reschedule anywhere. |
 //! | `tmpfs` | yes | RAM-backed scratch, wiped on unmount. Linux only. |
@@ -38,8 +38,20 @@ pub fn all(config: &VolumeRuntimeConfig) -> Vec<Box<dyn VolumeDriver>> {
 // =====
 
 /// The default driver: one directory per volume under
-/// `<worker state dir>/volumes/local-dir/<volume_id>`, created on first mount
+/// `<worker state dir>/local-volumes/<volume_id>/`, created on first mount
 /// and removed on destroy.
+///
+/// **Each volume guards itself.** `local-volumes/` is traverse-only
+/// (`0711`), like `allocs/`, so a task whose `user` is not the worker's can
+/// reach its own volume by path but cannot list the others. The per-volume
+/// directory `<volume_id>/` is the guard: owner-only (`0700`) from the
+/// moment it exists, and handed to an `exec` task's `user` when one mounts it
+/// ([`local_dir_guard`]). The payload inside it, `data/` in filesystem mode
+/// and `disk.img` in block mode, keeps the umask (or the `mode` param), so a
+/// container's non-root image user can still read a volume it was handed.
+/// The root sits beside `volumes/`, not inside it: `volumes/` stays
+/// owner-only for the drivers and plugins whose directories do not guard
+/// themselves (snapshots, `nfs`, `tmpfs` mountpoints, out-of-tree data).
 ///
 /// Node-local by definition — the bytes live on one machine's disk, so an
 /// instance holding one can only be replaced on that machine. `size` is
@@ -60,12 +72,73 @@ pub struct LocalDirDriver {
 /// Written last, so its presence means the snapshot is complete.
 const SNAPSHOT_RECORD: &str = "snapshot.json";
 
+/// The local-dir root's name, beside `volumes/` in the worker state dir.
+pub const LOCAL_VOLUMES_SUBDIR: &str = "local-volumes";
+
+/// The directory holding a filesystem-mode volume's bytes, inside its guard.
+const LOCAL_DIR_DATA: &str = "data";
+
+/// When `host_path` is a filesystem-mode `local-dir` volume under
+/// `data_dir` (`<data_dir>/local-volumes/<volume_id>/data`), its per-volume
+/// guard directory. A runtime that runs the task as its own `user` hands the
+/// guard (and the data) to that user; nothing else is ever handed over, so
+/// an operator's `host` volume or an NFS export never changes owner.
+pub fn local_dir_guard<'a>(host_path: &'a Path, data_dir: &Path) -> Option<&'a Path> {
+    if host_path.file_name()? != LOCAL_DIR_DATA {
+        return None;
+    }
+    let guard = host_path.parent()?;
+    let name = guard.file_name()?.to_str()?;
+    if name.is_empty() || name.starts_with('.') {
+        return None;
+    }
+    (guard.parent()? == data_dir.join(LOCAL_VOLUMES_SUBDIR)).then_some(guard)
+}
+
+/// Create `dir` owner-only (`0700`) when it does not exist, so it is never
+/// visible at the umask, not even between the create and a chmod.
+fn create_private_dir(dir: &Path) -> R<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to create {}", dir.display())),
+    }
+}
+
 impl LocalDirDriver {
+    /// The driver for a worker whose volume root is `volume_root`
+    /// (`<state dir>/volumes`): volumes go beside it, in
+    /// `<state dir>/local-volumes/`, and snapshots inside it.
     pub fn new(volume_root: PathBuf) -> Self {
+        let state_dir = volume_root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         LocalDirDriver {
-            root: volume_root.join("local-dir"),
+            root: state_dir.join(LOCAL_VOLUMES_SUBDIR),
             snapshot_root: volume_root.join("local-dir-snapshots"),
         }
+    }
+
+    /// Create the root traverse-only (the worker's `prepare_layout` already
+    /// did, but a driver used on its own, as `legion volume driver test`
+    /// does, guards itself the same way), then the volume's guard
+    /// owner-only. Returns the guard.
+    fn ensure_guard(&self, volume_id: &str) -> R<PathBuf> {
+        if !self.root.is_dir() {
+            std::fs::create_dir_all(&self.root)
+                .with_context(|| format!("failed to create {}", self.root.display()))?;
+            crate::util::restrict_dir_to_traverse_only(&self.root)?;
+        }
+        let guard = self.dir_for(volume_id);
+        create_private_dir(&guard)?;
+        Ok(guard)
     }
 
     fn snapshot_dir(&self, snapshot_id: &str) -> R<PathBuf> {
@@ -91,10 +164,11 @@ impl LocalDirDriver {
         }
     }
 
-    /// The volume's bytes in `mode`: its directory, or its disk image.
+    /// The volume's bytes in `mode`: its data directory, or its disk image.
+    /// Both sit inside the volume's guard ([`Self::dir_for`]).
     fn volume_payload(&self, volume_id: &str, mode: VolumeMode) -> PathBuf {
         match mode {
-            VolumeMode::Filesystem => self.dir_for(volume_id),
+            VolumeMode::Filesystem => self.dir_for(volume_id).join(LOCAL_DIR_DATA),
             VolumeMode::Block => self.image_for(volume_id),
         }
     }
@@ -134,6 +208,7 @@ impl LocalDirDriver {
         Ok((dir, record))
     }
 
+    /// The volume's guard directory, which `destroy` removes whole.
     fn dir_for(&self, volume_id: &str) -> PathBuf {
         self.root.join(volume_id)
     }
@@ -155,8 +230,7 @@ impl LocalDirDriver {
         if image.is_file() {
             return Ok((image, false));
         }
-        let dir = self.dir_for(&request.volume.id);
-        create_dir_with_mode(&dir, request.param_str("mode").as_deref())?;
+        self.ensure_guard(&request.volume.id)?;
 
         let size = request.block_size_bytes()?;
         let fs = request.block_fs();
@@ -244,7 +318,8 @@ impl VolumeDriver for LocalDirDriver {
                 .with_attr("fs", request.block_fs()));
         }
 
-        let dir = self.dir_for(&request.volume.id);
+        self.ensure_guard(&request.volume.id)?;
+        let dir = self.volume_payload(&request.volume.id, VolumeMode::Filesystem);
         let fresh = !dir.exists();
         create_dir_with_mode(&dir, request.param_str("mode").as_deref())?;
         let mut result = MountResult::at(&dir).fresh(fresh);
@@ -364,9 +439,9 @@ impl VolumeDriver for LocalDirDriver {
         let (dir, record) = self.existing_snapshot(request)?;
         let payload = Self::snapshot_payload(&dir, record.mode);
         let target = self.volume_payload(&request.volume.id, request.mode);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        // The staging copy and the moved-aside old tree below both live
+        // inside the guard, so neither is reachable to anyone else.
+        self.ensure_guard(&request.volume.id)?;
         // Copy beside the target, then swap: the volume is either all old or
         // all restored, never half of each.
         let staging = target.with_file_name(format!(
@@ -417,18 +492,17 @@ impl VolumeDriver for LocalDirDriver {
             // published by rename, never left half-built).
             return Ok(());
         }
-        std::fs::create_dir_all(&self.root)?;
-        let staging = self.root.join(format!(
+        // The staging guard is owner-only before anything is copied into
+        // it, and is published whole by the rename below.
+        let staging = self.ensure_guard(&format!(
             ".{}.clone-{}",
             request.volume.id,
             crate::util::random_string(8)
-        ));
+        ))?;
         let payload = Self::snapshot_payload(&dir, record.mode);
         let copied = match request.mode {
-            VolumeMode::Filesystem => clone_tree(&payload, &staging),
-            VolumeMode::Block => std::fs::create_dir_all(&staging)
-                .map_err(anyhow::Error::from)
-                .and_then(|()| clone_file(&payload, &staging.join("disk.img"))),
+            VolumeMode::Filesystem => clone_tree(&payload, &staging.join(LOCAL_DIR_DATA)),
+            VolumeMode::Block => clone_file(&payload, &staging.join("disk.img")),
         };
         if let Err(err) = copied {
             let _ = std::fs::remove_dir_all(&staging);
@@ -1139,6 +1213,88 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         Ok(())
+    }
+
+    /// The finding: `volumes/` was the only guard on local-dir data, so it
+    /// had to stay owner-only and an `exec` task with a `user` could not
+    /// reach its own volume. Each volume now guards itself: the root is
+    /// traverse-only, the per-volume directory owner-only from the moment it
+    /// exists (clones and restores included), and only the payload inside
+    /// keeps the umask or the `mode` param.
+    #[cfg(unix)]
+    #[test]
+    fn local_dir_volumes_guard_themselves_test() -> R<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &Path| -> R<u32> { Ok(std::fs::metadata(path)?.permissions().mode() & 0o777) };
+        let root = temp_root("local-dir-modes");
+        let plugin = LocalDirDriver::new(root.join("volumes"));
+        let mut req = request(VolumeOp::Mount, "local-dir", &root);
+        req.params.insert("mode".into(), json!("0755"));
+        let data = plugin.mount(&req)?.mount_path.expect("path");
+
+        let volumes = root.join(LOCAL_VOLUMES_SUBDIR);
+        let guard = volumes.join("vol-test");
+        assert_eq!(data, guard.join("data"));
+        assert_eq!(mode(&volumes)?, 0o711, "the root is traverse-only");
+        assert_eq!(mode(&guard)?, 0o700, "each volume guards itself");
+        assert_eq!(mode(&data)?, 0o755, "the payload keeps its `mode`");
+        assert!(
+            !root.join("volumes").join("local-dir").exists(),
+            "local-dir data is not under the owner-only volumes/"
+        );
+        assert_eq!(local_dir_guard(&data, &root), Some(guard.as_path()));
+
+        // A snapshot round trip keeps every copy behind a guard.
+        std::fs::write(data.join("marker"), b"v1")?;
+        let snap = request(VolumeOp::Snapshot, "local-dir", &root)
+            .with_snapshot(snapshot_ref("snap-modes", VolumeMode::Filesystem));
+        let taken = plugin.snapshot(&snap)?;
+        let restore = request(VolumeOp::Restore, "local-dir", &root).with_snapshot(taken.clone());
+        plugin.restore(&restore)?;
+        assert_eq!(mode(&guard)?, 0o700, "a restore keeps the guard");
+        let mut clone = request(VolumeOp::Clone, "local-dir", &root).with_snapshot(taken);
+        clone.volume.id = "vol-fork".into();
+        plugin.clone_volume(&clone)?;
+        assert_eq!(
+            mode(&volumes.join("vol-fork"))?,
+            0o700,
+            "a clone is guarded"
+        );
+        assert_eq!(std::fs::read(volumes.join("vol-fork/data/marker"))?, b"v1");
+
+        // A guard deleted out from under a later mount comes back guarded.
+        plugin.destroy(&req)?;
+        req.params.clear();
+        plugin.mount(&req)?;
+        assert_eq!(mode(&guard)?, 0o700);
+
+        std::fs::remove_dir_all(&root).ok();
+        Ok(())
+    }
+
+    /// Only Legion's own per-volume directory is ever handed to a task user:
+    /// never an operator's host path, an NFS export, or anything outside
+    /// this node's `local-volumes/`.
+    #[test]
+    fn local_dir_guard_matches_only_this_nodes_volumes_test() {
+        let data_dir = Path::new("/var/lib/legion/w1");
+        let ours = Path::new("/var/lib/legion/w1/local-volumes/9f2c/data");
+        assert_eq!(
+            local_dir_guard(ours, data_dir),
+            Some(Path::new("/var/lib/legion/w1/local-volumes/9f2c"))
+        );
+        for other in [
+            "/var/lib/legion/w2/local-volumes/9f2c/data",
+            "/srv/local-volumes/9f2c/data",
+            "/var/lib/legion/w1/local-volumes/9f2c/disk.img",
+            "/var/lib/legion/w1/local-volumes/9f2c",
+            "/var/lib/legion/w1/local-volumes/.9f2c.clone-x/data",
+            "/var/lib/legion/w1/volumes/nfs/9f2c/data",
+            "/data",
+        ] {
+            assert_eq!(local_dir_guard(Path::new(other), data_dir), None, "{other}");
+        }
     }
 
     #[test]

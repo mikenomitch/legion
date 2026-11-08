@@ -64,6 +64,10 @@ impl ManagerDaemonService {
             check_policy_against_plugin(policy, &object)
                 .map_err(|e| Status::failed_precondition(e.to_string()))?;
         }
+        // And so must every running job that uses it: a job keeps its config
+        // until it is resubmitted, so a plugin change it could not pass at
+        // submit is refused here rather than handed to the module.
+        self.check_jobs_against_plugin(&identity, &object)?;
         if req.dry_run {
             let mut plugin = net_plugin_to_proto(&object, 0, "", "");
             plugin.referenced_by = referencing.iter().map(|p| p.name.clone()).collect();
@@ -107,11 +111,11 @@ impl ManagerDaemonService {
             .store
             .upsert_net_plugin(object)
             .map_err(|e| map_store_error("Error saving net plugin", e))?;
-        if !idempotency_key.is_empty() {
-            self.store
-                .idempotency_record(&idempotency_key, "upsert_net_plugin", &record.object.name)
-                .map_err(|e| map_store_error("Error recording idempotency", e))?;
-        }
+        let (_, deduplicated) = self.record_idempotent(
+            &idempotency_key,
+            "upsert_net_plugin",
+            record.object.name.clone(),
+        )?;
         self.store.events().net_plugin_applied(
             &record.object.name,
             record.revision,
@@ -121,7 +125,7 @@ impl ManagerDaemonService {
         plugin.referenced_by = referencing.iter().map(|p| p.name.clone()).collect();
         Ok(Response::new(UpsertNetPluginReply {
             plugin: Some(plugin),
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -292,62 +296,57 @@ impl ManagerDaemonService {
     /// template runs.
     pub(super) fn check_job_plugins(&self, tasks: &[TaskConfig]) -> Result<(), Status> {
         let mut checked: HashMap<String, Option<NetPluginObject>> = HashMap::new();
-        for task in tasks {
-            let mut hops: Vec<(
-                String,
-                &crate::structs::netplugin::PluginConfig,
-                bool,
-                String,
-            )> = Vec::new();
-            if let Some(network) = task.network.as_ref() {
-                for (direction, chain) in
-                    [("egress", &network.egress), ("ingress", &network.ingress)]
-                {
-                    let Some(chain) = chain.as_ref() else {
-                        continue;
-                    };
-                    for (index, hop) in chain.handlers.iter().enumerate() {
-                        if let Some(reference) = hop_plugin(hop) {
-                            hops.push((
-                                format!("task {} network.{direction}.handlers[{index}]", task.name),
-                                reference,
-                                chain.is_http(),
-                                not_http(direction),
-                            ));
-                        }
-                    }
-                }
-            }
-            for upstream in task.connect.iter().flat_map(|c| c.upstreams.iter()) {
-                let key = upstream.key();
-                for (index, hop) in upstream.handlers.iter().enumerate() {
-                    if let Some(reference) = hop_plugin(hop) {
-                        hops.push((
-                            format!(
-                                "task {} connect.upstreams entry '{key}' handlers[{index}]",
-                                task.name
-                            ),
-                            reference,
-                            upstream.is_http(),
-                            format!(
-                                "upstream '{key}' is not HTTP. Give it an http:// or https:// \
-                                 target"
-                            ),
-                        ));
-                    }
-                }
-            }
-            for (what, reference, is_http, where_http) in hops {
-                let object = self.plugin_for_check(&mut checked, &reference.name)?;
-                check_plugin_reference(
-                    &what,
-                    reference,
-                    object.as_ref(),
-                    PluginUse::Job,
-                    is_http,
-                    &where_http,
-                )
+        for hop in tasks.iter().flat_map(job_plugin_hops) {
+            let object = self.plugin_for_check(&mut checked, &hop.reference.name)?;
+            hop.check(object.as_ref())
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Re-check every job that uses the plugin against its new object: the
+    /// latest config of each job that is not stopped. A stopped job is
+    /// checked again when it is next run. The first job the new object
+    /// would refuse refuses the write, named when the caller may read it.
+    fn check_jobs_against_plugin(
+        &self,
+        identity: &crate::structs::AclIdentity,
+        object: &NetPluginObject,
+    ) -> Result<(), Status> {
+        let jobs = self
+            .store
+            .get_jobs()
+            .map_err(|e| map_store_error("Error listing jobs", e))?;
+        for job in jobs.iter().filter(|job| job.status != "stopped") {
+            let Some(config) = self
+                .store
+                .get_job_config_optional(&job.id)
+                .map_err(|e| map_store_error("Error loading job config", e))?
+            else {
+                continue;
+            };
+            for hop in config
+                .tasks
+                .iter()
+                .flat_map(job_plugin_hops)
+                .filter(|hop| hop.reference.name == object.name)
+            {
+                if let Err(err) = hop.check(Some(object)) {
+                    let job_name = if identity.allows(
+                        AclResource::Job,
+                        AclAction::Read,
+                        &AclScope::job(&job.id),
+                    ) {
+                        format!("job '{}'", job.id)
+                    } else {
+                        "a job you cannot read".to_string()
+                    };
+                    return Err(Status::failed_precondition(format!(
+                        "{job_name} uses plugin '{}' and the new object would refuse it: {err}. \
+                         Update or stop the job first",
+                        object.name
+                    )));
+                }
             }
         }
         Ok(())
@@ -396,6 +395,70 @@ fn not_http(direction: &str) -> String {
         "{direction}.protocol is \"tcp\". Set protocol = \"http\" for a plugin that acts on \
          requests, or declare stage \"connect\""
     )
+}
+
+/// One `{ plugin = ... }` hop in a job's task: where it is, what it names,
+/// and whether its path is HTTP (and what to say when it is not).
+struct JobPluginHop<'a> {
+    what: String,
+    reference: &'a crate::structs::netplugin::PluginConfig,
+    is_http: bool,
+    where_http: String,
+}
+
+impl JobPluginHop<'_> {
+    fn check(&self, object: Option<&NetPluginObject>) -> R<()> {
+        check_plugin_reference(
+            &self.what,
+            self.reference,
+            object,
+            PluginUse::Job,
+            self.is_http,
+            &self.where_http,
+        )
+    }
+}
+
+/// Every plugin hop in a task: its inline chains and its upstreams'
+/// handlers.
+fn job_plugin_hops(task: &TaskConfig) -> Vec<JobPluginHop<'_>> {
+    let mut hops = Vec::new();
+    if let Some(network) = task.network.as_ref() {
+        for (direction, chain) in [("egress", &network.egress), ("ingress", &network.ingress)] {
+            let Some(chain) = chain.as_ref() else {
+                continue;
+            };
+            for (index, hop) in chain.handlers.iter().enumerate() {
+                if let Some(reference) = hop_plugin(hop) {
+                    hops.push(JobPluginHop {
+                        what: format!("task {} network.{direction}.handlers[{index}]", task.name),
+                        reference,
+                        is_http: chain.is_http(),
+                        where_http: not_http(direction),
+                    });
+                }
+            }
+        }
+    }
+    for upstream in task.connect.iter().flat_map(|c| c.upstreams.iter()) {
+        let key = upstream.key();
+        for (index, hop) in upstream.handlers.iter().enumerate() {
+            if let Some(reference) = hop_plugin(hop) {
+                hops.push(JobPluginHop {
+                    what: format!(
+                        "task {} connect.upstreams entry '{key}' handlers[{index}]",
+                        task.name
+                    ),
+                    reference,
+                    is_http: upstream.is_http(),
+                    where_http: format!(
+                        "upstream '{key}' is not HTTP. Give it an http:// or https:// target"
+                    ),
+                });
+            }
+        }
+    }
+    hops
 }
 
 /// The plugin re-checked against one stored policy that uses it.

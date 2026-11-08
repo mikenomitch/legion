@@ -163,7 +163,7 @@ body depends on whether something has to read it whole or send it twice:
 
 | The request | Its body |
 | --- | --- |
-| A body hop applies (`dlp`, a plugin's `body` stage) | Read whole, up to the hop's `maxBytes`. Over it, a hop that fails closed (the default) denies with `403`; one with `onError = "allow"` answers `413 Payload Too Large`, naming the cap |
+| A body hop applies (`dlp`, a plugin's `body` stage) | Read whole, up to the largest `maxBytes` of the route's body hops. Over it, the request is denied with `403` if any body hop fails closed (the default). If every body hop sets `onError = "allow"`, the body goes on **unread**: what was read and the rest are streamed to the upstream once, no body hop sees it, and the request is not retried |
 | The method may be retried (`http.retries`) | Kept up to `retries.maxBodyBytes` (default `1Mi`, at most `64Mi`) so a retry can send it again. A larger body is streamed to the upstream as it arrives and the request is **not retried** |
 | Anything else | Streamed to the upstream as it arrives |
 
@@ -489,10 +489,10 @@ its first heartbeat, and until then requests on that upstream get a `503`.
 - **Every request.** The value is read once per request and sent on every
   attempt of it: retries, and a [`proxy` handler](#proxy--bring-your-own-proxy)
   hand-off. A proxy hop sees the credential, because it has to reach the
-  origin with it. The hand-off is plain HTTP to the proxy (it opens TLS to
-  the origin), so a proxy on another node receives the key over the network
-  unencrypted: prefer a `node`- or `port`-local proxy target, and run only
-  proxies you would trust with the key.
+  origin with it, so run only proxies you would trust with the key. The
+  hand-off never crosses the network in plaintext: a proxy on another node
+  is reached only over the [mesh](#the-mesh), so its service needs
+  `mesh = true` ([`proxy` targets](#proxy--bring-your-own-proxy)).
 - **`authz` hops never see it.** They run before injection, and they receive
   the task's own headers (minus `authorization`, `cookie`, and
   `proxy-authorization`, as always), so a placeholder at most.
@@ -700,9 +700,11 @@ show` prints both for every hop.
 Every hop has a `timeout` (default `2s`) and an `onError` (default `deny`).
 If a hop cannot be reached (a webhook that times out, a proxy with no
 endpoint), the flow fails **closed** unless the hop sets `onError =
-"allow"`. A request body larger than a body hop's `maxBytes` is never let
-through unread: the request is denied (`403`), or answered `413` when the
-hop sets `onError = "allow"` ([Request bodies](#request-bodies)). `onError` belongs to the
+"allow"`. A request body larger than the body hops' `maxBytes` cannot be
+read, which is a hop error like any other: the request is denied (`403`)
+unless every body hop sets `onError = "allow"`, in which case the body is
+streamed through **unread** ([Request bodies](#request-bodies)). Keep a
+`dlp` hop that must see every byte on the default `onError = "deny"`. `onError` belongs to the
 hop: a chain has no `onError` of its own, and a chain that sets one is
 refused at submit.
 
@@ -803,6 +805,28 @@ Targets:
 
 Exactly one of `service` and `port` is set. `proxyProtocol = false` leaves
 out the PROXY v2 header.
+
+**How an HTTP hand-off travels.** The request handed to the proxy carries
+everything the task sent, any [injected credential](#credential-injection),
+and, for an `https://` target, what the task trusted the node to encrypt.
+So on an HTTP-mode upstream it never leaves the node in plaintext:
+
+| The picked endpoint | The hand-off |
+| --- | --- |
+| A mesh endpoint (the proxy's service has `mesh = true`), on any node | Over mesh mTLS with this node's certificate, the consuming workload named in a PROXY v2 TLV, as for any mesh hop; the request inside is in absolute form |
+| A plain endpoint on this node, or a sidecar `port` | Plain HTTP on the host |
+| A plain endpoint on another node | Not sent: `502`, `proxy handler <source>: ... is on another node and not on the mesh`, and a handler error on the heartbeat |
+
+Run a shared proxy as a `mesh = true` service, or use `local = true` to
+keep to the copy on each node. Keep the proxy's mesh port in L4 mode (no
+`ingress` chain with `protocol = "http"`): an HTTP ingress chain
+re-issues the request to the proxy in origin form, which a forward proxy
+cannot route. Hand-offs on the other paths (TCP: an L4 upstream,
+`CONNECT`, an ingress splice; and an absolute-URI `http://` request through
+the gated egress proxy) are not carried over the mesh yet: they dial the
+endpoint directly, so they cannot reach a proxy on a mesh port, and they
+cross the network as the task's own bytes, encrypted only if the task
+encrypted them. No credential is injected on those paths.
 
 The manager sends the endpoints on the heartbeat, as it does for an
 upstream. A target with no endpoint is a handler error (`onError`).
@@ -1108,11 +1132,14 @@ namespace, so the listeners are the only way out.
 The worker's heartbeat creates the namespace ahead of the reconcile that
 starts the task. An allocation the manager pushes straight to the worker can
 start before any heartbeat lists it (at once, or as soon as its artifacts are
-staged), so the start creates the namespace itself when it is missing; the two
-paths are serialized and idempotent. The datapath listeners inside it are
-bound on the worker's next heartbeat, so for up to one heartbeat interval a
-pushed task has a namespace with loopback only: its egress and upstream
-connections fail until the listeners exist. A worker that cannot
+staged). For such a start the worker creates the namespace before the
+launch, and binds the egress proxy, the resolver, and the upstream listeners
+inside it from the allocation the push carried. It also triggers a heartbeat
+at once, which brings the allocation's policy and its ingress listeners.
+Until that policy lands, the egress proxy and the upstreams fail closed:
+each connection is refused, and none goes out unjudged. The start itself
+also creates the namespace when it is missing, and every creation is
+serialized and idempotent. A worker that cannot
 create namespaces (no `CAP_SYS_ADMIN`, or not Linux) fails the start with
 `allocation <id> is network.mode = "gated" but its network namespace could not
 be created`, and never falls back to host networking.
@@ -1769,6 +1796,18 @@ ports, plus identities and policy bodies. Because this state is on disk, a
 node that restarts while the manager is down comes back with the same
 datapath it had.
 
+The namespaces of gated allocations that died while the worker was down
+are removed on the first heartbeat the manager acknowledges. The worker
+lists `/var/run/netns/legion-<allocation>` and unmounts every one that is not
+in the acknowledged desired set and not an allocation the worker holds
+(including one a push started before that heartbeat). A namespace that a
+process is still inside (any `/proc/<pid>/ns/net` pointing at it) is left in
+place, with a warning. It may belong to another worker on the same host, or
+to a process nothing tracks. Namespace names carry no node id, so two
+workers on one host (of one cluster or of two) whose gated allocations have
+the same id would share a namespace. Run gated tasks on only one worker per
+host.
+
 Connections in flight during the restart drop, because the listeners are new
 sockets. There is also a gap while the process starts. A separate
 `legion netd` process with listener hand-off (`SCM_RIGHTS`) and zero dropped
@@ -2100,6 +2139,11 @@ This section lists what that covers and what it does not.
   header), `dlp`, the `http` traffic block, and the external `authz` and
   `proxy` hops on every path (upstream splices, HTTP mode, the gated egress
   proxy, ingress).
+- **Only HTTP-mode upstream hand-offs ride the mesh.** A `proxy` hop on an
+  HTTP-mode upstream reaches a proxy on another node only over mesh mTLS.
+  TCP hand-offs and the gated proxy's `http://` hand-offs dial the endpoint
+  directly, so they cannot use a proxy on a mesh port
+  ([How an HTTP hand-off travels](#proxy--bring-your-own-proxy)).
 - **Egress in `host` mode is enforced only where the kernel classifier
   runs, and `gated` mode is not yet a full boundary.** On a Linux node with
   the [kernel classifier](#the-kernel-classifier), a host-mode `exec` or
