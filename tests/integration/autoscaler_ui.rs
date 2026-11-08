@@ -450,10 +450,7 @@ async fn fixture() -> R<Fixture> {
         },
     );
     // Every bundled app is seeded; this test drives the autoscaler.
-    assert_eq!(
-        reconciler.seed()?,
-        vec![APP.to_string(), "gitops".to_string()]
-    );
+    assert!(reconciler.seed()?.contains(&APP.to_string()));
     let outcome = reconciler.reconcile_app(APP).await;
     assert!(
         matches!(outcome, PassOutcome::Submitted { .. }),

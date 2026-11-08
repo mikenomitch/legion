@@ -27,6 +27,7 @@
 
 pub mod autoscaler;
 pub mod autoscaler_ui;
+pub mod certs;
 pub mod gitops;
 pub mod objects;
 pub mod ui;
@@ -76,6 +77,12 @@ pub const BUNDLED: &[BundledApp] = &[
         manifest_source: include_str!("bundled/autoscaler.ncl"),
         body: autoscaler::run,
         generated: Some(autoscaler::objects::fill_manifest),
+    },
+    BundledApp {
+        name: "certs",
+        manifest_source: include_str!("bundled/certs.ncl"),
+        body: certs::run,
+        generated: None,
     },
     BundledApp {
         name: "gitops",

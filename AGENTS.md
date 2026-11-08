@@ -275,7 +275,7 @@ knowingly accepted a limitation or trade-off.
   `docs/task-runtime-container.md`, `docs/task-runtime-noop.md`,
   `docs/rollout-strategy-plugins.md`
 - `docs/artifacts.md`, `docs/kv-store.md`, `docs/auth-and-acls.md`,
-  `docs/workload-identity.md`, `docs/stateful-workloads.md`,
+  `docs/workload-identity.md`, `docs/cert-manager.md`, `docs/stateful-workloads.md`,
   `docs/service-discovery.md`, `docs/exec-and-actions.md`, `docs/rollouts.md`
 - `docs/logging.md`, `docs/observability.md`, `docs/event-stream.md`,
   `docs/ui-architecture.md`

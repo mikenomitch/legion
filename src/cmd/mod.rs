@@ -6,6 +6,7 @@ pub mod app;
 pub mod app_view;
 pub mod boot_ticket;
 pub mod capabilities;
+pub mod cert;
 pub mod docs;
 pub mod events;
 pub mod exec;
@@ -72,6 +73,7 @@ fn base_cli() -> Command {
         .subcommand(app::config())
         .subcommand(namespace::config())
         .subcommand(object::config())
+        .subcommand(cert::config())
         .subcommand(gitops::config())
         .subcommand(template::config())
         .subcommand(instance::config())
@@ -123,6 +125,8 @@ mod tests {
         // gitops's renderer, which only the app runs: its stdout is already
         // a JSON answer for the app.
         "legion app gitops-render",
+        // The cert manager's HTTP-01 responder: a long-running server.
+        "legion cert http01",
         "legion guest-agent",
         "legion guest-resume",
     ];

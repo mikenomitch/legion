@@ -40,7 +40,7 @@ $ legion app install ./deployer.ncl
 ## Bundled and installed apps
 
 **Bundled apps** are compiled into the `legion` binary. Today there are
-two, `autoscaler` and `gitops`. The first manager to lead a new cluster's control plane
+three: `autoscaler`, `certs`, and `gitops`. The first manager to lead a new cluster's control plane
 **seeds** a record for each bundled app, enabled, with its manifest's
 permissions granted by `legion:bootstrap`, and the app starts with nothing
 configured. A bundled app runs the node's own binary: its job's command is
@@ -95,6 +95,21 @@ for a Repo, within what that Repo's writer was checked for. Its config takes
 `allowFileUrls` (default off). Its UI is a GitOps page in the sidebar, a
 panel on every job a Repo deployed, and a Sync now action. `legion gitops
 add|status|sync` is its CLI.
+
+The **cert manager**, `certs`, issues TLS certificates and renews them
+before they expire ([cert-manager.md](cert-manager.md)). Its manifest
+declares two object kinds: `certs/Issuer` (cluster-scoped: an ACME CA such
+as Let's Encrypt, a private CA kept in KV, or self-signed) and
+`certs/Certificate` (namespaced: names, an Issuer, and the KV key the
+certificate goes to), each requiring of its writer `kv` access to every
+key it names. Its grant is `kv` read and write under its reserved
+`legion/apps/certs/` (one ACME account key per Issuer), and `kv` read and
+write on `*` with `via = "objects"`: every other key it reads or writes, it
+does acting for the object that names it, so its own credential can touch
+no user key at all. It runs one replica and takes no config. Its UI is a
+Certificates page in the sidebar and a card on the cluster overview.
+`legion cert renew` re-issues a certificate now, and `legion cert http01`
+is the stateless HTTP-01 responder it pairs with.
 
 **Installed apps** come from a manifest file or URL (`legion app install`).
 They carry their own `version`, run their own code (an artifact or an image,

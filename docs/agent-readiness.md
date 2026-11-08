@@ -511,6 +511,26 @@ check in the standard envelope (`data.checks[]` with `name`, `passed`,
 `mutates: false` but not `readOnlySafe`: it runs a local command, and an
 `exec` signer really issues the test certificates.
 
+## 4d. Getting a TLS certificate
+
+The bundled cert manager's Issuers and Certificates are app objects
+([Cert Manager](cert-manager.md)), so an agent requests a certificate with
+the object tools it already has: `legion_object_kinds` returns
+`certs/Certificate` with its schema and examples, `legion_object_apply` (with
+`wait`) applies one and returns once the app reports, and
+`legion_object_get` reads its `Ready` reason (`Issued`, `RenewalFailing`,
+`IssueFailed`, `IssuerNotFound`, `IssuerNotAllowed`, ...) and its status
+fields (`notAfter`, `renewalTime`, `lastFailure`, `nextAttemptTime`).
+`legion object apply --dry-run` checks a Certificate against the kind's
+schema, rules, and what it requires of the writer (`kv` read and write on
+the key it names) without writing it. The certificate is then in KV as the
+bundle a port's `tls.cert = { kv }` serves.
+
+`legion cert renew <name> -j --wait` re-issues one now and returns the
+standard envelope (`data.requested`, `data.object`, and `data.renewed` with
+the new status), failing with the reason if the app could not. It is
+catalogued `mutates: true` (it is an object write).
+
 ## 5. Idempotency keys
 
 Mutating job, instance, volume, and snapshot operations accept an optional

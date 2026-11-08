@@ -138,9 +138,13 @@ Plans, roadmaps, to-do lists, and development notes live in
   HTTP calls, and `legion net plugin`.
 - [KV Store](kv-store.md): CRUD, versioning, locks, reactive task updates, and
   live file updates (`onChange = "update"`).
+- [Cert Manager](cert-manager.md): the bundled `certs` app. Issuers (Let's
+  Encrypt and other ACME CAs over DNS-01 or HTTP-01, a private CA kept in KV,
+  self-signed) and Certificates written to KV and renewed before they expire,
+  with rate-limit-safe backoff, status, a UI page, and `legion cert renew`.
 - [Serving TLS Certificates from KV](guides/tls-certificates.md): a guide to
-  renewing a Let's Encrypt certificate into KV and serving it from the node or
-  from nginx, with no restarts.
+  serving a certificate kept in KV from the node or from nginx, with no
+  restarts, and renewing it with the cert manager or a job of your own.
 - [KV Encryption at Rest](kv-encryption.md): on by default. Covers the root key
   outside the store, wrapped data keys inside it, rotation, backups, and
   what to do when a key is missing.

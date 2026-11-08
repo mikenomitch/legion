@@ -125,6 +125,7 @@ When one is required and what goes in it:
 | [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
 | [chunked-checkpoint-publish-plan.md](plans/chunked-checkpoint-publish-plan.md) | in execution (Phase 1 built: published parts as sealed, deduplicated chunks per job and dedup window, zero chunks skipped. Fetching only missing chunks, dirty-page hashing, and a real-S3 run are deferred) |
 | [cluster-ca-provider-plan.md](plans/cluster-ca-provider-plan.md) | shipped (2026-10-14: the `clusterCa` provider seam — `builtin` default, `file` operator intermediate, `exec` external signer with a Vault PKI helper; post-sign verification, CSR manager certificates, heartbeat bundle pins, a leader-recorded agreement check, `legion net ca provider test`; switching providers without re-joining workers and per-manager agreement deferred) |
+| [cert-manager-plan.md](plans/cert-manager-plan.md) | shipped (Phase 1, 2026-11-07: the bundled `certs` app with `certs/Issuer` (ACME, CA, self-signed) and `certs/Certificate` objects, ACME DNS-01 via Cloudflare or a webhook and HTTP-01 via the stateless `legion cert http01` responder, renewal with rate-limit-safe backoff, a Certificates page and overview card, `legion cert renew`. A job panel, RSA keys, more DNS providers, the ingress-shim extension, ARI, and datapath-answered challenges deferred) |
 | [checkpoint-encryption-plan.md](plans/checkpoint-encryption-plan.md) | shipped (2026-10-11: published checkpoint parts sealed under per-part keys from the keyring's checkpoint key, with manual checkpoint-key rotation, parallel sealing, and streaming decrypt deferred) |
 | [kv-encryption-plan.md](plans/kv-encryption-plan.md) | shipped (all four phases, 2026-09-21: KV values encrypted at rest by default, replicated keyring with the root key outside the store, `file`/`env`/`exec` providers, rotation + rewrap, join-time root key delivery; rendered task-config copies deliberately left for a follow-up plan) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
@@ -226,6 +227,7 @@ by project impact. The full template and a worked example:
 - [aws-comparative-benchmark-plan_calls.md](calls/aws-comparative-benchmark-plan_calls.md)
 - [bounded-candidate-scoring-plan_calls.md](calls/bounded-candidate-scoring-plan_calls.md)
 - [cluster-ca-provider-plan_calls.md](calls/cluster-ca-provider-plan_calls.md)
+- [cert-manager-plan_calls.md](calls/cert-manager-plan_calls.md)
 - [container-runtime-exec-and-signals-plan_calls.md](calls/container-runtime-exec-and-signals-plan_calls.md)
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
 - [data-dir-env-plan_calls.md](calls/data-dir-env-plan_calls.md)

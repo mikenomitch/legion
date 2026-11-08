@@ -88,6 +88,7 @@ pub const RESERVED_KIND_NOUNS: &[&str] = &[
     "boot",
     "bootticket",
     "capability",
+    "cert",
     "checkpoint",
     "doc",
     "eval",

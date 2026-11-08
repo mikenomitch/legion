@@ -50,18 +50,26 @@ impl Cluster {
     /// Start a cluster with the bundled autoscaler off: it is not under
     /// test here, and it would hold a port from the dynamic range.
     pub(crate) fn start(run_worker: bool) -> Cluster {
-        Self::start_cluster(run_worker, false)
+        Self::start_cluster(run_worker, &[])
     }
 
     /// Start a cluster that seeds and runs the bundled autoscaler, as a
     /// fresh cluster does. Hold `support::DYNAMIC_PORT_GATE`.
     pub(crate) fn start_with_autoscaler(run_worker: bool) -> Cluster {
-        Self::start_cluster(run_worker, true)
+        Self::start_cluster(run_worker, &["autoscaler"])
     }
 
-    fn start_cluster(run_worker: bool, autoscaler: bool) -> Cluster {
+    /// Start a cluster that seeds and runs the bundled cert manager. Hold
+    /// `support::DYNAMIC_PORT_GATE`.
+    pub(crate) fn start_with_certs(run_worker: bool) -> Cluster {
+        Self::start_cluster(run_worker, &["certs"])
+    }
+
+    /// Every bundled app not in `apps` is seeded disabled: each would run
+    /// on the system worker and hold a port from the dynamic range.
+    fn start_cluster(run_worker: bool, apps: &[&str]) -> Cluster {
         for attempt in 1..=3 {
-            let cluster = Self::spawn(run_worker, autoscaler);
+            let cluster = Self::spawn(run_worker, apps);
             let deadline = Instant::now() + Duration::from_secs(90);
             loop {
                 let lost_a_bind = std::fs::read_to_string(cluster.dir.path().join("manager.log"))
@@ -116,7 +124,7 @@ impl Cluster {
             .filter(|id| !id.is_empty())
     }
 
-    fn spawn(run_worker: bool, autoscaler: bool) -> Cluster {
+    fn spawn(run_worker: bool, apps: &[&str]) -> Cluster {
         let dir = tempfile::Builder::new()
             .prefix("legion-system-worker-")
             .tempdir_in(crate::support::scratch_root())
@@ -131,7 +139,10 @@ impl Cluster {
             // Under --run-worker the block is unused: the flag's worker binds
             // LEGION_WORKER_PORT, as it always has.
             "systemWorker": { "port": worker_port },
-            "apps": { "autoscaler": { "enabled": autoscaler } },
+            "apps": legion::apps::BUNDLED
+                .iter()
+                .map(|app| (app.name.to_string(), serde_json::json!({ "enabled": apps.contains(&app.name) })))
+                .collect::<serde_json::Map<_, _>>(),
         });
         let config_path = dir.path().join("manager.json");
         std::fs::write(&config_path, config.to_string()).expect("write config");
