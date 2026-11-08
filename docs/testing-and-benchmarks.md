@@ -13,7 +13,7 @@ Legion uses a mixed strategy:
 ### One integration binary
 
 Cargo builds every top-level `tests/*.rs` file as its own test binary, and
-each of those links all of Legion and its ~520 dependencies: about 200 MB of
+each of those links all of Legion and its ~490 dependencies: about 200 MB of
 unoptimized code and a full link per file, repeated whenever the library
 changes. With some sixty files that was most of a `cargo test` run's build
 time and most of the target directory. So the integration tests are modules

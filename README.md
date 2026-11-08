@@ -12,7 +12,7 @@ keeps it healthy, rolls out new versions, and routes traffic to it. It does
 the same job as [Kubernetes](https://kubernetes.io) or
 [Nomad](https://www.nomadproject.io), with far fewer moving parts.
 
-Legion ships as **one ~26 MB binary** that is the manager, the worker, the
+Legion ships as **one binary** that is the manager, the worker, the
 CLI, and an MCP server. State is stored in SQLite and optionally streamed
 to object storage or persisted using Raft.
 
@@ -142,8 +142,9 @@ sandboxes.
   [dependency graph](docs/jobs-tasks-and-scheduling.md), gated on another
   task starting, completing, or succeeding. Dependencies can span groups
   placed on different nodes, so you don't need a separate workflow engine.
-- **Small enough for the edge.** The shipping binary is ~26 MB, against
-  ~82 MB for k3s and ~150 MB for Nomad. It runs on macOS and Linux.
+- **One file to install.** The shipping binary is ~91 MB on linux/amd64
+  (stripped, fat LTO), against ~82 MB for k3s and ~150 MB for Nomad. It runs
+  on macOS and Linux.
 
 ### Built to run agents
 

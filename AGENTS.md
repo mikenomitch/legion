@@ -1,8 +1,8 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Source lives in `src/`: CLI in `cmd/`, orchestration in `manager/` and `worker/`, storage helpers in `storage/`, the shared WASM embedding layer in `wasm/`, TLS helpers in `certs.rs`, tracing utilities in `tracing_util.rs`, generated proto types in `structs.rs`, constants in `constants.rs`.
-- Protobuf schema: `proto/legion.proto` compiled by `build.rs` via `tonic-build`.
+- Source lives in `src/`: CLI in `cmd/`, orchestration in `manager/` and `worker/`, storage helpers in `storage/`, the shared WASM embedding layer in `wasm/`, TLS helpers in `certs.rs`, tracing utilities in `tracing_util.rs`, domain types in `structs/` (which re-exports the generated proto types), constants in `constants.rs`.
+- Protobuf schema: `proto/legion.proto`. `proto/` is also the `legion-proto` workspace crate: `proto/build.rs` compiles the schema via `tonic-build`, and `legion::structs` re-exports the generated types. An impl on a generated type that needs the rest of Legion is an extension trait in `src/structs/` (the orphan rule forbids an inherent impl on another crate's type); see `internal_docs/plans/workspace-crate-split-plan.md`.
 - Configs and examples: `configs/` (manager, worker, TLS dev certs, job demos).
 - When adding anything to job config, include it in `configs/jobs/maximal.ncl`.
 - Plugins: `plugins/<kind>/<name>/` built as `dylib` during Cargo build.
@@ -11,7 +11,7 @@
 ## Build, Test, and Development Commands
 - Build crate and plugins: `cargo build` (requires `protoc`).
 - Release build: `cargo build --release`.
-- Shipping build: `cargo build --profile dist` — adds LTO and strips symbols, cutting the binary from ~44 MB to ~26 MB at the cost of a much slower link. Output is `target/dist/legion`. See "Building a shipping binary" in `internal_docs/development.md`.
+- Shipping build: `cargo build --profile dist` — adds fat LTO and strips symbols, cutting the linux/amd64 binary from ~157 MB to ~91 MB at the cost of a much slower build (~35 min against ~15 on 4 cores). Output is `target/dist/legion`. See "Building a shipping binary" in `internal_docs/development.md`.
 - Run tests: `cargo test --all --locked`.
 - Run manager: `cargo run -- start manager -c configs/manager.ncl`.
 - Run worker: `cargo run -- join <TOKEN>` or `cargo run -- start worker <TOKEN>`.

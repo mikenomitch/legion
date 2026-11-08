@@ -257,7 +257,7 @@ required-features = ["loadgen"]
 loadgen = []
 
 # Local and test builds. At full debuginfo every test binary carries DWARF for
-# all ~520 crates in the tree, and the target dir grows by gigabytes per
+# all ~490 crates in the tree, and the target dir grows by gigabytes per
 # binary. Line tables keep file:line in panic backtraces for Legion's own
 # code; dependencies get none. To step through with variables in a debugger,
 # build with `CARGO_PROFILE_DEV_DEBUG=2`. The test profile inherits all of
@@ -286,20 +286,33 @@ opt-level = 3
 # Profile for shipped binaries: `cargo build --profile dist`.
 #
 # Legion is distributed as one binary that is manager, worker, CLI, and MCP
-# server, and it is expected to land on small and edge machines, so binary size
-# is a feature. The stock `--release` profile leaves ~18 MB on the table:
+# server, so binary size is a feature. The stock `--release` profile leaves
+# ~66 MB on the table (linux/amd64, ~490 crates, 2026-11-08):
 #
-#   --release            43.7 MB
-#   --profile dist       26.0 MB   (-41%)
+#   --release           157.4 MB
+#   --profile dist       91.2 MB   (-42%)
 #
-# Roughly half of that is `strip` dropping the symbol tables (__LINKEDIT: 8.9 MB
-# -> 0.3 MB); the other half is fat LTO collapsing dead code and cross-crate
-# duplication across the ~520-crate tree (__TEXT: 33.5 MB -> 24.8 MB).
+# About two thirds of that is `strip` dropping the symbol tables (42 MB); the
+# rest is fat LTO with one codegen unit collapsing dead code and cross-crate
+# duplication (loaded sections 115.1 MB -> 87.0 MB, `.text` 84.4 -> 67.8 MB).
 #
-# The cost is build time — fat LTO with a single codegen unit cannot parallelize
-# the final link, taking several minutes against about one for `--release`. That
-# is why this is a separate profile: `--release` stays fast for local work, and
-# only release artifacts pay for the smaller binary. Debug builds are unaffected.
+# The cost is build time. A clean `dist` build takes ~35 minutes on 4 vCPU
+# against ~15 for `--release`: one codegen unit cannot parallelize LLVM, and
+# the fat-LTO link alone is ~16 minutes. That is why this is a separate
+# profile: `--release` stays fast for local work, and only release artifacts
+# pay for the smaller binary. Debug builds are unaffected. Peak memory is
+# ~10 GB either way, and it is compiling the `legion` crate, not the link
+# (internal_docs/plans/workspace-crate-split-plan.md, § 5.3).
+[profile.dist]
+inherits = "release"
+# Collapse dead code and duplicated generics across every crate in the tree.
+lto = "fat"
+# One codegen unit per crate graph: less parallelism, more inlining, smaller code.
+codegen-units = 1
+# Drop symbol tables. Backtraces lose function names; keep the unstripped
+# artifact if you need to symbolize a crash from a shipped build.
+strip = "symbols"
+
 # Same optimizations as `dist` minus the parts that dominate LINK time:
 # `fat` LTO with one codegen unit takes ~25 minutes on the benchmark
 # operator box, which is longer than some measurement windows allow. Thin
@@ -311,16 +324,6 @@ opt-level = 3
 inherits = "release"
 lto = "thin"
 codegen-units = 16
-strip = "symbols"
-
-[profile.dist]
-inherits = "release"
-# Collapse dead code and duplicated generics across every crate in the tree.
-lto = "fat"
-# One codegen unit per crate graph: less parallelism, more inlining, smaller code.
-codegen-units = 1
-# Drop symbol tables. Backtraces lose function names; keep the unstripped
-# artifact if you need to symbolize a crash from a shipped build.
 strip = "symbols"
 
 # [[bin]] # Bin to run the HelloWorld gRPC server

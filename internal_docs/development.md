@@ -13,8 +13,9 @@ sudo apt-get install -y build-essential pkg-config libssl-dev \
     protobuf-compiler clang libclang-dev
 ```
 
-- **`protobuf-compiler`** — `build.rs` compiles `proto/legion.proto`
-  through `tonic-build`. CI installs this one explicitly.
+- **`protobuf-compiler`** — `proto/build.rs` (the `legion-proto` crate)
+  compiles `proto/legion.proto` through `tonic-build`. CI installs this one
+  explicitly.
 - **`clang` + `libclang-dev`** — `rusqlite` is built with the `session`
   feature (raft persistence replicates write effects as SQLite session
   changesets, see `docs/multi-raft.md`), which forces `libsqlite3-sys` to
@@ -89,6 +90,16 @@ A full `cargo test --all` used to leave ~20+ GB in `target/` and another
 gigabyte of SQLite stores in the system temp dir on every run. What keeps it
 down now, and what to keep doing:
 
+- **Memory.** Compiling the `legion` library is one rustc process that peaks
+  at 8–9 GB in a dev build and ~10 GB under `--profile dist`, almost all of it
+  in the front end (measured 2026-11-08, 4 vCPU / 16 GB, see
+  [the crate-split plan](plans/workspace-crate-split-plan.md#53-where-the-memory-goes)).
+  `cargo test` compiles the library and the library's unit-test build as two
+  such processes at once, so on a 16 GB machine with no swap a clean
+  `cargo test --all` gets OOM-killed (13.6 GB summed when the kernel killed
+  it). Build the unit tests on their own first, then the rest:
+  `cargo test --lib --no-run && cargo test --all`. Splitting the crate is the
+  structural fix.
 - **Debuginfo.** `[profile.dev]` keeps line tables for Legion's crates and
   none for dependencies. Panics keep `file:line`. For a debugger session with
   variables, build with `CARGO_PROFILE_DEV_DEBUG=2`.
@@ -102,9 +113,10 @@ down now, and what to keep doing:
   `tests/integration/support.rs`), which is removed when the test process
   exits. A run killed with Ctrl-C leaves its one `legion-tests-*` directory in
   `$TMPDIR`; delete those by hand if they pile up.
-- **Build script.** `build.rs` re-runs only when `proto/`, `build.rs`, or the
-  plugin env vars change. It used to watch the whole repository, so editing a
-  doc or a UI file rebuilt the crate.
+- **Build scripts.** The root `build.rs` re-runs only when itself or the
+  plugin env vars change; `proto/build.rs` only when `proto/` changes. It used
+  to watch the whole repository, so editing a doc or a UI file rebuilt the
+  crate. Editing `legion.proto` rebuilds `legion-proto` and then `legion`.
 - **Incremental cache.** `target/debug/incremental` is usually the largest
   thing in `target/`: rustc keeps up to two sessions of ~1.7 GB for each way
   the `legion` crate gets built (library, library tests, clippy's check of
@@ -159,28 +171,36 @@ cargo build --profile dist
 
 The binary lands in `target/dist/legion` rather than `target/release/legion`.
 
-Legion ships as one binary that is manager, worker, CLI, and MCP server, and it
-is meant to run on small and edge machines, so size counts. The `dist` profile
-adds fat LTO, a single codegen unit, and symbol stripping on top of `release`,
-which is worth about 18 MB (measured on macOS arm64, ~520 crates in the
-lockfile):
+Legion ships as one binary that is manager, worker, CLI, and MCP server, so
+size counts. The `dist` profile adds fat LTO, a single codegen unit, and
+symbol stripping on top of `release`, which is worth about 66 MB (measured
+2026-11-08 on linux/amd64, ~490 crates in the build, 4 vCPU / 16 GB):
 
-| Build | Size |
-| --- | --- |
-| `cargo build --release` | 43.7 MB |
-| `cargo build --profile dist` | **26.0 MB** |
+| Build | Size | Clean build | Peak RSS |
+| --- | --- | --- | --- |
+| `cargo build --release` | 157.4 MB | 15m 28s | 8.9 GB |
+| `cargo build --profile dist` | **91.2 MB** | 34m 44s | 10.0 GB |
 
-About half the saving is `strip` removing symbol tables and half is LTO
-collapsing dead code and duplicated generics across the dependency tree. For
-context, the same measurement run against other orchestrators: k3s is 81.5 MB,
-Nomad 150 MB, and a Kubernetes control-plane node (apiserver, controller
-manager, scheduler, kubelet, kube-proxy, etcd) is 341 MB.
+About two thirds of the saving is `strip` removing the symbol tables (42 MB)
+and the rest is LTO collapsing dead code and duplicated generics across the
+dependency tree (loaded sections 115.1 MB → 87.0 MB). Of the 91 MB, `.text`
+is 67.8 MB and unwind tables 7.6 MB.
+
+An earlier version of this page quoted 43.7 MB and 26.0 MB. Those were macOS
+arm64 numbers from an older, smaller tree, and the README's "~26 MB" came
+from them; why linux/amd64 is 3.5× that is an open item in TODO.md. For
+context, the same kind of measurement for other orchestrators: k3s is
+81.5 MB, Nomad 150 MB (both embed a web UI, which Legion serves from disk),
+and a Kubernetes control-plane node (apiserver, controller manager,
+scheduler, kubelet, kube-proxy, etcd) is 341 MB.
 
 Two things to know before reaching for it:
 
-- **It is slow.** Fat LTO with `codegen-units = 1` cannot parallelize the final
-  link, so expect several minutes where `--release` takes about one. Don't put
-  it in an edit-compile-test loop.
+- **It is slow.** Fat LTO with `codegen-units = 1` cannot parallelize LLVM or
+  the final link: ~35 minutes on four cores, three of them idle for most of
+  it, where `--release` takes ~15. Don't put it in an edit-compile-test loop.
+  It needs ~10 GB free at the peak, which comes while compiling the `legion`
+  crate itself, not during the link.
 - **Stripped binaries don't symbolize.** Backtraces from a `dist` build lose
   function names. Keep the unstripped artifact around if you need to debug a
   crash report from a shipped build.
@@ -207,8 +227,8 @@ runs in an empty chroot with no libc at all, which the glibc `legion` binary
 cannot. Install it beside the worker binary as `legion-guest`, or point the
 worker's `LEGION_GUEST_BINARY` at it.
 
-Publishing to crates.io: `legion-rs` depends on `legion-guest` by path and
-version, so publish `legion-guest` first.
+Publishing to crates.io: `legion-rs` depends on `legion-guest` and
+`legion-proto` by path and version, so publish those two first.
 
 ### Testing GRPC endpoints
 

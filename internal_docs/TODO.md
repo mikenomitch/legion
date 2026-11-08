@@ -5794,11 +5794,25 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       harvest step globs for. Rename the plugin crates unique, then share the
       dir — sequential builds mean no lock contention, and identical profile +
       dependency versions mean cargo reuses everything after the first plugin.
-- [ ] **Re-measure binary size on linux/amd64.** The 26 MB figure is macOS arm64;
-      Go binaries run 7-9% larger on amd64 and Legion has no cross-compile
-      target set up, so the shipping number is probably a bit higher.
+- [ ] **Find what makes the linux/amd64 binary 91 MB.** Measured 2026-11-08
+      ([plan § 5.3](plans/workspace-crate-split-plan.md#53-where-the-memory-goes)):
+      `target/dist/legion` is 91.2 MB stripped, `.text` alone 67.8 MB, where
+      the docs had quoted 26 MB from a macOS arm64 build of an older tree.
+      Unwind tables are 7.6 MB of it. Run `cargo bloat --profile dist
+      --crates` on an unstripped build to see which crates own the code
+      (candidates: `nickel-lang-core`, `wasmi`, `object_store` with `aws`,
+      `oci-client`, `opentelemetry-otlp`, `cel`, and Legion's own serde
+      expansion), then decide what to feature-gate or drop.
+- [ ] **Split the `legion` crate into workspace crates, phases 2–7**
+      ([plan](plans/workspace-crate-split-plan.md),
+      [calls](calls/workspace-crate-split-plan_calls.md)). Phase 1
+      (`legion-proto`) cut the build's peak from 11.1 to 10.0 GB; the rest is
+      the single 465k-line crate's front end. Next: `legion-core` (the metrics
+      registry out of `manager::telemetry`, which 79 call sites in `storage`
+      and `worker` reach up for), then `legion-types`, which needs
+      `structs` → {storage, manager, worker, task_plugins} broken first.
 - [ ] **Decide whether the UI ships inside the binary.** `ui/` is served from
-      disk today, so the 26 MB is not comparable to Nomad (150 MB) or k3s
+      disk today, so the 91 MB is not comparable to Nomad (150 MB) or k3s
       (81.5 MB), both of which embed their web assets. Embedding it is the
       simpler operator story; it costs binary size on workers that never serve
       a UI.
@@ -8642,9 +8656,29 @@ checked off in place above.
       are fixed.
 - [x] **The yanked `validit` 0.2.5 and `wide` 1.6.0 pins are bumped** to
       0.2.6 and 1.7.1 (2026-10-19).
+- [x] **Re-measured binary size on linux/amd64** (2026-11-08,
+      [plan § 5.3](plans/workspace-crate-split-plan.md#53-where-the-memory-goes)).
+      `--profile dist` is 91.2 MB stripped, not the 26 MB the README,
+      AGENTS.md, `Cargo.toml`, and `development.md` quoted from a macOS arm64
+      build; all four now carry the Linux numbers. What grew is a new open
+      item above.
+- [x] **`cargo clippy --all-targets -D warnings` passes again** (2026-11-08):
+      `net_bench` had stopped compiling (`HostGuardConfig.counter_interval`),
+      and three test lints had crept in.
 
 ## Developer workflow & CI
 
+- [x] **The generated proto types are their own crate, `legion-proto`**
+      (2026-11-08, phase 1 of the
+      [workspace crate split](plans/workspace-crate-split-plan.md) ·
+      [calls](calls/workspace-crate-split-plan_calls.md) ·
+      [docs/codebase-conventions.md](../docs/codebase-conventions.md#repository-and-module-boundaries)).
+      `proto/` is now the package around `legion.proto`; `legion::structs`
+      re-exports it, so call sites are unchanged. The four inherent impls on
+      generated types became extension traits (`EvalExt`, `SubmissionExt`,
+      `LedgerNodeExt`, `LedgerAllocationExt`) and the redacting `Debug`s moved
+      with the types. Clean `--profile dist` build peak 11.1 → 10.0 GB on a
+      4-vCPU/16 GB box; binary size unchanged.
 - [x] **Smaller, faster test builds** (2026-10-18,
       [calls](calls/test-build-footprint_calls.md) ·
       [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md#test-layout) ·
