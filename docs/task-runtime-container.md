@@ -23,8 +23,10 @@ Legion picks the runtime by operating system. There is no Docker dependency.
   number allocations from 1, and a bare `legion-<alloc>` would collide.
 - **Linux: a low-level OCI runtime.** Legion uses `runc` by default, which
   must be 1.2 or newer for the default [user namespace](#security). Set
-  `LEGION_OCI_RUNTIME` to run `crun` instead. These are the only two: any
-  other binary is refused at launch (see below). These runtimes can't pull
+  `LEGION_OCI_RUNTIME` to run `crun` instead. These are the only two for the
+  node's default runtime: any other binary is refused at launch (see below).
+  Other runtimes, such as gVisor and Kata, are offered per task as
+  [runtime classes](#runtime-classes). These runtimes can't pull
   images or read image references. They run a *bundle* (an extracted `rootfs/`
   plus a `config.json` runtime spec), which Legion builds from the image's OCI
   layout (see [Linux: image → bundle](#linux-image--bundle)).
@@ -132,6 +134,12 @@ Optional:
   [Capabilities](#capabilities-security).
 - `ulimits`: per-process resource limits (`setrlimit`), such as
   `{ nofile = 65536 }`. See [Resource limits](#resource-limits-ulimits).
+- `runtimeClass`: an OCI runtime class the node's worker type declares, such
+  as `gvisor` or `kata`. See [Runtime classes](#runtime-classes).
+
+Devices (GPUs) are not runtime config: they are `resources.devices`, and the
+container gets the device nodes, cgroup rules, mounts, and env the device
+plugin returns. See [Devices](#devices) and [docs/devices.md](devices.md).
 
 `security` and `ulimits` apply on Linux. Apple `container` runs each container
 in its own VM with the runtime's defaults, so on macOS they are accepted and
@@ -152,6 +160,84 @@ and `CMD` are not used. Apple `container` follows Docker's rule instead, where
 image's entrypoint on both, name it in `command`. For the official Postgres
 image, `command = ["docker-entrypoint.sh", "postgres"]` works everywhere: the
 entrypoint passes a command it does not recognize straight through.
+
+## Runtime classes
+
+A worker type can offer OCI runtimes besides the node's default runc or crun,
+by name, and a task picks one. This is how containers run under **gVisor**
+(`runsc`) or **Kata Containers**: a user-space kernel or a VM between the
+workload and the host, for code you do not trust.
+
+```nickel
+# Worker type
+container = {
+  runtimeClasses = {
+    gvisor = { path = "/usr/local/bin/runsc", userNamespace = false, isolatesRoot = true },
+    kata   = { path = "/usr/bin/kata-runtime", userNamespace = false, isolatesRoot = true },
+  },
+},
+```
+
+```nickel
+# Task
+config = { image = "python:3.12", command = ["python", "agent.py"], runtimeClass = "gvisor" },
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `path` | required | Absolute path to a runtime with runc's command line (`run --bundle`, `exec`, `kill`, `delete`, `state`). To pass flags (`runsc --platform=systrap`), point it at a wrapper script that adds them. |
+| `userNamespace` | `true` | The runtime applies an OCI user namespace with idmapped mounts. |
+| `seccomp` | `true` | The runtime applies the OCI seccomp profile. |
+| `isolatesRoot` | `false` | The runtime keeps container root off host root by itself (gVisor's kernel, Kata's VM). |
+
+How it works:
+
+- At start, the worker runs `<path> --version` for each class and
+  advertises the ones that answer as the node attribute
+  `container.runtimeClasses`. A class whose runtime is missing is logged
+  (`Container runtime class unavailable; not advertised`) and not
+  advertised.
+- A task with `runtimeClass` gets an implicit constraint
+  `container.runtimeClasses contains "<class>"`, so it only places on nodes
+  that have it. Unlike the default runtime, a class's binary is not required
+  to be runc or crun: the operator declared it.
+- The [privilege floor](#security) is applied as far as the class supports
+  it. A part the class does not support is **dropped when the class
+  `isolatesRoot`** (the start logs `Runtime class isolates root itself`),
+  because the class's own isolation stands in for it; otherwise the start
+  **fails** rather than run below the floor:
+
+  ```text
+  runtime class plain cannot apply a user namespace with idmapped mounts, which this task asks for (security.userNamespace, on by default), and the class does not isolate root by itself (isolatesRoot is false). Set security.userNamespace to opt out on the task (which makes it host-level), or run it on a class that supports it
+  ```
+
+  `isolatesRoot` is a trust statement: set it only for runtimes that really
+  are sandboxes. The submit-time host-level rules do not change with a
+  class: a task that keeps the default floor is not host-level whether or
+  not its class drops parts of it.
+- A task naming a class that the node it reached does not configure fails
+  with the classes the node has.
+
+Not verified here: no gVisor or Kata runtime has run these bundles in this
+repository's tests. gVisor's GPU support (`nvproxy`) and Kata's device
+passthrough are not wired to [devices](devices.md). Runtime classes are
+Linux only.
+
+## Devices
+
+A container task that asks for devices (`resources.devices`, see
+[docs/devices.md](devices.md)) gets, in its OCI bundle:
+
+- each device node in `linux.devices`, with `type`, `major`, and `minor` read
+  from the host node when the plugin left them out;
+- an allow rule per device node in `linux.resources.devices`, **after** the
+  deny-all rule every container has, so it reaches exactly its devices;
+- the plugin's and CDI spec's mounts (driver libraries) and hooks;
+- `LEGION_DEVICE_<NAME>_IDS` and the plugin's env, such as
+  `CUDA_VISIBLE_DEVICES` (a task's own `env` still wins).
+
+Under the default user namespace, runc and crun bind-mount device nodes
+instead of creating them. None of this has run on a real GPU here.
 
 ## Capabilities (`security`)
 
@@ -902,6 +988,8 @@ grant on job:write)
 | Capability adjustments (`security.capabilities`) | ✅ Linux, within the node's `container.allowCaps` (drops always allowed). Ignored on macOS (VM boundary, runtime defaults) |
 | Resource limits (`ulimits`) | ✅ Linux. Ignored on macOS |
 | Image layer cache | ✅ Linux, per node, in the content store. macOS: Apple `container`'s own image store |
+| Devices (`resources.devices`) | ✅ Linux: device nodes, cgroup allow rules, mounts, hooks, and env ([Devices](#devices)). ❌ macOS |
+| Runtime classes (`runtimeClass`) | ✅ Linux ([Runtime classes](#runtime-classes)). ❌ macOS |
 
 Container exec runs inside the container's namespaces, so it is sandboxed
 (`host = false`). An `exec:write` rule without `host` is enough.

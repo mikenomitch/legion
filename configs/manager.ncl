@@ -429,7 +429,10 @@
     # bootstrapSecretFile = "/etc/legion/bootstrap-secret",  # IaC pre-seed (>= 24 chars), read at first start
     # auditOnly = true,        # log denials without enforcing (migration mode)
     # loginTtl = "24h",        # lifetime of tokens minted via `legion login`
-    # tokenMaxTtl = "720h",    # upper bound for client-token lifetimes
+    # tokenDefaultTtl = "720h",      # lifetime of a token created without --ttl (default 30 days)
+    # tokenMaxTtl = "2160h",         # upper bound for client tokens (default 90 days; "none" lifts it)
+    # childTokenDefaultTtl = "1h",   # `legion acl token create --child` default lifetime
+    # childTokenMaxTtl = "24h",      # and its bound (also bounded by the parent's expiry)
     # jwksRefreshInterval = "5m",
     # authMethods = [
     #   {
@@ -454,4 +457,25 @@
     #   },
     # ],
   },
+
+  # Agent governance: the audit journal, approval gates, per-token write rate
+  # limits, and usage accounting (docs/audit-journal.md,
+  # docs/approvals-and-rate-limits.md, docs/usage-accounting.md). Everything
+  # below is the default except the approval rules, of which there are none
+  # by default.
+  # governance = {
+  #   audit = { enabled = true, retainEvents = 200000, retainAge = "90d", flushInterval = "250ms" },
+  #   approvals = {
+  #     ttl = "1h",
+  #     rules = [
+  #       { name = "prod-destroys", operations = ["DestroyJob", "StopJob"], namespaces = ["prod"] },
+  #       { name = "acl-writes", permissions = ["acl:write"] },
+  #     ],
+  #   },
+  #   rateLimit = {
+  #     writesPerSecond = 20, burst = 100, exemptManagement = true,
+  #     overrides = [ { policies = ["ci-agent"], writesPerSecond = 2, burst = 10 } ],
+  #   },
+  #   usage = { enabled = true, interval = "60s", retention = "90d" },
+  # },
 }

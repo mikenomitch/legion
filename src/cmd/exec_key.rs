@@ -121,6 +121,7 @@ async fn create(matches: &ArgMatches) -> R<()> {
                     message: format!("could not read {path}: {err}"),
                     hint: None,
                     retryable: false,
+                    details: None,
                 },
             ))
         }

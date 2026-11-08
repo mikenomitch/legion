@@ -14,10 +14,15 @@
 //! - other allocations' datapath listeners: their VIP blocks and their
 //!   upstream loopback ports. An allocation keeps its own.
 //!
-//! `hostGuard.allow` entries are accepted first. A drop in the output hook
-//! fails `connect()` at once with `EPERM`. Each allocation's rules carry
-//! their own counters, which the worker reads every heartbeat and reports
-//! as `net.denied` rows with source `host-guard`.
+//! Packets of an established flow are accepted first, before anything else
+//! is walked (mesh-control-path plan §6.6): the guard judges a connection
+//! once, at `connect()`. A socket is then dispatched to its allocation's
+//! chain by one verdict-map lookup on its cgroup, not a rule per allocation.
+//! `hostGuard.allow` entries are accepted first in each chain. A drop in the
+//! output hook fails `connect()` at once with `EPERM`. Each allocation's
+//! rules carry their own counters, which the worker reads at most every
+//! `hostGuard.counterInterval` (10 s) and reports as `net.denied` rows with
+//! source `host-guard`.
 //!
 //! The worker owns the table: it is replaced atomically on every change
 //! (`nft -f -` with an add-delete-add transaction). It shells out to `nft`,
@@ -206,7 +211,8 @@ impl GuardTable {
         }
         let _ = writeln!(
             out,
-            "    ip daddr 127.42.0.0/16 counter drop comment \"{DROP_DATAPATH}\""
+            "    ip daddr {} counter drop comment \"{DROP_DATAPATH}\"",
+            crate::structs::VIP_RANGE
         );
         if !self.datapath_ports().is_empty() {
             let _ = writeln!(
@@ -274,6 +280,9 @@ impl GuardTable {
             out,
             "    type filter hook output priority filter; policy accept;"
         );
+        // A flow the guard let through at `connect()` is not judged again
+        // packet by packet.
+        let _ = writeln!(out, "    ct state established,related accept");
         let _ = writeln!(
             out,
             "    socket cgroupv2 level {} \"{parent}\" jump allocations",
@@ -282,13 +291,30 @@ impl GuardTable {
         let _ = writeln!(out, "  }}");
 
         let _ = writeln!(out, "  chain allocations {{");
+        // One verdict map per cgroup level (allocation leaves all sit at
+        // one), so dispatch is a lookup, not a rule per allocation. A leaf
+        // listed twice keeps its first allocation: a map holds a key once.
+        let mut by_level: BTreeMap<usize, Vec<(String, i64)>> = BTreeMap::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         for allocation in &self.allocations {
-            let cgroup = allocation.cgroup.trim_matches('/');
+            let cgroup = allocation.cgroup.trim_matches('/').to_string();
+            if !seen.insert(cgroup.clone()) {
+                continue;
+            }
+            by_level
+                .entry(Self::level(&cgroup))
+                .or_default()
+                .push((cgroup, allocation.allocation_id));
+        }
+        for (level, leaves) in &by_level {
+            let entries: Vec<String> = leaves
+                .iter()
+                .map(|(cgroup, id)| format!("\"{cgroup}\" : jump alloc_{id}"))
+                .collect();
             let _ = writeln!(
                 out,
-                "    socket cgroupv2 level {} \"{cgroup}\" jump alloc_{}",
-                Self::level(cgroup),
-                allocation.allocation_id
+                "    socket cgroupv2 level {level} vmap {{ {} }}",
+                entries.join(", ")
             );
         }
         // A socket in the parent that is no known allocation's (a leaf the
@@ -474,6 +500,8 @@ pub fn parse_counters(json: &Value) -> BTreeMap<(i64, String), u64> {
 pub struct KernelGuard {
     loaded: Option<GuardTable>,
     reported: BTreeMap<(i64, String), u64>,
+    /// When the counters were last read.
+    last_read: Option<std::time::Instant>,
 }
 
 impl KernelGuard {
@@ -487,6 +515,20 @@ impl KernelGuard {
         self.loaded = Some(table);
         self.reported.clear();
         Ok(true)
+    }
+
+    /// Whether the counters are due a read at `now`, given `interval`
+    /// (`hostGuard.counterInterval`): reading forks `nft`, so it is
+    /// rate-limited rather than done every heartbeat. Marks them read.
+    pub fn counters_due(&mut self, now: std::time::Instant, interval: std::time::Duration) -> bool {
+        if self
+            .last_read
+            .is_some_and(|last| now.duration_since(last) < interval)
+        {
+            return false;
+        }
+        self.last_read = Some(now);
+        true
     }
 
     /// New drops since the last call: `(allocation, reason, packets)`.
@@ -595,6 +637,17 @@ mod kernel_guard_test {
         assert!(!script.contains("table inet legion_host_guard\n"));
     }
 
+    /// Reading the counters forks `nft`: at most once per interval.
+    #[test]
+    fn counters_are_read_at_most_once_per_interval_test() {
+        let mut guard = KernelGuard::default();
+        let start = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(10);
+        assert!(guard.counters_due(start, interval), "the first beat reads");
+        assert!(!guard.counters_due(start + std::time::Duration::from_secs(2), interval));
+        assert!(guard.counters_due(start + interval, interval));
+    }
+
     #[test]
     fn the_table_matches_the_golden_rendering_test() {
         let expected = r#"table inet legion_host_guard
@@ -607,11 +660,11 @@ table inet legion_host_guard {
   set datapath_ports { type inet_service; elements = { 20417 } }
   chain output {
     type filter hook output priority filter; policy accept;
+    ct state established,related accept
     socket cgroupv2 level 1 "legion" jump allocations
   }
   chain allocations {
-    socket cgroupv2 level 3 "legion/share/legion-88213" jump alloc_88213
-    socket cgroupv2 level 3 "legion/reserve/legion-9" jump alloc_9
+    socket cgroupv2 level 3 vmap { "legion/share/legion-88213" : jump alloc_88213, "legion/reserve/legion-9" : jump alloc_9 }
     jump unattributed
   }
   chain alloc_88213 {
@@ -622,7 +675,7 @@ table inet legion_host_guard {
     ip6 daddr @metadata_v6 counter drop comment "cloud metadata"
     ip daddr @deny_v4 counter drop comment "hostGuard.deny"
     fib daddr type local tcp dport @control_ports counter drop comment "a Legion control port"
-    ip daddr 127.42.0.0/16 counter drop comment "another allocation's datapath"
+    ip daddr 127.64.0.0/10 counter drop comment "another allocation's datapath"
     ip daddr 127.0.0.0/8 tcp dport @datapath_ports counter drop comment "another allocation's datapath"
   }
   chain alloc_9 {
@@ -631,7 +684,7 @@ table inet legion_host_guard {
     ip6 daddr @metadata_v6 counter drop comment "cloud metadata"
     ip daddr @deny_v4 counter drop comment "hostGuard.deny"
     fib daddr type local tcp dport @control_ports counter drop comment "a Legion control port"
-    ip daddr 127.42.0.0/16 counter drop comment "another allocation's datapath"
+    ip daddr 127.64.0.0/10 counter drop comment "another allocation's datapath"
     ip daddr 127.0.0.0/8 tcp dport @datapath_ports counter drop comment "another allocation's datapath"
   }
   chain unattributed {
@@ -640,7 +693,7 @@ table inet legion_host_guard {
     ip6 daddr @metadata_v6 counter drop comment "cloud metadata"
     ip daddr @deny_v4 counter drop comment "hostGuard.deny"
     fib daddr type local tcp dport @control_ports counter drop comment "a Legion control port"
-    ip daddr 127.42.0.0/16 counter drop comment "another allocation's datapath"
+    ip daddr 127.64.0.0/10 counter drop comment "another allocation's datapath"
     ip daddr 127.0.0.0/8 tcp dport @datapath_ports counter drop comment "another allocation's datapath"
   }
 }
@@ -658,7 +711,11 @@ table inet legion_host_guard {
             rendered.contains("socket cgroupv2 level 2 \"system.slice/legion\" jump allocations")
         );
         assert!(rendered.contains(
-            "socket cgroupv2 level 4 \"system.slice/legion/share/legion-88213\" jump alloc_88213"
+            "socket cgroupv2 level 4 vmap { \"system.slice/legion/share/legion-88213\" : jump alloc_88213 }"
+        ));
+        // The other allocation's leaf sits at its own level, in its own map.
+        assert!(rendered.contains(
+            "socket cgroupv2 level 3 vmap { \"legion/reserve/legion-9\" : jump alloc_9 }"
         ));
     }
 

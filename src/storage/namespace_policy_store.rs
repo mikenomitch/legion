@@ -88,15 +88,18 @@ fn task_reservation(
 
 /// Whether a task's count comes from its spec: not keyed (instances drive
 /// it) and not per-node.
-fn count_driven(per: Option<&str>, stateful: Option<&crate::structs::StatefulConfig>) -> bool {
+pub(crate) fn count_driven(
+    per: Option<&str>,
+    stateful: Option<&crate::structs::StatefulConfig>,
+) -> bool {
     per.is_none()
         && stateful.is_none_or(|stateful| stateful.mode != crate::structs::InstanceMode::Keyed)
 }
 
 /// `(job, group, task) -> (override, base count)` for every applied scale.
-type ScaleOverrides = BTreeMap<(String, String, String), (u32, u32)>;
+pub(crate) type ScaleOverrides = BTreeMap<(String, String, String), (u32, u32)>;
 
-fn scale_overrides_on(conn: &Connection) -> R<ScaleOverrides> {
+pub(crate) fn scale_overrides_on(conn: &Connection) -> R<ScaleOverrides> {
     let mut stmt = conn.prepare_cached(
         "SELECT job_id, task_group, task_name, count, base_count FROM task_scale
          WHERE count IS NOT NULL;",
@@ -110,7 +113,7 @@ fn scale_overrides_on(conn: &Connection) -> R<ScaleOverrides> {
     rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
 }
 
-fn effective_count(
+pub(crate) fn effective_count(
     overrides: &ScaleOverrides,
     job: &str,
     group: &str,
@@ -278,7 +281,7 @@ pub(crate) fn enforce_admission_on(
     }
     .charged();
     let is_new = !charges.contains_key(&config.name);
-    for policy in governing {
+    for policy in &governing {
         let others = charges
             .iter()
             .filter(|(job, _)| *job != &config.name && policy.matches(job_namespace(job)));
@@ -329,6 +332,8 @@ pub(crate) fn enforce_admission_on(
             }
         }
     }
+    // Device caps (`quota.<band>.devices`), charged the same way.
+    crate::devices::quota::enforce_on(conn, &governing, config, namespace)?;
     Ok(())
 }
 

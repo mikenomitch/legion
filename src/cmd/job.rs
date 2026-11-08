@@ -48,6 +48,17 @@ pub fn config() -> Command {
         .arg(allow_unknown_fields_flag())
         .arg(namespace_flag())
         .arg(json_flag())
+        .arg(
+            Arg::new("expected-version")
+                .long("expected-version")
+                .value_name("VERSION")
+                .value_parser(value_parser!(i64))
+                .help(
+                    "Submit only if the job is at this spec version (`version` in `job info \
+                     --json`); 0 means it must not exist. Fails, writing nothing, when another \
+                     submit landed first",
+                ),
+        )
         .args(config_var_args());
 
     let stop_cmd = Command::new("stop")
@@ -189,7 +200,8 @@ pub fn config() -> Command {
                 .required(true),
         )
         .arg(namespace_flag())
-        .arg(json_flag());
+        .arg(json_flag())
+        .args(crate::cmd::watch::read_flags());
 
     let plan_cmd = Command::new("plan")
         .about("Preview which nodes allocations would land on")
@@ -364,6 +376,7 @@ pub fn config() -> Command {
         .arg_required_else_help(true)
         .subcommand(run_cmd)
         .subcommand(info_cmd)
+        .subcommand(crate::cmd::watch::job_watch_cmd())
         .subcommand(plan_cmd)
         .subcommand(validate_cmd)
         .subcommand(schema_cmd)
@@ -712,6 +725,23 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
         |_| Vec::new(),
     ));
     warnings.extend(crate::task_plugins::container_security_warnings(&config));
+    // Namespace policy job rules (docs/namespaces.md, "Job rules"), when this
+    // caller can read the policies. `job plan` and `job run` always check
+    // them, on the manager.
+    match job_rules_refusal(arg_matches, &rendered, &config).await {
+        Ok(None) => {}
+        Ok(Some(refusal)) => {
+            let (message, hint) = crate::cmd::helpers::split_hint(&refusal);
+            return Err(output::fail_local(
+                format,
+                CliError::local("FailedPrecondition", message, hint),
+            ));
+        }
+        Err(why) => warnings.push(format!(
+            "namespace policy job rules were not checked ({why}); `legion job plan` checks \
+             them"
+        )),
+    }
 
     if format.is_json() {
         output::print_success(&json!({
@@ -745,6 +775,54 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     }
 
     Ok(())
+}
+
+/// `job validate`'s check of namespace policy `jobRules` (PLG4): the
+/// refusal the manager would give, `None` when the job passes, or why the
+/// rules could not be read (no manager, or no `acl:read`).
+async fn job_rules_refusal(
+    matches: &ArgMatches,
+    rendered: &str,
+    config: &JobConfig,
+) -> Result<Option<String>, String> {
+    let mut client = connect_manager_client()
+        .await
+        .map_err(|err| format!("no manager: {err:#}"))?;
+    let reply = client
+        .list_namespace_policies(crate::structs::ListNamespacePoliciesRequest {})
+        .await
+        .map_err(|status| status.message().to_string())?
+        .into_inner();
+    let policies: Vec<crate::structs::namespace_policy::NamespacePolicy> = reply
+        .policies
+        .iter()
+        .filter_map(|policy| serde_json::from_str(&policy.object_json).ok())
+        .collect();
+    // The namespace the submit would use: the jobspec's own, else -n, else
+    // `default`.
+    let declared = serde_json::from_str::<Value>(rendered)
+        .ok()
+        .and_then(|spec| {
+            spec.get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    spec.get("name")
+                        .and_then(Value::as_str)
+                        .and_then(|name| name.split_once('/'))
+                        .map(|(namespace, _)| namespace.to_string())
+                })
+        });
+    let namespace = declared
+        .or_else(|| crate::cmd::helpers::active_namespace(matches))
+        .unwrap_or_else(|| crate::structs::namespace::DEFAULT_NAMESPACE.to_string());
+    let mut job = config.clone();
+    job.name = crate::structs::namespace::job_id(
+        &namespace,
+        crate::structs::namespace::job_name(&config.name),
+    );
+    let governing = crate::structs::namespace_policy::governing(&policies, &namespace);
+    Ok(crate::structs::namespace_policy::check_job_rules(&governing, &job).err())
 }
 
 /// One extension value as `job info -j` shows it: the proto, with its JSON
@@ -1250,6 +1328,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("destroy", matches)) => destroy_job(matches).await,
         Some(("list", matches)) => list_jobs(matches).await,
         Some(("info", matches)) => get_info(matches).await,
+        Some(("watch", matches)) => crate::cmd::watch::job_watch(matches).await,
         Some(("plan", matches)) => plan_job(matches).await,
         Some(("validate", matches)) => validate_job(matches).await,
         Some(("schema", matches)) => job_schema(matches).await,
@@ -2154,6 +2233,13 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         if !reply.message.is_empty() {
             println!("{}", reply.message);
         }
+        // What the submit would change, field by field.
+        if !reply.diff.is_empty() {
+            println!("Changes to the stored spec:");
+            for change in &reply.diff {
+                println!("  {}", plan_diff_line(change));
+            }
+        }
         for warning in &reply.warnings {
             println!("warning: {warning}");
         }
@@ -2281,6 +2367,22 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
                         report.task, report.placeable
                     );
                 }
+                if !report.topology_key.is_empty() && report.would_place {
+                    let key = &report.topology_key;
+                    let domains = report.topology_domains;
+                    if report.topology_domain.is_empty() {
+                        println!(
+                            "    across more than one {key}: none of the {domains} with eligible \
+                             nodes fits it alone (topology {})",
+                            report.topology_mode
+                        );
+                    } else {
+                        println!(
+                            "    in {key}={} ({domains} {key} domain(s) have eligible nodes)",
+                            report.topology_domain
+                        );
+                    }
+                }
                 if !report.reason.is_empty() && !report.would_place {
                     println!("    {}", report.reason);
                 }
@@ -2350,6 +2452,31 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
+/// One line of `legion job plan`'s diff: `~ tasks.web.count: 2 → 3`,
+/// `+ tasks.cron: {…}`, `- tasks.old.env.X: "y"`.
+fn plan_diff_line(change: &crate::structs::JobFieldChange) -> String {
+    let cut = |text: &str| {
+        if text.chars().count() > 80 {
+            format!("{}…", text.chars().take(79).collect::<String>())
+        } else {
+            text.to_string()
+        }
+    };
+    if change.redacted {
+        return format!("~ {}: changed (from a KV key you cannot read)", change.path);
+    }
+    match change.change.as_str() {
+        "added" => format!("+ {}: {}", change.path, cut(&change.new_json)),
+        "removed" => format!("- {}: {}", change.path, cut(&change.old_json)),
+        _ => format!(
+            "~ {}: {} → {}",
+            change.path,
+            cut(&change.old_json),
+            cut(&change.new_json)
+        ),
+    }
+}
+
 #[instrument(skip_all)]
 async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
@@ -2389,6 +2516,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         idempotency_key,
         namespace,
         allow_unknown_fields: arg_matches.get_flag("allow-unknown-fields"),
+        expected_version: arg_matches.get_one::<i64>("expected-version").copied(),
     });
 
     let reply =
@@ -2411,6 +2539,8 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
             "message": reply.message,
             "deduplicated": reply.deduplicated,
             "warnings": reply.warnings,
+            "version": reply.version,
+            "revision": reply.revision,
             "wait": wait_result,
         }));
     } else {
@@ -2928,9 +3058,10 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
         arg_matches,
         arg_matches.get_one::<String>("name").context("need name")?,
     )?;
-    let request = tonic::Request::new(GetJobInfoRequest {
+    let mut request = tonic::Request::new(GetJobInfoRequest {
         name: job_name.clone(),
     });
+    crate::cmd::watch::apply_read_flags(&mut request, arg_matches)?;
     let response = output::resolve(
         format,
         "failed to fetch job info",
@@ -2969,6 +3100,9 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
                     Value::Array(reply.extensions.iter().map(extension_value_json).collect()),
                 );
             }
+            // What `--index` takes to wait for the next change
+            // (docs/watches-and-blocking-queries.md).
+            object.insert("revision".into(), json!(reply.revision));
         }
         print_json(&value);
     } else {

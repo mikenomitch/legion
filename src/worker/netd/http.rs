@@ -89,6 +89,8 @@ const HOP_BY_HOP: &[&str] = &[
 #[derive(Clone)]
 struct RetryPolicy {
     attempts: u32,
+    /// The largest body kept for a retry (`retries.maxBodyBytes`).
+    max_body_bytes: u64,
     on_5xx: bool,
     on_connect_failure: bool,
     on_reset: bool,
@@ -112,6 +114,7 @@ impl RetryPolicy {
             .unwrap_or(20);
         Some(RetryPolicy {
             attempts: config.attempts.unwrap_or(1).min(10),
+            max_body_bytes: config.max_body_bytes(),
             on_5xx: on.contains(&"5xx"),
             on_connect_failure: on.contains(&"connect-failure"),
             on_reset: on.contains(&"reset"),
@@ -192,7 +195,7 @@ pub struct HttpSettings {
     pub context: Arc<ForwarderContext>,
     pub balancer: Arc<dyn Balancer>,
     pub endpoints: Arc<Mutex<Arc<Vec<Endpoint>>>>,
-    pub inflight: Arc<Mutex<HashMap<String, usize>>>,
+    pub inflight: Arc<Mutex<crate::worker::balance::InflightCounts>>,
     /// Idle upstream connections, reused across requests.
     pool: Arc<ConnPool>,
     /// Where the allocation's access log lives (`<logs>/<alloc>/net-access.log`).
@@ -243,7 +246,7 @@ impl HttpSettings {
         context: Arc<ForwarderContext>,
         balancer: Arc<dyn Balancer>,
         endpoints: Arc<Mutex<Arc<Vec<Endpoint>>>>,
-        inflight: Arc<Mutex<HashMap<String, usize>>>,
+        inflight: Arc<Mutex<crate::worker::balance::InflightCounts>>,
         log_dir: Option<PathBuf>,
     ) -> Self {
         let timeout = config
@@ -447,38 +450,8 @@ impl HttpSettings {
 
     /// Count one request in flight to `addr` until the guard drops, so
     /// load-aware strategies see HTTP-mode load too.
-    fn in_flight(self: &Arc<Self>, addr: &str) -> InFlight {
-        *self
-            .inflight
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(addr.to_string())
-            .or_insert(0) += 1;
-        InFlight {
-            settings: self.clone(),
-            addr: addr.to_string(),
-        }
-    }
-}
-
-struct InFlight {
-    settings: Arc<HttpSettings>,
-    addr: String,
-}
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        let mut inflight = self
-            .settings
-            .inflight
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if let Some(count) = inflight.get_mut(&self.addr) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                inflight.remove(&self.addr);
-            }
-        }
+    fn in_flight(self: &Arc<Self>, addr: &str) -> crate::worker::balance::InflightGuard {
+        crate::worker::balance::acquire_inflight(&self.inflight, addr)
     }
 }
 
@@ -959,23 +932,37 @@ async fn handle(
         }
     };
 
-    // Split the head from the body. The body is read fully either way (one
-    // upstream connection per request, no streaming yet); the body hops
-    // (`dlp`, a plugin's `body` stage) cap it.
+    // Split the head from the body (mesh-control-path plan §6.4). The body
+    // is streamed to the upstream as it arrives unless something must read
+    // or replay it: the body hops (`dlp`, a plugin's `body` stage) read it
+    // whole, up to their cap; a request that may be retried keeps a copy up
+    // to `retries.maxBodyBytes`, and a larger one streams and is sent once.
+    // Nothing buffers an unbounded body.
+    let retry = settings.retry.clone();
+    let retriable_method = retry
+        .as_ref()
+        .is_some_and(|r| r.methods.iter().any(|m| m == &method));
+    let replays =
+        hand_off.is_none() && retriable_method && retry.as_ref().is_some_and(|r| r.attempts > 0);
     let (mut parts, body) = req.into_parts();
     if head.changed {
         apply_head(&mut parts, &head);
     }
-    let body_bytes: Bytes = if !exchange.reads_body() {
-        match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(err) => {
-                debug!(upstream = %settings.key, error = %err, "Failed to read request body");
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "failed to read request body".into(),
-                );
+    let mut request_body: RequestBody = if !exchange.reads_body() {
+        if replays {
+            let cap = retry.as_ref().map(|r| r.max_body_bytes).unwrap_or(0);
+            match RequestBody::buffer_for_replay(body, cap).await {
+                Ok(request_body) => request_body,
+                Err(err) => {
+                    debug!(upstream = %settings.key, error = %err, "Failed to read request body");
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "failed to read request body".into(),
+                    );
+                }
             }
+        } else {
+            RequestBody::streaming(body)
         }
     } else {
         match Limited::new(body, exchange.body_cap() as usize)
@@ -1042,7 +1029,7 @@ async fn handle(
                         .await;
                     }
                 }
-                bytes
+                RequestBody::buffered(bytes)
             }
             Err(err) => {
                 // Over the cap, or the client went away mid-body.
@@ -1060,12 +1047,20 @@ async fn handle(
                 }
                 return error_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    "request body exceeds the body hop's maxBytes".into(),
+                    format!(
+                        "request body is larger than {} bytes, the most this route's body hops \
+                         read (their maxBytes)",
+                        exchange.body_cap()
+                    ),
                 );
             }
         }
     };
-    let bytes_in = body_bytes.len() as u64;
+    // Bytes the client sent: known up front for a buffered body, counted
+    // as they stream otherwise (a log line written before the upload ends
+    // reports what had arrived).
+    let bytes_counter = request_body.counter();
+    let bytes_in = || bytes_counter.load(Ordering::Relaxed);
 
     // A `proxy` hop: one attempt, to the proxy, in absolute form with the
     // Legion attribution headers; the proxy answers for the origin.
@@ -1088,7 +1083,7 @@ async fn handle(
             &settings,
             &target.addr,
             &parts,
-            body_bytes.clone(),
+            &mut request_body,
             host_header.as_deref(),
             Some(&hand),
             None,
@@ -1099,7 +1094,7 @@ async fn handle(
             Ok(response) => {
                 let status = response.status();
                 net_metrics::connection(direction, PROTOCOL_HTTP, "allow");
-                note_edge_request(&settings, None, Some(status.as_u16()), started, bytes_in);
+                note_edge_request(&settings, None, Some(status.as_u16()), started, bytes_in());
                 if let Some(chain) = chain {
                     access_log(
                         &settings,
@@ -1111,7 +1106,7 @@ async fn handle(
                         "allow",
                         Some(&target.source),
                         started,
-                        bytes_in,
+                        bytes_in(),
                         0,
                     )
                     .await;
@@ -1127,7 +1122,7 @@ async fn handle(
                     Err(err.to_string()),
                 );
                 net_metrics::connection(direction, PROTOCOL_HTTP, "error");
-                note_edge_request(&settings, None, None, started, bytes_in);
+                note_edge_request(&settings, None, None, started, bytes_in());
                 error_response(
                     StatusCode::BAD_GATEWAY,
                     format!("proxy handler {}: {err}", target.source),
@@ -1144,7 +1139,7 @@ async fn handle(
             Some(addr) => Some(addr.to_string()),
             None => {
                 net_metrics::connection(direction, PROTOCOL_HTTP, "error");
-                note_edge_request(&settings, None, None, started, bytes_in);
+                note_edge_request(&settings, None, None, started, bytes_in());
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     format!("{} did not resolve", target.host),
@@ -1155,11 +1150,7 @@ async fn handle(
     };
 
     // 2. Attempts.
-    let retry = settings.retry.clone();
     let max_attempts = 1 + retry.as_ref().map(|r| r.attempts).unwrap_or(0);
-    let retriable_method = retry
-        .as_ref()
-        .is_some_and(|r| r.methods.iter().any(|m| m == &method));
     let mut candidates = settings.healthy_endpoints();
     let mut last_error: Option<String> = None;
     let deadline = settings.timeout.map(|t| started + t);
@@ -1167,7 +1158,12 @@ async fn handle(
     for attempt in 0..max_attempts {
         if attempt > 0 {
             let Some(retry) = retry.as_ref() else { break };
-            if !retriable_method || !settings.budget.try_take(retry.budget_percent) {
+            // A streamed body went with the first attempt: nothing to send
+            // again.
+            if !retriable_method
+                || !request_body.replayable()
+                || !settings.budget.try_take(retry.budget_percent)
+            {
                 break;
             }
         }
@@ -1243,7 +1239,7 @@ async fn handle(
             &settings,
             &addr,
             &parts,
-            body_bytes.clone(),
+            &mut request_body,
             host_header.as_deref(),
             None,
             mesh_endpoint.as_ref(),
@@ -1272,7 +1268,11 @@ async fn handle(
                     (r.on_5xx && status.is_server_error())
                         || (r.on_retriable_4xx && matches!(status.as_u16(), 408 | 425 | 429))
                 });
-                if retry_this && attempt + 1 < max_attempts && retriable_method {
+                if retry_this
+                    && attempt + 1 < max_attempts
+                    && retriable_method
+                    && request_body.replayable()
+                {
                     last_error = Some(format!("upstream answered {}", status.as_u16()));
                     continue;
                 }
@@ -1282,7 +1282,7 @@ async fn handle(
                     edge_tag.as_deref(),
                     Some(status.as_u16()),
                     started,
-                    bytes_in,
+                    bytes_in(),
                 );
                 if let Some(chain) = chain {
                     access_log(
@@ -1295,7 +1295,7 @@ async fn handle(
                         "allow",
                         None,
                         started,
-                        bytes_in,
+                        bytes_in(),
                         0,
                     )
                     .await;
@@ -1323,7 +1323,7 @@ async fn handle(
     }
 
     net_metrics::connection(direction, PROTOCOL_HTTP, "error");
-    note_edge_request(&settings, None, None, started, bytes_in);
+    note_edge_request(&settings, None, None, started, bytes_in());
     let message = last_error.unwrap_or_else(|| "upstream unavailable".into());
     let status = if message.contains("deadline") {
         StatusCode::GATEWAY_TIMEOUT
@@ -1341,7 +1341,7 @@ async fn handle(
             "error",
             None,
             started,
-            bytes_in,
+            bytes_in(),
             0,
         )
         .await;
@@ -1491,7 +1491,7 @@ async fn attempt_request(
     settings: &Arc<HttpSettings>,
     addr: &str,
     parts: &http::request::Parts,
-    body: Bytes,
+    body: &mut RequestBody,
     host_header: Option<&str>,
     hand_off: Option<&HandOff>,
     mesh: Option<&Endpoint>,
@@ -1526,10 +1526,12 @@ async fn attempt_request(
     let host = match settings.target.as_ref() {
         Some(target) => {
             let default_port = if target.tls { 443 } else { 80 };
-            if target.port == default_port {
+            if target.port == default_port && !target.host.contains(':') {
                 target.host.clone()
+            } else if target.port == default_port {
+                format!("[{}]", target.host)
             } else {
-                format!("{}:{}", target.host, target.port)
+                crate::structs::hostport::join(&target.host, target.port)
             }
         }
         None => host_header.unwrap_or(addr).to_string(),
@@ -1540,44 +1542,183 @@ async fn attempt_request(
             builder = builder.header(name.as_str(), value.as_str());
         }
     }
-    // The body is buffered, so the request can be rebuilt for a second try
-    // on a fresh connection when a pooled one turns out to be dead.
     let (head, ()) = builder
         .body(())
         .map_err(|err| AttemptError::Reset(err.to_string()))?
         .into_parts();
-    let request = || Request::from_parts(head.clone(), full(body.clone()));
 
     let key = pool_key(settings, addr, hand_off, mesh);
-    if let Some(key) = key.as_ref() {
-        if let Some(mut sender) = settings.pool.checkout(key) {
-            match sender.try_send_request(request()).await {
-                Ok(response) => return Ok(finish(settings, Some(key.clone()), sender, response)),
-                Err(mut err) => {
-                    // The upstream closed the pooled connection under us.
-                    // A request that never left, or one that is safe to
-                    // repeat, goes again on a fresh connection.
-                    let unsent = err.take_message().is_some();
-                    if !unsent && !IDEMPOTENT.contains(&parts.method.as_str()) {
+    // Dial before taking the body, so a connect failure leaves a streamed
+    // body unsent.
+    let pooled = key.as_ref().and_then(|key| settings.pool.checkout(key));
+    let mut request = None;
+    if let (Some(key), Some(mut sender)) = (key.as_ref(), pooled) {
+        let sent = Request::from_parts(head.clone(), body.take()?);
+        match sender.try_send_request(sent).await {
+            Ok(response) => return Ok(finish(settings, Some(key.clone()), sender, response)),
+            Err(mut err) => {
+                // The upstream closed the pooled connection under us. A
+                // request that never left goes again as it is (its body
+                // untouched); one that left goes again only when it is safe
+                // to repeat and its body was kept.
+                request = err.take_message();
+                let unsent = request.is_some();
+                if !unsent {
+                    if !IDEMPOTENT.contains(&parts.method.as_str()) || !body.replayable() {
                         return Err(AttemptError::Reset(err.into_error().to_string()));
                     }
-                    debug!(
-                        upstream = %settings.key,
-                        destination = addr,
-                        unsent,
-                        "Pooled upstream connection was closed; retrying on a new one"
-                    );
+                    request = Some(Request::from_parts(head.clone(), body.take()?));
                 }
+                debug!(
+                    upstream = %settings.key,
+                    destination = addr,
+                    unsent,
+                    "Pooled upstream connection was closed; retrying on a new one"
+                );
             }
         }
     }
 
     let mut sender = open(settings, addr, hand_off, mesh).await?;
+    let request = match request {
+        Some(request) => request,
+        None => Request::from_parts(head, body.take()?),
+    };
     let response = sender
-        .send_request(request())
+        .send_request(request)
         .await
         .map_err(|err| AttemptError::Reset(err.to_string()))?;
     Ok(finish(settings, key, sender, response))
+}
+
+/// A request's body on its way upstream (mesh-control-path plan §6.4):
+/// kept whole, so every attempt can send it, or streamed, so it goes once;
+/// with the count of client bytes it has carried so far.
+struct RequestBody {
+    kind: BodyKind,
+    counter: Arc<AtomicU64>,
+}
+
+enum BodyKind {
+    /// Small enough to keep (or read whole by a body hop): replayable.
+    Buffered(Bytes),
+    /// Streamed as it arrives; taken by the first attempt.
+    Streaming(Option<OutBody>),
+}
+
+impl RequestBody {
+    fn buffered(bytes: Bytes) -> Self {
+        RequestBody {
+            counter: Arc::new(AtomicU64::new(bytes.len() as u64)),
+            kind: BodyKind::Buffered(bytes),
+        }
+    }
+
+    /// Stream `incoming` (after `prefix`, the part already read) to the
+    /// upstream, counting what passes.
+    fn streaming_after(prefix: Bytes, incoming: Incoming) -> Self {
+        let counter = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&counter);
+        let body = Prefixed {
+            prefix: (!prefix.is_empty()).then_some(prefix),
+            rest: incoming,
+        }
+        .map_frame(move |frame| {
+            if let Some(data) = frame.data_ref() {
+                seen.fetch_add(data.len() as u64, Ordering::Relaxed);
+            }
+            frame
+        })
+        .map_err(|err| -> handlers::BoxError { Box::new(err) })
+        .boxed();
+        RequestBody {
+            kind: BodyKind::Streaming(Some(body)),
+            counter,
+        }
+    }
+
+    fn streaming(incoming: Incoming) -> Self {
+        Self::streaming_after(Bytes::new(), incoming)
+    }
+
+    /// Read `incoming` whole when it is at most `cap` bytes, so a retry can
+    /// send it again; past `cap`, stream what was read and the rest, once.
+    async fn buffer_for_replay(mut incoming: Incoming, cap: u64) -> Result<Self, hyper::Error> {
+        let mut kept = bytes::BytesMut::new();
+        while let Some(frame) = incoming.frame().await {
+            let Ok(data) = frame?.into_data() else {
+                // Trailers: not forwarded, as when a body is read whole.
+                continue;
+            };
+            kept.extend_from_slice(&data);
+            if kept.len() as u64 > cap {
+                let read = kept.len() as u64;
+                debug!(
+                    read,
+                    cap, "Request body is larger than retries.maxBodyBytes; streaming it once"
+                );
+                return Ok(Self::streaming_after(kept.freeze(), incoming));
+            }
+        }
+        Ok(Self::buffered(kept.freeze()))
+    }
+
+    fn counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.counter)
+    }
+
+    fn replayable(&self) -> bool {
+        matches!(self.kind, BodyKind::Buffered(_))
+    }
+
+    /// The body for one attempt: a copy of a kept body, or the stream the
+    /// first time only.
+    fn take(&mut self) -> Result<OutBody, AttemptError> {
+        match &mut self.kind {
+            BodyKind::Buffered(bytes) => Ok(full(bytes.clone())),
+            BodyKind::Streaming(body) => body.take().ok_or_else(|| {
+                AttemptError::Reset("the streamed request body was already sent".into())
+            }),
+        }
+    }
+}
+
+/// A body that yields bytes already read, then the rest of the client's
+/// stream.
+struct Prefixed {
+    prefix: Option<Bytes>,
+    rest: Incoming,
+}
+
+impl hyper::body::Body for Prefixed {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        let this = self.get_mut();
+        if let Some(prefix) = this.prefix.take() {
+            return std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(prefix))));
+        }
+        std::pin::Pin::new(&mut this.rest).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.prefix.is_none() && self.rest.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        let prefix = self.prefix.as_ref().map(|p| p.len() as u64).unwrap_or(0);
+        let rest = self.rest.size_hint();
+        let mut hint = hyper::body::SizeHint::new();
+        hint.set_lower(rest.lower() + prefix);
+        if let Some(upper) = rest.upper() {
+            hint.set_upper(upper + prefix);
+        }
+        hint
+    }
 }
 
 /// Which pool a request's connection belongs to. A `proxy` hop is never
@@ -1653,6 +1794,11 @@ async fn open(
             .connect(server_name, stream)
             .await
             .map_err(|err| AttemptError::Connect(format!("mesh tls: {err}")))?;
+        if crate::worker::netd::mesh_tls::resumed_with_expired_peer(tls.get_ref().1) {
+            return Err(AttemptError::Connect(
+                "mesh tls: resumed a session whose peer certificate expired".into(),
+            ));
+        }
         let header = handlers::proxy_header(
             &settings.context,
             &HopFacts {
@@ -1995,7 +2141,10 @@ mod tests {
             "one upstream connection"
         );
         // Nothing is left counted as in flight once the replies are back.
-        assert!(settings.inflight.lock().unwrap().is_empty());
+        assert!(
+            crate::worker::balance::inflight_snapshot(&settings.inflight.lock().unwrap())
+                .is_empty()
+        );
     }
 
     /// A pooled connection the upstream has since closed is never handed
@@ -2184,6 +2333,7 @@ mod integration {
             &crate::structs::host_guard::HostGuardConfig {
                 allow: vec![format!("127.0.0.1:{origin}")],
                 deny: vec![],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2316,6 +2466,7 @@ mod integration {
             &crate::structs::host_guard::HostGuardConfig {
                 allow: vec![format!("127.0.0.1:{origin}")],
                 deny: vec![],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2412,6 +2563,7 @@ mod integration {
             &crate::structs::host_guard::HostGuardConfig {
                 allow: vec![format!("127.0.0.1:{origin}")],
                 deny: vec![],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2684,6 +2836,7 @@ mod integration {
             &crate::structs::host_guard::HostGuardConfig {
                 allow: vec![format!("127.0.0.1:{origin}")],
                 deny: vec![],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -2845,5 +2998,153 @@ mod integration {
             body.contains("host=keep.me"),
             "L4 splice does not touch headers: {body}"
         );
+    }
+
+    /// An origin that counts requests, answers 503 on `/fail`, and otherwise
+    /// echoes how many body bytes it read.
+    async fn start_counting_origin() -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let hits = counted.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            let fail = req.uri().path() == "/fail";
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let status = if fail { 503 } else { 200 };
+                            Ok::<_, hyper::Error>(
+                                Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::from(format!("read={}", body.len()))))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    /// An HTTP-mode upstream to `origin` with `http` and `handlers`, on a
+    /// node whose host guard opens exactly the origin's port.
+    async fn http_upstream(
+        origin: u16,
+        http: serde_json::Value,
+        handlers: Vec<crate::structs::hops::HopConfig>,
+    ) -> (UpstreamForwarder, u16) {
+        let guard = crate::structs::host_guard::HostGuard::new(
+            &crate::structs::host_guard::HostGuardConfig {
+                allow: vec![format!("127.0.0.1:{origin}")],
+                deny: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let context = Arc::new(
+            ForwarderContext::new(Arc::new(NetPolicyCache::new()), Arc::new(Denials::new()))
+                .with_host_guard(Arc::new(guard)),
+        );
+        let forwarder = UpstreamForwarder::with_context(context);
+        let port = free_port().await;
+        forwarder
+            .sync(&[UpstreamSpec {
+                allocation_id: 7,
+                service: "origin".into(),
+                local_port: Some(port),
+                http_protocol: false,
+                balance: "round_robin".into(),
+                to: Some(format!("http://127.0.0.1:{origin}")),
+                http: Some(serde_json::from_value(http).unwrap()),
+                handlers,
+                credentials: Vec::new(),
+                ca: None,
+                vip: None,
+                canonical_port: None,
+                attachment: crate::worker::netd::attach::Attachment::Host,
+            }])
+            .await;
+        assert_eq!(forwarder.active().len(), 1, "listener bound");
+        (forwarder, port)
+    }
+
+    fn post(path: &str, bytes: usize) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {bytes}\r\n\r\n{}",
+            "a".repeat(bytes)
+        )
+    }
+
+    /// Mesh-control-path plan §6.4: with nothing to replay, a body streams
+    /// through whatever its size; with retries, a body within
+    /// `retries.maxBodyBytes` is kept and retried, and a larger one streams
+    /// once and is not retried.
+    #[tokio::test]
+    async fn request_bodies_stream_unless_a_retry_needs_them_test() {
+        let (origin, hits) = start_counting_origin().await;
+
+        // No retries: a 3 MiB upload goes through untouched.
+        let (_plain, port) = http_upstream(origin, serde_json::json!({}), Vec::new()).await;
+        let big = 3 * 1024 * 1024;
+        let (status, _, body) = request(port, &post("/upload", big)).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, format!("read={big}"));
+
+        let (_retrying, port) = http_upstream(
+            origin,
+            serde_json::json!({ "retries": {
+                "attempts": 1, "on": ["5xx"], "methods": ["POST"], "maxBodyBytes": "1Ki"
+            } }),
+            Vec::new(),
+        )
+        .await;
+        // Within the cap: kept, and retried once.
+        let before = hits.load(Ordering::SeqCst);
+        let (status, _, _) = request(port, &post("/fail", 512)).await;
+        assert_eq!(status, 503);
+        assert_eq!(hits.load(Ordering::SeqCst) - before, 2, "retried");
+        // Over the cap: streamed, sent once, and the answer passes through.
+        let before = hits.load(Ordering::SeqCst);
+        let (status, _, body) = request(port, &post("/fail", 4096)).await;
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(hits.load(Ordering::SeqCst) - before, 1, "not retried");
+        let (status, _, body) = request(port, &post("/upload", 4096)).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "read=4096", "the part read for the cap is sent too");
+    }
+
+    /// A body hop reads at most its `maxBytes`. Over it, a hop that fails
+    /// closed denies and one that fails open answers `413` naming the cap;
+    /// the upstream sees neither request.
+    #[tokio::test]
+    async fn a_body_over_a_body_hops_cap_is_refused_test() {
+        let (origin, hits) = start_counting_origin().await;
+        let dlp = |on_error: &str| -> crate::structs::hops::HopConfig {
+            serde_json::from_value(serde_json::json!({
+                "dlp": { "maxBytes": "1Ki", "patterns": ["sk-[A-Za-z0-9]{8,}"] },
+                "onError": on_error
+            }))
+            .unwrap()
+        };
+        let (_open, port) = http_upstream(origin, serde_json::json!({}), vec![dlp("allow")]).await;
+        let (status, _, body) = request(port, &post("/upload", 4096)).await;
+        assert_eq!(status, 413, "{body}");
+        assert!(body.contains("larger than 1024 bytes"), "{body}");
+        let (_closed, port) = http_upstream(origin, serde_json::json!({}), vec![dlp("deny")]).await;
+        let (status, _, _) = request(port, &post("/upload", 4096)).await;
+        assert_eq!(status, 403);
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the origin");
+        // Within the cap, the hop reads it and it goes on.
+        let (status, _, body) = request(port, &post("/upload", 100)).await;
+        assert_eq!((status, body.as_str()), (200, "read=100"));
     }
 }

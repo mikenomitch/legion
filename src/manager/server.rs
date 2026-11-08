@@ -131,12 +131,15 @@ mod app_ui_rpcs;
 mod autoscale_rpcs;
 mod checkpoint_support;
 mod delegation;
+pub mod endpoint_feed;
 mod extension_rpcs;
 mod fork_rpcs;
+mod governance_rpcs;
 mod make_room;
 mod material_rpcs;
 mod namespace_policy_rpcs;
 mod namespace_rpcs;
+mod net_policy_memo;
 mod node_content_rpcs;
 mod node_group_rpcs;
 mod object_rpcs;
@@ -146,6 +149,12 @@ mod scaling_rpcs;
 mod session_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
+// `PlanJobReply.diff` (revisions-and-watches plan §9).
+mod plan_diff;
+// Blocking reads and `Manager.Watch` (revisions-and-watches plan).
+#[cfg(test)]
+mod revision_rpcs_test;
+mod watch_rpcs;
 mod work_stream;
 pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};
 pub(crate) use scaling_rpcs::scaling_replica_counts;
@@ -154,6 +163,7 @@ pub use snapshot_rpcs::{
     checkpoint_part_keys, expire_snapshots, PartKeyUse, CHECKPOINT_CAPABILITY,
 };
 pub use suspend_rpcs::{idle_sweep, settle_stalled_resumes, IdleSweepOutcome, IdleSweeper};
+pub use watch_rpcs::{CONSISTENCY_HEADER, MAX_READ_WAIT, MIN_REVISION_HEADER, WAIT_HEADER};
 
 /// The delegated exec keys as last read, their version, and when.
 type CachedExecKeys = (std::time::Instant, String, Vec<crate::structs::ExecKey>);
@@ -170,7 +180,7 @@ fn signing_error_status(err: anyhow::Error, message: &str) -> Status {
     Status::internal(message.to_string())
 }
 
-fn map_store_error(action: &str, err: anyhow::Error) -> Status {
+pub(crate) fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     let status = store_error_status(action, &err);
     // Log by what the error means for the server. A refused or missing-thing
     // answer (NotFound, FailedPrecondition, a non-leader redirect, ...) is
@@ -2115,6 +2125,10 @@ pub struct ManagerDaemonService {
     /// re-read at most every `NET_POLICY_GENERATION_TTL`, so a cluster with
     /// no policies pays a mutex read per heartbeat rather than a query.
     net_policy_generation: Arc<Mutex<Option<(std::time::Instant, u64)>>>,
+    /// Effective-policy assignments by their inputs, per policy generation
+    /// (mesh-control-path plan §6.2), so a heartbeat neither lists policies
+    /// nor merges for an allocation whose inputs it has seen.
+    net_policy_memo: Arc<net_policy_memo::NetPolicyMemo>,
     /// The service graph: per (caller job, caller task, service, tag), the
     /// last 15 minutes of per-minute buckets folded from every node's
     /// `net_edges` heartbeat samples. In memory: a failover loses at most the
@@ -2204,6 +2218,7 @@ impl ManagerDaemonService {
             heartbeat: crate::structs::HeartbeatConfigFull::default(),
             net_policy_cache: Arc::new(Mutex::new(HashMap::new())),
             net_policy_generation: Arc::new(Mutex::new(None)),
+            net_policy_memo: Arc::default(),
             net_status: Arc::new(Mutex::new(HashMap::new())),
             net_plugin_status: Arc::new(Mutex::new(HashMap::new())),
             net_edges: Arc::new(Mutex::new(HashMap::new())),
@@ -2382,7 +2397,11 @@ impl ManagerDaemonService {
     /// falls back to the app's own identity (`delegation.rs`).
     fn authenticate_acl<T>(&self, request: &Request<T>) -> Result<AclIdentity, Status> {
         let caller = self.auth.authenticate(request.metadata(), &self.store)?;
-        self.with_delegation(caller, request.metadata())
+        let identity = self.with_delegation(caller, request.metadata())?;
+        // The audit journal records who called, and for whom
+        // (`crate::manager::governance`).
+        crate::manager::governance::note_identity(&identity);
+        Ok(identity)
     }
 
     /// Every manager a worker may dial (`HeartbeatReply.manager_addresses`,
@@ -2483,8 +2502,11 @@ impl ManagerDaemonService {
         namespace: Option<&str>,
         unknown_field_mode: UnknownFieldMode,
         app_warnings: Vec<String>,
+        // `RunJobRequest.expected_version`: compare-and-set on the job's
+        // latest version, checked in the entry that writes the new one.
+        expected_version: Option<i64>,
     ) -> Result<SubmittedJob, Status> {
-        self.submit_rendered_job_from(
+        self.submit_rendered_job_from_checked(
             identity,
             js,
             subs,
@@ -2495,6 +2517,7 @@ impl ManagerDaemonService {
             SubmitOrigin::Principal,
             unknown_field_mode,
             app_warnings,
+            expected_version,
         )
     }
 
@@ -2616,7 +2639,7 @@ impl ManagerDaemonService {
 
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
-            Status::invalid_argument(format!("Error validating task configs: {e}"))
+            Status::invalid_argument(format!("Error validating task configs: {e:#}"))
         })?;
         // `autoscale` against the cluster's scaling defaults and namespace
         // policies, as they stand now (docs/autoscaling.md).
@@ -2668,7 +2691,7 @@ impl ManagerDaemonService {
         &self,
         identity: &AclIdentity,
         js: &str,
-        mut subs: Vec<Submission>,
+        subs: Vec<Submission>,
         // Explicit eval-queue override (`--priority`/`--asap`). `None` lets
         // the job's priority band set the queue position, which is the
         // default and the point of having one field mean both things.
@@ -2685,6 +2708,52 @@ impl ManagerDaemonService {
         // calls (`ask_apps_to_validate`).
         app_warnings: Vec<String>,
     ) -> Result<SubmittedJob, Status> {
+        self.submit_rendered_job_from_checked(
+            identity,
+            js,
+            subs,
+            priority,
+            force_reschedule,
+            template,
+            namespace,
+            origin,
+            unknown_field_mode,
+            app_warnings,
+            None,
+        )
+    }
+
+    /// [`Self::submit_rendered_job_from`] with compare-and-set on the job's
+    /// latest version (`RunJobRequest.expected_version`; revisions-and-
+    /// watches plan §9). Only a principal's own submit takes one.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_rendered_job_from_checked(
+        &self,
+        identity: &AclIdentity,
+        js: &str,
+        mut subs: Vec<Submission>,
+        priority: Option<i64>,
+        force_reschedule: bool,
+        template: Option<&JobTemplateProvenance>,
+        namespace: Option<&str>,
+        origin: SubmitOrigin,
+        unknown_field_mode: UnknownFieldMode,
+        app_warnings: Vec<String>,
+        expected_version: Option<i64>,
+    ) -> Result<SubmittedJob, Status> {
+        if expected_version.is_some()
+            && (!matches!(origin, SubmitOrigin::Principal) || identity.acting_for.is_some())
+        {
+            return Err(Status::invalid_argument(
+                "expected_version is only taken on a principal's own submit, not on an app's \
+                 submit or one acting for an object",
+            ));
+        }
+        if expected_version.is_some_and(|version| version < 0) {
+            return Err(Status::invalid_argument(
+                "expected_version must be 0 (the job must not exist) or a stored version",
+            ));
+        }
         if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
             subs.push(Submission {
                 path: "job.rendered.json".into(),
@@ -2735,12 +2804,13 @@ impl ManagerDaemonService {
                     crate::structs::app::ManagedBy::for_object(actor),
                     Some(&unknown_fields),
                 ),
-                None => self.store.handle_job_submit_as(
+                None => self.store.handle_job_submit_checked(
                     &config,
                     &subs,
                     template,
                     &identity.principal,
                     Some(&unknown_fields),
+                    expected_version,
                 ),
             },
             SubmitOrigin::App {
@@ -3142,6 +3212,8 @@ impl ManagerDaemonService {
                 warnings: warnings_from_message(&message),
                 message,
                 deduplicated: true,
+                version: 0,
+                revision: self.store.current_revision_string(),
             }));
         }
 
@@ -3155,7 +3227,14 @@ impl ManagerDaemonService {
             inner.namespace.as_deref(),
             UnknownFieldMode::from_allow(inner.allow_unknown_fields),
             app_warnings,
+            inner.expected_version,
         )?;
+        // The version the job is at now, for the caller's next
+        // compare-and-set.
+        let version = self
+            .store
+            .latest_job_version(&submitted.job_name)
+            .unwrap_or_default();
 
         let message = submitted.message_with_warnings();
         // The lookup above only catches a duplicate that arrived after the
@@ -3186,6 +3265,8 @@ impl ManagerDaemonService {
             warnings: warnings_from_message(&message),
             message,
             deduplicated,
+            version,
+            revision: self.store.current_revision_string(),
         }))
     }
 
@@ -5447,6 +5528,7 @@ impl Manager for ManagerDaemonService {
                 inner.namespace.as_deref(),
                 UnknownFieldMode::from_allow(inner.allow_unknown_fields),
                 app_warnings,
+                None,
             )?;
             info!(
                 template = %template.name,
@@ -5491,7 +5573,11 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             self.job_read_scope(&request.get_ref().name),
         )?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
         let name = request.into_inner().name;
+        let revision = self
+            .prepare_read(&directives, watch_rpcs::ReadScope::Job(name.clone()))
+            .await?;
 
         let mut job = self.store.get_job_with_status(&name).map_err(|e| {
             self.job_lookup_error(&identity, &name, map_store_error("Error getting job", e))
@@ -5538,6 +5624,7 @@ impl Manager for ManagerDaemonService {
             managed_by,
             unknown_fields,
             extensions,
+            revision,
         };
 
         Ok(Response::new(reply))
@@ -5811,16 +5898,17 @@ impl Manager for ManagerDaemonService {
         request: Request<MintExecTicketRequest>,
     ) -> Result<Response<MintExecTicketReply>, Status> {
         let identity = self.authenticate_acl(&request)?;
-        if !identity.would_allow(AclResource::Exec, AclAction::Write, &AclScope::any())
-            && !identity.would_allow(AclResource::Action, AclAction::Write, &AclScope::any())
+        // Coarse gate: `exec:write` or `action:write` somewhere. Enforced
+        // (not just evaluated) so the write check reaches the audit journal
+        // and the gates; the precise check runs in the mint.
+        let coarse = if identity.would_allow(AclResource::Exec, AclAction::Write, &AclScope::any())
+            || !identity.would_allow(AclResource::Action, AclAction::Write, &AclScope::any())
         {
-            acl::enforce(
-                &identity,
-                AclResource::Exec,
-                AclAction::Write,
-                &AclScope::any(),
-            )?;
-        }
+            AclResource::Exec
+        } else {
+            AclResource::Action
+        };
+        acl::enforce(&identity, coarse, AclAction::Write, &AclScope::any())?;
         let req = request.into_inner();
         tracing::Span::current().record("allocation_id", req.allocation_id);
         tracing::Span::current().record("instance_id", req.instance_id.as_str());
@@ -5840,7 +5928,8 @@ impl Manager for ManagerDaemonService {
         let store = self.store.clone();
         let state = state.clone();
         let limits = self.exec_tickets.clone();
-        let reply = tokio::task::spawn_blocking(move || {
+        // `carry`: the precise exec/action check runs in the blocking task.
+        let reply = tokio::task::spawn_blocking(crate::manager::governance::carry(move || {
             crate::manager::exec::mint_exec_ticket(
                 &store,
                 &identity,
@@ -5849,7 +5938,7 @@ impl Manager for ManagerDaemonService {
                 &req,
                 std::time::SystemTime::now(),
             )
-        })
+        }))
         .await
         .map_err(|e| Status::internal(format!("mint task failed: {e}")))??;
         Ok(Response::new(reply))
@@ -6222,7 +6311,7 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Namespace policy refused the job", e))?;
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
-            Status::invalid_argument(format!("Error validating task configs: {e}"))
+            Status::invalid_argument(format!("Error validating task configs: {e:#}"))
         })?;
         let autoscale_plans = self.validate_autoscale(&config)?;
         self.validate_identity_sub_templates(&config)?;
@@ -6257,6 +6346,14 @@ impl Manager for ManagerDaemonService {
             .as_ref()
             .map(|existing| artifact_pin_diffs(existing, &config))
             .unwrap_or_default();
+        // Field by field, what the submit would change in the stored spec
+        // (revisions-and-watches plan §9, review AI5).
+        let diff = match existing_config.as_ref() {
+            Some(existing) if !existing.is_same_as(&config) => {
+                self.plan_field_diff(&identity, existing, &config)
+            }
+            _ => Vec::new(),
+        };
 
         let (
             plan,
@@ -6461,6 +6558,7 @@ impl Manager for ManagerDaemonService {
                 })
                 .collect(),
             extensions: self.job_extension_values(&config),
+            diff,
         };
 
         Ok(Response::new(reply))
@@ -6567,6 +6665,58 @@ impl Manager for ManagerDaemonService {
         Ok(Response::new(ListJobSpecHistoryReply { items }))
     }
 
+    // === AGENT GOVERNANCE (internal_docs/plans/agent-governance-plan.md) ===
+    // The handlers live in `governance_rpcs`; each enforces its own ACLs.
+
+    async fn list_audit_events(
+        &self,
+        request: Request<crate::structs::ListAuditEventsRequest>,
+    ) -> Result<Response<crate::structs::ListAuditEventsReply>, Status> {
+        self.list_audit_events_rpc(request).await
+    }
+
+    async fn create_child_token(
+        &self,
+        request: Request<crate::structs::CreateChildTokenRequest>,
+    ) -> Result<Response<crate::structs::CreateChildTokenReply>, Status> {
+        self.create_child_token_rpc(request).await
+    }
+
+    async fn list_approvals(
+        &self,
+        request: Request<crate::structs::ListApprovalsRequest>,
+    ) -> Result<Response<crate::structs::ListApprovalsReply>, Status> {
+        self.list_approvals_rpc(request).await
+    }
+
+    async fn get_approval(
+        &self,
+        request: Request<crate::structs::GetApprovalRequest>,
+    ) -> Result<Response<crate::structs::GetApprovalReply>, Status> {
+        self.get_approval_rpc(request).await
+    }
+
+    async fn decide_approval(
+        &self,
+        request: Request<crate::structs::DecideApprovalRequest>,
+    ) -> Result<Response<crate::structs::DecideApprovalReply>, Status> {
+        self.decide_approval_rpc(request).await
+    }
+
+    async fn get_caller_capabilities(
+        &self,
+        request: Request<crate::structs::GetCallerCapabilitiesRequest>,
+    ) -> Result<Response<crate::structs::GetCallerCapabilitiesReply>, Status> {
+        self.get_caller_capabilities_rpc(request).await
+    }
+
+    async fn get_usage(
+        &self,
+        request: Request<crate::structs::GetUsageRequest>,
+    ) -> Result<Response<crate::structs::GetUsageReply>, Status> {
+        self.get_usage_rpc(request).await
+    }
+
     // === NAMESPACES (docs/namespaces.md) ===
     // The handlers live in `namespace_rpcs`; each enforces `namespace` ACLs
     // itself (ListNamespaces filters per item).
@@ -6637,9 +6787,13 @@ impl Manager for ManagerDaemonService {
     ) -> Result<Response<ListJobsReply>, Status> {
         let identity =
             self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
         let request = request.into_inner();
         let selection = crate::structs::namespace::NamespaceSelection::parse(&request.namespaces)
             .map_err(Status::invalid_argument)?;
+        let revision = self
+            .prepare_read(&directives, watch_rpcs::ReadScope::Jobs)
+            .await?;
         let query = normalize_query(request.query);
         let sort_by = request.sort_by.unwrap_or_else(|| "updated_at".to_string());
         let sort_desc = request
@@ -6747,6 +6901,7 @@ impl Manager for ManagerDaemonService {
             status_counts,
             elsewhere_count,
             elsewhere_namespaces,
+            revision,
         }))
     }
 
@@ -7953,7 +8108,14 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             AclScope::job(&request.get_ref().job_id),
         )?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
         let inner = request.into_inner();
+        let revision = self
+            .prepare_read(
+                &directives,
+                watch_rpcs::ReadScope::Job(inner.job_id.clone()),
+            )
+            .await?;
         let group = inner.group.filter(|group| !group.trim().is_empty());
 
         let mut suspend = self
@@ -8058,6 +8220,7 @@ impl Manager for ManagerDaemonService {
             next_session_page_token: listing.next_page_token,
             session_count: listing.count,
             sessions_by_node: listing.by_node,
+            revision,
         }))
     }
 
@@ -8848,17 +9011,25 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         acl::enforce_worker_plane(&identity)?;
         crate::manager::telemetry::metrics().heartbeats_total.inc();
-        let req = request.into_inner();
-        let id = req.id;
+        let mut req = request.into_inner();
+        let id = std::mem::take(&mut req.id);
         acl::enforce_node_binding(&identity, &id)?;
-        let provisional_claims = req.provisional_claims;
-        // Checkpoint outcomes first: a failed restore also fails its
-        // allocation in `failed_allocations` below, and the instance's
-        // restore source must be cleared before that reschedules it, or the
-        // replacement would try the same restore again.
-        snapshot_rpcs::apply_snapshot_reports(&self.store, &id, &req.snapshot_reports);
+        let provisional_claims = std::mem::take(&mut req.provisional_claims);
 
-        // Offloaded, not called inline. In steady state this is now cheap —
+        // Everything this beat reports that can write the store runs on the
+        // blocking pool, in one hop, in the order it always ran (ST5,
+        // revisions-and-watches plan §8): checkpoint outcomes first (a
+        // failed restore also fails its allocation in `failed_allocations`,
+        // and the instance's restore source must be cleared before that
+        // reschedules it, or the replacement would try the same restore
+        // again), then the heartbeat itself, then failures, terminations,
+        // health, volume outcomes, and pressure actions. Each of those can
+        // make a replicated write, and a write parks its thread for the whole
+        // quorum round: inline, they held a runtime worker each, so a burst
+        // of reporting nodes starved every other handler on the manager.
+        //
+        // The heartbeat update was the first to move off the runtime.
+        // In steady state it is now cheap —
         // one read-model lookup and one map write, no commit and no fsync
         // (docs/node-liveness.md) — but the call is still BLOCKING on the
         // paths that do commit: a `lost -> active` transition, and the
@@ -8873,48 +9044,46 @@ impl Manager for ManagerDaemonService {
         // batches at size 1 and defeats the group commit entirely
         // (HEARTBEAT_BATCH_MAX is 128). Measured on gp3 EBS before the
         // offload: 86 heartbeats/sec, 17% of the 2s cadence, host idle.
-        {
+        let (retry_failed_allocations, retry_terminated_allocations) = {
             let store = self.store.clone();
-            let heartbeat_id = id.clone();
-            tokio::task::spawn_blocking(move || store.update_node_heartbeat(heartbeat_id))
-                .await
-                .map_err(|e| Status::internal(format!("heartbeat task failed: {e}")))?
-                .map_err(|e| map_store_error("Error updating node heartbeat", e))?;
-        }
-
-        let retry_failed_allocations = handle_failed_allocations(
-            &self.store,
-            &self.allocation_failures,
-            &id,
-            &req.failed_allocations,
-        );
-        let retry_terminated_allocations =
-            handle_terminated_allocations(&self.store, &id, &req.terminated_allocations);
-        if let Err(err) =
-            update_allocation_health_snapshots(&self.store, &id, &req.allocation_health)
-        {
-            error!(
-                node_id = %id,
-                error = ?err,
-                "Error updating allocation health snapshots"
-            );
-        }
-
-        // Volume outcomes flow manager-ward here: workers own the drivers, the
-        // manager owns the state machine (see docs/volumes.md).
-        apply_volume_reports(&self.store, &id, &req.volume_reports);
-
-        // Before the desired set is built, so an allocation the worker just
-        // evicted for memory pressure is already gone from this reply and is
-        // not handed straight back to it.
-        if let Err(err) = handle_pressure_actions(
-            &self.store,
-            &self.allocation_failures,
-            &id,
-            &req.pressure_actions,
-        ) {
-            error!(node_id = %id, error = ?err, "Error handling pressure actions");
-        }
+            let failures = Arc::clone(&self.allocation_failures);
+            let node_id = id.clone();
+            let snapshot_reports = std::mem::take(&mut req.snapshot_reports);
+            let failed = std::mem::take(&mut req.failed_allocations);
+            let terminated = std::mem::take(&mut req.terminated_allocations);
+            let health = std::mem::take(&mut req.allocation_health);
+            let volume_reports = std::mem::take(&mut req.volume_reports);
+            let pressure_actions = std::mem::take(&mut req.pressure_actions);
+            tokio::task::spawn_blocking(move || -> R<(Vec<i64>, Vec<i64>)> {
+                snapshot_rpcs::apply_snapshot_reports(&store, &node_id, &snapshot_reports);
+                store.update_node_heartbeat(node_id.clone())?;
+                let retry_failed = handle_failed_allocations(&store, &failures, &node_id, &failed);
+                let retry_terminated = handle_terminated_allocations(&store, &node_id, &terminated);
+                if let Err(err) = update_allocation_health_snapshots(&store, &node_id, &health) {
+                    error!(
+                        node_id = %node_id,
+                        error = ?err,
+                        "Error updating allocation health snapshots"
+                    );
+                }
+                // Volume outcomes flow manager-ward here: workers own the
+                // drivers, the manager owns the state machine (see
+                // docs/volumes.md).
+                apply_volume_reports(&store, &node_id, &volume_reports);
+                // Before the desired set is built, so an allocation the
+                // worker just evicted for memory pressure is already gone
+                // from this reply and is not handed straight back to it.
+                if let Err(err) =
+                    handle_pressure_actions(&store, &failures, &node_id, &pressure_actions)
+                {
+                    error!(node_id = %node_id, error = ?err, "Error handling pressure actions");
+                }
+                Ok((retry_failed, retry_terminated))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("heartbeat task failed: {e}")))?
+            .map_err(|e| map_store_error("Error updating node heartbeat", e))?
+        };
 
         // Elastic envelope resizes the node asked for (docs/session-mode.md,
         // "Elastic envelopes"). Before the desired set is built, so a reply
@@ -8945,28 +9114,39 @@ impl Manager for ManagerDaemonService {
             .map(|reported| self.store.work_log().check_heartbeat(&id, reported))
             .unwrap_or_default();
         let (desired_allocations, feed_allocations) = if stream.via_stream {
-            let held = self.store.work_log().held_payloads(&id, |allocation| {
-                !allocation.task_connect.is_empty()
-                    || !allocation.task_network.is_empty()
-                    || !allocation.network.is_empty()
-            });
+            let held = self.store.work_log().held_payloads(
+                &id,
+                |allocation| {
+                    !allocation.task_connect.is_empty()
+                        || !allocation.task_network.is_empty()
+                        || !allocation.network.is_empty()
+                },
+                // After a resume, the payloads it did not resend.
+                |missing| work_stream::load_held_payloads(&self.store, &id, missing),
+            );
             (Vec::new(), held)
         } else {
             let desired = build_desired_allocations(&self.store, &id, &req.allocation_ids)
                 .map_err(|e| map_store_error("Error building desired allocations", e))?;
             (desired.clone(), desired)
         };
-        // Endpoint feed for the node-local upstream forwarders. Costs nothing
-        // (no store access at all) when no desired allocation uses connect, and
-        // is infallible by construction: a connect-layer problem must never
-        // stop this node from reconciling its allocations.
-        let mut upstream_endpoints = build_upstream_endpoints(&self.store, &feed_allocations);
         // Effective network policy per desired allocation, as content hashes.
-        // Same contract as the endpoint feed: no store access when no policy
-        // exists and no task declares one; never fails the heartbeat.
+        // No store access when no policy exists and no task declares one;
+        // never fails the heartbeat.
         let net_policies = self.build_net_policies(&id, &feed_allocations);
-        // `proxy` handler targets ride the same feed, flagged `for_handler`.
-        upstream_endpoints.extend(self.build_handler_endpoints(&feed_allocations, &net_policies));
+        // Endpoint feed for the node-local upstream forwarders and `proxy`
+        // handler targets, as a delta against what the worker holds
+        // (mesh-control-path plan §6.1). Costs nothing (no store access at
+        // all) when no desired allocation uses connect, reads the catalog
+        // only for sets the endpoint index holds stale, and is infallible by
+        // construction: a connect-layer problem must never stop this node
+        // from reconciling its allocations.
+        let endpoint_feed = self.node_endpoint_feed(
+            &id,
+            &feed_allocations,
+            &net_policies,
+            req.endpoint_feed.as_ref(),
+        );
         // Denials the node's datapath recorded, turned into events so "which
         // rule blocked it" is answerable without node access.
         for denial in &req.net_denials {
@@ -9138,7 +9318,7 @@ impl Manager for ManagerDaemonService {
             net_policies,
             message: "ack".into(),
             desired_allocations,
-            upstream_endpoints,
+            endpoint_feed: Some(endpoint_feed),
             volume_destroy,
             stop_notices,
             claim_verdicts,
@@ -9271,9 +9451,20 @@ impl Manager for ManagerDaemonService {
         let id = req.id;
         acl::enforce_node_binding(&identity, &id)?;
 
+        // A changed device report (docs/devices.md) can free capacity a
+        // pending job is waiting for: a repaired GPU, a new card.
+        let devices_changed = crate::devices::report_changed(
+            self.store.cached_node(&id).ok().flatten().as_deref(),
+            &req.health_checks,
+        );
         self.store
             .update_node_health_checks(&id, &req.health_checks)
             .map_err(|e| map_store_error("Error updating node health checks", e))?;
+        if devices_changed {
+            if let Err(err) = self.store.request_capacity_reconcile() {
+                warn!(node_id = %id, error = %err, "Failed to queue the capacity pass after a device change");
+            }
+        }
 
         let reply = HealthCheckReply {
             message: "ack".into(),
@@ -10693,6 +10884,10 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             AclScope::any(),
         )?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
+        let revision = self
+            .prepare_read(&directives, watch_rpcs::ReadScope::Allocations)
+            .await?;
         let ledger = self
             .store
             .get_ledger()
@@ -10745,7 +10940,7 @@ impl Manager for ManagerDaemonService {
             None => true,
         });
 
-        let reply: GetLedgerReply = GetLedgerReply { nodes };
+        let reply: GetLedgerReply = GetLedgerReply { nodes, revision };
 
         Ok(Response::new(reply))
     }
@@ -11522,7 +11717,10 @@ impl Manager for ManagerDaemonService {
             reconcile_kv_changes(&self.store, &[(req.key.clone(), false)])?;
         }
 
-        Ok(Response::new(PutKvReply { entry: Some(entry) }))
+        Ok(Response::new(PutKvReply {
+            entry: Some(entry),
+            revision: self.store.current_revision_string(),
+        }))
     }
 
     #[instrument(skip_all)]
@@ -11533,7 +11731,11 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             AclScope::path(&request.get_ref().key),
         )?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
         let req = request.into_inner();
+        let revision = self
+            .prepare_read(&directives, watch_rpcs::ReadScope::Key(req.key.clone()))
+            .await?;
         let entry = if req.metadata_only {
             self.store.get_kv_metadata(&req.key)
         } else {
@@ -11560,7 +11762,11 @@ impl Manager for ManagerDaemonService {
             })
             .collect();
 
-        Ok(Response::new(GetKvReply { entry, references }))
+        Ok(Response::new(GetKvReply {
+            entry,
+            references,
+            revision,
+        }))
     }
 
     /// Resolves an artifact credential from KV for a worker about to fetch.
@@ -11630,7 +11836,14 @@ impl Manager for ManagerDaemonService {
     ) -> Result<Response<ListKvReply>, Status> {
         let identity =
             self.check_acl(&request, AclResource::Kv, AclAction::Read, AclScope::any())?;
+        let directives = watch_rpcs::ReadDirectives::from_metadata(request.metadata())?;
         let req = request.into_inner();
+        let revision = self
+            .prepare_read(
+                &directives,
+                watch_rpcs::ReadScope::Prefix(req.prefix.clone()),
+            )
+            .await?;
         // Values only on request: browsing key names should not decrypt and
         // ship every secret in the prefix.
         let entries = if req.include_values {
@@ -11665,7 +11878,11 @@ impl Manager for ManagerDaemonService {
             Vec::new()
         };
 
-        Ok(Response::new(ListKvReply { entries, locks }))
+        Ok(Response::new(ListKvReply {
+            entries,
+            locks,
+            revision,
+        }))
     }
 
     #[instrument(skip_all)]
@@ -11689,6 +11906,7 @@ impl Manager for ManagerDaemonService {
 
         Ok(Response::new(DeleteKvReply {
             message: "kv entry deleted".to_string(),
+            revision: self.store.current_revision_string(),
         }))
     }
 
@@ -12181,39 +12399,19 @@ impl Manager for ManagerDaemonService {
             }
         }
 
-        let ttl: Option<Duration> = req
-            .ttl
-            .as_deref()
-            .map(|raw| {
-                raw.parse::<humantime::Duration>()
-                    .map(Into::into)
-                    .map_err(|e| Status::invalid_argument(format!("invalid ttl `{raw}`: {e}")))
-            })
-            .transpose()?;
-        // Server-enforced lifetime bounds: when acl.tokenMaxTtl is set,
-        // client tokens must expire within it (management tokens are exempt).
-        if token_type == "client" {
-            if let Some(max) = self.auth.token_max_ttl {
-                match ttl {
-                    None => {
-                        return Err(Status::invalid_argument(format!(
-                            "client tokens must set a ttl of at most {} (acl.tokenMaxTtl)",
-                            humantime::format_duration(max)
-                        )))
-                    }
-                    Some(requested) if requested > max => {
-                        return Err(Status::invalid_argument(format!(
-                            "requested ttl exceeds acl.tokenMaxTtl ({})",
-                            humantime::format_duration(max)
-                        )))
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
+        // Every token expires unless asked otherwise (`acl.tokenDefaultTtl`,
+        // bounded by `acl.tokenMaxTtl` for client tokens; docs/auth-and-acls.md,
+        // "Token lifetimes").
+        let ttl = self
+            .auth
+            .create_token_ttl(&token_type, req.ttl.as_deref())?;
         let (token, secret) =
             self.auth
                 .mint_token(&self.store, &req.name, &token_type, &req.policies, ttl)?;
+        crate::manager::governance::note_detail(
+            "mintedAccessorId",
+            Value::String(token.accessor_id.clone()),
+        );
         info!(accessor_id = %token.accessor_id, name = %token.name, "ACL token created");
         Ok(Response::new(CreateAclTokenReply {
             token: Some(token),
@@ -12232,12 +12430,20 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             AclScope::none(),
         )?;
+        let parents = self
+            .store
+            .token_parents()
+            .map_err(|e| map_store_error("Error listing ACL tokens", e))?;
         let tokens = self
             .store
             .list_acl_tokens()
             .map_err(|e| map_store_error("Error listing ACL tokens", e))?
             .iter()
-            .map(|record| record.to_info())
+            .map(|record| {
+                let mut info = record.to_info();
+                info.parent_accessor_id = parents.get(&record.accessor_id).cloned();
+                info
+            })
             .collect();
         Ok(Response::new(ListAclTokensReply { tokens }))
     }
@@ -12515,6 +12721,17 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::DeleteObjectRequest>,
     ) -> Result<Response<crate::structs::DeleteObjectReply>, Status> {
         self.delete_object_rpc(request).await
+    }
+
+    type WatchStream = ReceiverStream<Result<crate::structs::WatchEvent, Status>>;
+
+    // ACL: `job:read` or `kv:read`, coarse here and per change in the
+    // handler (revisions-and-watches plan §3).
+    async fn watch(
+        &self,
+        request: Request<crate::structs::WatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        self.watch_rpc(request).await
     }
 
     type WatchObjectsStream = ReceiverStream<Result<crate::structs::ObjectEvent, Status>>;
@@ -13214,6 +13431,7 @@ fn scoped_idempotency_key(
     if key.is_empty() {
         return String::new();
     }
+    crate::manager::governance::note_idempotency_key(key);
     // Who the caller is, by how it authenticated and then its accessor (a
     // token) or its principal: a JWT subject spelled like a delegated
     // identity (`alice via app autoscaler`), or like an accessor, is
@@ -14286,10 +14504,26 @@ fn derive_node_health(value: &Value) -> Option<bool> {
                 None
             }
         }
+        // A typed node-check report (`{ status, message, attributes }`,
+        // docs/plugin-system.md "Node checks"): its status decides, and
+        // its message is prose, not a verdict.
+        Value::Object(map)
+            if matches!(
+                map.get("status").and_then(Value::as_str),
+                Some("pass" | "warn" | "fail")
+            ) =>
+        {
+            Some(map.get("status").and_then(Value::as_str) != Some("fail"))
+        }
         Value::Object(map) => {
             let mut seen = false;
             let mut all_ok = true;
-            for entry in map.values() {
+            // The device report (docs/devices.md) rides the health checks;
+            // an unhealthy GPU is that device's state, not the node's.
+            for (_, entry) in map
+                .iter()
+                .filter(|(key, _)| key.as_str() != crate::devices::REPORT_KEY)
+            {
                 if let Some(ok) = derive_node_health(entry) {
                     seen = true;
                     all_ok &= ok;
@@ -14303,17 +14537,6 @@ fn derive_node_health(value: &Value) -> Option<bool> {
         }
         _ => None,
     }
-}
-
-/// The workload identity subject of a desired allocation, as the endpoint
-/// feed matches `service.allow` against it.
-fn allocation_subject(allocation: &crate::structs::TaskAllocation) -> String {
-    let group = if allocation.task_group.is_empty() {
-        crate::structs::default_task_group()
-    } else {
-        allocation.task_group.clone()
-    };
-    crate::structs::workload_subject(&allocation.job_id, &group, &allocation.task_name)
 }
 
 fn build_desired_allocations(
@@ -14401,34 +14624,9 @@ pub(crate) fn desired_payload(
     Ok(payload)
 }
 
-/// Resolve the current endpoint set for every upstream declared by this node's
-/// desired allocations — the service-discovery feed the worker's loopback
-/// forwarders are driven from.
-///
-/// Fast path: allocations carry their `connect` block on the wire, so when no
-/// desired allocation declares upstreams this returns an empty vector without
-/// touching the store. Nodes running only plain jobs therefore pay zero extra
-/// queries per heartbeat (heartbeats run every
-/// `WORKER_HEARTBEAT_DURATION_SEC`, so this is the hot path).
-///
-/// Otherwise each *distinct* `(upstream service, consuming job)` pair is
-/// resolved once and memoized: the store lookup is an indexed seek over just
-/// that service's rows (see [`Store::service_endpoints`]), and the resulting
-/// wire list is shared by every allocation of the same job — a node running
-/// `count: 40` of one client task would otherwise rebuild the identical list 40
-/// times, every 2s. Endpoints are filtered to healthy ones and gated by the
-/// target service's `service.allow` intentions against the *consuming*
-/// allocation's job id; a denied consumer gets an empty list rather than an
-/// error.
-///
-/// The feed is **additive and never fatal** — which is why it returns a plain
-/// `Vec` and not an `R<_>`. A store failure (or an unparseable stored payload)
-/// omits that upstream's entry instead of failing the heartbeat: the worker only
-/// calls `set_endpoints` for entries actually present in the reply, so an
-/// omitted upstream keeps its last known good endpoints — the same fail-static
-/// property, without taking the node's whole allocation reconciliation (and,
-/// after each stateful task's fence window, its running allocations) down with
-/// it.
+/// Network policy on the heartbeat: assignments per allocation (memoized,
+/// `net_policy_memo`), and the queries `TestNetPolicy` and `net doctor` run.
+/// The endpoint feed lives in `endpoint_feed`.
 impl ManagerDaemonService {
     /// Effective network policy for every desired allocation, as content
     /// hashes. Zero store access when the cluster has no policy (cached
@@ -14438,98 +14636,10 @@ impl ManagerDaemonService {
         node_id: &str,
         desired: &[crate::structs::TaskAllocation],
     ) -> Vec<AllocNetPolicy> {
-        use crate::structs::netpolicy::NetSelectorFacts;
-        // Gated by placement, which can resolve `auto` with no `network`
-        // block on the task at all (a default sandbox, gated plan Phase 2):
-        // the allocation's own network records it.
-        let placed_gated = |allocation: &crate::structs::TaskAllocation| {
-            allocation
-                .network
-                .contains(crate::structs::netpolicy::MODE_GATED)
-                && serde_json::from_str::<crate::structs::AllocNetwork>(&allocation.network)
-                    .is_ok_and(|placed| placed.is_gated())
-        };
-        let any_inline = desired
-            .iter()
-            .any(|allocation| !allocation.task_network.trim().is_empty());
-        if self.net_policy_generation_cached() == 0
-            && !any_inline
-            && !desired.iter().any(placed_gated)
-        {
-            return Vec::new();
-        }
-        // Stored policies once per heartbeat; the node's pool once, and only
-        // when a policy could select on it.
-        let stored: Vec<crate::structs::netpolicy::NetPolicyObject> = match self
-            .store
-            .list_net_policies()
-        {
-            Ok(records) => records.into_iter().map(|record| record.object).collect(),
-            Err(err) => {
-                warn!(node_id = %node_id, error = ?err, "Skipping net policies; listing failed");
-                return Vec::new();
-            }
-        };
-        let needs_pool = stored.iter().any(|p| !p.selector.node_pools.is_empty());
-        let node_pool = if needs_pool {
-            self.store.get_node(node_id).ok().map(|node| node.pool)
-        } else {
-            None
-        };
-        let mut out = Vec::new();
-        for allocation in desired {
-            let network: Option<crate::structs::NetworkConfig> =
-                if allocation.task_network.trim().is_empty() {
-                    None
-                } else {
-                    match serde_json::from_str(&allocation.task_network) {
-                        Ok(network) => Some(network),
-                        Err(err) => {
-                            warn!(
-                                allocation_id = allocation.allocation_id,
-                                error = ?err,
-                                "Skipping net policy; invalid task network payload"
-                            );
-                            continue;
-                        }
-                    }
-                };
-            let facts = NetSelectorFacts {
-                node_pool: node_pool.clone(),
-                runtime: allocation.task_runtime.clone(),
-                job: allocation.job_id.clone(),
-                labels: network
-                    .as_ref()
-                    .map(|n| n.labels.clone())
-                    .unwrap_or_default(),
-            };
-            let service: Option<crate::structs::ServiceConfig> =
-                (!allocation.task_service.trim().is_empty())
-                    .then(|| serde_json::from_str(&allocation.task_service).ok())
-                    .flatten();
-            let (effective, _) =
-                merge_net_policies(&stored, &facts, network.as_ref(), service.as_ref());
-            // A gated allocation is told about an *empty* policy too, so the
-            // node can tell "known: nothing covers it" (`gated-default`) from
-            // "pending" (`policy-pending`). Gated by its declaration, by a
-            // `require` policy, or by placement resolving `auto` (a default
-            // sandbox, gated plan Phase 2), which the allocation's own
-            // network records.
-            let gated = placed_gated(allocation)
-                || network
-                    .as_ref()
-                    .is_some_and(|n| n.mode == crate::structs::netpolicy::MODE_GATED)
-                || effective.mode.as_deref() == Some(crate::structs::netpolicy::MODE_GATED);
-            if effective.is_empty() && !gated {
-                continue;
-            }
-            self.remember_net_policy(&effective);
-            out.push(AllocNetPolicy {
-                allocation_id: allocation.allocation_id,
-                policy_hash: effective.hash.clone(),
-            });
-        }
-        out
+        // Memoized per input and policy generation (mesh-control-path plan
+        // §6.2): a beat whose inputs did not change lists nothing, parses
+        // nothing, and merges nothing.
+        self.memoized_net_policies(node_id, desired)
     }
 
     /// The effective policy for one task, given selector facts. Returns the
@@ -14605,118 +14715,6 @@ impl ManagerDaemonService {
                 .unwrap_or_default(),
         };
         Ok((task, facts))
-    }
-
-    /// The datapath status nodes last reported for this task's running
-    /// allocations, as JSON, for `net doctor` and the UI.
-    /// Endpoint lists for every `proxy` handler target (`service` or `node`)
-    /// on the desired allocations' effective chains and upstreams, so the
-    /// datapath can hand a flow to an external proxy without a listener of
-    /// its own. Empty on nodes with no handler anywhere — the common case
-    /// costs one pass over the policy hashes.
-    fn build_handler_endpoints(
-        &self,
-        desired: &[crate::structs::TaskAllocation],
-        policies: &[crate::structs::AllocNetPolicy],
-    ) -> Vec<crate::structs::UpstreamEndpoints> {
-        let mut wanted: Vec<(i64, String, String)> = Vec::new();
-        let by_alloc: HashMap<i64, &str> = policies
-            .iter()
-            .map(|p| (p.allocation_id, p.policy_hash.as_str()))
-            .collect();
-        for allocation in desired {
-            let mut services: Vec<String> = Vec::new();
-            if let Some(hash) = by_alloc.get(&allocation.allocation_id) {
-                let cached = {
-                    let cache = self
-                        .net_policy_cache
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    cache.get(*hash).cloned()
-                };
-                if let Some(policy) = cached {
-                    for chain in [policy.egress.as_ref(), policy.ingress.as_ref()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        for hop in &chain.handlers {
-                            if let Some(service) = hop.handler.kind.endpoint_need() {
-                                services.push(service.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            if !allocation.task_connect.trim().is_empty() {
-                if let Ok(connect) =
-                    serde_json::from_str::<crate::structs::ConnectConfig>(&allocation.task_connect)
-                {
-                    for upstream in &connect.upstreams {
-                        for hop in &upstream.handlers {
-                            if let Some(service) = hop.kind.endpoint_need() {
-                                services.push(service.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            services.sort();
-            services.dedup();
-            let caller = allocation_subject(allocation);
-            for service in services {
-                wanted.push((allocation.allocation_id, service, caller.clone()));
-            }
-        }
-        if wanted.is_empty() {
-            return Vec::new();
-        }
-        let mut resolved: HashMap<String, Vec<crate::structs::ServiceEndpointRow>> = HashMap::new();
-        let mut out = Vec::new();
-        for (allocation_id, service, job_id) in wanted {
-            // A handler's `service` resolves like an upstream: in the
-            // allocation's own namespace unless it is qualified.
-            let target = crate::structs::namespace::qualify_in(
-                crate::structs::namespace::job_namespace(&job_id),
-                &service,
-            );
-            if !resolved.contains_key(&target) {
-                let rows = self
-                    .store
-                    .service_endpoints(Some(&target))
-                    .unwrap_or_default();
-                resolved.insert(target.clone(), rows);
-            }
-            let endpoints = resolved[&target]
-                .iter()
-                .filter(|row| {
-                    row.healthy && crate::structs::allow_permits(&row.allow, &row.job_id, &job_id)
-                })
-                .map(|row| ServiceEndpoint {
-                    namespace: crate::structs::namespace::job_namespace(&row.job_id).to_string(),
-                    service: row.service.clone(),
-                    job_id: row.job_id.clone(),
-                    task_name: row.task_name.clone(),
-                    allocation_id: row.allocation_id,
-                    node_id: row.node_id.clone(),
-                    address: row.address.clone().unwrap_or_default(),
-                    public_address: row.public_address.clone().unwrap_or_default(),
-                    port: u32::from(row.port.unwrap_or(0)),
-                    healthy: row.healthy,
-                    health_status: row.health_status.clone(),
-                    tags: row.tags.clone(),
-                    meta: row.meta.clone().into_iter().collect(),
-                    port_label: row.port_label.clone().unwrap_or_default(),
-                    mesh_tls: row.mesh_tls,
-                })
-                .collect();
-            out.push(crate::structs::UpstreamEndpoints {
-                allocation_id,
-                service,
-                endpoints,
-                for_handler: true,
-            });
-        }
-        out
     }
 
     /// Fold one node's edge samples into the graph windows.
@@ -15299,127 +15297,13 @@ fn parse_test_target(
             return (Some(parsed.host), ip, parsed.port, path);
         }
     }
-    let (host, port) = match target.rsplit_once(':') {
-        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => {
-            (host.to_string(), port.parse().unwrap_or(0))
-        }
-        _ => (target.to_string(), 0),
+    let (host, port) = match crate::structs::hostport::split(target) {
+        Some((host, port)) => (host.to_string(), port),
+        // A bare name or IP, IPv6 included, with no port.
+        None => (crate::structs::hostport::host_of(target).to_string(), 0),
     };
     let ip = host.parse().ok();
     (Some(host.to_ascii_lowercase()), ip, port, None)
-}
-
-fn build_upstream_endpoints(
-    store: &Store,
-    desired: &[crate::structs::TaskAllocation],
-) -> Vec<crate::structs::UpstreamEndpoints> {
-    if desired
-        .iter()
-        .all(|allocation| allocation.task_connect.trim().is_empty())
-    {
-        return Vec::new();
-    }
-
-    // Keyed by (service, consuming job id) because intentions are per consumer:
-    // the same service yields a different list to a permitted and a denied job.
-    let mut resolved: HashMap<(String, String), Vec<ServiceEndpoint>> = HashMap::new();
-    let mut upstreams = Vec::new();
-
-    for allocation in desired {
-        if allocation.task_connect.trim().is_empty() {
-            continue;
-        }
-        // A payload we wrote ourselves failing to parse is a manager bug, and
-        // retrying cannot fix it — skip this allocation's upstreams rather than
-        // fail the heartbeat and stall reconciliation for the whole node.
-        let connect: crate::structs::ConnectConfig =
-            match serde_json::from_str(&allocation.task_connect) {
-                Ok(connect) => connect,
-                Err(err) => {
-                    warn!(
-                        allocation_id = allocation.allocation_id,
-                        error = ?err,
-                        "Skipping upstream endpoints; invalid connect payload"
-                    );
-                    continue;
-                }
-            };
-        for upstream in &connect.upstreams {
-            // The service lives in the consumer's own namespace unless the
-            // upstream names another (docs/namespaces.md): a bare name never
-            // resolves across a namespace boundary. External upstreams dial a
-            // fixed destination and need no endpoint feed.
-            let Some(target) = upstream.service_ref(&allocation.job_id) else {
-                continue;
-            };
-            let key = (target.clone(), allocation.job_id.clone());
-            if !resolved.contains_key(&key) {
-                let rows = match store.service_endpoints(Some(&target)) {
-                    Ok(rows) => rows,
-                    Err(err) => {
-                        // Same reasoning as the corrupt-payload arm above:
-                        // omitting this upstream leaves the forwarder on its
-                        // last known good endpoints, while failing here would
-                        // stall this node's reconciliation entirely.
-                        warn!(
-                            allocation_id = allocation.allocation_id,
-                            service = %target,
-                            error = ?err,
-                            "Skipping upstream endpoints; service lookup failed"
-                        );
-                        continue;
-                    }
-                };
-                let endpoints = rows
-                    .into_iter()
-                    .filter(|row| {
-                        row.healthy
-                            && crate::structs::allow_permits(
-                                &row.allow,
-                                &row.job_id,
-                                &allocation.job_id,
-                            )
-                    })
-                    .map(|row| ServiceEndpoint {
-                        namespace: crate::structs::namespace::job_namespace(&row.job_id)
-                            .to_string(),
-                        service: row.service,
-                        job_id: row.job_id,
-                        task_name: row.task_name,
-                        allocation_id: row.allocation_id,
-                        node_id: row.node_id,
-                        address: row.address.unwrap_or_default(),
-                        public_address: row.public_address.unwrap_or_default(),
-                        port: u32::from(row.port.unwrap_or(0)),
-                        healthy: row.healthy,
-                        health_status: row.health_status,
-                        tags: row.tags,
-                        meta: row.meta.into_iter().collect(),
-                        port_label: row.port_label.unwrap_or_default(),
-                        mesh_tls: row.mesh_tls,
-                    })
-                    .collect::<Vec<_>>();
-                resolved.insert(key.clone(), endpoints);
-            }
-            let endpoints = resolved.get(&key).cloned().unwrap_or_default();
-            debug!(
-                allocation_id = allocation.allocation_id,
-                service = %target,
-                endpoints = endpoints.len(),
-                "Resolved upstream endpoints"
-            );
-            // The worker keys its listeners by the upstream's key (the alias,
-            // or `service.namespace` for a crossing), not the catalog name.
-            upstreams.push(crate::structs::UpstreamEndpoints {
-                allocation_id: allocation.allocation_id,
-                service: upstream.key(),
-                endpoints,
-                for_handler: false,
-            });
-        }
-    }
-
-    upstreams
 }
 
 /// Apply the volume operation outcomes a worker reported.
@@ -16157,6 +16041,64 @@ mod tests {
         assert_eq!(assignments.len(), 1, "{assignments:?}");
         assert_eq!(assignments[0].allocation_id, 7);
         assert!(!assignments[0].policy_hash.is_empty());
+        Ok(())
+    }
+
+    /// Mesh-control-path plan §6.2: assignments are memoized on their
+    /// inputs. Allocations of one task share one merge, a repeated beat
+    /// merges nothing, and a changed task network or a policy write (a new
+    /// generation) merges again.
+    #[test]
+    fn net_policy_assignments_are_memoized_until_an_input_changes() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let allocation = |allocation_id: i64, network: Value| crate::structs::TaskAllocation {
+            allocation_id,
+            job_id: "web".into(),
+            task_runtime: "exec".into(),
+            task_network: network.to_string(),
+            ..Default::default()
+        };
+        let network = json!({ "mode": "gated", "egress": { "allow": ["pypi.org"] } });
+        let desired = vec![allocation(1, network.clone()), allocation(2, network)];
+        let first = manager.build_net_policies("node-1", &desired);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].policy_hash, first[1].policy_hash);
+        assert_eq!(manager.net_policy_memo.merges(), 1, "one merge per task");
+
+        let again = manager.build_net_policies("node-1", &desired);
+        assert_eq!(again, first);
+        assert_eq!(
+            manager.net_policy_memo.merges(),
+            1,
+            "a steady beat merges nothing"
+        );
+
+        // A changed task network is a new input.
+        let changed = vec![allocation(
+            1,
+            json!({ "mode": "gated", "egress": { "allow": ["crates.io"] } }),
+        )];
+        let other = manager.build_net_policies("node-1", &changed);
+        assert_eq!(other.len(), 1);
+        assert_eq!(manager.net_policy_memo.merges(), 2, "merged again");
+
+        // A policy write moves the generation: everything merges again, and
+        // the stored policy now applies.
+        store.upsert_net_policy(serde_json::from_value(json!({
+            "name": "everyone", "enforcement": "require", "priority": 1,
+            "egress": { "allow": ["example.com"] }
+        }))?)?;
+        manager.bump_net_policy_generation();
+        let after = manager.build_net_policies("node-1", &desired);
+        assert_eq!(manager.net_policy_memo.merges(), 3);
+        assert_ne!(after[0].policy_hash, first[0].policy_hash);
+        // Every body a beat assigns is servable.
+        let cache = manager
+            .net_policy_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        assert!(cache.contains_key(&after[0].policy_hash));
         Ok(())
     }
 
@@ -17329,6 +17271,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?;
 
@@ -17411,6 +17354,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?;
 
@@ -17472,6 +17416,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?;
 
@@ -17529,6 +17474,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?;
         Ok(())
@@ -19046,6 +18992,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?;
 
@@ -20307,6 +20254,20 @@ mod tests {
         assert_eq!(derive_node_health(&checks), Some(false));
     }
 
+    /// Typed node-check reports decide by `status`, and the device report
+    /// never counts (docs/devices.md, docs/plugin-system.md).
+    #[test]
+    fn derive_node_health_reads_typed_reports_and_skips_devices_test() {
+        let checks = json!({
+            "disk": { "status": "warn", "message": "/var has 30% free, an error-free disk" },
+            "devices": { "groups": [{ "instances": [{ "id": "g", "healthy": false,
+                                                      "healthDetail": "fail" }] }] },
+        });
+        assert_eq!(derive_node_health(&checks), Some(true));
+        let checks = json!({ "disk": { "status": "fail", "message": "/var has 5% free" } });
+        assert_eq!(derive_node_health(&checks), Some(false));
+    }
+
     #[tokio::test]
     async fn list_rollout_events_returns_persisted_events() -> R<()> {
         let store = setup_store()?;
@@ -20720,6 +20681,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: Some("off-runtime-1".into()),
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
             .await?
             .into_inner();
@@ -20751,6 +20713,7 @@ mod tests {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: Default::default(),
+                expected_version: None,
             }))
         };
 
@@ -20890,6 +20853,58 @@ mod tests {
         }
     }
 
+    /// The feed a node holding `held` gets for `desired`, with no policy
+    /// handlers.
+    fn feed_for(
+        store: &Store,
+        desired: &[crate::structs::TaskAllocation],
+        held: Option<&crate::structs::EndpointFeedState>,
+    ) -> crate::structs::EndpointFeed {
+        let bindings = endpoint_feed::endpoint_bindings(desired, |_| Arc::default());
+        endpoint_feed::build_endpoint_feed(store, "node-test", bindings, held)
+    }
+
+    /// A feed flattened per binding, the way the worker applies it to its
+    /// listeners. A binding whose set the feed left out is left out too.
+    fn flattened(feed: &crate::structs::EndpointFeed) -> Vec<crate::structs::UpstreamEndpoints> {
+        feed.bindings
+            .iter()
+            .filter_map(|binding| {
+                let set = feed.sets.iter().find(|set| {
+                    set.service == binding.service && set.consumer == binding.consumer
+                })?;
+                Some(crate::structs::UpstreamEndpoints {
+                    allocation_id: binding.allocation_id,
+                    service: binding.upstream.clone(),
+                    endpoints: set.endpoints.clone(),
+                    for_handler: binding.for_handler,
+                })
+            })
+            .collect()
+    }
+
+    /// What a worker that applied `feed` reports holding.
+    fn held_after(feed: &crate::structs::EndpointFeed) -> crate::structs::EndpointFeedState {
+        crate::structs::EndpointFeedState {
+            bindings_digest: feed.bindings_digest.clone(),
+            sets: feed
+                .sets
+                .iter()
+                .map(|set| crate::structs::EndpointSetVersion {
+                    service: set.service.clone(),
+                    consumer: set.consumer.clone(),
+                    epoch: feed.epoch,
+                    version: set.version,
+                    digest: set.digest,
+                })
+                .collect(),
+        }
+    }
+
+    fn backend_of(store: &Store, service: &str) -> R<i64> {
+        Ok(store.service_endpoints(Some(service))?[0].allocation_id)
+    }
+
     #[test]
     fn upstream_endpoints_fast_path_never_touches_the_store() -> R<()> {
         // Heartbeats run every 2s on every node, so jobs that declare no
@@ -20906,8 +20921,8 @@ mod tests {
             ..Default::default()
         };
         let reads_before = store.read_index.load(std::sync::atomic::Ordering::Relaxed);
-        let endpoints = build_upstream_endpoints(&store, std::slice::from_ref(&plain));
-        assert!(endpoints.is_empty());
+        let feed = feed_for(&store, std::slice::from_ref(&plain), None);
+        assert!(feed.sets.is_empty() && feed.bindings.is_empty());
         assert_eq!(
             store.read_index.load(std::sync::atomic::Ordering::Relaxed),
             reads_before,
@@ -20915,8 +20930,8 @@ mod tests {
         );
 
         // An empty desired set is the same story.
-        let endpoints = build_upstream_endpoints(&store, &[]);
-        assert!(endpoints.is_empty());
+        let feed = feed_for(&store, &[], None);
+        assert!(feed.sets.is_empty() && feed.bindings.is_empty());
         assert_eq!(
             store.read_index.load(std::sync::atomic::Ordering::Relaxed),
             reads_before
@@ -20924,7 +20939,7 @@ mod tests {
 
         // …but one allocation with upstreams does put the store to work.
         let consumer = consumer_allocation(2, "consumer", "web");
-        let endpoints = build_upstream_endpoints(&store, &[plain, consumer]);
+        let endpoints = flattened(&feed_for(&store, &[plain, consumer], None));
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].allocation_id, 2);
         assert_eq!(endpoints[0].service, "web");
@@ -20937,47 +20952,50 @@ mod tests {
     }
 
     #[test]
-    fn upstream_endpoints_are_healthy_only_and_memoized_per_service_and_consumer() -> R<()> {
+    fn upstream_endpoints_are_healthy_only_and_read_once_per_service() -> R<()> {
         let store = setup_store()?;
         insert_node(&store, "node-a")?;
         seed_upstream_service(&store, "web", 18081, &[], true)?;
         seed_upstream_service(&store, "starting", 18082, &[], false)?;
 
-        // A node running `count: N` of one client task asks for the same
-        // (service, job) pair N times per heartbeat; it must be resolved once.
+        // A node running `count: N` of one client task binds the same
+        // (service, job) set N times; the node gets it once.
         let desired = vec![
             consumer_allocation(1, "consumer", "web"),
             consumer_allocation(2, "consumer", "web"),
             consumer_allocation(3, "consumer", "starting"),
         ];
         let reads_before = store.read_index.load(std::sync::atomic::Ordering::Relaxed);
-        let endpoints = build_upstream_endpoints(&store, &desired);
+        let feed = feed_for(&store, &desired, None);
         let reads = store.read_index.load(std::sync::atomic::Ordering::Relaxed) - reads_before;
-
+        assert_eq!(feed.bindings.len(), 3);
+        assert_eq!(feed.sets.len(), 2, "one set per (service, consumer)");
+        let endpoints = flattened(&feed);
         assert_eq!(endpoints.len(), 3);
         assert_eq!(endpoints[0].endpoints.len(), 1);
         assert_eq!(endpoints[1].endpoints.len(), 1);
         // No health snapshot yet => not healthy => not dialable.
         assert!(endpoints[2].endpoints.is_empty());
-        assert_eq!(reads, 2, "each distinct upstream service is resolved once");
+        assert_eq!(reads, 2, "each distinct upstream service is read once");
 
         let endpoint = &endpoints[0].endpoints[0];
         assert_eq!(endpoint.service, "web");
         assert_eq!(endpoint.port, 18081);
         assert!(endpoint.healthy);
 
-        // Two *different* consuming jobs cannot share a memo entry: intentions
-        // are evaluated per consumer, so each gets its own lookup.
+        // Other consumers and later beats share the index: no read at all
+        // until something marks a service dirty.
         let desired = vec![
             consumer_allocation(1, "consumer-a", "web"),
             consumer_allocation(2, "consumer-a", "web"),
             consumer_allocation(3, "consumer-b", "web"),
         ];
         let reads_before = store.read_index.load(std::sync::atomic::Ordering::Relaxed);
-        let endpoints = build_upstream_endpoints(&store, &desired);
+        let feed = feed_for(&store, &desired, None);
         let reads = store.read_index.load(std::sync::atomic::Ordering::Relaxed) - reads_before;
-        assert_eq!(endpoints.len(), 3);
-        assert_eq!(reads, 2, "one lookup per (service, consuming job) pair");
+        assert_eq!(feed.sets.len(), 2, "intentions are per consumer");
+        assert_eq!(flattened(&feed).len(), 3);
+        assert_eq!(reads, 0, "a fresh set is not read again");
         Ok(())
     }
 
@@ -20994,7 +21012,7 @@ mod tests {
 
         let visible = |job_id: &str, service: &str| -> R<usize> {
             let desired = vec![consumer_allocation(1, job_id, service)];
-            let endpoints = build_upstream_endpoints(&store, &desired);
+            let endpoints = flattened(&feed_for(&store, &desired, None));
             assert_eq!(endpoints.len(), 1, "one entry per declared upstream");
             Ok(endpoints[0].endpoints.len())
         };
@@ -21023,7 +21041,7 @@ mod tests {
             ..Default::default()
         };
         let healthy = consumer_allocation(2, "consumer", "web");
-        let endpoints = build_upstream_endpoints(&store, &[corrupt, healthy]);
+        let endpoints = flattened(&feed_for(&store, &[corrupt, healthy], None));
 
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].allocation_id, 2);
@@ -21036,9 +21054,9 @@ mod tests {
         // A store-level failure is the other half of the additive contract: if
         // it propagated, `heartbeat` would return Internal and the node would
         // stop starting, stopping and health-reporting allocations entirely —
-        // over a connect-only problem. Omitting the entry instead leaves the
-        // forwarder on its last known good endpoints (the worker only applies
-        // upstreams present in the reply).
+        // over a connect-only problem. Omitting the set instead leaves the
+        // forwarder on its last known good endpoints (the worker keeps a set
+        // the feed leaves out).
         let store = setup_store()?;
         insert_node(&store, "node-a")?;
         seed_upstream_service(&store, "broken", 18096, &[], true)?;
@@ -21063,12 +21081,132 @@ mod tests {
             consumer_allocation(1, "consumer", "broken"),
             consumer_allocation(2, "consumer", "fine"),
         ];
-        let endpoints = build_upstream_endpoints(&store, &desired);
-
-        assert_eq!(endpoints.len(), 1, "the failing upstream is omitted");
+        let feed = feed_for(&store, &desired, None);
+        assert_eq!(
+            feed.bindings.len(),
+            2,
+            "bindings do not depend on the catalog"
+        );
+        let endpoints = flattened(&feed);
+        assert_eq!(endpoints.len(), 1, "the failing set is omitted");
         assert_eq!(endpoints[0].allocation_id, 2);
         assert_eq!(endpoints[0].service, "fine");
         assert_eq!(endpoints[0].endpoints.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_steady_beat_ships_no_endpoints_and_a_change_ships_only_its_set() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        seed_upstream_service(&store, "web", 18100, &[], true)?;
+        seed_upstream_service(&store, "db", 18101, &[], true)?;
+        let desired = vec![
+            consumer_allocation(1, "consumer", "web"),
+            consumer_allocation(2, "consumer", "db"),
+            consumer_allocation(3, "consumer", "web"),
+        ];
+        let first = feed_for(&store, &desired, None);
+        assert!(!first.bindings_unchanged);
+        assert_eq!(first.bindings.len(), 3);
+        assert_eq!(first.sets.len(), 2);
+        let held = held_after(&first);
+        let web_version = first
+            .sets
+            .iter()
+            .find(|set| set.service == "web")
+            .expect("web")
+            .version;
+
+        // A steady beat: nothing read, nothing shipped.
+        let reads_before = store.read_index.load(std::sync::atomic::Ordering::Relaxed);
+        let steady = feed_for(&store, &desired, Some(&held));
+        assert!(steady.bindings_unchanged);
+        assert!(steady.bindings.is_empty());
+        assert!(steady.sets.is_empty());
+        assert_eq!(
+            store.read_index.load(std::sync::atomic::Ordering::Relaxed),
+            reads_before,
+            "a steady beat reads nothing"
+        );
+
+        // web's backend fails its health check: only web's set moves.
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[AllocationHealth {
+                allocation_id: backend_of(&store, "web")?,
+                healthy: false,
+                status: "failing".into(),
+                artifact_states: None,
+            }],
+        )?;
+        let changed = feed_for(&store, &desired, Some(&held));
+        assert!(changed.bindings_unchanged);
+        assert_eq!(changed.sets.len(), 1, "only the changed set");
+        assert_eq!(changed.sets[0].service, "web");
+        assert!(changed.sets[0].endpoints.is_empty());
+        assert!(changed.sets[0].version > web_version, "versions advance");
+
+        // The db consumer leaves the node: the bindings move, no set does.
+        let held = held_after(&changed);
+        let held = crate::structs::EndpointFeedState {
+            sets: first
+                .sets
+                .iter()
+                .filter(|set| set.service == "db")
+                .map(|set| crate::structs::EndpointSetVersion {
+                    service: set.service.clone(),
+                    consumer: set.consumer.clone(),
+                    epoch: first.epoch,
+                    version: set.version,
+                    digest: set.digest,
+                })
+                .chain(held.sets)
+                .collect(),
+            ..held
+        };
+        let fewer = feed_for(
+            &store,
+            &[desired[0].clone(), desired[2].clone()],
+            Some(&held),
+        );
+        assert!(!fewer.bindings_unchanged);
+        assert_eq!(fewer.bindings.len(), 2);
+        assert!(fewer.sets.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_stopped_backend_leaves_the_set_and_is_pushed_to_consuming_nodes() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        seed_upstream_service(&store, "web", 18102, &[], true)?;
+        seed_upstream_service(&store, "db", 18103, &[], true)?;
+        let web_consumer = [consumer_allocation(1, "consumer", "web")];
+        let db_consumer = [consumer_allocation(2, "consumer", "db")];
+        let bindings = endpoint_feed::endpoint_bindings(&web_consumer, |_| Arc::default());
+        let first = endpoint_feed::build_endpoint_feed(&store, "node-web", bindings, None);
+        assert_eq!(first.sets[0].endpoints.len(), 1);
+        let bindings = endpoint_feed::endpoint_bindings(&db_consumer, |_| Arc::default());
+        endpoint_feed::build_endpoint_feed(&store, "node-db", bindings, None);
+        assert!(endpoint_feed::endpoint_push(&store, "node-web").is_none());
+
+        store.remove_allocation_by_id(backend_of(&store, "web")?)?;
+        // The refresher's pass: re-read what the projection marked dirty.
+        assert_eq!(store.refresh_endpoint_sets(), 1, "only web was marked");
+        let push = endpoint_feed::endpoint_push(&store, "node-web").expect("web moved");
+        assert!(push.push_only);
+        let feed = push.endpoint_feed.expect("a push carries the feed");
+        assert!(feed.bindings_unchanged, "a push never carries bindings");
+        assert_eq!(feed.sets.len(), 1);
+        assert_eq!(feed.sets[0].service, "web");
+        assert!(feed.sets[0].endpoints.is_empty(), "the removal propagates");
+        assert!(feed.sets[0].version > first.sets[0].version);
+        assert!(
+            endpoint_feed::endpoint_push(&store, "node-db").is_none(),
+            "node-db does not consume web"
+        );
+        assert!(endpoint_feed::endpoint_push(&store, "node-web").is_none());
         Ok(())
     }
 

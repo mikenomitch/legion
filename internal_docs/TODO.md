@@ -574,14 +574,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#67](https://github.com/mikenomitch/legion/pull/67) | Tier 1 spot-check bugs and four security gaps: lanes DAG stall, rollout DAG freeze, sidecar retire, orphaned tasks, batch outcomes across restarts, `never`, keyed move budget, restore placement and network shape; host guard for git/OCI/S3, gated exec netns, private image cache, old runc | Plan [launch-blockers-and-security-gaps-plan.md](plans/launch-blockers-and-security-gaps-plan.md) SHIPPED; items checked off in place and in Done; not yet re-run on the rig |
-| [#64](https://github.com/mikenomitch/legion/pull/64) | The built-in cert manager: the bundled `certs` app (ACME, private-CA, and self-signed Issuers; Certificates in KV, renewed) and `legion cert` | Plan [cert-manager-plan.md](plans/cert-manager-plan.md) SHIPPED (Phase 1); checked off and in Done, the deferrals open under Ecosystem apps |
-| [#62](https://github.com/mikenomitch/legion/pull/62) | An architecture review against best-in-class designs | Doc only: [architecture-review-2026-11-07.md](architecture-review-2026-11-07.md); its findings are open items under their areas |
-| [#58](https://github.com/mikenomitch/legion/pull/58) | Park: the workload says when it is waiting, and its node suspends it | Plan [park-plan.md](plans/park-plan.md); Phases 1–2, entries under "Park" above and in Done |
-| [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after adversarial security and correctness reviews | All three plans SHIPPED; their items, and both hardening passes, are checked off and in Done; the reviews' open and design-level items are under *Ecosystem apps* |
-| branch `claude/app-objects` (PR not opened yet) | App-owned object kinds, Phases O1-O4 | Builds on #60; O1-O4 are checked off and in Done; the deferrals and follow-ups are open under Ecosystem apps |
-| [#66](https://github.com/mikenomitch/legion/pull/66) | GitOps: the bundled `gitops` app, `legion gitops`, its views | Plan [gitops-plan.md](plans/gitops-plan.md); G1-G3 checked off and in Done; follow-ups open under *Ecosystem apps* |
-| [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
+| [#68](https://github.com/mikenomitch/legion/pull/68) | Fixes for the 2026-11-07 architecture review: the raft write path (group commit, one execution per entry, data migrations in the log, a raft log tail sized by bytes), placement and commit cost, the mesh control path, revisions and watches, the device model and plugin seams, and agent governance (audit journal, child tokens, approvals, rate limits, usage, MCP 2025-06-18) | Six plans, each with a calls doc; their items are checked off and in Done, the deferrals are open under their areas, and per-finding status is in the review doc. AI8 (microVM isolation) was not attempted |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
 | [#37](https://github.com/mikenomitch/legion/pull/37) | An appearance picker with built-in themes and custom colors | UI only |
@@ -1015,7 +1008,11 @@ How to use it:
         and the obvious suspect is plan-apply conflict
         ([plan-apply-conflict-reduction-plan.md](plans/plan-apply-conflict-reduction-plan.md)).
         Measure `legion_plan_apply_total{outcome}` across a paced/burst
-        pair before drawing a conclusion.
+        pair before drawing a conclusion. The 2026-11-07 review (SCH3) named
+        a likelier cause: claims and enqueues did work that grew with queue
+        depth, under the claims mutex and inside the enqueue write. That is
+        fixed ([plan](plans/placement-and-commit-cost-plan.md)); re-measure
+        the paced/burst pair before looking further.
   - [ ] `configs/manager.ncl` pins `evalThreads = 4` explicitly, so it has
         to move with the default.
 - [x] **The eval loop no longer blocks tokio worker threads on quorum
@@ -1192,11 +1189,33 @@ How to use it:
         read the read pool or the read model, which do not see an
         in-flight entry (`stop_keyed_instance_apply` reads its instance
         through `get_instance`), and on a three-voter measurement.
-  - [ ] **One fsync per entry, not two** (plan §6.3): the state DB runs
-        `synchronous = FULL` in raft mode only to keep the applied marker
-        ahead of the log's purge horizon. `NORMAL` plus a startup restore
-        from the local snapshot would drop one fsync per entry. Needs a
-        Linux fsync measurement and a power-cut test.
+        **Group commit shipped instead (2026-11-08)**: ops queued behind an
+        in-flight entry now share the next one, and under `single` the
+        leader keeps its captured batch (speculation), so N+1 *could*
+        capture on top of N's committed rows. What still blocks overlap:
+        apply-time projection re-reads committed rows, so applying N while
+        N+1's rows are in the database would push N+1's uncommitted rows
+        into the read model and the worker stream. Needs projection from the
+        changeset's own values first
+        ([raft-write-path plan §6.2.4](plans/raft-write-path-plan.md) ·
+        [calls #5](calls/raft-write-path-plan_calls.md)).
+  - [x] **One fsync per entry, not two** (plan §6.3; shipped 2026-11-08 by
+        the raft-write-path plan): the state DB runs `synchronous = NORMAL`
+        in every mode, and the raft log store fsyncs it (a purge barrier)
+        before every log purge, so the applied marker is durable before the
+        log stops holding the entries above it — one state-DB fsync per
+        purge instead of one per entry, and no startup snapshot-restore path
+        ([plan §6.1](plans/raft-write-path-plan.md) ·
+        [calls #2](calls/raft-write-path-plan_calls.md) ·
+        [docs](../docs/multi-raft.md#snapshots-compaction-and-catch-up)).
+        The power-cut test is still open (below).
+  - [ ] **Power-cut test of the purge barrier.** The barrier's ordering is
+        unit-tested (`purge_runs_the_barrier_before_deleting`) and the fsync
+        cost was not measured on Linux hardware; a test that cuts power to a
+        node right after a purge (a VM with an unsynced block device, or
+        `dm-flakey`) is what would prove the applied marker never regresses
+        below the purge horizon
+        ([plan §6.1](plans/raft-write-path-plan.md)).
   - [ ] **A keyed bind still visits every live instance of the task**
         (plan §11), two index lookups each, so a task with tens of
         thousands of running instances pays milliseconds per placement.
@@ -2046,39 +2065,67 @@ How to use it:
       by regeneration, which runs on raft leadership acquisition. Found while
       fixing audit SC3.
 
-- [ ] **`plan_submission` rows are never deleted** ([review SCH2](architecture-review-2026-11-07.md)).
-      Nothing in `src/` prunes the table, and each row carries every
-      placement's 8 ranked candidates as JSON, through the raft log and every
-      snapshot: ~86M rows a day at 1k plans/s. Delete on apply, keep only
-      rejected or sampled plans, or keep the table out of replicated state.
-- [ ] **Claiming evals gets slower as the queue grows** ([review SCH3](architecture-review-2026-11-07.md)).
-      Every claim runs `COUNT(*)` over pending evals
-      (`eval_claims.rs` → `pending_eval_count_tx`), and the subsume query's
-      `COALESCE(job_id,'')` defeats the `job_id` index, both under the claims
-      mutex. On a schema copy at 50k pending evals: ~140 ms per batch of 16.
-      Likely part of "burst submission costs throughput" above. Store `''`
-      and index, keep the count in memory, or use an in-memory broker.
-- [ ] **`bin_pack` and `spread` score allocation counts, not resources**
-      ([review SCH4](architecture-review-2026-11-07.md)). `assigned_count`, min-max normalized over a possibly
-      truncated candidate list (`scheduler.rs` `cached_load_bounds`,
-      `policy.rs`), so a 32-CPU allocation weighs the same as a 0.1-CPU one.
-      Score the dominant-resource fraction from
-      `NodeScoringState.common_resources` (Nomad BestFit, K8s
-      `MostAllocated`/`BalancedAllocation`), and fix the docs' "fullness".
-- [ ] **The plan apply writes placements as JSON and reads them back**
-      ([review SCH5](architecture-review-2026-11-07.md)): INSERT, SELECT from `plan_submission`, re-parse, plus a
-      node-row SELECT and attribute parse per candidate tried, all inside the
-      serialized commit. Pass the struct through and read nodes from the read
-      model. Add to the suspects of "Make plan-commit cost flat in fleet
-      size" above.
+- [ ] **The plan apply still parses each attempted node row**
+      ([review SCH5](architecture-review-2026-11-07.md), the half that did not ship;
+      [plan](plans/placement-and-commit-cost-plan.md) §6.2, [calls](calls/placement-and-commit-cost-plan_calls.md) #2). The JSON round trip of the plan itself is
+      gone, but every candidate the bind walk tries still costs a node-row
+      SELECT and an attribute-JSON parse (memoized per plan). Borrowing the
+      read model's `Arc<Node>` "guarded by the node epoch" is not sound: the
+      read model is patched after commit, so it can say "available" while
+      the row says "draining" — the window the re-read exists to close.
+      Sound design: hash the row's raw attribute bytes inside the
+      transaction and compare against the read model node's attributes
+      re-serialized into the same keyed hasher; reuse the `Arc<Node>` on a
+      match. Measure serialize+hash against parse at 10k nodes first.
+- [ ] **Gangs ignore spot-interruption notices** ([review AI7](architecture-review-2026-11-07.md);
+      [calls](calls/placement-and-commit-cost-plan_calls.md) #8). A reclaim reaches a gang only as a node loss or drain
+      after the fact, and `onMemberLoss` applies then. Wants an
+      "interruption pending" node condition set from IMDS by the worker or
+      from the ASG lifecycle hook by the `aws-asg` plugin, which restarts
+      the node's gangs ahead of the loss and keeps fresh gangs off it.
+      Needs its own plan (checkpoint story included).
+- [ ] **Multi-level gang topology** ([plan](plans/placement-and-commit-cost-plan.md) §11). `topology` names one
+      attribute; a `preferred` gang that fits no rack spans the fewest racks
+      with no preference for one zone. Kueue-style levels (`keys = ["rack",
+      "zone"]`) when someone asks. Also at most eight domains are tried per
+      plan, so a gang that fits only by preemption may miss the domain where
+      it would have ([calls](calls/placement-and-commit-cost-plan_calls.md) #5).
+- [ ] **`legion_eval_queue_depth` lags up to a second on a deep queue**
+      ([calls](calls/placement-and-commit-cost-plan_calls.md) #6). Above `evalThreads × 16` pending, the claim path
+      refreshes it from a full count at most once a second. A `kind` label
+      (already wanted, see diagnosing-scheduler-performance.md) would want
+      the same treatment.
 - [ ] **One capture mutex serializes every lane, and every write runs
       twice** ([review SCH1](architecture-review-2026-11-07.md)). `CAPTURE_MUTEX` (`raft/capture.rs`) and one
       SQLite write connection are shared by all lanes, so `lanes` overlaps
-      only quorum waits; the leader executes, rolls back, then applies the
-      changeset. A mutex and connection per lane, and keeping the leader's
-      captured writes, compound with "Pipeline the lane" above. Park's keyed
-      suspend and wake are scheduler-lane entries too, so this lane now
-      carries more than plans.
+      only quorum waits. Park's keyed suspend and wake are scheduler-lane
+      entries too, so this lane now carries more than plans.
+      **Partly done (2026-11-08, [raft-write-path plan](plans/raft-write-path-plan.md)):**
+  - [x] Group commit: queued ops share one capture, one entry, one quorum
+        round and one apply ([plan §6.2](plans/raft-write-path-plan.md) ·
+        [docs](../docs/multi-raft.md#the-write-path-group-commit-and-single-execution)).
+  - [x] The leader executes each write once under `single`: it commits the
+        captured batch with an undo record and skips the re-apply when its
+        entry comes back ([plan §6.3](plans/raft-write-path-plan.md) ·
+        [calls #1](calls/raft-write-path-plan_calls.md)).
+  - [ ] **The leader still executes twice under `lanes`.** Speculation is
+        off there because one lane's capture could read another lane's
+        in-flight rows and commit a decision a leadership loss later undoes
+        ([plan §6.3.6](plans/raft-write-path-plan.md)). Unblocked by the
+        per-lane files below.
+  - [ ] **A database file per lane**, so lanes get independent WAL write
+        locks and their own capture mutex: each lane's owned tables in
+        `lane-<name>.sqlite`, attached to every connection, commutative
+        tables split per lane, snapshots and backups as file sets. A
+        per-lane mutex over the one shared write connection is unsound (a
+        capture holds a savepoint open across many statements). Needs its
+        own plan; design sketch in
+        [raft-write-path plan §6.4](plans/raft-write-path-plan.md) ·
+        [calls #6](calls/raft-write-path-plan_calls.md).
+  - [ ] **Measure group commit on three voters** and revisit the 64-op /
+        128 KiB batch bounds, which were set from the append-entries
+        deadline, not from a measurement
+        ([calls #4](calls/raft-write-path-plan_calls.md)).
 - [ ] **Scheduling plugins can only pick a node** ([review SCH6](architecture-review-2026-11-07.md)). One
       `select_node` method over eligible nodes, one policy cluster-wide, no
       free resources in the context, no candidate fast path (hard-coded to
@@ -2094,14 +2141,6 @@ How to use it:
 - [ ] **Usage-aware placement and a descheduler** ([review SCH7](architecture-review-2026-11-07.md)): stated as
       limitations in resource-enforcement.md and preemption-and-eviction.md,
       with no item until now.
-- [ ] **Gang placement ignores topology and spot interruption**
-      ([review AI7](architecture-review-2026-11-07.md)): no rack, NVLink-domain, or network-locality preference,
-      and nothing reacts to interruption notices (core or `aws-asg`).
-      Kueue topology-aware scheduling is the comparison.
-- [ ] **Info-level logs on every plan and claim** ([review SCH8](architecture-review-2026-11-07.md)):
-      `scheduler.rs` "Starting scheduler plan_and_apply" and the applied
-      line, "Claimed evals" in `eval_claims.rs`, and one per submit in
-      `structs/eval.rs`. AGENTS.md wants `debug` for per-iteration logs.
 - [ ] **`NEXT_UP.md` leads with August throughput** ([review SCH9](architecture-review-2026-11-07.md)): 80.35/s
       at 5k from 2026-08-04, against 905/s at 5k and 327/s at 50k in
       [benchmarks.md](../docs/benchmarks.md). For whoever owns the current
@@ -3503,6 +3542,10 @@ Plan: [rollout-strategy-plugins](../docs/rollout-strategy-plugins.md) · docs: [
 
 - [ ] **Rollout plugins have one hook** ([review PLG5](architecture-review-2026-11-07.md)): `resolve` only,
       with no step, analysis, or abort hooks (Argo Rollouts, Flagger).
+      Evaluated with the device-model work and deferred: it changes the
+      rollout state machine and needs a plan
+      ([calls 25](calls/device-model-and-plugin-seams-plan_calls.md#25-job-mutation-a-secrets-provider-rollout-hooks-and-controller-side-volumes-are-deferred)).
+      The strategy library is also still loaded on every resolve.
 
 ## Artifacts
 
@@ -3560,11 +3603,18 @@ Plan: [artifact-system-plan.md](plans/artifact-system-plan.md) · docs: [artifac
 - [ ] Artifact staging on Windows: hardlink/reflink fallbacks, path semantics,
       image consumption (see *Windows support pass*)
 
-- [ ] **Model weights do not fit the artifact cache** ([review AI6](architecture-review-2026-11-07.md)): the
-      node cache class is clamped to 1–20 GiB by default (smaller than one
-      70B checkpoint), ORAS layers are not cached, and there is no
-      peer-to-peer distribution or lazy loading (Dragonfly, Spegel,
-      SOCI/Nydus). Size the cache for models, and plan P2P and lazy load.
+- [ ] **Peer-to-peer artifact distribution and lazy loading** ([review AI6](architecture-review-2026-11-07.md)).
+      The cache is model-sized and ORAS layers are cached (Done,
+      Artifacts), but a hundred nodes starting one model each download it
+      from the registry (Dragonfly, Spegel), and a task waits for every
+      layer (SOCI, Nydus). The content index already knows which nodes hold
+      what; peer serving needs worker-to-worker auth and a peer-first fetch
+      path. Needs a plan
+      ([calls 23](calls/device-model-and-plugin-seams-plan_calls.md#23-p2p-distribution-lazy-loading-and-resumable-fetches-are-deferred)).
+- [ ] **Resumable fetches and a stall timeout.** A download that fails
+      partway starts over, and the 2-hour default deadline is the only
+      guard against a stalled one
+      ([calls 16](calls/device-model-and-plugin-seams-plan_calls.md#16-the-fetch-defaults-grow-to-1-tib-and-2-hours-there-is-no-stall-timeout)).
 
 ## Stateful & volumes
 
@@ -3741,24 +3791,25 @@ has open:
       `StreamEvents`, would let it follow the catalog; xDS stays out of scope
       ([swappable seams plan](plans/swappable-seams-plan.md) §1).
 
-- [ ] **The endpoint feed is rebuilt from scratch on every heartbeat**
-      ([review NET1](architecture-review-2026-11-07.md)). `build_upstream_endpoints` re-parses each allocation's
-      `task_connect`, queries per (service, consumer job), parses three JSON
-      values per catalog row, and clones per allocation; the worker replaces
-      lists wholesale. Convergence follows heartbeat cadence (~8 s at 10k
-      nodes, ~16 s at 20k). Push per-service versioned sets on the work
-      stream, deduplicated per node (delta xDS, EndpointSlices). The mesh
-      plan's "push endpoint deltas … already shipped" row was wrong and is
-      corrected.
-- [ ] **Policy assignments are recomputed on every heartbeat**
-      ([review NET2](architecture-review-2026-11-07.md)): `build_net_policies` lists every stored policy and
-      merges per allocation, O(policies × allocations) per node per beat.
-      Memoize the effective hash on (policy generation, selector facts,
-      task network hash).
-- [ ] **A node caps at 255 allocations with upstreams** ([review NET9](architecture-review-2026-11-07.md)):
-      `VIP_BLOCK_MAX = 255` in `structs/network.rs`, and upstream and
-      ingress-twin ports share 20000–32000 with task ports. Dense sandbox
-      nodes can reach both.
+- [ ] **Configurable node port ranges.** Task ports (`20000–32000`) and the
+      datapath's own ports (`61000–65535`) are constants placement applies
+      on the manager; a host that widened `ip_local_port_range` past 61000,
+      or runs a service there, can collide. Making them node attributes
+      placement reads is the fix ([mesh-control-path calls
+      #7](calls/mesh-control-path-plan_calls.md)).
+- [ ] **Endpoint pushes reach only streaming workers, and templates wait
+      for the next beat.** A worker off `StreamWork` converges on the
+      heartbeat's delta (still no per-beat catalog work), and a config-file
+      template re-renders on the heartbeat after a push, not at the push
+      ([service-discovery.md](../docs/service-discovery.md#how-endpoints-reach-a-node)).
+- [ ] **The endpoint index's `local_disk` health path is a store hook, not
+      the projection.** `local_disk` mode projects only the read-model
+      tables (`storage/raft/capture.rs` `READ_MODEL_TABLES`), so the health
+      upsert marks the index itself; any other write that changes a
+      catalog input outside those tables is caught only by the 30 s
+      re-read ([mesh-control-path calls
+      #1](calls/mesh-control-path-plan_calls.md)). Projecting
+      `allocation_health` in `local_disk` mode would close it.
 
 ## Networking
 
@@ -4044,9 +4095,12 @@ Datapath performance). Deferred, by name:
       fallback; about 20% of bulk throughput by Tensorlake's numbers
       (plan §6.6, [calls #3](calls/datapath-performance-plan_calls.md)).
 - [ ] **Multiplexed node-to-node tunnels for L4 mesh traffic.** Each L4
-      connection to a mesh endpoint still pays its own mTLS handshake;
-      ztunnel avoids that with pooled HTTP/2 CONNECT (HBONE) tunnels. A
-      wire-format change for the mesh, so it needs its own plan (plan §6.7).
+      connection to a mesh endpoint is still its own TLS connection (now a
+      resumed one, see Done, Mesh control path); ztunnel pools HTTP/2
+      CONNECT (HBONE) tunnels instead. A wire-format change for the mesh,
+      so it needs its own plan (plan §6.7; [review
+      NET3](architecture-review-2026-11-07.md), [mesh-control-path calls
+      #4](calls/mesh-control-path-plan_calls.md)).
 - [ ] **HTTP/2 between nodes in HTTP mode**, so one pooled connection
       carries concurrent requests (Linkerd's transparent upgrade). Pooling
       today reuses HTTP/1.1 connections one request at a time.
@@ -4057,29 +4111,21 @@ Datapath performance). Deferred, by name:
       ([calls #6](calls/datapath-performance-plan_calls.md)).
 
 
-- [ ] **Keep TLS session resumption across mesh config rebuilds**
-      ([review NET3](architecture-review-2026-11-07.md)): the forwarder rebuilds its rustls `ClientConfig` on every
-      identity change, dropping the resumption cache, so each 8 h refresh and
-      CA rotation is a full-handshake burst. Separate from, and cheaper than,
-      the kTLS and tunnel items above.
-- [ ] **HTTP mode buffers request bodies with no cap** ([review NET4](architecture-review-2026-11-07.md)):
-      with no body hop, `http.rs` runs `body.collect()` unbounded. Stream
-      when no retry or body hop needs replay; otherwise cap and answer `413`.
-- [ ] **IPv6 endpoints and binds** ([review NET5](architecture-review-2026-11-07.md)): endpoints are formatted
-      `"{}:{}"` without brackets (`specs.rs`), `worker_address_host`
-      splits on the last `:`, and ingress binds `0.0.0.0`. Use `SocketAddr`
-      end to end and bind dual-stack.
-- [ ] **The nftables guard fallback** ([review NET6](architecture-review-2026-11-07.md)): no
-      `ct state established` short-circuit, so every egress packet walks one
-      rule per allocation, and counters fork `nft -j list table` every beat.
-      Moot if the "drop nftables" decision above goes that way.
-- [ ] **Splay node-certificate reissue on CA rotation** ([review NET7](architecture-review-2026-11-07.md)):
-      `refresh_node_identity` reissues as soon as the bundle changes, so ~10k
-      CSRs land within one beat on an `exec` or Vault signer.
-- [ ] **Per-connection global mutex and allocations** ([review NET8](architecture-review-2026-11-07.md)):
-      `EdgeLedger` is one node-wide `Mutex<HashMap>`, and the in-flight map
-      allocates a `String` key per connection. Interned ids and sharded
-      counters before 50k connections/s per node matters.
+- [ ] **The nftables guard still forks `nft` to read its counters**, now
+      at most every `hostGuard.counterInterval` (10 s) instead of every
+      beat. Reading them over netlink goes with the "drop nftables" decision
+      above ([review NET6](architecture-review-2026-11-07.md), [mesh-control-path calls
+      #10](calls/mesh-control-path-plan_calls.md)).
+- [ ] **The forwarder clones the picked `Endpoint` per dial** (its address,
+      node id, and tags). Interning endpoints (`Arc<str>` addresses through
+      `balance::Endpoint`) removes the last per-connection allocations on
+      the dial path ([review NET8](architecture-review-2026-11-07.md), [mesh-control-path calls
+      #12](calls/mesh-control-path-plan_calls.md)).
+- [ ] **A fail-open body hop refuses an oversized body with `413`.** With
+      `onError = "allow"`, a body over `maxBytes` is answered `413` rather
+      than let through unread; decide whether "allow" should mean stream it
+      through unchecked ([mesh-control-path calls
+      #13](calls/mesh-control-path-plan_calls.md)).
 
 ### macOS gated networking
 
@@ -4381,31 +4427,47 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       (`content_publish::tests::publish_throughput`;
       [swappable seams calls #17](calls/swappable-seams-plan_calls.md)).
 
-- [ ] **Data migrations run outside the raft log** ([review ST1](architecture-review-2026-11-07.md)): backfills in
-      `migrations.rs` run locally at startup, so replicas that migrate at
-      different applied indexes could backfill different values (inferred).
-      Apply data migrations as replicated barrier entries at one index, and
-      tag entries with a schema version.
-- [ ] **No revision, watch, or blocking query for core objects**
-      ([review ST2](architecture-review-2026-11-07.md)). Reads carry no index, event IDs can go backwards after a
-      failover, the journal keeps 10k rows, follower-forwarded writes don't
-      wait for local apply, and there is no watch on jobs, allocations, or KV
-      (`WatchObjects` polls and resends a snapshot with no resume version).
-      Return a revision on every reply, add `min_index`/wait reads, derive
-      event IDs from the log, and give `WatchObjects` a resume version. Needs
-      a plan.
-- [ ] **A manager restart forces a full worker resync** ([review ST3](architecture-review-2026-11-07.md)):
-      StreamWork positions hang off a random per-process epoch
-      (`work_log.rs`), so a failover at 10k–50k nodes rebuilds every desired
-      set at once. Base positions on replicated row versions.
-- [ ] **Retain the raft log tail by bytes or time** ([review ST4](architecture-review-2026-11-07.md)): it is
-      `.clamp(1, 1000)` entries (`driver.rs`), so at a high write rate any
-      follower restart is a full snapshot install under the capture mutex.
-- [ ] **The heartbeat handler still runs blocking store work inline**
-      ([review ST5](architecture-review-2026-11-07.md)): `handle_failed_allocations`,
-      `handle_terminated_allocations`, and
-      `update_allocation_health_snapshots` can make raft writes on a runtime
-      worker; only `update_node_heartbeat` is offloaded.
+- [ ] **The raft log format is still the SQLite schema** (review ST1,
+      deferred half): changesets bind columns by position, so every
+      migration is a log-format change and table rebuilds must keep column
+      order. Logical commands (Nomad's FSM messages) or rows encoded by
+      column name would decouple them; either replaces the replication model
+      (JC-1). Data migrations themselves now run through the log (Done)
+      ([calls #8](calls/raft-write-path-plan_calls.md)).
+- [ ] **Data steps can only touch control-lane tables.** The
+      `data_migration` record is control-owned and `run_data_migrations` is
+      a control-lane op; a future backfill of a scheduler or status table
+      needs a record per lane (a commutative record would not survive a
+      sibling-lane snapshot install)
+      ([calls #9](calls/raft-write-path-plan_calls.md) ·
+      `src/storage/data_migrations.rs`).
+- [ ] **`WatchObjects` on the revision journal** (deferred from
+      [revisions-and-watches-plan.md](plans/revisions-and-watches-plan.md),
+      [calls #11](calls/revisions-and-watches-plan_calls.md)): app object
+      watches still poll a fingerprint about once a second and resend a full
+      snapshot on reconnect, with no resume version. Record `app_object`
+      changes in the journal and give `WatchObjectsRequest` a resume revision.
+- [ ] **A manager restart empties its revision journal**
+      ([plan](plans/revisions-and-watches-plan.md),
+      [calls #2](calls/revisions-and-watches-plan_calls.md)): watches and
+      worker streams that reconnect to a restarted manager relist or resync
+      (other managers still serve resumes). A persisted modify revision per
+      row (or replaying the retained raft log tail into the journal at start)
+      would let a restarted manager resume them too.
+- [ ] **Watches on more kinds**: nodes, rollouts, and evals have no watch
+      or blocking read ([plan non-goals](plans/revisions-and-watches-plan.md)).
+- [ ] **`--index` on list commands**: `legion job list`, `legion kv list`,
+      and `legion ledger` print a bare list in `--json`, so they do not take
+      `--index` yet; the RPCs (`ListJobs`, `ListKv`, `GetLedger`) do
+      ([docs](../docs/watches-and-blocking-queries.md#known-limitations)).
+- [ ] **Instance-only changes in `local_disk` mode**: the `local_disk`
+      projection records `instance` rows only through their allocations, so
+      an instance-only change does not wake a blocking `ListInstances`
+      (`READ_MODEL_TABLES` in `src/storage/raft/capture.rs`).
+- [ ] **Make `Store::replicated` async** (the rest of
+      [review ST5](architecture-review-2026-11-07.md)): the heartbeat's
+      writes now run on the blocking pool, but every replicated write still
+      parks a thread for its quorum round.
 
 ## Job types
 
@@ -4586,10 +4648,11 @@ docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging
       The cluster-wide per-task view is
       [autoscaler-v2](plans/autoscaler-v2-plan.md) Phase 1; build them together.
 
-- [ ] **Usage accounting over time** ([review AI9](architecture-review-2026-11-07.md)): namespaces show only
-      current charged usage. Record time-integrated CPU-seconds, GiB-hours,
-      and device-hours per namespace, job, and token, as the basis for
-      budgets and "what did this agent spend?".
+- [ ] **Usage accounting follow-ups** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) #10): budgets that enforce
+      (refuse or scale down past a namespace budget); measured (not
+      reserved) usage; submitter attribution that survives journal pruning
+      (stamp it on `job_config`); device-hours once the device model lands
+      (they will appear as `resource:<name>` automatically).
 
 ## Templates, registry & packaging
 
@@ -5216,29 +5279,71 @@ artifacts, volumes, node checks. Still to build:
       names `legion` instead of `legion-rs` and lacks `ring`. The other plugin
       lockfiles probably do too.
 
-- [ ] **Panic containment for dylib plugins** ([review PLG1](architecture-review-2026-11-07.md)): no plugin call
-      is wrapped in `catch_unwind`, and scheduling and rollout plugins run in
-      the manager. Contain now; for the stable ABI above, the WASM layer
-      network plugins already use (`src/wasm/`) is the candidate for
-      in-manager hooks, and exec or gRPC for task runtimes and fetchers.
-- [ ] **A device model: GPUs effectively do not work** ([review PLG2](architecture-review-2026-11-07.md)).
-      Devices come only from static config, nothing hands assigned IDs to the
-      task (no `CUDA_VISIBLE_DEVICES` or CDI anywhere), containers deny all
-      devices, the microVM has no VFIO, there is no device health or
-      topology, and quota cannot cap devices. A device-plugin seam that
-      fingerprints, returns CDI specs on allocate, reports health and
-      topology, and adds quota dimensions; MIG and fractional sharing after.
-      Needs a plan.
-- [ ] **Admission policy on jobs** ([review PLG4](architecture-review-2026-11-07.md)): object kinds have CEL
-      `rules`, but jobspecs pass no operator-defined policy. Reuse the `cel`
-      evaluator as namespace- or cluster-scoped job rules, run in
-      `job validate`, `job plan`, and `job run` (K8s
-      `ValidatingAdmissionPolicy`).
+- [ ] **Panic containment for task runtime dylibs** ([review PLG1](architecture-review-2026-11-07.md)).
+      Scheduling, rollout, node-check, and fetcher plugins are contained
+      and quarantined (Done, Plugin surface); `TaskPlugin` (~40 methods)
+      is not, so a panicking dylib task runtime still kills its worker
+      ([calls 22](calls/device-model-and-plugin-seams-plan_calls.md#22-task-runtime-dylibs-are-not-contained-wasm-and-out-of-process-plugins-are-deferred)).
+      The review's direction: task runtimes out of process.
+- [ ] **In-manager plugin hooks on the WASM layer** ([review PLG1](architecture-review-2026-11-07.md)):
+      scheduling and rollout hooks are contained dylibs now, but a plugin
+      that corrupts memory or loops still takes the manager down. The
+      fuel-bounded WASM layer network plugins use (`src/wasm/`) is the
+      candidate; artifact fetchers out of process (exec). Needs a plan.
+- [ ] **A quarantined plugin stays off until restart.** No command lifts a
+      quarantine, and `legion_plugin_panics_total` is the only cluster-wide
+      view of manager-side quarantines (workers report theirs in health
+      checks). A `legion plugin status` read surface would help.
+- [ ] **Devices: VFIO passthrough for `sandbox`** ([review PLG2](architecture-review-2026-11-07.md)).
+      Sandboxes refuse `resources.devices` at submit; cloud-hypervisor
+      supports VFIO, Firecracker does not
+      ([calls 21](calls/device-model-and-plugin-seams-plan_calls.md#21-sandboxes-refuse-devices-at-submit-mig-mps-and-dra-are-deferred)).
+- [ ] **Devices: MIG, MPS, time slicing, and DRA-style shared claims.** A
+      device is assigned whole; a plugin can report MIG instances as their
+      own group today.
+- [ ] **Devices: verify on real hardware.** The `nvidia` plugin's parsing
+      is tested against a stub `nvidia-smi`, and the OCI device entries
+      against generated specs only. Run a GPU job end to end (exec and
+      container, with and without `--cdi`) on a real NVIDIA node, under runc
+      and crun, with the default user namespace
+      ([devices.md](../docs/devices.md#what-has-been-verified)).
+- [ ] **Devices: a device cgroup for `exec`** (cgroup v2 device-control
+      eBPF), so an `exec` task can open only its assigned devices
+      ([calls 17](calls/device-model-and-plugin-seams-plan_calls.md#17-exec-tasks-get-device-env-not-a-device-cgroup)).
+- [ ] **Devices: preemption and the autoscaler ignore them.** Victim
+      selection does not free devices on purpose, and node-group shapes in
+      `GetCapacityDemand` carry no devices, so a pending GPU job asks for no
+      GPU node.
+- [ ] **Devices: topology across nodes.** `gang.topology` (review AI7,
+      [placement plan](plans/placement-and-commit-cost-plan.md)) keeps a gang
+      inside one value of a node attribute such as `rack`, but device
+      attributes (NVLink/peer group) are not node attributes, so a gang
+      cannot yet be kept inside one NVLink domain that spans nodes.
+- [ ] **Devices: show device usage** in `legion namespace get`, the
+      `legion_namespace_reserved_*` gauges, and `legion node usage`.
+- [ ] **Devices: read YAML CDI specs** (needs a YAML dependency;
+      [calls 6](calls/device-model-and-plugin-seams-plan_calls.md#6-container-edits-are-cdis-containeredits-verbatim-only-json-cdi-specs-are-read)).
+- [ ] **Devices: streaming health** (a long-running plugin, gRPC like
+      Kubernetes' `ListAndWatch`) if 30-second detection is too slow
+      ([calls 4](calls/device-model-and-plugin-seams-plan_calls.md#4-device-plugins-are-exec--json-legion-device1-not-grpc-sockets-or-dylibs)).
+- [ ] **Devices for edge-started work.** Boot tickets and sessions start
+      work the scheduler did not place, so a task that asks for devices
+      fails there ("has no assignment").
+- [ ] **Job mutation policies** ([review PLG4](architecture-review-2026-11-07.md)): `jobRules` validate
+      (Done); nothing can default or rewrite a job (K8s
+      `MutatingAdmissionPolicy`). Needs a plan
+      ([calls 25](calls/device-model-and-plugin-seams-plan_calls.md#25-job-mutation-a-secrets-provider-rollout-hooks-and-controller-side-volumes-are-deferred)).
+- [ ] **`job validate` checks job rules only with `acl:read`.** Most job
+      authors get a warning instead; `job plan` checks them
+      ([calls 20](calls/device-model-and-plugin-seams-plan_calls.md#20-job-validate-checks-job-rules-only-when-it-can-read-the-policies)).
 - [ ] **A secrets provider seam** ([review PLG4](architecture-review-2026-11-07.md)): secrets come from KV plus
       workload identity only, and autoscaler plugin config has no secret
       references.
-- [ ] **Node checks dlopen on every pass** ([review PLG5](architecture-review-2026-11-07.md)) and return an
-      untyped `Map` (`worker/node_check.rs`).
+- [ ] **Runtime classes: verify gVisor and Kata.** No `runsc` or Kata
+      runtime has run Legion's bundles; their device passthrough (gVisor
+      `nvproxy`, Kata VFIO) is not wired to devices, and Windows and an
+      out-of-process runtime API are out of scope
+      ([task-runtime-container.md](../docs/task-runtime-container.md#runtime-classes)).
 
 ## Agent surfaces
 
@@ -5265,32 +5370,33 @@ this" work:
 - [ ] An agent can easily configure a worker to talk to a manager
 - [ ] An agent can search the registry and find jobs worth installing and running
 
-- [ ] **A durable audit journal** ([review AI2](architecture-review-2026-11-07.md)): only ACL denials are logged,
-      `SchedulerEvent` has no actor, and sessions have none. Record accessor,
-      principal, on-behalf-of chain, operation, request digest, idempotency
-      key, and outcome for every write, queryable through `state query` and
-      MCP.
-- [ ] **Token expiry by default** ([review AI3](architecture-review-2026-11-07.md)): `acl.tokenMaxTtl` is
-      unbounded unless set.
-- [ ] **Token attenuation for sub-agents** ([review AI3](architecture-review-2026-11-07.md)): minting needs
-      `acl:write`, so an agent cannot hand a sub-agent a narrower token.
-      A "child token, subset of mine" RPC, or Biscuit-style attenuation.
-- [ ] **Approval gates and rate limits** ([review AI3](architecture-review-2026-11-07.md)): no human-approval
-      gate for destructive operations outside app install (MCP
-      `--allow-write` is all-or-nothing), and no per-token rate limit or
-      budget.
-- [ ] **A caller-aware capability catalog** ([review AI3](architecture-review-2026-11-07.md)): `capabilities`
-      lists operations the caller cannot perform.
-- [ ] **Bring the MCP server up to date** ([review AI4](architecture-review-2026-11-07.md)): protocol
-      `2024-11-05`, stdio only, and no tool annotations, `structuredContent`,
-      `outputSchema`, Streamable HTTP, or elicitation (the hook for approval
-      gates). About 60 user-facing RPCs have no tool (KV, ACL management,
-      rollout control, `ListJobSpecHistory`, `StreamEvents`, app install and
-      upgrade), and `legion_job_run` has no wait.
-- [ ] **Compare-and-set and a field diff for jobs** ([review AI5](architecture-review-2026-11-07.md)):
-      `RunJobRequest` has no `expected_version`, so two agents silently
-      overwrite each other, and `PlanJobReply` has no field-level diff.
-      Objects, ScaleTask, and app records already have CAS.
+- [ ] **Audit records from a follower that leads no raft lane are not
+      journaled** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) #5): such a manager answers its own denials and
+      validation errors, and their records go to the `audit` tracing target
+      (`audit_unjournaled`). Fix: a `ForwardableLaneWrite::AppendAudit` so the
+      batch is forwarded to a lane leader (`src/storage/raft/forward.rs`).
+- [ ] **No external audit sink** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) §4): syslog/webhook/S3 export of the
+      journal. `legion audit list --follow --json` is the seam today; a
+      bundled app consuming it is the likely shape.
+- [ ] **Inline narrowing for child tokens** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) #2): a child can only
+      drop whole policies. Add restriction rules evaluated as an intersection
+      with the parent (needs a second rule set on `AclIdentity`), so "only
+      namespace X" works when no policy for X exists.
+- [ ] **Multi-party approvals** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) §11): `approvers = 2` on a rule.
+- [ ] **Cluster-wide rate limits and budgets** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) #7): limits are per
+      manager and in memory. Budgets — a namespace-policy `budget` checked
+      against the usage rollups ([usage-accounting.md](../docs/usage-accounting.md)) — are the
+      cluster-wide control.
+- [ ] **MCP Streamable HTTP: SSE, sessions, and authorization** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) #8):
+      `legion mcp serve --http` answers JSON only, keeps no sessions, binds
+      loopback only, and every caller acts as the server's token. Elicitation
+      is stdio-only until SSE lands; remote use needs MCP's OAuth flow or a
+      per-request Legion token pass-through.
+- [ ] **An intent layer above jobs** ([review AI5](architecture-review-2026-11-07.md)): nothing like
+      "serve model X at p99 < 200 ms" (KServe, Knative); app object kinds are
+      the natural place. Out of scope of
+      [revisions-and-watches-plan.md](plans/revisions-and-watches-plan.md),
+      which shipped AI5's compare-and-set and plan diff.
 
 ## Embedding
 
@@ -5802,6 +5908,39 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **Placement quality and commit cost** (2026-11-08, [plan](plans/placement-and-commit-cost-plan.md) · [calls](calls/placement-and-commit-cost-plan_calls.md)).
+      Review findings SCH2, SCH3, SCH4, SCH5 (part), SCH8, AI7 (part).
+  - [x] **`plan_submission` is bounded** ([review SCH2](architecture-review-2026-11-07.md)): applied plans
+        write no row, rejected plans keep one, staged rows are deleted by
+        the apply that consumes them, every insert trims an id window of
+        1,000, and the scheduler-lane leader sweeps history and orphaned
+        staged rows on startup and leadership
+        ([docs](../docs/scheduler-and-eval-loop.md#plan-records)).
+  - [x] **Claims cost O(batch), not O(queue)** ([review SCH3](architecture-review-2026-11-07.md)): `IS` instead
+        of `COALESCE` in the duplicate lookup, two partial indexes over
+        pending evals, `+ready_at` planner steering, a count capped at the
+        fair share's saturation, and a rate-limited queue-depth gauge;
+        query plans pinned by a test. 116 ms → under 1 ms per batch of 16
+        at 50k pending ([docs](../docs/scheduler-and-eval-loop.md#eval-queue-semantics)).
+  - [x] **`bin_pack`/`spread` score requested resources against capacity**
+        ([review SCH4](architecture-review-2026-11-07.md)): dominant utilization after placing plus a
+        balanced-allocation tie-break, absolute per node, so truncated
+        candidate lists no longer change a node's score
+        ([docs](../docs/scheduler-and-eval-loop.md#scoring)). The automatic
+        anti-affinity penalty is scaled by the task's count, as Nomad's job
+        anti-affinity is, so many-replica tasks pack again under `bin_pack`
+        (batch-burst 71.5 → 105.4 evals/s) while two- and three-replica
+        services spread ([calls #1](calls/placement-and-commit-cost-plan_calls.md)).
+  - [x] **The apply consumes the plan in memory** ([review SCH5](architecture-review-2026-11-07.md), first
+        half): no JSON serialize, INSERT, SELECT, and re-parse inside the
+        commit. The node-row half is open above.
+  - [x] **Per-plan and per-claim logs at debug** ([review SCH8](architecture-review-2026-11-07.md)), with
+        one info line for a plan slower than a second.
+  - [x] **Topology-aware gang placement** ([review AI7](architecture-review-2026-11-07.md), first half):
+        `gang.topology = { key, mode = "required" | "preferred" }`, whole
+        domains tried best fit first, reported by `job plan` and the
+        blocked-job report ([docs](../docs/gang-scheduling.md#topology)).
+        Spot interruption is open above.
 - [x] **Gang scheduling, Phase 1** (2026-10-17,
       [#48](https://github.com/mikenomitch/legion/pull/48),
       [plan](plans/gang-scheduling-plan.md) as revised ·
@@ -6286,6 +6425,16 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 [plan](plans/artifact-system-plan.md) · [docs](../docs/artifacts.md)
 
+- [x] **Model weights fit the artifact cache** ([review AI6](architecture-review-2026-11-07.md), 2026-11-08):
+      `content.budgets.artifacts` defaults to 50% of the disk with a 1 GiB
+      floor and no ceiling (was 10% clamped to 20 GiB), a share can be
+      bounded with `{ share, max, min }`, ORAS layers are cached per layer
+      digest (copied in and out, so a task cannot change the cached
+      weights), and the fetch defaults grew to 1 TiB and 2 hours. P2P,
+      lazy loading, and resumable fetches stay open (Artifacts, above)
+      ([plan](plans/device-model-and-plugin-seams-plan.md) ·
+      [docs](../docs/artifacts.md#oras-layers) ·
+      calls 5, 14, 15, 16 in [device-model-and-plugin-seams-plan_calls.md](calls/device-model-and-plugin-seams-plan_calls.md))
 - [x] Grab container images (`oci://` fetcher + ORAS mediaType)
 - [x] Auth for fetching (KV credentials via `GetArtifactCredential` + cluster
       `artifacts.auth` matchers)
@@ -6465,6 +6614,48 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       Note `service list -j` / `resolve -j` now emit the standard `{ok, data}`
       envelope instead of a bare array (`jq '.[0]'` -> `jq '.data[0]'`, or use
       `--one`, which needs no `jq`).
+
+## Mesh control path
+
+[plan](plans/mesh-control-path-plan.md) · [calls](calls/mesh-control-path-plan_calls.md)
+· docs: [service-discovery.md](../docs/service-discovery.md#how-endpoints-reach-a-node),
+[network-handlers.md](../docs/network-handlers.md#sessions),
+[cluster-ca.md](../docs/cluster-ca.md#how-workers-learn),
+[architecture-managers-workers.md](../docs/architecture-managers-workers.md)
+
+- [x] **Endpoint deltas per service** ([review NET1](architecture-review-2026-11-07.md)):
+      a versioned endpoint set per service on each manager, invalidated from
+      committed changesets on every replica; the heartbeat ships only the
+      (service, consumer) sets and bindings whose digest changed; streaming
+      workers get changed sets pushed on `StreamWork` (push-only messages);
+      the worker swaps one listener's list at a time. Corrects the mesh
+      plan's §2 row, which claimed this had shipped.
+- [x] **Memoized policy assignments** ([review NET2](architecture-review-2026-11-07.md)):
+      policies listed once per generation, each distinct input merged once,
+      inputs verified on every hit.
+- [x] **Mesh TLS sessions survive certificate refreshes** ([review NET3](architecture-review-2026-11-07.md)):
+      swappable certificate resolvers, one client and one server config per
+      trust bundle, a node-wide server session store, every session dropped
+      on a bundle change, and resumed identities bounded by certificate
+      expiry. Pooled tunnels and kTLS stay open under Networking.
+- [x] **Bounded HTTP request bodies** ([review NET4](architecture-review-2026-11-07.md)):
+      streamed unless a body hop or a retry needs them;
+      `http.retries.maxBodyBytes` (default `1Mi`) caps the replay copy.
+- [x] **IPv6** ([review NET5](architecture-review-2026-11-07.md)):
+      `structs::hostport` joins and splits addresses everywhere a host
+      meets a port; ingress binds dual-stack and canonicalizes mapped peers.
+- [x] **nftables guard** ([review NET6](architecture-review-2026-11-07.md)):
+      established flows accepted first, one verdict-map dispatch per
+      cgroup level, counters read every `hostGuard.counterInterval`.
+- [x] **CA-rotation splay** ([review NET7](architecture-review-2026-11-07.md)):
+      a deterministic per-node offset, 25 served intervals capped at 10
+      minutes; at once when the issuer left the bundle.
+- [x] **Per-connection costs** ([review NET8](architecture-review-2026-11-07.md)):
+      a sharded edge ledger with borrowed-key lookups, atomic in-flight
+      counts held by the connection, pooled copy buffers.
+- [x] **VIP blocks and datapath ports** ([review NET9](architecture-review-2026-11-07.md)):
+      16,384 VIP blocks per node in `127.64.0.0/10`; datapath ports from
+      `61000–65535`, apart from task ports.
 
 ## Datapath performance
 
@@ -6792,6 +6983,27 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
 [plan](plans/persistence-plan.md) · [docs](../docs/persistence-streaming.md), [raft-operations.md](../docs/raft-operations.md)
 
 - [x] Streaming SQLite replication, Litestream-style, with optional lease failover
+- [x] **Revisions, watches, and blocking queries for jobs, allocations, and
+      KV** ([review ST2](architecture-review-2026-11-07.md); plan:
+      [revisions-and-watches-plan.md](plans/revisions-and-watches-plan.md);
+      docs: [watches-and-blocking-queries.md](../docs/watches-and-blocking-queries.md)).
+      A revision (each raft group's applied index; a persisted counter in
+      `local_disk`) on job, allocation, and KV reads and writes; blocking reads
+      (`x-legion-min-revision`/`x-legion-wait`, `--index/--wait`);
+      `Manager.Watch` with resume and resync-required (`legion job watch`,
+      `legion kv watch`, MCP `legion_watch`); event ids that never go
+      backwards across a failover; a follower that forwards a write waits for
+      its own apply before replying; opt-in linearizable reads
+      (`x-legion-consistency`, `--consistent`). Deferred items are above.
+- [x] **A failover no longer resyncs every worker**
+      ([review ST3](architecture-review-2026-11-07.md); plan §7): `StreamWork`
+      messages carry a revision, and a worker reconnecting to another manager
+      resumes with only what changed on its node since
+      ([docs](../docs/architecture-managers-workers.md#delivery)).
+- [x] **The heartbeat's report writes run off the runtime**
+      ([review ST5](architecture-review-2026-11-07.md); plan §8): failures,
+      terminations, health, volume, and pressure reports run on the blocking
+      pool in one hop, in their old order.
 - [x] **The manager's own identity for state replication** (2026-10-12). The
       WAL replica, the takeover restore and the lease share one credential
       path: `persistence.streaming.credentials` keys, or the platform chain
@@ -6808,6 +7020,40 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       Identity (open under Persistence & cluster operations)
 - [x] Raft control plane: leader election, failover controls, membership,
       observability, CLI and UI operations
+- [x] **The replicated write path: group commit, one execution, one fsync**
+      (2026-11-08, review SCH1). Ops queued behind an in-flight entry share
+      one capture (each in its own savepoint, guards per op), one raft entry
+      and one apply; under `single` the leader commits its batch with an
+      undo record and skips the re-apply, undoing on leadership loss,
+      truncation or a crash; the state DB runs `synchronous = NORMAL` with a
+      state-DB fsync before every log purge. New metrics
+      `legion_raft_entry_ops`, `legion_raft_speculation_total`,
+      `legion_raft_state_syncs_total`. The raft log format changed. Open:
+      lanes still execute twice, the shared capture mutex, overlap, and a
+      power-cut test (under Scheduling & placement)
+      ([plan](plans/raft-write-path-plan.md) ·
+      [calls](calls/raft-write-path-plan_calls.md) ·
+      [docs](../docs/multi-raft.md#the-write-path-group-commit-and-single-execution))
+- [x] **Retain the raft log tail by bytes** (2026-11-08, review ST4): the
+      `.clamp(1, 1000)`-entry tail is gone; `raft.logRetainBytes` (256 MiB
+      per group) is purged behind each snapshot by a driver task, and
+      `legion_raft_log_retained_seconds` reports how long that lets a
+      follower be down and still catch up by replay
+      ([plan §6.6](plans/raft-write-path-plan.md) ·
+      [calls #7](calls/raft-write-path-plan_calls.md) ·
+      [docs](../docs/raft-operations.md#operational-notes))
+- [x] **Data migrations run through the raft log** (2026-11-08, review ST1):
+      `migrations.rs` holds schema steps only (a test rejects `UPDATE`/
+      `DELETE` there); the job `updated_at` backfill, the app uid backfill
+      and the scaling-policy cleanup are data steps in
+      `storage/data_migrations.rs`, run once cluster-wide as one
+      control-lane entry by the leader once every voter runs the new schema,
+      and recorded in the replicated `data_migration` table. Raft entries
+      carry the schema version they were captured under. Deferred: logical
+      commands (open under Persistence & cluster operations)
+      ([plan §6.5](plans/raft-write-path-plan.md) ·
+      [calls](calls/raft-write-path-plan_calls.md) ·
+      [docs](../docs/upgrades.md#data-migrations-run-once-through-the-log-after-the-upgrade))
 - [x] `LEGION_DATA_DIR` moves every `.legion/*` default (store, raft, worker
       state, identity tokens) for one process, so a second cluster can run
       from the same checkout. The store default became the data dir itself,
@@ -7647,6 +7893,12 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       [plan](plans/worker-simulation-plan.md),
       [calls](calls/worker-simulation-plan_calls.md).
 
+- [x] **Usage accounting over time** ([review AI9](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [usage-accounting.md](../docs/usage-accounting.md)): reserved CPU,
+      memory, cores, allocations and custom resources integrated into hourly
+      rollups per namespace, job and submitting token by the status-lane
+      leader; `GetUsage`, `legion usage`, `legion namespace usage`, MCP
+      `legion_usage`. Budgets are open (Observability).
 ## Job types & dependencies
 
 [docs](../docs/jobs-tasks-and-scheduling.md)
@@ -7666,6 +7918,54 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       [docs](../docs/jobs-tasks-and-scheduling.md#job-status) ·
       calls: [job-status-plan_calls.md](calls/job-status-plan_calls.md))
 
+## Plugin surface
+
+Plan: [device-model-and-plugin-seams-plan.md](plans/device-model-and-plugin-seams-plan.md) ·
+calls: [device-model-and-plugin-seams-plan_calls.md](calls/device-model-and-plugin-seams-plan_calls.md)
+
+- [x] **A device model: GPUs work** ([review PLG2](architecture-review-2026-11-07.md), 2026-11-08). Device
+      plugins speak `legion-device/1` (exec + JSON: `fingerprint`,
+      `allocate`), configured in a worker type's `devices` block next to
+      `devices.static` and `cdiSpecDirs`; the report (groups, instances,
+      health, NUMA/peer-group attributes) rides the node-check report and
+      re-checks every 30 s; jobs ask with `resources.devices = [{ name,
+      count, constraints, affinities }]`; the store assigns ids at
+      allocation insert, inside one NVLink peer group or NUMA node when it
+      can, and records them on the allocation; the worker allocates through
+      the plugin and CDI specs, the container runtime writes device nodes,
+      cgroup allow rules, mounts, hooks, and env into the bundle, and `exec`
+      gets `LEGION_DEVICE_<NAME>_IDS` plus the plugin's env; unhealthy
+      instances are never assigned; namespace quota caps devices by name;
+      `legion node info`, the `legion_node_devices` MCP tool, and `legion
+      device plugin test`. Reference `nvidia` and `fake` plugins under
+      `plugins/devices/`. Not run on real GPUs; the deferrals are open under
+      Plugin surface ([docs](../docs/devices.md))
+- [x] **Panic containment for scheduling, rollout, node-check, and fetcher
+      plugins** ([review PLG1](architecture-review-2026-11-07.md), 2026-11-08). `legion::export_*!` contains each
+      method inside the plugin (a host-side `catch_unwind` cannot catch a
+      `cdylib`'s panic), the host reads a C-ABI panic probe after every
+      call, and a panicking plugin is quarantined until restart, logged,
+      and counted in `legion_plugin_panics_total`; a quarantined scheduling
+      plugin places with `bin_pack`. Plugin API version 3. Task runtime
+      dylibs and the WASM move stay open
+      ([docs](../docs/plugin-system.md#panics-and-quarantine))
+- [x] **Node checks load once and report typed results** ([review PLG5](architecture-review-2026-11-07.md), 2026-11-08):
+      a plugin is loaded on first use and reused, a load failure is a
+      failing check, and `health_check` returns `{ status, message,
+      attributes }` ([docs](../docs/plugin-system.md#3-node-check-plugins))
+- [x] **OCI runtime classes** ([review PLG3](architecture-review-2026-11-07.md), 2026-11-08): worker
+      types declare `container.runtimeClasses` (gVisor, Kata, ...), nodes
+      advertise the ones that answer `--version`, tasks pick one with
+      `config.runtimeClass` and place only where it is, and the privilege
+      floor is applied, dropped under `isolatesRoot`, or refused per class.
+      Not run under real gVisor or Kata
+      ([docs](../docs/task-runtime-container.md#runtime-classes))
+- [x] **Job rules** ([review PLG4](architecture-review-2026-11-07.md), 2026-11-08): namespace policies take CEL
+      `jobRules`, checked at `job run`, `job plan`, and (with `acl:read`)
+      `job validate`, with the policy and rule named; `--dry-run` lists
+      existing jobs a new rule would refuse. Mutation and a secrets
+      provider stay open ([docs](../docs/namespaces.md#job-rules))
+
 ## Agent surfaces
 
 [docs](../docs/agent-readiness.md)
@@ -7676,6 +7976,43 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
 - [x] An MCP server (`legion mcp serve`), with mutating tools gated behind
       `--allow-write`
 - [x] Idempotency keys on mutating RPCs; validate/plan/preview paths
+- [x] **A durable audit journal** ([review AI2](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [audit-journal.md](../docs/audit-journal.md)): every write RPC and
+      every denial, with accessor, principal, on-behalf-of chain, target,
+      request digest, idempotency key, approval and outcome, recorded by the
+      governance layer from the ACL check itself; replicated, batched,
+      retention-bounded; `ListAuditEvents`, `legion audit list [--follow]`,
+      MCP `legion_audit_list`, `state query` over `audit_event`.
+- [x] **Token expiry by default** ([review AI3](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [auth-and-acls.md](../docs/auth-and-acls.md#token-lifetimes)): 30-day
+      default, 90-day client bound; the bootstrap token is the documented
+      exception.
+- [x] **Child tokens for sub-agents** ([review AI3](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [auth-and-acls.md](../docs/auth-and-acls.md#child-tokens)):
+      `CreateChildToken` / `legion acl token create --child`, a subset of the
+      parent's policies plus the root's denies, expiring and revoked with it.
+- [x] **Approval gates and per-token rate limits** ([review AI3](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [approvals-and-rate-limits.md](../docs/approvals-and-rate-limits.md)):
+      `governance.approvals` rules, `APPROVAL_REQUIRED`/`APPROVAL_INVALID`,
+      `legion approval list|get|approve|deny`, `--approval`; `RATE_LIMITED`
+      with `retryAfterMs`. Budgets are open (Observability).
+- [x] **A caller-aware capability catalog** ([review AI3](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md)):
+      `GetCallerCapabilities`, `legion capabilities --mine`, and the MCP
+      `legion_capabilities` tool.
+- [x] **The MCP server, brought up to date** ([review AI4](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [agent-readiness.md](../docs/agent-readiness.md)): MCP 2025-06-18 with
+      negotiation, annotations, `outputSchema`/`structuredContent`,
+      elicitation for approvals, Streamable HTTP on loopback, and a tool (or
+      a recorded exclusion) for every user-facing RPC, enforced by a test.
+      The job-run wait shipped with the job compare-and-set (next entry).
+- [x] **Compare-and-set and a field diff for jobs**
+      ([review AI5](architecture-review-2026-11-07.md); plan:
+      [revisions-and-watches-plan.md](plans/revisions-and-watches-plan.md) §9;
+      docs: [watches-and-blocking-queries.md](../docs/watches-and-blocking-queries.md#compare-and-set-on-jobs)):
+      `RunJobRequest.expected_version` / `legion job run --expected-version`
+      (ABORTED naming the current version), `Job.version`,
+      `PlanJobReply.diff` in `legion job plan`, and MCP `legion_job_run`
+      `expected_version` and `wait_seconds`.
 
 ## UI
 

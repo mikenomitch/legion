@@ -521,6 +521,7 @@ async fn create(matches: &ArgMatches) -> R<()> {
                             "check it later with `legion snapshot get`, or raise --timeout".into(),
                         ),
                         retryable: true,
+                        details: None,
                     },
                 ));
             }
@@ -802,6 +803,7 @@ async fn restore(matches: &ArgMatches) -> R<()> {
                                 .into(),
                         ),
                         retryable: true,
+                        details: None,
                     },
                 ));
             }

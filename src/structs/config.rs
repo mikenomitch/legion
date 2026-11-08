@@ -109,6 +109,11 @@ pub struct ManagerConfig {
     pub workload_identity: Option<WorkloadIdentityConfig>,
     #[serde(default)]
     pub acl: Option<AclConfig>,
+    /// Agent governance: the audit journal, approval gates, per-token rate
+    /// limits and usage accounting (docs/audit-journal.md,
+    /// docs/approvals-and-rate-limits.md, docs/usage-accounting.md).
+    #[serde(default)]
+    pub governance: Option<crate::structs::governance::GovernanceConfig>,
     pub artifacts: Option<ArtifactsManagerConfig>,
     /// Exec/actions settings (see docs/exec-and-actions.md).
     #[serde(default)]
@@ -1600,9 +1605,21 @@ pub struct AclConfig {
     /// TTL applied to tokens minted via Login when the request omits one.
     pub login_ttl: Option<String>,
     /// Upper bound on the TTL of client tokens minted via CreateAclToken and
-    /// Login. When set, client tokens must expire and may not outlive this
-    /// bound; management tokens are exempt. Default: unbounded.
+    /// Login; management tokens are exempt. Default `2160h` (90 days).
+    /// `"none"` removes the bound (client tokens may then ask for
+    /// `ttl = "never"`).
     pub token_max_ttl: Option<String>,
+    /// Lifetime of a token created through CreateAclToken without a `ttl`
+    /// (client and management alike). Default `720h` (30 days). The
+    /// bootstrap management token is exempt: it never expires
+    /// (docs/auth-and-acls.md, "Token lifetimes").
+    pub token_default_ttl: Option<String>,
+    /// Lifetime of a child token (CreateChildToken) that asks for none.
+    /// Default `1h`.
+    pub child_token_default_ttl: Option<String>,
+    /// Upper bound on a child token's lifetime; it is also bounded by its
+    /// parent's expiry. Default `24h`.
+    pub child_token_max_ttl: Option<String>,
     /// JWT/OIDC auth methods that convert external identities into policies.
     #[serde(default)]
     pub auth_methods: Option<Vec<AclAuthMethodConfig>>,
@@ -1689,8 +1706,33 @@ pub struct AclConfigFull {
     pub audit_only: bool,
     pub login_ttl: String,
     pub token_max_ttl: Option<String>,
+    #[serde(default = "default_token_ttl")]
+    pub token_default_ttl: String,
+    #[serde(default = "default_child_token_ttl")]
+    pub child_token_default_ttl: String,
+    #[serde(default = "default_child_token_max_ttl")]
+    pub child_token_max_ttl: String,
     pub auth_methods: Vec<AclAuthMethodConfig>,
     pub jwks_refresh_interval: String,
+}
+
+/// Default lifetime of a token created without a `ttl` (30 days).
+pub const DEF_ACL_TOKEN_TTL: &str = "720h";
+/// Default upper bound on a client token's lifetime (90 days).
+pub const DEF_ACL_TOKEN_MAX_TTL: &str = "2160h";
+/// Default lifetime of a child token created without a `ttl`.
+pub const DEF_ACL_CHILD_TOKEN_TTL: &str = "1h";
+/// Default upper bound on a child token's lifetime.
+pub const DEF_ACL_CHILD_TOKEN_MAX_TTL: &str = "24h";
+
+fn default_token_ttl() -> String {
+    DEF_ACL_TOKEN_TTL.into()
+}
+fn default_child_token_ttl() -> String {
+    DEF_ACL_CHILD_TOKEN_TTL.into()
+}
+fn default_child_token_max_ttl() -> String {
+    DEF_ACL_CHILD_TOKEN_MAX_TTL.into()
 }
 
 impl Default for AclConfigFull {
@@ -1700,7 +1742,10 @@ impl Default for AclConfigFull {
             bootstrap_secret_file: None,
             audit_only: false,
             login_ttl: DEF_ACL_LOGIN_TTL.into(),
-            token_max_ttl: None,
+            token_max_ttl: Some(DEF_ACL_TOKEN_MAX_TTL.into()),
+            token_default_ttl: DEF_ACL_TOKEN_TTL.into(),
+            child_token_default_ttl: DEF_ACL_CHILD_TOKEN_TTL.into(),
+            child_token_max_ttl: DEF_ACL_CHILD_TOKEN_MAX_TTL.into(),
             auth_methods: Vec::new(),
             jwks_refresh_interval: DEF_ACL_JWKS_REFRESH.into(),
         }
@@ -1797,6 +1842,9 @@ impl From<AclConfigFull> for AclConfig {
             audit_only: Some(val.audit_only),
             login_ttl: Some(val.login_ttl),
             token_max_ttl: val.token_max_ttl,
+            token_default_ttl: Some(val.token_default_ttl),
+            child_token_default_ttl: Some(val.child_token_default_ttl),
+            child_token_max_ttl: Some(val.child_token_max_ttl),
             auth_methods: Some(val.auth_methods),
             jwks_refresh_interval: Some(val.jwks_refresh_interval),
         }
@@ -1824,7 +1872,19 @@ impl AclConfig {
             bootstrap_secret_file: self.bootstrap_secret_file.clone(),
             audit_only: self.audit_only.unwrap_or(d.audit_only),
             login_ttl: self.login_ttl.clone().unwrap_or(d.login_ttl),
-            token_max_ttl: self.token_max_ttl.clone(),
+            token_max_ttl: self.token_max_ttl.clone().or(d.token_max_ttl),
+            token_default_ttl: self
+                .token_default_ttl
+                .clone()
+                .unwrap_or(d.token_default_ttl),
+            child_token_default_ttl: self
+                .child_token_default_ttl
+                .clone()
+                .unwrap_or(d.child_token_default_ttl),
+            child_token_max_ttl: self
+                .child_token_max_ttl
+                .clone()
+                .unwrap_or(d.child_token_max_ttl),
             auth_methods: self.auth_methods.clone().unwrap_or(d.auth_methods),
             jwks_refresh_interval: self
                 .jwks_refresh_interval
@@ -2071,12 +2131,24 @@ pub struct RaftPersistenceConfig {
     pub expected_voters: Option<u32>,
     /// Log entries between snapshots (compaction threshold, default 10000,
     /// applied PER RAFT GROUP). A snapshot is built every this-many applied
-    /// entries and the raft log is purged behind it (a tail of
-    /// `snapshotEntries / 2`, capped at 1000, is kept for cheap follower
-    /// catch-up). `single` topology builds whole-DB `VACUUM INTO` images;
-    /// `lanes` topology builds per-lane table-scoped dumps with the same
-    /// policy per lane.
+    /// entries; how much log is kept behind it is `logRetainBytes`.
+    /// `single` topology builds whole-DB `VACUUM INTO` images; `lanes`
+    /// topology builds per-lane table-scoped dumps with the same policy per
+    /// lane.
     pub snapshot_entries: Option<u64>,
+    /// Bytes of raft log each group keeps behind its latest snapshot,
+    /// default [`DEF_RAFT_LOG_RETAIN_BYTES`] (256 MiB). After every snapshot
+    /// the log is purged down to its newest entries totalling at most this
+    /// many bytes; entries no snapshot covers yet are never purged. A
+    /// follower whose log position is still inside the retained log catches
+    /// up by replay; one that fell further behind receives a full snapshot,
+    /// which is far more expensive (it copies the whole state). So this is
+    /// the knob for "how long can a manager be down and rejoin cheaply":
+    /// `legion_raft_log_retained_seconds` reports the window it buys at the
+    /// current write rate. Bytes rather than entries because entries range
+    /// from hundreds of bytes to megabytes; the budget bounds disk use per
+    /// group whatever the workload. `0` keeps nothing behind the snapshot.
+    pub log_retain_bytes: Option<u64>,
     /// Explicit override for re-stamping a state DB onto a NEW raft cluster
     /// identity. The state DB is stamped with its cluster id at first engine
     /// start; a later start whose derived cluster id differs (e.g. the raft
@@ -2171,6 +2243,7 @@ impl Default for RaftPersistenceConfig {
             join_token: None,
             expected_voters: None,
             snapshot_entries: None,
+            log_retain_bytes: None,
             force_new_cluster: Some(false),
             heartbeat_interval_ms: None,
             election_timeout_min_ms: None,
@@ -2184,6 +2257,11 @@ pub const DEF_RAFT_TOPOLOGY: &str = "single";
 /// Default snapshot/compaction threshold: applied log entries between
 /// whole-DB snapshots in `single` topology (plan §A5).
 pub const DEF_RAFT_SNAPSHOT_ENTRIES: u64 = 10_000;
+/// Default bytes of raft log kept behind each snapshot, per group
+/// (`raft.logRetainBytes`, raft-write-path plan §6.6). 256 MiB holds tens of
+/// thousands of typical entries — minutes of history at a heavy write rate —
+/// for a bounded, predictable amount of disk.
+pub const DEF_RAFT_LOG_RETAIN_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Default leader heartbeat interval (`raft.heartbeatIntervalMs`).
 ///
@@ -2336,6 +2414,8 @@ pub struct ManagerConfigFull {
     pub workload_identity: WorkloadIdentityConfigFull,
     #[serde(default)]
     pub acl: AclConfigFull,
+    #[serde(default)]
+    pub governance: crate::structs::governance::GovernanceConfig,
     pub artifacts: ArtifactsManagerConfigFull,
     #[serde(default)]
     pub exec: ExecConfigFull,
@@ -2441,6 +2521,9 @@ pub struct RaftPersistenceConfigFull {
     /// optional in the Full config — unset means "no expectation declared".
     pub expected_voters: Option<u32>,
     pub snapshot_entries: u64,
+    /// Bytes of log kept behind each snapshot, per group. See
+    /// [`RaftPersistenceConfig::log_retain_bytes`].
+    pub log_retain_bytes: u64,
     pub force_new_cluster: bool,
     /// Leader heartbeat interval, ms. See
     /// [`RaftPersistenceConfig::heartbeat_interval_ms`].
@@ -2467,6 +2550,7 @@ impl Default for RaftPersistenceConfigFull {
             join_token: None,
             expected_voters: None,
             snapshot_entries: DEF_RAFT_SNAPSHOT_ENTRIES,
+            log_retain_bytes: DEF_RAFT_LOG_RETAIN_BYTES,
             force_new_cluster: false,
             heartbeat_interval_ms: DEF_RAFT_HEARTBEAT_INTERVAL_MS,
             election_timeout_min_ms: DEF_RAFT_ELECTION_TIMEOUT_MIN_MS,
@@ -2543,6 +2627,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
             persistence: Some(val.persistence.into()),
             workload_identity: Some(val.workload_identity.into()),
             acl: Some(val.acl.into()),
+            governance: Some(val.governance),
             artifacts: Some(val.artifacts.into()),
             exec: Some(ExecConfig {
                 enabled: Some(val.exec.enabled),
@@ -2616,6 +2701,7 @@ impl ManagerConfig {
                 .as_ref()
                 .map(AclConfig::with_defaults)
                 .unwrap_or_default(),
+            governance: self.governance.clone().unwrap_or_default(),
             artifacts: self
                 .artifacts
                 .as_ref()
@@ -2689,6 +2775,7 @@ impl Default for ManagerConfigFull {
             persistence: PersistenceConfigFull::default(),
             workload_identity: WorkloadIdentityConfigFull::default(),
             acl: AclConfigFull::default(),
+            governance: Default::default(),
             artifacts: ArtifactsManagerConfigFull::default(),
             exec: ExecConfigFull::default(),
             telemetry: TelemetryConfigFull::default(),
@@ -2778,6 +2865,7 @@ impl RaftPersistenceConfig {
             join_token: self.join_token.clone(),
             expected_voters: self.expected_voters,
             snapshot_entries: self.snapshot_entries.unwrap_or(DEF_RAFT_SNAPSHOT_ENTRIES),
+            log_retain_bytes: self.log_retain_bytes.unwrap_or(DEF_RAFT_LOG_RETAIN_BYTES),
             force_new_cluster: self.force_new_cluster.unwrap_or(false),
             heartbeat_interval_ms: self
                 .heartbeat_interval_ms
@@ -2882,6 +2970,7 @@ impl From<RaftPersistenceConfigFull> for RaftPersistenceConfig {
             join_token: value.join_token,
             expected_voters: value.expected_voters,
             snapshot_entries: Some(value.snapshot_entries),
+            log_retain_bytes: Some(value.log_retain_bytes),
             force_new_cluster: Some(value.force_new_cluster),
             heartbeat_interval_ms: Some(value.heartbeat_interval_ms),
             election_timeout_min_ms: Some(value.election_timeout_min_ms),
@@ -2996,6 +3085,11 @@ pub struct WorkerConfigAlt {
     /// capability set.
     #[serde(default)]
     pub container: Option<WorkerContainerConfig>,
+    /// Devices on workers of this type: plugins that discover them, devices
+    /// declared by hand, and where CDI specs live (docs/devices.md). Absent
+    /// means no devices.
+    #[serde(default)]
+    pub devices: Option<crate::devices::plugin::WorkerDevicesConfig>,
 }
 
 /// Worker-type `container` block. Carried to the worker as JSON in
@@ -3012,6 +3106,14 @@ pub struct WorkerContainerConfig {
     /// not add any.
     #[serde(default)]
     pub allow_caps: Option<Vec<String>>,
+    /// OCI runtime classes beyond the node's default runtime, by name
+    /// (docs/task-runtime-container.md, "Runtime classes"): gVisor, Kata, or
+    /// any runtime with runc's command line. A task picks one with
+    /// `config.runtimeClass`; the node advertises the ones whose runtime
+    /// answers `--version`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub runtime_classes:
+        std::collections::BTreeMap<String, crate::task_plugins::runtime_class::RuntimeClassConfig>,
 }
 
 impl WorkerContainerConfig {
@@ -3306,9 +3408,9 @@ pub const DEF_ARTIFACT_FETCH_PARALLELISM: usize = 4;
 /// Default per-artifact fetch attempts before the allocation fails.
 pub const DEF_ARTIFACT_FETCH_ATTEMPTS: u32 = 3;
 /// Default overall fetch deadline per artifact.
-pub const DEF_ARTIFACT_FETCH_TIMEOUT: &str = "10m";
+pub const DEF_ARTIFACT_FETCH_TIMEOUT: &str = "2h";
 /// Default per-artifact size cap (also bounds decompression).
-pub const DEF_ARTIFACT_MAX_SIZE: &str = "50GiB";
+pub const DEF_ARTIFACT_MAX_SIZE: &str = "1TiB";
 
 /// Worker-level artifact settings (worker config `artifacts` block). The
 /// cache plan later adds a sibling `cache` block under the same key.
@@ -3357,10 +3459,48 @@ pub struct WorkerContentConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerContentBudgets {
-    /// Cached artifacts. Default 10% of the disk, clamped to 1..20 GiB.
-    pub artifacts: Option<String>,
+    /// Cached artifacts (model weights included). Default 50% of the disk,
+    /// at least 1 GiB, no ceiling.
+    pub artifacts: Option<ContentBudget>,
     /// Checkpoint parts. Default 20% of the disk, clamped to 2..200 GiB.
-    pub snapshots: Option<String>,
+    pub snapshots: Option<ContentBudget>,
+}
+
+/// One `content.budgets` entry: a size or share as text (`"50GiB"`,
+/// `"20%"`), or a share with bounds: `{ share = "60%", max = "4TiB",
+/// min = "10GiB" }`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum ContentBudget {
+    Text(String),
+    Share {
+        share: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<String>,
+    },
+}
+
+impl From<&str> for ContentBudget {
+    fn from(text: &str) -> Self {
+        ContentBudget::Text(text.to_string())
+    }
+}
+
+impl ContentBudget {
+    fn spec(&self) -> R<crate::content_store::BudgetSpec> {
+        match self {
+            ContentBudget::Text(raw) => crate::content_store::BudgetSpec::parse(raw),
+            ContentBudget::Share { share, min, max } => {
+                crate::content_store::BudgetSpec::share_within(
+                    share,
+                    min.as_deref(),
+                    max.as_deref(),
+                )
+            }
+        }
+    }
 }
 
 impl WorkerContentConfig {
@@ -3377,25 +3517,27 @@ impl WorkerContentConfig {
             return Ok(None);
         }
         let budgets = self.budgets.clone().unwrap_or_default();
-        let budget = |class: &str, raw: Option<&str>, default: BudgetSpec| -> R<BudgetSpec> {
-            match raw {
-                None => Ok(default),
-                Some(raw) => BudgetSpec::parse(raw).with_context(|| {
-                    format!(
-                        "invalid content.budgets.{class} {raw:?} (expected a size such as \
-                         \"20GiB\" or a share of the disk such as \"20%\")"
-                    )
-                }),
-            }
-        };
+        let budget =
+            |class: &str, raw: Option<&ContentBudget>, default: BudgetSpec| -> R<BudgetSpec> {
+                match raw {
+                    None => Ok(default),
+                    Some(raw) => raw.spec().with_context(|| {
+                        format!(
+                            "invalid content.budgets.{class} {raw:?} (expected a size such as \
+                             \"20GiB\", a share of the disk such as \"20%\", or a bounded share \
+                             such as {{ share = \"50%\", max = \"2TiB\" }})"
+                        )
+                    }),
+                }
+            };
         let artifacts = budget(
             "artifacts",
-            budgets.artifacts.as_deref(),
+            budgets.artifacts.as_ref(),
             DEF_CONTENT_ARTIFACTS_BUDGET,
         )?;
         let snapshots = budget(
             "snapshots",
-            budgets.snapshots.as_deref(),
+            budgets.snapshots.as_ref(),
             DEF_CONTENT_SNAPSHOTS_BUDGET,
         )?;
         // Shares of one disk cannot add up past all of it. Defaults count,
@@ -3453,6 +3595,11 @@ pub struct WorkerArtifactsPayload {
     /// act on the session manifests the `contentStore` holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions: Option<WorkerSessionsConfig>,
+    /// The top-level `devices` block (docs/devices.md), riding the same
+    /// payload for the same reason: device plugins, static devices, and CDI
+    /// spec dirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devices: Option<crate::devices::plugin::WorkerDevicesConfig>,
 }
 
 /// A worker's `sessions` block (docs/session-mode.md, "No split brain").
@@ -3501,8 +3648,8 @@ impl Default for WorkerArtifactFetchConfigFull {
         WorkerArtifactFetchConfigFull {
             parallelism: DEF_ARTIFACT_FETCH_PARALLELISM,
             attempts: DEF_ARTIFACT_FETCH_ATTEMPTS,
-            timeout_secs: 600,
-            max_artifact_size_bytes: 50 * 1024 * 1024 * 1024,
+            timeout_secs: 2 * 3600,
+            max_artifact_size_bytes: 1 << 40,
             allowed_schemes: DEF_ARTIFACT_ALLOWED_SCHEMES
                 .iter()
                 .map(|s| s.to_string())
@@ -3680,20 +3827,20 @@ mod tests {
         let small = on(8 * GIB)?;
         assert_eq!(
             (small.artifacts, small.snapshots),
-            (GIB, 2 * GIB),
-            "the floors"
+            (4 * GIB, 2 * GIB),
+            "half the disk for artifacts, the snapshots floor"
         );
         let mid = on(100 * GIB)?;
         assert_eq!(
             (mid.artifacts, mid.snapshots),
-            (10 * GIB, 20 * GIB),
+            (50 * GIB, 20 * GIB),
             "the shares"
         );
         let big = on(4096 * GIB)?;
         assert_eq!(
             (big.artifacts, big.snapshots),
-            (20 * GIB, 200 * GIB),
-            "the caps"
+            (2048 * GIB, 200 * GIB),
+            "artifacts uncapped (model scale), the snapshots cap"
         );
         assert_eq!(
             defaults.config_for(Some(1024 * GIB))?,
@@ -3769,7 +3916,11 @@ mod tests {
         assert_eq!(settings.budgets.snapshots.percent(), Some(50.0));
         let sized = settings.config_for(Some(1000 * GIB))?;
         assert_eq!(sized.budgets.snapshots, 500 * GIB);
-        assert_eq!(sized.budgets.artifacts, 20 * GIB, "default artifacts cap");
+        assert_eq!(
+            sized.budgets.artifacts,
+            500 * GIB,
+            "default artifacts share"
+        );
         assert_eq!(BudgetSpec::parse(" 12.5% ")?.resolve(800), 100);
 
         let err = |config: WorkerContentConfig| format!("{:#}", config.resolve().unwrap_err());
@@ -3795,6 +3946,18 @@ mod tests {
             with(Some("90%"), Some("50GiB")).resolve().is_ok(),
             "a fixed size is no share"
         );
+        // A bounded share: the object form (AI6, an operator's ceiling).
+        let bounded: WorkerContentConfig = serde_json::from_str(
+            r#"{"budgets":{"artifacts":{"share":"60%","max":"100GiB","min":"10GiB"}}}"#,
+        )?;
+        let sized = bounded
+            .resolve()?
+            .expect("enabled")
+            .config_for(Some(1000 * GIB))?;
+        assert_eq!(sized.budgets.artifacts, 100 * GIB, "the ceiling");
+        let bad: WorkerContentConfig =
+            serde_json::from_str(r#"{"budgets":{"artifacts":{"share":"60GiB"}}}"#)?;
+        assert!(err(bad).contains("content.budgets.artifacts"));
         Ok(())
     }
 
@@ -4081,7 +4244,11 @@ mod tests {
         let defaults = WorkerArtifactsConfig::default().fetch_with_defaults()?;
         assert_eq!(defaults.parallelism, DEF_ARTIFACT_FETCH_PARALLELISM);
         assert_eq!(defaults.attempts, DEF_ARTIFACT_FETCH_ATTEMPTS);
-        assert_eq!(defaults.timeout_secs, 600);
+        assert_eq!(
+            defaults.timeout_secs,
+            2 * 3600,
+            "model-scale downloads fit the default"
+        );
         assert!(!defaults.allowed_schemes.contains(&"http".to_string()));
 
         let config: WorkerArtifactsConfig = serde_json::from_value(serde_json::json!({

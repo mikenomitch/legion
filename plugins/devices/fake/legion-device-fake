@@ -1,0 +1,39 @@
+#!/bin/sh
+# legion-device-fake: a device plugin (protocol legion-device/1) that reports
+# whatever inventory file it is given. Legion's tests use it; it is also the
+# smallest complete example of the protocol (docs/devices.md).
+#
+#   devices.plugins.fake = {
+#     command = ["/opt/legion/plugins/devices/fake/legion-device-fake",
+#                "/etc/legion/fake-devices.json"],
+#   }
+#
+# The inventory file is the `devices` list of a fingerprint reply:
+#
+#   [{"vendor":"fake","type":"gpu","model":"f1",
+#     "instances":[{"id":"fake-0"},{"id":"fake-1","healthy":false}]}]
+#
+# Edit the file to simulate a device failing or appearing: the worker
+# re-fingerprints on every node-check pass.
+#
+# `allocate` answers with FAKE_VISIBLE_DEVICES=<ids> and /dev/null as the
+# device node, so a container task really gets a device node and an allow
+# rule.
+set -eu
+
+inventory=${1:?usage: legion-device-fake <inventory.json>}
+request=$(cat)
+
+case "$request" in
+*'"op":"fingerprint"'*)
+    printf '{"devices":%s}\n' "$(cat "$inventory")"
+    ;;
+*'"op":"allocate"'*)
+    ids=$(printf '%s' "$request" | sed 's/.*"ids":\[\([^]]*\)\].*/\1/' | tr -d '" ')
+    printf '{"containerEdits":{"env":["FAKE_VISIBLE_DEVICES=%s"],"deviceNodes":[{"path":"/dev/null"}]}}\n' "$ids"
+    ;;
+*)
+    echo "legion-device-fake: unsupported request" >&2
+    exit 2
+    ;;
+esac

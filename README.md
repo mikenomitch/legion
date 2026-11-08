@@ -456,7 +456,8 @@ start:
   [Autoscaling Plugins](docs/autoscaling-plugins.md) ·
   [Gang Scheduling](docs/gang-scheduling.md) ·
   [Task Supervision](docs/task-supervision.md) ·
-  [Resource Enforcement](docs/resource-enforcement.md)
+  [Resource Enforcement](docs/resource-enforcement.md) ·
+  [Devices and GPUs](docs/devices.md)
 - **Sandboxes:** [Sandbox Runtime](docs/task-runtime-sandbox.md) ·
   [Running Agent Sandboxes](docs/guides/agent-sandboxes.md) ·
   [Sandboxes at Scale](docs/sandboxes-at-scale.md) ·
@@ -469,10 +470,14 @@ start:
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
   [Network Handlers](docs/network-handlers.md) ·
   [Network Plugins](docs/network-plugins.md) · [KV Store](docs/kv-store.md) ·
+  [Watches & Blocking Queries](docs/watches-and-blocking-queries.md) ·
   [Exec & Actions](docs/exec-and-actions.md) · [The Cluster CA](docs/cluster-ca.md) ·
   [Cert Manager](docs/cert-manager.md)
 - **Sharing a cluster:** [Namespaces](docs/namespaces.md) ·
   [Auth & ACLs](docs/auth-and-acls.md) ·
+  [Audit Journal](docs/audit-journal.md) ·
+  [Approvals and Rate Limits](docs/approvals-and-rate-limits.md) ·
+  [Usage Accounting](docs/usage-accounting.md) ·
   [Workload Identity](docs/workload-identity.md)
 - **Operating a cluster:** [Running Raft](docs/raft-operations.md) ·
   [Upgrades](docs/upgrades.md) · [Data Directory](docs/data-directory.md) ·

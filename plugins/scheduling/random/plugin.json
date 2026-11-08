@@ -1,5 +1,5 @@
 {
   "kind": "scheduling",
   "name": "random",
-  "legionApiVersion": 2
+  "legionApiVersion": 3
 }

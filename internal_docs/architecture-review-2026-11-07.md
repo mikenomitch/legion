@@ -794,40 +794,45 @@ See PLG2. This is the largest gap for AI workloads.
 
 ## Finding index
 
-| ID | Finding | Impact | Tracked before |
-| --- | --- | --- | --- |
-| NET1 | Endpoint feed rebuilt every heartbeat; plan claimed delta push shipped | High | No |
-| NET2 | Policy assignments recomputed every heartbeat | High | No |
-| NET3 | Full mTLS handshake per mesh connection; resumption cache dropped | Med-high | Partly |
-| NET4 | Uncapped HTTP request body buffering | Medium | No |
-| NET5 | IPv6 address formatting and binding | Medium | No |
-| NET6 | nftables fallback: no established short-circuit, `nft` fork per beat | Low-med | Partly |
-| NET7 | No splay on CA-rotation reissue | Low | No |
-| NET8 | Per-connection global mutex and allocations | Low | No |
-| NET9 | 255 allocations with upstreams per node | Low | No |
-| SCH1 | Stop-and-wait lane, cross-lane capture mutex, double execution | Critical | Partly |
-| SCH2 | `plan_submission` never pruned | High | No |
-| SCH3 | Claim cost grows with queue depth | High | No |
-| SCH4 | Scoring by allocation count, not resources | Med-high | No |
-| SCH5 | Apply writes JSON and reads it back | Medium | Partly |
-| SCH6 | Scheduling plugin seam is one `select_node` call, cluster-wide | Medium | No |
-| SCH7 | No soft spread, node-class cache, usage-aware placement, descheduler | Medium | No |
-| SCH8 | Info logs per plan and claim | Low | No |
-| SCH9 | `NEXT_UP.md` numbers out of date | Doc | No |
-| ST1 | Schema-coupled log; data migrations outside the log | Med-high | No |
-| ST2 | No revision, watch, or blocking query for core objects | High | No |
-| ST3 | Full worker resync on manager restart | Medium | No |
-| ST4 | In-memory snapshots; 1,000-entry log tail | Medium | Partly |
-| ST5 | Blocking store work in the heartbeat handler | Medium | No |
-| PLG1 | Dylib ABI, no panic containment | High | Partly |
-| PLG2 | No device model; GPUs unsupported | Critical (AI) | No |
-| PLG3 | Closed task runtimes; runc/crun only | Medium | No |
-| PLG4 | No admission policy on jobs; no secrets provider | Medium | No |
-| PLG5 | Shallow rollout and node-check seams | Low-med | Partly |
-| AI2 | No audit journal | High | No |
-| AI3 | Token expiry, attenuation, approvals, rate limits, caller-aware catalog | High | No |
-| AI4 | MCP protocol revision and coverage | Med-high | No |
-| AI5 | No CAS or field diff on jobs | Medium | No |
-| AI6 | Artifact cache too small for model weights; no P2P or lazy loading | Med-high | Partly |
-| AI7 | Gang topology and interruption awareness | Medium | No |
-| AI9 | No usage accounting over time | Medium | No |
+The status column records what the fix change of 2026-11-08 did with each
+finding: one plan per area, each with its judgement calls, and every open
+remainder is an item in [TODO.md](TODO.md). AI8 (sandbox verification) needs
+a real VMM and was not attempted.
+
+| ID | Finding | Impact | Tracked before | Status (2026-11-08) |
+| --- | --- | --- | --- | --- |
+| NET1 | Endpoint feed rebuilt every heartbeat; plan claimed delta push shipped | High | No | Fixed: versioned per-service sets, deltas on heartbeat and pushed on StreamWork ([plan](plans/mesh-control-path-plan.md)) |
+| NET2 | Policy assignments recomputed every heartbeat | High | No | Fixed: memoized per policy generation and input ([plan](plans/mesh-control-path-plan.md)) |
+| NET3 | Full mTLS handshake per mesh connection; resumption cache dropped | Med-high | Partly | Partly: resumption survives refreshes; pooled tunnels and kTLS open ([plan](plans/mesh-control-path-plan.md)) |
+| NET4 | Uncapped HTTP request body buffering | Medium | No | Fixed: streamed; buffered only for retries, capped by `maxBodyBytes` ([plan](plans/mesh-control-path-plan.md)) |
+| NET5 | IPv6 address formatting and binding | Medium | No | Fixed: bracketed host:port end to end, dual-stack ingress ([plan](plans/mesh-control-path-plan.md)) |
+| NET6 | nftables fallback: no established short-circuit, `nft` fork per beat | Low-med | Partly | Mostly: established short-circuit, vmap dispatch, counters every 10s; netlink open ([plan](plans/mesh-control-path-plan.md)) |
+| NET7 | No splay on CA-rotation reissue | Low | No | Fixed: per-node splay up to 10 min ([plan](plans/mesh-control-path-plan.md)) |
+| NET8 | Per-connection global mutex and allocations | Low | No | Mostly: sharded ledger, atomic in-flight, pooled buffers; endpoint interning open ([plan](plans/mesh-control-path-plan.md)) |
+| NET9 | 255 allocations with upstreams per node | Low | No | Fixed: 16,384 VIP blocks from 127.64.0.0/10; datapath ports 61000–65535 ([plan](plans/mesh-control-path-plan.md)) |
+| SCH1 | Stop-and-wait lane, cross-lane capture mutex, double execution | Critical | Partly | Partly: group commit, one fsync per entry, leader executes once under `single`; overlap and a per-lane mutex (needs a DB file per lane) open ([plan](plans/raft-write-path-plan.md)) |
+| SCH2 | `plan_submission` never pruned | High | No | Fixed: applied plans write no row; ~1,000 rejected kept ([plan](plans/placement-and-commit-cost-plan.md)) |
+| SCH3 | Claim cost grows with queue depth | High | No | Fixed: index-usable claim queries, bounded count ([plan](plans/placement-and-commit-cost-plan.md)) |
+| SCH4 | Scoring by allocation count, not resources | Med-high | No | Fixed: dominant-resource scoring, count-scaled anti-affinity ([plan](plans/placement-and-commit-cost-plan.md)) |
+| SCH5 | Apply writes JSON and reads it back | Medium | Partly | Partly: JSON round trip gone; node-row read open ([plan](plans/placement-and-commit-cost-plan.md)) |
+| SCH6 | Scheduling plugin seam is one `select_node` call, cluster-wide | Medium | No | Not in this change |
+| SCH7 | No soft spread, node-class cache, usage-aware placement, descheduler | Medium | No | Not in this change |
+| SCH8 | Info logs per plan and claim | Low | No | Fixed ([plan](plans/placement-and-commit-cost-plan.md)) |
+| SCH9 | `NEXT_UP.md` numbers out of date | Doc | No | Not in this change (owner's file) |
+| ST1 | Schema-coupled log; data migrations outside the log | Med-high | No | Mostly: data steps run once through the log; logical commands open ([plan](plans/raft-write-path-plan.md)) |
+| ST2 | No revision, watch, or blocking query for core objects | High | No | Fixed: revisions, blocking reads, `Watch`, monotonic event ids, read-after-write, linearizable reads; `WatchObjects` open ([plan](plans/revisions-and-watches-plan.md)) |
+| ST3 | Full worker resync on manager restart | Medium | No | Mostly: workers resume on any manager whose journal covers them; a restarted manager still resyncs ([plan](plans/revisions-and-watches-plan.md)) |
+| ST4 | In-memory snapshots; 1,000-entry log tail | Medium | Partly | Fixed: `raft.logRetainBytes` (256 MiB); in-memory snapshots still open ([plan](plans/raft-write-path-plan.md)) |
+| ST5 | Blocking store work in the heartbeat handler | Medium | No | Fixed: heartbeat store work on the blocking pool ([plan](plans/revisions-and-watches-plan.md)) |
+| PLG1 | Dylib ABI, no panic containment | High | Partly | Partly: panic containment and quarantine for scheduling, rollout, node-check, fetcher plugins; out-of-process/WASM open ([plan](plans/device-model-and-plugin-seams-plan.md)) |
+| PLG2 | No device model; GPUs unsupported | Critical (AI) | No | Phase 1: device plugins, assignment, CDI, quota; not run on real GPUs; MIG/VFIO open ([plan](plans/device-model-and-plugin-seams-plan.md)) |
+| PLG3 | Closed task runtimes; runc/crun only | Medium | No | Fixed: OCI runtime classes ([plan](plans/device-model-and-plugin-seams-plan.md)) |
+| PLG4 | No admission policy on jobs; no secrets provider | Medium | No | Partly: CEL job rules; mutation and secrets provider open ([plan](plans/device-model-and-plugin-seams-plan.md)) |
+| PLG5 | Shallow rollout and node-check seams | Low-med | Partly | Partly: node checks typed and cached; rollout hooks open ([plan](plans/device-model-and-plugin-seams-plan.md)) |
+| AI2 | No audit journal | High | No | Fixed: replicated audit journal ([plan](plans/agent-governance-plan.md)) |
+| AI3 | Token expiry, attenuation, approvals, rate limits, caller-aware catalog | High | No | Fixed: expiry by default, child tokens, approvals, rate limits, caller-aware catalog ([plan](plans/agent-governance-plan.md)) |
+| AI4 | MCP protocol revision and coverage | Med-high | No | Mostly: MCP 2025-06-18, annotations, structured results, elicitation, loopback HTTP, full RPC coverage; SSE and remote auth open ([plan](plans/agent-governance-plan.md)) |
+| AI5 | No CAS or field diff on jobs | Medium | No | Fixed: `expected_version` and a field diff; intent layer a non-goal ([plan](plans/revisions-and-watches-plan.md)) |
+| AI6 | Artifact cache too small for model weights; no P2P or lazy loading | Med-high | Partly | Partly: 50%-of-disk cache, 1 TiB artifacts, ORAS layers cached; P2P and lazy loading open ([plan](plans/device-model-and-plugin-seams-plan.md)) |
+| AI7 | Gang topology and interruption awareness | Medium | No | Partly: `gang.topology`; interruption awareness open ([plan](plans/placement-and-commit-cost-plan.md)) |
+| AI9 | No usage accounting over time | Medium | No | Fixed: hourly usage rollups incl. devices ([plan](plans/agent-governance-plan.md)) |

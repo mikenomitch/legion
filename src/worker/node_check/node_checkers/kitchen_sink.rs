@@ -11,10 +11,6 @@ impl NodeChecker for KitchenSinkNodeChecker {
         "kitchen-sink"
     }
 
-    fn has_fingerprinter(&self) -> bool {
-        true
-    }
-
     fn fingerprint(&self) -> Map<String, Value> {
         let mut sys = System::new_all();
         sys.refresh_all();

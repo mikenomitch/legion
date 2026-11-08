@@ -92,6 +92,12 @@
 
       # Lifetime of tokens minted by `legion raft join-token`.
       joinTokenTtlSeconds = 900,
+
+      # Bytes of raft log each group keeps behind its latest snapshot
+      # (default 256 MiB). A restarted manager still inside the kept log
+      # catches up by replay; one further behind gets a full snapshot.
+      # `legion_raft_log_retained_seconds` shows the window it buys.
+      # logRetainBytes = 268435456,
     },
   },
 

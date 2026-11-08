@@ -36,14 +36,11 @@ impl SchedulingPolicy for RandomPolicy {
     }
 }
 
-// Lets the host refuse this dylib if it was built with a different rustc or
-// legion version (Rust has no stable ABI).
-legion::declare_plugin_abi!();
-
-#[no_mangle]
-pub extern "C" fn get() -> Box<dyn SchedulingPolicy> {
-    Box::new(RandomPolicy::new())
-}
+// Exports the ABI fingerprint, the panic probe, and the contained
+// constructor: a panic in `select_node` quarantines the plugin and the
+// scheduler places with bin_pack instead (docs/plugin-system.md, "Panics
+// and quarantine").
+legion::export_scheduling_policy!(RandomPolicy::new());
 
 #[cfg(test)]
 mod tests {

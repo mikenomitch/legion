@@ -574,13 +574,17 @@ purpose:
   # A band not listed is uncapped.
   quota = {
     high   = { cpu = 64000,  memory = "128Gi" },
-    normal = { cpu = 200000, memory = "512Gi", cores = 32 },
+    normal = { cpu = 200000, memory = "512Gi", cores = 32, devices = { "nvidia/gpu" = 8 } },
   },
   maxJobs = 300,
   maxNamespaces = 8,                                    # caps delegated creation
   pools = { allowed = ["shared-*", "payments-gpu"], default = "shared-general" },
   runtimes = ["container", "sandbox"],
   hostVolumes = ["payments-*"],
+  jobRules = [
+    { rule = "self.tasks.all(t, !has(t.config.image) || !t.config.image.endsWith(':latest'))",
+      message = "pin images by tag or digest, not :latest" },
+  ],
 }
 ```
 
@@ -588,7 +592,8 @@ purpose:
 | --- | --- |
 | `name` | Unique: letters, digits, `-`, `_`, `.` |
 | `namespaces` | Required, non-empty: namespace names or `*`-globs. A glob reaches a reserved `legion-*` namespace only when it starts with `legion-` |
-| `quota` | Band (`critical` … `background`) → `{ cpu (MHz), memory (MiB, or a size like "64Gi"), cores }`; each dimension optional |
+| `quota` | Band (`critical` … `background`) → `{ cpu (MHz), memory (MiB, or a size like "64Gi"), cores, devices }`; each dimension optional. `devices` maps a device name (`gpu`, `nvidia/gpu`, `nvidia/gpu/<model>`) to a count ([Device quota](#device-quota)) |
+| `jobRules` | CEL rules every job must satisfy: `[{ rule, message }]` ([Job rules](#job-rules)) |
 | `maxJobs` | Jobs (any state) across every matching namespace |
 | `maxNamespaces` | Namespaces matching the policy |
 | `pools.allowed` | Pool names or globs every task must run in |
@@ -614,7 +619,8 @@ work that was already admitted:
 
 | Moment | Checks |
 | --- | --- |
-| `job run`, `job plan`, `RunJobTemplate` | runtimes, pools, host volumes, quota, `maxJobs` |
+| `job run`, `job plan`, `RunJobTemplate` | job rules, runtimes, pools, host volumes, quota (devices included), `maxJobs` |
+| `job validate` | job rules, when the caller can read the policies (`acl:read`); otherwise it warns that they were not checked |
 | `job scale` out | quota (scale-in is never refused) |
 | `instance create` (keyed, named sessions) | quota, for the new instances |
 | `namespace create` | `maxNamespaces` |
@@ -686,6 +692,63 @@ The `legion_namespace_reserved_*` gauges show live reservations only, so
 they can read lower than the charged usage while admitted work is still
 placing.
 
+### Device quota
+
+`quota.<band>.devices` caps devices ([docs/devices.md](devices.md)) by
+name, charged like cpu and memory: the larger of what a job declares (count
+× its `resources.devices` requests) and what its live allocations were
+assigned. A request counts against every key it could be served under, so a
+request for `gpu` counts against an `nvidia/gpu` cap (an NVIDIA card could
+serve it) and a request for `amd/gpu` does not:
+
+```console
+$ legion job run train.ncl -n ml-research
+error: namespace policy 'ml-teams' caps band 'normal' at 8 nvidia/gpu devices across ml-*;
+       in use 8, this job adds 2
+```
+
+`legion namespace get` and the `legion_namespace_reserved_*` gauges do not
+show device usage yet.
+
+### Job rules
+
+`jobRules` are [CEL](https://cel.dev) expressions every job in the governed
+namespaces must satisfy, the house rules no field of the jobspec expresses:
+
+```nickel
+jobRules = [
+  { rule = "self.tasks.all(t, !has(t.config.image) || !t.config.image.endsWith(':latest'))",
+    message = "pin images by tag or digest, not :latest" },
+  { rule = "self.tasks.all(t, !has(t.service) || has(t.service.meta.owner))",
+    message = "every service names an owner in service.meta.owner" },
+],
+```
+
+- `self` is the parsed jobspec, as JSON: `name` (the canonical id,
+  `namespace/name` outside `default`), `priority`, and `tasks[]` with each
+  task's `name`, `group`, `runtime`, `config`, `resources`, `service`,
+  `constraints`, `permit`, and the rest, before a policy's default pool is
+  written in.
+- A rule that does not evaluate to `true` refuses the job, naming each
+  failing rule, at `job run`, `job plan`, and `RunJobTemplate`, and at `job
+  validate` when the caller can read the policies:
+
+  ```text
+  the job breaks 1 job rule(s): namespace policy 'house-rules' jobRules[0]: pin images by tag or digest, not :latest
+  ```
+
+- Rules have the bounds app object kind rules have ([docs/app-
+  objects.md](app-objects.md)): at most 32 rules of 1 KiB each, a 10 ms
+  budget per rule and 50 ms per job, and a rule that errors or runs out of
+  time refuses the job (they fail closed). `oldSelf` is refused: a job rule
+  sees only the job being submitted.
+- A rule that does not compile is refused at `namespace policy apply`.
+  `--dry-run` lists the existing jobs a new rule would refuse.
+- Like every policy check, a rule refuses what comes next and never touches
+  a job that was already admitted.
+
+Rules validate; they never change a job (there is no mutation policy).
+
 ### Previewing a policy
 
 `--dry-run` validates the policy and lists what it would have refused among
@@ -714,6 +777,23 @@ $ legion namespace policy list
 $ legion namespace policy get payments      # limits, aggregate and per-namespace usage
 $ legion namespace policy delete payments
 ```
+
+## Usage over time
+
+A namespace's charged usage is what it holds now. What it used over time —
+reserved CPU core-hours, memory GiB-hours, cores, allocation-hours and any
+custom resource, in hourly buckets — is [usage accounting](usage-accounting.md):
+
+```bash
+legion namespace usage team-a --since 7d            # one namespace
+legion namespace usage team-a --by job --since 24h  # per job
+legion usage --namespaces 'team-*' --by submitter   # per submitting token
+```
+
+Rows are shown per namespace the caller can `namespace:read`; per-job and
+per-submitter rows also need `job:read`. It integrates reservations, not
+measured use, and is the basis future namespace budgets will be checked
+against.
 
 ## The UI
 

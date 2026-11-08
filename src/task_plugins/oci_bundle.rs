@@ -698,6 +698,7 @@ pub(crate) fn build_bundle(
         netns: ctx.netns,
         security: ctx.security,
         policy: ctx.policy,
+        devices: ctx.devices,
     };
     let spec = build_spec(command, env, &image, &user, &ctx);
     let config_path = bundle_dir.join("config.json");
@@ -1580,6 +1581,11 @@ pub(crate) struct BundleContext<'a> {
     /// The process's capability set and rlimits: the defaults, or the
     /// container task's `security.capabilities` / `ulimits`.
     pub(crate) policy: &'a ProcessPolicy,
+    /// The container edits of the allocation's devices (docs/devices.md):
+    /// device nodes with their cgroup allow rules, mounts, env, and hooks,
+    /// applied last. [`crate::devices::cdi::NO_EDITS`] keeps the deny-all
+    /// device rule alone.
+    pub(crate) devices: &'a crate::devices::cdi::ContainerEdits,
 }
 
 /// What confines a container beyond its namespaces and capabilities
@@ -1760,6 +1766,10 @@ fn build_spec(
     if ctx.security.seccomp {
         spec["linux"]["seccomp"] = crate::task_plugins::seccomp::default_profile();
     }
+    // Devices last (docs/devices.md): each device node gets an allow rule
+    // after the deny-all one, so the container reaches exactly the devices
+    // it was assigned and nothing else.
+    ctx.devices.apply_to_oci_spec(&mut spec);
     spec
 }
 
@@ -1847,6 +1857,7 @@ mod tests {
             netns: Some(netns),
             security: BundleSecurity::default(),
             policy: &ProcessPolicy::default(),
+            devices: &crate::devices::cdi::NO_EDITS,
         };
         let spec = build_spec(
             &["true".to_string()],
@@ -1897,6 +1908,7 @@ mod tests {
                 cgroup_namespace: true,
             },
             policy: &ProcessPolicy::default(),
+            devices: &crate::devices::cdi::NO_EDITS,
         };
         let spec = build_spec(
             &["true".to_string()],
@@ -2136,6 +2148,7 @@ mod tests {
                 netns: None,
                 security: BundleSecurity::default(),
                 policy: &ProcessPolicy::default(),
+                devices: &crate::devices::cdi::NO_EDITS,
             },
         );
 
@@ -2204,6 +2217,7 @@ mod tests {
                 netns: None,
                 security: BundleSecurity::default(),
                 policy: &ProcessPolicy::default(),
+                devices: &crate::devices::cdi::NO_EDITS,
             },
         )
     }
@@ -2322,6 +2336,7 @@ mod tests {
                 netns: None,
                 security: BundleSecurity::default(),
                 policy: &ProcessPolicy::default(),
+                devices: &crate::devices::cdi::NO_EDITS,
             },
         );
 
@@ -2386,6 +2401,7 @@ mod tests {
                 netns: None,
                 security: BundleSecurity::default(),
                 policy: &ProcessPolicy::default(),
+                devices: &crate::devices::cdi::NO_EDITS,
             },
         );
         let env = spec["process"]["env"].as_array().unwrap();
@@ -2589,6 +2605,7 @@ mod tests {
                 netns: None,
                 security: BundleSecurity::default(),
                 policy: &policy,
+                devices: &crate::devices::cdi::NO_EDITS,
             },
         );
         assert_eq!(caps(&spec, "bounding"), vec!["CAP_NET_RAW".to_string()]);

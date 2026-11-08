@@ -290,7 +290,7 @@ pass) is not checked.
 $ legion net ca rotate
 Rotated the cluster CA. The new CA (pin sha256:...) signs every certificate from now on.
 The previous CA stays trusted until 2026-11-03T18:05:11Z, so no worker-plane or mesh connection breaks;
-nodes re-issue their certificates within one heartbeat.
+nodes re-issue their certificates within their rotation splay (at most 10 minutes).
 ```
 
 The new CA is cross-signed by the old one and signs at once; both stay in
@@ -302,10 +302,11 @@ Legion does not hold your root, so it cannot cross-sign, and
 `legion net ca rotate` refuses with `FailedPrecondition` and this procedure:
 
 1. **Add the new CA to the bundle** on every manager: set `bundlePath` to a
-   file holding both the old and the new CA. Within one heartbeat every
-   worker re-issues and holds both.
+   file holding both the old and the new CA. Within the rotation splay
+   (below; at most 10 minutes) every worker re-issues and holds both. Wait
+   that long before step 2.
 2. **Switch the signing CA**: point `certPath`/`keyPath` at the new CA on
-   every manager. Every node re-issues within one heartbeat (the anchor
+   every manager. Every node re-issues within its splay (the anchor
    changed), so every certificate now comes from the new CA while the old one
    is still trusted.
 3. **A day later, remove the old CA** from the bundle.
@@ -326,10 +327,36 @@ mount, make it the default, and delete the old issuer a day later.
 
 Every heartbeat reply names the pins of the manager's whole trust bundle,
 anchor first (`HeartbeatReply.cluster_ca_pins`). A worker whose bundle has a
-different anchor or a different set of CAs re-issues its certificate at once,
-and the reply carries the new bundle, which it then verifies managers and
-peers against. A worker that was offline for a whole rotation (it never saw
-the new CA before the old one was removed) must re-join.
+different anchor or a different set of CAs re-issues its certificate, and
+the reply carries the new bundle, which it then verifies managers and peers
+against. A worker that was offline for a whole rotation (it never saw the
+new CA before the old one was removed) must re-join.
+
+**The rotation splay.** A rotation reaches every node within one heartbeat,
+so re-issuing at once would land every node's CSR on the signer together
+(about 10,000 within a beat on a 10,000-node fleet, a real load on an `exec`
+or Vault signer). Instead each node waits a fixed offset after it first sees
+the change: a value in `[0, window)` derived from its node id, so it is the
+same on every attempt and spread evenly across nodes, where `window` is 25
+heartbeat intervals, at most 10 minutes. The interval is the cadence the
+manager serves, which grows with the fleet past 2,500 nodes, so the signer
+sees about 50 CSRs a second at any fleet size up to the cap:
+
+| Fleet | Served cadence | Window |
+| --- | --- | --- |
+| up to 2,500 nodes | 2 s | 50 s |
+| 10,000 nodes | 8 s | 200 s |
+| 20,000 nodes | 16 s | 400 s |
+| 30,000 nodes and more | 24 s or more | 10 minutes |
+
+A node re-issues at once, without waiting, when the CA its certificate
+chains to is no longer in the manager's bundle (its certificate no longer
+verifies anywhere), when it holds no certificate, or when its certificate is
+due anyway (8 hours old, or under an hour left). Every window ends far
+inside the old CA's 24-hour overlap. The mesh keeps resuming TLS sessions
+across a certificate refresh, but drops them all when the trust bundle
+changes ([Network Handlers](network-handlers.md#sessions)), so the first
+connection between two nodes after a rotation is a full handshake.
 
 ## Status and diagnostics
 

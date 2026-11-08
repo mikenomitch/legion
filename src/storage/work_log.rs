@@ -24,8 +24,19 @@
 //!
 //! **The epoch** is a random non-zero value per manager process. A worker
 //! whose last message came from another epoch (a failover, a restart, a
-//! different manager) cannot be replayed to and gets a full resync, which
-//! is today's full desired set sent once.
+//! different manager) cannot be replayed to.
+//!
+//! **Resume** (revisions-and-watches plan §7, ST3): every message carries the
+//! revision its contents reflect, and a worker reconnecting from another
+//! epoch sends the revision of the last message it applied. When this
+//! manager's revision journal still holds every allocation change on the
+//! node since then ([`crate::storage::revisions::RevisionHub::node_changes_since`]),
+//! the first message is a **resume**: only those allocations, as upserts and
+//! stops, on top of what the worker holds. Otherwise it is a full resync,
+//! the node's whole desired set sent once. After a resume the log knows the
+//! node's desired ids but not every payload (`unloaded`); the heartbeat's
+//! feeds load the missing payloads the first time they need them
+//! ([`WorkLog::held_payloads`]).
 //!
 //! **Checkpoint work** rides the same messages as a push, not as part of
 //! the sequenced set (checkpoints-on-stream plan): the projection marks a
@@ -100,6 +111,14 @@ pub enum PendingWork {
     /// These allocations changed. Each is either upserted (still desired on
     /// this node) or stopped (no longer desired, and the worker held it).
     Changed(BTreeSet<i64>),
+    /// The stream resumes from the worker's revision `from`: these
+    /// allocations changed on the node since then (or since this manager's
+    /// log last saw it). Each is upserted when still desired and stopped
+    /// otherwise, whether or not this manager thinks the worker holds it.
+    Resume {
+        from: String,
+        changed: BTreeSet<i64>,
+    },
 }
 
 /// One node's delivery state.
@@ -115,7 +134,17 @@ struct NodeState {
     resync: bool,
     /// What the worker holds after the last message.
     held: BTreeMap<i64, TaskAllocation>,
+    /// Allocations the worker holds whose payloads this manager has not
+    /// read: after a resume, everything it did not resend. Loaded by
+    /// [`WorkLog::held_payloads`] when the heartbeat first needs them.
+    unloaded: BTreeSet<i64>,
     digest: WorkDigest,
+    /// The next message resumes from this revision (set by a resuming
+    /// attach, taken by `take_pending`).
+    resume_from: Option<String>,
+    /// The revision the next message reflects, noted by the materializer
+    /// before it takes the pending work ([`WorkLog::note_revision`]).
+    revision: String,
     /// Sent, not yet acknowledged, oldest first.
     unacked: VecDeque<StreamWorkReply>,
     /// The node's checkpoint work may have changed since it was last read.
@@ -312,6 +341,23 @@ impl WorkLog {
     /// queues a full resync otherwise. A stream attached for the node
     /// before is superseded: its sender sees a different session and stops.
     pub fn attach(&self, node_id: &str, last_epoch: u64, last_seq: u64) -> Attached {
+        self.attach_resuming(node_id, last_epoch, last_seq, || None)
+    }
+
+    /// [`Self::attach`], resuming instead of resyncing when the stream
+    /// cannot be replayed but `resume` names what changed on the node since
+    /// the worker's last revision: `(that revision, the changed
+    /// allocations)`. `resume` runs after the node's log is registered, so a
+    /// change committed meanwhile is either in its answer or noted in the
+    /// log, never in neither (the caller holds the revision journal's
+    /// publish lock around it).
+    pub fn attach_resuming(
+        &self,
+        node_id: &str,
+        last_epoch: u64,
+        last_seq: u64,
+        resume: impl FnOnce() -> Option<(String, BTreeSet<i64>)>,
+    ) -> Attached {
         let log = self
             .lock_nodes()
             .entry(node_id.to_string())
@@ -334,19 +380,35 @@ impl WorkLog {
                         .unacked
                         .front()
                         .is_some_and(|oldest| oldest.seq <= last_seq + 1));
+            state.resume_from = None;
             if resumable {
-                state
-                    .unacked
-                    .iter()
-                    .filter(|message| message.seq > last_seq)
-                    .cloned()
-                    .collect()
+                (
+                    state
+                        .unacked
+                        .iter()
+                        .filter(|message| message.seq > last_seq)
+                        .cloned()
+                        .collect(),
+                    false,
+                )
             } else {
-                state.resync = true;
                 state.unacked.clear();
-                Vec::new()
+                (Vec::new(), true)
             }
         };
+        let (replay, cannot_replay) = replay;
+        if cannot_replay {
+            let resumed = resume();
+            let mut state = log.lock();
+            match resumed {
+                Some((from, changed)) if state.session == session => {
+                    state.resync = false;
+                    state.dirty.extend(changed);
+                    state.resume_from = Some(from);
+                }
+                _ => state.resync = true,
+            }
+        }
         log.wake.notify_one();
         Attached {
             log,
@@ -405,8 +467,15 @@ impl WorkLog {
         }
         if state.resync {
             state.resync = false;
+            state.resume_from = None;
             state.dirty.clear();
             return PendingWork::Resync;
+        }
+        if let Some(from) = state.resume_from.take() {
+            return PendingWork::Resume {
+                from,
+                changed: std::mem::take(&mut state.dirty),
+            };
         }
         if state.dirty.is_empty() {
             return PendingWork::Nothing;
@@ -417,7 +486,62 @@ impl WorkLog {
     /// Whether the worker holds `allocation_id` (so its disappearance from
     /// the desired set is a stop to send).
     pub fn holds(log: &NodeWorkLog, allocation_id: i64) -> bool {
-        log.lock().held.contains_key(&allocation_id)
+        let state = log.lock();
+        state.held.contains_key(&allocation_id) || state.unloaded.contains(&allocation_id)
+    }
+
+    /// The revision the node's next message reflects: the revision
+    /// journal's position, read by the materializer (under the journal's
+    /// publish lock) just before it takes the pending work, so every
+    /// change at or below it is either in that work or was in an earlier
+    /// message.
+    pub fn note_revision(log: &NodeWorkLog, revision: String) {
+        log.lock().revision = revision;
+    }
+
+    /// Record and number a resume message (see [`PendingWork::Resume`]):
+    /// `upserts` and `stops` are what changed since `from`, and `desired`
+    /// is the node's whole desired id set after it, which is what the
+    /// worker holds once it applies the message.
+    pub fn commit_resume(
+        &self,
+        log: &NodeWorkLog,
+        from: String,
+        upserts: Vec<TaskAllocation>,
+        stops: Vec<StopNotice>,
+        desired: BTreeSet<i64>,
+        checkpoint_requests: Vec<CheckpointRequest>,
+    ) -> StreamWorkReply {
+        let mut state = log.lock();
+        state.held = upserts
+            .iter()
+            .map(|allocation| (allocation.allocation_id, allocation.clone()))
+            .collect();
+        state.unloaded = desired
+            .iter()
+            .filter(|id| !state.held.contains_key(id))
+            .copied()
+            .collect();
+        state.digest = WorkDigest::of(desired.iter().copied());
+        state.seq += 1;
+        let mut message = StreamWorkReply {
+            epoch: self.epoch,
+            seq: state.seq,
+            resync: false,
+            upserts,
+            stops,
+            digest: state.digest.render(),
+            checkpoint_requests: Vec::new(),
+            revision: state.revision.clone(),
+            resumed_from: from,
+            ..Default::default()
+        };
+        state.unacked.push_back(message.clone());
+        if state.unacked.len() > MAX_UNACKED {
+            state.unacked.pop_front();
+        }
+        message.checkpoint_requests = checkpoint_requests;
+        message
     }
 
     /// Record and number a materialized message: a full set when `resync`,
@@ -440,22 +564,26 @@ impl WorkLog {
                 .iter()
                 .map(|allocation| (allocation.allocation_id, allocation.clone()))
                 .collect();
+            state.unloaded.clear();
             state.digest = WorkDigest::of(state.held.keys().copied());
         } else {
             if upserts.is_empty() && stops.is_empty() && checkpoint_requests.is_empty() {
                 return None;
             }
             for allocation in &upserts {
+                let was_unloaded = state.unloaded.remove(&allocation.allocation_id);
                 if state
                     .held
                     .insert(allocation.allocation_id, allocation.clone())
                     .is_none()
+                    && !was_unloaded
                 {
                     state.digest.insert(allocation.allocation_id);
                 }
             }
             for stop in &stops {
-                if state.held.remove(&stop.allocation_id).is_some() {
+                let was_unloaded = state.unloaded.remove(&stop.allocation_id);
+                if state.held.remove(&stop.allocation_id).is_some() || was_unloaded {
                     state.digest.remove(stop.allocation_id);
                 }
             }
@@ -469,6 +597,9 @@ impl WorkLog {
             stops: if resync { Vec::new() } else { stops },
             digest: state.digest.render(),
             checkpoint_requests: Vec::new(),
+            revision: state.revision.clone(),
+            resumed_from: String::new(),
+            ..Default::default()
         };
         state.unacked.push_back(message.clone());
         if state.unacked.len() > MAX_UNACKED {
@@ -512,15 +643,28 @@ impl WorkLog {
 
     /// The payloads the worker holds, for the heartbeat feeds computed from
     /// the desired set (connect endpoints, network policy). Only cloned when
-    /// `wanted` says one of them needs it.
+    /// `wanted` says one of them needs it. Payloads a resume did not resend
+    /// are read first with `load` (once: they are kept), since `wanted`
+    /// needs them.
     pub fn held_payloads(
         &self,
         node_id: &str,
         wanted: impl Fn(&TaskAllocation) -> bool,
+        load: impl FnOnce(&[i64]) -> Vec<TaskAllocation>,
     ) -> Vec<TaskAllocation> {
         let Some(log) = self.node(node_id) else {
             return Vec::new();
         };
+        let missing: Vec<i64> = log.lock().unloaded.iter().copied().collect();
+        if !missing.is_empty() {
+            let loaded = load(&missing);
+            let mut state = log.lock();
+            for allocation in loaded {
+                if state.unloaded.remove(&allocation.allocation_id) {
+                    state.held.insert(allocation.allocation_id, allocation);
+                }
+            }
+        }
         let state = log.lock();
         if !state.held.values().any(&wanted) {
             return Vec::new();
@@ -762,6 +906,104 @@ mod work_log_test {
         assert!(!log.check_heartbeat("n1", &stale).via_stream);
         log.detach("n1", attached.session);
         assert!(!log.check_heartbeat("n1", &agree).via_stream);
+    }
+
+    /// ST3: a stream from another epoch whose revision the journal covers
+    /// resumes with just what changed, and the log then holds the node's
+    /// whole set (payloads it did not resend are loaded on demand).
+    #[test]
+    fn a_stream_from_another_epoch_resumes_with_only_the_changes() {
+        let log = WorkLog::new();
+        log.note_changes([("n1", 9)]);
+        let attached = log.attach_resuming("n1", 12345, 40, || {
+            Some(("r7".to_string(), BTreeSet::from([2, 5])))
+        });
+        assert!(attached.replay.is_empty());
+        // A change noted after the attach rides the same resume.
+        log.note_changes([("n1", 6)]);
+        WorkLog::note_revision(&attached.log, "r8".into());
+        let PendingWork::Resume { from, changed } =
+            WorkLog::take_pending(&attached.log, attached.session)
+        else {
+            panic!("a resume is pending");
+        };
+        assert_eq!(from, "r7");
+        assert_eq!(changed.into_iter().collect::<Vec<_>>(), vec![2, 5, 6]);
+
+        // 2 and 6 are still desired, 5 left; 1 and 3 were held all along.
+        let message = log.commit_resume(
+            &attached.log,
+            from,
+            vec![payload(2), payload(6)],
+            vec![StopNotice {
+                allocation_id: 5,
+                ..Default::default()
+            }],
+            BTreeSet::from([1, 2, 3, 6]),
+            Vec::new(),
+        );
+        assert!(!message.resync);
+        assert_eq!(message.resumed_from, "r7");
+        assert_eq!(message.revision, "r8");
+        assert_eq!(message.digest, WorkDigest::of([1, 2, 3, 6]).render());
+        assert!(WorkLog::holds(&attached.log, 1), "held, payload not loaded");
+        assert!(!WorkLog::holds(&attached.log, 5));
+
+        // The heartbeat's feeds load what the resume did not resend, once.
+        let mut loads = Vec::new();
+        let held = log.held_payloads(
+            "n1",
+            |_| true,
+            |missing| {
+                loads.push(missing.to_vec());
+                missing.iter().map(|id| payload(*id)).collect()
+            },
+        );
+        assert_eq!(loads, vec![vec![1, 3]]);
+        assert_eq!(held.len(), 4);
+        let again = log.held_payloads("n1", |_| true, |_| panic!("already loaded"));
+        assert_eq!(again.len(), 4);
+
+        // Deltas continue from there: a stop of an unloaded allocation moves
+        // the digest like any other.
+        let next = log
+            .commit_message(
+                &attached.log,
+                false,
+                Vec::new(),
+                vec![StopNotice {
+                    allocation_id: 3,
+                    ..Default::default()
+                }],
+                Vec::new(),
+            )
+            .expect("a stop");
+        assert_eq!(next.digest, WorkDigest::of([1, 2, 6]).render());
+        assert_eq!(next.seq, message.seq + 1);
+    }
+
+    #[test]
+    fn a_resume_the_journal_cannot_serve_resyncs() {
+        let log = WorkLog::new();
+        let attached = log.attach_resuming("n1", 12345, 3, || None);
+        assert!(matches!(
+            WorkLog::take_pending(&attached.log, attached.session),
+            PendingWork::Resync
+        ));
+        // Same epoch: replay wins and the resume is never asked.
+        let _ = log.commit_message(
+            &attached.log,
+            true,
+            vec![payload(1)],
+            Vec::new(),
+            Vec::new(),
+        );
+        let again = log.attach_resuming("n1", log.epoch(), 1, || panic!("not asked"));
+        assert!(again.replay.is_empty());
+        assert!(matches!(
+            WorkLog::take_pending(&again.log, again.session),
+            PendingWork::Nothing
+        ));
     }
 
     fn request(snapshot_id: &str, op: &str) -> CheckpointRequest {

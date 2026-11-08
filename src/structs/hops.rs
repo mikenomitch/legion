@@ -198,8 +198,9 @@ pub struct ProxyConfig {
 pub struct DlpConfig {
     /// Regular expressions; a body matching any is rejected.
     pub patterns: Vec<String>,
-    /// How much of a body is buffered and read (`1Mi`, default 1 MiB). A body
-    /// larger than this is rejected unless the hop says `onError = "allow"`.
+    /// How much of a body is buffered and read (`1Mi`, default 1 MiB). A
+    /// larger body is refused unread: `403`, or `413` when the hop says
+    /// `onError = "allow"` (docs/network-handlers.md, "Request bodies").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<Value>,
 }

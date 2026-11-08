@@ -20,7 +20,7 @@
 //!
 //!    impl Balancer for FirstHealthy {
 //!        fn name(&self) -> &'static str { "first_healthy" }
-//!        fn pick(&self, endpoints: &[Endpoint], _inflight: &HashMap<String, usize>) -> Option<usize> {
+//!        fn pick(&self, endpoints: &[Endpoint], _inflight: &InflightCounts) -> Option<usize> {
 //!            (!endpoints.is_empty()).then_some(0)
 //!        }
 //!    }
@@ -60,6 +60,74 @@ pub struct Endpoint {
     pub mesh_tls: bool,
 }
 
+/// Live connections per endpoint address through one listener, for
+/// load-aware strategies. Each count is an atomic the connection's
+/// [`InflightGuard`] holds, so a connection ending touches neither the map's
+/// lock nor its key (mesh-control-path plan §6.8, review NET8).
+pub type InflightCounts = HashMap<String, Arc<AtomicUsize>>;
+
+/// The live connections to `addr` (0 when it has none).
+pub fn inflight_count(inflight: &InflightCounts, addr: &str) -> usize {
+    inflight
+        .get(addr)
+        .map(|count| count.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Counts one connection to an endpoint until it drops.
+#[derive(Debug)]
+pub struct InflightGuard(Arc<AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Count a connection to `addr` until the guard drops. Allocates only the
+/// first time the listener sees `addr`; the entry then stays until
+/// [`prune_inflight`] finds it idle and gone from the endpoint list.
+pub fn acquire_inflight(inflight: &Mutex<InflightCounts>, addr: &str) -> InflightGuard {
+    let mut counts = inflight.lock().unwrap_or_else(|p| p.into_inner());
+    let count = match counts.get(addr) {
+        Some(count) => Arc::clone(count),
+        None => {
+            let count = Arc::new(AtomicUsize::new(0));
+            counts.insert(addr.to_string(), Arc::clone(&count));
+            count
+        }
+    };
+    count.fetch_add(1, Ordering::Relaxed);
+    InflightGuard(count)
+}
+
+/// Forget addresses with nothing in flight that are not in `endpoints`, so
+/// the map stays bounded by the endpoints a listener can still dial.
+pub fn prune_inflight(inflight: &Mutex<InflightCounts>, endpoints: &[Endpoint]) {
+    let mut counts = inflight.lock().unwrap_or_else(|p| p.into_inner());
+    counts.retain(|addr, count| {
+        count.load(Ordering::Relaxed) > 0 || endpoints.iter().any(|e| e.addr == *addr)
+    });
+}
+
+/// The live counts as plain numbers (diagnostics), without idle entries.
+pub fn inflight_snapshot(inflight: &InflightCounts) -> HashMap<String, usize> {
+    inflight
+        .iter()
+        .map(|(addr, count)| (addr.clone(), count.load(Ordering::Relaxed)))
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+
+/// Counts from (address, connections) pairs (tests).
+#[cfg(test)]
+pub fn counts<const N: usize>(pairs: [(&str, usize); N]) -> InflightCounts {
+    pairs
+        .into_iter()
+        .map(|(addr, n)| (addr.to_string(), Arc::new(AtomicUsize::new(n))))
+        .collect()
+}
+
 /// Picks which endpoint a new connection goes to.
 ///
 /// Implementations must be cheap and non-blocking: `pick` is called on the
@@ -73,7 +141,7 @@ pub trait Balancer: std::fmt::Debug + Send + Sync {
     /// `inflight` maps endpoint address -> current in-flight connection count
     /// through this listener, for load-aware strategies; strategies that do not
     /// care simply ignore it.
-    fn pick(&self, endpoints: &[Endpoint], inflight: &HashMap<String, usize>) -> Option<usize>;
+    fn pick(&self, endpoints: &[Endpoint], inflight: &InflightCounts) -> Option<usize>;
 
     /// Learn from one dial or request through `addr`. The datapath reports
     /// every outcome it sees; strategies that do not learn ignore it.
@@ -211,7 +279,7 @@ impl Balancer for LeastLatency {
         "least_latency"
     }
 
-    fn pick(&self, endpoints: &[Endpoint], inflight: &HashMap<String, usize>) -> Option<usize> {
+    fn pick(&self, endpoints: &[Endpoint], inflight: &InflightCounts) -> Option<usize> {
         match endpoints.len() {
             0 => return None,
             1 => return Some(0),
@@ -245,7 +313,7 @@ impl Balancer for LeastLatency {
                 .map_or(fallback, |s| s.at(now))
                 // An estimate decayed to nothing still has to count load.
                 .max(1.0);
-            let load = inflight.get(&endpoint.addr).copied().unwrap_or(0);
+            let load = inflight_count(inflight, &endpoint.addr);
             latency * (load + 1) as f64
         };
         // `first` and `second` are in random order, so ties break randomly.
@@ -307,7 +375,7 @@ impl Balancer for RoundRobin {
         "round_robin"
     }
 
-    fn pick(&self, endpoints: &[Endpoint], _inflight: &HashMap<String, usize>) -> Option<usize> {
+    fn pick(&self, endpoints: &[Endpoint], _inflight: &InflightCounts) -> Option<usize> {
         if endpoints.is_empty() {
             return None;
         }
@@ -330,7 +398,7 @@ impl Balancer for LocalFirst {
         "local_first"
     }
 
-    fn pick(&self, endpoints: &[Endpoint], _inflight: &HashMap<String, usize>) -> Option<usize> {
+    fn pick(&self, endpoints: &[Endpoint], _inflight: &InflightCounts) -> Option<usize> {
         if endpoints.is_empty() {
             return None;
         }
@@ -373,11 +441,11 @@ impl Balancer for LeastConn {
         "least_conn"
     }
 
-    fn pick(&self, endpoints: &[Endpoint], inflight: &HashMap<String, usize>) -> Option<usize> {
+    fn pick(&self, endpoints: &[Endpoint], inflight: &InflightCounts) -> Option<usize> {
         if endpoints.is_empty() {
             return None;
         }
-        let load = |endpoint: &Endpoint| inflight.get(&endpoint.addr).copied().unwrap_or(0);
+        let load = |endpoint: &Endpoint| inflight_count(inflight, &endpoint.addr);
         let least = endpoints.iter().map(load).min().unwrap_or(0);
         let tied: Vec<usize> = endpoints
             .iter()
@@ -553,7 +621,7 @@ mod tests {
     fn least_conn_prefers_the_idle_endpoint() -> R<()> {
         let balancer = balancer("least_conn")?;
         let endpoints = endpoints();
-        let inflight: HashMap<String, usize> = [("10.0.0.1:80".to_string(), 3)].into();
+        let inflight = counts([("10.0.0.1:80", 3)]);
         for _ in 0..5 {
             assert_eq!(balancer.pick(&endpoints, &inflight), Some(1));
         }
@@ -589,7 +657,7 @@ mod tests {
             balancer.observe(&endpoint.addr, Outcome::Latency(Duration::from_millis(1)));
         }
         // Equal latency, one endpoint busy: the idle one wins every pairing.
-        let busy: HashMap<String, usize> = [("10.0.0.1:80".to_string(), 4)].into();
+        let busy = counts([("10.0.0.1:80", 4)]);
         for _ in 0..20 {
             assert_eq!(balancer.pick(&endpoints, &busy), Some(1));
         }
@@ -646,11 +714,7 @@ mod tests {
         let balancer = balancer("least_conn")?;
         let endpoints = endpoints();
         // Equal load (including "no entry at all") must not pin one endpoint.
-        let inflight: HashMap<String, usize> = [
-            ("10.0.0.1:80".to_string(), 2),
-            ("10.0.0.2:80".to_string(), 2),
-        ]
-        .into();
+        let inflight = counts([("10.0.0.1:80", 2), ("10.0.0.2:80", 2)]);
         let picks: Vec<usize> = (0..4)
             .filter_map(|_| balancer.pick(&endpoints, &inflight))
             .collect();
@@ -660,5 +724,26 @@ mod tests {
             "{picks:?}"
         );
         Ok(())
+    }
+
+    /// Mesh-control-path plan §6.8: a connection's guard releases its count
+    /// without the map's key, and idle departed endpoints are pruned.
+    #[test]
+    fn inflight_guards_count_and_idle_departed_endpoints_are_pruned() {
+        let inflight = Mutex::new(InflightCounts::new());
+        let first = acquire_inflight(&inflight, "10.0.0.1:80");
+        let second = acquire_inflight(&inflight, "10.0.0.1:80");
+        let other = acquire_inflight(&inflight, "10.0.0.9:80");
+        assert_eq!(inflight_count(&inflight.lock().unwrap(), "10.0.0.1:80"), 2);
+        drop(first);
+        assert_eq!(inflight_count(&inflight.lock().unwrap(), "10.0.0.1:80"), 1);
+        drop(second);
+        // 10.0.0.9 left the endpoint list but still has a connection.
+        prune_inflight(&inflight, &endpoints());
+        assert!(inflight.lock().unwrap().contains_key("10.0.0.9:80"));
+        drop(other);
+        prune_inflight(&inflight, &endpoints());
+        assert!(!inflight.lock().unwrap().contains_key("10.0.0.9:80"));
+        assert!(inflight_snapshot(&inflight.lock().unwrap()).is_empty());
     }
 }

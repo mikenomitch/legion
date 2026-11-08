@@ -7,12 +7,14 @@ pub mod app_view;
 pub mod boot_ticket;
 pub mod capabilities;
 pub mod cert;
+pub mod device;
 pub mod docs;
 pub mod events;
 pub mod exec;
 pub mod exec_key;
 pub mod exec_ticket;
 pub mod gitops;
+pub mod governance;
 pub mod guest_agent;
 pub mod guest_resume;
 pub mod helpers;
@@ -47,6 +49,7 @@ pub mod start;
 pub mod state;
 pub mod template;
 pub mod volume;
+pub mod watch;
 
 use crate::prelude::*;
 
@@ -65,6 +68,7 @@ fn base_cli() -> Command {
         .propagate_version(true)
         .subcommand_required(true)
         .arg_required_else_help(true)
+        .arg(governance::approval_flag())
         .subcommand(capabilities::config())
         .subcommand(mcp::config())
         .subcommand(docs::config())
@@ -85,6 +89,9 @@ fn base_cli() -> Command {
         .subcommand(session::config())
         .subcommand(join::config())
         .subcommand(ledger::config())
+        .subcommand(governance::audit_config())
+        .subcommand(governance::approval_config())
+        .subcommand(governance::usage_config())
         .subcommand(events::config())
         .subcommand(kv::config())
         .subcommand(keyring::config())
@@ -93,6 +100,7 @@ fn base_cli() -> Command {
         .subcommand(guest_agent::config())
         .subcommand(guest_resume::config())
         .subcommand(volume::config())
+        .subcommand(device::config())
         .subcommand(snapshot::config())
         .subcommand(state::config())
         .subcommand(raft::config())

@@ -339,6 +339,7 @@ impl ArtifactFetcher for OciFetcher {
                     runtime,
                     &client,
                     &reference,
+                    &auth,
                     manifest,
                     manifest_digest,
                     media_type,
@@ -693,6 +694,62 @@ impl ImageBlobCache<'_> {
         std::fs::hard_link(&entry.path, dest).is_ok() || std::fs::copy(&entry.path, dest).is_ok()
     }
 
+    /// Copies a cached blob to `dest` (an in-kernel copy, a reflink where
+    /// the filesystem offers one). For files a task sees directly, such as
+    /// ORAS layers: the task gets its own copy, so it cannot change what the
+    /// next allocation receives. `false` on a miss, and, like
+    /// [`Self::place`], for a blob not verified as [`Self::repository`]'s
+    /// when this pull is not authorized to read the store.
+    fn copy_out(&self, digest: &str, dest: &std::path::Path) -> bool {
+        if !self.reads
+            && !matches!(
+                self.store.image_source(digest, &self.repository),
+                Ok(Some(_))
+            )
+        {
+            return false;
+        }
+        let Ok(digest) = ContentDigest::parse(digest) else {
+            return false;
+        };
+        let Ok(Some(entry)) = self.store.get(&digest) else {
+            return false;
+        };
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(dest);
+        std::fs::copy(&entry.path, dest).is_ok()
+    }
+
+    /// Keeps a copy of a blob just pulled into `path`; `path` stays the
+    /// task's own file. The store verifies the digest as it copies, and the
+    /// blob is recorded as [`Self::repository`]'s (`anonymous`: pulled with
+    /// no credential), which is what lets [`Self::copy_out`] serve it to a
+    /// later pull from the same repository.
+    fn keep_copy(&self, digest: &str, path: &std::path::Path, anonymous: bool) {
+        let Ok(digest) = ContentDigest::parse(digest) else {
+            return;
+        };
+        let opts = PutOptions::default()
+            .expect(digest.clone())
+            .label("oras layer");
+        if let Err(err) = self.store.put_file(ContentClass::Artifacts, path, opts) {
+            warn!(
+                %digest,
+                error = %format!("{err:#}"),
+                "Could not cache ORAS layer in node content store"
+            );
+            return;
+        }
+        if let Err(err) = self
+            .store
+            .record_image_source(&digest, &self.repository, anonymous)
+        {
+            debug!(error = %format!("{err:#}"), "Could not record ORAS layer provenance");
+        }
+    }
+
     /// The platform manifest of the image `top_digest` names, when it and
     /// every blob it lists are already in the store: an image this node can
     /// lay out with no registry request. `None` when anything is missing.
@@ -835,6 +892,7 @@ impl OciFetcher {
         runtime: &tokio::runtime::Runtime,
         client: &Client,
         reference: &Reference,
+        auth: &RegistryAuth,
         manifest: OciImageManifest,
         manifest_digest: String,
         media_type: &str,
@@ -858,6 +916,27 @@ impl OciFetcher {
         let total = check_size_budget(req, &selected)?;
         sink.set_bytes_total(Some(total));
 
+        // Layers (model weights, usually) are content addressed by their
+        // digest, so the node content store serves them like image layers:
+        // a layer the node already holds is copied in, not downloaded
+        // (review finding AI6; docs/artifacts.md, "ORAS layers"). The
+        // manifest just came from the registry with this job's credential,
+        // which proves it may read the repository; as for an image pulled
+        // that way (`reads: false`), only layers verified as this
+        // repository's are served from the store, so a manifest elsewhere
+        // naming a private layer's digest never reads it from the cache.
+        let store = sink.content_store().cloned();
+        let anonymous = matches!(auth, RegistryAuth::Anonymous);
+        let cache = store.as_deref().map(|store| ImageBlobCache {
+            store,
+            reads: false,
+            repository: image_repository(reference),
+        });
+        let _claim = cache
+            .as_ref()
+            .map(|_| ImagePullClaim::claim(&format!("oras:{manifest_digest}:{media_type}")));
+        let (mut cached, mut pulled) = (0usize, 0usize);
+
         let layers_dir = sink.dir().join("layers");
         let mut files = Vec::with_capacity(selected.len());
         for descriptor in selected {
@@ -875,9 +954,31 @@ impl OciFetcher {
                         .unwrap_or_else(|| "layer".to_string())
                 });
             let path = layers_dir.join(file_name);
-            runtime.block_on(pull_blob_to_file(client, reference, descriptor, &path))?;
+            // Copies both ways, never a shared inode: the task can write to
+            // its layer files without touching the store's.
+            if cache
+                .as_ref()
+                .is_some_and(|cache| cache.copy_out(&descriptor.digest, &path))
+            {
+                cached += 1;
+            } else {
+                runtime.block_on(pull_blob_to_file(client, reference, descriptor, &path))?;
+                if let Some(cache) = cache.as_ref() {
+                    cache.keep_copy(&descriptor.digest, &path, anonymous);
+                }
+                pulled += 1;
+            }
             sink.record_external_bytes(descriptor.size.max(0) as u64)?;
             files.push(path);
+        }
+        if cache.is_some() {
+            info!(
+                artifact = %req.redacted_source,
+                digest = %manifest_digest,
+                layers_cached = cached,
+                layers_pulled = pulled,
+                "ORAS layers ready (node content store)"
+            );
         }
         Ok(FetchedArtifact {
             bytes: sink.bytes_written(),
@@ -1540,6 +1641,198 @@ mod tests {
             FetchedPayload::Image { oci_layout, .. } => Ok(oci_layout),
             other => panic!("expected an image, got {other:?}"),
         }
+    }
+
+    /// Publishes `lib/img:<tag>` as an ORAS artifact: one manifest whose
+    /// layers carry `media_type` and a title annotation each.
+    fn publish_oras(
+        registry: &FakeRegistry,
+        tag: &str,
+        media_type: &str,
+        layers: &[(&str, &[u8])],
+    ) {
+        publish_oras_in(registry, "lib/img", tag, media_type, layers, true);
+    }
+
+    /// [`publish_oras`] in `repository`; with `blobs` false only the manifest
+    /// is served, as for a repository that names blobs it does not hold.
+    fn publish_oras_in(
+        registry: &FakeRegistry,
+        repository: &str,
+        tag: &str,
+        media_type: &str,
+        layers: &[(&str, &[u8])],
+        blobs: bool,
+    ) {
+        let descriptor = |media_type: &str, bytes: &[u8]| {
+            json!({
+                "mediaType": media_type,
+                "digest": ContentDigest::of_bytes(bytes).as_str(),
+                "size": bytes.len(),
+            })
+        };
+        let config = b"{}".as_slice();
+        let manifest = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+            "config": descriptor("application/vnd.oci.empty.v1+json", config),
+            "layers": layers
+                .iter()
+                .map(|(title, bytes)| {
+                    let mut entry = descriptor(media_type, bytes);
+                    let mut annotations = serde_json::Map::new();
+                    annotations.insert(TITLE_ANNOTATION.to_string(), json!(title));
+                    entry["annotations"] = Value::Object(annotations);
+                    entry
+                })
+                .collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        let layer_blobs = layers.iter().map(|(_, bytes)| *bytes);
+        for blob in std::iter::once(config).chain(layer_blobs.filter(|_| blobs)) {
+            registry.serve(
+                format!(
+                    "/v2/{repository}/blobs/{}",
+                    ContentDigest::of_bytes(blob).as_str()
+                ),
+                "application/octet-stream",
+                blob.to_vec(),
+            );
+        }
+        let digest = ContentDigest::of_bytes(&manifest).as_str().to_string();
+        for name in [tag.to_string(), digest] {
+            registry.serve(
+                format!("/v2/{repository}/manifests/{name}"),
+                oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+                manifest.clone(),
+            );
+        }
+    }
+
+    /// AI6: ORAS layers (how model weights ship) are served from the node
+    /// content store by digest, like image layers: the second pull of the
+    /// same weights downloads no layer, and a new version downloads only
+    /// the layers it changed.
+    #[test]
+    fn oras_layers_are_cached_by_digest_test() -> R<()> {
+        let registry = FakeRegistry::start();
+        let dir = tempfile::tempdir()?;
+        let store = open_store(dir.path());
+        let media_type = "application/vnd.acme.model.weights.v1";
+        let source = format!("oci://127.0.0.1:{}/lib/img:v1?protocol=http", registry.port);
+        let pull_oras = |name: &str| -> R<Vec<std::path::PathBuf>> {
+            let parsed = parse_artifact_source(&source)?;
+            let limits = FetchLimits::default();
+            let mut sink = ArtifactSink::new(dir.path().join(name), limits.max_bytes)?;
+            sink.set_content_store(Some(store.clone()));
+            let request = FetchRequest {
+                media_type: Some(media_type),
+                ..request(&parsed, &limits, &source)
+            };
+            match OciFetcher::new().fetch(&request, &mut sink)?.payload {
+                FetchedPayload::Layers { files, .. } => Ok(files),
+                other => panic!("expected layers, got {other:?}"),
+            }
+        };
+        let (shard_a, shard_b) = (b"weights-shard-a".as_slice(), b"weights-shard-b".as_slice());
+        publish_oras(
+            &registry,
+            "v1",
+            media_type,
+            &[
+                ("model-00001.safetensors", shard_a),
+                ("model-00002.safetensors", shard_b),
+            ],
+        );
+
+        let first = pull_oras("first")?;
+        assert_eq!(std::fs::read(&first[0])?, shard_a);
+        assert_eq!(
+            blob_pulls(&registry.take_log()).len(),
+            2,
+            "both shards pulled"
+        );
+
+        let second = pull_oras("second")?;
+        assert_eq!(std::fs::read(&second[1])?, shard_b);
+        assert!(
+            blob_pulls(&registry.take_log()).is_empty(),
+            "the second pull downloads no layer"
+        );
+
+        // v1 again under a new manifest with one changed shard.
+        let shard_b2 = b"weights-shard-b-v2".as_slice();
+        publish_oras(
+            &registry,
+            "v1",
+            media_type,
+            &[
+                ("model-00001.safetensors", shard_a),
+                ("model-00002.safetensors", shard_b2),
+            ],
+        );
+        let third = pull_oras("third")?;
+        assert_eq!(std::fs::read(&third[1])?, shard_b2);
+        assert_eq!(
+            blob_pulls(&registry.take_log()).len(),
+            1,
+            "only the changed shard is downloaded"
+        );
+        Ok(())
+    }
+
+    /// Regression (merging AI6's ORAS layer cache with the private image
+    /// cache fix): a cached layer is served only to a pull from the
+    /// repository it was verified in. A manifest in another repository that
+    /// names a private layer's digest gets the registry's answer for that
+    /// repository (here, no such blob), never the node's copy.
+    #[test]
+    fn a_cached_oras_layer_is_served_only_to_its_own_repository_test() -> R<()> {
+        let registry = FakeRegistry::start();
+        let dir = tempfile::tempdir()?;
+        let store = open_store(dir.path());
+        let media_type = "application/vnd.acme.model.weights.v1";
+        let pull_oras = |name: &str, repository: &str| -> R<Vec<std::path::PathBuf>> {
+            let source = format!(
+                "oci://127.0.0.1:{}/{repository}:v1?protocol=http",
+                registry.port
+            );
+            let parsed = parse_artifact_source(&source)?;
+            let limits = FetchLimits::default();
+            let mut sink = ArtifactSink::new(dir.path().join(name), limits.max_bytes)?;
+            sink.set_content_store(Some(store.clone()));
+            let request = FetchRequest {
+                media_type: Some(media_type),
+                ..request(&parsed, &limits, &source)
+            };
+            match OciFetcher::new().fetch(&request, &mut sink)?.payload {
+                FetchedPayload::Layers { files, .. } => Ok(files),
+                other => panic!("expected layers, got {other:?}"),
+            }
+        };
+        let secret = b"private-weights".as_slice();
+        let layers = [("model.safetensors", secret)];
+        publish_oras(&registry, "v1", media_type, &layers);
+        pull_oras("owner", "lib/img")?;
+        registry.take_log();
+
+        // The same repository is served from the store.
+        let again = pull_oras("owner-again", "lib/img")?;
+        assert_eq!(std::fs::read(&again[0])?, secret);
+        assert!(blob_pulls(&registry.take_log()).is_empty());
+
+        // Another repository naming the same digest is not.
+        publish_oras_in(&registry, "attacker/img", "v1", media_type, &layers, false);
+        pull_oras("attacker", "attacker/img")
+            .expect_err("the attacker's repository does not hold the layer");
+        // A failed pull may leave an empty file; never the cached bytes.
+        let attacker_layer = dir.path().join("attacker/layers/model.safetensors");
+        assert_ne!(
+            std::fs::read(&attacker_layer).ok().as_deref(),
+            Some(secret),
+            "the cached layer was copied out"
+        );
+        Ok(())
     }
 
     fn blob_pulls(log: &[String]) -> Vec<&String> {

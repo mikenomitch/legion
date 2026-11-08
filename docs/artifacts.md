@@ -494,8 +494,8 @@ type:
     fetch = {
       parallelism = 4,           # concurrent fetches per worker
       attempts = 3,              # per-artifact tries before the allocation fails
-      timeout = "10m",           # overall fetch deadline per artifact
-      maxArtifactSize = "50GiB", # per-artifact cap; also bounds decompression
+      timeout = "2h",            # overall fetch deadline per artifact
+      maxArtifactSize = "1TiB",  # per-artifact cap; also bounds decompression
       # allowedSchemes = [...]  # worker-side allowlist (defaults to the cluster default)
     },
   },
@@ -504,6 +504,13 @@ type:
 
 Workers without an `artifacts` block get these defaults. The settings are
 delivered through the existing worker pre-registration config flow.
+
+The defaults are sized for model weights: a 70B checkpoint is around 140 GB,
+which takes about 19 minutes over a 1 Gbps link, so the deadline is two hours
+and the size cap one tebibyte. `maxArtifactSize` also caps how much an
+archive may expand to, so lower it on nodes that fetch from sources you do
+not trust. The deadline is a whole-fetch deadline, not a stall timeout: a
+download that stalls holds its allocation until the deadline passes.
 
 > **Failure semantics: fetch failures use up your `onUnhealthy` budgets.**
 > A staging failure (404 after retries, checksum mismatch, timeout, oversize,
@@ -571,7 +578,26 @@ needs no registry request; a tag costs one `HEAD` to check where it points,
 and a moved tag downloads only the layers the node lacks. The details, and
 how a registry outage is handled, are in
 [docs/task-runtime-container.md](task-runtime-container.md#image-cache).
-ORAS artifacts (`oci://` with a `mediaType`) are not cached yet.
+
+### ORAS layers
+
+**ORAS artifacts** (`oci://` with a `mediaType`, how model weights usually
+ship) go through the store per layer, by the layer's digest: a layer the node
+holds is copied into the task's `layers/` directory instead of downloaded,
+even under a new tag or a new manifest that reuses it. A new model version
+that changed two of thirty shards downloads two. The copy is a local,
+in-kernel copy (a reflink on filesystems that offer one), so a task can
+write to its layer files without changing what the next allocation gets; on
+the first pull the layer is downloaded once and a copy kept. The manifest is
+still read from the registry on every stage, with the job's credential, so a
+tag that moved is noticed and a credential the registry refuses fails the
+stage. A layer is served from the store only to a pull from the repository
+it was downloaded and verified in, as for a cached image (see [Who a cached
+image is served to](#who-a-cached-image-is-served-to)): a manifest in
+another repository that lists the same digest gets its layers from its own
+registry, never the node's copy. The worker logs
+`ORAS layers ready (node content store)` with `layers_cached` and
+`layers_pulled`.
 
 Tasks always get their own copy. A task that writes to its staged file cannot
 change what the next allocation receives. A blob that fails digest
@@ -622,18 +648,30 @@ filesystem's total size, and logs the result (`Sized node content store
 budgets`). A disk that grows or shrinks takes effect at the next worker
 start.
 
-Without a `budgets` entry, a class takes its default share, clamped so that
+Without a `budgets` entry, a class takes its default share, bounded so that
 very small and very large disks still get a sensible budget:
 
-| Class | Default | Clamp | 8 GiB disk | 100 GiB disk | 1 TiB disk |
+| Class | Default | Bounds | 8 GiB disk | 100 GiB disk | 1 TiB disk |
 | --- | --- | --- | --- | --- | --- |
-| `artifacts` | 10% | 1 GiB to 20 GiB | 1 GiB | 10 GiB | 20 GiB |
+| `artifacts` | 50% | at least 1 GiB, no ceiling | 4 GiB | 50 GiB | 512 GiB |
 | `snapshots` | 20% | 2 GiB to 200 GiB | 2 GiB | 20 GiB | 200 GiB |
 
-The artifact cache caps at 20 GiB because a miss costs one refetch, so a
-bigger cache buys little. The snapshot budget caps at 200 GiB so a node with
-a multi-terabyte data disk keeps most of it for volumes unless you ask for
-more. A share you set yourself (`snapshots = "40%"`) is not clamped. On a
+The artifact cache has no ceiling because model weights are the largest
+artifacts a node pulls: one 70B checkpoint is around 140 GB, and a miss costs
+a download of that size. (It used to be 10% capped at 20 GiB, which held no
+large model at all.) The snapshot budget caps at 200 GiB so a node with a
+multi-terabyte data disk keeps most of it for volumes unless you ask for
+more. A share you set yourself (`snapshots = "40%"`) is not bounded, unless
+you write it as an object with bounds:
+
+```nickel
+budgets = {
+  artifacts = { share = "50%", max = "2TiB", min = "10GiB" },   # both bounds optional
+  snapshots = "15%",
+},
+```
+
+On a
 small disk the floors can add up to more than 30% of it, and then
 `minFreeDisk` is what protects the node: the store evicts unpinned content,
 then refuses new content, before free space drops below it, and the
@@ -1029,13 +1067,13 @@ dylib pattern as task-runtime plugins (see
 
 ```
 plugins/artifacts/<scheme>/
-  plugin.json                              # {"kind":"artifacts","name":"<scheme>","legionApiVersion":2}
+  plugin.json                              # {"kind":"artifacts","name":"<scheme>","legionApiVersion":3}
   Cargo.toml                               # cdylib depending on the legion crate
-  src/lib.rs                               # exports get()
+  src/lib.rs                               # legion::export_artifact_fetcher!(...)
 ```
 
 The plugin implements the blocking `ArtifactFetcher` trait
-(`src/artifacts/fetcher.rs`) and exports a `get` constructor:
+(`src/artifacts/fetcher.rs`) and exports it with `legion::export_artifact_fetcher!`:
 
 ```rust
 use legion::artifacts::fetcher::{ArtifactFetcher, FetchRequest, FetchedArtifact, FetchedPayload};
@@ -1053,13 +1091,10 @@ impl ArtifactFetcher for MyFetcher {
     }
 }
 
-// Required: lets the host refuse a mismatched build (docs/plugin-system.md).
-legion::declare_plugin_abi!();
-
-#[no_mangle]
-pub extern "C" fn get() -> Box<dyn ArtifactFetcher> {
-    Box::new(MyFetcher)
-}
+// Required: the build fingerprint (the host refuses a mismatched build), the
+// panic probe, and a constructor whose fetcher contains its own panics
+// (docs/plugin-system.md, "Panics and quarantine").
+legion::export_artifact_fetcher!(MyFetcher);
 ```
 
 Resolution order is **built-ins first, then plugins**. When no built-in
@@ -1083,17 +1118,24 @@ Remember the allowlists. Add a custom scheme to the cluster's
 
 ## Limitations
 
-- **The node content store caches digest-pinned single files and container
-  images.** A file artifact needs a `checksum` and an `http(s)`, `s3`, or
-  `file` source; an `oci://` image is cached per blob. Git trees, `file://`
-  directories, ORAS layers, and artifacts without a `checksum` fetch from
-  origin for every new allocation. There is
+- **The node content store caches digest-pinned single files, container
+  images, and ORAS layers.** A file artifact needs a `checksum` and an
+  `http(s)`, `s3`, or `file` source; an `oci://` image or ORAS artifact is
+  cached per blob. Git trees, `file://` directories, and artifacts without a
+  `checksum` fetch from origin for every new allocation. There is
   no TTL-based revalidation of mutable URLs, so a plain URL without a
   checksum is never served from the store. Add a `checksum` to opt in.
 - **No pre-warming for artifacts.** The store fills only when an allocation
   stages, or when `snapshot warm` pulls a published snapshot's parts. There
   is no artifact pre-pull and no way to list or clear the store from the CLI.
   Each node's store is its own: a new node always fetches from origin.
+- **No peer-to-peer distribution or lazy loading.** A hundred nodes starting
+  the same model each download it from the registry (nothing like Dragonfly
+  or Spegel shares it between nodes), and a task starts only once every
+  selected layer is on disk (nothing like SOCI or Nydus streams it on
+  demand). A registry or object store close to the nodes is the workaround.
+- **Fetches are not resumable.** A download that fails partway starts over on
+  the next attempt.
 - **Locality covers digest-pinned artifacts only.** Container image layers
   are not in the content store, so images do not count toward a placement's
   content set.

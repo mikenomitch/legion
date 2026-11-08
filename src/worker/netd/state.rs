@@ -33,9 +33,13 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetdState {
-    /// The desired set, endpoint feed, and policy assignments.
+    /// The desired set and policy assignments.
     #[serde(flatten)]
     pub network: DesiredNetwork,
+    /// The endpoint feed: bindings and the sets they name, so restored
+    /// listeners have their endpoints before the first heartbeat.
+    #[serde(default)]
+    pub feed: crate::worker::netd::endpoint_feed::PersistedFeed,
     /// Policy bodies by hash, so no fetch is needed to restore.
     #[serde(default)]
     pub policy_bodies: Vec<(String, EffectivePolicy)>,
@@ -113,7 +117,8 @@ impl NetdStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structs::{AllocNetPolicy, TaskAllocation, UpstreamEndpoints};
+    use crate::structs::{AllocNetPolicy, EndpointBinding, TaskAllocation};
+    use crate::worker::netd::endpoint_feed::PersistedFeed;
 
     #[test]
     fn round_trips_and_tolerates_absence() -> R<()> {
@@ -129,16 +134,21 @@ mod tests {
                     network: "{\"mode\":\"gated\"}".into(),
                     ..Default::default()
                 }],
-                upstream_endpoints: vec![UpstreamEndpoints {
-                    allocation_id: 7,
-                    service: "db".into(),
-                    endpoints: Vec::new(),
-                    for_handler: false,
-                }],
+                endpoint_feed: None,
                 net_policies: vec![AllocNetPolicy {
                     allocation_id: 7,
                     policy_hash: "abc".into(),
                 }],
+            },
+            feed: PersistedFeed {
+                bindings: vec![EndpointBinding {
+                    allocation_id: 7,
+                    upstream: "db".into(),
+                    service: "db".into(),
+                    consumer: "web".into(),
+                    ..Default::default()
+                }],
+                sets: Vec::new(),
             },
             policy_bodies: vec![("abc".into(), EffectivePolicy::default())],
         };
@@ -148,12 +158,7 @@ mod tests {
         // The file keeps its flat shape: the boundary type's fields sit
         // next to the bodies.
         let raw: Value = serde_json::from_str(&std::fs::read_to_string(store.path())?)?;
-        for key in [
-            "desired",
-            "upstreamEndpoints",
-            "netPolicies",
-            "policyBodies",
-        ] {
+        for key in ["desired", "feed", "netPolicies", "policyBodies"] {
             assert!(raw.get(key).is_some(), "{key} missing from {raw}");
         }
         #[cfg(unix)]

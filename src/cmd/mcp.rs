@@ -5,11 +5,14 @@
 //! operations as MCP tools, so any MCP-capable agent can discover and drive a
 //! Legion cluster without hand-rolling a gRPC client or scraping CLI text.
 //!
-//! ## Transport
+//! ## Protocol and transports
 //!
-//! One JSON-RPC message per line on stdin; one response line on stdout. This
-//! is the MCP stdio transport contract (messages must not contain embedded
-//! newlines).
+//! MCP `2025-06-18`, negotiated down to `2025-03-26` or `2024-11-05` for
+//! older clients, with tool annotations, `outputSchema`/`structuredContent`
+//! (Legion's envelope), and elicitation for approval gates
+//! (`mcp_protocol.rs`). Two transports: stdio (one JSON-RPC message per
+//! line, the default) and Streamable HTTP on loopback (`--http ADDR`,
+//! `POST /mcp`, JSON responses only).
 //!
 //! ## Safety
 //!
@@ -46,10 +49,19 @@ use crate::structs::{ForkInstanceRequest, SetSnapshotAliasRequest};
 use crate::structs::PromoteInstanceRequest;
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// MCP protocol revision this server implements.
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Tools that map one-to-one onto a Manager RPC (agent-governance plan).
+#[path = "mcp_tools.rs"]
+mod mcp_tools;
+/// The protocol layer: negotiation, annotations, structured results,
+/// elicitation, and the stdio and HTTP transports.
+#[path = "mcp_protocol.rs"]
+mod protocol;
+
+/// The newest MCP protocol revision this server implements (older ones are
+/// negotiated; see `mcp_protocol.rs`).
+#[cfg(test)]
+const MCP_PROTOCOL_VERSION: &str = protocol::LATEST;
 
 /// Build the clap configuration for `legion mcp`.
 pub fn config() -> Command {
@@ -60,7 +72,11 @@ pub fn config() -> Command {
                 .long("allow-write")
                 .help("Expose mutating tools (run/stop/destroy). Off by default.")
                 .action(ArgAction::SetTrue),
-        );
+        )
+        .arg(Arg::new("http").long("http").value_name("ADDR").help(
+            "Serve the Streamable HTTP transport at http://ADDR/mcp (loopback only, \
+                     e.g. 127.0.0.1:8765) instead of stdio",
+        ));
 
     Command::new("mcp")
         .about("Model Context Protocol server for AI agents")
@@ -72,7 +88,18 @@ pub fn config() -> Command {
 /// Handle `legion mcp ...`.
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
-        Some(("serve", args)) => serve(args.get_flag("allow-write")).await,
+        Some(("serve", args)) => {
+            let allow_write = args.get_flag("allow-write");
+            match args.get_one::<String>("http") {
+                Some(addr) => {
+                    let addr = addr
+                        .parse()
+                        .with_context(|| format!("--http {addr}: expected HOST:PORT"))?;
+                    protocol::serve_http(addr, allow_write).await
+                }
+                None => protocol::serve_stdio(allow_write).await,
+            }
+        }
         _ => unreachable!(),
     }
 }
@@ -288,12 +315,27 @@ fn name_arg_schema() -> Value {
 
 /// The full tool catalog. Read-only tools are always available; mutating tools
 /// are filtered out unless `--allow-write` is set.
+/// Every tool: the hand-written ones below, then the one-to-one RPC tools
+/// (`mcp_tools.rs`). Append new hand-written tools to `core_tool_defs`.
 fn tool_defs() -> Vec<ToolDef> {
+    let mut tools = core_tool_defs();
+    tools.extend(mcp_tools::tool_defs());
+    tools.push(mcp_tools::stream_tool());
+    tools
+}
+
+fn core_tool_defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "legion_capabilities",
-            description: "List Legion's agent-callable operations and whether each mutates state.",
-            input_schema: empty_schema,
+            description: "List Legion's agent-callable operations and whether each mutates state, each marked allowed, partial (with namespaces), or denied for this server's token when a manager is reachable. static = true skips the manager.",
+            input_schema: || {
+                json!({
+                    "type": "object",
+                    "properties": { "static": { "type": "boolean", "description": "Return the catalog without asking the manager what this token may do." } },
+                    "additionalProperties": false
+                })
+            },
             mutates: false,
         },
         ToolDef {
@@ -394,8 +436,17 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_info",
-            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`), and `deadline` (Unix seconds, 0 for none) when its `placementTimeout` fails the job if it is still short. A gang job with status `failed` (timed out, or failed by its `onMemberLoss`) places nothing until it is run again (docs/gang-scheduling.md). With `scale:read`, `scalingInputs` adds one entry per task with request vs usage, cluster-wide: ready/placed/desired/unplaced replicas, measured CPU (MHz, utilization against the reservation, per-replica histogram) and memory, requests per second, error ratio, and latency into a service the task backs (internal callers only), whether a rollout is active, and `freshness.state` (`current`, `missing`, `resyncing`; act only on `current`) (docs/autoscaling.md, \"Scaling inputs\").",
-            input_schema: name_arg_schema,
+            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`), and `deadline` (Unix seconds, 0 for none) when its `placementTimeout` fails the job if it is still short. A gang job with status `failed` (timed out, or failed by its `onMemberLoss`) places nothing until it is run again (docs/gang-scheduling.md). With `scale:read`, `scalingInputs` adds one entry per task with request vs usage, cluster-wide: ready/placed/desired/unplaced replicas, measured CPU (MHz, utilization against the reservation, per-replica histogram) and memory, requests per second, error ratio, and latency into a service the task backs (internal callers only), whether a rollout is active, and `freshness.state` (`current`, `missing`, `resyncing`; act only on `current`) (docs/autoscaling.md, \"Scaling inputs\"). The reply carries `revision` (and the job's spec `version`): pass it back as `min_revision` to wait, up to `wait_seconds` (default and max 300), until the job changes after it (a blocking query; docs/watches-and-blocking-queries.md).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Job name." },
+                    "min_revision": { "type": "string", "description": "Wait until the job (its row, versions, allocations, or task outcomes) changes after this revision (a `revision` from an earlier reply), then answer." },
+                    "wait_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "How long `min_revision` waits (default and max 300). On timeout the current state is returned; compare `revision` to tell." }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
             mutates: false,
         },
         ToolDef {
@@ -426,7 +477,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_plan",
-            description: "Dry-run a rendered jobspec: which nodes its allocations would land on, and — the reason to run this before submitting — which RUNNING allocations the submit would preempt, with their job, task, priority band and grace window. A non-empty `preemptions` list means the submit costs somebody else something; treat it as requiring confirmation. `preemptionMode` says whether an empty list means \"nothing would be displaced\" or \"preemption is off\". `gangReports` has one entry per task that sets `gang`: `wouldPlace: false` means the job would place NOTHING and wait (blocked, holding nothing) until `min - running` replicas fit together, with `placeable`, `eligibleNodes` and `reason` saying how far it got — resize the gang, wait, or add capacity (docs/gang-scheduling.md).",
+            description: "Dry-run a rendered jobspec: which nodes its allocations would land on, and — the reason to run this before submitting — which RUNNING allocations the submit would preempt, with their job, task, priority band and grace window. A non-empty `preemptions` list means the submit costs somebody else something; treat it as requiring confirmation. `preemptionMode` says whether an empty list means \"nothing would be displaced\" or \"preemption is off\". `gangReports` has one entry per task that sets `gang`: `wouldPlace: false` means the job would place NOTHING and wait (blocked, holding nothing) until `min - running` replicas fit together, with `placeable`, `eligibleNodes` and `reason` saying how far it got — resize the gang, wait, or add capacity. A gang with `topology` also reports `topologyDomain` (the rack or other domain it would use, or the closest one when it would wait) and `topologyDomains` (0: no eligible node has the attribute) (docs/gang-scheduling.md).",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -1047,7 +1098,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_net_ca_rotate",
-            description: "Rotate the built-in cluster CA in two steps: the new CA (cross-signed by the old one) signs at once, the old one stays trusted for 24 hours, and nodes re-issue within one heartbeat. No connection breaks. Fails with FailedPrecondition, naming the procedure, when the CA comes from a `file` or `exec` provider, which rotate outside Legion. Mutating.",
+            description: "Rotate the built-in cluster CA in two steps: the new CA (cross-signed by the old one) signs at once, the old one stays trusted for 24 hours, and nodes re-issue within their rotation splay (at most 10 minutes). No connection breaks. Fails with FailedPrecondition, naming the procedure, when the CA comes from a `file` or `exec` provider, which rotate outside Legion. Mutating.",
             input_schema: empty_schema,
             mutates: true,
         },
@@ -1190,19 +1241,41 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_run",
-            description: "Submit or update a job from a rendered jobspec (JSON). Mutating.",
+            description: "Submit or update a job from a rendered jobspec (JSON). Mutating. With expected_version, compare-and-set: refused (Aborted, naming the current version) when another submit landed first. With wait_seconds, waits until the job is up (running, complete, scheduled, idle) or failed, and returns that.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
                     "spec_json": { "type": "string", "description": "Rendered jobspec as a JSON string." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." },
                     "force_reschedule": { "type": "boolean", "description": "Reschedule even if unchanged." },
+                    "expected_version": { "type": "integer", "minimum": 0, "description": "Submit only if the job is at this spec version (the `version` legion_job_status or a previous legion_job_run returned); 0 means the job must not exist. A mismatch writes nothing and fails with Aborted naming the current version: read the job again and resubmit on top of it." },
+                    "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 300, "description": "After submitting, wait up to this many seconds (max 300) for the job's rollout to finish and its status to read running/complete/scheduled/idle (success) or failed/stopped; the result's `wait` says which, or `settled: false` on timeout. Default 0: return at once." },
                     "allow_unknown_fields": { "type": "boolean", "description": "Accept keys Legion does not know (default false: each one is an error naming it and the closest known key). When true, keys on the job, a task, a volume, a port, or a service are kept as pending and the rest are dropped; each is listed in `warnings`." }
                 },
                 "required": ["spec_json"],
                 "additionalProperties": false
             }),
             mutates: true,
+        },
+        // ── Revisions and watches (revisions-and-watches plan) ──────────
+        ToolDef {
+            name: "legion_watch",
+            description: "Wait (bounded) for the next changes to jobs, allocations, or KV keys and return them, with the revision to pass as from_revision next time. Read-only. Without from_revision it starts from now; with one it returns every change after it at once if there are any. A from_revision older than the manager's journal fails with ResyncRequired: read the objects again and watch from the read's revision.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["job", "allocation", "kv"], "description": "What to watch. A job changes when its row, versions, allocations, or task outcomes do." },
+                    "job": { "type": "string", "description": "Jobs and allocations: only this job." },
+                    "namespace": { "type": "string", "description": "Jobs and allocations: only jobs in this namespace (and resolves a bare `job` in it)." },
+                    "node_id": { "type": "string", "description": "Allocations: only this node." },
+                    "prefix": { "type": "string", "description": "KV: only keys under this prefix." },
+                    "from_revision": { "type": "string", "description": "Return changes after this revision (from a previous call, or a read's `revision`)." },
+                    "wait_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "How long to wait for a change (default 30, max 300). On timeout `changes` is empty and `revision` is current." }
+                },
+                "required": ["kind"],
+                "additionalProperties": false
+            }),
+            mutates: false,
         },
         ToolDef {
             name: "legion_job_stop",
@@ -1625,6 +1698,19 @@ fn tool_defs() -> Vec<ToolDef> {
             }),
             mutates: true,
         },
+        // --- Devices (device-model-and-plugin-seams plan) ---
+        ToolDef {
+            name: "legion_node_devices",
+            description: "Show the devices (GPUs, FPGAs, ...) nodes report: per node, each device group (`vendor/type/model`, attributes such as memoryMiB and driver) with its instances (id, `healthy`, `healthDetail`, attributes such as numaNode and peerGroup), and each device plugin's last status. Unhealthy instances are never assigned. Ask for devices in a job with `resources.devices = [{ name = \"nvidia/gpu\", count = 2 }]`; an allocation's assigned ids are in its `resources.devices[].assigned` (docs/devices.md). Omit `node_id` for every node that reports devices.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "node_id": { "type": "string", "description": "One node; omit for all." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
     ]
 }
 
@@ -1636,116 +1722,33 @@ fn available_tools(allow_write: bool) -> Vec<ToolDef> {
         .collect()
 }
 
-/// Run the stdio MCP server loop until stdin closes.
-async fn serve(allow_write: bool) -> R<()> {
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin).lines();
-    let mut stdout = tokio::io::stdout();
-
-    info!(allow_write, "legion mcp server started");
-
-    while let Some(line) = reader.next_line().await? {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let response = handle_message(line, allow_write).await;
-        if let Some(response) = response {
-            let mut text = serde_json::to_string(&response)?;
-            text.push('\n');
-            stdout.write_all(text.as_bytes()).await?;
-            stdout.flush().await?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Parse and dispatch one JSON-RPC message. Returns `None` for notifications
-/// (no `id`), which must not be answered.
+/// Parse and dispatch one JSON-RPC message on a fresh session. Returns
+/// `None` for notifications (no `id`), which must not be answered.
+#[cfg(test)]
 async fn handle_message(line: &str, allow_write: bool) -> Option<Value> {
-    let parsed: Value = match serde_json::from_str(line) {
-        Ok(value) => value,
-        Err(err) => {
-            return Some(json_rpc_error(
-                Value::Null,
-                -32700,
-                &format!("parse error: {err}"),
-            ));
-        }
-    };
-
-    let id = parsed.get("id").cloned();
-    let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = parsed.get("params").cloned().unwrap_or(Value::Null);
-
-    // Notifications carry no id and expect no response.
-    let is_notification = id.is_none();
-
-    match method {
-        "initialize" => Some(json_rpc_result(id, initialize_result())),
-        "tools/list" => Some(json_rpc_result(id, tools_list_result(allow_write))),
-        "tools/call" => Some(json_rpc_result(
-            id,
-            tools_call_result(params, allow_write).await,
-        )),
-        "ping" => Some(json_rpc_result(id, json!({}))),
-        _ if is_notification => None,
-        _ => Some(json_rpc_error(
-            id.unwrap_or(Value::Null),
-            -32601,
-            &format!("method not found: {method}"),
-        )),
-    }
-}
-
-fn initialize_result() -> Value {
-    json!({
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": { "tools": {} },
-        "serverInfo": { "name": "legion", "version": env!("CARGO_PKG_VERSION") }
-    })
-}
-
-fn tools_list_result(allow_write: bool) -> Value {
-    let tools = available_tools(allow_write)
-        .into_iter()
-        .map(|tool| {
-            json!({
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool_schema(&tool),
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({ "tools": tools })
-}
-
-/// Execute a `tools/call`. Tool-level failures are reported inside the result
-/// with `isError: true` (per MCP convention), not as JSON-RPC errors.
-async fn tools_call_result(params: Value, allow_write: bool) -> Value {
-    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-
-    // Enforce the write policy regardless of what tools/list advertised.
-    if !allow_write && tool_defs().iter().any(|t| t.name == name && t.mutates) {
-        return tool_error(&format!(
-            "tool {name} is mutating and requires the server to be started with --allow-write"
-        ));
-    }
-
-    match dispatch_tool(name, arguments).await {
-        Ok(value) => tool_success(&value),
-        Err(err) => tool_error(&err),
-    }
+    protocol::handle_line(line, allow_write).await
 }
 
 /// Run a tool and return its data payload as JSON, or a human-readable error
 /// string on failure.
 async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
+    // Boxed: the tool futures are large, and inlining them here would grow
+    // every tool call's stack frame.
+    if let Some(result) = Box::pin(mcp_tools::dispatch(name, args.clone())).await {
+        return result;
+    }
     match name {
         "legion_capabilities" => {
+            // Caller-aware when a manager answers (each entry marked
+            // allowed/partial/denied for this server's token), else the
+            // static catalog.
+            if args.get("static").and_then(Value::as_bool) != Some(true) {
+                if let Ok(mut client) = connect().await {
+                    if let Ok(view) = crate::cmd::capabilities::caller_catalog(&mut client).await {
+                        return Ok(view);
+                    }
+                }
+            }
             Ok(serde_json::to_value(crate::cmd::capabilities::catalog())
                 .map_err(|e| e.to_string())?)
         }
@@ -1939,8 +1942,24 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_job_info" => {
             let name = job_arg(&args, "name")?;
             let mut client = connect().await?;
-            let mut reply =
-                grpc(client.get_job_info(GetJobInfoRequest { name: name.clone() })).await?;
+            let mut request = tonic::Request::new(GetJobInfoRequest { name: name.clone() });
+            // A blocking query (revisions-and-watches plan §2).
+            if let Some(revision) = opt_str_arg(&args, "min_revision") {
+                let metadata = request.metadata_mut();
+                metadata.insert(
+                    crate::manager::server::MIN_REVISION_HEADER,
+                    revision
+                        .parse()
+                        .map_err(|_| format!("min_revision {revision:?} is not a revision"))?,
+                );
+                if let Some(wait) = args.get("wait_seconds").and_then(Value::as_u64) {
+                    metadata.insert(
+                        crate::manager::server::WAIT_HEADER,
+                        wait.to_string().parse().expect("digits are ascii"),
+                    );
+                }
+            }
+            let mut reply = grpc(client.get_job_info(request)).await?;
             // Request vs usage, as `legion job info` shows it; left out when
             // the caller lacks `scale:read` (docs/autoscaling.md).
             if let (Some(object), Some(usage)) = (
@@ -3044,25 +3063,9 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.delete_job_template(DeleteJobTemplateRequest { name })).await
         }
-        "legion_job_run" => {
-            let spec_json = str_arg(&args, "spec_json")?;
-            let idempotency_key = opt_str_arg(&args, "idempotency_key");
-            let force_reschedule = args
-                .get("force_reschedule")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let mut client = connect().await?;
-            grpc(client.run_job(RunJobRequest {
-                parsed_jobspec: spec_json,
-                submissions: vec![],
-                priority: None,
-                force_reschedule,
-                idempotency_key,
-                namespace: opt_str_arg(&args, "namespace"),
-                allow_unknown_fields: allow_unknown_fields_arg(&args),
-            }))
-            .await
-        }
+        "legion_job_run" => job_run_tool(args).await,
+        // ── Revisions and watches (revisions-and-watches plan) ──────────
+        "legion_watch" => watch_tool(args).await,
         "legion_job_stop" => {
             let name = job_arg(&args, "name")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
@@ -3290,6 +3293,13 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 idempotency_key,
             }))
             .await
+        }
+        // Devices (device-model-and-plugin-seams plan).
+        "legion_node_devices" => {
+            let only = opt_str_arg(&args, "node_id");
+            let mut client = connect().await?;
+            let reply = grpc(client.get_nodes(GetNodesRequest::default())).await?;
+            Ok(node_devices_reply(&reply, only.as_deref()))
         }
         other => Err(format!("unknown tool: {other}")),
     }
@@ -3521,6 +3531,107 @@ async fn gitops_sync_tool(args: Value) -> Result<Value, String> {
     serde_json::to_value(report).map_err(|err| err.to_string())
 }
 
+/// `legion_job_run`: submit (compare-and-set with `expected_version`), then
+/// with `wait_seconds` wait, with blocking reads, until the job settles
+/// (revisions-and-watches plan §9).
+async fn job_run_tool(args: Value) -> Result<Value, String> {
+    let spec_json = str_arg(&args, "spec_json")?;
+    let namespace = opt_str_arg(&args, "namespace");
+    let mut client = connect().await?;
+    let mut value = grpc(
+        client.run_job(RunJobRequest {
+            parsed_jobspec: spec_json.clone(),
+            submissions: vec![],
+            priority: None,
+            force_reschedule: args
+                .get("force_reschedule")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            namespace: namespace.clone(),
+            allow_unknown_fields: allow_unknown_fields_arg(&args),
+            expected_version: args.get("expected_version").and_then(Value::as_i64),
+        }),
+    )
+    .await?;
+    let wait = args
+        .get("wait_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(crate::manager::server::MAX_READ_WAIT.as_secs());
+    if wait > 0 {
+        let name = serde_json::from_str::<Value>(&spec_json)
+            .ok()
+            .and_then(|spec| spec.get("name").and_then(Value::as_str).map(str::to_string))
+            .ok_or_else(|| "the jobspec names no job to wait for".to_string())?;
+        let (declared, bare) = crate::structs::namespace::split_job_id(&name);
+        let job = crate::structs::namespace::job_id(namespace.as_deref().unwrap_or(declared), bare);
+        value["wait"] = crate::cmd::watch::wait_for_job_settled(
+            &mut client,
+            &job,
+            std::time::Duration::from_secs(wait),
+        )
+        .await?;
+    }
+    Ok(value)
+}
+
+/// `legion_watch`: wait, bounded, for the next changes to jobs,
+/// allocations, or KV keys after a revision, and return them with the
+/// revision to pass next time (revisions-and-watches plan §3).
+async fn watch_tool(args: Value) -> Result<Value, String> {
+    use crate::structs::{WatchKind, WatchRequest};
+    let kind = match str_arg(&args, "kind")?.as_str() {
+        "job" => WatchKind::Job,
+        "allocation" => WatchKind::Allocation,
+        "kv" => WatchKind::Kv,
+        other => return Err(format!("kind {other:?} is not job, allocation, or kv")),
+    };
+    let wait = std::time::Duration::from_secs(
+        args.get("wait_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .clamp(1, crate::manager::server::MAX_READ_WAIT.as_secs()),
+    );
+    let mut client = connect().await?;
+    let mut stream = client
+        .watch(WatchRequest {
+            kind: kind as i32,
+            namespace: opt_str_arg(&args, "namespace").unwrap_or_default(),
+            job: opt_str_arg(&args, "job").unwrap_or_default(),
+            node_id: opt_str_arg(&args, "node_id").unwrap_or_default(),
+            prefix: opt_str_arg(&args, "prefix").unwrap_or_default(),
+            from_revision: opt_str_arg(&args, "from_revision").unwrap_or_default(),
+        })
+        .await
+        .map_err(|status| status_error(&status))?
+        .into_inner();
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut revision = String::new();
+    let mut changes = Vec::new();
+    loop {
+        let next = match tokio::time::timeout_at(deadline, stream.message()).await {
+            Ok(next) => next.map_err(|status| status_error(&status))?,
+            Err(_) => None,
+        };
+        let Some(event) = next else { break };
+        if event.resync_required {
+            let err = crate::cmd::watch::resync_error(&event);
+            return Err(serde_json::to_string(&err).unwrap_or(err.message));
+        }
+        revision = event.revision.clone();
+        if !event.changes.is_empty() {
+            changes.extend(event.changes);
+            break;
+        }
+    }
+    Ok(json!({
+        "revision": revision,
+        "changes": changes,
+        "timedOut": changes.is_empty(),
+    }))
+}
+
 /// `legion_object_apply`: apply, then (with `wait`) wait for the app to
 /// reconcile the new generation, as `legion object apply --wait` does.
 async fn object_apply_tool(args: Value) -> Result<Value, String> {
@@ -3655,6 +3766,35 @@ fn decode_node_attrs(mut reply: Value) -> Value {
         nodes.iter_mut().for_each(decode);
     }
     reply
+}
+
+/// `legion_node_devices`: each node's device report (docs/devices.md), from
+/// a `GetNodes` reply. Nodes with no devices are left out unless asked for
+/// by id.
+fn node_devices_reply(reply: &Value, only: Option<&str>) -> Value {
+    let nodes: Vec<Value> = reply
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            let id = node.get("id").and_then(Value::as_str)?;
+            if only.is_some_and(|only| only != id) {
+                return None;
+            }
+            let report = node
+                .get("healthChecks")
+                .and_then(Value::as_str)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|checks| checks.get(crate::devices::REPORT_KEY).cloned());
+            match (report, only) {
+                (Some(report), _) => Some(json!({ "id": id, "devices": report })),
+                (None, Some(_)) => Some(json!({ "id": id, "devices": { "groups": [] } })),
+                (None, None) => None,
+            }
+        })
+        .collect();
+    json!({ "nodes": nodes })
 }
 
 /// `legion_scaling_demand`'s templates, as `GetCapacityDemand` takes them.
@@ -3880,23 +4020,6 @@ fn variables_arg(args: &Value) -> String {
         .unwrap_or_else(|| "{}".to_string())
 }
 
-fn tool_success(data: &Value) -> Value {
-    let text = serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string());
-    json!({ "content": [{ "type": "text", "text": text }], "isError": false })
-}
-
-fn tool_error(message: &str) -> Value {
-    json!({ "content": [{ "type": "text", "text": message }], "isError": true })
-}
-
-fn json_rpc_result(id: Option<Value>, result: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id.unwrap_or(Value::Null), "result": result })
-}
-
-fn json_rpc_error(id: Value, code: i64, message: &str) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3936,6 +4059,35 @@ mod tests {
         let cli = serde_json::to_value(crate::structs::Node::from(node)).expect("serialize");
         assert_eq!(cli["configAttrs"]["workerAddress"], "https://10.0.0.5:4848");
         assert_eq!(cli["dynamicAttrs"]["rack"], "r1");
+    }
+
+    /// `legion_node_devices` (docs/devices.md) lifts each node's device
+    /// report out of its health checks.
+    #[test]
+    fn node_devices_tool_reports_each_nodes_devices_test() {
+        let gpu = crate::structs::NodeMsg {
+            id: "gpu-1".into(),
+            health_checks: json!({ "disk": "pass", "devices": { "groups": [
+                { "vendor": "nvidia", "type": "gpu", "model": "A100", "instances": [{ "id": "GPU-0" }] },
+            ]}})
+            .to_string(),
+            ..Default::default()
+        };
+        let plain = crate::structs::NodeMsg {
+            id: "cpu-1".into(),
+            health_checks: "{}".into(),
+            ..Default::default()
+        };
+        let reply = serde_json::to_value(crate::structs::GetNodesReply {
+            nodes: vec![gpu, plain],
+            ..Default::default()
+        })
+        .expect("serialize");
+        let all = node_devices_reply(&reply, None);
+        assert_eq!(all["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(all["nodes"][0]["devices"]["groups"][0]["model"], "A100");
+        let one = node_devices_reply(&reply, Some("cpu-1"));
+        assert_eq!(one["nodes"][0]["devices"]["groups"], json!([]));
     }
 
     #[test]

@@ -71,10 +71,106 @@ pub struct NamespacePolicy {
     /// differently leave it unresolvable for tasks that do not set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoscale: Option<crate::autoscaler::AutoscaleRecord>,
+    /// CEL rules every job in the governed namespaces must satisfy at
+    /// `job run`, `job plan`, and `job validate` (docs/namespaces.md, "Job
+    /// rules"; review finding PLG4): `self` is the job as submitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub job_rules: Vec<JobRule>,
+}
+
+/// One `jobRules` entry.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobRule {
+    /// A CEL expression over `self` (the job) that must be true. At most
+    /// 1 KiB, with the cost bounds app object rules have.
+    pub rule: String,
+    /// What the refusal says (`pin images by tag or digest, not :latest`).
+    pub message: String,
+}
+
+impl JobRule {
+    fn as_kind_rule(&self) -> crate::structs::object_rules::KindRule {
+        crate::structs::object_rules::KindRule {
+            rule: self.rule.clone(),
+            message: self.message.clone(),
+            path: None,
+            message_expression: None,
+        }
+    }
+}
+
+impl NamespacePolicy {
+    /// The job rules, compiled (cached by digest). Errors name the rule.
+    pub fn compiled_job_rules(
+        &self,
+    ) -> Result<std::sync::Arc<crate::structs::object_rules::CompiledRules>, String> {
+        let rules: Vec<_> = self.job_rules.iter().map(JobRule::as_kind_rule).collect();
+        let compiled = crate::structs::object_rules::compile_rules(&rules)
+            .map_err(|err| format!("namespace policy '{}': jobRules: {err}", self.name))?;
+        if let Some((index, _)) = compiled
+            .rules
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.transition)
+        {
+            return Err(format!(
+                "namespace policy '{}': jobRules[{index}] uses oldSelf; job rules see only \
+                 the job being submitted (`self`)",
+                self.name
+            ));
+        }
+        Ok(compiled)
+    }
+}
+
+/// Check `config` against every governing policy's `jobRules`. Each failing
+/// rule is named: `namespace policy 'house-rules' jobRules[0]: pin images by
+/// tag or digest, not :latest`.
+pub fn check_job_rules(policies: &[&NamespacePolicy], config: &JobConfig) -> Result<(), String> {
+    if policies.iter().all(|policy| policy.job_rules.is_empty()) {
+        return Ok(());
+    }
+    let spec = serde_json::to_value(config)
+        .map_err(|err| format!("the job could not be checked against job rules: {err}"))?;
+    let mut failures = Vec::new();
+    for policy in policies {
+        if policy.job_rules.is_empty() {
+            continue;
+        }
+        let compiled = policy.compiled_job_rules()?;
+        if let Err(messages) = compiled.evaluate(&spec, None) {
+            for message in messages {
+                // `spec: <message>` from the evaluator: the job is the spec.
+                let message = message.strip_prefix("spec: ").unwrap_or(&message);
+                let index = policy
+                    .job_rules
+                    .iter()
+                    .position(|rule| message.starts_with(&rule.message))
+                    .map(|index| format!("jobRules[{index}]"))
+                    .unwrap_or_else(|| "jobRules".to_string());
+                failures.push(format!(
+                    "namespace policy '{}' {index}: {message}",
+                    policy.name
+                ));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the job breaks {} job rule(s): {}\nHint: `legion namespace get {}` lists the \
+             policies that govern the namespace",
+            failures.len(),
+            failures.join("; "),
+            job_namespace(&config.name)
+        ))
+    }
 }
 
 /// One band's cap. Each dimension is optional; an unset one is uncapped.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QuotaLimit {
     /// CPU in MHz, the unit of `resources.cpu`.
@@ -91,6 +187,11 @@ pub struct QuotaLimit {
     /// Exclusive cores (`resources.cores`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cores: Option<f64>,
+    /// Devices (`resources.devices`), by device name: `{ "nvidia/gpu" = 8 }`.
+    /// A request is charged against every key it could be served under, so
+    /// `gpu` counts against `nvidia/gpu` (docs/devices.md, "Quota").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub devices: BTreeMap<String, f64>,
 }
 
 /// Pool rules: every task's pool must match `allowed`; a task whose permit
@@ -241,6 +342,15 @@ impl NamespacePolicy {
                     ));
                 }
             }
+            for (device, value) in &limit.devices {
+                crate::devices::DeviceName::parse(device)
+                    .map_err(|err| format!("{what}: quota.{band}.devices: {err:#}"))?;
+                if !value.is_finite() || *value < 0.0 {
+                    return Err(format!(
+                        "{what}: quota.{band}.devices.{device} must be a non-negative number"
+                    ));
+                }
+            }
             quota.insert(parsed.as_str().to_string(), limit);
         }
         self.quota = quota;
@@ -296,6 +406,9 @@ impl NamespacePolicy {
         }
         if let Some(autoscale) = self.autoscale.as_ref() {
             autoscale.validate_inherited(&what)?;
+        }
+        if !self.job_rules.is_empty() {
+            self.compiled_job_rules()?;
         }
         Ok(())
     }
@@ -371,6 +484,8 @@ pub fn admit_job(policies: &[NamespacePolicy], config: &mut JobConfig) -> Result
     if governing.is_empty() {
         return Ok(());
     }
+    // Operator-defined admission rules (CEL), against the job as submitted.
+    check_job_rules(&governing, config)?;
     let mut defaults = governing.iter().filter_map(|policy| {
         policy
             .pools
@@ -510,6 +625,55 @@ mod namespace_policy_test {
             pending_extensions: Default::default(),
             extensions: Default::default(),
         }
+    }
+
+    /// PLG4: operator CEL rules on jobs, refused with the policy and the
+    /// rule named, and checked at apply for a rule that cannot compile.
+    #[test]
+    fn job_rules_refuse_jobs_that_break_them_test() {
+        let house = policy(json!({
+            "name": "house-rules",
+            "namespaces": ["*"],
+            "jobRules": [
+                { "rule": "self.tasks.all(t, !has(t.config.image) || !t.config.image.endsWith(':latest'))",
+                  "message": "pin images by tag or digest, not :latest" },
+                { "rule": "self.tasks.all(t, t.runtime != 'exec')",
+                  "message": "no exec tasks" },
+            ],
+        }));
+        let policies = vec![house];
+        let mut ok = job("web", "container", Value::Null);
+        ok.tasks[0].config = json!({ "image": "nginx:1.27", "command": ["nginx"] });
+        admit_job(&policies, &mut ok).unwrap();
+
+        let mut latest = ok.clone();
+        latest.tasks[0].config["image"] = json!("nginx:latest");
+        let err = admit_job(&policies, &mut latest).unwrap_err();
+        assert!(
+            err.contains("namespace policy 'house-rules' jobRules[0]: pin images"),
+            "{err}"
+        );
+        let mut both = job("both", "exec", Value::Null);
+        both.tasks[0].config = json!({ "image": "x:latest", "command": ["x"] });
+        let err = admit_job(&policies, &mut both).unwrap_err();
+        assert!(
+            err.contains("2 job rule(s)") && err.contains("jobRules[1]: no exec"),
+            "{err}"
+        );
+
+        // A rule that does not compile, or that uses oldSelf, fails apply.
+        let bad = NamespacePolicy::from_json(
+            &json!({ "name": "bad", "namespaces": ["*"],
+                     "jobRules": [{ "rule": "self.tasks.all(t,", "message": "m" }] })
+            .to_string(),
+        );
+        assert!(bad.unwrap_err().contains("jobRules"));
+        let transition = NamespacePolicy::from_json(
+            &json!({ "name": "t", "namespaces": ["*"],
+                     "jobRules": [{ "rule": "self.name == oldSelf.name", "message": "m" }] })
+            .to_string(),
+        );
+        assert!(transition.unwrap_err().contains("oldSelf"));
     }
 
     #[test]

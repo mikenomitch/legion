@@ -30,6 +30,10 @@ mod read_model_check;
 mod blocked_evals;
 pub use blocked_evals::{BlockedEval, CAPACITY_REPLAY_WINDOW};
 mod eval_claims;
+// What `plan_submission` keeps: rejections and staged plans, id-windowed.
+mod plan_records;
+use plan_records::PlanRecord;
+pub use plan_records::PLAN_SUBMISSION_RETAINED;
 mod fork_ops;
 mod group_commit;
 mod session_ops;
@@ -38,6 +42,8 @@ mod envelope_ops;
 pub use envelope_ops::{EnvelopeResizeOutcome, EnvelopeResizeRequest};
 mod snapshot_ops;
 mod suspend_ops;
+// Device assignment at allocation insert (docs/devices.md).
+mod device_ops;
 // The job status GetJobInfo/ListJobs report, derived from the workload.
 mod job_status_ops;
 // Reschedule backoff: the failed-allocation removal op, its holds, and the
@@ -71,6 +77,16 @@ pub use app_object_ops::{
 // §6.11).
 mod demand_ops;
 mod forget_ops;
+// Endpoint-index invalidation from committed changesets (mesh-control-path
+// plan §6.1).
+mod endpoint_ops;
+// The replicated write path's store-side half: the purge barrier's fsync,
+// speculative-batch recovery, replicated data migrations
+// (raft-write-path plan).
+mod raft_write_path;
+// Revisions and watches: where a revision comes from, and how the
+// projection feeds the change journal (revisions-and-watches plan).
+mod revision_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -170,6 +186,10 @@ pub struct JobSubmitRequest {
     /// What `allow_unknown_fields` kept and dropped, recorded on the
     /// version (`job_config.meta.unknownFields`).
     pub unknown_fields: Option<UnknownFieldsRecord>,
+    /// Compare-and-set on the job's latest version
+    /// (`RunJobRequest.expected_version`; 0 = must not exist), checked in
+    /// the entry that writes the version.
+    pub expected_version: Option<i64>,
 }
 
 /// One eval to enqueue, for the batched [`Store::enqueue_evals`].
@@ -284,6 +304,13 @@ impl EvalBatchLimits {
         let pending = pending.max(0) as usize;
         (pending / workers).clamp(1, self.max.max(1))
     }
+
+    /// The unclaimed-queue length at which [`Self::share_of`] stops
+    /// growing: any deeper queue gets the same batch, so a claim never
+    /// needs to count past it (`store/eval_claims.rs`).
+    fn saturation(&self) -> usize {
+        self.workers.max(1).saturating_mul(self.max.max(1))
+    }
 }
 
 /// Which eval kinds a claim may take.
@@ -335,25 +362,13 @@ fn node_public_address(config_attrs: &Value) -> Option<String> {
 }
 
 /// Extract the host portion of a node's advertised `workerAddress` config
-/// attribute (for example `http://10.0.0.5:4848` -> `10.0.0.5`).
+/// attribute (`http://10.0.0.5:4848` -> `10.0.0.5`,
+/// `http://[fd00::5]:4848` -> `fd00::5`). An IPv6 host comes back without
+/// brackets; whoever joins it with a port brackets it again
+/// (`structs::hostport`).
 fn worker_address_host(config_attrs: &Value) -> Option<String> {
     let address = config_attrs.as_object()?.get("workerAddress")?.as_str()?;
-    let without_scheme = address
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(address);
-    let host = without_scheme
-        .split('/')
-        .next()
-        .unwrap_or(without_scheme)
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or(without_scheme);
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
+    crate::structs::hostport::url_host(address).map(str::to_string)
 }
 
 /// Allocations per node, each node's vector shared by refcount: the few
@@ -827,7 +842,11 @@ pub(crate) type PlanCapacityParts = (
 
 #[derive(Debug, Clone)]
 pub struct PlanSubmission {
-    pub id: i64,
+    /// The `plan_submission` row that records this plan, if one is kept: a
+    /// staged plan's row, or a rejected plan's record. `None` for a plan
+    /// the fused submit-and-apply op applied, which keeps no row
+    /// (`store/plan_records.rs`).
+    pub id: Option<i64>,
     pub job_config_id: String,
     pub expected_versions: BTreeMap<String, i64>,
 }
@@ -1218,7 +1237,31 @@ enum PlanPlacements {
     Candidates(Vec<PlanSubmissionPlacement>),
 }
 
+/// What a plan's apply walk consumes, wherever it came from: the fused
+/// request in memory, or a staged row read back
+/// (`store/plan_records.rs`).
+struct PlanBody<'a> {
+    mode: &'a str,
+    placements: &'a [PlanSubmissionPlacement],
+    evictions: &'a [PlanEviction],
+    /// Set only by a ratification (docs/edge-boot.md).
+    target_instance: Option<&'a str>,
+}
+
 impl PlanPlacements {
+    /// Format-1 `(node, task)` pairs as the walk's singleton candidate
+    /// lists: exact-CAS semantics, one node per placement.
+    fn singleton_candidates(pairs: &[(String, i64)]) -> Vec<PlanSubmissionPlacement> {
+        pairs
+            .iter()
+            .map(|(node_id, task_id)| PlanSubmissionPlacement {
+                task_id: *task_id,
+                candidates: vec![node_id.clone()],
+                instance_id: None,
+            })
+            .collect()
+    }
+
     /// The `plan_submission.placements` JSON for this shape.
     fn to_json(&self) -> R<String> {
         match self {
@@ -1417,10 +1460,6 @@ pub struct Store {
     // Replication pipeline handle, installed by the raft engine at start
     // (phase A-1). Until it is set, `replicated()` in raft mode errors.
     replication: Arc<OnceLock<ReplicationHandle>>,
-    // Whether the write connection runs at `synchronous = FULL` (raft mode —
-    // see `configure_connection`); remembered so snapshot install reopens
-    // the connection with the same durability level.
-    durable_sync: bool,
     // Two-sweep observation grace for the status-lane orphan sweeps
     // (adversarial finding F2, 2026-07-28): an orphan is only DELETED after
     // being observed by two consecutive sweeps, so a freshly failed-over
@@ -1457,6 +1496,18 @@ pub struct Store {
     // plan, Phase 2): fed by the changeset projection on every replica,
     // read by whichever manager a worker streams from.
     work_log: Arc<crate::storage::work_log::WorkLog>,
+    // Versioned endpoint sets per service (mesh-control-path plan §6.1):
+    // invalidated by the changeset projection on every replica, read by
+    // the heartbeat's endpoint feed and the work stream's pushes.
+    endpoint_index: Arc<crate::storage::endpoint_index::EndpointIndex>,
+    // The change journal behind blocking reads, `Watch`, and `StreamWork`
+    // resume (revisions-and-watches plan): fed by the changeset projection
+    // on every replica, like the work log. See `store/revision_ops.rs`.
+    revisions: Arc<crate::storage::revisions::RevisionHub>,
+    // Whether revisions are raft applied indexes (raft persistence) rather
+    // than the `local_disk` counter. A plain flag, so the engine's own store
+    // clones, which carry a placeholder driver, still know.
+    raft_revisions: bool,
     // Eval claims as leader memory (sandbox-scaling plan, Phase 1): which
     // evals this manager's eval workers hold. A claim writes nothing; see
     // `store/eval_claims.rs`.
@@ -1998,6 +2049,48 @@ const SEED_TASK_STATUSES_SQL: &str =
 // 22nd century (i64::MAX >> 21 ms ≈ year 2109).
 const EVENT_ID_SEQ_BITS: u32 = 18;
 
+/// Per-residue (per-lane) high-water mark of `scheduler_event` ids: the
+/// largest id this process minted or saw committed. Minting never goes at
+/// or below it (`Store::next_scheduler_event_id`), and the projection raises
+/// it from every committed event (`Store::raise_event_id_floor`), so ids
+/// increase per lane across a failover as well as within a process.
+static EVENT_ID_HIGH_WATER: [std::sync::atomic::AtomicI64; Lane::ID_STRIDE as usize] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; Lane::ID_STRIDE as usize];
+
+/// The operator-facing sentence for a lost `RunJob` compare-and-set,
+/// shaped like `ApplyObject`'s: what the job is at, and how to recover.
+fn job_version_conflict(job: &str, current: i64, expected: i64) -> String {
+    if expected == 0 {
+        format!(
+            "job {job} already exists (version {current}); expected_version 0 creates only\n\
+             Hint: read it (legion job info {job}) and resubmit with --expected-version {current}"
+        )
+    } else if current == 0 {
+        format!(
+            "job {job} does not exist, and expected_version {expected} names a stored version\n\
+             Hint: pass --expected-version 0 to create it"
+        )
+    } else {
+        format!(
+            "job {job} is at version {current}, not {expected}: it changed since you read it\n\
+             Hint: read it again (legion job info {job}) and resubmit on top of it with \
+             --expected-version {current}"
+        )
+    }
+}
+
+/// What the work-log projection resolved from one committed changeset, for
+/// the revision journal ([`Store::record_revision_changes`]).
+#[derive(Debug, Default)]
+struct WorkChanges {
+    /// `(node, allocation)` pairs the changeset changed.
+    pairs: Vec<(String, i64)>,
+    /// Nodes whose allocation changes could not be named.
+    unknown_nodes: Vec<String>,
+    /// No change could be attributed to a node at all.
+    unattributed: bool,
+}
+
 // NOTE: This will become a general interface for all storage backends
 
 /// Columns `QueryStateStore` reads as NULL: private key material, password
@@ -2116,7 +2209,7 @@ impl Store {
         let keyring = Keyring::from_config(&config.encryption, &config.store_path)?;
         let cluster_ca = crate::manager::cluster_ca::ClusterCa::from_config(&config.cluster_ca)?;
 
-        let write_conn = Store::create_write_conn(&db_path, raft_enabled)?;
+        let write_conn = Store::create_write_conn(&db_path)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
         let read_conns = Store::create_read_pool(&db_path, config.eval_threads)?;
         let checkpoint_conn: MemSafeConn = Arc::new(Mutex::new(Connection::open(&db_path)?));
@@ -2150,7 +2243,6 @@ impl Store {
                 crate::structs::network::sandbox_gated_by_default(),
             )),
             replication: Arc::new(OnceLock::new()),
-            durable_sync: raft_enabled,
             node_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
             allocation_health_orphan_candidates: Arc::new(std::sync::Mutex::new(HashSet::new())),
             plan_coalescer: Arc::new(crate::storage::coalesce::Coalescer::new(
@@ -2174,6 +2266,9 @@ impl Store {
                 TASK_STATUS_SEED_BATCH_MAX,
             )),
             work_log: Arc::new(crate::storage::work_log::WorkLog::new()),
+            endpoint_index: Arc::new(crate::storage::endpoint_index::EndpointIndex::new()),
+            revisions: Arc::new(crate::storage::revisions::RevisionHub::new()),
+            raft_revisions: raft_enabled,
             eval_claims: Arc::new(std::sync::Mutex::new(eval_claims::EvalClaims::default())),
             capacity_events: Arc::new(std::sync::Mutex::new(
                 blocked_evals::CapacityEvents::default(),
@@ -2199,12 +2294,21 @@ impl Store {
         };
         store.liveness.configure(config.liveness.settings());
 
+        // Undo speculative raft batches a crash left behind, before the read
+        // model is built and before the raft engine reads the applied marker
+        // (raft-write-path plan §6.3).
+        crate::storage::raft::speculation::recover(&store)?;
+
         store.refresh_read_model()?;
 
         // Unwrap whatever data keys the (migrated) store already holds, so
         // reads work from the first request. A root key that is missing here
         // locks KV, loudly, and never stops the manager (docs/kv-encryption.md).
         store.load_keyring_at_start();
+
+        // Open the change journal at the revision the store is at now,
+        // before the raft engine replays any entry into it.
+        store.start_revisions();
 
         // Raft mode: start the engine AFTER migrations (the state machines
         // apply into the migrated DB) and BEFORE this store is handed to
@@ -2221,6 +2325,11 @@ impl Store {
         // only when it leads and every voter can apply the new table (the
         // upgrade gate), otherwise the daemon's keyring loop retries.
         store.initialize_keyring_at_start();
+
+        // Data steps (raft-write-path plan §6.5): a local store runs any
+        // pending ones now; under raft the control-lane leader runs them
+        // through the log once every voter can apply them.
+        store.run_data_migrations_at_start();
 
         Store::spawn_wal_checkpointer(Arc::downgrade(&store.checkpoint_conn));
 
@@ -2571,11 +2680,13 @@ impl Store {
     /// user table except the ones that legitimately differ between healthy
     /// replicas (plan §7-C2):
     ///
-    /// - `raft_applied` (applied marker legitimately lags on followers) and
-    ///   `raft_cluster` (node-local identity stamp) — raft bookkeeping,
-    ///   never replicated;
-    /// - `scheduler_event` / `idempotency_record` — commutative tables
-    ///   pruned locally per node (JC-28), so their retained windows differ.
+    /// - `raft_applied` (applied marker legitimately lags on followers),
+    ///   `raft_cluster` (node-local identity stamp), `raft_speculative` (the
+    ///   leader's undo records), and `store_revision` (the `local_disk`
+    ///   revision counter) — node-local bookkeeping, never replicated;
+    /// - `scheduler_event` / `idempotency_record` / `audit_event` —
+    ///   commutative tables pruned locally per node (JC-28), so their
+    ///   retained windows differ.
     ///
     /// `eval` is deliberately INCLUDED again (JC-41 reverses JC-27): the
     /// queue is replicated scheduler-lane state, so replicas that disagree
@@ -2591,8 +2702,9 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT name FROM sqlite_master
                  WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-                   AND name NOT IN ('raft_applied', 'raft_cluster',
-                                    'scheduler_event', 'idempotency_record')
+                   AND name NOT IN ('raft_applied', 'raft_cluster', 'raft_speculative',
+                                    'store_revision', 'scheduler_event',
+                                    'idempotency_record', 'audit_event')
                  ORDER BY name;",
             )?;
             let rows = stmt.query_map([], |row| row.get(0))?;
@@ -2793,10 +2905,10 @@ impl Store {
     }
 
     #[instrument(err, skip_all)]
-    fn create_write_conn(db_path: &Path, durable_sync: bool) -> R<MemSafeConn> {
+    fn create_write_conn(db_path: &Path) -> R<MemSafeConn> {
         let final_path = db_path.to_str().context("Error parsing store path")?;
         let conn = Connection::open(final_path)?;
-        Self::configure_connection(&conn, false, durable_sync)?;
+        Self::configure_connection(&conn, false)?;
         Ok(Arc::new(Mutex::new(conn)))
     }
 
@@ -2804,27 +2916,26 @@ impl Store {
     fn create_readonly_conn(db_path: &Path) -> R<MemSafeConn> {
         let final_path = db_path.to_str().context("Error parsing store path")?;
         let conn = Connection::open_with_flags(final_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        Self::configure_connection(&conn, true, false)?;
+        Self::configure_connection(&conn, true)?;
         conn.pragma_update(None, "query_only", "ON")?;
         Ok(Arc::new(Mutex::new(conn)))
     }
 
-    /// `durable_sync` (raft mode) runs the write connection at
-    /// `synchronous = FULL` instead of `NORMAL`. Raft purges its log behind
-    /// snapshots, so the "state is recoverable from the log" argument that
-    /// justifies NORMAL for local_disk does not hold past the purge horizon:
-    /// after a power loss, an applied marker that regressed below
-    /// `last_purged_log_id` (WAL not yet checkpointed) would make openraft's
-    /// startup reapply fail permanently — a bricked node. FULL makes every
-    /// applied entry fsync before it is acknowledged, so the marker can
-    /// never regress past durable state.
-    fn configure_connection(conn: &Connection, read_only: bool, durable_sync: bool) -> R<()> {
+    /// The write connection runs `synchronous = NORMAL` in every mode: a
+    /// commit is in the WAL but not yet fsynced, so a power loss can roll the
+    /// state DB back to an earlier commit. Raft mode tolerates that because
+    /// the state is recoverable from the log — up to the log's purge
+    /// horizon. Past it, an applied marker that regressed below
+    /// `last_purged_log_id` would make openraft's startup reapply fail for
+    /// good, so the raft log store fsyncs the state DB
+    /// ([`Store::sync_state_db_to_disk`]) before every purge: one fsync per
+    /// purge instead of one per entry (raft-write-path plan §6.1).
+    fn configure_connection(conn: &Connection, read_only: bool) -> R<()> {
         conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
 
         if !read_only {
             conn.pragma_update(None, "journal_mode", "WAL")?;
-            let synchronous = if durable_sync { "FULL" } else { "NORMAL" };
-            conn.pragma_update(None, "synchronous", synchronous)?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
         }
 
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -2866,6 +2977,8 @@ impl Store {
         let mut conn = self.write_connection()?;
         migrations.to_version(&mut conn, 0)?;
         migrations.to_latest(&mut conn)?;
+        // Empty tables: no data step has anything to migrate.
+        crate::storage::data_migrations::mark_all_done(&conn)?;
         drop(conn);
         self.refresh_read_model()?;
         // The keyring rows went with the tables: reload (now empty) and
@@ -2881,7 +2994,13 @@ impl Store {
         let migrations = get_migrations();
         let mut conn = Self::lock_conn(conn, "migration")?;
         info!("Running migrations");
+        let fresh: i64 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
         migrations.to_latest(&mut conn)?;
+        // A brand-new database has no rows for any data step to migrate:
+        // record them all as done (`storage::data_migrations` module docs).
+        if fresh == 0 {
+            crate::storage::data_migrations::mark_all_done(&conn)?;
+        }
 
         Ok(migrations)
     }
@@ -3240,6 +3359,10 @@ impl Store {
                 .with_context(|| format!("failed running VACUUM INTO {}", dest.display()))?;
             Ok(applied_index)
         })?;
+        // A leader's in-flight speculative batches are committed rows in the
+        // state DB; revert them in the copy so the backup is committed state
+        // only (raft-write-path plan §6.3).
+        crate::storage::raft::speculation::scrub_image(&dest)?;
         let bytes = std::fs::metadata(&dest)
             .with_context(|| format!("backup file {} missing after vacuum", dest.display()))?
             .len();
@@ -3307,6 +3430,10 @@ impl Store {
         let _ = std::fs::remove_file(&staged);
         std::fs::copy(backup, &staged)
             .with_context(|| format!("failed copying backup to {}", staged.display()))?;
+        // A raw copy of a raft leader's state DB (rather than a `state
+        // backup`, which is already scrubbed) can hold in-flight speculative
+        // batches: revert them, so only committed state is restored.
+        crate::storage::raft::speculation::scrub_image(&staged)?;
         {
             let conn = Connection::open(&staged)
                 .with_context(|| format!("failed opening staged restore {}", staged.display()))?;
@@ -3427,7 +3554,7 @@ impl Store {
 
         // Step 3: reopen against the new file.
         let new_write = Connection::open(&*self.db_path)?;
-        Self::configure_connection(&new_write, false, self.durable_sync)?;
+        Self::configure_connection(&new_write, false)?;
         *write_guard = new_write;
         // `data_version` is per connection: the new one starts its own count.
         *self
@@ -3437,7 +3564,7 @@ impl Store {
         for guard in read_guards.iter_mut() {
             let conn =
                 Connection::open_with_flags(&*self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            Self::configure_connection(&conn, true, false)?;
+            Self::configure_connection(&conn, true)?;
             conn.pragma_update(None, "query_only", "ON")?;
             **guard = conn;
         }
@@ -5053,6 +5180,10 @@ impl Store {
         )
     }
 
+    /// The staged path's insert: a `queued` row the matching
+    /// [`Self::apply_plan_submission`] consumes (deleting it when the plan
+    /// applies). The fused path writes no row up front
+    /// (`store/plan_records.rs`).
     fn insert_plan_submission_apply(
         &self,
         job_config_id: &str,
@@ -5063,7 +5194,7 @@ impl Store {
         target_instance: &str,
     ) -> R<PlanSubmission> {
         let conn = self.write_connection()?;
-        self.insert_plan_submission_on(
+        let id = Self::insert_plan_record_on(
             &conn,
             job_config_id,
             mode,
@@ -5071,48 +5202,10 @@ impl Store {
             expected_versions,
             evictions,
             target_instance,
-        )
-    }
-
-    /// [`Self::insert_plan_submission_apply`] on a caller-supplied
-    /// connection, so the row can join the transaction the plan itself
-    /// applies in (the fused op, and every plan inside a group commit).
-    fn insert_plan_submission_on(
-        &self,
-        conn: &Connection,
-        job_config_id: &str,
-        mode: &str,
-        placements_json: &str,
-        expected_versions: &BTreeMap<String, i64>,
-        evictions: &[PlanEviction],
-        target_instance: &str,
-    ) -> R<PlanSubmission> {
-        let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
-        let evictions_json = serde_json::to_string(evictions)?;
-        let expected_vector_json = serde_json::to_string(expected_versions)?;
-        let expected_job_epoch = *expected_versions
-            .get(&Self::scope_vector_key("job_config", job_config_id))
-            .unwrap_or(&0);
-        let id = conn
-            .prepare_cached(
-                "INSERT INTO plan_submission(job_config_id, mode, placements, expected_epoch, expected_version_vector, status, created_at, evictions, target_instance) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8) RETURNING id;",
-            )?
-            .query_row(
-                params![
-                    job_config_id,
-                    mode,
-                    placements_json,
-                    expected_job_epoch,
-                    expected_vector_json,
-                    created_at,
-                    evictions_json,
-                    target_instance
-                ],
-                |row| row.get(0),
-            )?;
-
+            None,
+        )?;
         Ok(PlanSubmission {
-            id,
+            id: Some(id),
             job_config_id: job_config_id.to_string(),
             expected_versions: expected_versions.clone(),
         })
@@ -5270,27 +5363,44 @@ impl Store {
         Ok(reply)
     }
 
-    /// One plan of either format, applied on `tx`: insert the submission
-    /// row and run the candidate walk, returning the side effects the
+    /// One plan of either format, applied on `tx`: run the candidate walk
+    /// over the request's own placements, returning the side effects the
     /// caller must emit once `tx` commits. Format 1 and format 2 share
-    /// this body — the submission's serialized shape is what differs, not
-    /// the walk (docs/late-binding-plan-apply.md).
+    /// this body (docs/late-binding-plan-apply.md).
+    ///
+    /// Nothing is written to `plan_submission` up front, and the walk never
+    /// reads the plan back: the placements are already here, in the
+    /// request. Serializing them to JSON, inserting them, selecting them
+    /// back, and parsing them again cost the serialized commit work that
+    /// grew with every placement's candidate list (review SCH5). A
+    /// rejected plan still leaves its record (`store/plan_records.rs`).
     fn submit_and_apply_plan_on(
         &self,
         tx: &Connection,
         request: &PlanApplyRequest,
     ) -> R<(PlanApplyReply, PlanApplyEffects)> {
-        let placements_json = request.placements.to_json()?;
-        let submission = self.insert_plan_submission_on(
-            tx,
-            &request.job_config_id,
-            &request.mode,
-            &placements_json,
-            &request.expected_versions,
-            &request.evictions,
-            &request.target_instance,
-        )?;
-        let (outcome, mut effects) = self.apply_plan_submission_on(tx, &submission)?;
+        let mut submission = PlanSubmission {
+            id: None,
+            job_config_id: request.job_config_id.clone(),
+            expected_versions: request.expected_versions.clone(),
+        };
+        let singletons;
+        let placements: &[PlanSubmissionPlacement] = match &request.placements {
+            PlanPlacements::Candidates(placements) => placements,
+            PlanPlacements::Nodes(pairs) => {
+                singletons = PlanPlacements::singleton_candidates(pairs);
+                &singletons
+            }
+        };
+        let body = PlanBody {
+            mode: &request.mode,
+            placements,
+            evictions: &request.evictions,
+            target_instance: Some(request.target_instance.as_str()).filter(|id| !id.is_empty()),
+        };
+        let (outcome, mut effects, record_id) =
+            self.apply_plan_walk_on(tx, &submission, body, PlanRecord::Unwritten(request))?;
+        submission.id = record_id;
         if let (Some(settle), PlanApplyOutcome::Applied(_)) = (&request.settle, &outcome) {
             // The plan placed everything its eval wanted: the job's blocked
             // eval, if any, waits for nothing.
@@ -5765,16 +5875,61 @@ impl Store {
 
     /// [`Self::apply_plan_submission_apply`] on a caller-supplied
     /// transaction, returning the side effects to emit once that
-    /// transaction commits. The group commit runs this once per plan
-    /// inside the batch's single transaction.
+    /// transaction commits: the staged path, which reads its plan back from
+    /// the `queued` row [`Self::insert_plan_submission`] wrote (it was
+    /// persisted across two ops), then runs the shared walk.
     fn apply_plan_submission_on(
         &self,
         tx: &Connection,
         submission: &PlanSubmission,
     ) -> R<(PlanApplyOutcome, PlanApplyEffects)> {
+        let id = submission
+            .id
+            .context("a staged plan submission carries the id of its row")?;
+        let row: Option<(String, String, String, Option<String>)> = tx
+            .prepare_cached(
+                "SELECT placements, mode, evictions, target_instance FROM plan_submission \
+                 WHERE id = ?1;",
+            )?
+            .query_row([id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .optional()?;
+        let Some((placements_json, mode, evictions_json, target_instance)) = row else {
+            bail!(
+                "plan submission {id} no longer exists: it was applied already, or it fell out \
+                 of the {PLAN_SUBMISSION_RETAINED}-record window before it was applied"
+            );
+        };
+        let placements = Self::parse_plan_submission_placements(&placements_json)?;
+        let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
+        let body = PlanBody {
+            mode: &mode,
+            placements: &placements,
+            evictions: &evictions,
+            target_instance: target_instance.as_deref().filter(|id| !id.is_empty()),
+        };
+        let (outcome, effects, _) =
+            self.apply_plan_walk_on(tx, submission, body, PlanRecord::Staged(id))?;
+        Ok((outcome, effects))
+    }
+
+    /// The apply walk both paths share: bind every placement of `body`
+    /// (see [`Self::apply_plan_submission_apply`] for the rules), and keep
+    /// `record` the way `store/plan_records.rs` says — an applied plan
+    /// leaves no row, a rejected one leaves its reason. Returns the side
+    /// effects to emit once `tx` commits, and the id of the record kept,
+    /// if any.
+    fn apply_plan_walk_on(
+        &self,
+        tx: &Connection,
+        submission: &PlanSubmission,
+        body: PlanBody<'_>,
+        record: PlanRecord<'_>,
+    ) -> R<(PlanApplyOutcome, PlanApplyEffects, Option<i64>)> {
         let tx_started = Instant::now();
         debug!(
-            submission_id = submission.id,
+            submission_id = ?submission.id,
             job_config_id = %submission.job_config_id,
             expected_scope_count = submission.expected_versions.len(),
             "Applying plan submission"
@@ -5791,21 +5946,24 @@ impl Store {
         let reject = |tx: &Connection,
                       reason: String,
                       reverted: Option<usize>|
-         -> R<(PlanApplyOutcome, PlanApplyEffects)> {
+         -> R<(PlanApplyOutcome, PlanApplyEffects, Option<i64>)> {
             if reverted.is_some() {
                 tx.execute_batch("ROLLBACK TO legion_plan_body; RELEASE legion_plan_body;")?;
             }
-            tx.prepare_cached(
-                "UPDATE plan_submission SET status = 'rejected', rejection_reason = ?1 WHERE id = ?2;",
-            )?
-            .execute(params![reason, submission.id])?;
+            let record_id = Self::record_rejected_plan_on(
+                tx,
+                &record,
+                &submission.job_config_id,
+                &submission.expected_versions,
+                &reason,
+            )?;
             let latest_versions = self.scope_vector_epochs_tx(tx, &submission.expected_versions)?;
             let rejected_event = self.stage_event_locked(
                 tx,
                 drafts::plan_rejected(&submission.job_config_id, &reason),
             );
             warn!(
-                submission_id = submission.id,
+                submission_id = record_id,
                 job_config_id = %submission.job_config_id,
                 reverted_writes = reverted.unwrap_or_default(),
                 duration_ms = tx_started.elapsed().as_millis() as u64,
@@ -5829,26 +5987,14 @@ impl Store {
                     events: rejected_event.into_iter().collect(),
                     ..PlanApplyEffects::default()
                 },
+                Some(record_id),
             ))
         };
 
-        let (placements_json, plan_mode, evictions_json, target_instance): (
-            String,
-            String,
-            String,
-            Option<String>,
-        ) = tx
-            .prepare_cached(
-                "SELECT placements, mode, evictions, target_instance FROM plan_submission \
-                 WHERE id = ?1;",
-            )?
-            .query_row([submission.id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?;
         // Only a ratification sets this, and it always carries exactly one
         // placement (docs/edge-boot.md): "bind this sandbox on this node, or
         // tell me who beat me to it".
-        let target_instance = target_instance.filter(|id| !id.is_empty());
+        let target_instance = body.target_instance;
         // A ratification compares no epochs, job-config or node. It never
         // planned against a snapshot, so a moved epoch says nothing about
         // it. Its one candidate is re-validated against committed rows in
@@ -5888,8 +6034,9 @@ impl Store {
             return reject(tx, format!("{PLAN_NOT_WANTED_PREFIX}{reason}"), None);
         }
 
-        let placements = Self::parse_plan_submission_placements(&placements_json)?;
-        let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
+        let placements = body.placements;
+        let evictions = body.evictions;
+        let plan_mode = body.mode;
 
         // ---- Preemption: victims leave before the placements they paid for
         // arrive, inside this same transaction.
@@ -5921,7 +6068,7 @@ impl Store {
         // the walk's fence asks "did anything ELSE change this node since I
         // planned", and our own evictions are not something else.
         let mut pre_eviction_node_epochs: HashMap<String, i64> = HashMap::new();
-        for eviction in &evictions {
+        for eviction in evictions {
             if let Entry::Vacant(entry) = pre_eviction_node_epochs.entry(eviction.node_id.clone()) {
                 let epoch = self.scope_epoch_tx(tx, "node", &eviction.node_id)?;
                 entry.insert(epoch);
@@ -5938,7 +6085,7 @@ impl Store {
         if body_savepoint {
             tx.execute_batch("SAVEPOINT legion_plan_body;")?;
         }
-        let preempted = self.apply_plan_evictions_tx(tx, submission, &evictions)?;
+        let preempted = self.apply_plan_evictions_tx(tx, submission, evictions)?;
 
         // Node rows load LAZILY, per candidate actually attempted, memoized
         // for the plan. The walk usually binds rank 0, so eagerly loading
@@ -6008,7 +6155,7 @@ impl Store {
         // Pass 1 avoids stacking a task's replicas; pass 2 relaxes it (see
         // the walk below).
         let mut plan_binds: HashSet<(i64, String)> = HashSet::new();
-        for placement in &placements {
+        for placement in placements {
             let task_id = placement.task_id;
             let state = match task_states.entry(task_id) {
                 Entry::Occupied(entry) => entry.into_mut(),
@@ -6228,11 +6375,8 @@ impl Store {
 
                 // A restore placed for one instance binds that instance:
                 // its node was chosen for that instance's pin or `compat`.
-                let bind_instance = placement
-                    .instance_id
-                    .as_deref()
-                    .or(target_instance.as_deref());
-                let allocation = self.insert_allocation_with_data(
+                let bind_instance = placement.instance_id.as_deref().or(target_instance);
+                let allocation = match self.insert_allocation_with_data(
                     tx,
                     node_id,
                     task_id,
@@ -6240,17 +6384,39 @@ impl Store {
                     &state.resources,
                     network.as_ref(),
                     bind_instance,
-                )?;
-                allocations.push(allocation);
-                candidate_ranks.push(rank);
+                ) {
+                    Ok(allocation) => allocation,
+                    // The node cannot serve the task's devices any more:
+                    // one more "the world moved" class, like a port.
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::devices::DevicesUnavailable>()
+                            .is_some() =>
+                    {
+                        if first_skip_reason.is_none() {
+                            first_skip_reason = Some(format!("{error:#}"));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 // Debit the bound node so later placements in the SAME plan
                 // see the reduced pool — the in-tx mirror of the planner's
-                // ledger consume.
+                // ledger consume. A task with devices debits the row as
+                // written, which names the exact ids it was assigned.
                 if let (Some(request), Some(pool)) =
                     (request.as_ref(), free_pools.get_mut(node_id.as_str()))
                 {
-                    pool.consume(request);
+                    if request.devices.is_empty() {
+                        pool.consume(request);
+                    } else if let Ok(row) =
+                        self.resource_policy.usage_request(&allocation.resources)
+                    {
+                        pool.consume(&row);
+                    }
                 }
+                allocations.push(allocation);
+                candidate_ranks.push(rank);
                 if let Some(tracker) = state.distinct.as_mut() {
                     tracker.insert_from_node(node);
                 }
@@ -6296,10 +6462,7 @@ impl Store {
             tx.execute_batch("RELEASE legion_plan_body;")?;
         }
 
-        tx.prepare_cached(
-            "UPDATE plan_submission SET status = 'applied', rejection_reason = NULL WHERE id = ?1;",
-        )?
-        .execute([submission.id])?;
+        Self::finish_applied_plan_on(tx, &record)?;
         let placed_event =
             drafts::allocations_placed(&submission.job_config_id, &allocations, &candidate_ranks)
                 .and_then(|draft| self.stage_event_locked(tx, draft));
@@ -6313,8 +6476,8 @@ impl Store {
         effects.touch_evicted(&preempted.victims);
         effects.touch_placed(&allocations);
         let fallbacks = candidate_ranks.iter().filter(|rank| **rank > 0).count();
-        info!(
-            submission_id = submission.id,
+        debug!(
+            submission_id = ?submission.id,
             job_config_id = %submission.job_config_id,
             placement_count = placements.len(),
             applied_allocations = allocations.len(),
@@ -6369,6 +6532,7 @@ impl Store {
                 candidate_ranks,
             }),
             effects,
+            submission.id,
         ))
     }
 
@@ -6658,6 +6822,20 @@ impl Store {
                 pool_usage.remove(allocation.node_id.as_str());
                 continue;
             };
+            // A task with devices was written with its assignment, which
+            // the task's own request does not carry: count the row.
+            if !request.devices.is_empty() {
+                match self.resource_policy.usage_request(&allocation.resources) {
+                    Ok(row) => snapshot.total.add(&row),
+                    Err(_) => {
+                        pool_usage.remove(allocation.node_id.as_str());
+                        continue;
+                    }
+                }
+                snapshot.count += 1;
+                snapshot.id_sum += allocation.id;
+                continue;
+            }
             snapshot.total.add(request);
             snapshot.count += 1;
             snapshot.id_sum += allocation.id;
@@ -7108,6 +7286,13 @@ impl Store {
             blocked: None,
             // Overlaid by GetJobInfo (`Store::reschedule_holds_for_job`).
             reschedule_backoffs: Vec::new(),
+            // The latest config's version (`JOB_SELECT_ATTRS`); absent from
+            // the upsert's RETURNING, which reads as 0 until the next read.
+            version: row
+                .get::<_, Option<i64>>(6)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
         };
 
         Ok(job)
@@ -10430,12 +10615,33 @@ impl Store {
         granted_by: &str,
         unknown_fields: Option<&UnknownFieldsRecord>,
     ) -> R<JobSubmitOutcome> {
-        self.handle_job_submit_inner(
+        self.handle_job_submit_checked(config, subs, template, granted_by, unknown_fields, None)
+    }
+
+    /// [`Self::handle_job_submit_as`] with compare-and-set on the job's
+    /// latest version (`RunJobRequest.expected_version`; revisions-and-
+    /// watches plan §9): the submit writes only when the job's latest
+    /// config is at exactly `expected_version` (0: the job must not exist),
+    /// checked inside the Control-lane entry that writes the new version, so
+    /// two racing writers cannot both win. A mismatch is
+    /// [`StorageError::Aborted`] naming the current version, and writes
+    /// nothing. `None` checks nothing.
+    pub fn handle_job_submit_checked(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+        granted_by: &str,
+        unknown_fields: Option<&UnknownFieldsRecord>,
+        expected_version: Option<i64>,
+    ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner_checked(
             config,
             subs,
             template,
             crate::storage::acl_store::GrantSource::Submitter(granted_by.to_string()),
             unknown_fields,
+            expected_version,
         )
     }
 
@@ -10522,12 +10728,25 @@ impl Store {
         grant: crate::storage::acl_store::GrantSource,
         unknown_fields: Option<&UnknownFieldsRecord>,
     ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner_checked(config, subs, template, grant, unknown_fields, None)
+    }
+
+    fn handle_job_submit_inner_checked(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+        grant: crate::storage::acl_store::GrantSource,
+        unknown_fields: Option<&UnknownFieldsRecord>,
+        expected_version: Option<i64>,
+    ) -> R<JobSubmitOutcome> {
         let request = JobSubmitRequest {
             config: config.clone(),
             subs: subs.to_vec(),
             template: template.cloned(),
             grant,
             unknown_fields: unknown_fields.filter(|record| !record.is_empty()).cloned(),
+            expected_version,
         };
         // A submit raised from INSIDE another op's capture must stay part of
         // that capture (`replicated` short-circuits there); routing it
@@ -10543,6 +10762,7 @@ impl Store {
                 template,
                 grant,
                 unknown_fields,
+                expected_version,
             } = request;
             self.replicated(Lane::Control, "handle_job_submit", move |s| {
                 s.handle_job_submit_apply(
@@ -10551,6 +10771,7 @@ impl Store {
                     template.as_ref(),
                     &grant,
                     unknown_fields.as_ref(),
+                    expected_version,
                 )
             })?
         } else {
@@ -10820,11 +11041,19 @@ impl Store {
         template: Option<&JobTemplateProvenance>,
         grant: &crate::storage::acl_store::GrantSource,
         unknown_fields: Option<&UnknownFieldsRecord>,
+        expected_version: Option<i64>,
     ) -> R<JobSubmitOutcome> {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
-        let (outcome, staged) =
-            self.handle_job_submit_tx(&tx, config, subs, template, grant, unknown_fields)?;
+        let (outcome, staged) = self.handle_job_submit_tx(
+            &tx,
+            config,
+            subs,
+            template,
+            grant,
+            unknown_fields,
+            expected_version,
+        )?;
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))?;
         drop(conn);
@@ -10884,6 +11113,7 @@ impl Store {
                 request.template.as_ref(),
                 &request.grant,
                 request.unknown_fields.as_ref(),
+                request.expected_version,
             ) {
                 Ok((outcome, staged)) => {
                     if let Err(err) = tx.execute_batch("RELEASE legion_submit_item;") {
@@ -10937,6 +11167,7 @@ impl Store {
                         request.template.as_ref(),
                         &request.grant,
                         request.unknown_fields.as_ref(),
+                        request.expected_version,
                     )
                 }),
             ];
@@ -10962,6 +11193,7 @@ impl Store {
                                 request.template.as_ref(),
                                 &request.grant,
                                 request.unknown_fields.as_ref(),
+                                request.expected_version,
                             )
                         })
                     })
@@ -11037,6 +11269,7 @@ impl Store {
     /// `latest_job_config_tx`). Stages events but does not publish them and
     /// does not commit — the caller does both, which is what lets the batch
     /// runner wrap each request in its own savepoint inside one commit.
+    #[allow(clippy::too_many_arguments)]
     fn handle_job_submit_tx(
         &self,
         tx: &Connection,
@@ -11045,6 +11278,7 @@ impl Store {
         template: Option<&JobTemplateProvenance>,
         grant: &crate::storage::acl_store::GrantSource,
         unknown_fields: Option<&UnknownFieldsRecord>,
+        expected_version: Option<i64>,
     ) -> R<(JobSubmitOutcome, Vec<SchedulerEventRecord>)> {
         let config = self.normalize_job_config(config)?;
         // The app reconciler's submit is compare-and-set on the app record
@@ -11068,7 +11302,22 @@ impl Store {
         let mut last_versions_id: Option<String> = None;
         let mut was_update = false;
 
-        if let Some(latest_job_config) = self.latest_job_config_tx(tx, &config.name)? {
+        let latest_job_config = self.latest_job_config_tx(tx, &config.name)?;
+        // Compare-and-set (`RunJobRequest.expected_version`), against the
+        // version this same entry reads, before anything is written.
+        if let Some(expected) = expected_version {
+            let current = latest_job_config
+                .as_ref()
+                .map(|latest| i64::from(latest.version.unwrap_or(0)))
+                .unwrap_or(0);
+            if current != expected {
+                return Err(StorageError::Aborted {
+                    message: job_version_conflict(&config.name, current, expected),
+                }
+                .into());
+            }
+        }
+        if let Some(latest_job_config) = latest_job_config {
             // if latest_job_config is deep equal to config, return unchanged
             if latest_job_config.is_same_as(&config) {
                 let job_config_id = latest_job_config.id();
@@ -12118,6 +12367,9 @@ impl Store {
             error!(error = ?err, "Failed rebuilding the scheduling read model from the state db");
         }
         self.work_log.resync_all();
+        self.endpoint_index.mark_all();
+        // Rows changed under the journal too: every watch resyncs.
+        self.reset_revisions();
         if keyring {
             self.keyring_rows_changed();
         }
@@ -12674,24 +12926,45 @@ impl Store {
         }
         self.note_capacity_events(capacity_nodes);
 
-        // Tell the work delivery log which allocations moved, on every
-        // replica and in every mode, after the read model reflects them.
-        // Infallible by design: see `note_work_changes`.
-        self.note_work_changes(
+        // Tell the work delivery log which allocations moved, and the
+        // revision journal what this entry changed, on every replica and in
+        // every mode, after the read model reflects them. Both are resolved
+        // against the DB first and published together under the journal's
+        // publish lock, so a `StreamWork` message tagged with the journal's
+        // position, or a worker resuming here, never sees one without the
+        // other (revisions-and-watches plan §7). Infallible by design: see
+        // `note_work_changes` and `prepare_revision_record`.
+        let work = self.note_work_changes(
             &alloc_delta,
             &refresh_nodes,
             &changed_instances,
             &changed_volume_jobs,
             &changed_volume_ids,
         );
+        let record = self.prepare_revision_record(bytes, &work);
+        {
+            let _publishing = self.revisions.publishing();
+            self.publish_work_changes(&work, &refresh_nodes);
+            self.publish_revision_record(record, &work);
+        }
         self.note_checkpoint_changes(checkpoint_nodes, checkpoint_reread_ids);
+        // The endpoint index (mesh-control-path plan §6.1), likewise on
+        // every replica and never failing; free while no node consumes a
+        // service.
+        self.note_endpoint_changes(bytes);
 
         if read_model_only {
             return Ok(());
         }
 
-        // Publish committed scheduler events in id order.
+        // Publish committed scheduler events in id order. Each committed id
+        // also raises this process's minting floor, so if this replica leads
+        // next, its first id sorts above every id the old leader committed,
+        // whatever its clock says (revisions-and-watches plan §4).
         event_ids.sort_unstable();
+        for &id in &event_ids {
+            Self::raise_event_id_floor(id);
+        }
         for &id in &event_ids {
             let record = {
                 let conn = self.read_connection()?;
@@ -12750,6 +13023,11 @@ impl Store {
     /// the same entry cleanly. The work log is a node-local delivery cache
     /// that a resync rebuilds, so a lookup failure resyncs every streaming
     /// node instead.
+    ///
+    /// The resolved changes are returned for the revision journal, which
+    /// keeps them per node whether or not anyone streams from this manager:
+    /// a worker that reconnects here from another manager resumes from them
+    /// (revisions-and-watches plan §7).
     fn note_work_changes(
         &self,
         delta: &AllocationDelta,
@@ -12757,13 +13035,10 @@ impl Store {
         changed_instances: &HashSet<String>,
         changed_volume_jobs: &HashSet<String>,
         changed_volume_ids: &HashSet<String>,
-    ) {
-        if !self.work_log.has_nodes() {
-            return;
-        }
+    ) -> WorkChanges {
+        let mut work = WorkChanges::default();
         if !delta.usable {
-            self.work_log
-                .resync_nodes(refresh_nodes.iter().map(String::as_str));
+            work.unknown_nodes = refresh_nodes.iter().cloned().collect();
         }
         match self.work_changes(
             delta,
@@ -12771,17 +13046,35 @@ impl Store {
             changed_volume_jobs,
             changed_volume_ids,
         ) {
-            Ok(changes) => self
-                .work_log
-                .note_changes(changes.iter().map(|(node, id)| (node.as_str(), *id))),
+            Ok(changes) => work.pairs = changes,
             Err(err) => {
                 warn!(
                     error = ?err,
                     "Failed resolving a committed changeset's allocation changes for the work \
                      stream; resyncing every streaming node"
                 );
-                self.work_log.resync_all();
+                work.unattributed = true;
             }
+        }
+        work
+    }
+
+    /// The memory half of [`Self::note_work_changes`]: mark what `work`
+    /// resolved in the work log (a full resync for nodes it could not
+    /// name). Called under the revision journal's publish lock.
+    fn publish_work_changes(&self, work: &WorkChanges, refresh_nodes: &BTreeSet<String>) {
+        if !self.work_log.has_nodes() {
+            return;
+        }
+        if !work.unknown_nodes.is_empty() {
+            self.work_log
+                .resync_nodes(refresh_nodes.iter().map(String::as_str));
+        }
+        if work.unattributed {
+            self.work_log.resync_all();
+        } else {
+            self.work_log
+                .note_changes(work.pairs.iter().map(|(node, id)| (node.as_str(), *id)));
         }
     }
 
@@ -12998,13 +13291,8 @@ impl Store {
     /// `max(id) + 1`) for the same instant — an existing journal's cursor
     /// never has to go backwards.
     fn next_scheduler_event_id() -> i64 {
-        use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
-        /// Per-residue high-water mark enforcing strict monotonicity per
-        /// lane (see above). One slot per possible residue.
-        static LAST: [AtomicI64; Lane::ID_STRIDE as usize] =
-            [const { AtomicI64::new(0) }; Lane::ID_STRIDE as usize];
-
         let residue = Self::event_id_residue();
         let seq = SEQ.get_or_init(|| AtomicU64::new(rand::random::<u64>()));
         let sequence = seq.fetch_add(1, Ordering::Relaxed) & ((1u64 << EVENT_ID_SEQ_BITS) - 1);
@@ -13013,7 +13301,7 @@ impl Store {
             | ((sequence as i64) << Lane::ID_STRIDE_BITS)
             | residue;
 
-        let slot = &LAST[residue as usize];
+        let slot = &EVENT_ID_HIGH_WATER[residue as usize];
         let mut previous = slot.load(Ordering::Relaxed);
         loop {
             // Advancing by a whole stride keeps the residue (and therefore
@@ -13028,6 +13316,22 @@ impl Store {
                 Err(actual) => previous = actual,
             }
         }
+    }
+
+    /// Raise the minting floor of `id`'s lane to `id`: the next id minted
+    /// for that lane in this process sorts above it. Fed every committed
+    /// event id by the projection (and the journal's newest ids at start),
+    /// which is what keeps ids from going backwards across a failover: a new
+    /// leader applies everything committed before it captures, so its floor
+    /// is above every id the old leader committed (revisions-and-watches
+    /// plan §4; docs/event-stream.md).
+    pub(crate) fn raise_event_id_floor(id: i64) {
+        use std::sync::atomic::Ordering;
+        if id <= 0 {
+            return;
+        }
+        let residue = id.rem_euclid(Lane::ID_STRIDE) as usize;
+        EVENT_ID_HIGH_WATER[residue].fetch_max(id, Ordering::Relaxed);
     }
 
     /// Whether an event id lands on the opportunistic journal-prune
@@ -14494,6 +14798,10 @@ impl Store {
         // every other placement path uses.
         target_instance: Option<&str>,
     ) -> R<Allocation> {
+        // Devices first, before anything is written: a node that cannot
+        // serve them fails the insert with nothing to roll back.
+        let assigned_resources = self.assign_devices_tx(tx, node_id, resources)?;
+        let resources = assigned_resources.as_ref().unwrap_or(resources);
         let network_json = network.map(to_string).transpose()?;
         // Stateful tasks: pick (or re-materialize) the instance this
         // allocation will fulfill before writing the row, so the binding is
@@ -15673,12 +15981,19 @@ impl Store {
             return Ok(());
         }
         let node_id = node_id.to_owned();
+        let ids: Vec<i64> = snapshots.iter().map(|s| s.allocation_id).collect();
         let snapshots = snapshots.to_vec();
         self.replicated(
             Lane::Status,
             "upsert_allocation_health_snapshots",
             move |s| s.upsert_allocation_health_snapshots_apply(&node_id, &snapshots),
-        )
+        )?;
+        // `local_disk` mode projects only the read-model tables, which do not
+        // include `allocation_health`: mark the endpoint sets here, after the
+        // commit. In raft mode the projection marked them already; a second
+        // mark costs one re-read.
+        self.endpoint_index.mark_allocations(ids);
+        Ok(())
     }
 
     fn upsert_allocation_health_snapshots_apply(
@@ -18715,13 +19030,17 @@ impl Store {
     fn insert_eval_apply(&self, eval: &Eval) -> R<()> {
         let conn = self.write_connection()?;
 
+        // An absent scope is stored as NULL, never '' or blanks, like every
+        // other eval writer: the claim's duplicate lookup matches scopes
+        // with `IS` (`store/eval_claims.rs`).
+        let scope = |value: &str| (!value.trim().is_empty()).then(|| value.to_string());
         let params = named_params! {
             ":id": eval.id,
             ":status": eval.status,
             ":type": eval.kind,
-            ":job_id": if eval.job_id.is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
-            ":job_config_id": if eval.job_config_id.is_empty() { None::<String> } else { Some(eval.job_config_id.clone()) },
-            ":node_id": if eval.node_name.is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
+            ":job_id": scope(&eval.job_id),
+            ":job_config_id": scope(&eval.job_config_id),
+            ":node_id": scope(&eval.node_name),
             ":priority": eval.priority,
             ":ready_at": Self::sortable_now()?,
         };
@@ -18892,6 +19211,12 @@ impl Store {
     /// This manager's per-node work delivery log (`Manager.StreamWork`).
     pub fn work_log(&self) -> Arc<crate::storage::work_log::WorkLog> {
         Arc::clone(&self.work_log)
+    }
+
+    /// This manager's per-service endpoint sets (mesh-control-path plan
+    /// §6.1).
+    pub fn endpoint_index(&self) -> Arc<crate::storage::endpoint_index::EndpointIndex> {
+        Arc::clone(&self.endpoint_index)
     }
 
     // Expose a clone so runtime worker tasks can await wake notifications.
@@ -19489,13 +19814,12 @@ impl Store {
             "UPDATE eval SET status = 'pending', ready_at = ?2 WHERE id = ?1;",
             params![eval_id, ready_at],
         )?;
-        let pending = Self::pending_eval_count_tx(&tx)?;
         let staged = self.stage_event_locked(&tx, event);
         tx.commit()?;
         self.publish_staged(staged);
-        crate::manager::telemetry::metrics()
-            .eval_queue_depth
-            .set(pending);
+        // The row was pending all along (a claim is leader memory), so the
+        // queue did not grow; the claim path keeps the gauge current
+        // (`store/eval_claims.rs`, SCH3).
         Ok(())
     }
 
@@ -19845,15 +20169,16 @@ impl Store {
         // row (JC-41): `scheduler_event` is commutative, so a scheduler-lane
         // INSERT is legal, and the row and its event replicate together.
         let enqueue_event = self.stage_event_locked(&tx, drafts::eval_enqueued(&eval, delay));
-        // See `pending_eval_count_tx`: the insert just grew the pending set,
-        // so refresh the queue-depth gauge while the tx is still open.
-        let pending = Self::pending_eval_count_tx(&tx)?;
         tx.commit()?;
         self.publish_staged(enqueue_event);
         drop(conn);
-        crate::manager::telemetry::metrics()
-            .eval_queue_depth
-            .set(pending);
+        // The insert grew the pending set by one. Counting it here cost
+        // O(pending) inside the serialized write on every enqueue (SCH3);
+        // the claim path resets the gauge from an exact or rate-limited
+        // count, so `+1` keeps it moving in between (a racing pair of
+        // enqueues can lose one; the next claim corrects it).
+        let depth = &crate::manager::telemetry::metrics().eval_queue_depth;
+        depth.set(depth.get() + 1);
 
         if delay.is_zero() && !capture::in_capture() {
             // Zero-delay evals are immediately claimable, so wake one
@@ -22242,6 +22567,7 @@ mod tests {
                 template: None,
                 grant: crate::storage::acl_store::GrantSource::CarryForward,
                 unknown_fields: None,
+                expected_version: None,
             },
             JobSubmitRequest {
                 config: v2,
@@ -22249,6 +22575,7 @@ mod tests {
                 template: None,
                 grant: crate::storage::acl_store::GrantSource::CarryForward,
                 unknown_fields: None,
+                expected_version: None,
             },
         ];
         let results = store.handle_job_submits_apply(&batch);
@@ -22279,6 +22606,7 @@ mod tests {
             template: None,
             grant: crate::storage::acl_store::GrantSource::CarryForward,
             unknown_fields: None,
+            expected_version: None,
         };
         let fresh = JobSubmitRequest {
             config: JobConfig {
@@ -22298,6 +22626,7 @@ mod tests {
             template: None,
             grant: crate::storage::acl_store::GrantSource::CarryForward,
             unknown_fields: None,
+            expected_version: None,
         };
         let results = store.handle_job_submits_apply(&[unchanged, fresh]);
         assert!(matches!(
@@ -22319,7 +22648,7 @@ mod tests {
         // Read-only connections have to be configured against a database that
         // already exists, so make it with the write path first.
         let writer = Connection::open(&path)?;
-        Store::configure_connection(&writer, false, false)?;
+        Store::configure_connection(&writer, false)?;
         let cached: i64 = writer.query_row("PRAGMA cache_size;", [], |r| r.get(0))?;
         assert_eq!(
             cached, SQLITE_CACHE_SIZE_KIB,
@@ -22327,7 +22656,7 @@ mod tests {
         );
 
         let reader = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        Store::configure_connection(&reader, true, false)?;
+        Store::configure_connection(&reader, true)?;
         let cached: i64 = reader.query_row("PRAGMA cache_size;", [], |r| r.get(0))?;
         assert_eq!(
             cached, SQLITE_CACHE_SIZE_KIB,
@@ -22418,28 +22747,38 @@ mod tests {
         );
     }
 
-    /// Adversarial regression (durability past the purge horizon): in raft
-    /// mode the state DB must run `synchronous = FULL` — raft purges its log
-    /// behind snapshots, so a power loss regressing the applied marker below
-    /// `last_purged_log_id` (possible under NORMAL until a WAL checkpoint)
-    /// would brick the node at startup reapply. local_disk keeps NORMAL.
+    /// Durability past the purge horizon (raft-write-path plan §6.1): the
+    /// state DB runs `synchronous = NORMAL` in every mode — one fsync per
+    /// entry is the raft log's — and the durability the old `FULL` setting
+    /// bought is the purge barrier's job: `sync_state_db_to_disk` must make
+    /// every committed transaction durable on demand. Pinned here for the
+    /// connection level; the barrier-before-purge ordering is pinned in
+    /// `raft::log_store` and end to end in `raft::driver`.
     #[test]
-    fn durable_sync_runs_write_connection_at_synchronous_full() -> R<()> {
+    fn state_db_runs_normal_and_syncs_on_demand() -> R<()> {
         let dir = tempfile::tempdir()?;
 
-        let normal = Connection::open(dir.path().join("normal.sqlite"))?;
-        Store::configure_connection(&normal, false, false)?;
-        let level: i64 = normal.query_row("PRAGMA synchronous;", [], |r| r.get(0))?;
-        assert_eq!(level, 1, "local_disk keeps synchronous=NORMAL");
-
-        let full = Connection::open(dir.path().join("full.sqlite"))?;
-        Store::configure_connection(&full, false, true)?;
-        let level: i64 = full.query_row("PRAGMA synchronous;", [], |r| r.get(0))?;
+        let conn = Connection::open(dir.path().join("state.sqlite"))?;
+        Store::configure_connection(&conn, false)?;
+        let level: i64 = conn.query_row("PRAGMA synchronous;", [], |r| r.get(0))?;
         assert_eq!(
-            level, 2,
-            "raft-mode write connections must run synchronous=FULL so the applied marker \
-             never regresses past the purged log horizon on power loss"
+            level, 1,
+            "the state DB runs synchronous=NORMAL in every mode"
         );
+        drop(conn);
+
+        // The barrier works against a live store with an open WAL: every
+        // file it names exists and fsyncs without error, and it is cheap
+        // enough to call per purge.
+        let store = setup_store()?;
+        store.put_kv("sync/probe", "v", KvValueType::String, None, None)?;
+        assert!(store.state_db_path().with_extension("sqlite-wal").exists());
+        store.sync_state_db_to_disk()?;
+        // A missing WAL (fully checkpointed and removed) is not an error.
+        let bare = tempfile::tempdir()?;
+        let path = bare.path().join("store.sqlite");
+        Connection::open(&path)?.execute_batch("CREATE TABLE t (x);")?;
+        raft_write_path::sync_state_files(&path)?;
         Ok(())
     }
 
@@ -32875,8 +33214,8 @@ mod tests {
         let first_local = local_port(&first)?;
         let second_local = local_port(&second)?;
         assert_ne!(first_local, second_local);
-        assert!(first_local >= crate::structs::DYNAMIC_PORT_MIN);
-        assert!(second_local <= crate::structs::DYNAMIC_PORT_MAX);
+        assert!(first_local >= crate::structs::DATAPATH_PORT_MIN);
+        assert!(second_local <= crate::structs::DATAPATH_PORT_MAX);
 
         // Upstream ports come from the same per-node set as task ports, so
         // they never land on a port already handed to a task.
@@ -33099,7 +33438,7 @@ mod tests {
             .as_ref()
             .and_then(|network| network.upstream("db"))
             .context("fresh allocation missing db upstream")?;
-        assert!(upstream.local_port >= Some(crate::structs::DYNAMIC_PORT_MIN));
+        assert!(upstream.local_port >= Some(crate::structs::DATAPATH_PORT_MIN));
         assert_eq!(upstream.balance, crate::structs::DEFAULT_BALANCE);
 
         // Changing an existing connect block is equally disqualifying, while
