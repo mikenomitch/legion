@@ -2,8 +2,8 @@
 
 `persistence.type = 'raft'` turns a set of Legion managers into a
 quorum-replicated cluster. A majority of managers must commit every store
-change before it is acknowledged or visible anywhere. Losing any minority of
-managers loses no committed write.
+change before it is acknowledged, cached, streamed, or visible on a
+follower. Losing any minority of managers loses no committed write.
 
 This page is the engine-level reference. The task-oriented runbook is
 [docs/raft-operations.md](raft-operations.md). Upgrade, backup, and restore
@@ -11,30 +11,39 @@ procedures are in [docs/upgrades.md](upgrades.md).
 
 ## What raft mode gives you
 
-A write runs on the leader inside a savepoint that is then rolled back.
-While it runs, a SQLite session records its row-level effects. This record is
-a **changeset**: the inserts, updates, and deletes with their values and
-rowids. The leader proposes those bytes as one [openraft] log entry. Only
-after a quorum commits it does every manager, the leader included, apply the
-same bytes to its local `store.sqlite`.
+A write runs on the leader inside a savepoint, together with any other
+writes queued at the same moment (group commit). While it runs, a SQLite
+session records its row-level effects. This record is a **changeset**: the
+inserts, updates, and deletes with their values and rowids. The leader
+proposes the batch's changeset as one [openraft] log entry. Only after a
+quorum commits it does every follower apply the same bytes to its local
+`store.sqlite`. The leader keeps the rows it captured (under the default
+`single` topology; under `lanes` it rolls them back and applies the entry
+like a follower), with an undo record in case the entry does not commit.
 
 Replicas cannot diverge, because they apply the recorded effects instead of
-re-running code. Nothing becomes visible, cached, or published as an event
-before quorum commit, not even on the leader. The caller gets its reply only
-after the local apply, so read-your-writes holds on the leader.
+re-running code. Nothing is cached or published as an event before quorum
+commit, not even on the leader, and the caller gets its reply only after
+the entry applied locally, so read-your-writes holds on the leader. For the
+one round trip between the leader's local commit and the apply, a direct SQL
+read on the leader can see the batch (see "The write path" below).
 
 ```text
 client ──write RPC──▶ leader manager
-                        │ 1. capture: run the SQL in a savepoint + session,
-                        │    extract the changeset, ROLLBACK (DB untouched)
-                        │ 2. propose changeset to the raft group
+                        │ 1. capture: run the queued writes in one savepoint
+                        │    (one nested savepoint + session each), combine
+                        │    their changesets, commit with an undo record
+                        │    (`single`) or ROLLBACK (`lanes`)
+                        │ 2. propose ONE changeset to the raft group
                         ├────── append ──────▶ follower B ──ack──┐
                         ├────── append ──────▶ follower C ──ack──┤
                         │ 3. quorum commit                 ◀─────┘
                         │ 4. every node applies the changeset + applied
-                        │    index in ONE transaction, then projects
-                        │    read-model cache / events / notifies from it
-                        ◀─ 5. reply to client (after local apply)
+                        │    index in ONE transaction (a `single` leader
+                        │    only writes the index and drops the undo
+                        │    record), then projects read-model cache /
+                        │    events / notifies from it
+                        ◀─ 5. reply to every client in the batch
 ```
 
 Raft mode also gives you:
