@@ -53,6 +53,14 @@ struct ContainerTaskConfig {
     #[serde(default)]
     ulimits: std::collections::BTreeMap<String, Value>,
 
+    /// The OCI runtime class to run this container with (docs/task-runtime-
+    /// container.md, "Runtime classes"): a name from the worker type's
+    /// `container.runtimeClasses`, such as `gvisor` or `kata`. The task only
+    /// places on nodes that advertise the class. Unset runs the node's
+    /// default runtime (runc or crun). Linux only.
+    #[serde(default, rename = "runtimeClass")]
+    runtime_class: Option<String>,
+
     /// Additional plugin-specific fields reserved for forward compatibility.
     #[serde(default, flatten)]
     #[schemars(skip)]
@@ -151,6 +159,10 @@ impl ContainerTaskConfig {
     fn validate(&self) -> R<()> {
         if self.command.is_empty() {
             bail!("container task command must include at least one entry");
+        }
+        if let Some(class) = &self.runtime_class {
+            crate::task_plugins::runtime_class::validate_name(class)
+                .context("config.runtimeClass")?;
         }
         if ![SECCOMP_DEFAULT, SECCOMP_UNCONFINED].contains(&self.security.seccomp.as_str()) {
             bail!(
@@ -367,7 +379,16 @@ enum ContainerRuntime {
     /// Linux: a low-level OCI runtime (runc by default) run against a bundle
     /// Legion builds from the image's OCI layout. The runtime itself neither
     /// pulls nor understands image references.
-    Oci { binary: String },
+    Oci {
+        binary: String,
+        /// The runtime class (`config.runtimeClass`) this runtime serves, with
+        /// its declared support for the privilege floor; `None` for the
+        /// node's default runc or crun.
+        class: Option<(
+            String,
+            crate::task_plugins::runtime_class::RuntimeClassConfig,
+        )>,
+    },
 }
 
 impl ContainerRuntime {
@@ -382,10 +403,42 @@ impl ContainerRuntime {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| DEFAULT_OCI_RUNTIME.to_string());
-            Ok(Self::Oci { binary })
+            Ok(Self::Oci {
+                binary,
+                class: None,
+            })
         } else {
             bail!("container tasks are not supported on this OS");
         }
+    }
+
+    /// The runtime one task runs on: its `config.runtimeClass` when it names
+    /// one (docs/task-runtime-container.md, "Runtime classes"), else
+    /// [`Self::detect`]. A class this node does not have fails with the
+    /// classes it does.
+    fn for_task(task: &TaskConfig) -> R<Self> {
+        let Some(name) = crate::task_plugins::runtime_class::task_class(&task.config) else {
+            return Self::detect();
+        };
+        if !cfg!(target_os = "linux") {
+            bail!(
+                "task {} names runtime class {name}, but runtime classes are Linux only",
+                task.name
+            );
+        }
+        let classes = crate::task_plugins::runtime_class::configured();
+        let Some(class) = classes.get(&name).cloned() else {
+            let known: Vec<&String> = classes.keys().collect();
+            bail!(
+                "task {} names runtime class {name}, which this node does not configure \
+                 (it has {known:?}); the worker type's container.runtimeClasses declares them",
+                task.name
+            );
+        };
+        Ok(Self::Oci {
+            binary: class.path.clone(),
+            class: Some((name, class)),
+        })
     }
 
     /// Whether this runtime can exec into a running container. Both dialects
@@ -429,7 +482,14 @@ impl ContainerRuntime {
             }
             // runc or crun, installed: anything else is refused here
             // ([`unsupported_oci_runtime`]).
-            Self::Oci { binary } => probe_oci_runtime(binary).map(|_| ()),
+            Self::Oci {
+                binary,
+                class: None,
+            } => probe_oci_runtime(binary).map(|_| ()),
+            Self::Oci {
+                class: Some((name, class)),
+                ..
+            } => crate::task_plugins::runtime_class::preflight(name, class),
         }
     }
 
@@ -437,7 +497,11 @@ impl ContainerRuntime {
     /// that cannot apply idmapped mounts (see [`idmapped_mount_gap`]). A
     /// no-op for Apple `container`, which ignores `security`.
     fn check_idmapped_mounts(&self) -> R<()> {
-        let Self::Oci { binary } = self else {
+        let Self::Oci {
+            binary,
+            class: None,
+        } = self
+        else {
             return Ok(());
         };
         let version = Command::new(binary)
@@ -756,7 +820,7 @@ fn build_signal_command(
             signal,
             name,
         ],
-        ContainerRuntime::Oci { binary } => {
+        ContainerRuntime::Oci { binary, .. } => {
             vec![binary.clone(), "kill".to_string(), name, signal]
         }
     })
@@ -776,7 +840,7 @@ fn remove_stale_container(oci_runtime: &ContainerRuntime, allocation: &Allocatio
     let name = container_name(oci_runtime, allocation);
     match oci_runtime {
         ContainerRuntime::AppleContainer => apple_container::remove_stale(&name, allocation),
-        ContainerRuntime::Oci { binary } => {
+        ContainerRuntime::Oci { binary, .. } => {
             crate::util::output_with_timeout(
                 Command::new(binary).args(["delete", "--force", &name]),
                 crate::util::RUNTIME_CLI_TIMEOUT,
@@ -831,7 +895,7 @@ fn build_exec_command(
             argv.extend(command.iter().cloned());
             argv
         }
-        ContainerRuntime::Oci { binary } => {
+        ContainerRuntime::Oci { binary, .. } => {
             let mut argv = vec![binary.clone(), "exec".to_string()];
             if tty {
                 argv.push("--tty".to_string());
@@ -927,6 +991,12 @@ impl TaskPlugin for ContainerTaskPlugin {
         crate::task_plugins::validate_schema(&self.schema(), config)?;
         ContainerTaskConfig::from_value(config)?;
         Ok(())
+    }
+
+    /// A task that names a runtime class places only where the class is
+    /// (the node attribute `container.runtimeClasses`).
+    fn normalize_task(&self, task: &mut TaskConfig) {
+        crate::task_plugins::runtime_class::constrain_to_class(task);
     }
 
     /// Apple `container` refuses a VM under
@@ -1028,7 +1098,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         _instance: &mut TaskInstance,
         signal: &str,
     ) -> R<()> {
-        let oci_runtime = ContainerRuntime::detect()?;
+        let oci_runtime = ContainerRuntime::for_task(task)?;
         let argv = build_signal_command(&oci_runtime, allocation, signal)?;
         let (program, args) = argv.split_first().expect("signal argv is never empty");
         let output = crate::util::output_with_timeout(
@@ -1072,7 +1142,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         _instance: &mut TaskInstance,
         mut opts: ExecOptions,
     ) -> R<Box<dyn ExecSession>> {
-        let oci_runtime = ContainerRuntime::detect()?;
+        let oci_runtime = ContainerRuntime::for_task(task)?;
         if !oci_runtime.supports_exec() {
             bail!("this container runtime does not support exec yet");
         }
@@ -1157,7 +1227,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         instance: &mut TaskInstance,
     ) -> R<()> {
         let config = ContainerTaskConfig::from_value(&task.config)?;
-        let oci_runtime = ContainerRuntime::detect()?;
+        let oci_runtime = ContainerRuntime::for_task(task)?;
         check_apple_memory_floor(&oci_runtime, task)?;
         // Before any image work: a task that asks for more than the operator
         // allows here fails now, naming what to change.
@@ -1168,7 +1238,42 @@ impl TaskPlugin for ContainerTaskPlugin {
             &oci_bundle::CapabilityAllowlist::from_env(),
         )?;
         oci_runtime.preflight()?;
-        if config.security.user_namespace {
+        // The privilege floor this runtime can carry (docs/task-runtime-
+        // container.md, "Runtime classes"): a class that cannot apply a part
+        // and isolates root itself drops it; one that does not refuses.
+        let wants_seccomp = config.security.seccomp == SECCOMP_DEFAULT;
+        let floor = match &oci_runtime {
+            ContainerRuntime::Oci {
+                class: Some((name, class)),
+                ..
+            } => {
+                let floor = crate::task_plugins::runtime_class::effective_floor(
+                    name,
+                    class,
+                    config.security.user_namespace,
+                    wants_seccomp,
+                )?;
+                if floor.user_namespace != config.security.user_namespace
+                    || floor.seccomp != wants_seccomp
+                {
+                    info!(
+                        allocation_id = allocation.id,
+                        task_name = %task.name,
+                        runtime_class = %name,
+                        user_namespace = floor.user_namespace,
+                        seccomp = floor.seccomp,
+                        "Runtime class isolates root itself; Legion's privilege floor parts it \
+                         cannot apply are left to it"
+                    );
+                }
+                floor
+            }
+            _ => crate::task_plugins::runtime_class::EffectiveFloor {
+                user_namespace: config.security.user_namespace,
+                seccomp: wants_seccomp,
+            },
+        };
+        if floor.user_namespace {
             oci_runtime.check_idmapped_mounts()?;
         }
         if oci_runtime == ContainerRuntime::AppleContainer && config.adjusts_linux_process() {
@@ -1253,7 +1358,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                 cmd.args(args);
                 cmd
             }
-            ContainerRuntime::Oci { binary } => {
+            ContainerRuntime::Oci { binary, .. } => {
                 // The runtime runs a bundle, not an image: get the image's OCI
                 // layout (from the artifact pipeline if staged, else pull it),
                 // convert it to a bundle, then `run` it.
@@ -1274,7 +1379,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                 // The privilege floor (worker-plane-auth plan §6.14): an id
                 // range of this allocation's own, the default seccomp
                 // profile, and a cgroup namespace.
-                let id_map = if config.security.user_namespace {
+                let id_map = if floor.user_namespace {
                     let alloc_dir = instance
                         .alloc_dir
                         .clone()
@@ -1290,7 +1395,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                 };
                 let security = oci_bundle::BundleSecurity {
                     id_map,
-                    seccomp: config.security.seccomp == SECCOMP_DEFAULT,
+                    seccomp: floor.seccomp,
                     cgroup_namespace: true,
                 };
                 let policy = config.process_policy()?;
@@ -1375,7 +1480,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         instance: &mut TaskInstance,
         ctx: &crate::task_plugins::StopContext,
     ) -> R<bool> {
-        let Ok(oci_runtime) = ContainerRuntime::detect() else {
+        let Ok(oci_runtime) = ContainerRuntime::for_task(task) else {
             return Ok(false);
         };
         let name = container_name(&oci_runtime, allocation);
@@ -1388,7 +1493,7 @@ impl TaskPlugin for ContainerTaskPlugin {
             // `runc`/`crun` `kill` signals the container init and
             // returns immediately, which is exactly the contract here — the
             // worker's reaper owns the deadline.
-            ContainerRuntime::Oci { binary } => (
+            ContainerRuntime::Oci { binary, .. } => (
                 binary.as_str(),
                 vec![
                     "kill".to_string(),
@@ -1457,7 +1562,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         // the container init when the foreground `run` is killed). Tear it down
         // explicitly by name first. Best-effort: an already-exited `--rm` /
         // deleted container is gone, which is success.
-        if let Ok(oci_runtime) = ContainerRuntime::detect() {
+        if let Ok(oci_runtime) = ContainerRuntime::for_task(task) {
             let name = container_name(&oci_runtime, allocation);
             let (program, args, timeout): (&str, Vec<&str>, _) = match &oci_runtime {
                 // `stop` signals the container's init and waits, so the
@@ -1467,7 +1572,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                     vec!["stop", &name],
                     apple_container::STOP_TIMEOUT,
                 ),
-                ContainerRuntime::Oci { binary } => (
+                ContainerRuntime::Oci { binary, .. } => (
                     binary.as_str(),
                     vec!["delete", "--force", &name],
                     crate::util::RUNTIME_CLI_TIMEOUT,
@@ -1625,6 +1730,7 @@ mod tests {
     fn preflight_reports_a_missing_oci_runtime() {
         let oci_runtime = ContainerRuntime::Oci {
             binary: "legion-no-such-oci-runtime".into(),
+            class: None,
         };
         let err = oci_runtime.preflight().expect_err("missing runtime");
         let message = err.to_string();
@@ -1644,7 +1750,7 @@ mod tests {
         let (probe, args) = match &oci_runtime {
             // `ls` needs the daemon, so it fails exactly where a launch would.
             ContainerRuntime::AppleContainer => (APPLE_CONTAINER_BIN, ["ls"]),
-            ContainerRuntime::Oci { binary } => (binary.as_str(), ["--version"]),
+            ContainerRuntime::Oci { binary, .. } => (binary.as_str(), ["--version"]),
         };
         let usable = Command::new(probe)
             .args(args)
@@ -1765,6 +1871,7 @@ mod tests {
         // Linux keeps `legion-<alloc>`, shared with the cgroup leaf name.
         let oci = ContainerRuntime::Oci {
             binary: "runc".into(),
+            class: None,
         };
         assert_eq!(container_name(&oci, &allocation), "legion-5");
         Ok(())
@@ -2380,6 +2487,7 @@ mod tests {
         for binary in ["runc", "/usr/local/sbin/runc", "crun"] {
             let oci_runtime = ContainerRuntime::Oci {
                 binary: binary.into(),
+                class: None,
             };
             let argv = build_exec_command(
                 &oci_runtime,
@@ -2506,7 +2614,8 @@ mod tests {
     fn exec_support_is_reported_for_every_detected_runtime() {
         assert!(ContainerRuntime::AppleContainer.supports_exec());
         assert!(ContainerRuntime::Oci {
-            binary: "runc".into()
+            binary: "runc".into(),
+            class: None,
         }
         .supports_exec());
 
@@ -2719,7 +2828,8 @@ mod tests {
         assert_eq!(
             build_signal_command(
                 &ContainerRuntime::Oci {
-                    binary: "crun".into()
+                    binary: "crun".into(),
+                    class: None,
                 },
                 &allocation,
                 "SIGHUP",
@@ -3405,6 +3515,7 @@ mod tests {
     fn the_node_allowlist_gates_linux_container_starts() -> R<()> {
         let linux = ContainerRuntime::Oci {
             binary: "runc".into(),
+            class: None,
         };
         let with = |security: Value| {
             ContainerTaskConfig::from_value(&json!({
@@ -3486,6 +3597,7 @@ mod tests {
         assert!(ContainerTaskPlugin.check_resources(&small)?.is_empty());
         let linux = ContainerRuntime::Oci {
             binary: "runc".into(),
+            class: None,
         };
         check_apple_memory_floor(&linux, &small)?;
 

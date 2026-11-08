@@ -18,10 +18,12 @@
             parallelism = 4,
             # Per-artifact retries before the allocation fails.
             attempts = 3,
-            # Overall fetch deadline per artifact.
-            timeout = "10m",
-            # Per-artifact size cap; also bounds decompression.
-            maxArtifactSize = "50GiB",
+            # Overall fetch deadline per artifact. Generous by default so a
+            # model checkpoint of a few hundred GB fetches over a 1 Gbps link.
+            timeout = "2h",
+            # Per-artifact size cap; also bounds decompression. Lower it for
+            # nodes that fetch from sources you do not trust.
+            maxArtifactSize = "1TiB",
         },
     },
     # The node content store (docs/artifacts.md, "The node content store"):
@@ -40,8 +42,10 @@
         # same as leaving it unset. Shares, defaults included, must add up
         # to at most 100%.
         budgets = {
-            # Unset: 10% of the disk, clamped to 1GiB..20GiB.
-            # artifacts = "20GiB",
+            # Unset: 50% of the disk, at least 1GiB, no ceiling: room for
+            # model weights. Cap a share with an object:
+            # artifacts = { share = "50%", max = "2TiB", min = "10GiB" },
+            # or set a fixed size: artifacts = "200GiB",
             # Unset: 20% of the disk, clamped to 2GiB..200GiB. Holds memory
             # checkpoints: local ones pinned until resumed or deleted,
             # published ones (suspend.durability = "store") as evictable
@@ -183,6 +187,17 @@
             # host network can then also read the node's traffic.
             # "NET_RAW",
         ],
+        # OCI runtimes a task can pick with config.runtimeClass
+        # (docs/task-runtime-container.md, "Runtime classes"). The worker
+        # runs `<path> --version` at start and advertises the classes that
+        # answer as container.runtimeClasses. isolatesRoot = true says the
+        # runtime keeps container root off host root itself (a user-space
+        # kernel, a VM), so floor parts it cannot apply are dropped instead
+        # of refusing the task.
+        # runtimeClasses = {
+        #     gvisor = { path = "/usr/local/bin/runsc", userNamespace = false, isolatesRoot = true },
+        #     kata = { path = "/usr/bin/kata-runtime", userNamespace = false, isolatesRoot = true },
+        # },
     },
     # Whether this node serves `Worker.StartClaim` — that is, whether it will
     # start work on a boot ticket at all (docs/edge-boot.md). Off by default

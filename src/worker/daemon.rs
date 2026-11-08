@@ -560,6 +560,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         }
     }
     apply_container_env(&config.container);
+    let runtime_classes = apply_runtime_classes(&config.container);
     // One host guard for the datapath and artifact fetches alike.
     let host_guard = Arc::new(host_guard_for(&config.security));
     let sandbox_bridges = apply_sandbox_bridges_env(enforcement_config.sandbox.as_ref());
@@ -836,6 +837,15 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         config_attrs.insert(
             crate::task_plugins::sandbox_addr::BRIDGES_ATTR.into(),
             json!(sandbox_bridges),
+        );
+    }
+    // The OCI runtime classes whose runtime answered: a container task that
+    // names one carries an implicit `container.runtimeClasses contains`
+    // constraint (docs/task-runtime-container.md, "Runtime classes").
+    if !runtime_classes.is_empty() {
+        config_attrs.insert(
+            crate::task_plugins::runtime_class::NODE_ATTR.into(),
+            json!(runtime_classes),
         );
     }
     // What managers (and edge routers) dial: the route's source address
@@ -1913,6 +1923,21 @@ fn apply_container_env(raw: &str) {
             allowlist.to_env_value(),
         );
     }
+}
+
+/// Publishes the worker type's OCI runtime classes to the container runtime
+/// and returns the ones whose runtime answers, which the node advertises
+/// (docs/task-runtime-container.md, "Runtime classes").
+fn apply_runtime_classes(raw: &str) -> Vec<String> {
+    let classes = crate::structs::WorkerContainerConfig::from_payload(raw)
+        .map(|config| config.runtime_classes)
+        .unwrap_or_default();
+    crate::task_plugins::runtime_class::publish(&classes);
+    let available = crate::task_plugins::runtime_class::probe(&classes);
+    if !available.is_empty() {
+        info!(runtime_classes = ?available, "Container runtime classes available on this node");
+    }
+    available
 }
 
 /// Publishes the worker's `sandbox.bridges` pools into the environment for

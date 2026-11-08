@@ -75,6 +75,7 @@ mod node_liveness;
 mod node_pressure;
 mod node_usage;
 mod plan_contention;
+mod plugin_seams;
 mod published_resume_integration;
 mod raft_apply_roundtrip;
 mod raft_cascade_delete;

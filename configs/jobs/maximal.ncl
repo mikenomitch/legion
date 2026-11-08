@@ -1308,6 +1308,11 @@
                     nofile = 65536,
                     nproc = { soft = 4096, hard = 8192 },
                 },
+                # An OCI runtime class the worker type declares in
+                # container.runtimeClasses (docs/task-runtime-container.md,
+                # "Runtime classes"): gVisor, Kata, ... The task only places
+                # on nodes that advertise it. Unset: the node's runc or crun.
+                runtimeClass = "gvisor",
             },
             resources = {
                 # Real limits on Linux when the worker runs with

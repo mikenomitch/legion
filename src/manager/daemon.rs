@@ -4237,8 +4237,11 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
                     block.allow_caps.as_deref(),
                 )
                 .with_context(|| format!("invalid worker config {path_str}"))?;
+                crate::task_plugins::runtime_class::validate_classes(&block.runtime_classes)
+                    .with_context(|| format!("invalid worker config {path_str}"))?;
                 serde_json::to_string(&crate::structs::WorkerContainerConfig {
                     allow_caps: Some(allowlist.to_config()),
+                    runtime_classes: block.runtime_classes.clone(),
                 })?
             }
         };

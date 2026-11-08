@@ -264,6 +264,8 @@ const STRUCTURAL_NODE_ATTRS: &[&str] = &[
     "hostGuard",
     "netKernel",
     "sandbox.bridges",
+    // crate::task_plugins::runtime_class::NODE_ATTR
+    "container.runtimeClasses",
 ];
 
 /// Whether `key` is a node attribute Legion reads as structure.
@@ -353,6 +355,7 @@ mod node_test {
             crate::worker::netd::kernel_guard::NODE_ATTR,
             crate::worker::netd::kernel::NODE_ATTR,
             crate::task_plugins::sandbox_addr::BRIDGES_ATTR,
+            crate::task_plugins::runtime_class::NODE_ATTR,
         ] {
             assert!(is_structural_node_attr(key), "{key}");
         }

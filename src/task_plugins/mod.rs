@@ -27,6 +27,7 @@ mod oci_bundle;
 mod oci_image;
 pub mod resource_enforcement;
 pub mod rootfs_cache;
+pub mod runtime_class;
 mod sandbox;
 pub(crate) mod sandbox_addr;
 mod sandbox_checkpoint;
