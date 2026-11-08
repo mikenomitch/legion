@@ -103,7 +103,7 @@ impl EdgeLedger {
         // A new key: counted against the bound before it is made.
         if self
             .keys
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |keys| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |keys| {
                 (keys < MAX_EDGES).then_some(keys + 1)
             })
             .is_err()
