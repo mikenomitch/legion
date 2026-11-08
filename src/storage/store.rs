@@ -32832,8 +32832,8 @@ mod tests {
         let first_local = local_port(&first)?;
         let second_local = local_port(&second)?;
         assert_ne!(first_local, second_local);
-        assert!(first_local >= crate::structs::DYNAMIC_PORT_MIN);
-        assert!(second_local <= crate::structs::DYNAMIC_PORT_MAX);
+        assert!(first_local >= crate::structs::DATAPATH_PORT_MIN);
+        assert!(second_local <= crate::structs::DATAPATH_PORT_MAX);
 
         // Upstream ports come from the same per-node set as task ports, so
         // they never land on a port already handed to a task.
@@ -33056,7 +33056,7 @@ mod tests {
             .as_ref()
             .and_then(|network| network.upstream("db"))
             .context("fresh allocation missing db upstream")?;
-        assert!(upstream.local_port >= Some(crate::structs::DYNAMIC_PORT_MIN));
+        assert!(upstream.local_port >= Some(crate::structs::DATAPATH_PORT_MIN));
         assert_eq!(upstream.balance, crate::structs::DEFAULT_BALANCE);
 
         // Changing an existing connect block is equally disqualifying, while
