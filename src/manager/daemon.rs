@@ -631,6 +631,27 @@ pub async fn run_manager_with(
     // Follower-side forwarding of rejected writes to the raft leader
     // (docs/raft-operations.md, "Writes on any manager").
     let leader_forward = crate::manager::leader_forward::LeaderForwardLayer::new(store.clone());
+    // Agent governance (docs/audit-journal.md,
+    // docs/approvals-and-rate-limits.md, docs/usage-accounting.md): the
+    // batched audit writer, the usage accumulator, and the request layer
+    // that journals and gates every Manager RPC.
+    full_config
+        .governance
+        .validate()
+        .map_err(|message| anyhow!("invalid governance config: {message}"))?;
+    let audit_journal = full_config.governance.audit_enabled().then(|| {
+        crate::manager::governance::journal::start(store.clone(), &full_config.governance)
+    });
+    if full_config.governance.usage_enabled() {
+        crate::manager::governance::usage::start(store.clone(), &full_config.governance);
+    }
+    let governance_layer = crate::manager::governance::layer::GovernanceLayer::new(Arc::new(
+        crate::manager::governance::Governance::new(
+            store.clone(),
+            full_config.governance.clone(),
+            audit_journal,
+        ),
+    ));
     let manager_node = Arc::new(
         ManagerDaemonService::with_manager_config(store, &full_config)
             .with_workload_identity(workload_identity_state.clone())
@@ -789,6 +810,10 @@ pub async fn run_manager_with(
         // not-the-leader is replayed to the leader and the leader's reply
         // returned, so every manager accepts every request.
         .layer(leader_forward)
+        // Inside leader forwarding: the manager that executes a request
+        // journals and gates it; a not-the-leader rejection it forwards is
+        // journaled by the leader (src/manager/governance/layer.rs).
+        .layer(governance_layer)
         .add_service(manager_service)
         .add_service(raft_transport_service)
         .serve_with_incoming_shutdown(api_incoming, async move {

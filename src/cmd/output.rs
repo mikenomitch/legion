@@ -62,6 +62,11 @@ pub struct CliError {
     pub hint: Option<String>,
     /// Whether retrying the same request may succeed.
     pub retryable: bool,
+    /// Typed details for a typed `code` (the manager's
+    /// `legion-error-details` metadata): `approvalId` and `requestDigest`
+    /// on `APPROVAL_REQUIRED`, `retryAfterMs` on `RATE_LIMITED`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 
 impl CliError {
@@ -92,6 +97,11 @@ impl CliError {
                 .or_else(|| server_hint.map(str::to_string))
                 .or_else(|| hint_for(code, message_text).map(str::to_string)),
             retryable: is_retryable(code),
+            details: status
+                .metadata()
+                .get(crate::manager::governance::ERROR_DETAILS_METADATA)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|raw| serde_json::from_str(raw).ok()),
         }
     }
 
@@ -103,6 +113,7 @@ impl CliError {
             message: message.into(),
             hint: hint.map(str::to_string),
             retryable: false,
+            details: None,
         }
     }
 }

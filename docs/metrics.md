@@ -406,6 +406,17 @@ while admitted work is still placing.
   silent absence. A `corrupt` count is a record this manager cannot decode
   (logged once, with the reason): `legion app uninstall <app>` removes it.
 
+### Governance
+
+- **`legion_governance_events_total{event}`** (counter): agent-governance
+  events on this manager ([audit journal](audit-journal.md),
+  [approvals and rate limits](approvals-and-rate-limits.md)).
+  `audit_written` counts journaled records; `audit_dropped` records lost
+  to a full queue or a failed batch (alert on any); `audit_unjournaled`
+  records a follower that leads no raft lane logged to the `audit`
+  tracing target instead; `rate_limited`, `approval_required`,
+  `approval_invalid` and `approval_used` count the gates' answers.
+
 ### Node usage
 
 Per-node gauges from the usage reports workers with

@@ -7,6 +7,7 @@ pub(crate) mod data_migrations;
 pub mod endpoint_index;
 pub mod errors;
 pub mod events;
+pub mod governance_store;
 pub mod keyring;
 pub mod liveness;
 pub mod migrations;

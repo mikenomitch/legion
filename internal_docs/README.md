@@ -100,6 +100,7 @@ When one is required and what goes in it:
 | Plan | Status |
 | --- | --- |
 | [adaptive-scheduler-concurrency-plan.md](plans/adaptive-scheduler-concurrency-plan.md) | in execution (phases 1–3 shipped 2026-08-04, default `observe`); its motivating "4 beats 16" measurement was retracted the next day ([aws-phase4-findings.md](aws-phase4-findings.md)), so phase 0 now has to find a conflict-bound cell before phase 4's default flip can be argued |
+| [agent-governance-plan.md](plans/agent-governance-plan.md) | in execution (2026-11-08): the audit journal, token expiry by default, child tokens, approval gates, per-token rate limits, the caller-aware catalog, MCP 2025-06-18 with full RPC coverage, and usage rollups shipped. Deferred: follower-side journaling, an external audit sink, inline child-token narrowing, multi-party approvals, budgets, MCP HTTP SSE/auth |
 | [artifact-system-plan.md](plans/artifact-system-plan.md) | shipped |
 | [artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md) | in execution (Phase 1 partly shipped as the node content store, Phase 3 partly as suspend plan Phase 7a) |
 | [device-model-and-plugin-seams-plan.md](plans/device-model-and-plugin-seams-plan.md) | in execution (2026-11-08, review findings PLG1–PLG5 and AI6; public pages [devices.md](../docs/devices.md), [plugin-system.md](../docs/plugin-system.md), [namespaces.md](../docs/namespaces.md), [artifacts.md](../docs/artifacts.md), [task-runtime-container.md](../docs/task-runtime-container.md)): a device model (exec device plugins `legion-device/1`, `resources.devices`, topology-aware assignment at insert, CDI edits for containers, env for exec, device health, device quota, reference `nvidia` and `fake` plugins); a model-scale artifacts cache and ORAS layer caching; panic containment and quarantine for scheduling, rollout, node-check, and fetcher plugins; typed, cached node checks; OCI runtime classes; CEL job rules. Not run on real GPUs, gVisor, or Kata. MIG/MPS, VFIO, DRA claims, task-runtime containment, WASM hooks, P2P and lazy loading, job mutation, secrets providers, and rollout hooks deferred |
@@ -218,6 +219,7 @@ header. Entries give the call, the alternatives, the trade-off, and why — rank
 by project impact. The full template and a worked example:
 [`calls/README.md`](calls/README.md).
 
+- [agent-governance-plan_calls.md](calls/agent-governance-plan_calls.md)
 - [architecture-audit-2026-10-09_calls.md](calls/architecture-audit-2026-10-09_calls.md)
 - [artifact-system-plan_calls.md](calls/artifact-system-plan_calls.md)
 - [artifact-cache-and-prewarm-plan_calls.md](calls/artifact-cache-and-prewarm-plan_calls.md)

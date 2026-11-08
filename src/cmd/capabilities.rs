@@ -1671,16 +1671,72 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Agent governance (internal_docs/plans/agent-governance-plan.md) ---
+        Capability {
+            name: "audit.list",
+            cli: "legion audit list [--accessor ID] [--operation RPC] [--target PREFIX] [--since 24h] [--follow]",
+            grpc: Some("Manager/ListAuditEvents"),
+            summary: "Query the durable audit journal: who (accessor, principal, on-behalf-of chain) did which write or was denied, on what target, with which outcome. Needs audit:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "acl.token.child",
+            cli: "legion acl token create --child --name NAME [--policy P]... [--ttl 1h] [--write-rate 5/s]",
+            grpc: Some("Manager/CreateChildToken"),
+            summary: "Mint a child of your own token for a sub-agent: a subset of its policies, expiring no later than it (default 1h, at most 24h), revoked with it. Needs no acl:write.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "approval.list",
+            cli: "legion approval list [--status pending] [--mine]",
+            grpc: Some("Manager/ListApprovals"),
+            summary: "List approval requests filed by governance.approvals gates (your own without approval:read).",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "approval.get",
+            cli: "legion approval get <ID>",
+            grpc: Some("Manager/GetApproval"),
+            summary: "Show one approval request: what it gates, who asked, and whether it was decided or used.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "approval.decide",
+            cli: "legion approval approve|deny <ID> [--reason TEXT]",
+            grpc: Some("Manager/DecideApproval"),
+            summary: "Approve or deny a pending approval request (approval:write; never your own). The requester then retries with --approval <ID>.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "usage",
+            cli: "legion usage [--namespaces NS] [--by namespace|job|submitter|hour] [--since 7d] | legion namespace usage <NS>",
+            grpc: Some("Manager/GetUsage"),
+            summary: "Time-integrated reserved usage (CPU core-hours, memory GiB-hours, cores, allocation-hours, custom resources) per namespace, job, or submitting token.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Discovery ---
         Capability {
             name: "capabilities",
-            cli: "legion capabilities",
-            grpc: None,
-            summary: "List the operations described by this catalog.",
+            cli: "legion capabilities [--mine]",
+            grpc: Some("Manager/GetCallerCapabilities"),
+            summary: "List the operations described by this catalog; --mine marks each allowed, partial (some namespaces), or denied for your token.",
             mutates: false,
             read_only_safe: true,
         },
     ]
+}
+
+#[derive(Tabled)]
+struct MineRow {
+    name: String,
+    access: String,
+    permission: String,
 }
 
 #[derive(Tabled)]
@@ -1696,13 +1752,112 @@ struct CapabilityRow {
 pub fn config() -> Command {
     Command::new("capabilities")
         .about("List Legion's agent-callable operations (machine-readable with --json)")
+        .arg(
+            Arg::new("mine")
+                .long("mine")
+                .action(ArgAction::SetTrue)
+                .help("Ask the manager which of them your token may perform"),
+        )
         .arg(json_flag())
+}
+
+/// The catalog as `client`'s caller may use it: each entry gains `access`
+/// (`allowed`, `partial`, `denied`, `open`, or `local` for entries no RPC
+/// backs) and, for `partial`, the `namespaces` where it holds
+/// (`GetCallerCapabilities`).
+pub async fn caller_catalog(
+    client: &mut crate::cmd::helpers::AuthedManagerClient,
+) -> Result<Value, tonic::Status> {
+    let reply = client
+        .get_caller_capabilities(crate::structs::GetCallerCapabilitiesRequest {})
+        .await?
+        .into_inner();
+    let by_rpc: HashMap<String, crate::structs::RpcAccess> = reply
+        .rpcs
+        .into_iter()
+        .map(|access| (access.rpc.clone(), access))
+        .collect();
+    let entries: Vec<Value> = catalog()
+        .into_iter()
+        .map(|cap| {
+            let mut entry = serde_json::to_value(&cap).unwrap_or(Value::Null);
+            let access = cap
+                .grpc
+                .and_then(|grpc| grpc.strip_prefix("Manager/"))
+                .and_then(|rpc| by_rpc.get(rpc));
+            if let Some(fields) = entry.as_object_mut() {
+                match access {
+                    Some(access) => {
+                        fields.insert("access".into(), json!(access.access));
+                        if !access.permission.is_empty() {
+                            fields.insert("permission".into(), json!(access.permission));
+                        }
+                        if !access.namespaces.is_empty() {
+                            fields.insert("namespaces".into(), json!(access.namespaces));
+                        }
+                    }
+                    None => {
+                        fields.insert("access".into(), json!("local"));
+                    }
+                }
+            }
+            entry
+        })
+        .collect();
+    Ok(json!({
+        "principal": reply.principal,
+        "accessorId": reply.accessor_id,
+        "source": reply.source,
+        "isManagement": reply.is_management,
+        "aclEnabled": reply.acl_enabled,
+        "capabilities": entries,
+    }))
 }
 
 /// Handle `legion capabilities`.
 #[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
+    if matches.get_flag("mine") {
+        let mut client = crate::cmd::helpers::connect_manager_client().await?;
+        let view = output::resolve(
+            format,
+            "Failed to read your capabilities",
+            caller_catalog(&mut client).await,
+        )?;
+        if format.is_json() {
+            output::print_success(&view);
+            return Ok(());
+        }
+        println!(
+            "Capabilities of {} ({}):",
+            view["principal"].as_str().unwrap_or("-"),
+            view["source"].as_str().unwrap_or("-")
+        );
+        let rows = view["capabilities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| MineRow {
+                name: entry["name"].as_str().unwrap_or_default().to_string(),
+                access: match entry["namespaces"].as_array() {
+                    Some(namespaces) => format!(
+                        "partial ({})",
+                        namespaces
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    None => entry["access"].as_str().unwrap_or_default().to_string(),
+                },
+                permission: entry["permission"].as_str().unwrap_or("-").to_string(),
+            })
+            .collect::<Vec<_>>();
+        crate::cmd::helpers::print_table(rows);
+        return Ok(());
+    }
     let caps = catalog();
 
     if format.is_json() {

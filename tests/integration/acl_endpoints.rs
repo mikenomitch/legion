@@ -307,6 +307,18 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("WatchObjects", Plane::App),
         ("UpdateObjectStatus", Plane::App),
         ("ReleaseObject", Plane::App),
+        // Agent governance (internal_docs/plans/agent-governance-plan.md).
+        // CreateChildToken is self-service: any Legion token mints a
+        // narrower child of itself. ListApprovals/GetApproval also answer a
+        // requester about its own requests; GetCallerCapabilities reports
+        // on the presented credential only.
+        ("ListAuditEvents", Plane::Protected("audit:read")),
+        ("CreateChildToken", Plane::Protected("token (self-service)")),
+        ("ListApprovals", Plane::Protected("approval:read")),
+        ("GetApproval", Plane::Protected("approval:read")),
+        ("DecideApproval", Plane::Protected("approval:write")),
+        ("GetCallerCapabilities", Plane::Open),
+        ("GetUsage", Plane::Protected("namespace:read (per item)")),
     ]
 }
 
@@ -2038,6 +2050,54 @@ async fn call_endpoint(
                 },
                 token,
             ))
+            .await
+            .map(|_| ()),
+        // Agent governance (agent-governance plan).
+        "ListAuditEvents" => svc
+            .list_audit_events(req(ListAuditEventsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "CreateChildToken" => svc
+            .create_child_token(req(
+                CreateChildTokenRequest {
+                    name: "acl-child".into(),
+                    policies: vec![FIXTURE_POLICY.into()],
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListApprovals" => svc
+            .list_approvals(req(ListApprovalsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetApproval" => svc
+            .get_approval(req(
+                GetApprovalRequest {
+                    id: "apr_missing".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DecideApproval" => svc
+            .decide_approval(req(
+                DecideApprovalRequest {
+                    id: "apr_missing".into(),
+                    approve: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetCallerCapabilities" => svc
+            .get_caller_capabilities(req(GetCallerCapabilitiesRequest {}, token))
+            .await
+            .map(|_| ()),
+        "GetUsage" => svc
+            .get_usage(req(GetUsageRequest::default(), token))
             .await
             .map(|_| ()),
         other => {
@@ -5816,6 +5876,113 @@ async fn namespace_errors_say_where_to_look_without_leaking() -> R<()> {
     assert_eq!(
         reply.warnings,
         vec!["rule 0 names namespace 'payments-prdo', which does not exist".to_string()]
+    );
+    Ok(())
+}
+
+// ── Agent governance (internal_docs/plans/agent-governance-plan.md) ──────
+
+/// The source-side access table (`legion::manager::rpc_access`, which backs
+/// `GetCallerCapabilities` and the MCP coverage test) must say what this
+/// endpoint table says for every RPC.
+#[test]
+fn rpc_access_table_matches_the_endpoint_table() {
+    use legion::manager::rpc_access::{access_of, Access};
+    for (method, plane) in endpoint_table() {
+        let access = access_of(method)
+            .unwrap_or_else(|| panic!("{method} has no row in src/manager/rpc_access.rs"));
+        match (plane, access) {
+            (Plane::Protected(gate), Access::Protected(resource, action)) => assert!(
+                gate.starts_with(&format!("{resource}:{action}")),
+                "{method}: endpoint table gates on {gate}, rpc_access says {resource}:{action}"
+            ),
+            (Plane::Protected(gate), Access::SelfService) => {
+                assert!(gate.contains("self-service"), "{method}: {gate}")
+            }
+            (Plane::Open, Access::Open)
+            | (Plane::Worker, Access::Worker)
+            | (Plane::App, Access::App) => {}
+            (plane, access) => panic!("{method}: endpoint table {plane:?}, rpc_access {access:?}"),
+        }
+    }
+}
+
+/// The audit journal covers every write: calling each endpoint the way the
+/// governance layer would (with a management token, so the call reaches its
+/// handler's checks) leaves a journal record exactly when the endpoint
+/// gates on a write permission — and none for the reads.
+#[tokio::test]
+async fn every_write_rpc_is_journaled() -> R<()> {
+    use legion::manager::governance::{layer::audited, Governance};
+    use legion::storage::governance_store::AuditFilter;
+    let store = setup_store()?;
+    let mut fixtures = seed_fixtures(&store)?;
+    let authenticator = enabled_authenticator();
+    let (_, management) = authenticator
+        .mint_initial_management_token(&store, None)
+        .map_err(|s| anyhow!(s.to_string()))?
+        .expect("a fresh store has no management token");
+    let (deletable, _) = authenticator
+        .mint_token(
+            &store,
+            "deletable",
+            "client",
+            &[FIXTURE_POLICY.to_string()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+    fixtures.deletable_token_accessor = deletable.accessor_id;
+    let svc = ManagerDaemonService::with_acl(store.clone(), authenticator);
+    let governance = Arc::new(Governance::new(store.clone(), Default::default(), None));
+
+    let mut unjournaled_writes = Vec::new();
+    let mut journaled_reads = Vec::new();
+    for (method, plane) in endpoint_table() {
+        if matches!(method, "Login" | "StreamWork" | "ExecAllocation") {
+            continue; // credential exchange; client streams the layer does not buffer
+        }
+        let _ = audited(
+            &governance,
+            method,
+            String::new(),
+            None,
+            call_endpoint(&svc, &fixtures, method, Some(&management)),
+        )
+        .await;
+        let records = store.list_audit_events(&AuditFilter {
+            operation: method.into(),
+            limit: 10,
+            ..Default::default()
+        })?;
+        let is_write = matches!(plane, Plane::Protected(gate) if gate.contains(":write"));
+        if is_write
+            && !records
+                .iter()
+                .any(|r| r.kind == "write" || r.kind == "denied")
+        {
+            unjournaled_writes.push(method);
+        }
+        let always = legion::manager::governance::ALWAYS_AUDITED.contains(&method);
+        // Gated first on a read, but a write too: restoring an instance from
+        // a snapshot also needs job:write (docs/auth-and-acls.md).
+        let read_gated_write = matches!(method, "RestoreInstance");
+        if matches!(plane, Plane::Protected(gate) if gate.contains(":read"))
+            && !always
+            && !read_gated_write
+        {
+            if let Some(record) = records.iter().find(|r| r.kind == "write") {
+                journaled_reads.push(format!("{method} ({}:{})", record.resource, record.action));
+            }
+        }
+    }
+    assert!(
+        unjournaled_writes.is_empty(),
+        "write RPCs that left no audit record (their handler's write check must run through \
+         acl::enforce on the request task): {unjournaled_writes:?}"
+    );
+    assert!(
+        journaled_reads.is_empty(),
+        "read RPCs journaled as writes: {journaled_reads:?}"
     );
     Ok(())
 }

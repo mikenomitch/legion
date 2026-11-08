@@ -27,6 +27,7 @@ mod support;
 
 mod acl_default_on;
 mod acl_endpoints;
+mod agent_governance;
 mod api_socket;
 mod app_action_delegation;
 mod app_extensions;

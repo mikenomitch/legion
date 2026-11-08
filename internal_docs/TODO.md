@@ -4595,10 +4595,11 @@ docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging
       The cluster-wide per-task view is
       [autoscaler-v2](plans/autoscaler-v2-plan.md) Phase 1; build them together.
 
-- [ ] **Usage accounting over time** ([review AI9](architecture-review-2026-11-07.md)): namespaces show only
-      current charged usage. Record time-integrated CPU-seconds, GiB-hours,
-      and device-hours per namespace, job, and token, as the basis for
-      budgets and "what did this agent spend?".
+- [ ] **Usage accounting follow-ups** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) #10): budgets that enforce
+      (refuse or scale down past a namespace budget); measured (not
+      reserved) usage; submitter attribution that survives journal pruning
+      (stamp it on `job_config`); device-hours once the device model lands
+      (they will appear as `resource:<name>` automatically).
 
 ## Templates, registry & packaging
 
@@ -5313,28 +5314,31 @@ this" work:
 - [ ] An agent can easily configure a worker to talk to a manager
 - [ ] An agent can search the registry and find jobs worth installing and running
 
-- [ ] **A durable audit journal** ([review AI2](architecture-review-2026-11-07.md)): only ACL denials are logged,
-      `SchedulerEvent` has no actor, and sessions have none. Record accessor,
-      principal, on-behalf-of chain, operation, request digest, idempotency
-      key, and outcome for every write, queryable through `state query` and
-      MCP.
-- [ ] **Token expiry by default** ([review AI3](architecture-review-2026-11-07.md)): `acl.tokenMaxTtl` is
-      unbounded unless set.
-- [ ] **Token attenuation for sub-agents** ([review AI3](architecture-review-2026-11-07.md)): minting needs
-      `acl:write`, so an agent cannot hand a sub-agent a narrower token.
-      A "child token, subset of mine" RPC, or Biscuit-style attenuation.
-- [ ] **Approval gates and rate limits** ([review AI3](architecture-review-2026-11-07.md)): no human-approval
-      gate for destructive operations outside app install (MCP
-      `--allow-write` is all-or-nothing), and no per-token rate limit or
-      budget.
-- [ ] **A caller-aware capability catalog** ([review AI3](architecture-review-2026-11-07.md)): `capabilities`
-      lists operations the caller cannot perform.
-- [ ] **Bring the MCP server up to date** ([review AI4](architecture-review-2026-11-07.md)): protocol
-      `2024-11-05`, stdio only, and no tool annotations, `structuredContent`,
-      `outputSchema`, Streamable HTTP, or elicitation (the hook for approval
-      gates). About 60 user-facing RPCs have no tool (KV, ACL management,
-      rollout control, `ListJobSpecHistory`, `StreamEvents`, app install and
-      upgrade), and `legion_job_run` has no wait.
+- [ ] **`legion_job_run` has no wait** ([review AI4](architecture-review-2026-11-07.md)): the rest of the
+      MCP finding shipped (see Done); the job-run wait option belongs with
+      the job compare-and-set work (AI5) and its RPC changes.
+- [ ] **Audit records from a follower that leads no raft lane are not
+      journaled** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) #5): such a manager answers its own denials and
+      validation errors, and their records go to the `audit` tracing target
+      (`audit_unjournaled`). Fix: a `ForwardableLaneWrite::AppendAudit` so the
+      batch is forwarded to a lane leader (`src/storage/raft/forward.rs`).
+- [ ] **No external audit sink** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) §4): syslog/webhook/S3 export of the
+      journal. `legion audit list --follow --json` is the seam today; a
+      bundled app consuming it is the likely shape.
+- [ ] **Inline narrowing for child tokens** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) #2): a child can only
+      drop whole policies. Add restriction rules evaluated as an intersection
+      with the parent (needs a second rule set on `AclIdentity`), so "only
+      namespace X" works when no policy for X exists.
+- [ ] **Multi-party approvals** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) §11): `approvers = 2` on a rule.
+- [ ] **Cluster-wide rate limits and budgets** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) #7): limits are per
+      manager and in memory. Budgets — a namespace-policy `budget` checked
+      against the usage rollups ([usage-accounting.md](../docs/usage-accounting.md)) — are the
+      cluster-wide control.
+- [ ] **MCP Streamable HTTP: SSE, sessions, and authorization** ([plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md) #8):
+      `legion mcp serve --http` answers JSON only, keeps no sessions, binds
+      loopback only, and every caller acts as the server's token. Elicitation
+      is stdio-only until SSE lands; remote use needs MCP's OAuth flow or a
+      per-request Legion token pass-through.
 - [ ] **Compare-and-set and a field diff for jobs** ([review AI5](architecture-review-2026-11-07.md)):
       `RunJobRequest` has no `expected_version`, so two agents silently
       overwrite each other, and `PlanJobReply` has no field-level diff.
@@ -7814,6 +7818,12 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       [plan](plans/worker-simulation-plan.md),
       [calls](calls/worker-simulation-plan_calls.md).
 
+- [x] **Usage accounting over time** ([review AI9](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [usage-accounting.md](../docs/usage-accounting.md)): reserved CPU,
+      memory, cores, allocations and custom resources integrated into hourly
+      rollups per namespace, job and submitting token by the status-lane
+      leader; `GetUsage`, `legion usage`, `legion namespace usage`, MCP
+      `legion_usage`. Budgets are open (Observability).
 ## Job types & dependencies
 
 [docs](../docs/jobs-tasks-and-scheduling.md)
@@ -7891,6 +7901,35 @@ calls: [device-model-and-plugin-seams-plan_calls.md](calls/device-model-and-plug
 - [x] An MCP server (`legion mcp serve`), with mutating tools gated behind
       `--allow-write`
 - [x] Idempotency keys on mutating RPCs; validate/plan/preview paths
+- [x] **A durable audit journal** ([review AI2](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [audit-journal.md](../docs/audit-journal.md)): every write RPC and
+      every denial, with accessor, principal, on-behalf-of chain, target,
+      request digest, idempotency key, approval and outcome, recorded by the
+      governance layer from the ACL check itself; replicated, batched,
+      retention-bounded; `ListAuditEvents`, `legion audit list [--follow]`,
+      MCP `legion_audit_list`, `state query` over `audit_event`.
+- [x] **Token expiry by default** ([review AI3](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [auth-and-acls.md](../docs/auth-and-acls.md#token-lifetimes)): 30-day
+      default, 90-day client bound; the bootstrap token is the documented
+      exception.
+- [x] **Child tokens for sub-agents** ([review AI3](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [auth-and-acls.md](../docs/auth-and-acls.md#child-tokens)):
+      `CreateChildToken` / `legion acl token create --child`, a subset of the
+      parent's policies plus the root's denies, expiring and revoked with it.
+- [x] **Approval gates and per-token rate limits** ([review AI3](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [approvals-and-rate-limits.md](../docs/approvals-and-rate-limits.md)):
+      `governance.approvals` rules, `APPROVAL_REQUIRED`/`APPROVAL_INVALID`,
+      `legion approval list|get|approve|deny`, `--approval`; `RATE_LIMITED`
+      with `retryAfterMs`. Budgets are open (Observability).
+- [x] **A caller-aware capability catalog** ([review AI3](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md)):
+      `GetCallerCapabilities`, `legion capabilities --mine`, and the MCP
+      `legion_capabilities` tool.
+- [x] **The MCP server, brought up to date** ([review AI4](architecture-review-2026-11-07.md); [plan](plans/agent-governance-plan.md), [calls](calls/agent-governance-plan_calls.md);
+      [agent-readiness.md](../docs/agent-readiness.md)): MCP 2025-06-18 with
+      negotiation, annotations, `outputSchema`/`structuredContent`,
+      elicitation for approvals, Streamable HTTP on loopback, and a tool (or
+      a recorded exclusion) for every user-facing RPC, enforced by a test.
+      The job-run wait is open.
 
 ## UI
 

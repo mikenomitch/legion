@@ -61,6 +61,15 @@ impl Interceptor for AuthInterceptor {
                 .metadata_mut()
                 .insert(crate::structs::app_ui::FOR_OBJECT_HEADER, object.clone());
         }
+        // A retry of a write an approval gate held (`--approval`,
+        // LEGION_APPROVAL, or an MCP tool call's `approval_id`).
+        if let Some(id) = crate::cmd::governance::current_approval_id() {
+            if let Ok(value) = id.parse::<MetadataValue<Ascii>>() {
+                request
+                    .metadata_mut()
+                    .insert(crate::manager::governance::APPROVAL_HEADER, value);
+            }
+        }
         if let Some(timeout) = self.request_timeout {
             let unbounded = request
                 .extensions()

@@ -124,6 +124,8 @@ reports `aclEnabled: false`.
 | `namespace` | namespace objects ([Namespaces](namespaces.md)) | get a namespace (listing is per item: any allow in a namespace shows it) | create, update, and delete namespaces whose names match (scope with `namespaces`). A cascade delete also needs `job:write` there. |
 | `app` | [apps](apps.md): Legion's add-ons | list and show apps (scope with `names`, matched against app names), and see their views and sandboxed pages and run their actions, each also checked against the view's, page's, or action's own declared permission ([Apps: Who sees what](apps.md#who-sees-what)) | install, upgrade, uninstall, enable, disable, and change settings and config. Installing and upgrading also need every permission the manifest asks for, and a config change that touches a code field needs the app's whole grant: `app:write` alone never hands out an app's grant. Cluster-scoped. |
 | `object` | objects of the kinds apps declare ([App Objects](app-objects.md)) | get, list, and see the kinds (`legion object kinds`, `get`, `list`); scope with `namespaces`, `names` (object names), and `kinds` (globs over `<app>/<Kind>`) | apply and delete objects. Writing an object also needs whatever its kind's `requires` resolves to for that object, checked as the writer ([App Objects: Requires](app-objects.md#requires)). A kind may be governed by `job`, `scale`, or `node` instead (its `access`), checked namespace-wide. A cluster-scoped kind's objects need `namespaces = ["*"]`. |
+| `audit` | the [audit journal](audit-journal.md) | list it (`legion audit list`, `ListAuditEvents`) | n/a |
+| `approval` | [approval requests](approvals-and-rate-limits.md) filed by approval gates | list and get everyone's (without it, a caller sees only its own) | approve or deny someone else's request (never your own) |
 
 Actions are `read` and `write`. `write` does not imply `read`, so grant both.
 Grant `state:read` sparingly, since it can read every table in the state
@@ -723,11 +725,87 @@ hash. Each token has:
 
 Create, inspect, and revoke tokens with `legion acl token create|list|delete`.
 Only a management token can create another management token.
+`legion acl token list` shows each token's expiry and, for a child token,
+its parent.
 
-To bound token lifetimes, set `acl = { tokenMaxTtl = "720h" }`. Every client
-token (created or login-minted) must then expire within the bound. Management
-tokens are exempt. Expired ACL and join tokens are rejected at
-authentication time and pruned hourly.
+#### Token lifetimes
+
+Tokens expire by default:
+
+| Token | Default lifetime | Bound |
+| --- | --- | --- |
+| client, `legion acl token create` | `acl.tokenDefaultTtl`, **30 days** | `acl.tokenMaxTtl`, **90 days** |
+| management, `legion acl token create --type management` | 30 days | none; `--ttl never` creates a non-expiring one |
+| minted by `legion login` | the method's TTL (`acl.loginTtl`, 24h) | `acl.tokenMaxTtl` |
+| [child token](#child-tokens) | `acl.childTokenDefaultTtl`, **1 hour** | `acl.childTokenMaxTtl` (**24 hours**) and its parent's expiry |
+| the bootstrap management token | never expires | — |
+| node tokens (`worker`) | never expire; rotated at every re-registration | — |
+
+```bash
+legion acl token create --name ci --policy ci-deployer            # expires in 30 days
+legion acl token create --name ci --policy ci-deployer --ttl 8h
+legion acl token create --name ci --policy ci-deployer --ttl 2400h
+# Error: requested ttl exceeds acl.tokenMaxTtl (90days)
+```
+
+```nickel
+acl = {
+  tokenDefaultTtl = "720h",
+  tokenMaxTtl = "2160h",        # "none" lifts the bound (and allows client tokens with --ttl never)
+  childTokenDefaultTtl = "1h",
+  childTokenMaxTtl = "24h",
+}
+```
+
+The bootstrap token is exempt on purpose: it is the break-glass credential,
+and an expired one would lock the operator out (the manager re-mints only
+when no management token exists at all). Rotate it instead: create a new
+management token, then `legion acl token delete` the bootstrap token's
+accessor. Expired ACL and join tokens are rejected at authentication time
+and pruned hourly.
+
+#### Child tokens
+
+Any caller holding a Legion ACL token can mint a **child** of it — no
+`acl:write` needed. This is how an agent hands a sub-agent a narrower,
+shorter-lived credential:
+
+```bash
+legion acl token create --child --name sub-agent --policy kv-team --ttl 30m --write-rate 5/s
+# Created child token `sub-agent` of 9f2c… The secret is shown only once.
+```
+
+Over gRPC it is `CreateChildToken`; over MCP, `legion_acl_token_create_child`.
+A child:
+
+- holds a **subset of its parent's policies** (all of them when `--policy` is
+  omitted). A child of a management token is a client token and must name
+  its policies;
+- expires no later than its parent, and no later than
+  `acl.childTokenMaxTtl`;
+- is **revoked with its parent**: deleting a token deletes every token
+  minted from it, at any depth (lineages are at most 8 deep);
+- is evaluated at request time as its own policies **plus every deny rule of
+  its root ancestor's policies**, and every ancestor must still exist and be
+  unexpired. Since a child's policies are a subset of the root's, and every
+  deny the root is bound by binds the child, a child is never wider than its
+  parent — even after someone edits the policies. A child stops working the
+  moment any ancestor is revoked or expires;
+- may carry its own write rate limit (`--write-rate`), which may not exceed
+  its parent's own ([rate limits](approvals-and-rate-limits.md#rate-limits)).
+
+JWT-bearer callers (`legion login` first), anonymous callers, and apps
+acting for a viewer or an object cannot mint children. Minting is not
+idempotent: the secret is returned once and never stored, so a retry mints
+a second child, and the unused one expires on its own. Every minting is in
+the [audit journal](audit-journal.md) with the child's accessor.
+
+#### Approval gates and rate limits
+
+Writes can be held for a human's approval and are rate-limited per token;
+see [Approvals and Rate Limits](approvals-and-rate-limits.md). Every
+mutating call, and every denial, is recorded in the [audit
+journal](audit-journal.md).
 
 Long-lived streams (`StreamEvents` and exec sessions, including the UI's exec
 WebSocket) re-check their credential every 30 seconds. Revoking or expiring a
@@ -846,7 +924,9 @@ described above):
 1. **Audit-only**: with `acl = { enabled = true, auditOnly = true }`, every
    denial is logged but allowed. Logs use the tracing target `acl_audit` and
    include principal, accessor ID, resource, action, and scope. Watch the
-   log, write policies, then drop `auditOnly`.
+   log, write policies, then drop `auditOnly`. Every write is also in the
+   durable [audit journal](audit-journal.md) (`legion audit list`), allowed
+   or not.
 2. **Anonymous policy**: a policy named `anonymous` applies to requests with
    no credential. Grant it temporary read access while you distribute
    tokens, then delete it.

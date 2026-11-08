@@ -97,6 +97,16 @@ pub enum AclResource {
     /// maps onto another resource (`access = { resource = "scale" }`) is
     /// governed by that resource instead.
     Object,
+    /// The audit journal (`legion audit`, docs/audit-journal.md): `read`
+    /// lists it. Cluster-scoped. Separate from `operator` and `acl` because
+    /// the journal shows every caller's activity, which neither an operator
+    /// nor a policy author should get implicitly.
+    Audit,
+    /// Approval requests (`legion approval`,
+    /// docs/approvals-and-rate-limits.md): `read` lists everyone's, `write`
+    /// approves or denies them. Cluster-scoped. Any caller may read its own
+    /// requests without it.
+    Approval,
 }
 
 impl AclResource {
@@ -118,6 +128,8 @@ impl AclResource {
             AclResource::Namespace => "namespace",
             AclResource::App => "app",
             AclResource::Object => "object",
+            AclResource::Audit => "audit",
+            AclResource::Approval => "approval",
         }
     }
 
@@ -139,6 +151,8 @@ impl AclResource {
             "namespace",
             "app",
             "object",
+            "audit",
+            "approval",
         ]
     }
 
@@ -182,6 +196,8 @@ impl AclResource {
             AclResource::Namespace,
             AclResource::App,
             AclResource::Object,
+            AclResource::Audit,
+            AclResource::Approval,
         ]
         .into_iter()
         .find(|resource| resource.as_str() == name)

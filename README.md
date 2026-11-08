@@ -474,6 +474,9 @@ start:
   [Cert Manager](docs/cert-manager.md)
 - **Sharing a cluster:** [Namespaces](docs/namespaces.md) ·
   [Auth & ACLs](docs/auth-and-acls.md) ·
+  [Audit Journal](docs/audit-journal.md) ·
+  [Approvals and Rate Limits](docs/approvals-and-rate-limits.md) ·
+  [Usage Accounting](docs/usage-accounting.md) ·
   [Workload Identity](docs/workload-identity.md)
 - **Operating a cluster:** [Running Raft](docs/raft-operations.md) ·
   [Upgrades](docs/upgrades.md) · [Data Directory](docs/data-directory.md) ·

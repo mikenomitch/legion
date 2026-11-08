@@ -2620,8 +2620,9 @@ impl Store {
     /// - `raft_applied` (applied marker legitimately lags on followers) and
     ///   `raft_cluster` (node-local identity stamp) — raft bookkeeping,
     ///   never replicated;
-    /// - `scheduler_event` / `idempotency_record` — commutative tables
-    ///   pruned locally per node (JC-28), so their retained windows differ.
+    /// - `scheduler_event` / `idempotency_record` / `audit_event` —
+    ///   commutative tables pruned locally per node (JC-28), so their
+    ///   retained windows differ.
     ///
     /// `eval` is deliberately INCLUDED again (JC-41 reverses JC-27): the
     /// queue is replicated scheduler-lane state, so replicas that disagree
@@ -2638,7 +2639,8 @@ impl Store {
                 "SELECT name FROM sqlite_master
                  WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
                    AND name NOT IN ('raft_applied', 'raft_cluster', 'raft_speculative',
-                                    'scheduler_event', 'idempotency_record')
+                                    'scheduler_event', 'idempotency_record',
+                                    'audit_event')
                  ORDER BY name;",
             )?;
             let rows = stmt.query_map([], |row| row.get(0))?;
