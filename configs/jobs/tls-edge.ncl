@@ -1,5 +1,7 @@
-# Serving a KV-held certificate, two ways. Pairs with
-# configs/jobs/cert-renewer.ncl, which keeps `certs/app.example.com` renewed.
+# Serving a KV-held certificate, two ways. Pairs with the cert manager (a
+# certs/Certificate with kv = "certs/app.example.com"; docs/cert-manager.md)
+# or configs/jobs/cert-renewer.ncl, either of which keeps
+# `certs/app.example.com` renewed.
 #
 # The KV value is one PEM bundle: the certificate chain, then the private key.
 # Put one by hand to try this without the renewer:

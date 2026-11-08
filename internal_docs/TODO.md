@@ -511,6 +511,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#64](https://github.com/mikenomitch/legion/pull/64) | The built-in cert manager: the bundled `certs` app (ACME, private-CA, and self-signed Issuers; Certificates in KV, renewed) and `legion cert` | Plan [cert-manager-plan.md](plans/cert-manager-plan.md) SHIPPED (Phase 1); checked off and in Done, the deferrals open under Ecosystem apps |
 | [#62](https://github.com/mikenomitch/legion/pull/62) | An architecture review against best-in-class designs | Doc only: [architecture-review-2026-11-07.md](architecture-review-2026-11-07.md); its findings are open items under their areas |
 | [#58](https://github.com/mikenomitch/legion/pull/58) | Park: the workload says when it is waiting, and its node suspends it | Plan [park-plan.md](plans/park-plan.md); Phases 1–2, entries under "Park" above and in Done |
 | [#60](https://github.com/mikenomitch/legion/pull/60) | The apps substrate (A1-A6), autoscaler v2 (Phases 1-7), app actions as the viewer, and the apps hardening after adversarial security and correctness reviews | All three plans SHIPPED; their items, and both hardening passes, are checked off and in Done; the reviews' open and design-level items are under *Ecosystem apps* |
@@ -3918,9 +3919,13 @@ Still unplanned, and not covered by the plan:
       `network.ports[].tls.clients.ca = { kv }` in
       [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md) S5
       ([network-handlers.md#certificates-and-cas-from-kv](../docs/network-handlers.md#certificates-and-cas-from-kv)).
-- [ ] A built-in ACME client (answering HTTP-01 from the ingress datapath).
-      Only worth it once the cluster edge above exists. Until then, the
-      renewer job in `configs/jobs/cert-renewer.ncl` covers it.
+- [ ] Answering ACME HTTP-01 (and TLS-ALPN-01) from the ingress datapath,
+      so a port that serves a name proves it without a separate responder.
+      The ACME client itself shipped in the cert manager
+      ([cert-manager.md](../docs/cert-manager.md)), which answers HTTP-01
+      through the stateless `legion cert http01` responder
+      ([calls 3](calls/cert-manager-plan_calls.md)). Only worth it once the
+      cluster edge above exists.
 
 Credential injection: [egress-credential-injection-plan.md](plans/egress-credential-injection-plan.md)
 · calls: [egress-credential-injection-plan_calls.md](calls/egress-credential-injection-plan_calls.md)
@@ -4478,8 +4483,6 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
         a "public cert client" (Let's Encrypt by default, bring-your-own CA
         supported), leaving the "secure client" as the self-signed-CA path only
         workers hold? Or is TLS the wrong mechanism here entirely?
-- [ ] **Cert manager built in**, with public-CA routes, usable by workloads and
-      not just the control plane
 - [ ] **A join secret can still claim the name of a node that is down.** A
       live node's name is refused to a join token since 2026-10-17
       ([calls #8](calls/security-gap-closure-plan_calls.md)); a `lost` one is not, so a host that lost its
@@ -5097,7 +5100,41 @@ plan.
   - [ ] With ACLs off nothing is stamped, so two Repos that define one job
         flip it between them instead of one being refused.
 - [ ] Ingress proxy / load balancer (also listed under *Networking*)
-- [ ] Cert manager (also listed under *Auth, TLS & security*)
+- [ ] **Cert manager follow-ups.** Phase 1 shipped (see Done, Ecosystem
+      apps): [plan](plans/cert-manager-plan.md) ·
+      [calls](calls/cert-manager-plan_calls.md) ·
+      docs: [cert-manager.md](../docs/cert-manager.md). Deferred, each
+      when someone needs it:
+  - [ ] **A job panel** listing the certificates a job's ports and files
+        read, with their expiry. Needs `job:read` (or `GetKv` references)
+        in the app's grant, which today reads nothing but its own objects
+        ([calls 20](calls/cert-manager-plan_calls.md)).
+  - [ ] **More DNS-01 providers**: Route 53 (SigV4, web identity), Google
+        Cloud DNS, RFC 2136 (TSIG). Today Cloudflare and the `httpreq`
+        webhook ([calls 16](calls/cert-manager-plan_calls.md)).
+  - [ ] **A DNS-01 self-check** against the zone's authoritative
+        nameservers before asking the CA, instead of the fixed
+        `propagationDelay` ([calls 13](calls/cert-manager-plan_calls.md)).
+  - [ ] **A jobspec key that requests a certificate** for a port
+        (cert-manager's ingress-shim). Blocked on extension values carrying
+        authority the app can act for ([calls 19](calls/cert-manager-plan_calls.md)).
+  - [ ] **RSA keys** for certificates (needs a crypto backend that can
+        generate them; [calls 14](calls/cert-manager-plan_calls.md)).
+  - [ ] **ACME Renewal Information (ARI)**, so the CA can move a renewal
+        earlier (a mass revocation), and **revocation** on request.
+  - [ ] **CA rotation** for a `ca` Issuer: cross-sign, publish both in
+        `trust`, switch, drop the old one, like `legion net ca rotate`.
+  - [ ] **Per-Issuer name policy** (approver-policy): which names a
+        namespace may ask a shared CA for, beyond `namespaces`.
+  - [ ] **Replicas.** The app must run one replica; a second would issue
+        twice. A KV lease (as the autoscaler's shards use) would let a
+        standby take over.
+  - [ ] **The Certificates page filters by namespace, not by kind**: a
+        viewer with `object:read` on another app's kinds in a namespace sees
+        that namespace's certificate names and expiry (never keys).
+  - [ ] **Run it against Let's Encrypt staging** with Cloudflare DNS-01 and
+        with the HTTP-01 responder on a public node. CI uses the in-process
+        fake CA only.
 - [ ] Overlay network controller
 
 ## Plugin surface
@@ -6800,6 +6837,40 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
   - [x] Found on the way: a kind's `requires` with `job:read` recorded a
         band on the read, so the authority rule matched no read at all;
         reads carry no band now (`resolve_requirements`).
+- [x] **Cert manager built in** (2026-11-07, in flight in
+      [#64](https://github.com/mikenomitch/legion/pull/64);
+      [plan](plans/cert-manager-plan.md) ·
+      [calls](calls/cert-manager-plan_calls.md) · docs:
+      [cert-manager.md](../docs/cert-manager.md),
+      [apps.md](../docs/apps.md#bundled-and-installed-apps),
+      [guides/tls-certificates.md](../docs/guides/tls-certificates.md),
+      [agent-readiness.md](../docs/agent-readiness.md); examples in
+      `configs/certs/`). Usable by workloads, with public-CA routes; the
+      deferrals are open under Ecosystem apps.
+  - [x] The bundled `certs` app (`src/apps/certs/`,
+        `src/apps/bundled/certs.ncl`), seeded enabled on the managers, with
+        two kinds: `certs/Issuer` (cluster-scoped; `acme`, `ca`, or
+        `selfSigned`, and the `namespaces` that may use it) and
+        `certs/Certificate` (names, issuer, the KV key, duration,
+        renewBefore, key algorithm, usages, `parts`), with CEL rules and
+        `requires` of `kv` access on every key they name.
+  - [x] Its grant: its own `legion/apps/certs/*` and `kv` on `*` only
+        `via = "objects"`; every user key read or written acting for the
+        object that names it.
+  - [x] Private issuance: a `ca` Issuer generates a CA (ECDSA P-256, 10
+        years) or loads one (an intermediate under your root, self-tested),
+        and publishes its certificate to `trust`; self-signed.
+  - [x] An RFC 8555 client on `ring` and `reqwest` (ES256 JWS, badNonce
+        retry, EAB), one account per Issuer; DNS-01 through Cloudflare or an
+        `httpreq` webhook; HTTP-01 through the stateless `legion cert
+        http01` responder.
+  - [x] Renewal at two thirds of the lifetime (or `renewBefore`), on spec,
+        Issuer, or foreign-certificate changes; backoff from 5 minutes to 6
+        hours, kept in status across restarts; the old certificate keeps
+        serving while a renewal fails.
+  - [x] A Certificates page and an overview card; `legion cert renew`;
+        tests against an in-process fake ACME CA and, in
+        `tests/integration/certs.rs`, a manager with ACLs on.
 
 - [x] **App-owned object kinds, Phase O4: CEL validation `rules`**
       (2026-10-29, merged into branch `claude/app-objects`;

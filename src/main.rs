@@ -54,6 +54,7 @@ async fn main() -> R<()> {
         Some(("app", sub_matches)) => cmd::app::handle(sub_matches).await?,
         Some(("namespace", sub_matches)) => cmd::namespace::handle(sub_matches).await?,
         Some(("object", sub_matches)) => cmd::object::handle(sub_matches).await?,
+        Some(("cert", sub_matches)) => cmd::cert::handle(sub_matches).await?,
         Some(("gitops", sub_matches)) => cmd::gitops::handle(sub_matches).await?,
         Some(("template", sub_matches)) => cmd::template::handle(sub_matches).await?,
         Some(("instance", sub_matches)) => cmd::instance::handle(sub_matches).await?,

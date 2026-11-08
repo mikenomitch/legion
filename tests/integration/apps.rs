@@ -282,7 +282,11 @@ async fn seeded() -> R<(Fixture, AppReconciler)> {
     let mut reconciler = fx.reconciler(marker("0.1.0", "a"));
     assert_eq!(
         reconciler.seed()?,
-        vec!["autoscaler".to_string(), "gitops".to_string()]
+        vec![
+            "autoscaler".to_string(),
+            "certs".to_string(),
+            "gitops".to_string(),
+        ]
     );
     let outcome = reconciler.reconcile_app("autoscaler").await;
     assert!(
@@ -312,7 +316,11 @@ async fn seeding_happens_once_test() -> R<()> {
     let reconciler = fx.reconciler_seeded(marker("0.1.0", "a"), seed);
     assert_eq!(
         reconciler.seed()?,
-        vec!["autoscaler".to_string(), "gitops".to_string()]
+        vec![
+            "autoscaler".to_string(),
+            "certs".to_string(),
+            "gitops".to_string(),
+        ]
     );
     let record = fx.app("autoscaler")?;
     assert!(!record.enabled, "the seed-time override applied");
@@ -324,8 +332,9 @@ async fn seeding_happens_once_test() -> R<()> {
             .context("bundled")?
             .permissions
     );
-    // Every bundled app is seeded: the autoscaler and gitops.
-    assert_eq!(fx.events("app.installed")?.len(), 2);
+    // One per bundled app: the autoscaler, certs, and gitops.
+    let installed = legion::apps::BUNDLED.len();
+    assert_eq!(fx.events("app.installed")?.len(), installed);
 
     // An operator enables it; a later leader's seed pass, with a config
     // that still says disabled, changes nothing.
@@ -341,7 +350,7 @@ async fn seeding_happens_once_test() -> R<()> {
     let later = fx.reconciler_seeded(marker("0.1.0", "a"), seed);
     assert!(later.seed()?.is_empty());
     assert!(fx.app("autoscaler")?.enabled);
-    assert_eq!(fx.events("app.installed")?.len(), 2);
+    assert_eq!(fx.events("app.installed")?.len(), installed);
     Ok(())
 }
 
@@ -1773,6 +1782,8 @@ async fn a_record_that_does_not_decode_breaks_nothing_else_test() -> R<()> {
     )?;
     assert_eq!(fx.get_app("autoscaler").await?.status, "corrupt");
     uninstall_app(&fx, "autoscaler", false, false).await?;
+    // Only the removed record is seeded again; the other bundled apps
+    // still have theirs.
     assert_eq!(reconciler.seed()?, vec!["autoscaler".to_string()]);
     assert_eq!(fx.app("autoscaler")?.settings.replicas, 1);
     Ok(())

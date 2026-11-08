@@ -278,6 +278,24 @@ pub fn catalog() -> Vec<Capability> {
             mutates: false,
             read_only_safe: true,
         },
+        // --- Certificates (docs/cert-manager.md); certs/Issuer and
+        // certs/Certificate are objects, read and written with `object.*` ---
+        Capability {
+            name: "cert.renew",
+            cli: "legion cert renew <NAME> [-n NS] [--wait [--timeout D]]",
+            grpc: Some("Manager/ApplyObject"),
+            summary: "Re-issue a certs/Certificate now (sets its certs/renew label; the certs app issues a new certificate and key once). --wait waits for the new one.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "cert.http01",
+            cli: "legion cert http01 (--issuer ISSUER | --thumbprint T) [--listen ADDR] [--no-redirect]",
+            grpc: Some("Manager/GetObject"),
+            summary: "Serve ACME HTTP-01 challenges for an Issuer on port 80, statelessly, and redirect other requests to HTTPS: a long-running responder to run as a job. Not agent-safe: it binds a port and runs until stopped.",
+            mutates: false,
+            read_only_safe: false,
+        },
         // --- Task autoscaling (docs/autoscaling.md) ---
         Capability {
             name: "scaling.status",

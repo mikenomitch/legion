@@ -53,6 +53,10 @@ still be happy with at fifty thousand nodes.
   CI runs `legion gitops sync web --wait` to deploy now and fail on a bad
   rollout. gitops can deploy only what the Repo's author could
   ([GitOps](docs/gitops.md)).
+- **TLS certificates, built in.** A `certs/Certificate` naming a domain and
+  a KV key gets a Let's Encrypt (or private-CA) certificate there and renews
+  it before it expires; a port's `tls.cert = { kv }` serves it, and a renewal
+  swaps in without a restart ([Cert Manager](docs/cert-manager.md)).
 - **Readable job specs.** [Nickel](docs/configuration-language.md) gives you
   types, imports, and functions for DRY specs. You don't need YAML or Helm
   charts.
@@ -465,7 +469,8 @@ start:
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
   [Network Handlers](docs/network-handlers.md) ·
   [Network Plugins](docs/network-plugins.md) · [KV Store](docs/kv-store.md) ·
-  [Exec & Actions](docs/exec-and-actions.md) · [The Cluster CA](docs/cluster-ca.md)
+  [Exec & Actions](docs/exec-and-actions.md) · [The Cluster CA](docs/cluster-ca.md) ·
+  [Cert Manager](docs/cert-manager.md)
 - **Sharing a cluster:** [Namespaces](docs/namespaces.md) ·
   [Auth & ACLs](docs/auth-and-acls.md) ·
   [Workload Identity](docs/workload-identity.md)

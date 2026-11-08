@@ -128,7 +128,7 @@ fn start_with(dir: tempfile::TempDir, extra: serde_json::Value, workers: &Path) 
         "telemetry": { "enabled": false },
         "taskResourceDefaults": { "cpu": 0, "memory": 0, "allocations": 100 },
         // The bundled autoscaler is not under test here (apps.rs runs it).
-        "apps": { "autoscaler": { "enabled": false } },
+        "apps": { "autoscaler": { "enabled": false }, "certs": { "enabled": false } },
     });
     for (key, value) in extra.as_object().expect("object") {
         config[key] = value.clone();

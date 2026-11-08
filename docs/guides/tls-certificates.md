@@ -17,12 +17,16 @@ rotation:
   file. On a change the file is rewritten in place and the task is signaled
   to reload.
 
-Neither restarts anything. Legion stores and serves certificates, but it
-does not issue public ones, so renewal is a small scheduled job.
+Neither restarts anything. Getting the certificate into KV, and renewing
+it, is the bundled [cert manager](../cert-manager.md)'s job: apply a
+`certs/Certificate` naming the key, and it keeps a Let's Encrypt (or
+private-CA) certificate there. If you would rather run your own ACME
+client, a small scheduled job does it ([below](#renew-it-yourself)).
 
 Runnable specs:
-[`configs/jobs/cert-renewer.ncl`](../../configs/jobs/cert-renewer.ncl) and
-[`configs/jobs/tls-edge.ncl`](../../configs/jobs/tls-edge.ncl).
+[`configs/certs/`](../../configs/certs),
+[`configs/jobs/tls-edge.ncl`](../../configs/jobs/tls-edge.ncl), and
+[`configs/jobs/cert-renewer.ncl`](../../configs/jobs/cert-renewer.ncl).
 
 ## The format
 
@@ -34,7 +38,19 @@ certificate with an old key.
 legion kv put certs/app.example.com "$(cat fullchain.pem privkey.pem)"
 ```
 
-That is all you need to try either consumer below without the renewer.
+That is all you need to try either consumer below without the cert
+manager. With it, a Certificate puts the certificate there for you:
+
+```nickel
+{
+  kind = "certs/Certificate",
+  name = "app",
+  namespace = "default",
+  spec = { issuer = "letsencrypt", dnsNames = ["app.example.com"], kv = "certs/app.example.com" },
+}
+```
+
+([Cert Manager](../cert-manager.md) sets up the `letsencrypt` Issuer.)
 
 ## Serve it from the node
 
@@ -90,7 +106,16 @@ without dropping connections. `splay` spreads the reloads across a fleet.
 
 ## Renew it
 
-`cert-renewer.ncl` is a batch task that runs every 12 hours:
+The cert manager renews a Certificate two thirds of the way through its
+life, writes the new bundle in one put, and both consumers above pick it up.
+A failed renewal keeps the current certificate and retries with backoff;
+`legion object get certificate app` says why, and `legion cert renew app`
+renews now. See [Cert Manager](../cert-manager.md).
+
+### Renew it yourself
+
+To run your own ACME client instead, `cert-renewer.ncl` is a batch task that
+runs every 12 hours:
 
 1. It reads the current certificate from KV and exits if it is good for more
    than 30 days.
@@ -139,8 +164,8 @@ handshakes, and the doctor shows the `legion kv put` that fixes it.
   [KV Encryption at Rest](../kv-encryption.md)). Prefer the node route
   (`ports[].tls.cert = { kv }`) where you can. It keeps the key in KV and in node
   memory only.
-- There is no built-in ACME client. The renewer is a regular job you can
-  read and change.
+- The cert manager issues ECDSA keys only; an RSA certificate has to come
+  from your own ACME client (the renewer job) or CA.
 
 Reference: [Certificates and CAs from KV](../network-handlers.md#certificates-and-cas-from-kv)
 and [Live file updates](../kv-store.md#live-file-updates).

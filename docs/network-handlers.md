@@ -962,7 +962,11 @@ legion kv put certs/admin-clients "$(cat clients-ca.pem)"
   its `netd_state.json`. After a worker restart it fetches it again on its
   first heartbeat.
 
-To renew automatically, run a scheduled batch job that puts the new bundle.
+To get and renew certificates automatically, apply a `certs/Certificate`
+naming the key: the bundled [cert manager](cert-manager.md) issues it (from
+Let's Encrypt, a private CA, or self-signed), writes it to the key in this
+format, and renews it before it expires. To run your own ACME client instead,
+use a scheduled batch job that puts the new bundle:
 [`configs/jobs/cert-renewer.ncl`](../configs/jobs/cert-renewer.ncl) does it
 with lego and DNS-01, and
 [`configs/jobs/tls-edge.ncl`](../configs/jobs/tls-edge.ncl) serves the result.
@@ -971,7 +975,7 @@ a file with `onChange = "update"` instead
 ([Live file updates](kv-store.md#live-file-updates)).
 
 Limits: a renewal reaches the node on its next heartbeat, so expect up to
-one heartbeat interval of delay. Legion does not run an ACME client itself.
+one heartbeat interval of delay.
 
 **Doctor.** `legion net doctor` reports `tls` as a layer. It flags files
 that do not parse, a KV value that was rejected (naming the key and the
@@ -2044,8 +2048,9 @@ This section lists what that covers and what it does not.
 - **TLS**: a port terminates TLS (mutual with `clients`) with your files or
   a certificate held in KV (swapped live on renewal), and a mesh service's
   port with the node certificate.
-  Legion stores and serves certificates but does not issue public ones: a
-  renewal job (or any ACME client) writes them to KV. The mesh is node-to-node mTLS with attributed
+  The bundled [cert manager](cert-manager.md) issues and renews certificates
+  into KV (Let's Encrypt, a private CA, or self-signed); a renewal job of
+  your own, or any ACME client, can write them there instead. The mesh is node-to-node mTLS with attributed
   workload identity, never per-workload certificates. There is no kTLS fast
   path (a TLS connection, mesh hops included, is copied in user space rather
   than spliced), no revocation

@@ -1,6 +1,12 @@
 # Certificate renewer: keeps a Let's Encrypt certificate for one domain in
 # Legion KV, and renews it before it expires.
 #
+# Most clusters do not need this job: the bundled cert manager does the same
+# for any number of domains, with status and backoff (docs/cert-manager.md;
+# configs/certs/). This is the bring-your-own-ACME-client version, for when
+# you want lego (an RSA key, a DNS provider the cert manager has no built-in
+# support for, or a client you can read and change).
+#
 # What it does, every 12 hours:
 #   1. Reads the current certificate from KV and exits if it is still good
 #      for more than 30 days. Most runs stop here.

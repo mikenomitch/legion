@@ -287,7 +287,7 @@ impl Cluster {
             // Nothing else: no controlPlaneBindings, no policy for the job.
             "workloadIdentity": { "enabled": true },
             // The bundled autoscaler is not under test here (apps.rs runs it).
-            "apps": { "autoscaler": { "enabled": false } },
+            "apps": { "autoscaler": { "enabled": false }, "certs": { "enabled": false } },
         });
         let config_path = dir.path().join("manager.json");
         std::fs::write(&config_path, config.to_string()).expect("write config");
