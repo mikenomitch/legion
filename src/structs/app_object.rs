@@ -90,6 +90,7 @@ pub const RESERVED_KIND_NOUNS: &[&str] = &[
     "capability",
     "cert",
     "checkpoint",
+    "device",
     "doc",
     "eval",
     "evaluation",
