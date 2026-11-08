@@ -92,7 +92,8 @@ cluster also seeds and runs the bundled autoscaler on its system worker,
 holding a port from the worker's range; a test that does not exercise it
 turns it off with `"apps": { "autoscaler": { "enabled": false } }` in the
 manager config. Every cluster in the binary hands out the same dynamic
-ports (from 20000), so a test that binds one, or runs a task that does,
+ports (task ports from 20000, the datapath's own from 61000), so a test that
+binds one, or runs a task that does,
 holds `crate::support::DYNAMIC_PORT_GATE`.
 
 ### Notable integration tests

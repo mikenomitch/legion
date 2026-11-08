@@ -609,12 +609,13 @@ to its macOS ones. In that block:
   declaration order. Each listens on the upstream's **canonical port**,
   which is the first of these that applies: a pinned `port`, the port the
   service declared on its own task (`network.ports[].to`, or its static
-  port), an external target's port, or a port from the dynamic range.
+  port), an external target's port, or a port from the datapath's range
+  (`61000–65535`).
   `db.svc.legion:5432` works because the `db` service declared 5432.
 
 The VIP is the upstream's address: `LEGION_UPSTREAM_<KEY>` is
 `<vip>:<canonical port>`, and the upstream takes no port from the node's
-dynamic range. A pinned `port` also binds `127.0.0.1:<port>` (the same
+port ranges. A pinned `port` also binds `127.0.0.1:<port>` (the same
 listener), for a config file that wants a literal loopback address. A
 sandbox's upstreams keep a loopback port too, because the guest's relay is
 keyed by it.
@@ -655,7 +656,8 @@ A node whose `resolv.conf` names no nameserver answers every name outside
 starts. No query goes to a public resolver the operator did not name.
 
 **macOS** configures only `127.0.0.1` on `lo0`, so no VIP block is assigned
-there. Each upstream gets a loopback port from the dynamic range, which is
+there. Each upstream gets a loopback port from the datapath's range
+(`61000–65535`), which is
 what `LEGION_UPSTREAM_<KEY>` names, and there is no per-allocation resolver.
 The same applies on a Linux node that has run out of VIP blocks.
 
