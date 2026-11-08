@@ -906,6 +906,104 @@ mod work_log_test {
         assert!(!log.check_heartbeat("n1", &agree).via_stream);
     }
 
+    /// ST3: a stream from another epoch whose revision the journal covers
+    /// resumes with just what changed, and the log then holds the node's
+    /// whole set (payloads it did not resend are loaded on demand).
+    #[test]
+    fn a_stream_from_another_epoch_resumes_with_only_the_changes() {
+        let log = WorkLog::new();
+        log.note_changes([("n1", 9)]);
+        let attached = log.attach_resuming("n1", 12345, 40, || {
+            Some(("r7".to_string(), BTreeSet::from([2, 5])))
+        });
+        assert!(attached.replay.is_empty());
+        // A change noted after the attach rides the same resume.
+        log.note_changes([("n1", 6)]);
+        WorkLog::note_revision(&attached.log, "r8".into());
+        let PendingWork::Resume { from, changed } =
+            WorkLog::take_pending(&attached.log, attached.session)
+        else {
+            panic!("a resume is pending");
+        };
+        assert_eq!(from, "r7");
+        assert_eq!(changed.into_iter().collect::<Vec<_>>(), vec![2, 5, 6]);
+
+        // 2 and 6 are still desired, 5 left; 1 and 3 were held all along.
+        let message = log.commit_resume(
+            &attached.log,
+            from,
+            vec![payload(2), payload(6)],
+            vec![StopNotice {
+                allocation_id: 5,
+                ..Default::default()
+            }],
+            BTreeSet::from([1, 2, 3, 6]),
+            Vec::new(),
+        );
+        assert!(!message.resync);
+        assert_eq!(message.resumed_from, "r7");
+        assert_eq!(message.revision, "r8");
+        assert_eq!(message.digest, WorkDigest::of([1, 2, 3, 6]).render());
+        assert!(WorkLog::holds(&attached.log, 1), "held, payload not loaded");
+        assert!(!WorkLog::holds(&attached.log, 5));
+
+        // The heartbeat's feeds load what the resume did not resend, once.
+        let mut loads = Vec::new();
+        let held = log.held_payloads(
+            "n1",
+            |_| true,
+            |missing| {
+                loads.push(missing.to_vec());
+                missing.iter().map(|id| payload(*id)).collect()
+            },
+        );
+        assert_eq!(loads, vec![vec![1, 3]]);
+        assert_eq!(held.len(), 4);
+        let again = log.held_payloads("n1", |_| true, |_| panic!("already loaded"));
+        assert_eq!(again.len(), 4);
+
+        // Deltas continue from there: a stop of an unloaded allocation moves
+        // the digest like any other.
+        let next = log
+            .commit_message(
+                &attached.log,
+                false,
+                Vec::new(),
+                vec![StopNotice {
+                    allocation_id: 3,
+                    ..Default::default()
+                }],
+                Vec::new(),
+            )
+            .expect("a stop");
+        assert_eq!(next.digest, WorkDigest::of([1, 2, 6]).render());
+        assert_eq!(next.seq, message.seq + 1);
+    }
+
+    #[test]
+    fn a_resume_the_journal_cannot_serve_resyncs() {
+        let log = WorkLog::new();
+        let attached = log.attach_resuming("n1", 12345, 3, || None);
+        assert!(matches!(
+            WorkLog::take_pending(&attached.log, attached.session),
+            PendingWork::Resync
+        ));
+        // Same epoch: replay wins and the resume is never asked.
+        let _ = log.commit_message(
+            &attached.log,
+            true,
+            vec![payload(1)],
+            Vec::new(),
+            Vec::new(),
+        );
+        let again = log.attach_resuming("n1", log.epoch(), 1, || panic!("not asked"));
+        assert!(again.replay.is_empty());
+        assert!(matches!(
+            WorkLog::take_pending(&again.log, again.session),
+            PendingWork::Nothing
+        ));
+    }
+
     fn request(snapshot_id: &str, op: &str) -> CheckpointRequest {
         CheckpointRequest {
             snapshot_id: snapshot_id.into(),

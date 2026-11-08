@@ -1350,6 +1350,16 @@ impl MultiRaftDriver {
         }
     }
 
+    /// [`Self::read_barrier`] on every active group: one under `single`
+    /// topology, three under `lanes`.
+    pub(crate) fn read_barrier_all(&self) -> R<()> {
+        let lanes: Vec<Lane> = self.engine()?.lanes.keys().copied().collect();
+        for lane in lanes {
+            self.read_barrier(lane)?;
+        }
+        Ok(())
+    }
+
     /// A (lazily connected) channel to a peer manager's listener from the
     /// engine's shared pool. `None` before the engine starts or for a
     /// malformed address. Call inside a tokio runtime: building the channel

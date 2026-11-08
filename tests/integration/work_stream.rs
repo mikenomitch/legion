@@ -18,8 +18,9 @@
 //!   carries no desired set, a digest disagreement queues one resync, and a
 //!   worker that does not stream keeps the full desired set;
 //! - a leader kill: streams attached to a surviving manager carry on
-//!   without a resync, a worker whose manager died resyncs once on another,
-//!   and no allocation is lost or duplicated;
+//!   without a resync, a worker whose manager died resumes on another from
+//!   its revision with only what changed meanwhile (no full resync), and no
+//!   allocation is lost or duplicated;
 //! - creating or mounting a job-level volume claim re-sends the job's
 //!   allocations, inside a raft apply, without failing it;
 //! - checkpoint work (a suspend's capture, the reclaim after a resume) is
@@ -208,9 +209,34 @@ impl Probe {
 
     fn open_with(
         rt: &tokio::runtime::Runtime,
+        client: ManagerClient<Channel>,
+        node_id: &str,
+        last: (u64, u64),
+        auto_ack: bool,
+    ) -> R<Probe> {
+        Self::open_inner(rt, client, node_id, last, "", auto_ack)
+    }
+
+    /// Open naming the revision of the last message applied, as a worker
+    /// whose stream dropped does (revisions-and-watches plan §7).
+    fn open_resuming(
+        rt: &tokio::runtime::Runtime,
+        addr: SocketAddr,
+        node_id: &str,
+        last: (u64, u64),
+        revision: &str,
+        auto_ack: bool,
+    ) -> R<Probe> {
+        let client = rt.block_on(ManagerClient::connect(format!("http://{addr}")))?;
+        Self::open_inner(rt, client, node_id, last, revision, auto_ack)
+    }
+
+    fn open_inner(
+        rt: &tokio::runtime::Runtime,
         mut client: ManagerClient<Channel>,
         node_id: &str,
         last: (u64, u64),
+        revision: &str,
         auto_ack: bool,
     ) -> R<Probe> {
         let (requests, rx) = tokio::sync::mpsc::channel::<StreamWorkRequest>(64);
@@ -219,6 +245,7 @@ impl Probe {
                 node_id: node_id.to_string(),
                 last_epoch: last.0,
                 last_seq: last.1,
+                last_revision: revision.to_string(),
             })),
         }))?;
         let mut inbound = rt
@@ -753,10 +780,12 @@ fn mirrored(mirrors: &BTreeMap<&str, WorkMirror>) -> BTreeMap<String, BTreeSet<i
 /// from, fed by the changeset projection every replica runs. So killing the
 /// leader disturbs only the streams attached to it: a worker streaming from
 /// a surviving manager keeps its position (no resync, no gap), and a worker
-/// whose manager died reconnects elsewhere and resyncs exactly once. No
+/// whose manager died reconnects elsewhere and resumes from the revision of
+/// the last message it applied: one message with what changed on its node
+/// meanwhile, never its whole set (ST3, revisions-and-watches plan §7). No
 /// allocation is lost or delivered twice.
 #[test]
-fn a_leader_kill_resyncs_only_the_workers_that_lost_their_manager() -> R<()> {
+fn a_leader_kill_resumes_the_workers_that_lost_their_manager() -> R<()> {
     let dir = tempfile::tempdir()?;
     let a = raft_manager(dir.path(), "mgr-a", true, None)?;
     let (token, _) = a.store().issue_raft_join_token("test")?;
@@ -847,15 +876,47 @@ fn a_leader_kill_resyncs_only_the_workers_that_lost_their_manager() -> R<()> {
     eprintln!("killed {killed}; new leader {}", managers[new_leader].name);
     probes.remove("w-2").expect("w-2").close();
     mirrors.get_mut("w-2").expect("w-2").mark_down();
+    let w2_revision = mirrors["w-2"].revision().to_string();
+    assert!(!w2_revision.is_empty(), "every message carries a revision");
 
-    // w-2 reconnects to the survivor with its old position: another epoch.
-    let probe = Probe::open(&rt, managers[survivor].addr(), "w-2", w2_position, true)?;
-    probes.insert("w-2", probe);
-
-    // Work placed after the failover reaches both workers.
+    // Work placed while w-2 is disconnected, after the failover.
     create_and_place(managers[new_leader].store(), 2)?;
     let after = placed(managers[new_leader].store());
     assert_eq!(after.values().map(BTreeSet::len).sum::<usize>(), 6);
+    wait_for(Duration::from_secs(30), "the survivor applied them", || {
+        placed(managers[survivor].store()) == after
+    });
+
+    // w-2 reconnects to the survivor: another epoch, but its revision is
+    // inside the survivor's journal, so it resumes instead of resyncing.
+    let probe = Probe::open_resuming(
+        &rt,
+        managers[survivor].addr(),
+        "w-2",
+        w2_position,
+        &w2_revision,
+        true,
+    )?;
+    let opening = probe.expect("the resume");
+    assert!(!opening.resync, "a resume, not a full resync: {opening:?}");
+    assert_eq!(opening.resumed_from, w2_revision);
+    let before_w2 = &before["w-2"];
+    let resent = upsert_ids(&opening);
+    assert!(
+        resent.iter().all(|id| !before_w2.contains(id)),
+        "only what changed is resent: {resent:?} (held {before_w2:?})"
+    );
+    assert_eq!(
+        resent,
+        after["w-2"]
+            .difference(before_w2)
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        "every allocation placed on w-2 while it was away"
+    );
+    mirrors.get_mut("w-2").expect("w-2").apply(&opening);
+    probes.insert("w-2", probe);
+
     wait_for(Duration::from_secs(30), "both streams converge", || {
         drain(&probes, &mut mirrors, &mut resyncs);
         mirrored(&mirrors) == after
@@ -868,8 +929,8 @@ fn a_leader_kill_resyncs_only_the_workers_that_lost_their_manager() -> R<()> {
         "a stream on a surviving manager never resyncs"
     );
     assert_eq!(
-        resyncs["w-2"], 1,
-        "a worker whose manager died resyncs exactly once"
+        resyncs["w-2"], 0,
+        "a worker whose manager died resumes on a survivor without a resync"
     );
     for (_, probe) in probes {
         probe.close();

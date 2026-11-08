@@ -267,3 +267,7 @@ matters to a cursor: they never go backwards across a failover. See
   (their `--json` shape is a bare list); the RPCs do.
 - In `local_disk` mode, an instance-only change (no allocation row moved)
   does not wake a blocking `ListInstances`.
+- Under `topology = "lanes"`, a linearizable read confirms leadership on all
+  three groups, so it needs one manager to lead them all (lane convergence
+  normally keeps them together). While leadership is split, it fails with
+  the not-the-leader rejection after one forward.

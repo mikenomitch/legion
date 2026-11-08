@@ -166,9 +166,10 @@ impl Store {
     /// leader, confirm leadership with a quorum and wait until everything
     /// committed before now has applied here; on a follower, the typed
     /// not-the-leader error (which the leader-forward layer replays on the
-    /// leader). Every lane's group is checked, since a job read spans all
-    /// three. A no-op outside raft mode, where this manager is the only
-    /// writer. Blocking: call it off the async runtime.
+    /// leader). Every active group is checked (one under `single`, three
+    /// under `lanes`), since a job read spans all three lanes. A no-op
+    /// outside raft mode, where this manager is the only writer. Blocking:
+    /// call it off the async runtime.
     pub fn linearizable_read_barrier(&self) -> R<()> {
         let Some(driver) = self
             .persistence_driver
@@ -177,10 +178,7 @@ impl Store {
         else {
             return Ok(());
         };
-        for lane in Lane::ALL {
-            driver.read_barrier(lane)?;
-        }
-        Ok(())
+        driver.read_barrier_all()
     }
 
     /// The latest spec version of `job_id` (`job_config.version`), or 0 when
@@ -541,5 +539,161 @@ impl Store {
             Self::raise_event_id_floor(id);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod revision_ops_test {
+    use super::*;
+    use crate::storage::revisions::ChangeKind;
+    use crate::structs::{KvValueType, ManagerConfigFull};
+
+    fn store() -> R<Store> {
+        let dir = tempfile::Builder::new()
+            .prefix("legion-revision-ops-")
+            .tempdir_in(crate::test_scratch::root())?
+            .keep();
+        Store::start_storage(&ManagerConfigFull {
+            store_path: dir.to_str().context("store path")?.to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn job(name: &str, count: u32) -> JobConfig {
+        JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(count),
+                ..TaskConfig::new("web", "noop")
+            }],
+            version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
+        }
+    }
+
+    fn sub() -> Vec<Submission> {
+        vec![Submission {
+            path: "job.ncl".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }]
+    }
+
+    #[test]
+    fn local_writes_move_the_revision_and_land_in_the_journal() -> R<()> {
+        let store = store()?;
+        let before = store.current_revision()?;
+        store.put_kv("app/a", "1", KvValueType::String, None, None)?;
+        let after_kv = store.current_revision()?;
+        assert!(after_kv.covers(&before) && after_kv != before);
+        store.handle_job_submit(&job("web", 1), &sub())?;
+        let after_job = store.current_revision()?;
+        assert!(after_job.covers(&after_kv) && after_job != after_kv);
+
+        let batch = store
+            .revisions()
+            .changes_since(&before, &[0, 1, 2])
+            .expect("inside the window");
+        let kinds: Vec<(ChangeKind, String)> = batch
+            .changes
+            .iter()
+            .map(|change| (change.change.kind, change.change.key.clone()))
+            .collect();
+        assert!(
+            kinds.contains(&(ChangeKind::Kv, "app/a".into())),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&(ChangeKind::Job, "web".into())),
+            "{kinds:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_local_revision_survives_a_restart() -> R<()> {
+        let dir = tempfile::Builder::new()
+            .prefix("legion-revision-restart-")
+            .tempdir_in(crate::test_scratch::root())?
+            .keep();
+        let config = ManagerConfigFull {
+            store_path: dir.to_str().context("store path")?.to_string(),
+            ..Default::default()
+        };
+        let reached = {
+            let store = Store::start_storage(&config)?;
+            store.put_kv("k", "1", KvValueType::String, None, None)?;
+            store.put_kv("k", "2", KvValueType::String, None, None)?;
+            store.current_revision()?
+        };
+        let reopened = Store::start_storage(&config)?;
+        let after = reopened.current_revision()?;
+        assert!(after.covers(&reached), "{reached} -> {after}");
+        // Nothing before the restart can be served from the new journal.
+        assert!(reopened
+            .revisions()
+            .changes_since(&Revision::single(0), &[0])
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn submit_compare_and_set_checks_the_latest_version() -> R<()> {
+        let store = store()?;
+        store.handle_job_submit_checked(&job("cas", 1), &sub(), None, "me", None, Some(0))?;
+        assert_eq!(store.latest_job_version("cas")?, 1);
+        let lost = store
+            .handle_job_submit_checked(&job("cas", 2), &sub(), None, "me", None, Some(0))
+            .expect_err("exists");
+        assert!(
+            matches!(
+                StorageError::from_anyhow(&lost),
+                Some(StorageError::Aborted { .. })
+            ),
+            "{lost:#}"
+        );
+        store.handle_job_submit_checked(&job("cas", 2), &sub(), None, "me", None, Some(1))?;
+        assert_eq!(store.latest_job_version("cas")?, 2);
+        assert_eq!(store.get_job("cas")?.version, 2);
+        let stale = store
+            .handle_job_submit_checked(&job("cas", 3), &sub(), None, "me", None, Some(1))
+            .expect_err("stale");
+        assert!(
+            format!("{stale:#}").contains("is at version 2, not 1"),
+            "{stale:#}"
+        );
+        assert_eq!(store.latest_job_version("cas")?, 2, "nothing was written");
+        Ok(())
+    }
+
+    /// The floor is process-wide, shared by every test in this binary, so
+    /// this moves it only a few ids ahead for a real lane (other tests rely
+    /// on ids following the clock), and checks the big jump on residue 7,
+    /// which no lane mints with.
+    #[test]
+    fn a_committed_event_id_raises_the_minting_floor() {
+        use std::sync::atomic::Ordering;
+        let unused = 7usize;
+        let far = (1i64 << 60) + unused as i64;
+        Store::raise_event_id_floor(far);
+        assert!(super::EVENT_ID_HIGH_WATER[unused].load(Ordering::Relaxed) >= far);
+        Store::raise_event_id_floor(far - Lane::ID_STRIDE);
+        assert!(
+            super::EVENT_ID_HIGH_WATER[unused].load(Ordering::Relaxed) >= far,
+            "the floor never goes down"
+        );
+
+        let ahead = Store::next_scheduler_event_id() + 3 * Lane::ID_STRIDE;
+        Store::raise_event_id_floor(ahead);
+        let next = Store::next_scheduler_event_id();
+        assert!(next > ahead, "{next} must sort above the committed {ahead}");
+        assert_eq!(
+            next.rem_euclid(Lane::ID_STRIDE),
+            ahead.rem_euclid(Lane::ID_STRIDE)
+        );
     }
 }

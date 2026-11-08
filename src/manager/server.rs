@@ -149,6 +149,8 @@ mod suspend_rpcs;
 // `PlanJobReply.diff` (revisions-and-watches plan §9).
 mod plan_diff;
 // Blocking reads and `Manager.Watch` (revisions-and-watches plan).
+#[cfg(test)]
+mod revision_rpcs_test;
 mod watch_rpcs;
 mod work_stream;
 pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};

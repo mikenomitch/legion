@@ -300,7 +300,9 @@ impl ManagerDaemonService {
                 identity,
                 filter,
                 floor,
-                position: floor.max(&start.recorded),
+                // Only what has been sent may be claimed: the backlog moves
+                // it past `floor` once delivered.
+                position: floor,
                 allowed_jobs: HashMap::new(),
             };
             // The opening progress event says where the stream starts.
@@ -312,6 +314,7 @@ impl ManagerDaemonService {
             if !watch.deliver(&tx, start.changes).await {
                 return;
             }
+            watch.position = watch.position.max(&start.recorded);
             let mut idle_until = tokio::time::Instant::now() + WATCH_PROGRESS;
             loop {
                 tokio::select! {
@@ -321,7 +324,8 @@ impl ManagerDaemonService {
                         }
                     }
                     _ = tokio::time::sleep_until(idle_until) => {
-                        watch.position = watch.position.max(&hub.recorded());
+                        // The position as of the last drain: anything recorded
+                        // since is not sent yet, so it must not be claimed.
                         if tx.send(Ok(watch.progress())).await.is_err() {
                             break;
                         }

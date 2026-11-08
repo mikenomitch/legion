@@ -394,8 +394,17 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_info",
-            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`), and `deadline` (Unix seconds, 0 for none) when its `placementTimeout` fails the job if it is still short. A gang job with status `failed` (timed out, or failed by its `onMemberLoss`) places nothing until it is run again (docs/gang-scheduling.md). With `scale:read`, `scalingInputs` adds one entry per task with request vs usage, cluster-wide: ready/placed/desired/unplaced replicas, measured CPU (MHz, utilization against the reservation, per-replica histogram) and memory, requests per second, error ratio, and latency into a service the task backs (internal callers only), whether a rollout is active, and `freshness.state` (`current`, `missing`, `resyncing`; act only on `current`) (docs/autoscaling.md, \"Scaling inputs\").",
-            input_schema: name_arg_schema,
+            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`), and `deadline` (Unix seconds, 0 for none) when its `placementTimeout` fails the job if it is still short. A gang job with status `failed` (timed out, or failed by its `onMemberLoss`) places nothing until it is run again (docs/gang-scheduling.md). With `scale:read`, `scalingInputs` adds one entry per task with request vs usage, cluster-wide: ready/placed/desired/unplaced replicas, measured CPU (MHz, utilization against the reservation, per-replica histogram) and memory, requests per second, error ratio, and latency into a service the task backs (internal callers only), whether a rollout is active, and `freshness.state` (`current`, `missing`, `resyncing`; act only on `current`) (docs/autoscaling.md, \"Scaling inputs\"). The reply carries `revision` (and the job's spec `version`): pass it back as `min_revision` to wait, up to `wait_seconds` (default and max 300), until the job changes after it (a blocking query; docs/watches-and-blocking-queries.md).",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Job name." },
+                    "min_revision": { "type": "string", "description": "Wait until the job (its row, versions, allocations, or task outcomes) changes after this revision (a `revision` from an earlier reply), then answer." },
+                    "wait_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "How long `min_revision` waits (default and max 300). On timeout the current state is returned; compare `revision` to tell." }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
             mutates: false,
         },
         ToolDef {
@@ -1961,8 +1970,24 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_job_info" => {
             let name = job_arg(&args, "name")?;
             let mut client = connect().await?;
-            let mut reply =
-                grpc(client.get_job_info(GetJobInfoRequest { name: name.clone() })).await?;
+            let mut request = tonic::Request::new(GetJobInfoRequest { name: name.clone() });
+            // A blocking query (revisions-and-watches plan §2).
+            if let Some(revision) = opt_str_arg(&args, "min_revision") {
+                let metadata = request.metadata_mut();
+                metadata.insert(
+                    crate::manager::server::MIN_REVISION_HEADER,
+                    revision
+                        .parse()
+                        .map_err(|_| format!("min_revision {revision:?} is not a revision"))?,
+                );
+                if let Some(wait) = args.get("wait_seconds").and_then(Value::as_u64) {
+                    metadata.insert(
+                        crate::manager::server::WAIT_HEADER,
+                        wait.to_string().parse().expect("digits are ascii"),
+                    );
+                }
+            }
+            let mut reply = grpc(client.get_job_info(request)).await?;
             // Request vs usage, as `legion job info` shows it; left out when
             // the caller lacks `scale:read` (docs/autoscaling.md).
             if let (Some(object), Some(usage)) = (

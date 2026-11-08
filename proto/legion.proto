@@ -18604,7 +18604,11 @@ message WatchChange {
   // fields below are unset.
   bool deleted = 7;
 
-  // The revision of the newest change to this object in this message.
+  // Where the newest change to this object in this message committed: the
+  // raft index of the group it committed in, written as a revision with only
+  // that group's component set (under `single` and `local_disk`, just the
+  // index). For ordering and display; resume from `WatchEvent.revision`,
+  // never from this.
   string revision = 8;
 
   // Jobs: the job as `GetJobInfo` reads it when the message is sent
