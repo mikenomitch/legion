@@ -14204,6 +14204,7 @@ fn apply_move_verdict(
                 *move_count,
                 *move_period_secs,
                 reason,
+                None,
             );
             // A gang already failed its job and stopped every member
             // (`Store::gang_member_lost`).
@@ -14239,6 +14240,36 @@ fn apply_move_verdict(
                 moves,
                 reason = %reason,
                 "Move limit exceeded; marking job failed"
+            );
+        }
+        // A keyed instance spent its own budget: the removal op already
+        // stopped it. The job, its task status, and its other instances
+        // are untouched.
+        MoveVerdict::InstanceStopped {
+            instance_id,
+            task_name,
+            moves,
+            move_count,
+            move_period_secs,
+            reason,
+        } => {
+            store.events().allocation_reschedule_exhausted(
+                allocation,
+                task_name,
+                *moves,
+                *move_count,
+                *move_period_secs,
+                reason,
+                Some(instance_id),
+            );
+            warn!(
+                allocation_id = allocation.id,
+                job_id = %allocation.job_id,
+                instance_id = %instance_id,
+                task = %task_name,
+                moves,
+                reason = %reason,
+                "Move limit exceeded; stopping the keyed instance"
             );
         }
     }

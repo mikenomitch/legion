@@ -386,10 +386,41 @@ staging failed: http://169.254.169.254/latest/meta-data/: the host guard refuses
 
 To serve artifacts from the node itself (a dev setup on `localhost`), add an
 allow entry for that port to the worker type's `hostGuard.allow`.
-An `s3://` source's `endpoint` is judged the same way before the fetch, but
-the S3 client resolves it again, so the check is not pinned to the address
-it judged. **Git and OCI fetches are not checked.** A `git::` or `oci://`
-source on an internal address is fetched and staged like any other.
+
+Every other scheme is checked too, as far as its client lets the worker
+hold it to what was judged:
+
+| Source | What is judged | Held to it? |
+| --- | --- | --- |
+| `http(s)://` | every hop's host | Yes: each hop is pinned to the judged addresses, and each redirect is judged again |
+| `git::https://`, `git::http://` | the remote's host | Yes: git is pinned to the judged addresses (`http.curloptResolve`, git 2.37 or later) and may not follow redirects (`http.followRedirects=false`) |
+| `git::ssh://` | the remote's host | Yes: ssh connects to the first judged address and checks the host key under the remote's name |
+| `git::git://` | — | Refused on a guarded worker: nothing can pin it. Use `https://` or `ssh://` |
+| `git::file://` | — | No network |
+| `oci://` | the registry's host | No: the registry client resolves the name again, and follows a blob's or token's redirect on its own |
+| `s3://` | the custom endpoint: the `endpoint` query parameter, else the one the KV credential names | No: the S3 client resolves it again and follows redirects |
+
+A guarded `git` fetch also sets `GIT_LFS_SKIP_SMUDGE=1`: a repository's own
+`.lfsconfig` names the LFS host, which nobody judged, so LFS files stage as
+their pointer files. An older git fails the fetch rather than resolving the
+host again unjudged:
+
+```console
+staging failed: git::https://git.internal/acme/tools: this node's git cannot pin a fetch to the addresses the host guard judged (that needs git 2.37 or later); upgrade git
+```
+
+An `s3://` source's `region` (the query parameter or the credential's) must
+be lowercase letters, digits, and hyphens, because it becomes part of the
+default AWS endpoint's host name.
+
+**What is not held.** An `oci://` registry and an `s3://` endpoint are judged
+before the fetch, but their clients resolve the name again and follow
+redirects, and neither the second lookup nor a redirect's target is judged.
+For OCI, every blob is checked against the manifest's digest, so a redirect
+cannot put anything but the image's own bytes in the task directory. An S3
+endpoint that passes the check and answers with a redirect to a guarded
+address is followed. The tag and branch lookups the manager makes at submit
+(`resolve = "pin"`, below) run on the manager, which has no host guard.
 ## Pinning: `resolve = "pin"` vs `'always'`
 
 Mutable references (OCI tags and git branches or tags) default to
@@ -558,9 +589,15 @@ that changed two of thirty shards downloads two. The copy is a local,
 in-kernel copy (a reflink on filesystems that offer one), so a task can
 write to its layer files without changing what the next allocation gets; on
 the first pull the layer is downloaded once and a copy kept. The manifest is
-still read from the registry on every stage, so a tag that moved is noticed.
-The worker logs `ORAS layers ready (node content store)` with
-`layers_cached` and `layers_pulled`.
+still read from the registry on every stage, with the job's credential, so a
+tag that moved is noticed and a credential the registry refuses fails the
+stage. A layer is served from the store only to a pull from the repository
+it was downloaded and verified in, as for a cached image (see [Who a cached
+image is served to](#who-a-cached-image-is-served-to)): a manifest in
+another repository that lists the same digest gets its layers from its own
+registry, never the node's copy. The worker logs
+`ORAS layers ready (node content store)` with `layers_cached` and
+`layers_pulled`.
 
 Tasks always get their own copy. A task that writes to its staged file cannot
 change what the next allocation receives. A blob that fails digest
@@ -860,8 +897,11 @@ submission):
 So every node that may restore a snapshot needs the same `contentStore` (url
 and auth) as the node that published it. A node reads only its own store, so
 a snapshot published to one region's bucket cannot be restored on a node
-configured for another region's bucket. Constrain the resume to the
-publishing region instead.
+configured for another region's bucket. The scheduler prefers a node whose
+`contentStore` holds every part: each worker advertises its store's URL as
+the `contentStore` node attribute. It falls back to the other candidates
+only when no such node is eligible, so constrain the resume to the
+publishing region when those others cannot read the store.
 
 A malformed `contentStore` (an unsupported scheme, a bucket-less URL, `auth`
 on a `file://` store) fails manager startup. A worker whose content store is
@@ -981,6 +1021,43 @@ is downloaded: with it on or off, the worker pulls through the
 layer once and a tag costs one `HEAD` request per start (Apple `container`
 pulls for itself when the flag is off). What the flag adds is the artifact
 pipeline's auth matchers, digest pinning, and status rows.
+
+### Who a cached image is served to
+
+The node content store is shared by every job on the node, and a cached blob
+says nothing about who may read it. So the worker records, for each image,
+the repository (`registry/repo`) it pulled and verified it from, and whether
+that registry served it with no credential. A pull is served from the cache
+only when:
+
+- the image came from **this same repository** (another registry answering
+  for the same digest proves nothing), and
+- it was **public** there, or the registry **accepts this job's credential**
+  for it: a successful lookup of the tag or the digest with that credential
+  in the last 10 minutes, or one manifest `HEAD` by digest now.
+
+A registry that refuses the job's credential fails the pull, with the cache
+never consulted:
+
+```console
+staging failed: oci://ghcr.io/acme/api@sha256:4f…: the registry refused this job's credentials for an image this node holds; a cached private image is served only to jobs its registry lets pull it
+```
+
+When the registry cannot answer (down, rate limited, unreachable), a tag
+falls back to the digest it last resolved to on this node only for a public
+image, or for a credential the registry accepted in the last 10 minutes.
+Otherwise the registry's error stands. A worker restart forgets those
+acceptances, so a private image's first start after a restart needs its
+registry. A pull the cache is not authorized for fetches its manifests from
+the registry, which so checks the credential, and reuses only the layers the
+node already verified from that same repository, so a moved tag still
+downloads only the layers that changed. An image cached before the worker
+recorded provenance is pulled from its registry once more, on its next start.
+
+Layer digests still act as names: a job that gets its own registry to serve a
+manifest listing another image's layers, in its own repository, does not get
+those layers from this cache, because they were never verified from that
+repository.
 
 ## Fetcher plugins
 

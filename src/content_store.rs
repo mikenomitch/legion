@@ -609,7 +609,18 @@ impl ContentStore {
              CREATE TABLE IF NOT EXISTS image_ref(
                reference TEXT PRIMARY KEY,
                digest TEXT NOT NULL,
-               resolved_at INTEGER NOT NULL);",
+               resolved_at INTEGER NOT NULL);
+             -- Each repository an image's bytes were pulled and verified from
+             -- on this node, and whether the registry served them with no
+             -- credential (src/artifacts/fetchers/oci.rs). A cached image is
+             -- served only for a repository it came from, and a private one
+             -- only to a credential that registry accepts.
+             CREATE TABLE IF NOT EXISTS image_source(
+               digest TEXT NOT NULL,
+               repository TEXT NOT NULL,
+               anonymous INTEGER NOT NULL,
+               verified_at INTEGER NOT NULL,
+               PRIMARY KEY(digest, repository));",
         )
         .context("initialize content index")?;
         let seq: i64 = db.query_row("SELECT COALESCE(MAX(use_seq), 0) FROM entry", [], |r| {
@@ -1066,6 +1077,45 @@ impl ContentStore {
             .optional()?;
         row.map(|(digest, at)| Ok((ContentDigest::parse(&digest)?, at)))
             .transpose()
+    }
+
+    /// Record that the image `digest` (what a reference names: a manifest
+    /// or an index) was pulled and verified from `repository`
+    /// (`registry/repo`), with no credential when `anonymous`. Once served
+    /// anonymously, a repository's image stays known to be public.
+    pub fn record_image_source(
+        &self,
+        digest: &ContentDigest,
+        repository: &str,
+        anonymous: bool,
+    ) -> R<()> {
+        let inner = self.inner.lock().expect("content store");
+        inner.db.execute(
+            "INSERT INTO image_source(digest, repository, anonymous, verified_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(digest, repository) DO UPDATE SET
+               anonymous = MAX(anonymous, excluded.anonymous),
+               verified_at = excluded.verified_at",
+            params![digest.as_str(), repository, anonymous as i64, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the image `digest` was pulled and verified from `repository`
+    /// on this node: `Some(true)` when the registry served it anonymously
+    /// (a public image), `Some(false)` when only with a credential, `None`
+    /// when never from this repository.
+    pub fn image_source(&self, digest: &str, repository: &str) -> R<Option<bool>> {
+        let inner = self.inner.lock().expect("content store");
+        Ok(inner
+            .db
+            .query_row(
+                "SELECT anonymous FROM image_source WHERE digest = ?1 AND repository = ?2",
+                params![digest, repository],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|anonymous| anonymous != 0))
     }
 
     /// Bytes used, pinned, and budgeted per class.

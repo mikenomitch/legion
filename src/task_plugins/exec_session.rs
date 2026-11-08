@@ -42,6 +42,10 @@ pub struct ExecOptions {
     /// that task's memory/CPU limits rather than in the worker's cgroup.
     /// `None` leaves the process where the worker is.
     pub cgroup: Option<std::path::PathBuf>,
+    /// A network namespace (a bind-mounted nsfs path, Linux) the process
+    /// starts in, so a session into a gated task sees the task's network,
+    /// not the host's. `None` leaves it in the worker's namespace.
+    pub netns: Option<std::path::PathBuf>,
 }
 
 impl ExecOptions {
@@ -54,7 +58,51 @@ impl ExecOptions {
             env: BTreeMap::new(),
             clear_env: false,
             cgroup: None,
+            netns: None,
         }
+    }
+}
+
+/// Run `spawn` on a short-lived thread that first joins the network
+/// namespace at `netns`, so the process it forks starts there.
+///
+/// A network namespace is per thread, and a child inherits its forking
+/// thread's, so this covers the PTY path too, where `portable-pty` offers no
+/// `pre_exec` hook. The worker's own threads never leave its namespace: the
+/// joining thread ends with the spawn. A failed join fails the session
+/// rather than running it in the worker's network.
+fn spawn_in_netns(
+    netns: &std::path::Path,
+    spawn: impl FnOnce() -> R<Box<dyn ExecSession>> + Send,
+) -> R<Box<dyn ExecSession>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(netns)
+            .with_context(|| format!("open network namespace {}", netns.display()))?;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    // SAFETY: a plain syscall on a descriptor this closure owns.
+                    if unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+                        return Err(anyhow::Error::from(std::io::Error::last_os_error()))
+                            .with_context(|| {
+                                format!("join network namespace {}", netns.display())
+                            });
+                    }
+                    spawn()
+                })
+                .join()
+                .map_err(|_| anyhow::anyhow!("the exec session's spawn thread panicked"))?
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = spawn;
+        anyhow::bail!(
+            "cannot join network namespace {}: network namespaces are Linux only",
+            netns.display()
+        )
     }
 }
 
@@ -110,6 +158,13 @@ fn apply_common(builder: &mut CommandBuilder, opts: &ExecOptions) {
 
 /// Spawn an interactive PTY-backed session.
 pub fn spawn_pty(opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
+    match &opts.netns {
+        Some(netns) => spawn_in_netns(netns, || spawn_pty_here(opts)),
+        None => spawn_pty_here(opts),
+    }
+}
+
+fn spawn_pty_here(opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
     let (program, args) = opts
         .command
         .split_first()
@@ -169,6 +224,13 @@ pub fn spawn_pty(opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
 
 /// Spawn a non-interactive pipe-backed session (stdout/stderr separate).
 pub fn spawn_pipe(opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
+    match &opts.netns {
+        Some(netns) => spawn_in_netns(netns, || spawn_pipe_here(opts)),
+        None => spawn_pipe_here(opts),
+    }
+}
+
+fn spawn_pipe_here(opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
     let (program, args) = opts
         .command
         .split_first()
@@ -418,6 +480,73 @@ mod tests {
         let _ = out.stdout.read_to_end(&mut buf);
         assert_eq!(session.wait()?, 126);
         assert!(!String::from_utf8_lossy(&buf).contains("ran\r\n"));
+        Ok(())
+    }
+
+    /// Regression (TODO "`legion exec` into a gated `exec` task runs in the
+    /// host network namespace"): a session given a namespace starts in it,
+    /// over a pipe and over a PTY, and the worker's own thread stays where
+    /// it was. Needs CAP_SYS_ADMIN for `unshare -n`; skipped without it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sessions_start_in_the_network_namespace_they_are_given_test() -> R<()> {
+        let mut holder = match std::process::Command::new("unshare")
+            .args(["-n", "sleep", "30"])
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return Ok(()),
+        };
+        let netns = std::path::PathBuf::from(format!("/proc/{}/ns/net", holder.id()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let own = std::fs::read_link("/proc/self/ns/net")?;
+        let theirs = loop {
+            let link = std::fs::read_link(&netns).ok();
+            if link.as_ref().is_some_and(|link| *link != own) {
+                break link.unwrap();
+            }
+            if std::time::Instant::now() >= deadline {
+                // `unshare -n` refused (no CAP_SYS_ADMIN): nothing to test.
+                let _ = holder.kill();
+                let _ = holder.wait();
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let read_netns = |tty: bool| -> R<String> {
+            let mut opts = ExecOptions::new(
+                vec!["/bin/readlink".into(), "/proc/self/ns/net".into()],
+                tty,
+            );
+            opts.netns = Some(netns.clone());
+            let mut session = if tty {
+                spawn_pty(&opts)?
+            } else {
+                spawn_pipe(&opts)?
+            };
+            let mut out = session.take_output()?;
+            let mut buf = Vec::new();
+            let _ = out.stdout.read_to_end(&mut buf);
+            assert_eq!(session.wait()?, 0);
+            Ok(String::from_utf8_lossy(&buf).trim().to_string())
+        };
+        let expected = theirs.display().to_string();
+        assert_eq!(read_netns(false)?, expected, "pipe session");
+        assert_eq!(read_netns(true)?, expected, "pty session");
+        assert_eq!(
+            std::fs::read_link("/proc/thread-self/ns/net")?,
+            own,
+            "the calling thread never left the worker's namespace"
+        );
+
+        let mut opts = ExecOptions::new(vec!["/bin/true".into()], false);
+        opts.netns = Some(std::path::PathBuf::from("/nonexistent/netns"));
+        assert!(
+            spawn_pipe(&opts).is_err(),
+            "a missing namespace fails the session"
+        );
+        let _ = holder.kill();
+        let _ = holder.wait();
         Ok(())
     }
 

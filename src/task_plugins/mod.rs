@@ -48,7 +48,10 @@ mod vmm_api;
 pub mod vsock_exec;
 
 pub use checkpoint::{AfterCheckpoint, CheckpointDir, CheckpointQuery, CheckpointSupport};
-pub use container::{container_task_capabilities, ContainerTaskPlugin};
+pub use container::{
+    container_task_capabilities, idmapped_mounts_attribute, ContainerTaskPlugin,
+    IDMAPPED_MOUNTS_ATTR,
+};
 pub use exec::ExecTaskPlugin;
 pub use exec_session::{spawn_pipe, spawn_pty, ExecOptions, ExecOutputStreams, ExecSession};
 pub use oci_bundle::CapabilityAllowlist;

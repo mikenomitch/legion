@@ -615,10 +615,11 @@ scheduler lane. If a later write fails, the manager asks the worker to send
 the report again (`HeartbeatReply.retry_terminated_allocations`). The
 earlier writes are idempotent, so the repeat converges. In the `lanes`
 topology the eval can run before the scheduler leader has applied the
-status-lane write. It then keeps holding the dependents, and they wait for
-the job's next evaluation (a resubmit, a node change, any other eval). The
-`single` topology, where every lane rides one group, doesn't have this
-race.
+status-lane write. That is why the scheduler, when it judges `dependsOn`,
+also reads the finished replicas' rows on its own lane: they were committed
+before the eval was, so the eval always sees them, and a dependent is
+released by the eval its dependency's exit queued even when the task's
+status still reads `running` on that manager.
 
 Scheduling is leader-only in the same way. Eval queue state replicates
 everywhere, so a failover resumes the queue. Only the leader's loops act.

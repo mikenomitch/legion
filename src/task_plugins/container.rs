@@ -367,6 +367,59 @@ fn idmapped_mount_gap(binary: &str, version_output: &str) -> Option<String> {
     ))
 }
 
+/// The node attribute a worker sets (to `"unsupported"`) when its OCI
+/// runtime is a runc that predates idmapped mounts. A container task with
+/// `security.userNamespace` on (the default) carries the implicit constraint
+/// that it is not set ([`constrain_to_idmapped_mounts`]), so it never places
+/// on such a node, where every start would fail. The attribute is absent on
+/// every other node: crun, runc 1.2 or later, Apple `container` (which
+/// ignores `security`), and a node with no container runtime.
+pub const IDMAPPED_MOUNTS_ATTR: &str = "container.idmappedMounts";
+
+/// This node's value for [`IDMAPPED_MOUNTS_ATTR`]: `Some("unsupported")`
+/// when its OCI runtime is a runc before 1.2, `None` otherwise. Shells out
+/// to `<runtime> --version`.
+pub fn idmapped_mounts_attribute() -> Option<&'static str> {
+    let Ok(ContainerRuntime::Oci { binary, .. }) = ContainerRuntime::detect() else {
+        return None;
+    };
+    let version = crate::util::output_with_timeout(
+        Command::new(&binary).arg("--version"),
+        crate::util::RUNTIME_CLI_TIMEOUT,
+    )
+    .ok()
+    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())?;
+    idmapped_mount_gap(&binary, &version).map(|_| "unsupported")
+}
+
+/// Give a user-namespaced container task (the default) the implicit
+/// constraint `container.idmappedMounts is_not_set`, so it places only on
+/// nodes whose OCI runtime can start it. Constraints in the object form
+/// become the equivalent list. Idempotent, so a resubmit does not stack
+/// copies, and a no-op for a task that sets `security.userNamespace = false`.
+fn constrain_to_idmapped_mounts(task: &mut TaskConfig) {
+    if !container_security(&task.config).user_namespace {
+        return;
+    }
+    let rule = serde_json::json!({ "key": IDMAPPED_MOUNTS_ATTR, "operator": "is_not_set" });
+    let mut rules = match std::mem::take(&mut task.constraints) {
+        Value::Array(rules) => rules,
+        Value::Object(map) => map
+            .into_iter()
+            .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+            .collect(),
+        Value::Null => Vec::new(),
+        other => {
+            task.constraints = other;
+            return;
+        }
+    };
+    if !rules.contains(&rule) {
+        rules.push(rule);
+    }
+    task.constraints = Value::Array(rules);
+}
+
 /// Apple's container CLI (macOS). Installed via `brew install container`.
 const APPLE_CONTAINER_BIN: &str = apple_container::BIN;
 
@@ -950,6 +1003,18 @@ pub struct ContainerTaskPlugin;
 impl ContainerTaskPlugin {}
 
 impl TaskPlugin for ContainerTaskPlugin {
+    /// Implicit placement constraints:
+    ///
+    /// - a user-namespaced task (the default) gains
+    ///   `container.idmappedMounts is_not_set`, so it never places on a node
+    ///   whose runc predates idmapped mounts ([`constrain_to_idmapped_mounts`]);
+    /// - a task that names a runtime class places only where the class is
+    ///   (the node attribute `container.runtimeClasses`).
+    fn normalize_task(&self, task: &mut TaskConfig) {
+        constrain_to_idmapped_mounts(task);
+        crate::task_plugins::runtime_class::constrain_to_class(task);
+    }
+
     /// A gated allocation's namespace is a real boundary: nothing leaves it
     /// except through the datapath, which holds its policy until ratified.
     fn network_gate_for(&self, allocation: &Allocation) -> crate::task_plugins::NetworkGate {
@@ -991,12 +1056,6 @@ impl TaskPlugin for ContainerTaskPlugin {
         crate::task_plugins::validate_schema(&self.schema(), config)?;
         ContainerTaskConfig::from_value(config)?;
         Ok(())
-    }
-
-    /// A task that names a runtime class places only where the class is
-    /// (the node attribute `container.runtimeClasses`).
-    fn normalize_task(&self, task: &mut TaskConfig) {
-        crate::task_plugins::runtime_class::constrain_to_class(task);
     }
 
     /// Apple `container` refuses a VM under
@@ -2524,6 +2583,58 @@ mod tests {
             );
             assert_eq!(argv, vec![binary, "exec", "legion-42", "/bin/true"]);
         }
+    }
+
+    /// Regression (TODO "`container: pass` readiness"): a runc before 1.2
+    /// passed readiness and failed every default start. A user-namespaced
+    /// task now carries a constraint such a node fails, and a task that
+    /// turns user namespaces off does not.
+    #[test]
+    fn a_user_namespaced_task_avoids_nodes_without_idmapped_mounts_test() -> R<()> {
+        let node = |attrs: Value| crate::structs::Node {
+            id: "n".into(),
+            pool: "default".into(),
+            status: "ready".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
+            config_attrs: attrs,
+            fingerprint_attrs: serde_json::json!({}),
+            dynamic_attrs: serde_json::json!({}),
+            health_checks: serde_json::json!({}),
+        };
+        let old_runc = node(serde_json::json!({ IDMAPPED_MOUNTS_ATTR: "unsupported" }));
+        let new_runc = node(serde_json::json!({}));
+
+        let mut task = TaskConfig {
+            config: serde_json::json!({ "image": "nginx", "command": ["nginx"] }),
+            constraints: serde_json::json!({ "role": "web" }),
+            ..TaskConfig::new("web", "container")
+        };
+        ContainerTaskPlugin.normalize_task(&mut task);
+        ContainerTaskPlugin.normalize_task(&mut task);
+        let rules = task.constraints.as_array().expect("list form");
+        assert_eq!(
+            rules.len(),
+            2,
+            "idempotent, and the object form kept: {rules:?}"
+        );
+        let constraints = crate::constraints::ConstraintSet::new(&task.constraints)?;
+        let with_role = |mut n: crate::structs::Node| {
+            n.config_attrs["role"] = serde_json::json!("web");
+            n
+        };
+        assert!(!constraints.is_satisfied(&with_role(old_runc.clone()), None));
+        assert!(constraints.is_satisfied(&with_role(new_runc), None));
+
+        let mut opted_out = TaskConfig {
+            config: serde_json::json!({ "image": "nginx", "security": { "userNamespace": false } }),
+            ..TaskConfig::new("legacy", "container")
+        };
+        ContainerTaskPlugin.normalize_task(&mut opted_out);
+        let constraints = crate::constraints::ConstraintSet::new(&opted_out.constraints)?;
+        assert!(constraints.is_satisfied(&old_runc, None));
+        Ok(())
     }
 
     /// The default privilege floor needs idmapped mounts: runc before 1.2

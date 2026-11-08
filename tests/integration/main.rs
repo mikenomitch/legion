@@ -67,6 +67,7 @@ mod heartbeat_scale_benchmark;
 mod index_truncation_spread;
 mod instance_scale_measure;
 mod join_tokens;
+mod keyed_move_budget;
 mod kv_encryption;
 mod manager_shutdown;
 mod metrics_endpoint;

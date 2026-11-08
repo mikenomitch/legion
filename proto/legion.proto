@@ -7863,9 +7863,10 @@ message RescheduleBackoff {
   // while it comes within `move_period` of the previous replacement's
   // release, so it resets once a replacement survives a whole period. The
   // backoff is `move_delay` doubled per earlier failure in the count. The
-  // job's failure budget is separate: with `move_count` set, the job fails
-  // when a failure finds `move_count` moves of the task inside
-  // `move_period`.
+  // move budget is separate: with `move_count` set, a failure that finds
+  // `move_count` moves inside `move_period` is not moved again. Moves are
+  // counted per keyed instance (spending the budget stops only that
+  // instance) and per task otherwise (spending it fails the job).
   uint32 attempt = 6;
 
   // The backoff this failure got, in seconds.
@@ -10891,9 +10892,12 @@ message TerminatedAllocation {
   int64 allocation_id = 1;
 
   // True when the exit status was one the task counts as success
-  // (`restart.successExitCodes`, default `[0]`). A task whose policy is
-  // `never` can also terminate unsuccessfully; the manager marks the
-  // allocation complete either way and records the status.
+  // (`restart.successExitCodes`, default `[0]`). False only for a task whose
+  // restart policy is `never`: it runs once, so an unsuccessful exit is final
+  // rather than a failure to reschedule. The manager marks the allocation
+  // `complete` on success and `failed` otherwise, and sets the task's status
+  // to match (`Success` once every replica succeeded, `Failed` as soon as one
+  // did not). Every other unsuccessful exit travels `failed_allocations`.
   bool success = 2;
 
   // Process exit code. Unset when the process was killed by a signal, or when

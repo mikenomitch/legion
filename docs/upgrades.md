@@ -56,6 +56,15 @@ binary cannot yet read such a file when a field was added to the message
 since, and it fails naming the field, for example `missing field
 envelopeResources` reading `netd_state.json`. This is a known gap.
 
+The record of running tasks, `worker_state.json`, is read one task at a
+time. A task whose record the new binary cannot read is stopped, through its
+cgroup and its process group, rather than left running unmanaged; the
+manager then places it again. The worker logs `The worker state file holds
+records this build cannot read` and keeps the old file beside the new one as
+`worker_state.json.unreadable-<unix seconds>`. Before, one such record made
+the restarted worker forget every running task, and the manager started a
+second copy of each beside the first.
+
 ## Stopping a manager
 
 Restart managers with SIGTERM (or Ctrl-C, which sends SIGINT). That's what

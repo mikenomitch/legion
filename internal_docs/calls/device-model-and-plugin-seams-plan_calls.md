@@ -305,7 +305,37 @@ task that writes to its weights would change what the next allocation gets,
 and the store's cheap `get` (size only) would not notice. Keeping "tasks get
 their own copy" matches single-file artifacts.
 
-## 15. The fetch defaults grow to 1 TiB and 2 hours; there is no stall timeout
+## 15. Cached ORAS layers follow the image cache's repository rule
+
+**Call.** A cached ORAS layer is served only to a pull from the repository
+(`registry/repo`) it was downloaded and verified in. Each layer's source is
+recorded when it is stored, and a pull is never served a layer by digest
+alone. This came up when this branch was merged with `main`'s private image
+cache fix (#67), which scopes cached image blobs the same way.
+
+**Alternatives.** Serve any cached layer by digest, as the ORAS cache first
+did: the digest proves the bytes. Or ask the registry for every layer
+(`HEAD` on the blob in this repository) before serving it from the store.
+
+**Trade-off.** The same weights published in two repositories are
+downloaded once per repository, not once per node.
+
+**Why (security, simplicity).** A digest proves what the bytes are, not who
+may read them. With a node-wide cache keyed by digest alone, a job could
+publish a manifest in its own repository that lists a private layer's
+digest (from a leaked manifest, say) and get the node's copy with no
+credential for the private repository. The manifest itself is always read
+from the registry with the job's credential, so the registry already checks
+access to the repository; requiring the layer to be verified from that same
+repository closes the rest, with no extra request per layer. It is also the
+image cache's rule, so there is one rule for both:
+
+```console
+$ legion job run weights.ncl   # oci://ghcr.io/attacker/w:v1, mediaType = …
+staging failed: oci://ghcr.io/attacker/w:v1: pull blob sha256:…: … 404
+```
+
+## 16. The fetch defaults grow to 1 TiB and 2 hours; there is no stall timeout
 
 **Call.** `maxArtifactSize` defaults to 1 TiB (was 50 GiB) and the fetch
 deadline to 2 hours (was 10 minutes).
@@ -321,7 +351,7 @@ allocation for up to 2 hours per attempt.
 would have been a doc footnote. A stall timeout is the right fix and is a
 TODO.
 
-## 16. `exec` tasks get device env, not a device cgroup
+## 17. `exec` tasks get device env, not a device cgroup
 
 **Call.** `exec` sets `LEGION_DEVICE_*` and the plugin's env, and nothing
 stops the process opening other device nodes.
@@ -336,7 +366,7 @@ ignore their env.
 carries its own implementation); building and loading one is its own project.
 The container runtime gets real enforcement today through the OCI spec.
 
-## 17. Node checks return a typed health report; the fingerprint stays a map
+## 18. Node checks return a typed health report; the fingerprint stays a map
 
 **Call.** `NodeChecker::health_check` returns `Option<NodeCheckReport { status,
 message, attributes }>`; `has_fingerprinter`/`has_health_check` are gone;
@@ -354,7 +384,7 @@ needs a verdict and prose, which a map of strings conflated (any string not
 "pass" was a failure, so a message was a failure). The old disk rule marked
 half-full disks unhealthy.
 
-## 18. Node-check plugins load once; a load failure is a failing check until restart
+## 19. Node-check plugins load once; a load failure is a failing check until restart
 
 **Call.** A node-check plugin is loaded on first use and reused for the life
 of the worker; a load failure is cached and reported as a failing check
@@ -367,7 +397,7 @@ every pass.
 **Why.** Reloading a dylib every 30 seconds is the cost PLG5 named, and
 re-logging the same load error every pass was noise.
 
-## 19. `job validate` checks job rules only when it can read the policies
+## 20. `job validate` checks job rules only when it can read the policies
 
 **Call.** `job validate` fetches namespace policies (`acl:read`) and applies
 their `jobRules`; without access, or offline, it warns and says `job plan`
@@ -382,7 +412,7 @@ warns instead of checking.
 **Why.** `job plan` already runs every policy check on the manager, as the
 caller; a second RPC for the same answer is surface without a new job.
 
-## 20. Sandboxes refuse devices at submit; MIG, MPS, and DRA are deferred
+## 21. Sandboxes refuse devices at submit; MIG, MPS, and DRA are deferred
 
 **Call.** A `sandbox` task with `resources.devices` is refused at submit.
 MIG partitions, MPS, time slicing, and DRA-style shared claims are not
@@ -396,7 +426,7 @@ can report MIG instances as their own group, assigned whole).
 **Why.** Each is a project with hardware-specific failure modes, and none can
 be tested without the hardware.
 
-## 21. Task runtime dylibs are not contained; WASM and out-of-process plugins are deferred
+## 22. Task runtime dylibs are not contained; WASM and out-of-process plugins are deferred
 
 **Call.** Only the four small plugin traits got containment. The `TaskPlugin`
 trait (about 40 methods) did not; moving in-manager hooks to WASM and task
@@ -411,7 +441,7 @@ task runtimes is out of process, and a 40-method forwarding adapter is a
 standing trap (a method forgotten falls back to the trait default and
 silently changes the plugin's behavior).
 
-## 22. P2P distribution, lazy loading, and resumable fetches are deferred
+## 23. P2P distribution, lazy loading, and resumable fetches are deferred
 
 **Call.** None of Dragonfly/Spegel-style peer sharing, SOCI/Nydus-style lazy
 loading, or HTTP range resume shipped.
@@ -426,7 +456,7 @@ registry.
 that tries peers before origin, and eviction coordination: a plan of its own.
 Lazy loading needs a FUSE or snapshotter layer. Both are recorded as TODOs.
 
-## 23. Runtime classes take no extra flags; a wrapper script carries them
+## 24. Runtime classes take no extra flags; a wrapper script carries them
 
 **Call.** A class is a `path`, with no `args`.
 
@@ -438,7 +468,7 @@ Lazy loading needs a FUSE or snapshotter layer. Both are recorded as TODOs.
 would need the args threaded through; a wrapper is one file the operator
 already understands.
 
-## 24. Job mutation, a secrets provider, rollout hooks, and controller-side volumes are deferred
+## 25. Job mutation, a secrets provider, rollout hooks, and controller-side volumes are deferred
 
 **Call.** PLG4's mutation policies and secrets provider, and PLG5's rollout
 step/analysis/abort hooks and controller-side volume operations, did not ship.
