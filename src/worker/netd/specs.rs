@@ -226,8 +226,12 @@ pub fn gated_namespace_ids(desired: &[TaskAllocation], alloc_root: &Path) -> Vec
 /// `mesh_tls` comes through as the manager set it: a mesh endpoint refuses a
 /// plaintext dial at the handshake.
 pub fn dialable_endpoints(update: &UpstreamEndpoints) -> Vec<Endpoint> {
-    update
-        .endpoints
+    dialable(&update.endpoints)
+}
+
+/// [`dialable_endpoints`] over a bare endpoint list (an `EndpointSet`'s).
+pub fn dialable(endpoints: &[crate::structs::ServiceEndpoint]) -> Vec<Endpoint> {
+    endpoints
         .iter()
         .filter(|endpoint| !endpoint.address.trim().is_empty() && endpoint.port != 0)
         .map(|endpoint| Endpoint {

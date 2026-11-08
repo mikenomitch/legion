@@ -2690,6 +2690,9 @@ async fn heartbeat_tick(
             (allocations, allocation_health.clone(), allocation_health)
         };
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
+            // What the node holds of its endpoint feed, so the reply carries
+            // only what changed (mesh-control-path plan §6.1).
+            endpoint_feed: Some(netd.feed_report()),
             work_stream: work_stream.clone(),
             content_locations: content_report
                 .as_ref()
@@ -2906,13 +2909,13 @@ async fn heartbeat_tick(
         // endpoint feed, and the policy assignments.
         netd.send(NetdInput::Desired(DesiredNetwork {
             desired: reply.desired_allocations.clone(),
-            upstream_endpoints: reply.upstream_endpoints.clone(),
+            endpoint_feed: reply.endpoint_feed.take(),
             net_policies: reply.net_policies.clone(),
         }))
         .await;
         // Config-file templates, rendered from the same feed; written before
         // any launch below so a task starts with its files in place.
-        apply_templates(task_manager, &reply).await;
+        apply_templates(task_manager, netd, &reply).await;
         // KV files marked `onChange = "update"`, rewritten under running
         // allocations whose rendered content moved.
         apply_live_kv_files(task_manager, &reply);
@@ -3211,7 +3214,11 @@ static TEMPLATES: LazyLock<crate::worker::templates::TemplateEngine> =
 /// endpoint feed: the first time before the task launches, then on every
 /// heartbeat that changes a file, applying `changeMode` after `coalesce`
 /// and `splay`.
-async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &HeartbeatReply) {
+async fn apply_templates(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    netd: &Netd,
+    reply: &HeartbeatReply,
+) {
     use crate::worker::templates::{ChangeAction, TemplateContext};
     let live: std::collections::HashSet<i64> = reply
         .desired_allocations
@@ -3236,17 +3243,8 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
         } else {
             serde_json::from_str(&allocation.network).ok()
         };
-        let endpoints: std::collections::BTreeMap<String, Vec<Endpoint>> = reply
-            .upstream_endpoints
-            .iter()
-            .filter(|u| u.allocation_id == allocation.allocation_id && !u.for_handler)
-            .map(|u| {
-                (
-                    u.service.clone(),
-                    crate::worker::netd::specs::dialable_endpoints(u),
-                )
-            })
-            .collect();
+        let endpoints: std::collections::BTreeMap<String, Vec<Endpoint>> =
+            netd.template_endpoints(allocation.allocation_id);
         let (running, base) = {
             let mut manager = task_manager.lock().expect("task manager");
             let running = manager.has_allocation(allocation.allocation_id);
@@ -3559,6 +3557,13 @@ fn launch_streamed_work(
 ) {
     if applied.reconcile {
         HEARTBEAT_WAKE.notify_one();
+    }
+    // Endpoint sets the manager pushed: applied to the listeners now, not at
+    // the next beat (mesh-control-path plan §6.1).
+    if let (Some(feed), Some(netd)) = (applied.endpoint_feed, launcher.netd.clone()) {
+        tokio::spawn(async move {
+            netd.send(NetdInput::Endpoints(feed)).await;
+        });
     }
     // Checkpoint work starts the moment it is pushed, deduplicated against
     // what this node already has in flight or finished, exactly as when a

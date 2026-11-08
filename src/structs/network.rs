@@ -5,7 +5,8 @@ use serde_json::{Map, Value};
 
 use crate::prelude::{anyhow, bail, R};
 
-/// Inclusive dynamic port range used when a port has no `static` value.
+/// Inclusive dynamic port range used when a task's port has no `static`
+/// value.
 pub const DYNAMIC_PORT_MIN: u16 = 20000;
 pub const DYNAMIC_PORT_MAX: u16 = 32000;
 
@@ -1889,7 +1890,7 @@ impl std::fmt::Display for StaticPortInUse {
 
 impl std::error::Error for StaticPortInUse {}
 
-/// Take the next free port from the dynamic range, advancing the shared
+/// Take the next free port from the task range, advancing the shared
 /// cursor. `what` names the offending entry in the exhaustion error.
 fn next_dynamic_port(cursor: &mut u16, taken: &mut HashSet<u16>, what: &str) -> R<u16> {
     while *cursor <= DYNAMIC_PORT_MAX && taken.contains(cursor) {
@@ -1900,9 +1901,6 @@ fn next_dynamic_port(cursor: &mut u16, taken: &mut HashSet<u16>, what: &str) -> 
             "no free dynamic port available for {what} (range {DYNAMIC_PORT_MIN}-{DYNAMIC_PORT_MAX} exhausted on this node)"
         );
     }
-    let port = *cursor;
-    taken.insert(port);
-    Ok(port)
 }
 
 /// Assign every node-local port one allocation needs — task host ports and

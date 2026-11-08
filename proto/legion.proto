@@ -9386,6 +9386,17 @@ message HeartbeatRequest {
   // kept in memory by the manager for GetNetPluginStatus and
   // `legion net doctor`. Empty on a node that runs no plugin.
   repeated NetPluginNodeStatus net_plugins = 21;
+
+  // What this worker holds of its endpoint feed (docs/service-discovery.md,
+  // "How endpoints reach a node"): the digest of its bindings and, for every
+  // endpoint set it holds, the set's key, version, and digest. The manager
+  // answers with only what differs (`HeartbeatReply.endpoint_feed`), so a
+  // beat whose upstream services did not change carries no endpoints at
+  // all.
+  //
+  // Absent (or empty) from a worker that holds nothing yet, which is answered
+  // with every set and the bindings.
+  EndpointFeedState endpoint_feed = 22;
 }
 
 // One envelope resize a node asks for. See
@@ -9639,6 +9650,25 @@ message StreamWorkReply {
   // `checkpoint` capability. A message may carry only this field, with no
   // `upserts` or `stops`; it still takes the next `seq`.
   repeated CheckpointRequest checkpoint_requests = 7;
+
+  // Endpoint sets for this node that changed since the manager last told it,
+  // pushed the moment the manager's endpoint index noticed the change
+  // (docs/service-discovery.md, "How endpoints reach a node"). Only on a
+  // `push_only` message. Carries sets, never bindings
+  // (`bindings_unchanged` is set).
+  //
+  // A hint, like `checkpoint_requests`: never replayed and not counted in
+  // `digest`. The heartbeat's `endpoint_feed` stays the record, so a lost
+  // push costs one heartbeat interval. The worker applies a pushed set only
+  // when it is newer than what it holds (`EndpointFeed.epoch` and
+  // `EndpointSet.version`) and only while a binding names it.
+  EndpointFeed endpoint_feed = 8;
+
+  // This message carries only pushes (`endpoint_feed`) and has no place in
+  // the node's sequence: `seq`, `resync`, `upserts`, `stops`, and `digest`
+  // are unset, the worker neither moves its position nor acknowledges it,
+  // and the manager never replays it.
+  bool push_only = 9;
 }
 
 // One finished (or refused-after-verification) direct exec session.
@@ -10003,21 +10033,12 @@ message HeartbeatReply {
   // Default: empty list.
   repeated VolumeDestroyRequest volume_destroy = 3;
 
-  // Current endpoint set for every upstream declared by the desired
-  // allocations on this node (see `TaskAllocation.task_connect`). This is the
-  // service-discovery feed for the node-local forwarders: the worker applies
-  // it to the running forwarders and the next accepted connection is balanced
-  // across the addresses listed here.
-  //
-  // One entry per (allocation, upstream service) pair, refreshed on every
-  // heartbeat — that is, every `WORKER_HEARTBEAT_DURATION_SEC` (2s), which is
-  // the endpoint refresh cadence a consumer observes after a backend comes up,
-  // goes unhealthy, or moves.
-  //
-  // Default: empty list when no desired allocation declares upstreams. The
-  // manager performs no catalog work at all in that case, so nodes running
-  // only plain jobs pay nothing for this field.
-  repeated UpstreamEndpoints upstream_endpoints = 4;
+  // Field 4 carried `repeated UpstreamEndpoints upstream_endpoints`: every
+  // (allocation, upstream) pair's full endpoint list, rebuilt and resent on
+  // every heartbeat. Replaced by the per-service, versioned
+  // `endpoint_feed` (field 25).
+  reserved 4;
+  reserved "upstream_endpoints";
 
   // Why the manager is stopping allocations on this node.
   //
@@ -10256,6 +10277,28 @@ message HeartbeatReply {
   // exists yet or the manager cannot vouch for one (its provider failed, or
   // it disagrees with the cluster); a worker then keeps what it holds.
   repeated string cluster_ca_pins = 23;
+
+  // The service-discovery feed for this node's upstream forwarders and
+  // `proxy` handlers, as a delta against what the request's
+  // `endpoint_feed` says the worker holds (docs/service-discovery.md, "How
+  // endpoints reach a node"): the endpoint sets whose digest differs, and
+  // the bindings when their digest differs. An unchanged node gets an
+  // `EndpointFeed` with no sets and `bindings_unchanged` set.
+  //
+  // Endpoint sets are per (service, consumer), not per allocation: 40
+  // allocations of one job consuming one service share one set. A worker
+  // that streams its work (`StreamWork`) also gets changed sets pushed the
+  // moment the manager notices a change, so this field is the record and
+  // the backstop, not the fast path.
+  //
+  // Applied only from a successful heartbeat, so a manager outage keeps the
+  // last known good endpoints (fail-static). A set the manager could not
+  // compute (a store error) is left out, which also keeps the worker's copy.
+  //
+  // Default: an empty feed (no bindings, no sets) when no desired
+  // allocation declares upstreams or `proxy` handlers; the manager then
+  // reads no catalog at all.
+  EndpointFeed endpoint_feed = 25;
 }
 
 // Why one allocation is being stopped.
@@ -10304,11 +10347,10 @@ message StopNotice {
   string preemptor_band = 4;
 }
 
-// The endpoints one allocation may currently reach for one upstream service.
-//
-// Sent in `HeartbeatReply.upstream_endpoints`, this is the manager's answer to
-// "where should this allocation's forwarder for service X send traffic right
-// now". It is a snapshot, not a delta: each heartbeat carries the full list.
+// The endpoints one allocation may currently reach for one upstream service:
+// the worker's per-listener view of its endpoint feed. The worker derives it
+// from `EndpointFeed` (a binding and the set it names) and persists it with
+// the datapath's state; it is not sent on the wire.
 message UpstreamEndpoints {
   // Allocation consuming the service — the allocation whose task declared this
   // upstream in its `connect` block. Identifies which node-local forwarder the
@@ -10350,6 +10392,129 @@ message UpstreamEndpoints {
   // targets are dialed by the datapath when a chain hands a flow off, and
   // never get a loopback listener of their own.
   bool for_handler = 4;
+}
+
+// What a worker holds of its endpoint feed, reported on every heartbeat
+// (`HeartbeatRequest.endpoint_feed`) so the manager sends only what changed.
+message EndpointFeedState {
+  // `EndpointFeed.bindings_digest` of the bindings the worker holds. Empty
+  // when it holds none yet.
+  string bindings_digest = 1;
+
+  // One entry per endpoint set the worker holds.
+  repeated EndpointSetVersion sets = 2;
+}
+
+// Which version of one endpoint set a worker holds.
+message EndpointSetVersion {
+  // The set's key: `EndpointSet.service` and `EndpointSet.consumer`.
+  string service = 1;
+  string consumer = 2;
+
+  // The `EndpointFeed.epoch` the set came with.
+  uint64 epoch = 3;
+
+  // The set's `EndpointSet.version`.
+  uint64 version = 4;
+
+  // The set's `EndpointSet.digest`. The manager compares digests, not
+  // versions, so a worker that moves to another manager (whose versions
+  // count differently) is sent only sets whose content differs.
+  fixed64 digest = 5;
+}
+
+// A node's endpoint feed, or the part of it that changed
+// (`HeartbeatReply.endpoint_feed`, `StreamWorkReply.endpoint_feed`).
+//
+// The feed has two halves. **Bindings** say which endpoint set each
+// listener uses: allocation 7's upstream `db` uses the set for service `db`
+// as seen by consumer `web`. **Sets** are the endpoints of one service as
+// one consumer may see them, versioned per service. A node holds each set
+// once, however many of its allocations bind it.
+message EndpointFeed {
+  // The answering manager's endpoint-index epoch: a random non-zero value
+  // per manager process. `EndpointSet.version` is ordered only within one
+  // epoch.
+  uint64 epoch = 1;
+
+  // `bindings` is left out because the worker's `bindings_digest` matches:
+  // keep the bindings held. When false, `bindings` is the node's complete
+  // binding list and replaces what the worker holds (an empty list means
+  // no listener on the node uses the feed).
+  bool bindings_unchanged = 2;
+
+  // Every binding on the node, when `bindings_unchanged` is false.
+  repeated EndpointBinding bindings = 3;
+
+  // Digest of the node's current bindings, for the worker to report back in
+  // `EndpointFeedState.bindings_digest`. Set whether or not `bindings` is
+  // included; empty on a push.
+  string bindings_digest = 4;
+
+  // Endpoint sets the worker does not hold at this digest: new, changed, or
+  // never sent. A set no binding names any more is dropped by the worker on
+  // its own; the manager never sends a removal.
+  repeated EndpointSet sets = 5;
+}
+
+// Which endpoint set one listener uses.
+message EndpointBinding {
+  // The allocation whose task declared the upstream or the `proxy` handler.
+  int64 allocation_id = 1;
+
+  // The listener's key: the upstream's key (`connect.upstreams[].name`, or
+  // the service its `to` names), or, for a `proxy` handler, the handler's
+  // `service` as written.
+  string upstream = 2;
+
+  // True when the binding feeds a `proxy` handler's target rather than an
+  // upstream listener. Handler targets are dialed when a chain hands a flow
+  // off, and get no loopback listener of their own.
+  bool for_handler = 3;
+
+  // The set this listener uses (`EndpointSet.service`,
+  // `EndpointSet.consumer`).
+  string service = 4;
+  string consumer = 5;
+}
+
+// The endpoints of one service as one consumer may dial them.
+message EndpointSet {
+  // The canonical service reference: `web` for a service in `default`,
+  // `payments-prod/web` for one in another namespace (docs/namespaces.md).
+  string service = 1;
+
+  // Who the intentions (`service.allow`) are checked against: the consuming
+  // allocation's job id for an upstream, its workload subject for a `proxy`
+  // handler.
+  string consumer = 2;
+
+  // The service's version on the answering manager: it grows whenever the
+  // service's catalog rows change, and never otherwise. Ordered within one
+  // `EndpointFeed.epoch` only.
+  uint64 version = 3;
+
+  // A digest of `endpoints`, stable across managers that agree on the
+  // content: what the worker reports back in `EndpointSetVersion.digest`.
+  fixed64 digest = 4;
+
+  // Endpoints the consumer may dial, already filtered:
+  //
+  // - **healthy only** — an endpoint appears when its latest health
+  //   snapshot is healthy *and* its node is alive, the same liveness rule
+  //   `ResolveService` applies. Unhealthy or lost backends are absent.
+  // - **intention filtered** — when the target service declares
+  //   `service.allow`, an endpoint is visible only if that list is empty,
+  //   contains `"*"`, or names the consumer. A denied consumer receives an
+  //   empty list rather than an error.
+  //
+  // Ordered by allocation id. Endpoint fields carry the same meaning as in
+  // `ResolveServiceReply`; a consumer dials `address:port` (an IPv6
+  // `address` in brackets) and skips entries whose `address` is empty or
+  // whose `port` is 0. An empty list is authoritative and means "send no
+  // traffic": it is how a scaled-to-zero, unhealthy, or intention-denied
+  // service is reported.
+  repeated ServiceEndpoint endpoints = 5;
 }
 
 // One volume operation outcome reported by a worker.
@@ -12455,7 +12620,7 @@ message ServiceSummary {
   // single `"*"` entry; the two are reported verbatim rather than normalized
   // so tooling can tell "no policy declared" from "explicitly open". The list
   // filters the endpoint list a consuming allocation receives in
-  // `HeartbeatReply.upstream_endpoints`; on a `service.mesh = true` service
+  // `EndpointSet.endpoints`; on a `service.mesh = true` service
   // the receiving node also refuses a verified caller outside it
   // (`Legion-Denied-By: service/allow`). It never affects who may *read* the
   // catalog through ListServices/ResolveService.
@@ -14229,8 +14394,8 @@ message TaskAllocation {
   // `network` alongside the task's host ports, because loopback ports come
   // out of the same per-node port space. The worker starts one forwarder per
   // upstream and load-balances new connections across that service's healthy
-  // endpoints, which the manager refreshes every heartbeat in
-  // `HeartbeatReply.upstream_endpoints`. An upstream that names no `balance`
+  // endpoints, which the manager keeps current per service in
+  // `HeartbeatReply.endpoint_feed`. An upstream that names no `balance`
   // uses `least_latency` (docs/service-discovery.md, "Balancing strategies").
   //
   // Empty string (not `{}`) when the task declares no upstreams, so jobs that

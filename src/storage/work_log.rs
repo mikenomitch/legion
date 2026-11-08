@@ -469,6 +469,7 @@ impl WorkLog {
             stops: if resync { Vec::new() } else { stops },
             digest: state.digest.render(),
             checkpoint_requests: Vec::new(),
+            ..Default::default()
         };
         state.unacked.push_back(message.clone());
         if state.unacked.len() > MAX_UNACKED {

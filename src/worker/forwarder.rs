@@ -185,7 +185,7 @@ struct UpstreamShared {
 }
 
 /// `proxy` handler targets by (allocation, service).
-type HandlerEndpoints = HashMap<(i64, String), Vec<Endpoint>>;
+type HandlerEndpoints = HashMap<(i64, String), Arc<Vec<Endpoint>>>;
 /// Ingress TLS configs by (allocation, port label): the fingerprint of what
 /// built each, and the result.
 /// Client configs for external upstreams that pin a `ca`, by (allocation,
@@ -947,13 +947,31 @@ impl ForwarderContext {
         service: &str,
         endpoints: Vec<Endpoint>,
     ) {
-        lock(&self.handler_endpoints).insert((allocation_id, service.to_string()), endpoints);
+        self.set_handler_endpoints_shared(allocation_id, service, Arc::new(endpoints));
+    }
+
+    /// [`Self::set_handler_endpoints`] with a list shared with other
+    /// listeners of the same endpoint set (mesh-control-path plan §6.1).
+    pub fn set_handler_endpoints_shared(
+        &self,
+        allocation_id: i64,
+        service: &str,
+        endpoints: Arc<Vec<Endpoint>>,
+    ) {
+        let mut handlers = lock(&self.handler_endpoints);
+        match handlers.get_mut(&(allocation_id, service.to_string())) {
+            Some(held) if Arc::ptr_eq(held, &endpoints) => {}
+            Some(held) => *held = endpoints,
+            None => {
+                handlers.insert((allocation_id, service.to_string()), endpoints);
+            }
+        }
     }
 
     pub fn handler_endpoints_for(&self, allocation_id: i64, service: &str) -> Vec<Endpoint> {
         lock(&self.handler_endpoints)
             .get(&(allocation_id, service.to_string()))
-            .cloned()
+            .map(|endpoints| endpoints.as_ref().clone())
             .unwrap_or_default()
     }
 
@@ -1280,6 +1298,12 @@ impl ForwarderContext {
         self.mesh_wanted.load(Ordering::Relaxed)
     }
 
+    /// Install a newly issued node certificate. Under the same trust bundle
+    /// the certificate is swapped into the existing mesh configs, so every
+    /// session survives the refresh; under a new bundle (a CA rotation, a CA
+    /// added or removed) new configs with empty session stores replace them,
+    /// so nothing established under the old bundle resumes
+    /// (mesh-control-path plan §6.3).
     pub fn set_mesh_identity(&self, identity: MeshIdentity) -> R<()> {
         let client = identity.client_config()?;
         *self.mesh.write().unwrap_or_else(|p| p.into_inner()) = Some((Arc::new(identity), client));
@@ -1337,7 +1361,7 @@ impl ForwarderContext {
                 .unwrap_or(0)
         };
         let fingerprint = format!(
-            "{}|{}|{}|{}",
+            "{}|{}|{}",
             match termination {
                 PortTermination::Mesh => "mesh".to_string(),
                 PortTermination::Own(tls) => serde_json::to_string(tls).unwrap_or_default(),
@@ -1935,13 +1959,26 @@ impl UpstreamForwarder {
 
     /// Replace the endpoint set one listener balances across.
     ///
-    /// Called once per `HeartbeatReply.upstream_endpoints` entry, after a
-    /// heartbeat that actually succeeded — that is what makes the datapath
-    /// fail-static. An empty list is authoritative: the listener keeps
-    /// accepting but closes each connection immediately, which is how a
-    /// scaled-to-zero, unhealthy, or intention-denied service stops receiving
-    /// traffic. Updates for an unknown listener are ignored.
+    /// Called for every listener the endpoint feed binds, after a heartbeat
+    /// that actually succeeded or a work-stream push — that is what makes
+    /// the datapath fail-static. An empty list is authoritative: the
+    /// listener keeps accepting but closes each connection immediately,
+    /// which is how a scaled-to-zero, unhealthy, or intention-denied service
+    /// stops receiving traffic. Updates for an unknown listener are ignored.
     pub fn set_endpoints(&self, allocation_id: i64, service: &str, endpoints: Vec<Endpoint>) {
+        self.set_endpoints_shared(allocation_id, service, Arc::new(endpoints));
+    }
+
+    /// [`Self::set_endpoints`] with a list shared with the other listeners
+    /// of the same endpoint set. The same list again is no change: nothing
+    /// is swapped and nothing is logged, so a steady beat costs the
+    /// listener nothing (mesh-control-path plan §6.1).
+    pub fn set_endpoints_shared(
+        &self,
+        allocation_id: i64,
+        service: &str,
+        endpoints: Arc<Vec<Endpoint>>,
+    ) {
         let shared = {
             let listeners = lock(&self.listeners);
             listeners
@@ -1955,6 +1992,10 @@ impl UpstreamForwarder {
             );
             return;
         };
+        let mut held = lock(&shared.endpoints);
+        if Arc::ptr_eq(&held, &endpoints) {
+            return;
+        }
         debug!(
             allocation_id,
             service,

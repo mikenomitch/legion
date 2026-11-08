@@ -67,6 +67,9 @@ pub struct Applied {
     /// from a message the mirror ignored: a push is the manager's current
     /// view whatever its position, and the worker deduplicates it.
     pub checkpoint_requests: Vec<CheckpointRequest>,
+    /// Endpoint sets a push-only message carried (mesh-control-path plan
+    /// §6.1), for the datapath to apply now. Not part of the mirror.
+    pub endpoint_feed: Option<crate::structs::EndpointFeed>,
 }
 
 impl WorkMirror {
@@ -229,6 +232,15 @@ where
     ));
     let mut inbound = client.clone().stream_work(request).await?.into_inner();
     while let Some(message) = inbound.message().await? {
+        // A push-only message has no position: hand its pushes on, and
+        // neither apply it to the mirror nor acknowledge it.
+        if message.push_only {
+            on_applied(Applied {
+                endpoint_feed: message.endpoint_feed,
+                ..Default::default()
+            });
+            continue;
+        }
         let applied = mirror
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -274,6 +286,7 @@ mod work_stream_test {
                 .collect(),
             digest: String::new(),
             checkpoint_requests: Vec::new(),
+            ..Default::default()
         }
     }
 

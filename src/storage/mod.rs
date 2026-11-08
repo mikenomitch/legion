@@ -3,6 +3,7 @@ pub mod app_store;
 pub mod boot_ticket_store;
 pub(crate) mod coalesce;
 pub mod content_index;
+pub mod endpoint_index;
 pub mod errors;
 pub mod events;
 pub mod keyring;

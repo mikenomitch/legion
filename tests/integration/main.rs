@@ -50,6 +50,7 @@ mod cli_closed_pipe;
 mod config_jobs;
 mod content_locality;
 mod edge_boot_integration;
+mod endpoint_feed;
 mod eval_loop;
 mod eval_regen_failover;
 mod exec_session_benchmark;

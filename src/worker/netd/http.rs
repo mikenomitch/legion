@@ -1088,7 +1088,7 @@ async fn handle(
             &settings,
             &target.addr,
             &parts,
-            body_bytes.clone(),
+            &mut request_body,
             host_header.as_deref(),
             Some(&hand),
             None,
@@ -1155,7 +1155,6 @@ async fn handle(
     };
 
     // 2. Attempts.
-    let retry = settings.retry.clone();
     let max_attempts = 1 + retry.as_ref().map(|r| r.attempts).unwrap_or(0);
     let retriable_method = retry
         .as_ref()
@@ -1243,7 +1242,7 @@ async fn handle(
             &settings,
             &addr,
             &parts,
-            body_bytes.clone(),
+            &mut request_body,
             host_header.as_deref(),
             None,
             mesh_endpoint.as_ref(),
@@ -1526,8 +1525,10 @@ async fn attempt_request(
     let host = match settings.target.as_ref() {
         Some(target) => {
             let default_port = if target.tls { 443 } else { 80 };
-            if target.port == default_port {
+            if target.port == default_port && !target.host.contains(':') {
                 target.host.clone()
+            } else if target.port == default_port {
+                format!("[{}]", target.host)
             } else {
                 format!("{}:{}", target.host, target.port)
             }
@@ -1540,13 +1541,10 @@ async fn attempt_request(
             builder = builder.header(name.as_str(), value.as_str());
         }
     }
-    // The body is buffered, so the request can be rebuilt for a second try
-    // on a fresh connection when a pooled one turns out to be dead.
     let (head, ()) = builder
         .body(())
         .map_err(|err| AttemptError::Reset(err.to_string()))?
         .into_parts();
-    let request = || Request::from_parts(head.clone(), full(body.clone()));
 
     let key = pool_key(settings, addr, hand_off, mesh);
     if let Some(key) = key.as_ref() {
@@ -1573,8 +1571,12 @@ async fn attempt_request(
     }
 
     let mut sender = open(settings, addr, hand_off, mesh).await?;
+    let request = match request {
+        Some(request) => request,
+        None => Request::from_parts(head, body.take()?),
+    };
     let response = sender
-        .send_request(request())
+        .send_request(request)
         .await
         .map_err(|err| AttemptError::Reset(err.to_string()))?;
     Ok(finish(settings, key, sender, response))

@@ -71,6 +71,9 @@ pub use app_object_ops::{
 // §6.11).
 mod demand_ops;
 mod forget_ops;
+// Endpoint-index invalidation from committed changesets (mesh-control-path
+// plan §6.1).
+mod endpoint_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -1457,6 +1460,10 @@ pub struct Store {
     // plan, Phase 2): fed by the changeset projection on every replica,
     // read by whichever manager a worker streams from.
     work_log: Arc<crate::storage::work_log::WorkLog>,
+    // Versioned endpoint sets per service (mesh-control-path plan §6.1):
+    // invalidated by the changeset projection on every replica, read by
+    // the heartbeat's endpoint feed and the work stream's pushes.
+    endpoint_index: Arc<crate::storage::endpoint_index::EndpointIndex>,
     // Eval claims as leader memory (sandbox-scaling plan, Phase 1): which
     // evals this manager's eval workers hold. A claim writes nothing; see
     // `store/eval_claims.rs`.
@@ -2174,6 +2181,7 @@ impl Store {
                 TASK_STATUS_SEED_BATCH_MAX,
             )),
             work_log: Arc::new(crate::storage::work_log::WorkLog::new()),
+            endpoint_index: Arc::new(crate::storage::endpoint_index::EndpointIndex::new()),
             eval_claims: Arc::new(std::sync::Mutex::new(eval_claims::EvalClaims::default())),
             capacity_events: Arc::new(std::sync::Mutex::new(
                 blocked_evals::CapacityEvents::default(),
@@ -12118,6 +12126,7 @@ impl Store {
             error!(error = ?err, "Failed rebuilding the scheduling read model from the state db");
         }
         self.work_log.resync_all();
+        self.endpoint_index.mark_all();
         if keyring {
             self.keyring_rows_changed();
         }
@@ -12685,6 +12694,10 @@ impl Store {
             &changed_volume_ids,
         );
         self.note_checkpoint_changes(checkpoint_nodes, checkpoint_reread_ids);
+        // The endpoint index (mesh-control-path plan §6.1), likewise on
+        // every replica and never failing; free while no node consumes a
+        // service.
+        self.note_endpoint_changes(bytes);
 
         if read_model_only {
             return Ok(());
@@ -15623,12 +15636,19 @@ impl Store {
             return Ok(());
         }
         let node_id = node_id.to_owned();
+        let ids: Vec<i64> = snapshots.iter().map(|s| s.allocation_id).collect();
         let snapshots = snapshots.to_vec();
         self.replicated(
             Lane::Status,
             "upsert_allocation_health_snapshots",
             move |s| s.upsert_allocation_health_snapshots_apply(&node_id, &snapshots),
-        )
+        )?;
+        // `local_disk` mode projects only the read-model tables, which do not
+        // include `allocation_health`: mark the endpoint sets here, after the
+        // commit. In raft mode the projection marked them already; a second
+        // mark costs one re-read.
+        self.endpoint_index.mark_allocations(ids);
+        Ok(())
     }
 
     fn upsert_allocation_health_snapshots_apply(
@@ -18835,6 +18855,12 @@ impl Store {
     /// This manager's per-node work delivery log (`Manager.StreamWork`).
     pub fn work_log(&self) -> Arc<crate::storage::work_log::WorkLog> {
         Arc::clone(&self.work_log)
+    }
+
+    /// This manager's per-service endpoint sets (mesh-control-path plan
+    /// §6.1).
+    pub fn endpoint_index(&self) -> Arc<crate::storage::endpoint_index::EndpointIndex> {
+        Arc::clone(&self.endpoint_index)
     }
 
     // Expose a clone so runtime worker tasks can await wake notifications.
