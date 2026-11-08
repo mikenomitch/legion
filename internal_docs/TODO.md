@@ -1181,6 +1181,14 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
       failure, ACL scope).
 - [ ] **Flaky tests:** `acked_write_survives_any_single_node_loss` on small hosts;
       `worker::forwarder`, `wait_for_next_eval…`, and the guest-agent vsock relay test.
+      Under load on a 4-core box (2026-11-08) these also failed once and passed
+      alone: `raft_durability::leader_loss_mid_burst`,
+      `raft_write_path::every_log_purge_fsyncs_the_state_db_first`,
+      `proxy_hand_offs_cross_nodes_only_over_the_mesh_test`,
+      `plugins_rewrite_requests_and_responses_on_an_http_upstream_test` (WASM
+      10 ms deadline), and `typical_rules_are_cheap_test` (10 ms budget). The
+      lib-test build also needs `-j 1` or `-j 2` on a 15 GB host, or it is
+      OOM-killed.
 - [ ] **Share one target dir across plugin builds** (each rebuilds ~470 crates).
 - [ ] **Decide whether the UI ships inside the binary.**
 - [ ] **Create the `proto-breaking-ok` label** (audit M5).
