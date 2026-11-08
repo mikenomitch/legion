@@ -2,14 +2,18 @@
 
 > **Judgement calls:** [mesh-control-path-plan_calls.md](../calls/mesh-control-path-plan_calls.md)
 
-**Status: IN EXECUTION** (planned and built 2026-11-08, one change for
-[architecture review](../architecture-review-2026-11-07.md) findings NET1–NET9).
+**Status: SHIPPED** (planned and built 2026-11-08, one change for
+[architecture review](../architecture-review-2026-11-07.md) findings NET1–NET9;
+public pages: [service-discovery.md](../../docs/service-discovery.md#how-endpoints-reach-a-node),
+[network-handlers.md](../../docs/network-handlers.md#sessions),
+[cluster-ca.md](../../docs/cluster-ca.md#how-workers-learn)).
 What shipped and what was deferred is listed per phase in
 [Implementation phases](#8-implementation-phases); the deferred items are open
 in [TODO.md](../TODO.md) under *Service discovery & the mesh* and *Networking*.
 Deliberately deferred: pooled node-to-node tunnels (HBONE-style HTTP/2
 CONNECT) and kTLS (NET3's fuller fix), reading guard counters over netlink
-(NET6), and a configurable node port range (NET9).
+(NET6), interning endpoints on the dial path (NET8), and configurable node
+port ranges (NET9).
 
 ## 1. Problem statement
 
@@ -334,7 +338,8 @@ Each phase ships on its own; all shipped in one change.
 6. **NET6** established short-circuit, vmap dispatch, counter interval —
    shipped; netlink counters deferred.
 7. **NET7** splay — shipped.
-8. **NET8** ledger, in-flight, buffers — shipped.
+8. **NET8** ledger, in-flight, buffers — shipped; interning endpoints on the
+   dial path deferred.
 9. **NET9** VIP range and datapath port range — shipped; configurable ranges
    deferred.
 
