@@ -262,7 +262,7 @@ impl Control for GrpcControl {
             {
                 Ok(false)
             }
-            Err(status) => Err(status_error("taking the issuer lock", status)),
+            Err(status) => Err(status_error("taking the certificates lock", status)),
         }
     }
 

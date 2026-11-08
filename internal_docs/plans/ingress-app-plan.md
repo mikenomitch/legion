@@ -2,11 +2,20 @@
 
 > **Judgement calls:** [ingress-app-plan_calls.md](../calls/ingress-app-plan_calls.md)
 
-**Status: IN EXECUTION** (written 2026-11-07). Phases 1 and 2 are built in
-the same change as this plan. Phase 3 is planned and nothing in it is built.
-Where the build differs from this text, the calls doc says how and why. The
-Phase 2 acceptance check against Pebble (§12) has not been run: CI covers
-issuance against an in-process ACME CA instead (calls entry 5).
+**Status: IN EXECUTION** (written 2026-11-07, revised 2026-11-08). Phases 1
+and 2 are built in the same change as this plan. Phase 3 is planned and
+nothing in it is built. Where the build differs from this text, the calls
+doc says how and why.
+
+**Revised 2026-11-08: certificates come from the cert manager.** The
+in-app ACME client of §6.5 was built, then replaced before merge by
+delegation to the bundled cert manager (`certs`, cert-manager plan): the
+ingress keeps one `certs/Certificate` per routed host and answers HTTP-01
+from the Issuer's thumbprint (§6.7, calls entry 1). §6.7 wins where it and
+§6.2 or §6.5 disagree; those sections stay as written, marked. The same
+revision added where to point DNS (§6.8). Phase 2's Pebble check (§12) is
+replaced by an end-to-end test against the cert manager and its fake ACME
+CA, which validates HTTP-01 through the ingress.
 
 Deliberately deferred:
 
@@ -15,8 +24,8 @@ Deliberately deferred:
 - per-namespace host ownership
 - TCP and TLS passthrough routes
 - waking a suspended or scaled-to-zero service on a request
-- wildcard certificates (they need DNS-01)
 - metrics and access logs
+- a load benchmark, and a connection limit
 
 ---
 
@@ -274,6 +283,9 @@ $ legion app view ingress nav                  # every route, backends, certific
 $ legion app config set ingress -f ingress.json
 ```
 
+> **Superseded by §6.7** for the certificate fields: the config is now
+> `certificates`, `issuer`, `acme { server, email }`, and `redirectHttps`.
+
 The app's config. Every field is optional:
 
 ```json
@@ -326,7 +338,7 @@ and the field is a no-op. Any other name is a submit error:
 Error: exec hardening: capabilities.add may name only net_bind_service, which lets a task bind ports below 1024 without root; "sys_admin" would make it root-equivalent
 ```
 
-Why not the datapath's root-owned listener? See calls entry 1: it costs a
+Why not the datapath's root-owned listener? See calls entry 2: it costs a
 hop and hides the client's address.
 
 **Bundled apps can be seeded disabled.** `BundledApp` gains `seed_enabled`.
@@ -377,6 +389,10 @@ ACME issuer (KV lock holder only) ─► legion/apps/ingress/acme/certs/<host>
 
 ### 6.5 Certificates
 
+> **Superseded by §6.7** for ordering: the ingress no longer runs an ACME
+> client, account, challenge board, or issuer lock. Serving (SNI from KV),
+> operator bundles, and redirects are unchanged.
+
 - **Where.** The ingress's own reserved KV prefix:
   - `legion/apps/ingress/certs/<anything>`: operator bundles, which win;
   - `legion/apps/ingress/acme/certs/<host>`: ordered by the app;
@@ -426,10 +442,66 @@ Views (`legion-view/1`), each needing `job:read`:
 when a listener could not be bound. A manager outage keeps the last routes
 serving.
 
+### 6.7 Certificates from the cert manager (revision)
+
+The cert manager (cert-manager plan) shipped a general Issuer/Certificate
+model on the same cluster, and two ACME clients in one product is the
+duplication the revision removes. The ingress becomes a client of it:
+
+- **One Certificate per provable routed host**, in `legion-system`, named
+  `<host-slug>-<10 hex of sha256(host)>`, labeled `ingress/managed=true`
+  and `ingress/host=<host>`, with `kv =
+  legion/apps/ingress/issued/<name>`. Hosts the Issuer cannot prove are
+  skipped with a reason; hosts an operator bundle covers are skipped. A
+  route that goes takes its Certificate and its KV key with it.
+- **The Issuer.** Config `issuer`, default `ingress`. For `ingress`, the
+  app keeps the Issuer itself from `acme { server, email }`: ACME with
+  `http01 = {}`, `namespaces = ["legion-system"]`. Any other name must
+  exist and serve `legion-system`; the views say when it does not.
+- **HTTP-01** is answered on `:80` from the Issuer's status `thumbprint`
+  with `certs::http01::answer`, the same stateless responder `legion cert
+  http01` uses. Every replica re-reads the Issuer every 5 s until it has the
+  thumbprint, then every pass.
+- **No order before the account.** With an HTTP-01-only Issuer and no
+  thumbprint yet, new Certificates wait, so the first order cannot fail its
+  challenge into the cert manager's 5-minute backoff.
+- **One writer** by the KV lock `legion/apps/ingress/certificates/lock`
+  (90 s lease), renewed every pass (30 s, and 2 s after routes settle).
+  Every replica reads; only the holder applies and deletes.
+- **Serving** is §6.5's KV store, reading `issued/` beside the operator's
+  `certs/`; operator bundles still win.
+- **Grants.** The ingress gains `object` read/write on
+  `certs/Certificate` in `legion-system`, read on `certs/Issuer`, and write
+  on the `certs/Issuer` named `ingress`. The cert manager's `via =
+  "objects"` KV rule names `legion/apps/*` beside `*`, so acting for the
+  ingress's Certificate it can write the ingress's private prefix; the
+  for-object authority (what the Certificate's writer was checked for)
+  still bounds it to keys that writer holds.
+- **Config surface.** `acme.enabled` → `certificates`;
+  `acme.directory` → `acme.server` (the cert manager's spelling);
+  `acme.trustRoots` is gone (a private ACME CA is an Issuer of your own).
+
+### 6.8 Where to point DNS (revision)
+
+The quick start's weakest step was "point DNS at the node's address",
+which the views showed as a cluster address only. Now:
+
+- The ingress's job declares a catalog service, `legion-system/ingress`
+  (port `http`), so `legion service resolve legion-system/ingress` lists
+  every replica with its `publicAddress` (from
+  `LEGION_WORKER_PUBLIC_ADDRESS`).
+- The app resolves its own service every 10 s and shows **Point DNS here**
+  on its page: the addresses, public first, and how to give a NAT'd node a
+  public address.
+- It resolves each exact routed host from its node (at once for a new host
+  or a changed replica set, and every 60 s), and the Routes table's DNS
+  column reads `points here`, `points to <ips>`, or `no record`.
+
 ## 7. Proto, struct, config, and persistence changes
 
 - **No proto change.** Everything rides existing RPCs: `WatchAppExtensions`,
-  `ResolveService`, KV, and KV locks.
+  `ResolveService`, KV, KV locks, and (§6.7) `ApplyObject`, `GetObject`,
+  `ListObjects`, and `DeleteObject`.
 - **No store change.** The app's records are KV under its reserved prefix.
 - **Exec runtime:** `hardening.capabilities.add`, validated, honoured on
   Linux. It goes in `configs/jobs/maximal.ncl`, `docs/task-runtime-exec.md`,
@@ -456,10 +528,12 @@ balancer or with `acme.enabled = false`)**
 
 **Phase 2: HTTPS (ships alone on top of Phase 1)**
 - `:443` with the SNI store from KV.
-- The ACME client and issuer, with lock, backoff, and renewal.
+- ~~The ACME client and issuer, with lock, backoff, and renewal.~~ Revised:
+  a Certificate per host from the cert manager, with the lock (§6.7).
 - The redirect.
 - Certificates in the views.
-- Docs, and a Pebble end-to-end test.
+- Where to point DNS (§6.8).
+- Docs, and an end-to-end test against the cert manager (replaces Pebble).
 
 **Phase 3: planned**
 - A `WatchServices` stream to replace polling, so a deploy's new endpoints
@@ -472,7 +546,8 @@ balancer or with `acme.enabled = false`)**
 - Waking suspended keyed instances and scale-from-zero services on a
   request (the autoscaler's reserved `wake` source).
 - TCP and TLS passthrough routes.
-- DNS-01 and wildcard certificates.
+- ~~DNS-01 and wildcard certificates.~~ Available through §6.7: name a
+  DNS-01 Issuer in `issuer`.
 - HSTS.
 
 ## 9. Testing plan
@@ -497,9 +572,13 @@ balancer or with `acme.enabled = false`)**
   - a real in-process manager: the bundled app is seeded disabled, its key
     validates at submit, and its values reach the app's identity over
     `WatchAppExtensions`;
-  - ACME end to end against an in-process CA that verifies every JWS and
-    validates HTTP-01 against the ingress (runs in CI), and against Pebble
-    when `LEGION_TEST_PEBBLE_DIR` holds its binaries (skipped otherwise).
+  - ~~ACME end to end against an in-process CA, and against Pebble.~~
+    Revised: against a fake control, a Certificate per host (skipped
+    wildcard and internal names, removal with the route, the account gate),
+    a named Issuer, HTTP-01 from the thumbprint, and the DNS check; and in
+    `tests/integration/certs.rs`, the real cert manager engine issuing for
+    the ingress through the cert manager's fake ACME CA, which validates
+    HTTP-01 against the ingress's port.
 - **Existing tests that assert the seeded list is exactly `["autoscaler"]`**
   are updated to include the ingress.
 
@@ -520,7 +599,7 @@ balancer or with `acme.enabled = false`)**
 
 ## 11. Open questions
 
-- **Should the ingress be on by default?** Lean: no (calls entry 3).
+- **Should the ingress be on by default?** Lean: no (calls entry 5).
   Revisit if a manager-config "edge" flag appears.
 - **Should routes also be app objects** (`ingress/Route`), for hosts that
   point outside Legion? Lean: later, if asked. A service is the common
@@ -539,8 +618,12 @@ balancer or with `acme.enabled = false`)**
   refresh, with no client errors for GETs.
 
 **Phase 2**
-- With `acme.directory` pointed at Pebble, a routed host gets a
-  certificate within one issuer pass. Both replicas serve it, and
-  `http://` redirects.
+- ~~With `acme.directory` pointed at Pebble, a routed host gets a
+  certificate within one issuer pass.~~ Revised: a routed host gets a
+  Certificate in `legion-system`, the cert manager issues it through
+  HTTP-01 answered by the ingress with no failed order, every replica
+  serves it, and `http://` redirects.
+- `legion service resolve legion-system/ingress` and the Ingress page name
+  the addresses to point DNS at, and each route's DNS is checked.
 - An operator bundle under `legion/apps/ingress/certs/` is served for its
   names, and no order is placed for them.

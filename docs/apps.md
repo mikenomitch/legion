@@ -108,9 +108,11 @@ as Let's Encrypt, a private CA kept in KV, or self-signed) and
 certificate goes to), each requiring of its writer `kv` access to every
 key it names. Its grant is `kv` read and write under its reserved
 `legion/apps/certs/` (one ACME account key per Issuer), and `kv` read and
-write on `*` with `via = "objects"`: every other key it reads or writes, it
-does acting for the object that names it, so its own credential can touch
-no user key at all. It runs one replica and takes no config. Its UI is a
+write on `*` and `legion/apps/*` with `via = "objects"`: every other key it
+reads or writes, it does acting for the object that names it, so its own
+credential can touch no user key at all, and it reaches another app's
+private prefix only for that app's own Certificates (the ingress keeps its
+certificates that way). It runs one replica and takes no config. Its UI is a
 Certificates page in the sidebar and a card on the cluster overview.
 `legion cert renew` re-issues a certificate now, and `legion cert http01`
 is the stateless HTTP-01 responder it pairs with.
@@ -122,13 +124,19 @@ The **ingress** routes public hostnames to services
 already serves. It reads the values over `WatchAppExtensions`, resolves each
 routed service's endpoints, and proxies on ports 80 and 443. Its task keeps
 `CAP_NET_BIND_SERVICE` through `hardening.capabilities.add`, so it binds
-those ports as its own uid. It orders certificates from an ACME CA (Let's
-Encrypt by default) over HTTP-01, one issuer per cluster by a KV lock, and
-keeps them, its ACME account, and the challenge answers under its reserved
-`legion/apps/ingress/`. Its grant is `job:read` in every namespace (the
-catalog) and `kv` read and write under `legion/apps/ingress/`. Its config
-takes `acme` (`enabled`, `directory`, `email`, `trustRoots`; `directory`
-and `trustRoots` are code fields) and `redirectHttps`. Its UI is an Ingress
+those ports as its own uid. It gets certificates from the cert manager: one
+`certs/Certificate` in `legion-system` per routed host its Issuer can prove,
+written under its reserved `legion/apps/ingress/`, with HTTP-01 answered on
+port 80 from the Issuer's account thumbprint and one writer per cluster by a
+KV lock. Unless its config names another Issuer it keeps its own, `ingress`
+(Let's Encrypt, HTTP-01, for `legion-system` only). Its job declares the
+catalog service `legion-system/ingress`, which it reads back to show where
+DNS should point. Its grant is `job:read` in every namespace (the catalog)
+and on its own job, `kv` read and write under `legion/apps/ingress/`,
+`certs/Certificate` read and write in `legion-system`, `certs/Issuer` read,
+and `certs/Issuer` write on `ingress` alone. Its config takes
+`certificates`, `issuer`, `acme` (`server`, `email`; `issuer` and
+`acme.server` are code fields), and `redirectHttps`. Its UI is an Ingress
 page in the sidebar and a panel on the page of each job it routes.
 
 **Installed apps** come from a manifest file or URL (`legion app install`).

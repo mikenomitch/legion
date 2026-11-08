@@ -876,11 +876,19 @@ is structured:
   says when a name gets no automatic certificate, or when the ingress is
   disabled and so did not check (`legion app enable ingress`, an `app:write`
   call, turns it on).
+- **Where DNS should point** is `legion service resolve
+  legion-system/ingress -j`: each replica's `address` and, when its worker
+  has one, `publicAddress`. `legion app view ingress nav -j` carries the
+  same under "Point DNS here", and each route's DNS as the ingress sees it
+  (`points here`, `points to <ips>`, `no record`).
 - **After deploy**, `legion app view ingress job <job> -j` returns the job's
-  routes: each URL, its service's healthy and total endpoints, its
-  certificate's state (`acme, 89d left`, `ordering`, `ordering failed`,
+  routes: each URL, its service's healthy and total endpoints, its DNS, its
+  certificate's state (`cert manager, 89d left`, `requested`, `waiting for
+  issuer`, the cert manager's failure reason such as `IssueFailed`, or
   `HTTP only`), and any problem. `legion app view ingress nav -j` is the
-  whole page.
+  whole page. The certificate itself is a Certificate in `legion-system`
+  (`legion object list certificates -n legion-system -j`), with the cert
+  manager's full status.
 - **Its own errors** use the standard envelope with a `Legion-Ingress-Error`
   header (`no_route`, `no_endpoint`, `bad_gateway`, `upstream_timeout`), and
   `retryable` with `Retry-After` where waiting helps. An agent polling for a

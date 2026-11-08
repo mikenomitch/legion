@@ -1,8 +1,8 @@
 # Ingress
 
 The ingress puts your services on the internet. Add one line to a service,
-point DNS at your cluster, and the service answers at its hostname over
-HTTPS, with a certificate Legion orders and renews for you.
+point DNS where the ingress tells you, and the service answers at its
+hostname over HTTPS, with a certificate Legion issues and renews for you.
 
 ```nickel
 service = {
@@ -14,9 +14,9 @@ service = {
 The ingress is one of Legion's [bundled apps](apps.md), like the
 autoscaler. It is a proxy on ports 80 and 443 of the nodes it runs on. It
 routes each request by hostname and path to the healthy instances of the
-service that claimed them, and it orders certificates from Let's Encrypt
-(or any ACME CA). You don't install a proxy, write proxy config, or run a
-certificate manager.
+service that claimed them, and it gets a certificate for each hostname from
+the bundled [cert manager](cert-manager.md), from Let's Encrypt by default.
+You don't install a proxy, write proxy config, or set up certificates.
 
 ## Quick start
 
@@ -55,13 +55,23 @@ job:
 $ legion job run shop.ncl
 ```
 
-**3. Point DNS at it.** Create an `A` record for `shop.example.com` with
-the public address of the node the ingress runs on. The Ingress page in the
-UI (`legion app view ingress nav` in the terminal) lists each replica's node
-under **Listening on**. That is the node's cluster address. On a cloud VM
-behind NAT, use the VM's public IP.
+**3. Point DNS at it.** Ask where:
 
-Within a minute or so the ingress orders a certificate over HTTP-01, and:
+```console
+$ legion service resolve legion-system/ingress
+ADDRESS        PUBLIC          ALLOC  NODE                    HEALTHY  STATUS
+10.0.3.17:80   203.0.113.7:80  12     legion-system-x8f2k1qz  yes      running
+```
+
+Create an `A` record for `shop.example.com` pointing at the `PUBLIC`
+address, or at `ADDRESS` when `PUBLIC` is `-`. The Ingress page in the UI
+(`legion app view ingress nav` in the terminal) says the same under **Point
+DNS here**, and its Routes table checks each host's DNS for you
+([Where to point DNS](#where-to-point-dns)).
+
+Once DNS points at the ingress, the cert manager gets a certificate from
+Let's Encrypt (the CA checks the name over HTTP-01, which the ingress
+answers), and within a minute or so:
 
 ```console
 $ curl -I http://shop.example.com/
@@ -104,8 +114,8 @@ ingress = { host = ["example.com", "www.example.com"] },
 # /api/... goes here, everything else to the site.
 ingress = { host = "example.com", path = "/api", stripPath = true },
 
-# Every tenant subdomain to one service (needs your own wildcard
-# certificate for HTTPS; see below).
+# Every tenant subdomain to one service (HTTPS needs a DNS-01 Issuer or
+# your own wildcard certificate; see below).
 ingress = { host = "*.apps.example.com" },
 ```
 
@@ -132,10 +142,10 @@ shop: task web: service web: ingress (ingress app): shop.example.com/ is already
 Hint: the app refused these values; fix them and submit again
 ```
 
-It also warns about names it cannot get a certificate for:
+It also warns about names its Issuer cannot prove:
 
 ```text
-warning: shop: task web: service web: ingress (ingress app): shop.internal gets no automatic certificate (no public CA issues for it); it is served over HTTP unless an operator bundle under legion/apps/ingress/certs/ covers it
+warning: shop: task web: service web: ingress (ingress app): shop.internal gets no automatic certificate (no public CA issues for shop.internal: serve it over HTTP, or use a ca Issuer); it is served over HTTP unless an operator bundle under legion/apps/ingress/certs/ covers it
 ```
 
 While the app is disabled, values are accepted after the schema check, with
@@ -176,7 +186,7 @@ $ legion app set ingress --placement workers --pool edge --replicas 4
 | --- | --- | --- |
 | placement | `managers` | The managers' [system workers](architecture-managers-workers.md#the-system-worker). Right for clusters whose managers face the internet. |
 | replicas | `1` | One per node. Point DNS at every node that runs one (round-robin `A` records, or a cloud load balancer across them). |
-| resources | 500 MHz, 256 MiB | `legion app set ingress --cpu 2000 --memory 512`. On managers, it shares the system worker's lend (`systemWorker.resources`, 1000 MHz and 1024 MiB by default). |
+| resources | 500 MHz, 256 MiB | `legion app set ingress --cpu 2000 --memory 512`. On managers, it shares the system worker's lend (`systemWorker.resources`, 1000 MHz and 1024 MiB by default) with the other bundled apps. |
 
 `--placement workers` (or `any`) needs `operator:write`
 ([Placement](apps.md#placement)). The workers it lands on must accept the
@@ -184,12 +194,56 @@ $ legion app set ingress --placement workers --pool edge --replicas 4
 `namespaces = ["*", "legion-*"]` or `["legion-system"]`
 ([Nodes that accept only some namespaces](namespaces.md#nodes-that-accept-only-some-namespaces)).
 
+**Sizing.** On managers, the system worker's lend is a hard ceiling: the
+cgroup caps the ingress, the cert manager, and the other bundled apps
+together at `systemWorker.resources`, one CPU by default. That is plenty
+for a small site and for TLS handshakes at a modest rate, but a busy site
+will hit it, and the proxy then slows rather than fails. For real traffic,
+run it on edge workers (`--placement workers --pool edge`) with
+`--cpu`/`--memory` to match, or raise `systemWorker.resources` on the
+managers.
+
 To seed it on for every new cluster, set it in the manager config:
 
 ```nickel
 # configs/manager.ncl
 apps = { ingress = { enabled = true } },
 ```
+
+### Where to point DNS
+
+The ingress's job declares a catalog service, `legion-system/ingress`, so
+its replicas are listed like any service's endpoints:
+
+```console
+$ legion service resolve legion-system/ingress -j | jq -r '.data[] | .publicAddress // .address'
+203.0.113.7
+10.0.3.18
+```
+
+Point each routed host at those addresses: one `A` (or `AAAA`) record per
+address, or a cloud load balancer across them. Listing `legion-system`
+takes a rule that names it (an operator's token has one); the Ingress page
+shows the same addresses to anyone who can open it. `PUBLIC` is the address the
+node's worker reports with `LEGION_WORKER_PUBLIC_ADDRESS`; a node without
+one shows only its cluster address. On a cloud VM behind NAT, start its
+worker with `LEGION_WORKER_PUBLIC_ADDRESS=<public IP>` and the public
+address appears here and on the page.
+
+The Ingress page's **Point DNS here** block lists the same addresses, and
+its Routes table has a **DNS** column. The ingress resolves every routed
+host from its own node, at once for a new route and every minute after:
+
+| DNS column | Meaning |
+| --- | --- |
+| `points here` | The host resolves to at least one replica's address (cluster or public). |
+| `points to 198.51.100.4` | It resolves, but to none of them: an old record, or another server. |
+| `no record` | It does not resolve. |
+| `-` | A wildcard: there is no single name to look up. |
+
+The check sees DNS as the ingress's node does, so split-horizon DNS, or a
+CDN or load balancer in front of the ingress, reads `points to` while the
+route works fine.
 
 ### Ports below 1024 without root
 
@@ -209,52 +263,124 @@ handshake rather than serve the wrong one.
 
 ### Automatic certificates
 
-For every routed host a public CA could issue for, the ingress orders a
-certificate over ACME HTTP-01 and renews it when a third of its lifetime is
-left. That is about 30 days before expiry for Let's Encrypt's 90-day
-certificates.
+The ingress does not order certificates itself: the bundled
+[cert manager](cert-manager.md) does. For every routed host its Issuer can
+prove, the ingress keeps one `certs/Certificate` in `legion-system` and
+serves what the cert manager writes for it. You see them like any other
+Certificate:
 
-- **One issuer per cluster.** Every replica runs the issuer, but only the
-  holder of a KV lock orders, so a certificate is ordered once however many
-  replicas run. The challenge answer is written to the app's KV first, and
-  any replica the CA reaches answers it.
-- **Shared.** Ordered certificates are stored in KV
-  (`legion/apps/ingress/acme/certs/<host>`). Every replica loads new ones
-  within 10 seconds.
-- **Names it does not order.** Wildcards (HTTP-01 cannot prove them), IP
-  addresses, single-label names, and the names reserved for local and test
-  use: `localhost`, `.local`, `.internal`, `.test`, `.example`, `.invalid`,
-  `.lan`, `.localdomain`, `.home.arpa`. Those are served over HTTP, or over
-  HTTPS with your own certificate.
-- **Failures back off per host.** The waits are 5 minutes, then 10, then 20,
-  doubling up to 6 hours, which stays inside Let's Encrypt's limit of 5
-  failed validations per host per hour. The usual cause is DNS that does
-  not point at the ingress yet. The Ingress page shows each host's last
-  error.
+```console
+$ legion object list certificates -n legion-system
+```
+
+- **The Issuer.** By default it is `ingress`, an ACME Issuer for Let's
+  Encrypt over HTTP-01 that the ingress creates and keeps from its `acme`
+  config. It serves only `legion-system`, so tenants cannot use it. Name
+  another Issuer in the config to use that one instead
+  ([Using your own Issuer](#using-your-own-issuer)).
+- **The ingress answers HTTP-01.** On port 80,
+  `/.well-known/acme-challenge/<token>` gets `<token>.<thumbprint>`, where
+  the thumbprint is the Issuer's public ACME account thumbprint. Every
+  replica answers every challenge, with no shared state and no list of
+  pending challenges. Challenges are never redirected to HTTPS.
+- **Nothing is asked for before the account exists.** Until the cert
+  manager has registered the Issuer's ACME account, the ingress could not
+  answer a challenge, and a failed first order would wait out the cert
+  manager's 5-minute backoff. So new Certificates wait for the account, and
+  the page reads `waiting for the Issuer to register its ACME account`.
+- **One Certificate per host.** Each is named after its host (`shop.example.com`
+  becomes `shop-example-com-<hash>`), labeled `ingress/managed=true` and
+  `ingress/host=<host>`, and written to `legion/apps/ingress/issued/<name>`,
+  the ingress's own KV. When a route goes, its Certificate and its key go
+  with it.
+- **Renewal, retries, and rate limits** are the cert manager's
+  ([When it is issued](cert-manager.md#when-it-is-issued),
+  [Failures and rate limits](cert-manager.md#failures-and-rate-limits)):
+  renewal when a third of the lifetime is left, and failures backing off
+  from 5 minutes to 6 hours. The usual cause of a failure is DNS that does
+  not point at the ingress yet.
+- **One writer.** Every replica follows the Issuer and the Certificates,
+  but only the holder of a KV lock writes them, so two replicas that see a
+  route change a moment apart do not undo each other. Every replica loads
+  new certificates within 10 seconds.
+- **Names it does not ask for**, with an HTTP-01 Issuer: wildcards (HTTP-01
+  cannot prove them), IP addresses, single-label names, and the names
+  reserved for local and test use: `localhost`, `.local`, `.internal`,
+  `.test`, `.example`, `.invalid`, `.lan`, `.localdomain`, `.home.arpa`.
+  Those are served over HTTP, or over HTTPS with your own Issuer or bundle.
+  The page says why for each.
 
 **Turning the ingress on agrees to the CA's terms of service** (Let's
-Encrypt's subscriber agreement, by default) on your behalf, as Caddy does.
-Set `acme.enabled = false` if you will not.
+Encrypt's subscriber agreement, by default) on your behalf, as Caddy does:
+the default Issuer registers an account. Set `certificates = false` if you
+will not.
 
-Point it at another CA, or at Let's Encrypt's staging environment while
-you test, through the app's config:
+Point the default Issuer at Let's Encrypt's staging environment while you
+test, or at another ACME CA, through the app's config:
 
 ```console
 $ cat ingress.json
-{ "acme": { "directory": "letsencrypt-staging", "email": "ops@example.com" } }
+{ "acme": { "server": "letsencrypt-staging", "email": "ops@example.com" } }
 $ legion app config set ingress -f ingress.json
 ```
 
-| `acme.` field | Default | Meaning |
+| Field | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `true` | Order certificates. Turn it off behind a load balancer that terminates TLS. |
-| `directory` | `letsencrypt` | `letsencrypt`, `letsencrypt-staging`, or an ACME directory URL (`https://`). Each directory keeps its own account. |
-| `email` | none | The account's contact address. |
-| `trustRoots` | none | Extra PEM roots to trust when talking to the directory: a private ACME CA such as step-ca. |
+| `certificates` | `true` | Ask the cert manager for a certificate per routed host. Turn it off behind a load balancer that terminates TLS. |
+| `issuer` | `ingress` | The `certs/Issuer` that issues them. `ingress` is the one the app keeps from `acme`; any other name must already exist. |
+| `acme.server` | `letsencrypt` | The default Issuer's CA: `letsencrypt`, `letsencrypt-staging`, or an ACME directory URL (`https://`). Ignored when `issuer` names another. |
+| `acme.email` | none | The default Issuer's account contact address. |
+| `redirectHttps` | `true` | Redirect plain HTTP to HTTPS for hosts with a certificate ([Redirects](#redirects)). |
 
-`directory` and `trustRoots` are [code fields](apps.md#config): changing
-them needs the app's whole grant, because they decide who can obtain
+`issuer` and `acme.server` are [code fields](apps.md#config): changing them
+needs the app's whole grant, because they decide who can obtain
 certificates for your hosts.
+
+The cert manager is on by default on every cluster. If it is disabled,
+nothing is issued: the page's Certificates notice says the Issuer is not
+ready (or missing), and hosts are served over HTTP, or from your own
+bundles, until it is back (`legion app enable certs`).
+
+### Using your own Issuer
+
+The default Issuer proves exact public names over HTTP-01. For anything
+else, write an Issuer that can, list `legion-system` in its `namespaces`
+(`*` does not reach the reserved `legion-*` namespaces), and name it in the
+ingress's config:
+
+- **Wildcard hosts** (`*.apps.example.com`): an ACME Issuer with `dns01`
+  ([DNS-01](cert-manager.md#dns-01)).
+- **Internal names** (`admin.internal`): a private CA
+  ([A private CA](cert-manager.md#a-private-ca)). Every name is provable,
+  and clients must trust the CA.
+- **A CA that needs an account binding** (ZeroSSL, Google): ACME with
+  `eab` ([ACME](cert-manager.md#acme)).
+
+```nickel
+# edge-issuer.ncl
+{
+  kind = "certs/Issuer",
+  name = "edge",
+  spec = {
+    namespaces = ["legion-system"],
+    acme = {
+      email = "ops@example.com",
+      dns01 = { cloudflare = { apiToken = { kv = "secrets/cloudflare-dns" } } },
+    },
+  },
+}
+```
+
+```console
+$ legion object apply -f edge-issuer.ncl --wait
+$ echo '{ "issuer": "edge" }' > ingress.json
+$ legion app config set ingress -f ingress.json
+```
+
+The ingress then asks `edge` for every routed host it can prove, wildcards
+included, and stops keeping its own `ingress` Issuer (it does not delete
+it). An Issuer that does not serve `legion-system` is named on the page,
+with the fix.
 
 ### Your own certificates
 
@@ -266,8 +392,9 @@ $ legion kv put legion/apps/ingress/certs/corp-wildcard "$(cat wildcard.crt chai
 ```
 
 The ingress serves it for every DNS name in the leaf's subject alternative
-names, wildcards included, within 10 seconds, and orders nothing for names
-it covers. Your bundle wins over an ordered certificate for the same name.
+names, wildcards included, within 10 seconds, and asks the cert manager for
+nothing it covers. Your bundle wins over an issued certificate for the same
+name.
 Replace the key to rotate it, and delete it to stop serving it. A bundle
 that does not load (a key that does not match its certificate, or a leaf
 with no DNS names) is listed on the Ingress page with the reason.
@@ -339,12 +466,16 @@ header:
 ## Seeing it
 
 - **The Ingress page** (sidebar; `legion app view ingress nav`). It shows:
-  - where the ingress listens;
+  - **Point DNS here**: every replica's node and address;
   - every route you can read, with its URL, its service's healthy and total
-    endpoints, its certificate's state, and any problem (a lost conflict, a
-    stopped job, no healthy endpoint, a mesh-only service);
-  - every certificate, with its source, issuer, and expiry, plus ordering
-    failures and bundles that do not load.
+    endpoints, its DNS, its certificate's state, and any problem (a lost
+    conflict, a stopped job, no healthy endpoint, a mesh-only service);
+  - every certificate, with its source (your bundle or the cert manager),
+    issuer, and expiry; Certificates the cert manager has not issued, with
+    its reason; hosts it was not asked for, with why; and bundles that do
+    not load;
+  - a notice when the Issuer is missing, not ready, or does not serve
+    `legion-system`.
 
   Only namespaces where you hold `job:read` are listed.
 - **The Ingress panel on a job's page** (`legion app view ingress job
@@ -353,17 +484,19 @@ header:
   report route and certificate counts. The app is unhealthy only when it
   cannot bind its ports. A lost connection to the manager is reported, and
   routing carries on.
-- **Logs** (`legion app logs ingress -f`): routes changing, certificates
-  ordered or failing, the issuer lock moving between replicas.
+- **Logs** (`legion app logs ingress -f`): routes changing, Certificates
+  asked for and dropped, bundles loaded, the certificates lock moving
+  between replicas. The cert manager logs the orders themselves
+  (`legion app logs certs -f`).
 
 ## Behind a load balancer
 
 If a cloud load balancer terminates TLS in front of the ingress, turn
-ordering off. Requests then arrive on port 80 and are routed by `Host` as
-usual:
+certificates off. Requests then arrive on port 80 and are routed by `Host`
+as usual:
 
 ```json
-{ "acme": { "enabled": false } }
+{ "certificates": false }
 ```
 
 The load balancer must pass `Host` through. The ingress appends the load
@@ -371,16 +504,24 @@ balancer's address to `X-Forwarded-For`, after the client's.
 
 ## Security
 
-- **What the app may do.** The ingress's grant is `job:read` in every
-  tenant namespace, which it uses to read the service catalog, and `kv` read
-  and write under its own `legion/apps/ingress/`. It cannot change jobs or
-  read anyone else's KV. It runs as its own uid, holding only
+- **What the app may do.** The ingress's grant is exactly what it calls:
+  - `job:read` in every tenant namespace, to read the service catalog, and
+    on its own job in `legion-system`, to list its replicas;
+  - `kv` read and write under its own `legion/apps/ingress/`;
+  - `certs/Certificate` read and write in `legion-system`, `certs/Issuer`
+    read, and `certs/Issuer` write on the one named `ingress`.
+
+  It cannot change jobs, read anyone else's KV, or touch another Issuer or
+  another namespace's Certificates. It runs as its own uid, holding only
   `CAP_NET_BIND_SERVICE`.
-- **Where its secrets live.** Certificate private keys, ordered or yours,
-  and the ACME account key live in KV under `legion/apps/ingress/`. That
-  KV is encrypted at rest when [KV encryption](kv-encryption.md) is on.
-  Reading it takes a rule that names the reserved prefix, or a management
-  token.
+- **Where its secrets live.** Certificate private keys live in KV under
+  `legion/apps/ingress/`: your bundles under `certs/`, and what the cert
+  manager issues under `issued/`. The cert manager writes there only acting
+  for one of the ingress's own Certificates, which only the ingress can
+  write ([Access](cert-manager.md#access)). The ACME account key is the
+  cert manager's, under `legion/apps/certs/`. That KV is encrypted at rest
+  when [KV encryption](kv-encryption.md) is on. Reading it takes a rule that
+  names the reserved prefix, or a management token.
 - **Hostnames are first come, first served.** Any job author whose service
   can be routed can claim any hostname nobody has claimed yet. On a cluster
   whose DNS points a wildcard at the ingress, that author can then get a
@@ -409,9 +550,17 @@ balancer's address to `X-Forwarded-For`, after the client's.
   so each node stops answering for a few seconds. Run two or more replicas
   behind DNS to ride through it.
 - **IPv4 listeners.** The ingress listens on `0.0.0.0`.
-- **No wildcard certificates from ACME** (they need DNS-01). Bring your own.
+- **Wildcards and internal names need an Issuer of your own** (DNS-01 or a
+  private CA), or your own bundle. The default Issuer proves exact public
+  names over HTTP-01 only.
+- **A brand-new Issuer with several replicas.** Each replica reads the
+  Issuer's thumbprint every 5 seconds until it has it, and the writer asks
+  for Certificates as soon as it does. For those few seconds, a challenge
+  that reaches another replica gets `503`, and the cert manager retries
+  after its backoff. Once the account exists the thumbprint never changes.
+- **The DNS check is from the ingress's node**, and only for exact names.
 - **No metrics endpoint or access log yet.** Routes and certificates are
-  on the Ingress page, and the app logs each order and failure.
+  on the Ingress page, and the app logs routes and Certificates.
 - **No waking a suspended or scaled-to-zero service.** To wake suspended
   keyed instances on a request, use the [gateway](gateway.md).
 
@@ -421,5 +570,6 @@ balancer's address to `X-Forwarded-For`, after the client's.
   ingress` prints the config schema).
 - The key: `legion app extensions ingress`, `legion job schema`.
 - Bundled apps, settings, and the trust model: [apps.md](apps.md).
+- The cert manager, Issuers, and Certificates: [cert-manager.md](cert-manager.md).
 - Exec capabilities: [task-runtime-exec.md](task-runtime-exec.md),
   [task-supervision.md](task-supervision.md#process-hardening).

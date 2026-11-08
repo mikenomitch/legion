@@ -315,9 +315,10 @@
                 #   probe = { path = "/healthz" },
                 # The bundled ingress's key (docs/ingress.md): route these
                 # public hostnames, under `path`, to this service, with
-                # automatic HTTPS. The ingress speaks plain HTTP to the
-                # service, so it reports a `mesh = true` service like this
-                # one as unroutable; route a service without `mesh`.
+                # HTTPS from the cert manager. The ingress speaks plain
+                # HTTP to the service, so it reports a `mesh = true`
+                # service like this one as unroutable; route a service
+                # without `mesh`.
                 ingress = {
                     host = ["maximal.acme.dev", "www.maximal.acme.dev"],
                     path = "/",          # a prefix, on segment boundaries
