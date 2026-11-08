@@ -574,6 +574,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#67](https://github.com/mikenomitch/legion/pull/67) | Tier 1 spot-check bugs and four security gaps: lanes DAG stall, rollout DAG freeze, sidecar retire, orphaned tasks, batch outcomes across restarts, `never`, keyed move budget, restore placement and network shape; host guard for git/OCI/S3, gated exec netns, private image cache, old runc | Plan [launch-blockers-and-security-gaps-plan.md](plans/launch-blockers-and-security-gaps-plan.md) SHIPPED; items checked off in place and in Done; not yet re-run on the rig |
 | [#64](https://github.com/mikenomitch/legion/pull/64) | The built-in cert manager: the bundled `certs` app (ACME, private-CA, and self-signed Issuers; Certificates in KV, renewed) and `legion cert` | Plan [cert-manager-plan.md](plans/cert-manager-plan.md) SHIPPED (Phase 1); checked off and in Done, the deferrals open under Ecosystem apps |
 | [#62](https://github.com/mikenomitch/legion/pull/62) | An architecture review against best-in-class designs | Doc only: [architecture-review-2026-11-07.md](architecture-review-2026-11-07.md); its findings are open items under their areas |
 | [#58](https://github.com/mikenomitch/legion/pull/58) | Park: the workload says when it is waiting, and its node suspends it | Plan [park-plan.md](plans/park-plan.md); Phases 1–2, entries under "Park" above and in Done |

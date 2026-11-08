@@ -2,7 +2,7 @@
 
 > **Judgement calls:** [launch-blockers-and-security-gaps-plan_calls.md](../calls/launch-blockers-and-security-gaps-plan_calls.md)
 
-**Status: SHIPPED** on branch `claude/festive-johnson-rfoku6`, except what §9
+**Status: SHIPPED** in [#67](https://github.com/mikenomitch/legion/pull/67), except what §9
 names as deferred. Nothing here has run on the AWS rig yet; every fix is
 covered by unit or integration tests only.
 
@@ -151,8 +151,10 @@ per-identity worker lock; re-running the AWS spot check (tracked in TODO).
 
 ## 7. Testing
 
-Each fix has a regression test that fails without it (checked by reverting
-the fix for the lanes overlay); see the calls doc and the PR for the list.
+Each fix has a regression test, listed in
+[#67](https://github.com/mikenomitch/legion/pull/67). The lanes overlay's
+test was confirmed to fail with the fix reverted; the others were written
+against the behavior before the fix, but not re-checked by reverting.
 
 ## 8. Rollout
 
