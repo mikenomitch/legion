@@ -4054,7 +4054,10 @@ impl<'a> Scheduler<'a> {
                 .as_ref()
                 .and_then(|instance_id| restore_manifests.get(instance_id));
             let eligible = match floating_restore {
-                Some(restore) => filter_restore_compat(task_config, restore, eligible)?,
+                Some(restore) => prefer_content_store_readers(
+                    restore,
+                    filter_restore_compat(task_config, restore, eligible)?,
+                ),
                 None => eligible,
             };
             // A spread fork never shares a node with a sibling. A hard rule,
@@ -5036,7 +5039,22 @@ impl<'a> Scheduler<'a> {
         // have none: skip the status read entirely for them.
         let has_dependencies = tasks.iter().any(|(_, task, _)| !task.depends_on.is_empty());
         let status_by_id = if has_dependencies && gate == DependencyGate::Live {
-            self.store.task_statuses_for_job_config(job_config_id)?
+            let mut statuses = self.store.task_statuses_for_job_config(job_config_id)?;
+            // A finished batch replica is on this lane before the eval that
+            // reads it, while its task's status-lane write may not be applied
+            // here yet (`lanes` topology): let the rows upgrade a status that
+            // still reads as not finished.
+            for (task_config_id, outcome) in
+                self.store.batch_outcomes_for_job_config(job_config_id)?
+            {
+                let status = statuses
+                    .entry(task_config_id)
+                    .or_insert(TaskStatusState::Pending);
+                if matches!(status, TaskStatusState::Pending | TaskStatusState::Running) {
+                    *status = outcome;
+                }
+            }
+            statuses
         } else {
             HashMap::new()
         };
@@ -6009,6 +6027,59 @@ fn check_restore_compat(
 /// mixed-version fleet never sends a published restore to an older worker.
 /// When none fit, the error names up to three candidates and why each one
 /// fails.
+/// Narrow a published restore's candidates to the nodes that read every one
+/// of its parts with their own `contentStore` credential.
+///
+/// A restoring node fetches a part under its own `contentStore.url` with
+/// that store's `auth`, and any other part anonymously, which a private
+/// bucket refuses (docs/artifacts.md, "Publishing content"). Placement used
+/// to ignore which store a node had, so a resume could land on a node
+/// pointed at another bucket and fail there. When at least one candidate's
+/// advertised store ([`crate::content_publish::NODE_ATTR`]) covers every
+/// part, only those remain; when none does, the candidates stand, and the
+/// restore reads anonymously (a public store) or fails naming the missing
+/// credential, as before.
+fn prefer_content_store_readers<'b>(
+    restore: &crate::storage::store::RestorePin,
+    eligible: Vec<&'b Node>,
+) -> Vec<&'b Node> {
+    let Ok(manifest) = serde_json::from_str::<crate::structs::checkpoint::SnapshotManifest>(
+        &restore.manifest_json,
+    ) else {
+        return eligible;
+    };
+    let urls: Vec<&str> = manifest
+        .memory
+        .iter()
+        .filter_map(|part| part.url.as_deref())
+        .collect();
+    if urls.is_empty() {
+        return eligible;
+    }
+    let readers: Vec<&Node> = eligible
+        .iter()
+        .copied()
+        .filter(|node| {
+            node.config_attrs
+                .get(crate::content_publish::NODE_ATTR)
+                .and_then(Value::as_str)
+                .is_some_and(|store| {
+                    urls.iter()
+                        .all(|url| crate::content_publish::node_store_covers(store, url))
+                })
+        })
+        .collect();
+    if readers.is_empty() {
+        debug!(
+            instance_id = %restore.instance_id,
+            snapshot_id = %restore.snapshot_id,
+            "No eligible node's contentStore holds this published snapshot; it is fetched anonymously"
+        );
+        return eligible;
+    }
+    readers
+}
+
 fn filter_restore_compat<'b>(
     task_config: &TaskConfig,
     restore: &crate::storage::store::RestorePin,
@@ -6881,6 +6952,67 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    /// Regression (TODO "Placement ignores which `contentStore` a node
+    /// has"): a published restore goes to a node whose own store holds its
+    /// parts, the one node that reads them with a credential. With no such
+    /// node, every candidate stays, and the fetch is anonymous as before.
+    #[test]
+    fn a_published_restore_prefers_nodes_whose_store_holds_its_parts_test() {
+        let node = |id: &str, store: Option<&str>| Node {
+            id: id.to_string(),
+            pool: "default".into(),
+            status: "ready".into(),
+            availability: "available".into(),
+            last_heartbeat: "2023-01-01T00:00:00Z".into(),
+            heartbeat_source: String::new(),
+            config_attrs: match store {
+                Some(url) => serde_json::json!({ crate::content_publish::NODE_ATTR: url }),
+                None => serde_json::json!({}),
+            },
+            fingerprint_attrs: serde_json::json!({}),
+            dynamic_attrs: serde_json::json!({}),
+            health_checks: serde_json::json!({}),
+        };
+        let restore = |url: &str| crate::storage::store::RestorePin {
+            instance_id: "user-1".into(),
+            snapshot_id: "snap-1".into(),
+            node_id: Some("node-a".into()),
+            manifest_json: serde_json::json!({
+                "id": "snap-1", "jobId": "j", "task": "agent", "originAllocId": 7,
+                "runtime": "sandbox", "kind": "memory", "createdAt": "2026-10-10T00:00:00Z",
+                "memory": [{
+                    "role": "memory", "file": "mem", "digest": "sha256:ee", "size": 4096,
+                    "url": url, "keyId": "ck_1",
+                }],
+            })
+            .to_string(),
+            published: true,
+            spread: false,
+        };
+        let east = node("east", Some("s3://content-use1/legion"));
+        let west = node("west", Some("s3://content-usw2/legion"));
+        let bare = node("bare", None);
+        let ids = |nodes: Vec<&Node>| nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
+
+        let from_west = restore("s3://content-usw2/legion/sealed/abc");
+        assert_eq!(
+            ids(prefer_content_store_readers(
+                &from_west,
+                vec![&east, &west, &bare]
+            )),
+            vec!["west"]
+        );
+        let elsewhere = restore("s3://someone-elses-bucket/sealed/abc");
+        assert_eq!(
+            ids(prefer_content_store_readers(
+                &elsewhere,
+                vec![&east, &west, &bare]
+            )),
+            vec!["east", "west", "bare"],
+            "no node holds it: the candidates stand"
+        );
     }
 
     /// `weights.locality` parses like every other weight; 0 turns it off.
@@ -8425,6 +8557,98 @@ mod tests {
         assert!(second.held_tasks.is_empty());
         assert_eq!(second.allocations[0].node_id, first.allocations[0].node_id);
 
+        Ok(())
+    }
+
+    /// Regression (spot check 2026-10-12): in the `lanes` topology the
+    /// dependency eval can run on the scheduler leader before it applies the
+    /// status-lane half of a batch completion. The eval used to read the
+    /// task as still running, hold its dependents, and nothing evaluated the
+    /// job again. The scheduler-lane row the completion wrote first is
+    /// enough to release them.
+    #[test]
+    fn a_dependency_eval_sees_a_completion_whose_status_write_lags_test() -> R<()> {
+        // A success releases both dependents; a failure releases only the
+        // `complete` one.
+        let cases: [(bool, &[&str], &[&str]); 2] = [
+            (true, &["api", "audit"], &[]),
+            (false, &["audit"], &["api"]),
+        ];
+        for (success, placed, held) in cases {
+            let store = setup_store()?;
+            // A worker that reports exits, so a batch task is not projected
+            // successful at placement.
+            store.insert_node(make_node_msg_with_sources(
+                "node-a",
+                json!({}),
+                json!({}),
+                json!({ "protocolVersion": 2 }),
+            ))?;
+            let depends = |condition| {
+                vec![crate::structs::TaskDependency {
+                    task: "build".into(),
+                    condition,
+                }]
+            };
+            let job = JobConfig {
+                priority: Default::default(),
+                rollout: None,
+                rollout_by_group: Default::default(),
+                name: "dag-lanes".into(),
+                tasks: vec![
+                    TaskConfig {
+                        lifecycle: TaskLifecycle::Batch,
+                        ..TaskConfig::new("build", "exec")
+                    },
+                    TaskConfig {
+                        lifecycle: TaskLifecycle::Service,
+                        depends_on: depends(TaskDependencyCondition::Success),
+                        ..TaskConfig::new("api", "noop")
+                    },
+                    TaskConfig {
+                        lifecycle: TaskLifecycle::Batch,
+                        depends_on: depends(TaskDependencyCondition::Complete),
+                        ..TaskConfig::new("audit", "exec")
+                    },
+                ],
+                version: None,
+                pending_extensions: Default::default(),
+                extensions: Default::default(),
+            };
+            store.handle_job_submit(&job, &[dummy_submission()])?;
+            let job_config_id = store.get_job_config(&job.name)?.id();
+            let scheduler = Scheduler::new(&store)?;
+            let first = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+            assert_eq!(first.allocations.len(), 1, "only build runs first");
+            let build = &first.allocations[0];
+
+            // The scheduler-lane half only: this replica has not applied the
+            // status-lane write that follows it.
+            store.complete_allocation_local(build.id, success)?;
+            let statuses = store.task_statuses_for_job_config(&job_config_id)?;
+            assert!(
+                !matches!(
+                    statuses.get(&build.task_config_id),
+                    Some(TaskStatusState::Success | TaskStatusState::Failed)
+                ),
+                "the status lane still says build is not finished: {statuses:?}"
+            );
+
+            let second = scheduler.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+            let mut names = second
+                .allocations
+                .iter()
+                .map(|allocation| {
+                    store
+                        .get_task_config_by_id(allocation.task_config_id)?
+                        .map(|task| task.name)
+                        .context("task config")
+                })
+                .collect::<R<Vec<_>>>()?;
+            names.sort();
+            assert_eq!(names, placed, "success = {success}");
+            assert_eq!(second.held_tasks, held, "success = {success}");
+        }
         Ok(())
     }
 

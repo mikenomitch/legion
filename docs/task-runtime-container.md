@@ -855,8 +855,12 @@ grant on job:write)
   `userNamespace = false` on that node's jobs, or move them to a newer
   kernel.
 - Idmapped mounts also need runtime support: runc 1.2 or newer, or crun.
-  runc before 1.2 ignores them, so on it a start with a user namespace
-  fails before any image work:
+  A worker on an older runc advertises `container.idmappedMounts =
+  "unsupported"`, and a user-namespaced task carries the implicit
+  constraint `container.idmappedMounts is_not_set`, so it is not placed
+  there (see [Installation](installation.md)). runc before 1.2 ignores
+  idmapped mounts, so a start that reaches it anyway fails before any image
+  work:
 
   ```text
   OCI runtime `runc` is runc 1.1.12-0ubuntu3, which predates idmapped mounts; security.userNamespace (on by default) needs them for the task directory and volumes. Install runc 1.2 or newer (the default) or crun, and point LEGION_OCI_RUNTIME at it, or set security.userNamespace = false on the task

@@ -421,6 +421,20 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         "Worker state directory (keep it stable across restarts: it is how a \
          restarted worker re-adopts its running tasks)"
     );
+    // Another identity's tasks on this host are nobody's now, and the
+    // manager places their work again: say so where the operator looks.
+    for (other, live) in
+        crate::worker::state::other_identities_with_live_tasks(&worker_state_dir(), &name)
+    {
+        warn!(
+            worker_name = %name,
+            other_identity = %other,
+            live_tasks = live,
+            "Worker identity {other} in this data dir left {live} task(s) running that this \
+             worker does not manage; unless a worker named {other} is running, start this \
+             worker as `--name {other}` to re-adopt them, or stop them"
+        );
+    }
     // Before anything writes into it: each entry's mode is part of the
     // isolation between allocations (see `prepare_layout`).
     WorkerStateStore::new(state_path.clone()).prepare_layout()?;
@@ -816,10 +830,34 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             json!(sandbox_bridges),
         );
     }
+    // A runc too old for idmapped mounts fails every default container
+    // start; saying so keeps user-namespaced container tasks off this node.
+    if let Some(value) =
+        tokio::task::spawn_blocking(crate::task_plugins::idmapped_mounts_attribute).await?
+    {
+        warn!(
+            "This node's OCI runtime is a runc older than 1.2, which cannot start a container \
+             with security.userNamespace (the default); such tasks will not be placed here. \
+             Install runc 1.2 or newer, or crun"
+        );
+        config_attrs.insert(
+            crate::task_plugins::IDMAPPED_MOUNTS_ATTR.into(),
+            Value::String(value.into()),
+        );
+    }
     // What managers (and edge routers) dial: the route's source address
     // toward the manager unless overridden (docs/architecture-managers-
     // workers.md, "Ports"). Always `https://`: the worker plane is mTLS.
     config_attrs.insert("workerAddress".into(), Value::String(advertised.clone()));
+    // Where this node reads published snapshot parts with its own
+    // credential: the scheduler prefers such a node for a published restore
+    // (docs/suspend-and-resume.md). The URL only, never its `auth`.
+    if let Some(target) = content_store_target.as_ref() {
+        config_attrs.insert(
+            crate::content_publish::NODE_ATTR.into(),
+            Value::String(target.url.clone()),
+        );
+    }
     // `legion node info` shows whether host-mode tasks are guarded here.
     config_attrs.insert(
         crate::worker::netd::kernel_guard::NODE_ATTR.into(),

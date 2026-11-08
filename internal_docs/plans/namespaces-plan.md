@@ -573,7 +573,10 @@ federation later. § 8.6 says which, and the public page says it first.
   pulled it to the same node. This predates namespaces. Namespaces turn it
   into a tenant-to-tenant leak: it is the problem Kubernetes' `AlwaysPullImages`
   admission plugin exists for. Tracked in [TODO.md](../TODO.md), and named in
-  the public page's limitations until it is fixed.
+  the public page's limitations until it is fixed. **Fixed 2026-11-08:** a
+  cached image is served only for the repository it was verified from, and
+  only when it is public there or the registry accepts the job's credential
+  ([artifacts.md](../../docs/artifacts.md#who-a-cached-image-is-served-to)).
 - **The CLI has no global flags.** `--json` is attached per command by
   `json_flag()` (`src/cmd/helpers.rs:385`, 131 uses). `--addr` and `--token`
   flags don't exist. The precedent is env, then file, then default
@@ -957,7 +960,7 @@ written so no one has to infer it.
 | Service discovery and mesh | resolves names within the namespace; crossing is explicit (§ 8.7) | stop a process from dialing an IP it already knows | `network.mode = "gated"` plus net policies selecting namespaces |
 | Network | nothing by itself | filter packets | `gated` plus net policies |
 | Compute | nothing (until Phase 4 *restricts* which pools a namespace may use) | separate nodes, kernels or caches | node pools; the `sandbox` runtime |
-| Images and artifacts | nothing today | stop a node serving a cached private image to a job without credentials for it (§ 6.2) | the fix tracked in TODO.md |
+| Images and artifacts | nothing today | stop a node serving a cached private image to a job without credentials for it (§ 6.2) | shipped 2026-11-08 ([artifacts.md](../../docs/artifacts.md#who-a-cached-image-is-served-to)) |
 | KV | nothing | KV is path-scoped | `paths` selectors |
 | Workload identity | makes subjects distinct, and adds a namespace claim (§ 8.8) | — | IdP trust policies that match the namespace |
 | Capacity | nothing until Phase 4 | — | namespace policies (§ 8.12) |

@@ -44,14 +44,44 @@ fn build_target(req: &FetchRequest<'_>) -> R<S3Target> {
     if req.url.host_str().unwrap_or_default().is_empty() {
         bail!("{} has no bucket host", req.redacted_source);
     }
-    // A custom `endpoint` is a host the job chose, judged like any other
-    // fetch destination. The default AWS endpoints are left alone.
+    // A region is a DNS label of the default AWS endpoint
+    // (`s3.<region>.amazonaws.com`), so anything else in it could change
+    // the host the client dials.
+    let query_region = req
+        .url
+        .query_pairs()
+        .find(|(name, _)| name == "region")
+        .map(|(_, value)| value.into_owned());
+    let credential_region = match req.credential {
+        Some(crate::artifacts::fetcher::Credential::Aws { region, .. }) => region.clone(),
+        _ => None,
+    };
+    for region in [query_region, credential_region].into_iter().flatten() {
+        if !valid_region(&region) {
+            bail!(
+                "{} names region {region:?}; a region is lowercase letters, digits, and \
+                 hyphens",
+                req.redacted_source
+            );
+        }
+    }
+    // A custom endpoint is a host the job chose, judged like any other fetch
+    // destination: the `endpoint` query parameter, else the one the KV
+    // credential names (the order the client itself applies). The default
+    // AWS endpoints are left alone.
     if let Some(guard) = req.limits.egress.as_deref() {
         let endpoint = req
             .url
             .query_pairs()
             .find(|(name, _)| name == "endpoint")
-            .map(|(_, value)| value.into_owned());
+            .map(|(_, value)| value.into_owned())
+            .filter(|endpoint| !endpoint.trim().is_empty())
+            .or_else(|| match req.credential {
+                Some(crate::artifacts::fetcher::Credential::Aws { endpoint, .. }) => endpoint
+                    .clone()
+                    .filter(|endpoint| !endpoint.trim().is_empty()),
+                _ => None,
+            });
         if let Some(endpoint) = endpoint {
             let endpoint = url::Url::parse(&endpoint)
                 .with_context(|| format!("{} has an invalid endpoint", req.redacted_source))?;
@@ -108,6 +138,15 @@ fn build_target(req: &FetchRequest<'_>) -> R<S3Target> {
         key,
         file_name,
     })
+}
+
+/// Whether `region` can only ever be a region: a non-empty run of
+/// lowercase letters, digits, and hyphens.
+fn valid_region(region: &str) -> bool {
+    !region.is_empty()
+        && region
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 impl ArtifactFetcher for S3Fetcher {
@@ -187,6 +226,57 @@ mod tests {
         let target = build_target(&request)?;
         assert_eq!(target.file_name, "v42.tar.gz");
         assert_eq!(target.key.as_ref(), "api/v42.tar.gz");
+        Ok(())
+    }
+
+    /// Regression (TODO "an `s3://` `endpoint` is judged before the fetch
+    /// but ..."): the endpoint a KV credential names is judged like a query
+    /// `endpoint`, and a region that is not a region is refused before it
+    /// can become part of a host name.
+    #[test]
+    fn the_host_guard_judges_the_credential_endpoint_and_regions_test() -> R<()> {
+        use crate::structs::host_guard::{HostGuard, HostGuardConfig};
+        let limits = FetchLimits {
+            egress: Some(std::sync::Arc::new(HostGuard::new(
+                &HostGuardConfig::default(),
+            )?)),
+            ..FetchLimits::default()
+        };
+        let build = |source: &str, credential: Option<&Credential>| -> R<S3Target> {
+            let parsed = parse_artifact_source(source)?;
+            build_target(&FetchRequest {
+                scheme: &parsed.scheme,
+                url: &parsed.url,
+                redacted_source: source,
+                checksum: None,
+                media_type: None,
+                credential,
+                limits: &limits,
+            })
+        };
+        let aws = |region: &str, endpoint: Option<&str>| Credential::Aws {
+            access_key_id: "AK".into(),
+            secret_access_key: "SK".into(),
+            session_token: None,
+            region: Some(region.into()),
+            endpoint: endpoint.map(str::to_string),
+        };
+        let metadata = aws("us-east-1", Some("http://169.254.169.254"));
+        let err = build("s3://bucket/key", Some(&metadata))
+            .expect_err("the credential's endpoint is judged");
+        assert!(format!("{err:#}").contains("host guard refuses"), "{err:#}");
+
+        let err =
+            build("s3://bucket/key?region=x@10.0.0.5/", None).expect_err("a region is a DNS label");
+        assert!(format!("{err:#}").contains("names region"), "{err:#}");
+        let err = build("s3://bucket/key", Some(&aws("US East", None)))
+            .expect_err("so is the credential's");
+        assert!(format!("{err:#}").contains("names region"), "{err:#}");
+
+        build(
+            "s3://bucket/key?region=eu-west-1",
+            Some(&aws("us-east-1", None)),
+        )?;
         Ok(())
     }
 

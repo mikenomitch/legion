@@ -302,8 +302,11 @@ fails for good.
 Held tasks move on their own. When a worker reports that a task with
 dependents reached a terminal state, the manager queues an eval for the job:
 a `job_reschedule`, or a `rollout_tick` when the config is being rolled out
-to, so the rollout's step and health gating still apply. That eval places
-whatever the exit made ready. A three-step pipeline therefore runs one step
+to. That eval places whatever the exit made ready. A rollout places released
+dependents ahead of its own gates (a pause, a manual advance, the batch
+retire window), so a gated rollout does not freeze the DAG; a service
+dependent is still held to its rollout step's size (see
+[Rollouts](rollouts.md#resubmitting-a-batch-or-dag-job)). A three-step pipeline therefore runs one step
 at a time:
 
 ```nickel
@@ -716,6 +719,16 @@ onUnhealthy = {
 },
 ```
 
+A keyed instance (`stateful.mode = "keyed"`, such as one sandbox or
+workspace per user) counts its own moves instead. Each keyed instance is a
+separate unit of work, so a few unrelated instances of one job failing does
+not fail the job: an instance whose moves inside `movePeriod` reach
+`moveCount` is stopped, as `legion instance stop` would leave it, and the
+job and its other instances keep running. Its `last_stop` names the spent
+budget, and `legion instance start <id>` retries it with a fresh budget.
+Slot instances and stateless tasks share the task's budget, and spending it
+fails the job.
+
 The hold is what makes the backoff stick. The scheduler leaves one
 replacement unplaced per active hold, whichever eval runs for the job: the
 capacity pass after other allocations free room, a node joining, or the
@@ -732,7 +745,8 @@ Operators see a deferred replacement in three places:
 - an `allocation.reschedule_deferred` event (warn) per deferral, with the
   task, instance, node, allocation, attempt, backoff, next attempt time, and
   reason, and an `allocation.reschedule_exhausted` event (error) when the
-  budget runs out, ahead of `job.failed` (see the
+  budget runs out, ahead of `job.failed` (or, for a keyed instance, with
+  `instanceStopped: true` and no `job.failed`; see the
   [event table](event-stream.md));
 - `legion instance get` and `instance list` for a stateful instance, whose
   state reads `rescheduling` and whose detail says why and until when:

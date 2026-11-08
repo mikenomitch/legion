@@ -14,7 +14,7 @@ use crate::constants::allocation_status_is_terminal;
 use crate::manager::dispatcher::dispatch_allocations;
 use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlacementBlocked, PlanMode, Scheduler};
-use crate::prelude::{bail, debug, instrument, warn, Context, R};
+use crate::prelude::{bail, debug, info, instrument, warn, Context, R};
 use crate::storage::store::{AllocationHealthSnapshot, Store};
 use crate::structs::{
     Allocation, Eval, JobConfig, Rollout, RolloutCapacityTimeoutAction, RolloutConfig,
@@ -113,6 +113,16 @@ struct GroupTaskPlan {
     desired_new: u32,
     current_new: u32,
     current_old_allocs: Vec<Allocation>,
+    /// The new version of this task waits for another task to exit
+    /// (`dependsOn` with condition `complete` or `success`), so its
+    /// placement is DAG progress that [`release_dependency_holds`] makes
+    /// regardless of the rollout's step gating.
+    waits_on_exit: bool,
+    /// Another task of the new version waits for this one to exit. A batch
+    /// task like that is placed whole at every step: placing a fraction of
+    /// it would hold its dependents (the task succeeds only once every
+    /// replica has) and with them the step, forever.
+    has_exit_dependents: bool,
 }
 
 #[derive(Debug)]
@@ -243,11 +253,32 @@ pub fn handle_rollout_tick(eval: &Eval, store: &Store) -> R<String> {
     let mut envelope = parse_rollout_envelope(&rollout.config_json)?;
     let now = OffsetDateTime::now_utc();
 
-    let plans = build_group_plans(&to_config, from_config.as_ref(), store, &rollout)?;
+    let mut plans = build_group_plans(&to_config, from_config.as_ref(), store, &rollout)?;
     ensure_runtime_groups(&mut envelope.runtime, &plans);
-    let tick_inputs = build_tick_inputs(store, &rollout, &plans)?;
 
     let scheduler = Scheduler::new(store)?;
+    // DAG progress inside the new version goes first, ahead of every step
+    // gate: a dependent whose dependency just exited is placed whether the
+    // rollout is paused, waiting for a manual advance or a step stagger, or
+    // held by the batch retire window. Before, the dependency release was
+    // only a `rollout_tick`, and any of those gates froze the DAG with it.
+    let released =
+        release_dependency_holds(store, &scheduler, &rollout, &plans, &envelope.runtime)?;
+    if released > 0 {
+        plans = build_group_plans(&to_config, from_config.as_ref(), store, &rollout)?;
+    }
+    // A paused rollout moves no further until `rollout advance` sets it
+    // pending again: the tick a dependency release queued must not run its
+    // steps (under `destroyFirst` that retired more of the old version and
+    // flipped the rollout back to `running`).
+    if rollout.status == "paused" {
+        return Ok(format!(
+            "Rollout {} paused: released {released} held dependent allocation(s)",
+            rollout.id
+        ));
+    }
+    let tick_inputs = build_tick_inputs(store, &rollout, &plans)?;
+
     let outcome = execute_tick(
         store,
         &scheduler,
@@ -767,6 +798,116 @@ fn execute_group_tick(
     })
 }
 
+/// Whether a `dependsOn` condition waits for the dependency to exit.
+fn waits_for_exit(condition: &crate::structs::TaskDependencyCondition) -> bool {
+    matches!(
+        condition,
+        crate::structs::TaskDependencyCondition::Complete
+            | crate::structs::TaskDependencyCondition::Success
+    )
+}
+
+/// Place the new version's tasks that were held behind a dependency's exit,
+/// ahead of the rollout's step gating. Returns how many were placed.
+///
+/// A dependency release is DAG progress inside the new version, not a step
+/// of replacing the old one, so it does not wait on a manual advance, a step
+/// stagger, a paused group, or the batch retire window:
+///
+/// - a batch dependent is placed whole, as `build_step_targets` targets it;
+/// - a service or sidecar dependent is placed up to its group's active step
+///   target, never beyond it, and never while `destroyFirst` still has old
+///   allocations of it to retire first (the step path owns that order).
+///
+/// The scheduler still judges every `dependsOn`, so a task whose dependency
+/// has not exited stays held, and tasks outside the release keep their
+/// current counts. A placement it cannot make (capacity, a static port the
+/// old version holds) is left to the step path, which knows how to wait.
+fn release_dependency_holds(
+    store: &Store,
+    scheduler: &Scheduler<'_>,
+    rollout: &Rollout,
+    plans: &[GroupPlan],
+    runtime: &RolloutRuntime,
+) -> R<usize> {
+    let mut targets: HashMap<i64, u32> = HashMap::new();
+    for plan in plans {
+        let active_step = runtime
+            .groups
+            .get(&plan.name)
+            .filter(|state| state.active_step_started_at.is_some())
+            .map(|state| state.step_index)
+            .filter(|step| *step < plan.step_fractions.len());
+        for task in &plan.tasks {
+            let Some(task_id) = task.new_task_id else {
+                continue;
+            };
+            if !task.waits_on_exit {
+                continue;
+            }
+            let target = if matches!(task.lifecycle, TaskLifecycle::Batch) {
+                task.desired_new
+            } else {
+                let Some(step) = active_step else {
+                    continue;
+                };
+                if matches!(plan.replacement, RolloutReplacement::DestroyFirst)
+                    && !task.current_old_allocs.is_empty()
+                {
+                    continue;
+                }
+                let fraction = plan.step_fractions[step];
+                build_step_targets(plan, fraction, step)
+                    .per_task_target_new
+                    .get(&task.name)
+                    .copied()
+                    .unwrap_or_default()
+            };
+            if task.current_new < target {
+                targets.insert(task_id, target);
+            }
+        }
+    }
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    match scheduler.plan_and_apply_with_targets(
+        &rollout.to_job_config_id,
+        PlanMode::Reschedule,
+        &targets,
+    ) {
+        Ok(outcome) => {
+            if outcome.allocations.is_empty() {
+                return Ok(0);
+            }
+            dispatch_allocations(store, &outcome.allocations)?;
+            let message = format!(
+                "Released {} allocation(s) held behind a dependency's exit",
+                outcome.allocations.len()
+            );
+            info!(rollout_id = rollout.id, job_id = %rollout.job_id, "{message}");
+            let _ = store.append_rollout_event(
+                rollout.id,
+                &rollout.job_id,
+                None,
+                "info",
+                &message,
+                Some(&json!({ "released": outcome.allocations.len() }).to_string()),
+            );
+            Ok(outcome.allocations.len())
+        }
+        Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => Err(err),
+        Err(err) => {
+            debug!(
+                rollout_id = rollout.id,
+                error = %format!("{err:#}"),
+                "Dependency release could not place; the rollout step will retry"
+            );
+            Ok(0)
+        }
+    }
+}
+
 fn build_step_targets(plan: &GroupPlan, step_fraction: f64, step_index: usize) -> StepTargets {
     let mut targets = StepTargets::default();
     for task in &plan.tasks {
@@ -783,6 +924,9 @@ fn build_step_targets(plan: &GroupPlan, step_fraction: f64, step_index: usize) -
                 .saturating_add(1)
                 .min(updatable)
                 .min(task.desired_new)
+        } else if task.has_exit_dependents && matches!(task.lifecycle, TaskLifecycle::Batch) {
+            // A DAG step runs whole: its dependents wait for every replica.
+            task.desired_new
         } else {
             ((task.desired_new as f64) * step_fraction)
                 .ceil()
@@ -1544,6 +1688,38 @@ fn retire_old_allocations_for_group(
 ) -> R<RetireOutcome> {
     let mut outcome = RetireOutcome::default();
 
+    // The batch retire window: a running old batch allocation is left to
+    // finish until `batchKillAfter` has elapsed in this step (forever when
+    // unset). It only guards work in flight, so it is checked per allocation
+    // below rather than for the whole task.
+    let batch_window_closed = |task: &GroupTaskPlan| -> R<bool> {
+        Ok(match (&task.lifecycle, plan.config.batch_kill_after) {
+            (TaskLifecycle::Batch, None) => true,
+            (TaskLifecycle::Batch, Some(kill_after)) => {
+                let started_at =
+                    parse_optional_ts(state.active_step_started_at.as_deref())?.unwrap_or(now);
+                now - started_at < time::Duration::try_from(kill_after)?
+            }
+            _ => false,
+        })
+    };
+    // Nodes where the window keeps an old batch step of this group running.
+    // Its sidecars there stay with it: a sidecar serves the task beside it
+    // (a log shipper, a progress reporter), and retiring it alone left the
+    // step running without it (spot check 2026-10-12, `05-dag.ncl`'s
+    // `progress`).
+    let mut held_batch_nodes: HashSet<String> = HashSet::new();
+    for task in &plan.tasks {
+        if batch_window_closed(task)? {
+            held_batch_nodes.extend(
+                task.current_old_allocs
+                    .iter()
+                    .filter(|alloc| !allocation_status_is_terminal(&alloc.status))
+                    .map(|alloc| alloc.node_id.clone()),
+            );
+        }
+    }
+
     for task in &plan.tasks {
         let target_old = per_task_target_old
             .get(&task.name)
@@ -1554,19 +1730,7 @@ fn retire_old_allocations_for_group(
             continue;
         }
 
-        // The batch retire window: a running old batch allocation is left to
-        // finish until `batchKillAfter` has elapsed in this step (forever when
-        // unset). It only guards work in flight, so it is checked per
-        // allocation below rather than for the whole task.
-        let batch_window_closed = match (&task.lifecycle, plan.config.batch_kill_after) {
-            (TaskLifecycle::Batch, None) => true,
-            (TaskLifecycle::Batch, Some(kill_after)) => {
-                let started_at =
-                    parse_optional_ts(state.active_step_started_at.as_deref())?.unwrap_or(now);
-                now - started_at < time::Duration::try_from(kill_after)?
-            }
-            _ => false,
-        };
+        let batch_window_closed = batch_window_closed(task)?;
 
         let to_remove = (current_old - target_old) as usize;
         let mut old_allocs = task.current_old_allocs.clone();
@@ -1626,6 +1790,14 @@ fn retire_old_allocations_for_group(
         if batch_window_closed {
             let chosen = batch.len();
             batch.retain(|alloc| allocation_status_is_terminal(&alloc.status));
+            outcome.blocked |= batch.len() < chosen;
+        }
+        if matches!(task.lifecycle, TaskLifecycle::Sidecar) && !held_batch_nodes.is_empty() {
+            let chosen = batch.len();
+            batch.retain(|alloc| {
+                allocation_status_is_terminal(&alloc.status)
+                    || !held_batch_nodes.contains(&alloc.node_id)
+            });
             outcome.blocked |= batch.len() < chosen;
         }
         if batch.is_empty() {
@@ -1735,6 +1907,14 @@ fn build_group_plans(
             .or_default()
             .push(allocation);
     }
+
+    // Tasks of the new version some other task waits on to exit.
+    let exit_dependencies: HashSet<String> = to_tasks
+        .iter()
+        .flat_map(|(_, task)| task.depends_on.iter())
+        .filter(|dependency| waits_for_exit(&dependency.condition))
+        .map(|dependency| dependency.task.clone())
+        .collect();
 
     let mut by_group_new: HashMap<String, HashMap<String, (i64, TaskConfig)>> = HashMap::new();
     for (task_id, task) in to_tasks {
@@ -1861,6 +2041,12 @@ fn build_group_plans(
                 .cloned()
                 .unwrap_or_default();
 
+            let waits_on_exit = new_entry.as_ref().is_some_and(|(_, task)| {
+                task.depends_on
+                    .iter()
+                    .any(|dependency| waits_for_exit(&dependency.condition))
+            });
+            let has_exit_dependents = new_entry.is_some() && exit_dependencies.contains(&name);
             tasks.push(GroupTaskPlan {
                 name,
                 lifecycle,
@@ -1869,6 +2055,8 @@ fn build_group_plans(
                 desired_new,
                 current_new,
                 current_old_allocs,
+                waits_on_exit,
+                has_exit_dependents,
             });
         }
 
@@ -2302,6 +2490,8 @@ mod tests {
             desired_new: 4,
             current_new: 0,
             current_old_allocs: Vec::new(),
+            waits_on_exit: false,
+            has_exit_dependents: false,
         };
         let plan = GroupPlan {
             name: "data".to_string(),
@@ -2432,6 +2622,8 @@ mod tests {
                         network: None,
                     },
                 ],
+                waits_on_exit: false,
+                has_exit_dependents: false,
             }],
             sequential_slots: None,
         };
@@ -2628,6 +2820,8 @@ mod tests {
                 desired_new: 1,
                 current_new: 1,
                 current_old_allocs: Vec::new(),
+                waits_on_exit: false,
+                has_exit_dependents: false,
             }],
             sequential_slots: None,
         };
@@ -2949,6 +3143,159 @@ mod tests {
         let third = tick(&store, &v2.name, &v2_id)?;
         assert!(third.contains("retired 1 old allocations"), "{third}");
         assert!(store.allocs_for_job_config(&v1_id)?.is_empty());
+        Ok(())
+    }
+
+    /// A node whose worker reports exits, so a batch task is not projected
+    /// successful at placement.
+    fn insert_supervised_node(store: &Store, id: &str) -> R<()> {
+        insert_node(store, id)?;
+        let mut node = store.get_node(id)?;
+        node.dynamic_attrs = json!({ "protocolVersion": 2 });
+        store.insert_node(NodeMsg::from(node))?;
+        Ok(())
+    }
+
+    /// Regression: with fractional steps, a batch task with dependents was
+    /// placed a step's fraction at a time. Its dependents wait for every
+    /// replica to succeed, and the step waited for its dependents, so the
+    /// rollout never got past step 0. Such a batch task now runs whole.
+    #[test]
+    fn fractional_steps_place_a_dag_step_whole_test() -> R<()> {
+        let store = setup_store()?;
+        insert_supervised_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let job = |run: &str| {
+            let mut job = dag_job("dag-steps", run);
+            job.tasks[0].count.num = 2;
+            job.rollout = Some(RolloutConfig {
+                percent_steps: Some(vec![50, 100]),
+                ..Default::default()
+            });
+            job
+        };
+        let v1 = job("1");
+        store.handle_job_submit(&v1, &[submission()])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+        for allocation in scheduler
+            .plan_and_apply(&v1_id, PlanMode::Fresh)?
+            .allocations
+        {
+            report_exit(&store, &allocation)?;
+        }
+
+        let v2 = job("2");
+        store.handle_job_submit(&v2, &[submission()])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        create_default_rollout(&store, &v2.name, &v1_id, &v2_id)?;
+        tick(&store, &v2.name, &v2_id)?; // retires v1's finished fetches
+        tick(&store, &v2.name, &v2_id)?;
+        let fetches = store.allocs_for_job_config(&v2_id)?;
+        assert_eq!(fetches.len(), 2, "step 0 places the whole fetch step");
+        for fetch in &fetches {
+            report_exit(&store, fetch)?;
+        }
+        tick(&store, &v2.name, &v2_id)?;
+        assert!(
+            alloc_of(&store, &v2_id, "report")?.is_some(),
+            "report follows once every fetch succeeded"
+        );
+        Ok(())
+    }
+
+    /// Regression (TODO "A config under rollout releases its held dependents
+    /// through a `rollout_tick`"): a paused rollout froze the new version's
+    /// DAG, because a dependency's exit only queued a tick and the tick ran
+    /// the step gates first. The release now places ahead of every gate,
+    /// and a paused rollout stays paused.
+    #[test]
+    fn a_paused_rollout_still_releases_dependents_test() -> R<()> {
+        let store = setup_store()?;
+        insert_supervised_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let v1 = dag_job("dag-paused", "1");
+        store.handle_job_submit(&v1, &[submission()])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+        let fetch = scheduler.plan_and_apply(&v1_id, PlanMode::Fresh)?;
+        report_exit(&store, &fetch.allocations[0])?;
+
+        let v2 = dag_job("dag-paused", "2");
+        store.handle_job_submit(&v2, &[submission()])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        let rollout = create_default_rollout(&store, &v2.name, &v1_id, &v2_id)?;
+        tick(&store, &v2.name, &v2_id)?; // retires v1's finished fetch
+        tick(&store, &v2.name, &v2_id)?;
+        let new_fetch = alloc_of(&store, &v2_id, "fetch")?.context("v2 fetch placed")?;
+
+        store.update_rollout_status(rollout.id, "paused", false, Some("paused by a test"))?;
+        report_exit(&store, &new_fetch)?;
+        let message = tick(&store, &v2.name, &v2_id)?;
+        assert!(message.contains("paused: released 1"), "{message}");
+        assert!(alloc_of(&store, &v2_id, "report")?.is_some());
+        let after = store.get_rollout(rollout.id)?.context("rollout")?;
+        assert_eq!(after.status, "paused", "the release does not resume it");
+        Ok(())
+    }
+
+    /// Regression (spot check 2026-10-12, `05-dag.ncl`): the batch retire
+    /// window kept a running old batch step, but retired the sidecar beside
+    /// it, so the step ran on without it. A sidecar on a node where the
+    /// window holds a batch step of its group now waits with the step.
+    #[test]
+    fn a_sidecar_waits_with_the_batch_step_it_serves_test() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let job = |run: &str| JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "dag-sidecar".into(),
+            tasks: vec![
+                TaskConfig {
+                    group: "pipeline".into(),
+                    lifecycle: TaskLifecycle::Batch,
+                    config: json!({ "run": run }),
+                    ..TaskConfig::new("fetch", "noop")
+                },
+                TaskConfig {
+                    group: "pipeline".into(),
+                    lifecycle: TaskLifecycle::Sidecar,
+                    depends_on: vec![crate::structs::TaskDependency {
+                        task: "fetch".into(),
+                        condition: crate::structs::TaskDependencyCondition::Start,
+                    }],
+                    config: json!({ "run": run }),
+                    ..TaskConfig::new("progress", "noop")
+                },
+            ],
+            version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
+        };
+        let v1 = job("1");
+        store.handle_job_submit(&v1, &[submission()])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+        scheduler.plan_and_apply(&v1_id, PlanMode::Fresh)?;
+        scheduler.plan_and_apply(&v1_id, PlanMode::Reschedule)?;
+        let fetch = alloc_of(&store, &v1_id, "fetch")?.context("v1 fetch")?;
+        alloc_of(&store, &v1_id, "progress")?.context("v1 progress")?;
+
+        let v2 = job("2");
+        store.handle_job_submit(&v2, &[submission()])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        create_default_rollout(&store, &v2.name, &v1_id, &v2_id)?;
+        let first = tick(&store, &v2.name, &v2_id)?;
+        assert!(first.contains("waiting for batch retire window"), "{first}");
+        assert_eq!(
+            store.allocs_for_job_config(&v1_id)?.len(),
+            2,
+            "the running step keeps its sidecar"
+        );
+
+        report_exit(&store, &fetch)?;
+        let second = tick(&store, &v2.name, &v2_id)?;
+        assert!(second.contains("retired 2 old allocations"), "{second}");
         Ok(())
     }
 

@@ -13526,6 +13526,54 @@ impl Store {
         Ok(statuses)
     }
 
+    /// The terminal status a config's batch tasks have reached, read from
+    /// the scheduler lane's own allocation rows rather than from
+    /// `task_status`: `Failed` once any replica ended `failed`, otherwise
+    /// what [`Self::batch_task_outcome_tx`] decides from the replicas.
+    /// Tasks with no finished replica are absent.
+    ///
+    /// The scheduler overlays this on [`Self::task_statuses_for_job_config`]
+    /// when it judges `dependsOn`. A batch exit writes the allocation row
+    /// (scheduler lane) and then the task's status (status lane), and only
+    /// then queues the dependency eval on the scheduler lane. In the `lanes`
+    /// topology the scheduler leader can run that eval before it applies the
+    /// status-lane write, read `Running`, hold the dependents, and nothing
+    /// evaluated the job again. The rows the eval reads here were committed
+    /// on its own lane before the eval was, so raft's log order guarantees
+    /// it sees them.
+    pub fn batch_outcomes_for_job_config(
+        &self,
+        job_config_id: &str,
+    ) -> R<HashMap<i64, TaskStatusState>> {
+        let conn = self.read_connection()?;
+        let finished: Vec<(i64, i64)> = {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT task_config_id, \
+                        SUM(CASE WHEN status = '{ALLOCATION_STATUS_FAILED}' THEN 1 ELSE 0 END) \
+                 FROM allocation \
+                 WHERE job_config_id = ?1 \
+                   AND status IN ('{ALLOCATION_STATUS_COMPLETE}', '{ALLOCATION_STATUS_FAILED}') \
+                 GROUP BY task_config_id;"
+            ))?;
+            let rows = stmt.query_map([job_config_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Self::collect_rows(rows)?
+        };
+        let mut outcomes = HashMap::new();
+        for (task_config_id, failed) in finished {
+            // As `complete_allocation_apply` decides it: one failed replica
+            // fails the task at once.
+            let outcome = if failed > 0 {
+                Some(TaskStatusState::Failed)
+            } else {
+                Self::batch_task_outcome_tx(&conn, task_config_id)?
+            };
+            if let Some(outcome) = outcome {
+                outcomes.insert(task_config_id, outcome);
+            }
+        }
+        Ok(outcomes)
+    }
+
     /// Move a task to `status` (status lane). Forwards to the lane leader
     /// from a follower: worker reports (a batch exit through
     /// [`Self::complete_allocation`], a task failed for good) land on
@@ -13610,9 +13658,11 @@ impl Store {
     ///
     /// Queues nothing when no task of the config depends on this one, or
     /// when the config is no longer wanted. A config being rolled out to
-    /// gets a `rollout_tick`, so its dependents keep the rollout's step and
-    /// health gating; any other config gets a `job_reschedule`, which places
-    /// only what is missing. Returns whether an eval was queued.
+    /// gets a `rollout_tick`, which releases its held dependents ahead of the
+    /// rollout's gates while keeping a service dependent to its step's size
+    /// (`manager::rollout::release_dependency_holds`); any other config gets
+    /// a `job_reschedule`, which places only what is missing. Returns whether
+    /// an eval was queued.
     pub fn queue_dependency_progress(&self, allocation: &Allocation) -> R<bool> {
         let tasks = self.shared_task_configs_for_job_config(&allocation.job_config_id)?;
         let Some(task_name) = tasks
@@ -18535,6 +18585,13 @@ impl Store {
                 ),
             });
         }
+        // An explicit start is a fresh move budget: an instance stopped
+        // because it spent its own (`MoveVerdict::InstanceStopped`) would
+        // otherwise be stopped again by its very next failure.
+        conn.execute(
+            "DELETE FROM reschedule_hold WHERE instance_id = ?1;",
+            [instance_id],
+        )?;
         info!(
             instance_id,
             job_id = %instance.job_id,

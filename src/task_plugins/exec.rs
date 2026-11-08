@@ -200,6 +200,28 @@ impl ExecTaskConfig {
     }
 }
 
+/// The network namespace an exec session into `allocation` starts in: the
+/// gated task's own (`/var/run/netns/legion-<allocation>`), or `None` for a
+/// task that is not gated or is confined on a node without namespaces
+/// (macOS). An error when the namespace a gated task runs in is gone.
+fn gated_session_netns(allocation: &Allocation) -> R<Option<std::path::PathBuf>> {
+    if !crate::task_plugins::allocation_is_gated(allocation)
+        || crate::task_plugins::allocation_is_confined(allocation)
+    {
+        return Ok(None);
+    }
+    let path = crate::worker::netd::netns::netns_path(allocation.id);
+    if !path.exists() {
+        bail!(
+            "allocation {} is network.mode = \"gated\", but its network namespace {} is gone; \
+             refusing to run the session in the host's network",
+            allocation.id,
+            path.display()
+        );
+    }
+    Ok(Some(path))
+}
+
 /// The cgroup an exec task's process was spawned into, as an absolute path:
 /// the explicit `config.cgroup` when the job named one, else the leaf worker
 /// core created for the allocation (the same precedence `start` applies).
@@ -475,6 +497,13 @@ impl TaskPlugin for ExecTaskPlugin {
             let explicit = config.linux_options()?.cgroup;
             opts.cgroup = task_cgroup_dir(explicit.as_deref(), instance);
         }
+        // A gated task runs in its own network namespace; so does a session
+        // into it. It used to run in the host's, where it reached everything
+        // the gate keeps the task from. A namespace that is gone fails the
+        // session instead of falling back to the host network.
+        if let Some(netns) = gated_session_netns(allocation)? {
+            opts.netns = Some(netns);
+        }
 
         info!(
             allocation_id = allocation.id,
@@ -484,6 +513,11 @@ impl TaskPlugin for ExecTaskPlugin {
                 .cgroup
                 .as_ref()
                 .map(|dir| dir.display().to_string())
+                .unwrap_or_default(),
+            netns = %opts
+                .netns
+                .as_ref()
+                .map(|path| path.display().to_string())
                 .unwrap_or_default(),
             "Opening exec session for exec task"
         );
