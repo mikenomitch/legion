@@ -172,7 +172,11 @@ or keeps every candidate when none does.
 **Alternatives.** Require such a node (a hard filter).
 
 **Trade-off.** With no matching node eligible, the restore can still land on
-a node that fetches anonymously and fails there.
+a node that fetches anonymously and fails there. It also costs one scan of
+the candidates per published restore: `restore/published_floating/nodes_5000`
+measured 137 ms before and 156 ms after for 25 placements (about 0.8 ms per
+placement), against run-to-run noise of about 10 to 15% on the groups that
+do not run the new code.
 
 **Why (simplicity).** A public store or a `file://` store shared by path would
 be refused by a hard filter; the soft rule never makes a working restore
