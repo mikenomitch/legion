@@ -511,6 +511,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#65](https://github.com/mikenomitch/legion/pull/65) | The bundled ingress: `service.ingress` routes, a proxy on 80/443, automatic HTTPS, and exec `capabilities.add` | Stacked on #64. Plan [ingress-app-plan.md](plans/ingress-app-plan.md); Phases 1–2 in Done (Ecosystem apps), Phase 3 open under "Ingress" |
 | [#64](https://github.com/mikenomitch/legion/pull/64) | The built-in cert manager: the bundled `certs` app (ACME, private-CA, and self-signed Issuers; Certificates in KV, renewed) and `legion cert` | Plan [cert-manager-plan.md](plans/cert-manager-plan.md) SHIPPED (Phase 1); checked off and in Done, the deferrals open under Ecosystem apps |
 | [#62](https://github.com/mikenomitch/legion/pull/62) | An architecture review against best-in-class designs | Doc only: [architecture-review-2026-11-07.md](architecture-review-2026-11-07.md); its findings are open items under their areas |
 | [#58](https://github.com/mikenomitch/legion/pull/58) | Park: the workload says when it is waiting, and its node suspends it | Plan [park-plan.md](plans/park-plan.md); Phases 1–2, entries under "Park" above and in Done |
@@ -5096,7 +5097,7 @@ plan.
         would make every preflight complete.
   - [ ] With ACLs off nothing is stamped, so two Repos that define one job
         flip it between them instead of one being refused.
-- [ ] **Ingress** (built in this change, PR in the in-flight table):
+- [ ] **Ingress** ([#65](https://github.com/mikenomitch/legion/pull/65)):
       [plan](plans/ingress-app-plan.md) (IN EXECUTION; Phases 1 and 2 in
       Done) · [calls](calls/ingress-app-plan_calls.md) · docs:
       [ingress.md](../docs/ingress.md). Phase 3 and what building it
