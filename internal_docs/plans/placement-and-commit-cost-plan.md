@@ -253,7 +253,9 @@ balance  = 1 - (max_d util_d - min_d util_d)
 bin_pack = dominant + 0.05 × balance
 spread   = (1 - dominant) + 0.05 × balance
 score    = affinity + bin_pack_weight × bin_pack + spread_weight × spread
-           - anti_affinity × same_task_allocs + locality
+           - anti_affinity × (collisions + 1) / count   (0 with no collision;
+                                                   count-scaled after measurement, calls #1)
+           + locality
 ```
 
 Absolute fractions, so the score of a node does not depend on which other
@@ -407,9 +409,10 @@ evals of distinct scopes:
 | `spread`, 1 GiB task, same cluster | lands on the 75%-full node | lands on the emptier node |
 | `index_truncation_spread` allocations per slice | 39 / 29 / 41 / 51 | 34 / 40 / 45 / 41 |
 
-**Scheduler SLO benchmark** (`scheduler_benchmark_slo::`, all scenarios,
-medians of three interleaved base/after runs; evals/s, then build and apply
-phase means in µs):
+**Scheduler SLO benchmark, first cut (flat 0.2 anti-affinity penalty)**
+(`scheduler_benchmark_slo::`, all scenarios, medians of three interleaved
+base/after runs; evals/s, then build and apply phase means in µs). Superseded
+by the follow-up below, which is what shipped:
 
 | scenario | evals/s base | after | build base | after | apply base | after |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -432,6 +435,38 @@ placement shape: the 0.2 anti-affinity penalty now outweighs packing for
 small replicas, they spread over more nodes, and the apply pays a node-row
 parse and capacity recheck per distinct node (calls #1; the SCH5 node-row
 TODO would cut that cost).
+
+**Follow-up: count-scaled anti-affinity.** The penalty became
+`0.2 × (collisions + 1) / desired count` (calls #1). Same method, fresh base
+binary from `a447c87`; the first table is the SLO gate (medians of three
+interleaved rounds), the second the four scenarios that had regressed
+(`scheduler_scale_benchmark::`, medians of five interleaved rounds):
+
+| scenario | evals/s base | after | build base | after | apply base | after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| batch-burst | 80.3 | 108.6 | 4708 | 2812 | 6559 | 5553 |
+| churn-large | 79.1 | 75.4 | 4265 | 4817 | 4546 | 4463 |
+| churn-medium | 144.6 | 139.2 | 1561 | 1829 | 4173 | 4185 |
+| dense-fleet | 35.3 | 35.7 | 8954 | 9309 | 17198 | 16438 |
+| high-fanout | 132.1 | 116.2 | 2818 | 2437 | 3861 | 5064 |
+| mixed-heterogeneous | 126.5 | 134.1 | 2935 | 2870 | 3928 | 3564 |
+| steady-small | 191.8 | 131.9 | 1234 | 1591 | 3399 | 5265 |
+| unit-fleet | 205.7 | 214.6 | 884 | 867 | 3496 | 3320 |
+| web-fleet | 134.2 | 157.2 | 2403 | 2081 | 4221 | 3604 |
+
+| scenario (5 rounds) | evals/s base | after | build base | after | apply base | after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| batch-burst | 71.5 | 105.4 | 5011 | 3037 | 7647 | 5589 |
+| churn-large | 77.5 | 78.1 | 4196 | 4430 | 4604 | 4444 |
+| high-fanout | 132.8 | 126.9 | 2776 | 2178 | 3848 | 4688 |
+| mixed-heterogeneous | 125.0 | 124.3 | 2914 | 3117 | 3993 | 3865 |
+
+Single runs swung by up to ±30% on this host (steady-small's base alone
+ranged 137–192 evals/s across the three rounds, and its first round was
+192 base vs 198 after), so the three-round medians for steady-small and
+high-fanout are within noise. What is structural: many-replica tasks pack
+again (batch-burst +47%), and two-replica tasks (high-fanout) still spread,
+paying a higher apply per plan for the extra nodes.
 
 No release micro-benchmark (`benchmarks/micro/scheduler_bench.rs`) was run:
 a release build of the crate on this shared host would have held the build

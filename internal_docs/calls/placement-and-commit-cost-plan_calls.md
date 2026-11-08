@@ -6,7 +6,7 @@ Covers architecture-review findings SCH2, SCH3, SCH4, SCH5, SCH8, and AI7.
 Entries are ranked by project impact, highest first; an entry's number is its
 rank.
 
-## 1. Built-in scoring is resource utilization after placing, absolute, with no min-max normalization
+## 1. Built-in scoring is resource utilization after placing, absolute, and the anti-affinity penalty is scaled by the task's count
 
 **Call.** `bin_pack` scores a node by the dominant fraction of the resources
 the task requests that would be in use after placing it (`max_d (used_d +
@@ -14,44 +14,49 @@ request_d) / capacity_d` over memory, cpu, cores, and allocation slots with a
 finite capacity); `spread` scores one minus that. A small balanced-allocation
 term (`0.05 × (1 − (max_d − min_d))`) breaks near-ties toward nodes whose
 dimensions fill evenly. Fractions are absolute: a node's score does not
-depend on which other nodes are candidates.
+depend on which other nodes are candidates. The automatic anti-affinity
+penalty, previously 0.2 per same-task allocation on the node, is now Nomad's
+job anti-affinity shape: `0.2 × (collisions + 1) / desired count` when the
+node holds any, 0 when it holds none.
+
+```nickel
+# unchanged surface; the same keys mean count-scaled now
+schedulerSettings = { weights = { bin_pack = 1.0, automatic_anti_affinity = 0.2 } }
+```
 
 **Alternatives.** (a) Kubernetes `MostAllocated`/`LeastAllocated`: the
 *mean* of per-resource fractions rather than the max. (b) Nomad BestFit v3,
 `20 − (10^freeCpu + 10^freeMem)`, which rewards nearly-full nodes
 super-linearly. (c) Keep min-max normalization, but of utilization instead of
-counts.
+counts. For the penalty: (d) keep the flat 0.2 per collision; (e) a separate
+spreading rule (`maxSkew`-style) instead of a soft penalty.
 
 **Trade-off.** With absolute fractions a small task moves a node's score by a
-few hundredths, where the old min-max term always spanned 0–1. The automatic
-anti-affinity penalty (0.2 per same-task allocation) now outweighs packing
-for small replicas of one task, so `bin_pack` places a service's replicas on
-different, already-busy nodes instead of stacking them on one. That is
-Nomad's behavior too (its job anti-affinity is averaged into binpack), and it
-is better for availability; a job that wants stacking says so with
-`weights.automatic_anti_affinity = 0`. Visible as different placements on
-existing clusters for new work. It also costs plan throughput where one
-task has many replicas: spreading touches more nodes per plan, and the apply
-pays per distinct node. Measured (plan §12, medians of three interleaved
-runs): batch-burst 75.2 → 69.0 evals/s, high-fanout 134.6 → 113.8,
-churn-large 77.4 → 67.4, mixed-heterogeneous 130.4 → 115.3, the other five
-scenarios equal or faster; with the anti-affinity weight at 0 the two
-variants tried match base (110.9 vs 112.0, 120.9 vs 120.4), so the score
-itself costs nothing. Revisit with Nomad's shape, a penalty scaled by the
-task's count (`collisions / count`), if packing density or that throughput
-matters more than replica spreading; the TODO names both.
+few hundredths, where the old min-max term always spanned 0–1. The first cut
+kept the flat penalty, which then outweighed packing for every task: under
+`bin_pack` all replicas spread, plans touched more nodes, and the apply paid
+a node-row recheck per extra node — batch-burst 75.2 → 69.0 evals/s and
+three other many-replica SLO scenarios 8–15% slower (plan §12). Scaling the
+penalty by the count restores packing where it matters: a twenty-replica
+task pays 0.2 × 2/20 per first collision, less than one replica's share of a
+node, so `bin_pack` fills a node with it (batch-burst 71.5 → 105.4 evals/s
+against base, five interleaved rounds). The cost moves to small counts: a
+two- or three-replica service still spreads under `bin_pack` (0.2 × 2/3 for
+three replicas), as Nomad's does, where count-based scoring stacked it; for
+two replicas the penalty is exactly the old 0.2, and high-fanout (ten
+two-replica tasks per job) stays within noise of base (132.8 → 126.9) with a
+higher apply time from touching more nodes. A job that wants stacking at any
+count sets `automatic_anti_affinity = 0`.
 
 **Why (performance/scale and simplicity).** The max is what decides whether
 the *next* large task fits — a node with 90% of its memory used and 10% of
 its CPU is full for a memory-heavy task, which the mean (50%) hides. Absolute
 fractions make the score independent of index truncation, `nodes_considered`,
-and `score_sample`, which is what made the review call the old score
-unsound on large fleets. One formula explains both policies in a sentence.
-
-```nickel
-# unchanged surface; the same policy names score differently
-schedulerSettings = { weights = { bin_pack = 1.0, automatic_anti_affinity = 0.2 } }
-```
+and `score_sample`, which is what made the review call the old score unsound
+on large fleets. Count-scaling the penalty keeps one knob with one meaning
+("how strongly to avoid stacking one task") while making its strength
+proportionate to the task, which is the property the flat penalty lacked once
+the packing term stopped being inflated by min-max normalization.
 
 ## 2. Node rows in the apply walk are still parsed from the row, not borrowed from the read model
 

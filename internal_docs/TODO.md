@@ -2011,16 +2011,6 @@ How to use it:
       "zone"]`) when someone asks. Also at most eight domains are tried per
       plan, so a gang that fits only by preemption may miss the domain where
       it would have ([calls](calls/placement-and-commit-cost-plan_calls.md) #5).
-- [ ] **`bin_pack` now spreads a task's replicas, and that costs plan
-      throughput** ([plan §12](plans/placement-and-commit-cost-plan.md),
-      [calls #1](calls/placement-and-commit-cost-plan_calls.md)). With
-      utilization scoring, a small task moves a node's score by a few
-      hundredths, so the fixed 0.2-per-allocation automatic anti-affinity
-      penalty outweighs packing and replicas land on different nodes. Plans
-      then touch more nodes and the apply pays per node: 8-15% fewer evals/s
-      in the many-replica SLO scenarios (equal with the penalty at 0).
-      Options: scale the penalty by the task's count like Nomad's job
-      anti-affinity, and/or land the SCH5 node-row item above.
 - [ ] **`legion_eval_queue_depth` lags up to a second on a deep queue**
       ([calls](calls/placement-and-commit-cost-plan_calls.md) #6). Above `evalThreads × 16` pending, the claim path
       refreshes it from a full count at most once a second. A `kind` label
@@ -5781,7 +5771,11 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
         ([review SCH4](architecture-review-2026-11-07.md)): dominant utilization after placing plus a
         balanced-allocation tie-break, absolute per node, so truncated
         candidate lists no longer change a node's score
-        ([docs](../docs/scheduler-and-eval-loop.md#scoring)).
+        ([docs](../docs/scheduler-and-eval-loop.md#scoring)). The automatic
+        anti-affinity penalty is scaled by the task's count, as Nomad's job
+        anti-affinity is, so many-replica tasks pack again under `bin_pack`
+        (batch-burst 71.5 → 105.4 evals/s) while two- and three-replica
+        services spread ([calls #1](calls/placement-and-commit-cost-plan_calls.md)).
   - [x] **The apply consumes the plan in memory** ([review SCH5](architecture-review-2026-11-07.md), first
         half): no JSON serialize, INSERT, SELECT, and re-parse inside the
         commit. The node-row half is open above.
