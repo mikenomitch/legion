@@ -686,7 +686,7 @@ async fn ca_rotate(matches: &ArgMatches) -> R<()> {
     println!(
         "Rotated the cluster CA. The new CA (pin {}) signs every certificate from now on.\n\
          The previous CA stays trusted until {}, so no worker-plane or mesh connection breaks;\n\
-         nodes re-issue their certificates within one heartbeat. Join tokens minted before\n\
+         nodes re-issue their certificates within their rotation splay (at most 10 minutes). Join tokens minted before\n\
          the rotation work until then; mint new ones after.",
         reply.pin, reply.overlap_until
     );

@@ -2933,6 +2933,13 @@ async fn heartbeat_tick(
             credentials,
             manager_addr,
             &reply.cluster_ca_pins,
+            name,
+            reply
+                .next_interval_seconds
+                .map(|seconds| Duration::from_secs(u64::from(seconds)))
+                .unwrap_or(Duration::from_secs(
+                    crate::constants::WORKER_HEARTBEAT_DURATION_SEC,
+                )),
         )
         .await;
         // Policy bodies by hash, KV-held ingress certificates, and upstream
@@ -3323,12 +3330,16 @@ async fn apply_templates(
 }
 
 /// Keep the node certificate current: re-issued after a third of its
-/// lifetime, or at once when the manager's trust bundle differs from the
-/// node's (a CA rotation, or a CA added to or removed from the bundle). The
-/// same identity serves the worker plane listener (hot-swapped, no restart)
-/// and the mesh. Fail-static: a failed
-/// issuance keeps the certificate the node has, and a node without one
-/// refuses mesh flows rather than sending them in the clear.
+/// lifetime, or when the manager's trust bundle differs from the node's (a
+/// CA rotation, or a CA added to or removed from the bundle). A bundle
+/// change waits out the node's rotation splay first (mesh-control-path plan
+/// §6.7), so a rotation does not land every node's CSR on the signer in one
+/// beat; it is at once when the CA the node's certificate chains to left
+/// the bundle. The same identity serves the worker plane listener
+/// (hot-swapped, no restart) and the mesh. Fail-static: a failed issuance
+/// keeps the certificate the node has, and a node without one refuses mesh
+/// flows rather than sending them in the clear.
+#[allow(clippy::too_many_arguments)]
 async fn refresh_node_identity(
     node_identity: &crate::worker::plane::NodeIdentity,
     netd: &Netd,
@@ -3336,12 +3347,40 @@ async fn refresh_node_identity(
     credentials: &Arc<WorkerCredentials>,
     manager_addr: &str,
     manager_ca_pins: &[String],
+    node_id: &str,
+    interval: Duration,
 ) {
-    if !node_identity.needs_refresh(Some(manager_ca_pins)) {
-        return;
+    use crate::worker::plane::RefreshNeed;
+    let now = std::time::Instant::now();
+    match node_identity.refresh_need(Some(manager_ca_pins)) {
+        None => {
+            *ROTATION_DUE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return;
+        }
+        Some(RefreshNeed::BundleChanged { issuer_left: false }) => {
+            let mut pending = ROTATION_DUE.lock().unwrap_or_else(|p| p.into_inner());
+            let due = match pending.as_ref() {
+                Some((pins, due)) if pins.as_slice() == manager_ca_pins => *due,
+                _ => {
+                    let splay = crate::worker::plane::rotation_splay(node_id, interval);
+                    info!(
+                        splay_ms = splay.as_millis() as u64,
+                        "The cluster's trust bundle changed; re-issuing the node certificate after the rotation splay"
+                    );
+                    let due = now + splay;
+                    *pending = Some((manager_ca_pins.to_vec(), due));
+                    due
+                }
+            };
+            if now < due {
+                return;
+            }
+        }
+        Some(_) => {}
     }
     match node_identity.issue(client, credentials, manager_addr).await {
         Ok(()) => {
+            *ROTATION_DUE.lock().unwrap_or_else(|p| p.into_inner()) = None;
             if let Some(mesh) = node_identity.mesh_identity() {
                 netd.send(NetdInput::MeshIdentity(mesh)).await;
             }
@@ -3518,6 +3557,11 @@ static USAGE_SAMPLER: std::sync::LazyLock<Mutex<crate::worker::usage::UsageSampl
 static CONTENT_ADVERTISER: std::sync::LazyLock<
     Mutex<crate::worker::content_report::ContentAdvertiser>,
 > = std::sync::LazyLock::new(|| Mutex::new(Default::default()));
+
+/// The trust bundle (pins) a pending CA-rotation re-issue is for, and when
+/// it is due (`refresh_node_identity`, mesh-control-path plan §6.7).
+static ROTATION_DUE: std::sync::LazyLock<Mutex<Option<(Vec<String>, std::time::Instant)>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Capability a worker that streams its work advertises at registration.
 pub const WORK_STREAM_CAPABILITY: &str = "work-stream";
