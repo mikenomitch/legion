@@ -5,11 +5,14 @@
 //! operations as MCP tools, so any MCP-capable agent can discover and drive a
 //! Legion cluster without hand-rolling a gRPC client or scraping CLI text.
 //!
-//! ## Transport
+//! ## Protocol and transports
 //!
-//! One JSON-RPC message per line on stdin; one response line on stdout. This
-//! is the MCP stdio transport contract (messages must not contain embedded
-//! newlines).
+//! MCP `2025-06-18`, negotiated down to `2025-03-26` or `2024-11-05` for
+//! older clients, with tool annotations, `outputSchema`/`structuredContent`
+//! (Legion's envelope), and elicitation for approval gates
+//! (`mcp_protocol.rs`). Two transports: stdio (one JSON-RPC message per
+//! line, the default) and Streamable HTTP on loopback (`--http ADDR`,
+//! `POST /mcp`, JSON responses only).
 //!
 //! ## Safety
 //!
@@ -46,10 +49,19 @@ use crate::structs::{ForkInstanceRequest, SetSnapshotAliasRequest};
 use crate::structs::PromoteInstanceRequest;
 use crate::task_plugins::validate_job_config;
 use serde::Serialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// MCP protocol revision this server implements.
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Tools that map one-to-one onto a Manager RPC (agent-governance plan).
+#[path = "mcp_tools.rs"]
+mod mcp_tools;
+/// The protocol layer: negotiation, annotations, structured results,
+/// elicitation, and the stdio and HTTP transports.
+#[path = "mcp_protocol.rs"]
+mod protocol;
+
+/// The newest MCP protocol revision this server implements (older ones are
+/// negotiated; see `mcp_protocol.rs`).
+#[cfg(test)]
+const MCP_PROTOCOL_VERSION: &str = protocol::LATEST;
 
 /// Build the clap configuration for `legion mcp`.
 pub fn config() -> Command {
@@ -60,7 +72,11 @@ pub fn config() -> Command {
                 .long("allow-write")
                 .help("Expose mutating tools (run/stop/destroy). Off by default.")
                 .action(ArgAction::SetTrue),
-        );
+        )
+        .arg(Arg::new("http").long("http").value_name("ADDR").help(
+            "Serve the Streamable HTTP transport at http://ADDR/mcp (loopback only, \
+                     e.g. 127.0.0.1:8765) instead of stdio",
+        ));
 
     Command::new("mcp")
         .about("Model Context Protocol server for AI agents")
@@ -72,7 +88,18 @@ pub fn config() -> Command {
 /// Handle `legion mcp ...`.
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
-        Some(("serve", args)) => serve(args.get_flag("allow-write")).await,
+        Some(("serve", args)) => {
+            let allow_write = args.get_flag("allow-write");
+            match args.get_one::<String>("http") {
+                Some(addr) => {
+                    let addr = addr
+                        .parse()
+                        .with_context(|| format!("--http {addr}: expected HOST:PORT"))?;
+                    protocol::serve_http(addr, allow_write).await
+                }
+                None => protocol::serve_stdio(allow_write).await,
+            }
+        }
         _ => unreachable!(),
     }
 }
@@ -288,12 +315,27 @@ fn name_arg_schema() -> Value {
 
 /// The full tool catalog. Read-only tools are always available; mutating tools
 /// are filtered out unless `--allow-write` is set.
+/// Every tool: the hand-written ones below, then the one-to-one RPC tools
+/// (`mcp_tools.rs`). Append new hand-written tools to `core_tool_defs`.
 fn tool_defs() -> Vec<ToolDef> {
+    let mut tools = core_tool_defs();
+    tools.extend(mcp_tools::tool_defs());
+    tools.push(mcp_tools::stream_tool());
+    tools
+}
+
+fn core_tool_defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "legion_capabilities",
-            description: "List Legion's agent-callable operations and whether each mutates state.",
-            input_schema: empty_schema,
+            description: "List Legion's agent-callable operations and whether each mutates state, each marked allowed, partial (with namespaces), or denied for this server's token when a manager is reachable. static = true skips the manager.",
+            input_schema: || {
+                json!({
+                    "type": "object",
+                    "properties": { "static": { "type": "boolean", "description": "Return the catalog without asking the manager what this token may do." } },
+                    "additionalProperties": false
+                })
+            },
             mutates: false,
         },
         ToolDef {
@@ -1636,116 +1678,31 @@ fn available_tools(allow_write: bool) -> Vec<ToolDef> {
         .collect()
 }
 
-/// Run the stdio MCP server loop until stdin closes.
-async fn serve(allow_write: bool) -> R<()> {
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin).lines();
-    let mut stdout = tokio::io::stdout();
-
-    info!(allow_write, "legion mcp server started");
-
-    while let Some(line) = reader.next_line().await? {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let response = handle_message(line, allow_write).await;
-        if let Some(response) = response {
-            let mut text = serde_json::to_string(&response)?;
-            text.push('\n');
-            stdout.write_all(text.as_bytes()).await?;
-            stdout.flush().await?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Parse and dispatch one JSON-RPC message. Returns `None` for notifications
-/// (no `id`), which must not be answered.
+/// Parse and dispatch one JSON-RPC message on a fresh session. Returns
+/// `None` for notifications (no `id`), which must not be answered.
+#[cfg(test)]
 async fn handle_message(line: &str, allow_write: bool) -> Option<Value> {
-    let parsed: Value = match serde_json::from_str(line) {
-        Ok(value) => value,
-        Err(err) => {
-            return Some(json_rpc_error(
-                Value::Null,
-                -32700,
-                &format!("parse error: {err}"),
-            ));
-        }
-    };
-
-    let id = parsed.get("id").cloned();
-    let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = parsed.get("params").cloned().unwrap_or(Value::Null);
-
-    // Notifications carry no id and expect no response.
-    let is_notification = id.is_none();
-
-    match method {
-        "initialize" => Some(json_rpc_result(id, initialize_result())),
-        "tools/list" => Some(json_rpc_result(id, tools_list_result(allow_write))),
-        "tools/call" => Some(json_rpc_result(
-            id,
-            tools_call_result(params, allow_write).await,
-        )),
-        "ping" => Some(json_rpc_result(id, json!({}))),
-        _ if is_notification => None,
-        _ => Some(json_rpc_error(
-            id.unwrap_or(Value::Null),
-            -32601,
-            &format!("method not found: {method}"),
-        )),
-    }
-}
-
-fn initialize_result() -> Value {
-    json!({
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": { "tools": {} },
-        "serverInfo": { "name": "legion", "version": env!("CARGO_PKG_VERSION") }
-    })
-}
-
-fn tools_list_result(allow_write: bool) -> Value {
-    let tools = available_tools(allow_write)
-        .into_iter()
-        .map(|tool| {
-            json!({
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool_schema(&tool),
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({ "tools": tools })
-}
-
-/// Execute a `tools/call`. Tool-level failures are reported inside the result
-/// with `isError: true` (per MCP convention), not as JSON-RPC errors.
-async fn tools_call_result(params: Value, allow_write: bool) -> Value {
-    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-
-    // Enforce the write policy regardless of what tools/list advertised.
-    if !allow_write && tool_defs().iter().any(|t| t.name == name && t.mutates) {
-        return tool_error(&format!(
-            "tool {name} is mutating and requires the server to be started with --allow-write"
-        ));
-    }
-
-    match dispatch_tool(name, arguments).await {
-        Ok(value) => tool_success(&value),
-        Err(err) => tool_error(&err),
-    }
+    protocol::handle_line(line, allow_write).await
 }
 
 /// Run a tool and return its data payload as JSON, or a human-readable error
 /// string on failure.
 async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
+    if let Some(result) = mcp_tools::dispatch(name, args.clone()).await {
+        return result;
+    }
     match name {
         "legion_capabilities" => {
+            // Caller-aware when a manager answers (each entry marked
+            // allowed/partial/denied for this server's token), else the
+            // static catalog.
+            if args.get("static").and_then(Value::as_bool) != Some(true) {
+                if let Ok(mut client) = connect().await {
+                    if let Ok(view) = crate::cmd::capabilities::caller_catalog(&mut client).await {
+                        return Ok(view);
+                    }
+                }
+            }
             Ok(serde_json::to_value(crate::cmd::capabilities::catalog())
                 .map_err(|e| e.to_string())?)
         }
@@ -3878,23 +3835,6 @@ fn variables_arg(args: &Value) -> String {
         .filter(|value| value.is_object())
         .map(Value::to_string)
         .unwrap_or_else(|| "{}".to_string())
-}
-
-fn tool_success(data: &Value) -> Value {
-    let text = serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string());
-    json!({ "content": [{ "type": "text", "text": text }], "isError": false })
-}
-
-fn tool_error(message: &str) -> Value {
-    json!({ "content": [{ "type": "text", "text": message }], "isError": true })
-}
-
-fn json_rpc_result(id: Option<Value>, result: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id.unwrap_or(Value::Null), "result": result })
-}
-
-fn json_rpc_error(id: Value, code: i64, message: &str) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
 #[cfg(test)]
