@@ -170,6 +170,19 @@ settle, in the same write:
   field only matches another empty field),
 - already claimable (`ready_at <= now`).
 
+A claim costs the same whatever the queue holds. The duplicate lookup is an
+equality seek on a partial index over pending rows (an absent scope is stored
+as NULL and matched with `IS`), the head of the queue is read in index order
+and stops after the batch, and the pending count that sizes the batch stops
+counting at the point where a deeper queue would not change the batch
+(`evalThreads × 16`). Measured on one store at 50,000 pending evals, a batch of
+16 went from 116 ms to under a millisecond.
+
+`legion_eval_queue_depth` is exact while the queue is shallower than that
+point. Deeper, it is refreshed from a full count at most once a second, and
+each enqueue adds one in between, so on a deep queue it can lag by about a
+second.
+
 This keeps the queue from filling with redundant work for the same entity.
 It only discards work the claimed eval covers. Node-scoped kinds
 (`node_drain`, `node_lost_reschedule`) carry no job, so they collapse per

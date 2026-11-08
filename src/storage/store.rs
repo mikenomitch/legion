@@ -284,6 +284,13 @@ impl EvalBatchLimits {
         let pending = pending.max(0) as usize;
         (pending / workers).clamp(1, self.max.max(1))
     }
+
+    /// The unclaimed-queue length at which [`Self::share_of`] stops
+    /// growing: any deeper queue gets the same batch, so a claim never
+    /// needs to count past it (`store/eval_claims.rs`).
+    fn saturation(&self) -> usize {
+        self.workers.max(1).saturating_mul(self.max.max(1))
+    }
 }
 
 /// Which eval kinds a claim may take.
@@ -18658,13 +18665,17 @@ impl Store {
     fn insert_eval_apply(&self, eval: &Eval) -> R<()> {
         let conn = self.write_connection()?;
 
+        // An absent scope is stored as NULL, never '' or blanks, like every
+        // other eval writer: the claim's duplicate lookup matches scopes
+        // with `IS` (`store/eval_claims.rs`).
+        let scope = |value: &str| (!value.trim().is_empty()).then(|| value.to_string());
         let params = named_params! {
             ":id": eval.id,
             ":status": eval.status,
             ":type": eval.kind,
-            ":job_id": if eval.job_id.is_empty() { None::<String> } else { Some(eval.job_id.clone()) },
-            ":job_config_id": if eval.job_config_id.is_empty() { None::<String> } else { Some(eval.job_config_id.clone()) },
-            ":node_id": if eval.node_name.is_empty() { None::<String> } else { Some(eval.node_name.clone()) },
+            ":job_id": scope(&eval.job_id),
+            ":job_config_id": scope(&eval.job_config_id),
+            ":node_id": scope(&eval.node_name),
             ":priority": eval.priority,
             ":ready_at": Self::sortable_now()?,
         };
@@ -19432,13 +19443,12 @@ impl Store {
             "UPDATE eval SET status = 'pending', ready_at = ?2 WHERE id = ?1;",
             params![eval_id, ready_at],
         )?;
-        let pending = Self::pending_eval_count_tx(&tx)?;
         let staged = self.stage_event_locked(&tx, event);
         tx.commit()?;
         self.publish_staged(staged);
-        crate::manager::telemetry::metrics()
-            .eval_queue_depth
-            .set(pending);
+        // The row was pending all along (a claim is leader memory), so the
+        // queue did not grow; the claim path keeps the gauge current
+        // (`store/eval_claims.rs`, SCH3).
         Ok(())
     }
 
@@ -19788,15 +19798,16 @@ impl Store {
         // row (JC-41): `scheduler_event` is commutative, so a scheduler-lane
         // INSERT is legal, and the row and its event replicate together.
         let enqueue_event = self.stage_event_locked(&tx, drafts::eval_enqueued(&eval, delay));
-        // See `pending_eval_count_tx`: the insert just grew the pending set,
-        // so refresh the queue-depth gauge while the tx is still open.
-        let pending = Self::pending_eval_count_tx(&tx)?;
         tx.commit()?;
         self.publish_staged(enqueue_event);
         drop(conn);
-        crate::manager::telemetry::metrics()
-            .eval_queue_depth
-            .set(pending);
+        // The insert grew the pending set by one. Counting it here cost
+        // O(pending) inside the serialized write on every enqueue (SCH3);
+        // the claim path resets the gauge from an exact or rate-limited
+        // count, so `+1` keeps it moving in between (a racing pair of
+        // enqueues can lose one; the next claim corrects it).
+        let depth = &crate::manager::telemetry::metrics().eval_queue_depth;
+        depth.set(depth.get() + 1);
 
         if delay.is_zero() && !capture::in_capture() {
             // Zero-delay evals are immediately claimable, so wake one

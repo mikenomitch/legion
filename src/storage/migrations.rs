@@ -2481,6 +2481,24 @@ fn migration_list() -> Vec<M<'static>> {
         DELETE FROM scaling_counter WHERE name = 'scaling_policy';",
         )
         .down(""),
+        // Eval claims stay O(batch) as the queue grows (architecture review
+        // SCH3; `store/eval_claims.rs`). Both indexes are partial over
+        // pending rows, so they cost nothing for settled history.
+        // `idx_eval_pending_scope` serves the claim's duplicate lookup, an
+        // equality on (kind, job, job config, node) that the old
+        // `COALESCE(col, '')` form could not seek; `idx_eval_pending_kind_order`
+        // serves the throttled worker's non-planning claim, which otherwise
+        // walked every planning eval at the head of the queue to find none.
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_eval_pending_scope
+                 ON eval(type, job_id, job_config_id, node_id) WHERE status = 'pending';
+             CREATE INDEX IF NOT EXISTS idx_eval_pending_kind_order
+                 ON eval(type, priority DESC, id ASC) WHERE status = 'pending';",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_eval_pending_scope;
+             DROP INDEX IF EXISTS idx_eval_pending_kind_order;",
+        ),
     ]
 }
 

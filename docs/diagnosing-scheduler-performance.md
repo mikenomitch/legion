@@ -414,7 +414,10 @@ submit can never overtake an older backlog.
 **Known limitation, and the workaround**
 
 `legion_eval_queue_depth` is a single unlabelled gauge. It tells you the queue
-is 764 deep but not what is in it, which is what you need here. Until it has a
+is 764 deep but not what is in it, which is what you need here. On a queue
+deeper than `evalThreads × 16` it is refreshed from a full count at most once
+a second, so it can lag by that much
+([claims](scheduler-and-eval-loop.md#eval-queue-semantics)). Until it has a
 `kind` label, read the queue contents from the store directly:
 
 ```console

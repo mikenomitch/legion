@@ -44,6 +44,73 @@ pub(crate) struct EvalClaims {
     capacity_seq: HashMap<String, u64>,
 }
 
+/// How often the O(pending) full count may refresh `legion_eval_queue_depth`.
+const QUEUE_DEPTH_REFRESH_INTERVAL_MS: u64 = 1_000;
+
+/// When the queue-depth gauge last took a full count, in [`process_millis`]
+/// (0 = never). Process-wide, like the gauge it rate-limits.
+static QUEUE_DEPTH_REFRESHED_AT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds since this process first asked, for cheap rate limits.
+fn process_millis() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// The head of the ready queue for a claim. `+ready_at` keeps `ready_at`
+/// out of index selection: with it eligible, SQLite ranges over
+/// `(status, ready_at, ...)` and sorts every ready row to find the head.
+/// Without it the walk follows `(status, priority DESC, id ASC)` (or, for
+/// the non-planning kinds, `idx_eval_pending_kind_order`) and stops after
+/// the batch. The non-planning kind list is a compile-time constant, never
+/// caller input, so it is built into the statement.
+fn claim_head_sql(scope: ClaimScope) -> String {
+    let kind_filter = match scope {
+        ClaimScope::Any => String::new(),
+        ClaimScope::NonPlanning => format!(
+            " AND type IN ({})",
+            crate::manager::concurrency::NON_PLANNING_EVAL_KINDS
+                .iter()
+                .map(|kind| format!("'{kind}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    format!(
+        "SELECT id, status, type, job_id, job_config_id, node_id, priority, ready_at
+         FROM eval
+         WHERE status = 'pending' AND +ready_at <= ?1{kind_filter}
+         ORDER BY priority DESC, id ASC
+         LIMIT ?2;"
+    )
+}
+
+/// The pending duplicates one claimed eval subsumes: same kind, same
+/// (job, job config, node) scope, already claimable. `IS` rather than
+/// `COALESCE(col, '') = ?`: every eval writer stores an absent scope as
+/// NULL, never '', so `IS` matches the same rows, and unlike the COALESCE
+/// it is an equality the `idx_eval_pending_scope` seek can use. The
+/// COALESCE form scanned the pending set once per claimed eval.
+const SUBSUME_SQL: &str = "SELECT id FROM eval
+     WHERE status = 'pending'
+       AND type = ?2
+       AND job_id IS ?4
+       AND job_config_id IS ?5
+       AND node_id IS ?6
+       AND +ready_at <= ?3
+       AND id != ?1;";
+
+/// Pending rows, counted no further than `?1`.
+const PENDING_CAPPED_SQL: &str =
+    "SELECT COUNT(*) FROM (SELECT 1 FROM eval WHERE status = 'pending' LIMIT ?1);";
+
+/// An eval's scope column as the claim queries bind it: `""` (how
+/// [`Store::eval_from_row`] reads a NULL) back to NULL.
+fn scope_param(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
 impl Store {
     fn lock_eval_claims(&self) -> std::sync::MutexGuard<'_, EvalClaims> {
         self.eval_claims
@@ -54,7 +121,8 @@ impl Store {
     /// Claim the next ready eval, if any (a batch of one).
     #[instrument(err, skip_all)]
     pub fn claim_eval(&self) -> R<Option<Eval>> {
-        Ok(self.claim_up_to(|_| 1, ClaimScope::Any)?.into_iter().next())
+        let one = EvalBatchLimits { max: 1, workers: 1 };
+        Ok(self.claim_up_to(one, ClaimScope::Any)?.into_iter().next())
     }
 
     /// Claim a fair-share batch of ready evals ([`EvalBatchLimits`]).
@@ -72,42 +140,40 @@ impl Store {
     /// can see, and duplicate collapse, are identical.
     #[instrument(err, skip_all)]
     pub fn claim_evals(&self, limits: EvalBatchLimits, scope: ClaimScope) -> R<Vec<Eval>> {
-        self.claim_up_to(|pending| limits.share_of(pending), scope)
+        self.claim_up_to(limits, scope)
     }
 
-    fn claim_up_to(&self, take_for: impl FnOnce(i64) -> usize, scope: ClaimScope) -> R<Vec<Eval>> {
+    /// The claim itself. Everything here runs under the claims mutex, so
+    /// every statement is bounded by the batch, never by the queue
+    /// (architecture review SCH3): the count stops at the fair share's
+    /// saturation point, the head query walks `priority DESC, id ASC` in
+    /// index order, and the duplicate lookup is an equality seek on the
+    /// pending-scope index. `EXPLAIN QUERY PLAN` for each is pinned by
+    /// `eval_claims_test::claim_queries_use_their_indexes`.
+    fn claim_up_to(&self, limits: EvalBatchLimits, scope: ClaimScope) -> R<Vec<Eval>> {
         let started = Instant::now();
         let capacity_seq = self.capacity_seq();
         let mut claims = self.lock_eval_claims();
         let conn = self.read_connection()?;
         let now = Self::sortable_now()?;
-        let pending = Self::pending_eval_count_tx(&conn)?;
-        let unclaimed = (pending - claims.held.len() as i64).max(0);
-        let take = take_for(unclaimed);
-        if unclaimed == 0 || take == 0 {
+        let held = claims.held.len() as i64;
+        // The fair share stops growing once the unclaimed queue reaches
+        // `workers × max`, so counting past that point buys nothing: the
+        // count is exact below the cap and "at least the cap" at it.
+        let cap = held.saturating_add(limits.saturation() as i64);
+        let pending = Self::pending_eval_count_capped(&conn, cap)?;
+        let exact = pending < cap;
+        let unclaimed = (pending - held).max(0);
+        if unclaimed == 0 {
+            drop(claims);
+            if exact {
+                crate::manager::telemetry::metrics().eval_queue_depth.set(0);
+            }
             return Ok(Vec::new());
         }
+        let take = limits.share_of(unclaimed);
         let candidates: Vec<Eval> = {
-            // The non-planning kind list is a compile-time constant, never
-            // caller input, so it is built into the statement.
-            let kind_filter = match scope {
-                ClaimScope::Any => String::new(),
-                ClaimScope::NonPlanning => format!(
-                    " AND type IN ({})",
-                    crate::manager::concurrency::NON_PLANNING_EVAL_KINDS
-                        .iter()
-                        .map(|kind| format!("'{kind}'"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            };
-            let mut stmt = conn.prepare_cached(&format!(
-                "SELECT id, status, type, job_id, job_config_id, node_id, priority, ready_at
-                 FROM eval
-                 WHERE status = 'pending' AND ready_at <= ?1{kind_filter}
-                 ORDER BY priority DESC, id ASC
-                 LIMIT ?2;"
-            ))?;
+            let mut stmt = conn.prepare_cached(&claim_head_sql(scope))?;
             let rows = stmt.query_map(params![now, (take + claims.held.len()) as i64], |row| {
                 self.eval_from_row(row)
             })?;
@@ -121,30 +187,20 @@ impl Store {
             if claims.held.contains(&eval.id) {
                 continue;
             }
-            // Collapse only work this claim genuinely subsumes: same kind,
-            // same (job, job config, node) scope with NULL and '' alike, and
-            // already claimable. The reasons each part matters are on the
-            // old claim's sweep in git history and in
+            // Collapse only work this claim genuinely subsumes (see
+            // `SUBSUME_SQL`). The reasons each part matters are on the old
+            // claim's sweep in the history and in
             // docs/scheduler-and-eval-loop.md ("Claims").
             let subsumed: Vec<String> = {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT id FROM eval
-                     WHERE status = 'pending'
-                       AND id != ?1
-                       AND type = ?2
-                       AND ready_at <= ?3
-                       AND COALESCE(job_id, '') = ?4
-                       AND COALESCE(job_config_id, '') = ?5
-                       AND COALESCE(node_id, '') = ?6;",
-                )?;
+                let mut stmt = conn.prepare_cached(SUBSUME_SQL)?;
                 let rows = stmt.query_map(
                     params![
                         eval.id,
                         eval.kind,
                         now,
-                        eval.job_id.trim(),
-                        eval.job_config_id.trim(),
-                        eval.node_name.trim()
+                        scope_param(&eval.job_id),
+                        scope_param(&eval.job_config_id),
+                        scope_param(&eval.node_name)
                     ],
                     |row| row.get::<_, i64>(0).map(|id| id.to_string()),
                 )?;
@@ -160,19 +216,55 @@ impl Store {
             eval.status = "in_flight".to_string();
             claimed.push(eval);
         }
-        let depth = (pending - claims.held.len() as i64).max(0);
+        let held_after = claims.held.len();
         drop(claims);
-        crate::manager::telemetry::metrics()
-            .eval_queue_depth
-            .set(depth);
+        // The gauge: exact when the capped count was, otherwise a full count
+        // at most once per interval, outside the claims mutex.
+        if exact {
+            crate::manager::telemetry::metrics()
+                .eval_queue_depth
+                .set((pending - held_after as i64).max(0));
+        } else {
+            Self::refresh_eval_queue_depth(&conn, held_after, false)?;
+        }
         if !claimed.is_empty() {
-            info!(
+            debug!(
                 claimed = claimed.len(),
                 duration_ms = started.elapsed().as_millis() as u64,
                 "Claimed evals"
             );
         }
         Ok(claimed)
+    }
+
+    /// Pending rows, counted no further than `cap`: exact below it, `cap`
+    /// at or above it. O(min(pending, cap)) on the status index, where the
+    /// full count it replaced was O(pending) on every claim.
+    fn pending_eval_count_capped(conn: &Connection, cap: i64) -> R<i64> {
+        Ok(conn
+            .prepare_cached(PENDING_CAPPED_SQL)?
+            .query_row([cap.max(0)], |row| row.get(0))?)
+    }
+
+    /// Set `legion_eval_queue_depth` from a full count of pending rows less
+    /// the `held` ones this manager has claimed. The count is O(pending), so
+    /// unless `force`d it runs at most once per
+    /// [`QUEUE_DEPTH_REFRESH_INTERVAL_MS`] per process (the gauge is
+    /// process-wide too); in between, the claim path's exact small counts
+    /// and the enqueue path's `+1` keep it moving.
+    pub(crate) fn refresh_eval_queue_depth(conn: &Connection, held: usize, force: bool) -> R<()> {
+        use std::sync::atomic::Ordering;
+        let now_ms = process_millis().max(1);
+        let last = QUEUE_DEPTH_REFRESHED_AT_MS.load(Ordering::Relaxed);
+        if !force && last != 0 && now_ms.saturating_sub(last) < QUEUE_DEPTH_REFRESH_INTERVAL_MS {
+            return Ok(());
+        }
+        QUEUE_DEPTH_REFRESHED_AT_MS.store(now_ms, Ordering::Relaxed);
+        let pending = Self::pending_eval_count_tx(conn)?;
+        crate::manager::telemetry::metrics()
+            .eval_queue_depth
+            .set((pending - held as i64).max(0));
+        Ok(())
     }
 
     /// The pending duplicates a claim of `eval_id` subsumes, which its
@@ -295,6 +387,84 @@ mod eval_claims_test {
         store.complete_eval(&claimed.id, true)?;
         store.complete_eval(&next.id, true)?;
         assert_eq!(pending(&store)?, 0, "settles deleted the duplicate too");
+        Ok(())
+    }
+
+    fn query_plan(store: &Store, sql: &str) -> R<String> {
+        let conn = store.read_connection()?;
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        // The plan does not depend on the values, only on their presence.
+        let nulls = std::iter::repeat_n(rusqlite::types::Null, stmt.parameter_count());
+        let rows = stmt.query_map(rusqlite::params_from_iter(nulls), |row| {
+            row.get::<_, String>(3)
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?.join(" | "))
+    }
+
+    /// Every statement a claim runs holds the claims mutex, so none may scan
+    /// or sort the pending queue (architecture review SCH3). Pinned by query
+    /// plan, which here is a property of the schema and the SQL rather than
+    /// of the data: Legion never runs `ANALYZE`, so SQLite plans without
+    /// table statistics.
+    #[test]
+    fn claim_queries_use_their_indexes() -> R<()> {
+        let (_dir, store) = store()?;
+
+        let head = query_plan(&store, &claim_head_sql(ClaimScope::Any))?;
+        assert!(head.contains("idx_eval_status_priority_id"), "{head}");
+        assert!(
+            !head.contains("TEMP B-TREE"),
+            "the head must not sort: {head}"
+        );
+        assert!(!head.contains("SCAN eval"), "{head}");
+
+        let non_planning = query_plan(&store, &claim_head_sql(ClaimScope::NonPlanning))?;
+        assert!(
+            non_planning.contains("idx_eval_pending_kind_order"),
+            "the throttled claim seeks its kinds: {non_planning}"
+        );
+        assert!(!non_planning.contains("SCAN eval"), "{non_planning}");
+
+        let subsume = query_plan(&store, SUBSUME_SQL)?;
+        assert!(
+            subsume.contains("idx_eval_pending_scope")
+                && subsume.contains("job_id=?")
+                && subsume.contains("node_id=?"),
+            "the duplicate lookup seeks the whole scope: {subsume}"
+        );
+
+        let count = query_plan(&store, PENDING_CAPPED_SQL)?;
+        assert!(!count.contains("SCAN eval"), "{count}");
+        Ok(())
+    }
+
+    /// `IS` matching treats an absent scope (NULL) as a scope of its own: a
+    /// job-scoped eval never subsumes a node-scoped one of the same kind, and
+    /// blank scopes written by any path are stored as NULL so they match.
+    #[test]
+    fn duplicate_collapse_matches_absent_scopes_exactly() -> R<()> {
+        let (_dir, store) = store()?;
+        let node_scoped =
+            store.enqueue_eval("node_lost_reschedule", None, None, Some("n1"), None)?;
+        store.enqueue_eval(
+            "node_lost_reschedule",
+            Some(" "),
+            Some(""),
+            Some("n1"),
+            None,
+        )?;
+        store.enqueue_eval("node_lost_reschedule", Some("web"), None, Some("n1"), None)?;
+
+        let claimed = store.claim_eval()?.context("claimable")?;
+        assert_eq!(claimed.id, node_scoped.id);
+        assert_eq!(
+            store.subsumed_by_claim(&claimed.id).len(),
+            1,
+            "the blank-scoped duplicate collapses, the job-scoped eval does not"
+        );
+        let next = store.claim_eval()?.context("the job-scoped eval")?;
+        assert_eq!(next.job_id, "web");
+        assert!(store.claim_eval()?.is_none());
         Ok(())
     }
 
