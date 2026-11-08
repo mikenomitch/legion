@@ -114,6 +114,7 @@ impl Cluster {
                 force_reschedule: false,
                 idempotency_key: None,
                 allow_unknown_fields: false,
+                expected_version: None,
             })))?;
         Ok(())
     }

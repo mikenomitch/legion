@@ -12,8 +12,67 @@
 //! same `build_checkpoint_requests` the heartbeat reply uses.
 
 use super::*;
+use crate::storage::revisions::Revision;
 use crate::storage::work_log::{NodeWorkLog, PendingWork, WorkLog};
 use crate::structs::{stream_work_request, StopNotice, StreamWorkReply, StreamWorkRequest};
+
+/// How long a resuming stream waits for this manager's replica to catch up
+/// to the worker's revision before it gives up and resyncs (a worker that
+/// last streamed from the old leader can be a few entries ahead of a
+/// follower).
+const RESUME_CATCH_UP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why each of `gone` left the node's desired set: the stop notice its
+/// removal recorded, when there is one.
+fn stop_notices_for(store: &Store, node_id: &str, gone: Vec<i64>) -> Vec<StopNotice> {
+    if gone.is_empty() {
+        return Vec::new();
+    }
+    let notices: HashMap<i64, StopNotice> = store
+        .stop_notices_for_node(node_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|notice| {
+            (
+                notice.allocation_id,
+                StopNotice {
+                    allocation_id: notice.allocation_id,
+                    cause: notice.cause.as_str().to_string(),
+                    preemptor_job: notice.preemptor_job,
+                    preemptor_band: notice.preemptor_band,
+                },
+            )
+        })
+        .collect();
+    gone.into_iter()
+        .map(|allocation_id| {
+            notices.get(&allocation_id).cloned().unwrap_or(StopNotice {
+                allocation_id,
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+/// The payloads of `ids` still desired on `node_id`, for a heartbeat feed
+/// that needs payloads a resume did not resend
+/// ([`WorkLog::held_payloads`]). Best effort: an allocation that cannot be
+/// read is left out, as it would be from the desired set.
+pub(super) fn load_held_payloads(
+    store: &Store,
+    node_id: &str,
+    ids: &[i64],
+) -> Vec<crate::structs::TaskAllocation> {
+    let mut task_cache = DesiredTaskCache::default();
+    ids.iter()
+        .filter_map(|id| store.get_allocation_by_id(*id).ok().flatten())
+        .filter(|allocation| {
+            allocation.node_id == node_id
+                && crate::constants::allocation_status_is_dispatchable(&allocation.status)
+        })
+        .filter_map(|allocation| desired_payload(store, &allocation, &mut task_cache).ok())
+        .collect()
+}
 
 /// Messages buffered toward one worker before the sender waits for it.
 const WORK_STREAM_BUFFER: usize = 64;
@@ -30,8 +89,60 @@ pub(super) fn next_work_message(
     session: u64,
     node_id: &str,
 ) -> R<Option<StreamWorkReply>> {
-    let (resync, upserts, stops) = match WorkLog::take_pending(log, session) {
+    // The revision this message reflects, and the work it carries, taken
+    // together under the journal's publish lock: every change at or below
+    // the revision is either in this work or was sent before.
+    let pending = {
+        let hub = store.revisions();
+        let _publishing = hub.publishing();
+        WorkLog::note_revision(log, hub.recorded().render());
+        WorkLog::take_pending(log, session)
+    };
+    let (resync, upserts, stops) = match pending {
         PendingWork::Nothing => (false, Vec::new(), Vec::new()),
+        PendingWork::Resume { from, changed } => {
+            // What changed on the node since the worker's revision: upsert
+            // what is still desired, stop the rest. The worker holds the
+            // node's set as of that revision, so this brings it to now.
+            let desired: Vec<crate::structs::Allocation> = store
+                .allocs_for_node(node_id)?
+                .into_iter()
+                .filter(|allocation| {
+                    crate::constants::allocation_status_is_dispatchable(&allocation.status)
+                })
+                .collect();
+            let desired_ids: BTreeSet<i64> =
+                desired.iter().map(|allocation| allocation.id).collect();
+            let mut task_cache = DesiredTaskCache::default();
+            let mut upserts = Vec::new();
+            for allocation in &desired {
+                if changed.contains(&allocation.id) {
+                    upserts.push(desired_payload(store, allocation, &mut task_cache)?);
+                }
+            }
+            let gone: Vec<i64> = changed
+                .iter()
+                .filter(|id| !desired_ids.contains(id))
+                .copied()
+                .collect();
+            let stops = stop_notices_for(store, node_id, gone);
+            let checkpoints = if WorkLog::take_checkpoint_work(log) {
+                WorkLog::unpushed_checkpoints(
+                    log,
+                    snapshot_rpcs::build_checkpoint_requests(store, node_id),
+                )
+            } else {
+                Vec::new()
+            };
+            return Ok(Some(work_log.commit_resume(
+                log,
+                from,
+                upserts,
+                stops,
+                desired_ids,
+                checkpoints,
+            )));
+        }
         PendingWork::Resync => (
             true,
             build_desired_allocations(store, node_id, &[])?,
@@ -61,37 +172,7 @@ pub(super) fn next_work_message(
                     None => {}
                 }
             }
-            let stops = if gone.is_empty() {
-                Vec::new()
-            } else {
-                // Why each one went: the stop notice its removal recorded,
-                // when there is one.
-                let notices: HashMap<i64, StopNotice> = store
-                    .stop_notices_for_node(node_id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|notice| {
-                        (
-                            notice.allocation_id,
-                            StopNotice {
-                                allocation_id: notice.allocation_id,
-                                cause: notice.cause.as_str().to_string(),
-                                preemptor_job: notice.preemptor_job,
-                                preemptor_band: notice.preemptor_band,
-                            },
-                        )
-                    })
-                    .collect();
-                gone.into_iter()
-                    .map(|allocation_id| {
-                        notices.get(&allocation_id).cloned().unwrap_or(StopNotice {
-                            allocation_id,
-                            ..Default::default()
-                        })
-                    })
-                    .collect()
-            };
-            (false, upserts, stops)
+            (false, upserts, stop_notices_for(store, node_id, gone))
         }
     };
     // Checkpoint work the node has not been pushed yet (checkpoints-on-stream
@@ -145,12 +226,43 @@ impl ManagerDaemonService {
         let store = self.store.clone();
         let work_log = store.work_log();
         let node_id = open.node_id.clone();
-        let attached = work_log.attach(&node_id, open.last_epoch, open.last_seq);
+        // A worker from another epoch (a restart, a failover, another
+        // manager) that names its last revision can resume instead of
+        // resyncing (revisions-and-watches plan §7). Let this replica catch
+        // up to that revision first: a worker that last streamed from the
+        // old leader can be a few entries ahead of a follower.
+        let resume_from = (open.last_epoch != work_log.epoch())
+            .then(|| Revision::parse(&open.last_revision).ok())
+            .flatten();
+        let resume_from = match resume_from {
+            Some(revision) if store.wait_for_revision(&revision, RESUME_CATCH_UP).await => {
+                Some(revision)
+            }
+            Some(revision) => {
+                debug!(
+                    node_id = %node_id,
+                    revision = %revision,
+                    "This manager did not catch up to the worker's revision; resyncing"
+                );
+                None
+            }
+            None => None,
+        };
+        let attached = {
+            let hub = store.revisions();
+            let _publishing = hub.publishing();
+            work_log.attach_resuming(&node_id, open.last_epoch, open.last_seq, || {
+                let revision = resume_from?;
+                hub.node_changes_since(&node_id, &revision)
+                    .map(|changed| (open.last_revision.clone(), changed))
+            })
+        };
         let (tx, rx) = tokio::sync::mpsc::channel(WORK_STREAM_BUFFER);
         info!(
             node_id = %node_id,
             replay = attached.replay.len(),
             last_seq = open.last_seq,
+            last_revision = %open.last_revision,
             "Work stream attached"
         );
 

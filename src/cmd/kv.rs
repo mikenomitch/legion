@@ -53,7 +53,8 @@ pub fn config() -> Command {
                 .help("Key to fetch")
                 .required(true),
         )
-        .arg(json_flag());
+        .arg(json_flag())
+        .args(crate::cmd::watch::read_flags());
 
     let list_cmd = Command::new("list")
         .about("List key/value entries")
@@ -130,6 +131,7 @@ pub fn config() -> Command {
         .subcommand(list_cmd)
         .subcommand(delete_cmd)
         .subcommand(patch_cmd)
+        .subcommand(crate::cmd::watch::kv_watch_cmd())
 }
 
 #[instrument(skip_all)]
@@ -162,9 +164,9 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
             let key = arg_matches
                 .get_one::<String>("key")
                 .context("Must provide key")?;
-            let format = OutputFormat::from_matches(arg_matches);
-            get_kv(key, format).await
+            get_kv(key, arg_matches).await
         }
+        Some(("watch", arg_matches)) => crate::cmd::watch::kv_watch(arg_matches).await,
         Some(("list", arg_matches)) => {
             let prefix = arg_matches
                 .get_one::<String>("prefix")
@@ -268,16 +270,18 @@ async fn put_kv(
 }
 
 #[instrument(skip_all)]
-async fn get_kv(key: &str, format: OutputFormat) -> R<()> {
+async fn get_kv(key: &str, matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
     let mut client = connect_manager_client().await?;
-    let request = GetKvRequest {
+    let mut request = tonic::Request::new(GetKvRequest {
         key: key.to_string(),
         metadata_only: false,
-    };
+    });
+    crate::cmd::watch::apply_read_flags(&mut request, matches)?;
     let response = output::resolve(
         format,
         "failed to get kv entry",
-        client.get_kv(tonic::Request::new(request)).await,
+        client.get_kv(request).await,
     )?;
     let reply = response.into_inner();
     let entry = match reply.entry {
@@ -291,6 +295,7 @@ async fn get_kv(key: &str, format: OutputFormat) -> R<()> {
         output::print_success(&KvGetPrint {
             entry,
             references: reply.references,
+            revision: reply.revision,
         });
         return Ok(());
     }
@@ -313,6 +318,8 @@ struct KvGetPrint {
     #[serde(flatten)]
     entry: KvEntry,
     references: Vec<KvJobReference>,
+    /// What `--index` takes to wait for the key's next change.
+    revision: String,
 }
 
 /// The error `kv get` reports for a key with no entry.

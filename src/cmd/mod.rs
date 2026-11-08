@@ -47,6 +47,7 @@ pub mod start;
 pub mod state;
 pub mod template;
 pub mod volume;
+pub mod watch;
 
 use crate::prelude::*;
 
