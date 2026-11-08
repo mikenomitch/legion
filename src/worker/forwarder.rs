@@ -297,7 +297,15 @@ pub struct ForwarderContext {
     /// The node's network plugins (docs/network-plugins.md).
     plugins: Arc<crate::worker::netd::plugins::PluginHost>,
     /// The node's mesh credential and the client config built from it.
-    mesh: RwLock<Option<(Arc<MeshIdentity>, Arc<rustls::ClientConfig>)>>,
+    /// The node's mesh certificate and the TLS configs built for its trust
+    /// bundle, which keep their sessions across certificate refreshes
+    /// (`netd::mesh_tls`).
+    mesh: RwLock<
+        Option<(
+            Arc<MeshIdentity>,
+            Arc<crate::worker::netd::mesh_tls::MeshTls>,
+        )>,
+    >,
     /// Whether anything on this node needs a mesh certificate.
     mesh_wanted: AtomicBool,
     /// Ingress TLS configs per (allocation, port label): the fingerprint of
@@ -1305,10 +1313,22 @@ impl ForwarderContext {
     /// so nothing established under the old bundle resumes
     /// (mesh-control-path plan §6.3).
     pub fn set_mesh_identity(&self, identity: MeshIdentity) -> R<()> {
-        let client = identity.client_config()?;
-        *self.mesh.write().unwrap_or_else(|p| p.into_inner()) = Some((Arc::new(identity), client));
-        // Ingress configs built from the previous certificate are stale.
-        lock(&self.ingress_tls).clear();
+        use crate::worker::netd::mesh_tls::MeshTls;
+        let mut mesh = self.mesh.write().unwrap_or_else(|p| p.into_inner());
+        let tls = match mesh.as_ref() {
+            Some((_, tls)) if tls.same_bundle(&identity) => {
+                tls.refresh(&identity)?;
+                debug!("Mesh certificate refreshed; sessions kept");
+                Arc::clone(tls)
+            }
+            held => {
+                if held.is_some() {
+                    info!("Mesh trust bundle changed; new TLS configs, every session dropped");
+                }
+                Arc::new(MeshTls::new(&identity)?)
+            }
+        };
+        *mesh = Some((Arc::new(identity), tls));
         Ok(())
     }
 
@@ -1326,7 +1346,16 @@ impl ForwarderContext {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .map(|(_, client)| tokio_rustls::TlsConnector::from(client.clone()))
+            .map(|(_, tls)| tokio_rustls::TlsConnector::from(tls.client_config()))
+    }
+
+    /// The mesh's server config, shared by every mesh port on the node.
+    pub fn mesh_server_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.mesh
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|(_, tls)| tls.server_config())
     }
 
     /// The server config for an ingress port that terminates TLS, built
@@ -1340,7 +1369,13 @@ impl ForwarderContext {
         termination: &PortTermination,
     ) -> Result<Arc<rustls::ServerConfig>, String> {
         use crate::structs::source::{MATERIAL_CLIENT_CA, MATERIAL_PORT_CERT};
-        let mesh = self.mesh_identity();
+        // The mesh's config is node-wide, built per trust bundle, with its
+        // session store (`netd::mesh_tls`): never cached per port.
+        if *termination == PortTermination::Mesh {
+            return self
+                .mesh_server_config()
+                .ok_or_else(|| "mesh certificate not issued yet".to_string());
+        }
         let (cert_state, ca_state) = match termination {
             PortTermination::Mesh => (None, None),
             PortTermination::Own(tls) => (
@@ -1366,7 +1401,6 @@ impl ForwarderContext {
                 PortTermination::Mesh => "mesh".to_string(),
                 PortTermination::Own(tls) => serde_json::to_string(tls).unwrap_or_default(),
             },
-            mesh.as_ref().map(|m| m.expires_at).unwrap_or(0),
             version(&cert_state),
             version(&ca_state),
         );
@@ -1380,12 +1414,7 @@ impl ForwarderContext {
             }
         }
         let result = match termination {
-            PortTermination::Mesh => match mesh {
-                Some(identity) => identity
-                    .server_config(true)
-                    .map_err(|err| format!("mesh server config: {err:#}")),
-                None => Err("mesh certificate not issued yet".to_string()),
-            },
+            PortTermination::Mesh => Err("mesh ports use the node-wide config".to_string()),
             PortTermination::Own(tls) => {
                 port_server_config(tls, cert_state.as_ref(), ca_state.as_ref())
             }
@@ -2697,6 +2726,17 @@ where
         }
     };
     match tokio::time::timeout(DIAL_TIMEOUT, connector.connect(server_name, upstream)).await {
+        Ok(Ok(tls))
+            if crate::worker::netd::mesh_tls::resumed_with_expired_peer(tls.get_ref().1) =>
+        {
+            debug!(
+                endpoint = %endpoint.addr,
+                "Refusing a resumed mesh session whose peer certificate expired"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            None
+        }
         Ok(Ok(mut tls)) => {
             let header =
                 handlers::proxy_header(&shared.context, facts, peer, endpoint.addr.parse().ok());

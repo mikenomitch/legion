@@ -1655,6 +1655,11 @@ async fn open(
             .connect(server_name, stream)
             .await
             .map_err(|err| AttemptError::Connect(format!("mesh tls: {err}")))?;
+        if crate::worker::netd::mesh_tls::resumed_with_expired_peer(tls.get_ref().1) {
+            return Err(AttemptError::Connect(
+                "mesh tls: resumed a session whose peer certificate expired".into(),
+            ));
+        }
         let header = handlers::proxy_header(
             &settings.context,
             &HopFacts {

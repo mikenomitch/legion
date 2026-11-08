@@ -442,6 +442,15 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
                 return;
             }
         };
+    // A resumed session carries the identity of the handshake that started
+    // its chain; it is refused once that certificate has expired, so a node
+    // that stopped being re-issued cannot keep resuming (mesh-control-path
+    // plan §6.3).
+    if crate::worker::netd::mesh_tls::resumed_with_expired_peer(stream.get_ref().1) {
+        debug!(allocation_id, peer = %peer, "Refusing a resumed session whose certificate expired");
+        net_metrics::connection("ingress", PROTOCOL_TCP, "error");
+        return;
+    }
     let peer_identity = stream
         .get_ref()
         .1

@@ -36,6 +36,7 @@ pub mod ingress;
 pub mod kernel;
 pub mod kernel_guard;
 pub mod listen;
+pub mod mesh_tls;
 pub mod netns;
 pub mod plugins;
 pub mod policy;
