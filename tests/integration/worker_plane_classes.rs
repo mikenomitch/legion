@@ -64,6 +64,9 @@ fn worker_table() -> Vec<(&'static str, &'static [Caller])> {
         ("StartClaim", &[Caller::Ticket]),
         ("Probe", &[Caller::Manager]),
         ("StopSessions", &[Caller::Manager]),
+        // A manager routes `ResizeInstance` and `ResizeAllocation` here
+        // after its own `scale:write` check (docs/resize.md).
+        ("ResizeSession", &[Caller::Manager]),
         // Session suspend and resume are routed by a manager, like
         // StopSessions (session durability plan §6.6).
         ("SuspendSessions", &[Caller::Manager]),
@@ -248,6 +251,18 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
             .stop_sessions(legion::structs::StopSessionsRequest {
                 session_ids: vec!["workspace-not-running".into()],
                 reason: "stop".into(),
+            })
+            .await
+            .map(|_| ()),
+        // A session this worker does not run: NotFound once admitted.
+        "ResizeSession" => client
+            .resize_session(legion::structs::ResizeSessionRequest {
+                session_id: "workspace-not-running".into(),
+                to: Some(legion::structs::ResizeResources {
+                    memory: Some(64.0),
+                    ..Default::default()
+                }),
+                ..Default::default()
             })
             .await
             .map(|_| ()),

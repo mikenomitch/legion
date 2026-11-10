@@ -20,6 +20,7 @@
 //! (`legion_job_run`, `legion_job_stop`, `legion_job_scale`, `legion_scaling_pause`,
 //! `legion_job_destroy`, `legion_instance_create`, `legion_session_run`, `legion_instance_stop`,
 //! `legion_instance_start`, `legion_instance_promote`,
+//! `legion_instance_resize`, `legion_alloc_resize`,
 //! `legion_instance_destroy`) are gated behind `--allow-write`, mirroring the
 //! `read_only_safe` flag in the capabilities catalog. Even with
 //! `--allow-write`, `legion_state_query` always runs in read-only mode (no SQL
@@ -1546,6 +1547,46 @@ fn core_tool_defs() -> Vec<ToolDef> {
             mutates: true,
         },
         ToolDef {
+            name: "legion_instance_resize",
+            description: "Resize a running keyed instance or session in place (docs/resize.md): memory (the reservation, MiB), memory_max (the ceiling, MiB), and cpu (MHz), as an override over the spec, with no new job version and no restart. A keyed instance's grow takes only free room on its node; a session's grow is admitted against its task's envelope on its node and writes nothing to the store. The reply's outcome is applied, deferred (an elastic envelope is growing; retry), refused (no room, with `free`, or a shrink below current use without force), needs_restart (the runtime cannot make the change while the unit runs; nothing was restarted), or not_supported. Only applied changed anything. dry_run answers without changing anything. Needs scale:write on the job. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Keyed instance id or session id." },
+                    "memory": { "type": "number", "description": "New reservation in MiB." },
+                    "memory_max": { "type": "number", "description": "New ceiling in MiB (never below memory)." },
+                    "cpu": { "type": "number", "description": "New CPU in MHz." },
+                    "reason": { "type": "string", "description": "Why, recorded on the override and the event." },
+                    "force": { "type": "boolean", "description": "Allow a ceiling below current use (the kernel may reclaim or kill)." },
+                    "dry_run": { "type": "boolean", "description": "Answer what would happen without changing anything." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["instance_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_alloc_resize",
+            description: "Resize one running top-level allocation in place (docs/resize.md): memory (the reservation, MiB), memory_max (the ceiling, MiB), and cpu (MHz), as an override over its task's spec. One compare-and-set commits the new size and the node's runtime applies it; a grow takes only free room on the node and never preempts. Outcomes as legion_instance_resize; a refused grow carries the node's `free` room. Resizing back to the spec's amounts removes the override, and the override ends with the allocation. Needs scale:write on the job. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "allocation_id": { "type": "integer", "description": "Allocation id." },
+                    "memory": { "type": "number", "description": "New reservation in MiB." },
+                    "memory_max": { "type": "number", "description": "New ceiling in MiB (never below memory)." },
+                    "cpu": { "type": "number", "description": "New CPU in MHz." },
+                    "reason": { "type": "string", "description": "Why, recorded on the override and the event." },
+                    "force": { "type": "boolean", "description": "Allow a ceiling below current use (the kernel may reclaim or kill)." },
+                    "dry_run": { "type": "boolean", "description": "Answer what would happen without changing anything." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["allocation_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
             name: "legion_instance_stop",
             description: "Stop (pause) a keyed-mode instance: stop its allocation, retain the row and storage handle, keep the id owned. Reversible via legion_instance_start. Mutating.",
             input_schema: || json!({
@@ -2740,6 +2781,39 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 new_id,
                 idempotency_key,
             }))
+            .await
+        }
+        "legion_instance_resize" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let mut client = connect().await?;
+            grpc(
+                client.resize_instance(crate::structs::ResizeInstanceRequest {
+                    instance_id,
+                    to: Some(resize_amounts(&args)?),
+                    reason: opt_str_arg(&args, "reason").unwrap_or_default(),
+                    force: bool_flag(&args, "force"),
+                    dry_run: bool_flag(&args, "dry_run"),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
+        "legion_alloc_resize" => {
+            let allocation_id = args
+                .get("allocation_id")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| "missing required integer argument: allocation_id".to_string())?;
+            let mut client = connect().await?;
+            grpc(
+                client.resize_allocation(crate::structs::ResizeAllocationRequest {
+                    allocation_id,
+                    to: Some(resize_amounts(&args)?),
+                    reason: opt_str_arg(&args, "reason").unwrap_or_default(),
+                    force: bool_flag(&args, "force"),
+                    dry_run: bool_flag(&args, "dry_run"),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
             .await
         }
         "legion_instance_stop" => {
@@ -4009,6 +4083,27 @@ fn object_arg(args: &Value) -> Result<Option<crate::structs::ScalingObjectRef>, 
     }))
 }
 
+/// The amounts a resize tool names: at least one of `memory`, `memory_max`,
+/// and `cpu`.
+fn resize_amounts(args: &Value) -> Result<crate::structs::ResizeResources, String> {
+    let amount = |key: &str| args.get(key).and_then(|value| value.as_f64());
+    let to = crate::structs::ResizeResources {
+        memory: amount("memory"),
+        memory_max: amount("memory_max"),
+        cpu: amount("cpu"),
+    };
+    if to.memory.is_none() && to.memory_max.is_none() && to.cpu.is_none() {
+        return Err("provide at least one of memory, memory_max, and cpu".to_string());
+    }
+    Ok(to)
+}
+
+fn bool_flag(args: &Value, key: &str) -> bool {
+    args.get(key)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 fn opt_str_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key)
         .and_then(Value::as_str)
@@ -4242,6 +4337,8 @@ mod tests {
         assert!(!names.contains(&"legion_instance_stop"));
         assert!(!names.contains(&"legion_instance_start"));
         assert!(!names.contains(&"legion_instance_promote"));
+        assert!(!names.contains(&"legion_instance_resize"));
+        assert!(!names.contains(&"legion_alloc_resize"));
         assert!(!names.contains(&"legion_instance_destroy"));
     }
 
@@ -4339,6 +4436,8 @@ mod tests {
         assert!(names.contains(&"legion_instance_stop"));
         assert!(names.contains(&"legion_instance_start"));
         assert!(names.contains(&"legion_instance_promote"));
+        assert!(names.contains(&"legion_instance_resize"));
+        assert!(names.contains(&"legion_alloc_resize"));
         assert!(names.contains(&"legion_instance_destroy"));
     }
 

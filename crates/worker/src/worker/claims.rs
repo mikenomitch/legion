@@ -227,6 +227,18 @@ impl ClaimTable {
         }
     }
 
+    /// Replace what a claim holds (a session resized in place,
+    /// docs/resize.md), keeping its task's running totals exact.
+    pub fn set_resources(&mut self, claim_id: &str, resources: Value) {
+        let Some(mut record) = self.claims.get(claim_id).cloned() else {
+            return;
+        };
+        self.add_usage(&record, -1.0);
+        record.resources = resources;
+        self.add_usage(&record, 1.0);
+        self.claims.insert(claim_id.to_string(), record);
+    }
+
     pub fn remove(&mut self, claim_id: &str) -> Option<ClaimRecord> {
         let record = self.claims.remove(claim_id)?;
         if self.by_instance.get(&record.instance_id) == Some(&record.claim_id) {

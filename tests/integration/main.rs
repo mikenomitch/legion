@@ -100,6 +100,7 @@ mod raft_topology_stamp;
 mod raft_upgrade_bootstrap;
 mod raft_write_path;
 mod ratify_throughput_measure;
+mod resize;
 mod resource_scoring;
 mod restore_placement_indexed;
 mod revisions_watch;

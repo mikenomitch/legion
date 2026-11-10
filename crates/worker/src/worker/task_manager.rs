@@ -27,6 +27,7 @@ use std::path::PathBuf;
 /// Sessions sleeping on their node: suspend, resume, eviction, periodic and
 /// worker-stop checkpoints (session durability plan §6.6).
 pub mod children;
+pub mod resize;
 pub mod session_runs;
 pub mod session_sleep;
 pub mod session_store;
@@ -983,6 +984,13 @@ pub struct WorkerTaskManager {
     /// The launch payload of each running session, by session id, so a
     /// suspend records what its resume relaunches.
     session_payloads: HashMap<String, TaskAllocation>,
+    /// Room deferred session grows wait for, by `(job, session task)`, with
+    /// when each stops asking (docs/resize.md, "Sessions").
+    resize_demand:
+        HashMap<(String, String), (std::collections::BTreeMap<String, f64>, std::time::Instant)>,
+    /// The committed size each allocation was last converged toward, so a
+    /// resize the runtime cannot make is tried once, not every heartbeat.
+    resize_converged: HashMap<i64, String>,
     /// The owner of each child session this node holds, running or
     /// suspended, by the child's id (docs/child-sessions.md). An index over
     /// the links the launch payloads carry.
@@ -1148,6 +1156,8 @@ impl WorkerTaskManager {
             idle_sessions: HashMap::new(),
             session_specs: HashMap::new(),
             session_payloads: HashMap::new(),
+            resize_demand: HashMap::new(),
+            resize_converged: HashMap::new(),
             session_owners: HashMap::new(),
             gone_children: HashMap::new(),
             child_end_reasons: HashMap::new(),
@@ -2993,6 +3003,10 @@ impl WorkerTaskManager {
             }
         }
 
+        // A running allocation whose committed size changed is resized in
+        // place, never relaunched (docs/resize.md).
+        self.converge_resized_allocations(allocations);
+
         let pending: Vec<TaskAllocation> = allocations
             .iter()
             .filter(|allocation| {
@@ -4460,11 +4474,16 @@ impl WorkerTaskManager {
                 continue;
             };
             let session = crate::structs::session::resource_amounts(&spec.task.resources);
-            let used: std::collections::BTreeMap<String, f64> = self
+            let mut used: std::collections::BTreeMap<String, f64> = self
                 .claims
                 .session_usage(&job_id, &task_name)
                 .into_iter()
                 .collect();
+            // A session grow waiting for room counts as held, so the
+            // envelope grows to fit it (docs/resize.md, "Sessions").
+            for (name, extra) in self.resize_demand_for(&job_id, &task_name, now) {
+                *used.entry(name).or_insert(0.0) += extra;
+            }
             let Some(size) = self.envelope_sizes.get_mut(&local) else {
                 continue;
             };

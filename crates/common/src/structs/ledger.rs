@@ -141,6 +141,8 @@ impl From<Allocation> for LedgerAllocation {
             artifact_states: None,
             // Enriched by the GetLedger handler from the task config.
             task_name: String::new(),
+            // Enriched by the GetLedger handler from the allocation's row.
+            resources_override: String::new(),
         }
     }
 }
@@ -165,6 +167,7 @@ impl LedgerAllocationExt for LedgerAllocation {
             network,
             artifact_states: _,
             task_name: _,
+            resources_override: _,
         } = self;
 
         let resources: Value =

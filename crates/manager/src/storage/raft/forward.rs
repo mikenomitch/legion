@@ -207,6 +207,12 @@ pub(crate) enum ForwardableLaneWrite {
         node_id: String,
         request: crate::storage::store::EnvelopeResizeRequest,
     },
+    /// `Store::resize_allocation` — scheduler lane. A top-level
+    /// allocation's resize (docs/resize.md), from an RPC that can land on
+    /// any manager. Returns the outcome.
+    ResizeAllocation {
+        request: crate::storage::store::AllocationResizeRequest,
+    },
 }
 
 impl ForwardableLaneWrite {
@@ -237,7 +243,8 @@ impl ForwardableLaneWrite {
             | ForwardableLaneWrite::CompleteAllocation { .. }
             | ForwardableLaneWrite::ApplySnapshotReport { .. }
             | ForwardableLaneWrite::BeginSuspend { .. }
-            | ForwardableLaneWrite::ResizeEnvelope { .. } => Lane::Scheduler,
+            | ForwardableLaneWrite::ResizeEnvelope { .. }
+            | ForwardableLaneWrite::ResizeAllocation { .. } => Lane::Scheduler,
         }
     }
 
@@ -270,6 +277,7 @@ impl ForwardableLaneWrite {
             ForwardableLaneWrite::EmitEvent { .. } => "emit_event",
             ForwardableLaneWrite::AppendAudit { .. } => "append_audit_events",
             ForwardableLaneWrite::ResizeEnvelope { .. } => "resize_envelope",
+            ForwardableLaneWrite::ResizeAllocation { .. } => "resize_allocation",
         }
     }
 }
@@ -421,6 +429,9 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
         ForwardableLaneWrite::ResizeEnvelope { node_id, request } => {
             done(store.resize_envelope_local(&node_id, &request))
         }
+        ForwardableLaneWrite::ResizeAllocation { request } => {
+            done(store.resize_allocation_local(&request))
+        }
     }
 }
 
@@ -558,6 +569,22 @@ mod tests {
                     .node("n1")
                     .allocation(5)
                     .meta(serde_json::json!({ "step": "evict-bursting" })),
+            },
+            ForwardableLaneWrite::ResizeAllocation {
+                request: crate::storage::store::AllocationResizeRequest {
+                    allocation_id: 7,
+                    from: crate::structs::resize::ResourceSize {
+                        memory: Some(1024.0),
+                        ..Default::default()
+                    },
+                    to: crate::structs::resize::ResourceSize {
+                        memory: Some(2048.0),
+                        ..Default::default()
+                    },
+                    reason: "grow".into(),
+                    by: "accessor:1".into(),
+                    dry_run: false,
+                },
             },
             ForwardableLaneWrite::ResizeEnvelope {
                 node_id: "n1".into(),

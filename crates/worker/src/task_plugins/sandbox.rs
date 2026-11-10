@@ -277,6 +277,12 @@ const BALLOON_RECORD: &str = "balloon.json";
 struct BalloonRecord {
     guest_mib: u64,
     reserved_mib: u64,
+    /// The balloon size a resize holds the guest at: its boot size less its
+    /// current `memoryMax` (docs/resize.md). The pressure response inflates
+    /// above it and deflates back to it, never to zero. 0 for a guest that
+    /// was never resized below its boot size.
+    #[serde(default)]
+    floor_mib: u64,
 }
 
 fn write_balloon_record(scratch: &Path, record: &BalloonRecord) -> R<()> {
@@ -330,20 +336,90 @@ fn inflate_balloon(backend: &Backend, scratch: &Path, bytes: u64) -> R<Option<u6
     Ok(Some((target - current) * MIB))
 }
 
-/// Deflate a ballooned guest's balloon.
+/// Deflate a ballooned guest's balloon, back to the size a resize holds it
+/// at (zero for a guest at its boot size).
 fn deflate_balloon(backend: &Backend, scratch: &Path) -> R<()> {
-    if read_balloon_record(scratch).is_none() {
+    let Some(record) = read_balloon_record(scratch) else {
         return Ok(());
-    }
+    };
+    set_balloon(backend, scratch, record.floor_mib)
+}
+
+/// Set a guest's balloon to `mib` through its VMM's API socket.
+fn set_balloon(backend: &Backend, scratch: &Path, mib: u64) -> R<()> {
+    const MIB: u64 = 1024 * 1024;
     let socket = scratch.join("vmm.sock");
     match backend {
         Backend::Firecracker { .. } => {
-            crate::task_plugins::vmm_api::FirecrackerApi::new(&socket).set_balloon_mib(0)
+            crate::task_plugins::vmm_api::FirecrackerApi::new(&socket).set_balloon_mib(mib)
         }
         Backend::CloudHypervisor { .. } => {
-            crate::task_plugins::vmm_api::CloudHypervisorApi::new(&socket).set_balloon_bytes(0)
+            crate::task_plugins::vmm_api::CloudHypervisorApi::new(&socket)
+                .set_balloon_bytes(mib * MIB)
         }
         _ => Ok(()),
+    }
+}
+
+/// What a resize does to a running guest's memory (docs/resize.md,
+/// "Sandboxes").
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuestResize {
+    /// The ceiling is the size the balloon already holds the guest at.
+    Unchanged(Option<BalloonRecord>),
+    /// Set the balloon to `target_mib` and record the new bounds.
+    Balloon {
+        target_mib: u64,
+        record: BalloonRecord,
+    },
+    /// Nothing can make this change while the guest runs.
+    NeedsRestart(String),
+}
+
+/// Decide a guest's resize from its boot size, its balloon record, and the
+/// ceiling and reservation asked for. A guest's memory is fixed at boot: the
+/// ceiling moves below that by inflating the balloon and back up to it by
+/// deflating, and nothing grows it past its boot size.
+fn plan_guest_resize(
+    name: &str,
+    vmm: &str,
+    guest_mib: u64,
+    record: Option<BalloonRecord>,
+    ceiling_mib: Option<u64>,
+    reserved_mib: Option<u64>,
+) -> GuestResize {
+    let ceiling = ceiling_mib.unwrap_or(guest_mib);
+    if ceiling > guest_mib {
+        return GuestResize::NeedsRestart(format!(
+            "sandbox {name} booted with a {guest_mib} MiB guest; {vmm} cannot grow it past \
+             that while it runs"
+        ));
+    }
+    let Some(record) = record else {
+        if ceiling == guest_mib {
+            return GuestResize::Unchanged(None);
+        }
+        return GuestResize::NeedsRestart(format!(
+            "sandbox {name} booted without a balloon (its memoryMax was its memory and it \
+             takes no memory checkpoints), so {vmm} cannot take memory back from its \
+             {guest_mib} MiB guest while it runs"
+        ));
+    };
+    let next = BalloonRecord {
+        guest_mib,
+        reserved_mib: reserved_mib.unwrap_or(record.reserved_mib).min(ceiling),
+        floor_mib: guest_mib - ceiling,
+    };
+    if next == record {
+        return GuestResize::Unchanged(Some(record));
+    }
+    if next.floor_mib == record.floor_mib {
+        // Only the reservation moved: the record changes, the balloon does not.
+        return GuestResize::Unchanged(Some(next));
+    }
+    GuestResize::Balloon {
+        target_mib: next.floor_mib,
+        record: next,
     }
 }
 
@@ -1561,6 +1637,7 @@ impl SandboxTaskPlugin {
                 &BalloonRecord {
                     guest_mib: u64::from(spec.memory_mib),
                     reserved_mib: u64::from(reserved_mib.unwrap_or(spec.memory_mib)),
+                    floor_mib: 0,
                 },
             )?;
         }
@@ -2522,6 +2599,65 @@ impl TaskPlugin for SandboxTaskPlugin {
         deflate_balloon(&backend, &work_root(allocation, instance))
     }
 
+    /// The reservation and the CPU weight are the VMM cgroup's and change
+    /// live. The ceiling is the guest's usable memory, which the balloon
+    /// moves within the size the guest booted with (docs/resize.md).
+    fn resize_support(&self) -> crate::structs::resize::ResizeSupport {
+        crate::structs::resize::ResizeSupport::ALL
+    }
+
+    fn resize(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        change: &crate::structs::resize::ResizeChange,
+    ) -> R<crate::structs::resize::ResizeAnswer> {
+        use crate::structs::resize::ResizeAnswer;
+        let config = SandboxTaskConfig::from_value(&task.config)?;
+        let backend = Backend::detect(config.hypervisor.as_deref())?;
+        let vmm = match backend {
+            Backend::Firecracker { .. } => "firecracker",
+            Backend::CloudHypervisor { .. } => "cloud-hypervisor",
+            // A dev backend is a container: its cgroup is the whole story.
+            _ => return crate::worker::resources::resize_instance_cgroup(instance, change, None),
+        };
+        let scratch = work_root(allocation, instance);
+        let guest_mib = u64::from(config.memory_mib());
+        let to = change.to_size();
+        let whole = |mib: f64| mib.ceil().max(0.0) as u64;
+        let plan = plan_guest_resize(
+            &sandbox_name(allocation),
+            vmm,
+            guest_mib,
+            read_balloon_record(&scratch),
+            to.memory_max.or(to.memory).map(whole),
+            to.memory.map(whole),
+        );
+        if let GuestResize::NeedsRestart(message) = plan {
+            return Ok(ResizeAnswer::NeedsRestart(message));
+        }
+        // The cgroup's ceiling stays the boot size plus the VMM's overhead:
+        // the guest's usable memory is the balloon's to move, and a cgroup
+        // ceiling under a guest that has not handed its pages back yet
+        // would kill the VMM.
+        let ceiling = vmm_cgroup_memory_bytes(config.memory_mib(), vmm_overhead_mib());
+        let answer =
+            crate::worker::resources::resize_instance_cgroup(instance, change, Some(ceiling))?;
+        if answer != ResizeAnswer::Applied || change.dry_run {
+            return Ok(answer);
+        }
+        match plan {
+            GuestResize::Balloon { target_mib, record } => {
+                set_balloon(&backend, &scratch, target_mib)?;
+                write_balloon_record(&scratch, &record)?;
+            }
+            GuestResize::Unchanged(Some(record)) => write_balloon_record(&scratch, &record)?,
+            GuestResize::Unchanged(None) | GuestResize::NeedsRestart(_) => {}
+        }
+        Ok(ResizeAnswer::Applied)
+    }
+
     fn restore(
         &self,
         allocation: &Allocation,
@@ -2627,6 +2763,7 @@ impl TaskPlugin for SandboxTaskPlugin {
                 reserved_mib: memory_reservation_mib(&task.resources)
                     .map(u64::from)
                     .unwrap_or(guest_mib),
+                floor_mib: 0,
             },
         )
     }
@@ -2690,6 +2827,7 @@ mod tests {
             &BalloonRecord {
                 guest_mib: 4096,
                 reserved_mib: 512,
+                floor_mib: 0,
             },
         )?;
         let vmm = FakeVmm::start_at(scratch.path().join("vmm.sock"), false, |seen| {
@@ -2708,6 +2846,129 @@ mod tests {
         Ok(())
     }
 
+    /// A guest's ceiling moves within its boot size through the balloon,
+    /// and nothing grows it past that (docs/resize.md, "Sandboxes").
+    #[test]
+    fn a_guest_resize_moves_the_balloon_within_the_boot_size() {
+        let record = BalloonRecord {
+            guest_mib: 4096,
+            reserved_mib: 1024,
+            floor_mib: 0,
+        };
+        // Down: the balloon takes the difference.
+        let down = plan_guest_resize("ws-7", "firecracker", 4096, Some(record), Some(2048), None);
+        let held = BalloonRecord {
+            guest_mib: 4096,
+            reserved_mib: 1024,
+            floor_mib: 2048,
+        };
+        assert_eq!(
+            down,
+            GuestResize::Balloon {
+                target_mib: 2048,
+                record: held
+            }
+        );
+        // Back up to the boot size: the balloon deflates.
+        assert_eq!(
+            plan_guest_resize("ws-7", "firecracker", 4096, Some(held), Some(4096), None),
+            GuestResize::Balloon {
+                target_mib: 0,
+                record
+            }
+        );
+        // Above the boot size: an answer, never an action.
+        assert_eq!(
+            plan_guest_resize("ws-7", "firecracker", 4096, Some(record), Some(16384), None),
+            GuestResize::NeedsRestart(
+                "sandbox ws-7 booted with a 4096 MiB guest; firecracker cannot grow it past \
+                 that while it runs"
+                    .into()
+            )
+        );
+        // Only the reservation moved: the record follows, the balloon stays.
+        assert_eq!(
+            plan_guest_resize(
+                "ws-7",
+                "firecracker",
+                4096,
+                Some(record),
+                Some(4096),
+                Some(2048)
+            ),
+            GuestResize::Unchanged(Some(BalloonRecord {
+                reserved_mib: 2048,
+                ..record
+            }))
+        );
+        // A reservation is never recorded above the ceiling.
+        match plan_guest_resize("ws-7", "firecracker", 4096, Some(record), Some(512), None) {
+            GuestResize::Balloon { record, .. } => assert_eq!(record.reserved_mib, 512),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A guest booted without a balloon keeps its ceiling until a restart.
+    #[test]
+    fn a_guest_without_a_balloon_needs_a_restart_to_shrink() {
+        assert_eq!(
+            plan_guest_resize(
+                "ws-7",
+                "cloud-hypervisor",
+                2048,
+                None,
+                Some(2048),
+                Some(1024)
+            ),
+            GuestResize::Unchanged(None)
+        );
+        assert!(matches!(
+            plan_guest_resize("ws-7", "cloud-hypervisor", 2048, None, Some(1024), None),
+            GuestResize::NeedsRestart(message) if message.contains("booted without a balloon")
+        ));
+    }
+
+    /// A resized guest's pressure episode ends back at the size the resize
+    /// holds, not at zero, on both VMMs.
+    #[test]
+    fn deflating_after_pressure_returns_to_the_resized_ceiling() -> R<()> {
+        use crate::task_plugins::vmm_api::fake::FakeVmm;
+        for (backend, path, body) in [
+            (
+                Backend::Firecracker {
+                    binary: "firecracker".into(),
+                },
+                "/balloon",
+                json!({ "amount_mib": 1024 }),
+            ),
+            (
+                Backend::CloudHypervisor {
+                    binary: "cloud-hypervisor".into(),
+                },
+                "/api/v1/vm.resize",
+                json!({ "desired_balloon": 1024u64 * 1024 * 1024 }),
+            ),
+        ] {
+            let scratch = tempfile::tempdir()?;
+            write_balloon_record(
+                scratch.path(),
+                &BalloonRecord {
+                    guest_mib: 4096,
+                    reserved_mib: 512,
+                    floor_mib: 1024,
+                },
+            )?;
+            let vmm = FakeVmm::start_at(scratch.path().join("vmm.sock"), false, |_| {
+                (204, String::new())
+            });
+            deflate_balloon(&backend, scratch.path())?;
+            let seen = vmm.drain();
+            assert_eq!(seen[0].path, path);
+            assert_eq!(seen[0].body, Some(body));
+        }
+        Ok(())
+    }
+
     #[test]
     fn reclaim_drives_a_cloud_hypervisor_balloon_in_bytes() -> R<()> {
         use crate::task_plugins::vmm_api::fake::FakeVmm;
@@ -2720,6 +2981,7 @@ mod tests {
             &BalloonRecord {
                 guest_mib: 2048,
                 reserved_mib: 512,
+                floor_mib: 0,
             },
         )?;
         let vmm = FakeVmm::start_at(scratch.path().join("vmm.sock"), false, |seen| {

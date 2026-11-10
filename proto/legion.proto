@@ -1303,6 +1303,57 @@ service Manager {
   // - FailedPrecondition: the session's job config no longer has its task.
   rpc PromoteInstance (PromoteInstanceRequest) returns (PromoteInstanceReply);
 
+  // Resizes one running top-level allocation in place: its `memory`
+  // (reservation), `memoryMax` (ceiling), and `cpu`, as an override over the
+  // task's spec (docs/resize.md). No new job version and no rollout.
+  //
+  // One scheduler-lane compare-and-set on the allocation's row commits the
+  // new size (`from` is the effective size this manager read, `to` the new
+  // one), and the allocation's node applies it through the task runtime. A
+  // grow (a larger `memory` or `cpu`) is reserved first and takes only free
+  // room on the node; it never preempts. A shrink is applied on the node
+  // first and released after. A runtime that cannot make the change live
+  // answers `needs_restart` or `not_supported` and nothing changes: Legion
+  // never restarts a unit to resize it.
+  //
+  // The reply always reports an `outcome`; only `applied` changed anything.
+  // A resize back to the spec's own amounts removes the override. The
+  // override ends with the allocation: a replacement starts at the spec.
+  //
+  // ACL: `scale:write` on the allocation's job (the caller needs
+  // `scale:write` on some job before the allocation is looked up, so its
+  // existence is not probeable).
+  //
+  // Errors:
+  // - NotFound: no live allocation has this id.
+  // - InvalidArgument: no amount given, a non-positive amount, or a ceiling
+  //   below the reservation.
+  // - FailedPrecondition: the allocation is a session envelope (it resizes
+  //   through `stateful.envelope`), is not running, or its row changed under
+  //   this call (`stale`; read it again).
+  // - Unavailable: the allocation's node could not be reached. Nothing was
+  //   committed for a shrink; a grow's reservation is rolled back.
+  rpc ResizeAllocation (ResizeAllocationRequest) returns (ResizeReply);
+
+  // Resizes one instance in place: a keyed or slot instance (its current
+  // allocation, exactly as `ResizeAllocation`) or a running session, named
+  // by its id (docs/resize.md).
+  //
+  // A session's resize is node-local and writes nothing to the replicated
+  // store: the manager routes it to the node the session id's tag names
+  // (`Worker.ResizeSession`), which admits a grow against the session
+  // task's envelope and tells the runtime. A grow the envelope has no room
+  // for answers `refused` with the room it has, or `deferred` when the
+  // envelope is elastic and is growing to make room.
+  //
+  // ACL: `scale:write` on the instance's job, checked after a coarse
+  // `scale:write` gate.
+  //
+  // Errors: as `ResizeAllocation`, plus FailedPrecondition when a keyed
+  // instance is suspended or stopped (it has no running allocation), and
+  // Unavailable when a session's node cannot be reached.
+  rpc ResizeInstance (ResizeInstanceRequest) returns (ResizeReply);
+
   // Lists every node that holds an envelope for a session task, for a
   // picker (Envoy, HAProxy, or a platform's own code) that starts sessions
   // at the nodes directly with a session ticket (`Worker.StartSession`,
@@ -8119,6 +8170,20 @@ message InstanceInfo {
   // (`ChildInfo.kind` tells them apart). Filled by `GetInstance`; empty in
   // lists.
   repeated ChildInfo children = 49;
+
+  // The instance's effective resizable resources, as a JSON object of
+  // `memory` and `memoryMax` (MiB) and `cpu` (MHz): the spec's amounts with
+  // any resize laid over them (docs/resize.md). Set on GetInstance for an
+  // instance with a running allocation and for a running session; empty
+  // otherwise.
+  string resources = 50;
+
+  // The resize override on the instance's current allocation, as a JSON
+  // object: the overridden amounts (`memory`, `memoryMax`, `cpu`), the
+  // spec's amounts under `spec`, and `reason`, `by` (the accessor that
+  // resized), and `at` (RFC 3339). Empty when the instance runs at its
+  // spec, and for sessions, whose node keeps their size.
+  string resources_override = 51;
 }
 
 // A failed allocation's replacement waiting out its task's reschedule
@@ -13859,6 +13924,13 @@ message LedgerAllocation {
   // lookup. Empty only when the task config row is gone, which a live
   // allocation never sees.
   string task_name = 11;
+
+  // The resize override on this allocation, as a JSON object (the
+  // overridden `memory`, `memoryMax`, `cpu`, the spec's amounts under
+  // `spec`, and `reason`, `by`, `at`); empty when the allocation runs at
+  // its spec. `resources` above is always the effective reservation
+  // (docs/resize.md).
+  string resources_override = 12;
 }
 
 // Request payload for UpdateNodeDynamic.
@@ -14355,6 +14427,21 @@ service Worker {
   // the id's tag names another node.
   rpc StopSession (StopSessionRequest) returns (StopSessionReply);
 
+  // Resizes one unit this node runs, in place (docs/resize.md): a session,
+  // admitted against its task's envelope with nothing written to the
+  // replicated store, or a top-level allocation whose new size a manager
+  // has already committed. The node tells the task runtime, which changes
+  // what it can live and answers `needs_restart` or `not_supported` for
+  // the rest; nothing is restarted.
+  //
+  // Caller class: `manager`. `Manager.ResizeInstance` and
+  // `Manager.ResizeAllocation` are the only callers.
+  //
+  // Errors: NotFound when the node runs no such session or allocation
+  // (with `wrong_node` in the message when a session id's tag names
+  // another node); InvalidArgument for a malformed request.
+  rpc ResizeSession (ResizeSessionRequest) returns (ResizeSessionReply);
+
   // Suspends sessions on this node (session durability plan §6.6,
   // docs/session-mode.md "Idle sessions"). A manager calls it to route
   // `legion instance suspend <session>` to the node the session id's tag
@@ -14644,6 +14731,17 @@ service Workload {
   // the caller is a session, Unavailable when no manager can be reached,
   // and NotFound when the socket's allocation is no longer running.
   rpc CreateChildInstance (WorkloadCreateChildInstanceRequest) returns (CreateInstanceReply);
+
+  // Resizes one of the caller's own child sessions in place
+  // (docs/resize.md): how a child grows after it starts. Admitted against
+  // the child task's envelope on this node, exactly as
+  // `Manager.ResizeInstance` on a session, with no token: the socket's
+  // attribution names the owner, and only its own children are reachable.
+  //
+  // Errors: NotFound when the session is not a child of the caller (so
+  // another owner's child is not probeable); FailedPrecondition when the
+  // child runs on another node (resize it through a manager).
+  rpc ResizeChildSession (ResizeChildSessionRequest) returns (ResizeSessionReply);
 }
 
 // `Workload.CreateChildInstance`.
@@ -20561,4 +20659,197 @@ message JobFieldChange {
   // The value came from a KV key the caller cannot read, so `old_json` and
   // `new_json` are left empty.
   bool redacted = 5;
+}
+
+
+// === RESIZE (docs/resize.md) ===
+
+// The amounts a resize sets. An unset field is left as it is. At least one
+// must be set.
+message ResizeResources {
+  // The reservation in MiB: what the scheduler packs on, and the cgroup's
+  // `memory.low`.
+  optional double memory = 1;
+
+  // The ceiling in MiB: the cgroup's `memory.max`, or the memory a sandbox
+  // guest can use (its balloon). Never below `memory`.
+  optional double memory_max = 2;
+
+  // CPU in MHz: the scheduler's reservation and the cgroup's `cpu.weight`.
+  optional double cpu = 3;
+}
+
+// Request payload for `Manager.ResizeAllocation`.
+message ResizeAllocationRequest {
+  // The allocation to resize. Required.
+  int64 allocation_id = 1;
+
+  // The new amounts. Required; unset amounts keep their current value.
+  ResizeResources to = 2;
+
+  // Why, recorded on the override and the `allocation.resized` event.
+  // Optional.
+  string reason = 3;
+
+  // Allow a shrink of the ceiling below what the unit uses now. The
+  // runtime may reclaim memory or the kernel may kill the task. Default
+  // false: such a shrink is `refused`.
+  bool force = 4;
+
+  // Answer whether the resize would fit and whether the runtime can make
+  // it, without changing anything. The reply's `outcome` is what a real
+  // call would answer.
+  bool dry_run = 5;
+
+  // Optional retry key. A repeat with the same key and request returns the
+  // first reply with `deduplicated = true` and changes nothing.
+  optional string idempotency_key = 6;
+}
+
+// Request payload for `Manager.ResizeInstance`.
+message ResizeInstanceRequest {
+  // A keyed or slot instance id, or a running session's id. Required.
+  string instance_id = 1;
+
+  // The new amounts. Required; unset amounts keep their current value.
+  ResizeResources to = 2;
+
+  // Why, recorded on the override and the `instance.resized` event.
+  string reason = 3;
+
+  // As `ResizeAllocationRequest.force`.
+  bool force = 4;
+
+  // As `ResizeAllocationRequest.dry_run`.
+  bool dry_run = 5;
+
+  // As `ResizeAllocationRequest.idempotency_key`. For a session the key is
+  // remembered by the manager that took the call, as for session runs.
+  optional string idempotency_key = 6;
+}
+
+// Reply payload for `Manager.ResizeAllocation` and `Manager.ResizeInstance`.
+message ResizeReply {
+  // What happened: `applied` (the unit runs at the new size), `deferred`
+  // (its elastic envelope is growing to make room; retry), `refused` (it
+  // does not fit, or a shrink would go below current use), `needs_restart`
+  // (the runtime cannot make this change while the unit runs), or
+  // `not_supported` (the runtime, or the node's worker, cannot resize).
+  // Only `applied` changed anything.
+  string outcome = 1;
+
+  // The unit's effective resizable resources before the call, as a JSON
+  // object (`memory`, `memoryMax`, `cpu`).
+  string from = 2;
+
+  // The effective resources the call asked for (and, when `applied`, the
+  // unit now has), as a JSON object.
+  string to = 3;
+
+  // The spec's own amounts for the unit's task, as a JSON object, so a
+  // caller can show "override active; spec 1000".
+  string spec = 4;
+
+  // The node the unit runs on.
+  string node_id = 5;
+
+  // Why, when `outcome` is not `applied`: the runtime's or the scheduler's
+  // own account ("node w-03 has 11264 MiB free; the grow needs 63 GiB more").
+  string message = 6;
+
+  // What to do about it, when there is something ("resize to at most ...,
+  // or move the allocation").
+  string hint = 7;
+
+  // The free room a refused grow was checked against, as a JSON object of
+  // amounts by resource (`memory`, `cpu`): the node's for an allocation,
+  // the envelope's for a session. Empty otherwise.
+  string free = 8;
+
+  // True when this reply was replayed for a repeated `idempotency_key`.
+  bool deduplicated = 9;
+
+  // The allocation resized, when the unit has one (0 for a session).
+  int64 allocation_id = 10;
+
+  // The instance or session id, when the unit has one.
+  string instance_id = 11;
+
+  // The unit's job.
+  string job_id = 12;
+
+  // True when the request was a dry run: nothing changed whatever
+  // `outcome` says.
+  bool dry_run = 13;
+
+  // Whether retrying the same request later may succeed (`deferred`, and a
+  // `refused` grow, which fits once room frees up).
+  bool retryable = 14;
+}
+
+// Request payload for `Worker.ResizeSession`.
+message ResizeSessionRequest {
+  // The session to resize. Set this or `allocation_id`.
+  string session_id = 1;
+
+  // A top-level allocation to resize, when a manager applies a resize it
+  // committed (or, for a shrink, is about to release). 0 with `session_id`.
+  int64 allocation_id = 2;
+
+  // The new amounts; unset amounts keep their current value.
+  ResizeResources to = 3;
+
+  // Allow a shrink below current use.
+  bool force = 4;
+
+  // Decide and answer without changing anything.
+  bool dry_run = 5;
+
+  // Why, for the node's log.
+  string reason = 6;
+}
+
+// Request payload for `Workload.ResizeChildSession`.
+message ResizeChildSessionRequest {
+  // The child session to resize: one this caller owns.
+  string session_id = 1;
+
+  // The new amounts; unset amounts keep their current value.
+  ResizeResources to = 2;
+
+  // Allow a shrink below current use.
+  bool force = 3;
+
+  // Decide and answer without changing anything.
+  bool dry_run = 4;
+}
+
+// Reply payload for `Worker.ResizeSession` and `Workload.ResizeChildSession`.
+message ResizeSessionReply {
+  // As `ResizeReply.outcome`.
+  string outcome = 1;
+
+  // The unit's effective resizable resources before the call (JSON).
+  string from = 2;
+
+  // The effective resources asked for (JSON).
+  string to = 3;
+
+  // Why, when `outcome` is not `applied`.
+  string message = 4;
+
+  // The envelope's free room a refused or deferred session grow was
+  // checked against (JSON amounts by resource). Empty otherwise.
+  string free = 5;
+
+  // This node's id.
+  string node_id = 6;
+
+  // The unit's job and task, so the manager can record the event and
+  // enforce the caller's scope.
+  string job_id = 7;
+  string task_name = 8;
+
+  // The unit's task runtime (`exec`, `container`, `sandbox`, ...).
+  string runtime = 9;
 }

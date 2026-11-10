@@ -759,6 +759,62 @@ impl Worker for WorkerDaemonService {
         Ok(Response::new(crate::structs::StopSessionsReply { stopped }))
     }
 
+    /// Resize one unit this node runs, in place (docs/resize.md).
+    /// Manager-only: a manager routes `ResizeInstance` and
+    /// `ResizeAllocation` here after its own ACL check.
+    #[instrument(err, skip_all, fields(session_id, allocation_id))]
+    async fn resize_session(
+        &self,
+        request: Request<crate::structs::ResizeSessionRequest>,
+    ) -> Result<Response<crate::structs::ResizeSessionReply>, Status> {
+        use crate::worker::task_manager::resize::{
+            requested_size, resize_status, wire_reply, ResizeTarget,
+        };
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "ResizeSession")?;
+        let request = request.into_inner();
+        tracing::Span::current().record("session_id", request.session_id.as_str());
+        tracing::Span::current().record("allocation_id", request.allocation_id);
+        let target = match (request.session_id.is_empty(), request.allocation_id) {
+            (false, 0) => ResizeTarget::Session(request.session_id.clone()),
+            (true, id) if id != 0 => ResizeTarget::Allocation(id),
+            _ => {
+                return Err(Status::invalid_argument(
+                    "set exactly one of session_id and allocation_id",
+                ))
+            }
+        };
+        let size = requested_size(request.to.as_ref());
+        let task_manager = self.task_manager.clone();
+        let force = request.force;
+        let dry_run = request.dry_run;
+        let resize_target = target.clone();
+        // A runtime's resize talks to a VMM socket or writes cgroup files:
+        // off the async threads.
+        let done = tokio::task::spawn_blocking(move || {
+            let mut manager = task_manager
+                .lock()
+                .map_err(|_| anyhow!("Task manager lock poisoned"))?;
+            manager.resize_unit(&resize_target, &size, force, dry_run)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("resize task failed: {err}")))?;
+        match done {
+            Ok(done) => Ok(Response::new(wire_reply(&done, &self.node_id))),
+            Err(err) => {
+                let status = resize_status(err);
+                // A session this node does not hold: say whose it is, as
+                // every session RPC does.
+                if let (tonic::Code::NotFound, ResizeTarget::Session(session_id)) =
+                    (status.code(), &target)
+                {
+                    return Err(self.session_not_here(session_id));
+                }
+                Err(status)
+            }
+        }
+    }
+
     /// Suspend sessions on this node (session durability plan §6.6).
     /// Manager-only, like `StopSessions`.
     #[instrument(err, skip_all, fields(sessions))]

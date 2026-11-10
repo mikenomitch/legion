@@ -37,6 +37,7 @@ pub mod oidc;
 pub mod operator;
 pub mod output;
 pub mod raft;
+pub mod resize;
 pub mod sandbox;
 pub mod scaling;
 pub mod scaling_demand;
@@ -82,6 +83,7 @@ fn base_cli() -> Command {
         .subcommand(gitops::config())
         .subcommand(template::config())
         .subcommand(instance::config())
+        .subcommand(resize::alloc_config())
         .subcommand(node::config())
         .subcommand(start::config())
         .subcommand(join_token::config())

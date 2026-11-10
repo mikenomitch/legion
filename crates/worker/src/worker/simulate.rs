@@ -879,6 +879,16 @@ impl Worker for SimWorkerService {
         ))
     }
 
+    async fn resize_session(
+        &self,
+        request: Request<crate::structs::ResizeSessionRequest>,
+    ) -> Result<Response<crate::structs::ResizeSessionReply>, Status> {
+        crate::worker::plane::require_manager(&request, "ResizeSession")?;
+        Err(Status::failed_precondition(
+            "a simulated node runs nothing to resize",
+        ))
+    }
+
     async fn run_session(
         &self,
         _request: Request<crate::structs::RunSessionRequest>,

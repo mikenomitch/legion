@@ -1245,6 +1245,22 @@ impl TaskPlugin for ContainerTaskPlugin {
         crate::task_plugins::ResourceEnforcement::RuntimeApplied
     }
 
+    /// Every resizable resource is a cgroup file, so all three change live
+    /// (docs/resize.md).
+    fn resize_support(&self) -> crate::structs::resize::ResizeSupport {
+        crate::structs::resize::ResizeSupport::ALL
+    }
+
+    fn resize(
+        &self,
+        _allocation: &Allocation,
+        _task: &TaskConfig,
+        instance: &mut TaskInstance,
+        change: &crate::structs::resize::ResizeChange,
+    ) -> R<crate::structs::resize::ResizeAnswer> {
+        crate::worker::resources::resize_instance_cgroup(instance, change, None)
+    }
+
     /// Signal the container's *init*, not the tracked pid — the tracked
     /// process is the runtime CLI supervisor, and killing it would leave the
     /// workload running unsignaled (the bug this override exists to avoid).

@@ -343,6 +343,13 @@ impl Worker for FakeNode {
         Err(Status::unimplemented("fake node"))
     }
 
+    async fn resize_session(
+        &self,
+        _request: Request<legion::structs::ResizeSessionRequest>,
+    ) -> Result<Response<legion::structs::ResizeSessionReply>, Status> {
+        Err(Status::unimplemented("fake node"))
+    }
+
     async fn run_session(
         &self,
         _request: Request<legion::structs::RunSessionRequest>,

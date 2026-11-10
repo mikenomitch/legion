@@ -474,6 +474,7 @@ pub fn config() -> Command {
         .subcommand(names_instance(fork_cmd))
         .subcommand(names_instance(destroy_cmd))
         .subcommand(promote_cmd)
+        .subcommand(crate::cmd::resize::instance_resize_command())
         .subcommand(names_instance(replace_cmd))
         .subcommand(list_cmd)
         .subcommand(names_instance(get_cmd))
@@ -500,6 +501,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("fork", arg_matches)) => fork_instance(arg_matches).await,
         Some(("destroy", arg_matches)) => destroy_instance(arg_matches).await,
         Some(("promote", arg_matches)) => promote_instance(arg_matches).await,
+        Some(("resize", arg_matches)) => crate::cmd::resize::resize_instance(arg_matches).await,
         Some(("replace", arg_matches)) => replace_instance(arg_matches).await,
         Some(("list", arg_matches)) => list_instances(arg_matches).await,
         Some(("get", arg_matches)) => get_instance(arg_matches).await,

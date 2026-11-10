@@ -211,6 +211,11 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         // The session's job is known only after the index lookup, so the
         // coarse gate is `job:write` on any job.
         ("PromoteInstance", Plane::Protected("job:write")),
+        // Resize is the `scale` resource (docs/resize.md): a principal can
+        // resize without redeploy rights. The unit's job is known only
+        // after the lookup, so the coarse gate is `scale:write` on any job.
+        ("ResizeAllocation", Plane::Protected("scale:write")),
+        ("ResizeInstance", Plane::Protected("scale:write")),
         ("ListSessionNodes", Plane::Protected("job:read")),
         // A run of the task's own command; a request that replaces the
         // command also needs `exec:write` (the matrix is in
@@ -1402,6 +1407,34 @@ async fn call_endpoint(
                 legion::structs::RunSessionRequest {
                     job_id: JOB_NAME.into(),
                     dry_run: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ResizeAllocation" => svc
+            .resize_allocation(req(
+                legion::structs::ResizeAllocationRequest {
+                    allocation_id: 987_654,
+                    to: Some(legion::structs::ResizeResources {
+                        memory: Some(64.0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ResizeInstance" => svc
+            .resize_instance(req(
+                legion::structs::ResizeInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                    to: Some(legion::structs::ResizeResources {
+                        memory: Some(64.0),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
                 token,

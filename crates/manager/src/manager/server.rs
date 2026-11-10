@@ -147,6 +147,7 @@ mod node_content_rpcs;
 mod node_group_rpcs;
 mod object_rpcs;
 mod plugin_rpcs;
+mod resize_rpcs;
 mod runtime_state_rpcs;
 mod scaling_objects;
 mod scaling_rpcs;
@@ -1007,6 +1008,9 @@ fn map_instance_info(
         lease_issued_at: None,
         envelope_alloc_id: None,
         reschedule_backoff,
+        // Filled by GetInstance from the allocation's row (docs/resize.md).
+        resources: String::new(),
+        resources_override: String::new(),
     }
 }
 
@@ -8540,6 +8544,16 @@ impl Manager for ManagerDaemonService {
                 .await?
             {
                 let mut info = self.session_info(&session);
+                // A session's size is its node's: what its status reports.
+                if let Some(resources) = session
+                    .status
+                    .as_ref()
+                    .and_then(|status| serde_json::from_str::<Value>(&status.resources).ok())
+                {
+                    info.resources = crate::structs::resize::ResourceSize::of(&resources)
+                        .to_json()
+                        .to_string();
+                }
                 self.attach_children(&mut info).await;
                 return Ok(Response::new(GetInstanceReply {
                     instance: Some(info),
@@ -8591,6 +8605,7 @@ impl Manager for ManagerDaemonService {
             .instance_history(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?;
 
+        let current_alloc_id = instance.current_alloc_id;
         // The usage lock is released before the await below.
         let (idle_unmeasured, egress_unenforced, mut info) = {
             let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
@@ -8607,6 +8622,7 @@ impl Manager for ManagerDaemonService {
         if info.detail.is_none() {
             info.detail = idle_unmeasured.or(egress_unenforced);
         }
+        self.attach_resources(&mut info, current_alloc_id);
         self.attach_children(&mut info).await;
         Ok(Response::new(GetInstanceReply {
             instance: Some(info),
@@ -8629,6 +8645,26 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::ListSessionNodesRequest>,
     ) -> Result<Response<crate::structs::ListSessionNodesReply>, Status> {
         self.list_session_nodes_rpc(request).await
+    }
+
+    #[instrument(err, skip_all, fields(allocation_id = request.get_ref().allocation_id))]
+    async fn resize_allocation(
+        &self,
+        request: Request<crate::structs::ResizeAllocationRequest>,
+    ) -> Result<Response<crate::structs::ResizeReply>, Status> {
+        // ACL: `scale:write` on the allocation's job, after a coarse
+        // `scale:write` gate; enforced in `resize_allocation_rpc`.
+        self.resize_allocation_rpc(request).await
+    }
+
+    #[instrument(err, skip_all, fields(instance_id = %request.get_ref().instance_id))]
+    async fn resize_instance(
+        &self,
+        request: Request<crate::structs::ResizeInstanceRequest>,
+    ) -> Result<Response<crate::structs::ResizeReply>, Status> {
+        // ACL: `scale:write` on the instance's job, after a coarse
+        // `scale:write` gate; enforced in `resize_instance_rpc`.
+        self.resize_instance_rpc(request).await
     }
 
     #[instrument(err, skip_all, fields(job_id = %request.get_ref().job_id))]
@@ -11271,6 +11307,13 @@ impl Manager for ManagerDaemonService {
             .task_names_for_configs(&task_config_ids)
             .map_err(|e| map_store_error("Error getting task names", e))?;
 
+        // Resize overrides (docs/resize.md): `resources` is already the
+        // effective reservation; this says what differs from the spec.
+        let resource_overrides = self
+            .store
+            .resource_overrides(&allocation_ids)
+            .map_err(|e| map_store_error("Error getting resize overrides", e))?;
+
         let mut nodes: Vec<LedgerNode> = ledger.into_iter().map(Into::into).collect();
         for node in &mut nodes {
             for allocation in &mut node.allocations {
@@ -11279,6 +11322,10 @@ impl Manager for ManagerDaemonService {
                     .and_then(|snapshot| snapshot.artifact_states.clone());
                 allocation.task_name = task_names
                     .get(&allocation.task_config_id)
+                    .cloned()
+                    .unwrap_or_default();
+                allocation.resources_override = resource_overrides
+                    .get(&allocation.id)
                     .cloned()
                     .unwrap_or_default();
             }
@@ -14998,6 +15045,15 @@ fn build_desired_allocations(
     Ok(allocations)
 }
 
+/// The desired set a node's heartbeat reply carries, for integration tests
+/// that drive a worker's reconcile without a heartbeat loop.
+pub fn desired_allocations_for_test(
+    store: &Store,
+    node_id: &str,
+) -> R<Vec<crate::structs::TaskAllocation>> {
+    build_desired_allocations(store, node_id, &[])
+}
+
 /// Task configs by job config, for building many payloads.
 #[derive(Default)]
 pub(crate) struct DesiredTaskCache(HashMap<String, HashMap<i64, TaskConfig>>);
@@ -15039,6 +15095,7 @@ pub(crate) fn desired_payload(
         store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
     let mut payload = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
     crate::manager::dispatcher::attach_gang_env(store, task, allocation, &mut payload)?;
+    crate::manager::dispatcher::attach_resize_override(store, task, allocation, &mut payload);
     let session_task = crate::manager::dispatcher::attach_session_task_spec(
         &mut payload,
         task,
@@ -17331,6 +17388,13 @@ mod tests {
             &self,
             _request: Request<crate::structs::StopSessionsRequest>,
         ) -> Result<Response<crate::structs::StopSessionsReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn resize_session(
+            &self,
+            _request: Request<crate::structs::ResizeSessionRequest>,
+        ) -> Result<Response<crate::structs::ResizeSessionReply>, Status> {
             Err(Status::unimplemented("not used in test"))
         }
 

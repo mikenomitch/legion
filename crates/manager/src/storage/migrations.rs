@@ -2633,6 +2633,16 @@ fn migration_list() -> Vec<M<'static>> {
              CREATE INDEX IF NOT EXISTS instance_owner ON instance (owner) WHERE owner IS NOT NULL;",
         )
         .down(""),
+        // Resize (docs/resize.md): what a resize set on an allocation that
+        // differs from its task's spec, as JSON (`memory`, `memoryMax`,
+        // `cpu`, the spec's amounts, `reason`, `by`, `at`). NULL for every
+        // allocation at its spec. The row's `resources` is always the
+        // effective reservation.
+        M::up(
+            "ALTER TABLE allocation ADD COLUMN resources_override TEXT;
+             CREATE INDEX IF NOT EXISTS allocation_resources_override ON allocation (id) WHERE resources_override IS NOT NULL;",
+        )
+        .down(""),
     ]
 }
 

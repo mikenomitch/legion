@@ -31,6 +31,7 @@ pub mod netpolicy;
 pub mod network;
 pub mod node;
 pub mod object_rules;
+pub mod resize;
 pub mod run;
 pub mod runtime_state;
 pub mod session;

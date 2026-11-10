@@ -579,6 +579,29 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
+            name: "instance.resize",
+            cli: "legion instance resize <INSTANCE> [--memory <SIZE>] [--memory-max <SIZE>] [--cpu <MHZ>] [--reason <TEXT>] [--force] [--dry-run]",
+            grpc: Some("Manager/ResizeInstance"),
+            summary: "Resize a running keyed instance or session in place (memory, memoryMax, \
+                 cpu) as an override over the spec: no new job version, no restart. A session's \
+                 resize is node-local and writes nothing to the store. Answers applied, \
+                 deferred, refused (with the free room), needs_restart, or not_supported. \
+                 Needs scale:write. Supports --idempotency-key and --dry-run.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "alloc.resize",
+            cli: "legion alloc resize <ALLOCATION> [--memory <SIZE>] [--memory-max <SIZE>] [--cpu <MHZ>] [--reason <TEXT>] [--force] [--dry-run]",
+            grpc: Some("Manager/ResizeAllocation"),
+            summary: "Resize one running allocation in place (memory, memoryMax, cpu): one \
+                 compare-and-set on its row, applied by its node's runtime. A grow takes only \
+                 free room and is refused with the room the node has. Needs scale:write. \
+                 Supports --idempotency-key and --dry-run.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "session.nodes",
             cli: "legion session nodes <JOB> [--task <TASK>] [--format envoy-eds|haproxy]",
             grpc: Some("Manager/ListSessionNodes"),

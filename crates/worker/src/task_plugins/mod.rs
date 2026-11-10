@@ -837,6 +837,39 @@ pub trait TaskPlugin: Send + Sync {
         Ok(())
     }
 
+    /// What this runtime can change on a running unit (docs/resize.md).
+    ///
+    /// The default is nothing, so a runtime that predates resize, in-tree
+    /// or a dylib, answers every resize `not_supported` and is never asked
+    /// to apply one.
+    fn resize_support(&self) -> crate::structs::resize::ResizeSupport {
+        crate::structs::resize::ResizeSupport::default()
+    }
+
+    /// Change a running unit's `memory`, `memoryMax`, or `cpu` in place.
+    ///
+    /// `change` carries the unit's full effective resources before and
+    /// after. Worker core has already admitted the change (an envelope's
+    /// room for a session, the committed row for an allocation) and calls
+    /// this only for resources [`Self::resize_support`] claims. The runtime
+    /// applies what it can live and answers `NeedsRestart` or `Refused` for
+    /// what it cannot; it never restarts the unit. On `Applied` it updates
+    /// `instance.resource_assignment` to what it wrote, which worker core
+    /// persists. With `change.dry_run` it decides and changes nothing.
+    fn resize(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        change: &crate::structs::resize::ResizeChange,
+    ) -> R<crate::structs::resize::ResizeAnswer> {
+        let _ = (allocation, task, instance, change);
+        Ok(crate::structs::resize::ResizeAnswer::NotSupported(format!(
+            "the {} runtime cannot resize a running unit",
+            self.name()
+        )))
+    }
+
     /// Start the allocation from a checkpoint instead of booting it. Called
     /// in place of `start`, after `prepare` and after worker core restored or
     /// cloned the volumes the manifest names.

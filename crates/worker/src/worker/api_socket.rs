@@ -319,6 +319,58 @@ impl crate::structs::workload_server::Workload for AllocationWorkload {
         ))
     }
 
+    #[instrument(err, skip_all, fields(allocation_id = self.allocation_id, session_id))]
+    async fn resize_child_session(
+        &self,
+        request: tonic::Request<crate::structs::ResizeChildSessionRequest>,
+    ) -> Result<tonic::Response<crate::structs::ResizeSessionReply>, tonic::Status> {
+        use crate::worker::task_manager::resize::{
+            requested_size, resize_status, wire_reply, ResizeTarget,
+        };
+        use tonic::Status;
+        // ACL: workload channel. Only the caller's own children are
+        // reachable; every other id answers NotFound, whatever it names.
+        let request = request.into_inner();
+        tracing::Span::current().record("session_id", request.session_id.as_str());
+        let me = self.owner()?;
+        let mut guard = self.lock()?;
+        let owned = guard
+            .child_link(&request.session_id)
+            .is_some_and(|link| link.owner.kind == me.owner.kind && link.owner.id == me.owner.id);
+        if !owned {
+            return Err(Status::not_found(format!(
+                "no child {} of this workload",
+                request.session_id
+            )));
+        }
+        let size = requested_size(request.to.as_ref());
+        let done = guard
+            .resize_unit(
+                &ResizeTarget::Session(request.session_id.clone()),
+                &size,
+                request.force,
+                request.dry_run,
+            )
+            .map_err(|err| {
+                let status = resize_status(err);
+                // The link is here but the session is not: it runs on
+                // another node, which only a manager can reach.
+                if status.code() == tonic::Code::NotFound {
+                    Status::failed_precondition(format!(
+                        "child {} does not run on this node; resize it through a manager \
+                         (`legion instance resize`)",
+                        request.session_id
+                    ))
+                } else {
+                    status
+                }
+            })?;
+        Ok(tonic::Response::new(wire_reply(
+            &done,
+            &self.channel.node_id,
+        )))
+    }
+
     #[instrument(err, skip_all, fields(allocation_id = self.allocation_id, task))]
     async fn create_child_instance(
         &self,

@@ -853,6 +853,8 @@ pub struct Metrics {
     /// `legion_envelope_resizes_total{direction, outcome}` (docs/metrics.md,
     /// "Sessions"; elastic-session-envelopes plan §6.3)
     pub envelope_resizes_total: Arc<CounterVec>,
+    /// `legion_resizes_total{unit, outcome}` (docs/metrics.md, "Resize")
+    pub resizes_total: Arc<CounterVec>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
     /// `legion_namespace_jobs{namespace}` (docs/metrics.md, "Namespaces")
@@ -1403,6 +1405,14 @@ impl Metrics {
                 name: "legion_envelope_resizes_total",
                 help: "Elastic envelope resizes nodes asked this manager for, by direction (grow|shrink) and outcome (applied|partial|refused|stale|gone|invalid|error). Applied and partial resizes are one scheduler-lane write each; the rest write nothing.",
                 labels: &["direction", "outcome"],
+            },
+            series: Series::new(),
+        });
+        let resizes_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_resizes_total",
+                help: "In-place resizes this manager answered (ResizeAllocation, ResizeInstance), by unit (allocation|instance|session) and outcome (applied|deferred|refused|needs_restart|not_supported|stale|error). Dry runs are not counted. An applied allocation or instance resize is one scheduler-lane write; a session resize writes nothing.",
+                labels: &["unit", "outcome"],
             },
             series: Series::new(),
         });
@@ -2064,6 +2074,7 @@ impl Metrics {
             Arc::clone(&session_promotions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&keyed_children_ended_total) as Arc<dyn RenderMetric>,
             Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
             Arc::clone(&apps) as Arc<dyn RenderMetric>,
@@ -2183,6 +2194,7 @@ impl Metrics {
             session_starts_total,
             session_runs_total,
             envelope_resizes_total,
+            resizes_total,
             session_stops_total,
             session_promotions_total,
             keyed_children_ended_total,

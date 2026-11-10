@@ -113,6 +113,7 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
         let mut task_allocation =
             build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
         attach_gang_env(store, task, allocation, &mut task_allocation)?;
+        attach_resize_override(store, task, allocation, &mut task_allocation);
         if let Some(tasks) = task_cache.get(&allocation.job_config_id) {
             let session_task = attach_session_task_spec(
                 &mut task_allocation,
@@ -484,6 +485,7 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
     // it staged with before starting anything.
     let mut payload = build_task_allocation(&task, allocation, instance.as_ref(), &volumes)?;
     attach_gang_env(store, &task, allocation, &mut payload)?;
+    attach_resize_override(store, &task, allocation, &mut payload);
     payload.provisional = Some(provisional);
 
     run_dispatch_future(async {
@@ -542,6 +544,64 @@ pub fn attach_session_seal_keys(
         return;
     }
     payload.session_seal_keys = store.keyring().session_seal_keys(&payload.job_id);
+}
+
+/// Lay an allocation's resize override over its payload's resources
+/// (docs/resize.md), so a worker that launches the allocation afresh (a
+/// reboot, a restart from the manager's copy) starts it at its effective
+/// size, the size the row reserves.
+///
+/// The row's `resources` are the effective amounts, and they equal the
+/// task's declared-or-default amounts unless a resize changed them. That
+/// comparison is the whole cost for every allocation at its spec, which is
+/// almost all of them on every heartbeat; only a difference reads the
+/// override record, and only the amounts the record names are overlaid, so
+/// a cluster default that changed since placement never becomes a declared
+/// size.
+pub fn attach_resize_override(
+    store: &Store,
+    task: &TaskConfig,
+    allocation: &Allocation,
+    payload: &mut TaskAllocation,
+) {
+    use crate::structs::resize::{ResourceSize, ResourcesOverride};
+    if allocation.id == 0 || crate::structs::session::envelope_serves(task).is_some() {
+        return;
+    }
+    let row = ResourceSize::of(&allocation.resources);
+    let declared = ResourceSize::of(&task.resources);
+    let default = |key: &str| {
+        store
+            .resource_policy
+            .task_defaults
+            .get(key)
+            .and_then(Value::as_f64)
+    };
+    let at_spec = row.memory == declared.memory.or_else(|| default("memory"))
+        && row.cpu == declared.cpu.or_else(|| default("cpu"))
+        && row.memory_max == declared.memory_max;
+    if at_spec {
+        return;
+    }
+    let Some(record) = store
+        .resource_overrides(&[allocation.id])
+        .ok()
+        .and_then(|mut found| found.remove(&allocation.id))
+        .and_then(|raw| serde_json::from_str::<ResourcesOverride>(&raw).ok())
+    else {
+        return;
+    };
+    let declared: Value = if payload.task_resources.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(&payload.task_resources) {
+            Ok(value) => value,
+            Err(_) => return,
+        }
+    };
+    if let Ok(effective) = record.size.apply_to(&declared) {
+        payload.task_resources = effective.to_string();
+    }
 }
 
 /// Add a gang member's identity to its payload's env

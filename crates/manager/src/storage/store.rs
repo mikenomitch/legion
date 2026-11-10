@@ -42,7 +42,9 @@ mod group_commit;
 mod session_ops;
 // Elastic session envelopes: a node's in-place envelope resize.
 mod envelope_ops;
+mod resize_ops;
 pub use envelope_ops::{EnvelopeResizeOutcome, EnvelopeResizeRequest};
+pub use resize_ops::{AllocationResizeOutcome, AllocationResizeRequest, AllocationSize};
 mod snapshot_ops;
 mod suspend_ops;
 // Device assignment at allocation insert (docs/devices.md).

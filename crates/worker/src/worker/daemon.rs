@@ -209,6 +209,9 @@ fn worker_capabilities(publishing: bool, edge_sessions: bool) -> Vec<String> {
         // that predates sessions is never given one.
         crate::structs::session::SESSIONS_CAPABILITY.to_string(),
         crate::structs::runtime_state::RUNTIME_DISABLE_CAPABILITY.to_string(),
+        // Answers `Worker.ResizeSession` (docs/resize.md). A manager never
+        // sends a resize to a node without it.
+        crate::structs::resize::RESIZE_CAPABILITY.to_string(),
     ];
     if publishing {
         capabilities.push(crate::structs::snapshot::CONTENT_PUBLISH_CAPABILITY.to_string());
