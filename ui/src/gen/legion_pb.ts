@@ -12876,17 +12876,21 @@ export class InstanceInfo extends Message<InstanceInfo> {
   rescheduleBackoff?: RescheduleBackoff;
 
   /**
-   * The unit that owns this session as its child (docs/child-sessions.md).
-   * Unset for a unit nobody owns. A promoted child is detached and carries
-   * none.
+   * The unit that owns this unit as its child (docs/child-sessions.md): a
+   * session child's reference comes from its node's report, a keyed
+   * child's from its row. Unset for a unit nobody owns. A promoted child
+   * keeps the reference when its owner is an `instance` or an `allocation`
+   * and loses it when its owner is a `session`.
    *
    * @generated from field: optional legion.OwnerRef owner = 48;
    */
   owner?: OwnerRef;
 
   /**
-   * The sessions this unit owns, as the session index lists them: ids,
-   * tasks, nodes, and states. Filled by `GetInstance`; empty in lists.
+   * The children this unit owns: its session children as the session index
+   * lists them, then its keyed children from the replicated store
+   * (`ChildInfo.kind` tells them apart). Filled by `GetInstance`; empty in
+   * lists.
    *
    * @generated from field: repeated legion.ChildInfo children = 49;
    */

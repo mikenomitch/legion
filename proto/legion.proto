@@ -1277,6 +1277,12 @@ service Manager {
   // replacement placed after node loss reserves the task's full resources,
   // like any keyed placement.
   //
+  // Ownership (docs/child-sessions.md): promoting an owner re-keys its
+  // children's references to the new instance. Promoting a child whose
+  // owner is an `instance` or an `allocation` writes the reference into the
+  // new row in this entry, so it stays that owner's (keyed) child;
+  // promoting a child of a `session` detaches it.
+  //
   // ACL: `job:write` on the session's job, checked coarsely before the
   // session lookup and precisely after it.
   //
@@ -8101,13 +8107,17 @@ message InstanceInfo {
   // the job. Replicated, so every manager reports it. Unset otherwise.
   optional RescheduleBackoff reschedule_backoff = 47;
 
-  // The unit that owns this session as its child (docs/child-sessions.md).
-  // Unset for a unit nobody owns. A promoted child is detached and carries
-  // none.
+  // The unit that owns this unit as its child (docs/child-sessions.md): a
+  // session child's reference comes from its node's report, a keyed
+  // child's from its row. Unset for a unit nobody owns. A promoted child
+  // keeps the reference when its owner is an `instance` or an `allocation`
+  // and loses it when its owner is a `session`.
   optional OwnerRef owner = 48;
 
-  // The sessions this unit owns, as the session index lists them: ids,
-  // tasks, nodes, and states. Filled by `GetInstance`; empty in lists.
+  // The children this unit owns: its session children as the session index
+  // lists them, then its keyed children from the replicated store
+  // (`ChildInfo.kind` tells them apart). Filled by `GetInstance`; empty in
+  // lists.
   repeated ChildInfo children = 49;
 }
 

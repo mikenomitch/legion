@@ -1619,6 +1619,12 @@ export const Manager = {
      * replacement placed after node loss reserves the task's full resources,
      * like any keyed placement.
      *
+     * Ownership (docs/child-sessions.md): promoting an owner re-keys its
+     * children's references to the new instance. Promoting a child whose
+     * owner is an `instance` or an `allocation` writes the reference into the
+     * new row in this entry, so it stays that owner's (keyed) child;
+     * promoting a child of a `session` detaches it.
+     *
      * ACL: `job:write` on the session's job, checked coarsely before the
      * session lookup and precisely after it.
      *

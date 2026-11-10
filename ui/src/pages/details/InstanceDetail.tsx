@@ -696,19 +696,25 @@ function Callouts(props: { instance: InstanceInfo; routeJob: string; provisional
       <Show when={props.instance.owner}>
         {(owner) => (
           <Note tone="neutral">
-            <span class="font-medium">A child session.</span> It is owned by {owner().kind}{' '}
+            <span class="font-medium">{props.instance.durable ? 'A keyed child.' : 'A child session.'}</span> It is owned by{' '}
+            {owner().kind}{' '}
             <Show when={owner().kind !== 'allocation'} fallback={<span class="font-mono text-xs">{owner().id}</span>}>
               <A href={instanceHref(props.instance.jobId, owner().id)} class={cx(linkClass, 'font-mono text-xs')}>
                 {owner().id}
               </A>
             </Show>{' '}
-            and ends when its owner is stopped, destroyed, or lost. Suspending the owner does not end it.
+            <Show
+              when={props.instance.durable}
+              fallback={<>and ends when its owner is stopped, destroyed, or lost. Suspending the owner does not end it.</>}
+            >
+              and is stopped when its owner is stopped and destroyed when it is destroyed. Suspending the owner does not end it.
+            </Show>
           </Note>
         )}
       </Show>
       <Show when={props.instance.children.length > 0}>
         <Note tone="neutral">
-          <span class="font-medium">Owns {props.instance.children.length} child session{props.instance.children.length === 1 ? '' : 's'}:</span>{' '}
+          <span class="font-medium">Owns {props.instance.children.length} {props.instance.children.length === 1 ? 'child' : 'children'}:</span>{' '}
           <For each={props.instance.children}>
             {(child, index) => (
               <>
@@ -717,7 +723,9 @@ function Callouts(props: { instance: InstanceInfo; routeJob: string; provisional
                   {child.sessionId}
                 </A>{' '}
                 <span class="text-xs">
-                  ({child.taskName} on {child.nodeId}, {child.state})
+                  ({child.kind === 'instance' ? 'keyed, ' : ''}
+                  {child.taskName}
+                  {child.nodeId ? ` on ${child.nodeId}` : ''}, {child.state})
                 </span>
               </>
             )}
