@@ -62,6 +62,7 @@ fn status(node: usize, index: usize) -> SessionStatus {
         origin: "manager".into(),
         ticket_jti: String::new(),
         checkpoint: None,
+        owner: None,
     }
 }
 

@@ -1022,13 +1022,19 @@ allocation's task may ask for.
 
 | Call | What it does | Allowed when |
 | --- | --- | --- |
-| `Workload.RunSession` (`legion session run --local`) | A [session run](session-runs.md) of a session task of the caller's own job, on the caller's node | the calling task is the task being run |
+| `Workload.RunSession` (`legion session run --local`) | A [session run](session-runs.md) of a session task of the caller's own job, on the caller's node | the calling task is the task being run, or names it in `children.tasks` |
+| `Workload.StartChildSession` (`legion session start <task> --owner self`) | Starts a session of a sibling task as a [child](child-sessions.md) of the caller, on the caller's node | the calling task names the task in `children.tasks` |
+| `Workload.ListChildren` (`legion session children`) | Lists the caller's children on its node, with why the recently ended ones ended | always (a caller sees only its own) |
+| `Workload.StopChildSession` (`legion session stop <id> --local`) | Ends one of the caller's children | the id is a child of the caller; any other id is `NOT_FOUND` |
 
 A call for another job, or one that replaces the run's command, is refused
-with `PERMISSION_DENIED`. A session task cannot declare identities and so
-has no socket, which leaves no pair this rule admits: a workload that
-needs a run of a sibling task sends it through the `Manager` service on the
-same socket, where its `legion` identity needs `job:write`.
+with `PERMISSION_DENIED`. The jobspec is the whole authorization: a task
+reaches a sibling task through this service only when its own `children`
+block names it. A session task cannot declare identities and so has no
+socket; its children are started from outside with `--owner`. A workload
+that needs something the block does not grant sends the call through the
+`Manager` service on the same socket, where its `legion` identity needs
+`job:write`.
 
 **Who may connect.** Tasks can share a user, so the file's mode is not enough.
 Where every task is guaranteed a cgroup leaf (Linux with cgroup v2, and either

@@ -13687,15 +13687,19 @@ mod tests {
         let temp_dir = TempDir::new()?;
         {
             let manager = child_worker(&temp_dir)?;
-            start_owned(&manager, "agent-1", owns_workspaces(1), None, "manager")?;
-            start_owned(
+            let owner = start_owned(&manager, "agent-1", owns_workspaces(1), None, "manager")?;
+            let child = start_owned(
                 &manager,
                 "machine-1",
                 None,
                 Some(owner_ref(OWNER_SESSION, "agent-1")),
                 "manager",
             )?;
-            let guard = manager.lock().expect("task manager");
+            let mut guard = manager.lock().expect("task manager");
+            // The launch thread logs a session after it registers it; log
+            // both here so the sync below cannot run ahead of that.
+            guard.log_running_session(owner.local_key);
+            guard.log_running_session(child.local_key);
             assert!(guard.sync_session_log(Duration::from_secs(5)));
             drop(guard);
             // The old worker exits without stopping anything.

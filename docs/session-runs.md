@@ -267,8 +267,10 @@ replace it.
 - **`cpuMs` is 0** unless the node governs the session with a cgroup.
 - **`container` and `sandbox` runs need a shell in the image** (see [The
   run directory](#the-run-directory)); a distroless image cannot take runs.
-- **A workload cannot run a sibling task through its API socket.** The
-  worker serves the call (`Workload.RunSession`, `legion session run
-  --local`), but the only pair the jobspec can authorize is a task
-  running itself, and a session task has no API socket; see
+- **A workload runs a sibling task through its API socket only when its
+  task declares it.** `legion session run --local` (`Workload.RunSession`)
+  is admitted when the calling task names the target task in
+  [`children.tasks`](child-sessions.md#declaring-children), or is the
+  target task itself. A session task has no API socket, so the caller is a
+  service, batch, slot, or keyed task; see
   [workload-identity.md](workload-identity.md#the-api-socket).

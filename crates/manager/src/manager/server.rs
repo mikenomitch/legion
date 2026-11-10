@@ -7375,10 +7375,8 @@ impl Manager for ManagerDaemonService {
                 .check_namespace_quota_growth(&config.name, config.priority, &task.resources, 1)
                 .map_err(|e| map_store_error("Namespace policy refused the instance", e))?;
         }
-        if crate::structs::session::is_session_task(task) {
-            if requested_id.is_none() {
-                return self.create_session(&identity, &inner, &config, task).await;
-            }
+        if crate::structs::session::is_session_task(task) && requested_id.is_none() {
+            return self.create_session(&identity, &inner, &config, task).await;
         }
         // Children are sessions (docs/child-sessions.md): a create with an
         // id makes a keyed instance, which cannot be owned yet.
@@ -7393,14 +7391,14 @@ impl Manager for ManagerDaemonService {
                 requested_id.unwrap_or_default()
             )));
         }
-        if crate::structs::session::is_session_task(task) {
-            if !crate::structs::session::accepts_names(task) {
-                return Err(Status::invalid_argument(format!(
-                    "task {} sets stateful.promote.onName = false: its instances are unnamed \
-                     sessions; omit instance_id",
-                    task.name
-                )));
-            }
+        if crate::structs::session::is_session_task(task)
+            && !crate::structs::session::accepts_names(task)
+        {
+            return Err(Status::invalid_argument(format!(
+                "task {} sets stateful.promote.onName = false: its instances are unnamed \
+                 sessions; omit instance_id",
+                task.name
+            )));
         }
 
         // Phase 6: restore from a snapshot instead of booting empty.
@@ -19958,6 +19956,7 @@ mod tests {
                     instance_id: Some(id.into()),
                     idempotency_key: None,
                     from_snapshot: None,
+                    owner: None,
                 })))
                 .map_err(|err| anyhow!(err))
         };
@@ -20107,6 +20106,7 @@ mod tests {
                 instance_id: Some("user-a".into()),
                 idempotency_key: None,
                 from_snapshot: None,
+                owner: None,
             })))
             .map_err(|err| anyhow!(err))?;
         let get = || -> R<InstanceInfo> {
@@ -21758,6 +21758,7 @@ mod tests {
                 instance_id: Some("user-a".into()),
                 idempotency_key: None,
                 from_snapshot: None,
+                owner: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -21828,6 +21829,7 @@ mod tests {
                 instance_id: Some("user-a".into()),
                 idempotency_key: None,
                 from_snapshot: None,
+                owner: None,
             })))
             .expect_err("tombstoned id must be rejected");
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
@@ -21842,6 +21844,7 @@ mod tests {
                 instance_id: None,
                 idempotency_key: None,
                 from_snapshot: None,
+                owner: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -21873,6 +21876,7 @@ mod tests {
                 instance_id: id.map(String::from),
                 idempotency_key: None,
                 from_snapshot: None,
+                owner: None,
             })))
         };
 
@@ -21972,6 +21976,7 @@ mod tests {
                 instance_id: None,
                 idempotency_key: Some("create-1".into()),
                 from_snapshot: None,
+                owner: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -21983,6 +21988,7 @@ mod tests {
                 instance_id: None,
                 idempotency_key: Some("create-1".into()),
                 from_snapshot: None,
+                owner: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();

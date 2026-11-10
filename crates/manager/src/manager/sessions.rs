@@ -372,7 +372,7 @@ pub enum Located {
 
 /// What one node answered to `Worker.GetSession`.
 enum NodeAnswer {
-    Holds(SessionStatus),
+    Holds(Box<SessionStatus>),
     Absent,
     Evicted(String),
     /// The id's tag is not this node's (a stale tag map): ask elsewhere.
@@ -401,7 +401,7 @@ async fn ask_node_within(
     request.set_timeout(timeout);
     match client.get_session(request).await {
         Ok(reply) => match reply.into_inner().session {
-            Some(status) => NodeAnswer::Holds(status),
+            Some(status) => NodeAnswer::Holds(Box::new(status)),
             None => NodeAnswer::Absent,
         },
         Err(status) if status.code() == tonic::Code::NotFound => {
@@ -439,7 +439,7 @@ pub async fn locate(store: &Store, session_id: &str) -> Located {
                 NodeAnswer::Holds(status) => {
                     return Located::Found(Box::new(IndexedSession {
                         node_id: node_id.clone(),
-                        status: Some(status),
+                        status: Some(*status),
                         recent: false,
                     }))
                 }

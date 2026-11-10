@@ -79,13 +79,10 @@ impl ClaimRatifier for NoRatifier {
 /// job whose envelope the scheduler placed on the worker.
 struct Cluster {
     svc: ManagerDaemonService,
-    /// The same worker the manager dials, for in-process edge calls.
-    edge: WorkerDaemonService,
     task_manager: Arc<Mutex<WorkerTaskManager>>,
     launch_pool: Arc<legion::worker::launch_pool::LaunchPool>,
-    issuer: Issuer,
-    #[allow(dead_code)]
-    dir: tempfile::TempDir,
+    /// Holds the stores and the worker's state for the test's lifetime.
+    _dir: tempfile::TempDir,
     /// The epoch of the next session report this test sends for the node.
     epoch: Mutex<u64>,
 }
@@ -193,11 +190,9 @@ impl Cluster {
 
         let cluster = Cluster {
             svc,
-            edge: service(),
             task_manager,
             launch_pool,
-            issuer,
-            dir,
+            _dir: dir,
             epoch: Mutex::new(0),
         };
         cluster.submit()?;
@@ -718,15 +713,16 @@ async fn promotion_carries_ownership_test() -> R<()> {
     let instance = owner_ref(OWNER_INSTANCE, "user-42");
     let mut rekeyed = false;
     for _ in 0..200 {
-        let guard = cluster.task_manager.lock().expect("task manager");
-        let link = guard
-            .child_link(&follows.instance_id)
-            .map(|link| link.owner.clone());
-        if link == Some(instance.clone()) && guard.child_link(&detached.instance_id).is_none() {
-            rekeyed = true;
+        rekeyed = {
+            let guard = cluster.task_manager.lock().expect("task manager");
+            let link = guard
+                .child_link(&follows.instance_id)
+                .map(|link| link.owner.clone());
+            link == Some(instance.clone()) && guard.child_link(&detached.instance_id).is_none()
+        };
+        if rekeyed {
             break;
         }
-        drop(guard);
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(rekeyed, "the node re-keyed the child to the promoted owner");
@@ -762,6 +758,9 @@ async fn promotion_carries_ownership_test() -> R<()> {
 /// its node says is gone ends the child at the next beat.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_remote_session_owners_end_reaches_its_children_test() -> R<()> {
+    // The grace that covers a session briefly in no index (it just moved)
+    // is 20 s; this test's owner is gone for good.
+    legion::manager::children::NOT_FOUND_GRACE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     let cluster = Cluster::new().await?;
     let agent = cluster.start(AGENT, None).await?;
     let child = cluster

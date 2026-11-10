@@ -11095,6 +11095,29 @@ export class CreateInstanceRequest extends Message<CreateInstanceRequest> {
    */
   fromSnapshot?: string;
 
+  /**
+   * Start the unnamed session as a child of this unit
+   * (docs/child-sessions.md): it ends when its owner ends, and is listed
+   * under it. Session tasks only, and only without `instance_id`. The
+   * owner must be a running unit of the same job whose task names this
+   * task in `children.tasks`. Needs `job:write` like any create.
+   *
+   * `kind` is `session` (a session id), `instance` (a keyed or slot
+   * instance id), or `allocation` (an allocation id, for owners with no
+   * instance identity); empty asks the manager to work it out from `id`.
+   * The child goes to its owner's node when that node's envelope for this
+   * task has room, and to another node with room otherwise.
+   *
+   * Errors: NotFound when no running unit has the id; FailedPrecondition
+   * when the owner's task does not declare this task, when the owner is
+   * itself a child (depth 1 only), or when the task is keyed;
+   * ResourceExhausted (retryable) when the owner already has
+   * `children.max` children or no envelope has room.
+   *
+   * @generated from field: optional legion.OwnerRef owner = 7;
+   */
+  owner?: OwnerRef;
+
   constructor(data?: PartialMessage<CreateInstanceRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11109,6 +11132,7 @@ export class CreateInstanceRequest extends Message<CreateInstanceRequest> {
     { no: 4, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 6, name: "from_snapshot", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "owner", kind: "message", T: OwnerRef, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateInstanceRequest {
@@ -11205,6 +11229,14 @@ export class CreateInstanceReply extends Message<CreateInstanceReply> {
    */
   state = "";
 
+  /**
+   * The owner the session was started under (`CreateInstanceRequest.owner`),
+   * with its kind resolved. Unset for a create without an owner.
+   *
+   * @generated from field: optional legion.OwnerRef owner = 8;
+   */
+  owner?: OwnerRef;
+
   constructor(data?: PartialMessage<CreateInstanceReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11220,6 +11252,7 @@ export class CreateInstanceReply extends Message<CreateInstanceReply> {
     { no: 5, name: "durable", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 6, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "owner", kind: "message", T: OwnerRef, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateInstanceReply {
@@ -12755,6 +12788,23 @@ export class InstanceInfo extends Message<InstanceInfo> {
    */
   rescheduleBackoff?: RescheduleBackoff;
 
+  /**
+   * The unit that owns this session as its child (docs/child-sessions.md).
+   * Unset for a unit nobody owns. A promoted child is detached and carries
+   * none.
+   *
+   * @generated from field: optional legion.OwnerRef owner = 48;
+   */
+  owner?: OwnerRef;
+
+  /**
+   * The sessions this unit owns, as the session index lists them: ids,
+   * tasks, nodes, and states. Filled by `GetInstance`; empty in lists.
+   *
+   * @generated from field: repeated legion.ChildInfo children = 49;
+   */
+  children: ChildInfo[] = [];
+
   constructor(data?: PartialMessage<InstanceInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -12810,6 +12860,8 @@ export class InstanceInfo extends Message<InstanceInfo> {
     { no: 45, name: "lease_issued_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 46, name: "envelope_alloc_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
     { no: 47, name: "reschedule_backoff", kind: "message", T: RescheduleBackoff, opt: true },
+    { no: 48, name: "owner", kind: "message", T: OwnerRef, opt: true },
+    { no: 49, name: "children", kind: "message", T: ChildInfo, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceInfo {
@@ -18611,6 +18663,17 @@ export class SessionStatus extends Message<SessionStatus> {
    */
   checkpoint?: SessionCheckpointInfo;
 
+  /**
+   * The unit that owns this session as its child (docs/child-sessions.md).
+   * Unset for a session nobody owns.
+   * The node reports it on every session report, so the managers know
+   * which sessions to end when an `instance` or `allocation` owner reaches
+   * a terminal state.
+   *
+   * @generated from field: legion.OwnerRef owner = 13;
+   */
+  owner?: OwnerRef;
+
   constructor(data?: PartialMessage<SessionStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -18631,6 +18694,7 @@ export class SessionStatus extends Message<SessionStatus> {
     { no: 10, name: "origin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "ticket_jti", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 12, name: "checkpoint", kind: "message", T: SessionCheckpointInfo },
+    { no: 13, name: "owner", kind: "message", T: OwnerRef },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SessionStatus {
@@ -19121,6 +19185,16 @@ export class StreamWorkReply extends Message<StreamWorkReply> {
    */
   resumedFrom = "";
 
+  /**
+   * Owner notices for this node's child sessions, pushed as soon as this
+   * manager sees the owner's state change (see
+   * `HeartbeatReply.owner_notices`, which repeats them). Push-only: outside
+   * the sequence and never replayed.
+   *
+   * @generated from field: repeated legion.OwnerNotice owner_notices = 11;
+   */
+  ownerNotices: OwnerNotice[] = [];
+
   constructor(data?: PartialMessage<StreamWorkReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -19141,6 +19215,7 @@ export class StreamWorkReply extends Message<StreamWorkReply> {
     { no: 10, name: "runtime_states", kind: "message", T: RuntimeStateSet },
     { no: 20, name: "revision", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 21, name: "resumed_from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "owner_notices", kind: "message", T: OwnerNotice, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamWorkReply {
@@ -20848,6 +20923,17 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   runtimeStates?: RuntimeStateSet;
 
+  /**
+   * What happened to the owners of child sessions this node holds
+   * (docs/child-sessions.md): the managers decide when an `instance` or
+   * `allocation` owner ended, and when a `session` owner on another node
+   * did. Sent on every reply until the node's session report no longer
+   * lists a child of the owner, so a lost notice is repeated.
+   *
+   * @generated from field: repeated legion.OwnerNotice owner_notices = 27;
+   */
+  ownerNotices: OwnerNotice[] = [];
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -20880,6 +20966,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 23, name: "cluster_ca_pins", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 25, name: "endpoint_feed", kind: "message", T: EndpointFeed },
     { no: 26, name: "runtime_states", kind: "message", T: RuntimeStateSet },
+    { no: 27, name: "owner_notices", kind: "message", T: OwnerNotice, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -30849,6 +30936,24 @@ export class StartSessionRequest extends Message<StartSessionRequest> {
    */
   forceMove = false;
 
+  /**
+   * Start the session as a child of this owner (docs/child-sessions.md).
+   * The owner must be running on this node: a session id (`kind =
+   * "session"`), a keyed or slot instance id (`"instance"`), or an
+   * allocation id (`"allocation"`); empty `kind` asks the node to work it
+   * out. The owner's task must name the ticket's task in `children.tasks`
+   * and be a task of the ticket's job. The ticket is still the credential.
+   *
+   * Errors: NotFound when the owner is not running on this node (start it
+   * through a manager to place a child on another node);
+   * FailedPrecondition when the owner's task does not declare the task or
+   * the owner is itself a child; ResourceExhausted (retryable) at
+   * `children.max` or a full envelope.
+   *
+   * @generated from field: legion.OwnerRef owner = 8;
+   */
+  owner?: OwnerRef;
+
   constructor(data?: PartialMessage<StartSessionRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -30864,6 +30969,7 @@ export class StartSessionRequest extends Message<StartSessionRequest> {
     { no: 5, name: "wait", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
     { no: 6, name: "resume_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "force_move", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "owner", kind: "message", T: OwnerRef },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartSessionRequest {
@@ -30949,6 +31055,14 @@ export class StartSessionReply extends Message<StartSessionReply> {
    */
   movedFrom = "";
 
+  /**
+   * The owner the session was started under, with its kind resolved.
+   * Unset for a session nobody owns.
+   *
+   * @generated from field: legion.OwnerRef owner = 8;
+   */
+  owner?: OwnerRef;
+
   constructor(data?: PartialMessage<StartSessionReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -30964,6 +31078,7 @@ export class StartSessionReply extends Message<StartSessionReply> {
     { no: 5, name: "resumed_from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 7, name: "moved_from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "owner", kind: "message", T: OwnerRef },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartSessionReply {
@@ -30980,6 +31095,444 @@ export class StartSessionReply extends Message<StartSessionReply> {
 
   static equals(a: StartSessionReply | PlainMessage<StartSessionReply> | undefined, b: StartSessionReply | PlainMessage<StartSessionReply> | undefined): boolean {
     return proto3.util.equals(StartSessionReply, a, b);
+  }
+}
+
+/**
+ * A typed reference to the unit that owns a child (docs/child-sessions.md).
+ * It is stored with the child, wherever the child's own record lives, and
+ * whoever holds that record ends the child when the owner's authority says
+ * the owner reached a terminal state.
+ *
+ * @generated from message legion.OwnerRef
+ */
+export class OwnerRef extends Message<OwnerRef> {
+  /**
+   * What `id` names, which also decides who says the owner ended:
+   *
+   * - `session`: a session id. Its node decides: stopped, destroyed, or
+   *   its workload exited. Suspending or moving it is not an end.
+   * - `instance`: a keyed or slot instance id, the logical unit that
+   *   outlives its allocations. The managers decide: stopped or destroyed.
+   *   Suspended, archived, or rescheduling is not an end.
+   * - `allocation`: an allocation id, for an owner with no instance
+   *   identity (a service replica, a batch run). The managers decide:
+   *   complete, failed, stopped, or lost.
+   *
+   * @generated from field: string kind = 1;
+   */
+  kind = "";
+
+  /**
+   * The owner's id: a session id, an instance id, or an allocation id in
+   * decimal.
+   *
+   * @generated from field: string id = 2;
+   */
+  id = "";
+
+  constructor(data?: PartialMessage<OwnerRef>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.OwnerRef";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): OwnerRef {
+    return new OwnerRef().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): OwnerRef {
+    return new OwnerRef().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): OwnerRef {
+    return new OwnerRef().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: OwnerRef | PlainMessage<OwnerRef> | undefined, b: OwnerRef | PlainMessage<OwnerRef> | undefined): boolean {
+    return proto3.util.equals(OwnerRef, a, b);
+  }
+}
+
+/**
+ * What happened to the owner of child sessions a node holds.
+ *
+ * @generated from message legion.OwnerNotice
+ */
+export class OwnerNotice extends Message<OwnerNotice> {
+  /**
+   * The owner, as the children's references name it.
+   *
+   * @generated from field: legion.OwnerRef owner = 1;
+   */
+  owner?: OwnerRef;
+
+  /**
+   * `stopped` or `destroyed`: the owner reached a terminal state, and the
+   * node ends its children (a session child has no difference between the
+   * two). `suspended`: the owner suspended, and the node suspends the
+   * children whose owner task sets `children.suspendWithOwner`.
+   * `promoted`: the owner session became the instance `promoted_to`, and
+   * the node re-keys its children's references to it.
+   *
+   * @generated from field: string event = 2;
+   */
+  event = "";
+
+  /**
+   * For `promoted`: the reference the children carry from now on.
+   *
+   * @generated from field: legion.OwnerRef promoted_to = 3;
+   */
+  promotedTo?: OwnerRef;
+
+  /**
+   * A short reason for the log and the child's `gone` record, e.g.
+   * `instance user-42 stopped`.
+   *
+   * @generated from field: string detail = 4;
+   */
+  detail = "";
+
+  constructor(data?: PartialMessage<OwnerNotice>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.OwnerNotice";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "owner", kind: "message", T: OwnerRef },
+    { no: 2, name: "event", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "promoted_to", kind: "message", T: OwnerRef },
+    { no: 4, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): OwnerNotice {
+    return new OwnerNotice().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): OwnerNotice {
+    return new OwnerNotice().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): OwnerNotice {
+    return new OwnerNotice().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: OwnerNotice | PlainMessage<OwnerNotice> | undefined, b: OwnerNotice | PlainMessage<OwnerNotice> | undefined): boolean {
+    return proto3.util.equals(OwnerNotice, a, b);
+  }
+}
+
+/**
+ * One child of an owner, as `GetInstance`, `Worker.GetSession`, and
+ * `Workload.ListChildren` list it.
+ *
+ * @generated from message legion.ChildInfo
+ */
+export class ChildInfo extends Message<ChildInfo> {
+  /**
+   * The child's session id.
+   *
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  /**
+   * The child's task.
+   *
+   * @generated from field: string task_name = 2;
+   */
+  taskName = "";
+
+  /**
+   * The node holding it.
+   *
+   * @generated from field: string node_id = 3;
+   */
+  nodeId = "";
+
+  /**
+   * `starting`, `running`, `suspended`, or `gone` (it ended in the last
+   * ten minutes; only its own node reports this).
+   *
+   * @generated from field: string state = 4;
+   */
+  state = "";
+
+  /**
+   * For `gone`: why, e.g. `stopped`, `exited`, `evicted`, `owner ended`.
+   *
+   * @generated from field: string reason = 5;
+   */
+  reason = "";
+
+  constructor(data?: PartialMessage<ChildInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ChildInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ChildInfo {
+    return new ChildInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ChildInfo {
+    return new ChildInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ChildInfo {
+    return new ChildInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ChildInfo | PlainMessage<ChildInfo> | undefined, b: ChildInfo | PlainMessage<ChildInfo> | undefined): boolean {
+    return proto3.util.equals(ChildInfo, a, b);
+  }
+}
+
+/**
+ * `Workload.StartChildSession`.
+ *
+ * @generated from message legion.StartChildSessionRequest
+ */
+export class StartChildSessionRequest extends Message<StartChildSessionRequest> {
+  /**
+   * The session task to start a child of. It must be a task of the
+   * caller's job that the caller's task names in `children.tasks`.
+   *
+   * @generated from field: string task_name = 1;
+   */
+  taskName = "";
+
+  /**
+   * Node-local retry key: a repeat on the same node returns the same child
+   * with `deduplicated = true`.
+   *
+   * @generated from field: string idempotency_key = 2;
+   */
+  idempotencyKey = "";
+
+  /**
+   * Whether to answer once the child runs (the default) or as soon as it
+   * is admitted (`false`, state `starting`).
+   *
+   * @generated from field: optional bool wait = 3;
+   */
+  wait?: boolean;
+
+  constructor(data?: PartialMessage<StartChildSessionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StartChildSessionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "wait", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartChildSessionRequest {
+    return new StartChildSessionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StartChildSessionRequest {
+    return new StartChildSessionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StartChildSessionRequest {
+    return new StartChildSessionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StartChildSessionRequest | PlainMessage<StartChildSessionRequest> | undefined, b: StartChildSessionRequest | PlainMessage<StartChildSessionRequest> | undefined): boolean {
+    return proto3.util.equals(StartChildSessionRequest, a, b);
+  }
+}
+
+/**
+ * `Workload.ListChildren`.
+ *
+ * @generated from message legion.ListChildrenRequest
+ */
+export class ListChildrenRequest extends Message<ListChildrenRequest> {
+  constructor(data?: PartialMessage<ListChildrenRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListChildrenRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListChildrenRequest {
+    return new ListChildrenRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListChildrenRequest {
+    return new ListChildrenRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListChildrenRequest {
+    return new ListChildrenRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListChildrenRequest | PlainMessage<ListChildrenRequest> | undefined, b: ListChildrenRequest | PlainMessage<ListChildrenRequest> | undefined): boolean {
+    return proto3.util.equals(ListChildrenRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.ListChildrenReply
+ */
+export class ListChildrenReply extends Message<ListChildrenReply> {
+  /**
+   * The reference the caller's children carry: the caller's own unit.
+   *
+   * @generated from field: legion.OwnerRef owner = 1;
+   */
+  owner?: OwnerRef;
+
+  /**
+   * The caller's children on this node.
+   *
+   * @generated from field: repeated legion.ChildInfo children = 2;
+   */
+  children: ChildInfo[] = [];
+
+  /**
+   * The most children the caller may own at once (`children.max`); 0 when
+   * the caller's task declares no `children` block.
+   *
+   * @generated from field: uint32 max = 3;
+   */
+  max = 0;
+
+  constructor(data?: PartialMessage<ListChildrenReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListChildrenReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "owner", kind: "message", T: OwnerRef },
+    { no: 2, name: "children", kind: "message", T: ChildInfo, repeated: true },
+    { no: 3, name: "max", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListChildrenReply {
+    return new ListChildrenReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListChildrenReply {
+    return new ListChildrenReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListChildrenReply {
+    return new ListChildrenReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListChildrenReply | PlainMessage<ListChildrenReply> | undefined, b: ListChildrenReply | PlainMessage<ListChildrenReply> | undefined): boolean {
+    return proto3.util.equals(ListChildrenReply, a, b);
+  }
+}
+
+/**
+ * `Workload.StopChildSession`.
+ *
+ * @generated from message legion.StopChildSessionRequest
+ */
+export class StopChildSessionRequest extends Message<StopChildSessionRequest> {
+  /**
+   * The child's session id, as `StartChildSession` returned it.
+   *
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  constructor(data?: PartialMessage<StopChildSessionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StopChildSessionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopChildSessionRequest {
+    return new StopChildSessionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StopChildSessionRequest {
+    return new StopChildSessionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StopChildSessionRequest {
+    return new StopChildSessionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StopChildSessionRequest | PlainMessage<StopChildSessionRequest> | undefined, b: StopChildSessionRequest | PlainMessage<StopChildSessionRequest> | undefined): boolean {
+    return proto3.util.equals(StopChildSessionRequest, a, b);
+  }
+}
+
+/**
+ * @generated from message legion.StopChildSessionReply
+ */
+export class StopChildSessionReply extends Message<StopChildSessionReply> {
+  /**
+   * Whether the child was ended by this call (false when it had already
+   * ended and is remembered as `gone`).
+   *
+   * @generated from field: bool stopped = 1;
+   */
+  stopped = false;
+
+  constructor(data?: PartialMessage<StopChildSessionReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.StopChildSessionReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "stopped", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StopChildSessionReply {
+    return new StopChildSessionReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): StopChildSessionReply {
+    return new StopChildSessionReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): StopChildSessionReply {
+    return new StopChildSessionReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: StopChildSessionReply | PlainMessage<StopChildSessionReply> | undefined, b: StopChildSessionReply | PlainMessage<StopChildSessionReply> | undefined): boolean {
+    return proto3.util.equals(StopChildSessionReply, a, b);
   }
 }
 
@@ -31720,6 +32273,15 @@ export class GetSessionReply extends Message<GetSessionReply> {
    */
   nodeId = "";
 
+  /**
+   * The children this session owns on this node (docs/child-sessions.md):
+   * running and suspended ones, and the ones that ended in the last ten
+   * minutes with `state = "gone"` and why.
+   *
+   * @generated from field: repeated legion.ChildInfo children = 3;
+   */
+  children: ChildInfo[] = [];
+
   constructor(data?: PartialMessage<GetSessionReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -31730,6 +32292,7 @@ export class GetSessionReply extends Message<GetSessionReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "session", kind: "message", T: SessionStatus },
     { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "children", kind: "message", T: ChildInfo, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetSessionReply {
@@ -34882,6 +35445,16 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   taskService = "";
 
+  /**
+   * JSON `ChildrenConfig`: the task's `children` block (`tasks`, `max`,
+   * `suspendWithOwner`, `orphanAfter`; docs/child-sessions.md). Empty when
+   * the task declares none. The node reads it to admit a child started
+   * from inside the allocation, and to count against `max`.
+   *
+   * @generated from field: string task_children = 36;
+   */
+  taskChildren = "";
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -34925,6 +35498,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 33, name: "task_speculative_start", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 34, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 35, name: "task_service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 36, name: "task_children", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {
@@ -42746,6 +43320,42 @@ export class SessionStart extends Message<SessionStart> {
    */
   leaseIssuedAtUnixMs = protoInt64.zero;
 
+  /**
+   * The unit that owns the session as its child (docs/child-sessions.md).
+   * The node stores it with the session (`sessions.db`), reports it, ends
+   * the session when a `session` owner on the same node ends, and ends it
+   * on the managers' notice for every other owner.
+   *
+   * @generated from field: legion.OwnerRef owner = 2;
+   */
+  owner?: OwnerRef;
+
+  /**
+   * How many children the owner already has on other nodes, as the sending
+   * manager's session index counts them. The node adds the children it
+   * holds itself and refuses the start at the owner task's `children.max`.
+   *
+   * @generated from field: uint32 owner_children_elsewhere = 3;
+   */
+  ownerChildrenElsewhere = 0;
+
+  /**
+   * Set by the node, never read from a caller: the owner is a session
+   * that does not run on this node (the child was placed elsewhere, or the
+   * owner moved away), so the managers say when it ended.
+   *
+   * @generated from field: bool owner_remote = 4;
+   */
+  ownerRemote = false;
+
+  /**
+   * The owner task's `children.suspendWithOwner`, as whoever resolved the
+   * owner's task read it: the child suspends when its owner does.
+   *
+   * @generated from field: bool suspend_with_owner = 5;
+   */
+  suspendWithOwner = false;
+
   constructor(data?: PartialMessage<SessionStart>) {
     super();
     proto3.util.initPartial(data, this);
@@ -42755,6 +43365,10 @@ export class SessionStart extends Message<SessionStart> {
   static readonly typeName = "legion.SessionStart";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "lease_issued_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "owner", kind: "message", T: OwnerRef },
+    { no: 3, name: "owner_children_elsewhere", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "owner_remote", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "suspend_with_owner", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SessionStart {

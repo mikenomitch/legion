@@ -2,9 +2,36 @@
 
 > **Judgement calls:** [child-sessions-plan_calls.md](../calls/child-sessions-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-28; ownership generalized 2026-11-07 so
-that keyed instances and allocations can own children too, see calls entry
-1). Nothing here is built.
+**Status: IN EXECUTION** (written 2026-10-28; ownership generalized
+2026-11-07, see calls entry 1). **Phases 1 and 2 are built** (2026-11-10):
+the `children` block, the typed owner reference for all three owner kinds,
+session children started from outside (`CreateInstance.owner`, a ticket)
+and from inside any runtime over the API socket, the cascade for session
+owners on the node and for instance, allocation, and remote session owners
+through the managers' owner notices, promotion that carries ownership, the
+router's fallback to another node, and listing. Public doc:
+[docs/child-sessions.md](../../docs/child-sessions.md).
+
+Not built: Phase 3 (keyed children) and Phase 4 (connection handoff). The
+isolate host's start path (§6.3, first row) belongs to the isolate runtime.
+
+Where the build differs from the text below (each is a calls entry):
+
+- A session owner on another node is asked about by the managers, not by
+  the child's node (§6.4; calls entry 10).
+- Raft-owned owners are judged on every heartbeat and pushed on a
+  one-second stream tick, not from the owner's apply (§6.4; entry 11).
+- No `owner` / `root` identity claims and no tenant label: sessions have
+  neither identities nor labels (§6.6, §6.9; entry 13).
+- A child that moves nodes is detached (entry 14).
+- Through a manager a child is started with `legion instance create
+  --owner`, not `legion session start --owner` (§6.3; entry 15).
+- `child_gone` is a ten-minute record the owner lists, not an event
+  (§6.4; entry 16).
+- Promoting a child detaches it whatever its owner, until Phase 3 gives the
+  instance row an `owner` column (§6.5; entry 17). The Phase 1 refusal to
+  promote an owner with children was never shipped: Phase 2's carrying
+  landed with it.
 
 A **child** is a session or keyed instance of one task that another unit
 started and owns. It ends when its owner ends, is charged to its own task's

@@ -79,6 +79,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   code once in a fresh, single-use session of a task with a `run` block and
   returns stdout, stderr, the exit status, a JSON result, and named files;
   stopped runs as data, per-node idempotency, and who may run what.
+- [Child Sessions](child-sessions.md): a session another unit of the job
+  started and owns. Covers the `children` block, the typed owner reference,
+  starting a child with `--owner` or from inside a task with no credential,
+  when an owner's end ends its children, promotion, and the limits.
 - [Volumes](volumes.md): persistent storage for stateful tasks. Covers plugins,
   the driver contract, node pinning, and reclaim.
 - [Suspend and Resume](suspend-and-resume.md): suspending a keyed instance to

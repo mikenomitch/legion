@@ -359,6 +359,8 @@ Sessions also end when:
 
 - **The workload exits.** The node forgets it, and reports nothing as a
   failed allocation: it never had one.
+- **Its owner ends,** when it was started as a
+  [child](child-sessions.md).
 - **Its envelope leaves the node,** because the job stopped, the node was
   drained, or an update moved the envelope. The node ends the session 30
   seconds after its envelope goes, so a job update that replaces the
@@ -970,6 +972,7 @@ Sessions use the same surfaces as keyed instances: `legion_instance_create`
 (omit `instance_id`), `legion_instance_list`, `legion_instance_get`,
 `legion_instance_stop`, and `legion_instance_promote` over MCP, plus
 `legion_session_run` for [one-shot runs](session-runs.md),
+`owner` on `legion_instance_create` for [child sessions](child-sessions.md),
 `legion_session_nodes` for the edge node list and
 `legion_boot_ticket_create` with `scope = "session"`, and the
 `--json` envelope on the CLI. An agent should always pass an idempotency
@@ -984,6 +987,14 @@ A session task that declares a `run` block also takes **runs**: `legion
 session run` starts a fresh session, stages the caller's files, executes the
 task's command once, returns its output, and ends the session, in one call
 and with no raft write. See [Session Runs](session-runs.md).
+
+## Sessions that own sessions
+
+A session can be started as a **child** of another unit of its job
+(`legion instance create <job> --task <task> --owner <id>`): it ends when
+its owner ends, goes to its owner's node when that node has room, and is
+listed under its owner. Ending a session ends its children first. See
+[Child Sessions](child-sessions.md).
 
 ## Upgrades
 

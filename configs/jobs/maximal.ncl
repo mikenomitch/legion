@@ -106,6 +106,30 @@
             runtime = "exec",
             group = "frontend",
             lifecycle = "service",
+            # Child sessions (docs/child-sessions.md): each `web` allocation
+            # may own sessions of the `scratch` session task below. A child
+            # is started under its owner (`legion instance create
+            # maximal-demo --task scratch --owner <ALLOC ID>`, or `legion
+            # session start scratch --owner self` inside the task, over the
+            # API socket the `legion` identity below provides), ends when
+            # its owner is stopped or lost, is charged to scratch's own
+            # envelope, and is listed under its owner. Any task except a
+            # child task may declare this.
+            children = {
+                # Session (or keyed) tasks of this job this task's units may
+                # own. A session task may not name a keyed task.
+                tasks = ["scratch"],
+                # The most children one owner holds at once (default 1).
+                max = 2,
+                # Whether an owner's children suspend when it does (default
+                # false: each child follows its own task's idle policy).
+                suspendWithOwner = false,
+                # Session owners only: how long a child on another node
+                # outlives an owner nobody can reach (default "10m", at
+                # least "1m"). Read for nothing else; shown here for the
+                # full surface.
+                orphanAfter = "10m",
+            },
             # Cross-group dependency: service and batch tasks may depend on
             # tasks in any group. web is not planned until the prep group's
             # batch task has succeeded. (A service may only take a

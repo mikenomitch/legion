@@ -331,6 +331,7 @@ pub fn start_local_session(
 /// identity in the workload's environment (`LEGION_INSTANCE_ID`,
 /// `LEGION_INSTANCE_MODE=session`), the serve gate, and the lease it was
 /// first issued at (kept across a resume on another node).
+#[allow(clippy::too_many_arguments)]
 pub fn session_payload(
     spec: &crate::worker::task_manager::SessionSpec,
     job_id: &str,

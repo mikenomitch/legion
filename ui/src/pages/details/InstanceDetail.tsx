@@ -693,6 +693,38 @@ function Callouts(props: { instance: InstanceInfo; routeJob: string; provisional
           can be suspended, forked, and snapshotted.
         </Note>
       </Show>
+      <Show when={props.instance.owner}>
+        {(owner) => (
+          <Note tone="neutral">
+            <span class="font-medium">A child session.</span> It is owned by {owner().kind}{' '}
+            <Show when={owner().kind !== 'allocation'} fallback={<span class="font-mono text-xs">{owner().id}</span>}>
+              <A href={instanceHref(props.instance.jobId, owner().id)} class={cx(linkClass, 'font-mono text-xs')}>
+                {owner().id}
+              </A>
+            </Show>{' '}
+            and ends when its owner is stopped, destroyed, or lost. Suspending the owner does not end it.
+          </Note>
+        )}
+      </Show>
+      <Show when={props.instance.children.length > 0}>
+        <Note tone="neutral">
+          <span class="font-medium">Owns {props.instance.children.length} child session{props.instance.children.length === 1 ? '' : 's'}:</span>{' '}
+          <For each={props.instance.children}>
+            {(child, index) => (
+              <>
+                <Show when={index() > 0}>, </Show>
+                <A href={instanceHref(props.instance.jobId, child.sessionId)} class={cx(linkClass, 'font-mono text-xs')}>
+                  {child.sessionId}
+                </A>{' '}
+                <span class="text-xs">
+                  ({child.taskName} on {child.nodeId}, {child.state})
+                </span>
+              </>
+            )}
+          </For>
+          . They end when this unit does.
+        </Note>
+      </Show>
       <Show when={props.instance.promotedFrom}>
         {(origin) => (
           <Note tone="neutral">

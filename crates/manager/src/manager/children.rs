@@ -292,8 +292,25 @@ struct Watch {
     suspended: HashMap<String, Instant>,
 }
 
+/// How long a session owner must stay unfound before its children are
+/// ended, in milliseconds. A session that just moved, or just started under
+/// an id with no node tag, is in no manager's index until its node's next
+/// report; one "not found" is therefore not an end. Tests lower it.
+#[doc(hidden)]
+pub static NOT_FOUND_GRACE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(20_000);
+
+fn not_found_grace() -> Duration {
+    Duration::from_millis(NOT_FOUND_GRACE_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// How soon an owner that was not found is asked about again.
+const MISSING_RECHECK: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 struct RemoteOwner {
+    /// When the owner was first not found, while it stays so.
+    missing_since: Option<Instant>,
     /// When the owner was last asked about.
     asked: Instant,
     /// A probe is in flight.
@@ -352,10 +369,21 @@ fn probe_remote_owner(store: &Store, owner_id: String, job_id: String, child_tas
         };
         entry.asking = false;
         match located {
-            sessions::Located::Found(_) => entry.seen = Instant::now(),
-            // Its node answered, and every manager's index agrees: it ended.
-            sessions::Located::NotFound | sessions::Located::Evicted(_) => {
-                entry.ended = Some(format!("session {owner_id} ended"));
+            sessions::Located::Found(_) => {
+                entry.seen = Instant::now();
+                entry.missing_since = None;
+            }
+            // Evicted by its node: an end, on the node's own word.
+            sessions::Located::Evicted(_) => {
+                entry.ended = Some(format!("session {owner_id} was evicted"));
+            }
+            // No node and no manager has it. An end once that has held for
+            // the grace: a session that just moved is briefly in no index.
+            sessions::Located::NotFound => {
+                let since = *entry.missing_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= not_found_grace() {
+                    entry.ended = Some(format!("session {owner_id} ended"));
+                }
             }
             // Its node does not answer: an end only after `orphanAfter`.
             sessions::Located::Unreachable(_) => {
@@ -482,7 +510,12 @@ pub fn owner_notices(store: &Store, node_id: &str) -> Vec<OwnerNotice> {
                         });
                         false
                     } else if !entry.asking
-                        && now.duration_since(entry.asked) >= children::ORPHAN_CHECK_EVERY
+                        && now.duration_since(entry.asked)
+                            >= if entry.missing_since.is_some() {
+                                MISSING_RECHECK.min(not_found_grace())
+                            } else {
+                                children::ORPHAN_CHECK_EVERY
+                            }
                     {
                         entry.asked = now;
                         entry.asking = true;
@@ -495,6 +528,7 @@ pub fn owner_notices(store: &Store, node_id: &str) -> Vec<OwnerNotice> {
                     watch.remote.insert(
                         id.clone(),
                         RemoteOwner {
+                            missing_since: None,
                             asked: now,
                             asking: true,
                             seen: now,

@@ -468,7 +468,8 @@ start:
   [Running Agent Sandboxes](docs/guides/agent-sandboxes.md) ·
   [Sandboxes at Scale](docs/sandboxes-at-scale.md) ·
   [Session Mode](docs/session-mode.md) ·
-  [Session Runs](docs/session-runs.md) · [Edge Boot](docs/edge-boot.md) ·
+  [Session Runs](docs/session-runs.md) ·
+  [Child Sessions](docs/child-sessions.md) · [Edge Boot](docs/edge-boot.md) ·
   [Suspend and Resume](docs/suspend-and-resume.md) · [Park](docs/park.md) ·
   [Gateway: Wake on Request](docs/gateway.md)
 - **Guides:** [Running Postgres](docs/guides/postgres.md) ·
