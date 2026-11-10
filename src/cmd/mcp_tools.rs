@@ -26,6 +26,17 @@ pub(super) const EXCLUDED: &[(&str, &str)] = &[
          could not use (legion_acl_token_create_child hands a sub-agent a credential instead)",
     ),
     (
+        "SetRuntimeEnabled",
+        "the incident switch for a task runtime is an operator's decision \
+         (`legion operator runtime disable`), deliberately not offered to agents \
+         (docs/runtime-disable.md)",
+    ),
+    (
+        "ListRuntimeStates",
+        "read by `legion operator runtime status`; an agent sees a disable in the refusal or \
+         the blocked eval it causes, and has no way to act on the listing",
+    ),
+    (
         "WatchScalingPolicies",
         "a long-lived watch stream the autoscaler app consumes; legion_scaling_status and \
          legion_scaling_inputs answer the same questions as bounded reads",

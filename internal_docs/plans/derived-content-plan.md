@@ -2,7 +2,30 @@
 
 > **Judgement calls:** [derived-content-plan_calls.md](../calls/derived-content-plan_calls.md)
 
-**Status: PLANNED** (written 2026-11-07). Nothing here is built.
+**Status: SHIPPED** (Phase 1, 2026-11-10; written 2026-11-07). Public page:
+[docs/artifacts.md, "Derived content"](../../docs/artifacts.md#derived-content).
+
+- **Built:** the `derived` class of the node content store (index table,
+  `content.budgets.derived`, one LRU across kinds, pins, TTL, GC, and
+  `minFreeDisk` evicting derived content first), recipes and `ensure` with
+  single-flight and temp-then-rename commits, root disk bases moved onto it,
+  `LEGION_SANDBOX_ROOTFS_CACHE` removed and the old `rootfs-cache/` directory
+  deleted at first start, the metrics, and derived entries in
+  `GetNodeContent`, `legion node content`, and the worker page.
+- **Not built, and not this plan's to build alone:** Phase 2 (`cwasm`,
+  `preinit-image`, `preinit-entry`, and the confined builder process) ships
+  with the [isolate runtime](isolate-runtime-plan.md), which does not exist;
+  Phase 3 (`vm-base`) ships with prepared VMs
+  ([sandbox-scaling-plan.md](sandbox-scaling-plan.md) Phase 8), which do not
+  exist either. The kinds and the `confined` flag are defined, and a
+  confined recipe is refused by the in-process builder until Phase 2 brings
+  one (calls entry 9).
+- **Where the build differs from the text below:** the root disk tests took
+  five mechanical line edits rather than none (calls entry 12); the cache
+  needs the content store to be enabled (calls entry 7); §6.5's "existing
+  content-store gauges" did not exist, so the class exports
+  `legion_derived_bytes` (calls entry 14); and `GetNodeContent` gets the
+  listing from the node's heartbeat report (calls entry 10).
 
 Workers increasingly *build* things from content they already hold: a
 sandbox's base root disk from an image's layers, and soon a compiled Wasm

@@ -1915,8 +1915,10 @@ service Manager {
   // it, and says so with `index_reported = false`. Only entries of at least
   // 1 MiB are advertised, so small artifacts never appear.
   //
-  // The content store's byte budgets and per-class totals are not part of
-  // this reply: the index carries digests, not classes.
+  // The byte budgets and totals of the `artifacts` and `snapshots` classes
+  // are not part of this reply: the index carries digests, not classes. The
+  // `derived` class is reported whole in `derived`, because its entries are
+  // never advertised by digest.
   //
   // ACL: node:read, scoped to the node's pool (checked unscoped before the
   // lookup, so a caller with no node access cannot probe which nodes exist).
@@ -10228,6 +10230,103 @@ message ContentLocationReport {
   // checkpoint headroom and keep new memory-checkpoint instances off a node
   // with no room for their checkpoint (see `SnapshotBudget`).
   optional SnapshotBudget snapshot_budget = 6;
+
+  // The node's derived content: what Legion built on it from verified
+  // inputs and can build again (see `DerivedContentReport`). Present on
+  // every full report from a node with a content store, and on a delta only
+  // when the node's derived set, a size in it, or a pin on it changed since
+  // the last report this manager acknowledged. Absent on a delta means
+  // "unchanged": the manager keeps what it holds. Absent on a full report
+  // means the node has no content store, and the manager drops what it held.
+  //
+  // This is a listing for operators, never a location: derived entries are
+  // not in `added`, the scheduler does not score on them, and no node
+  // fetches one from another.
+  optional DerivedContentReport derived = 7;
+}
+
+// The `derived` class of one node's content store, as the node reports it
+// (docs/artifacts.md, "Derived content"). Derived content is everything
+// Legion builds on a node from content the node already verified: today the
+// base root disk of each sandbox image. An entry is expensive to build, the
+// same for every unit of its inputs on the node, and safe to discard, so
+// the class has one byte budget (`content.budgets.derived`) and one
+// least-recently-used order across every kind.
+//
+// Derived content is built on its node and stays there. No RPC puts an
+// entry, reads one off a node, or publishes one.
+message DerivedContentReport {
+  // The class budget in bytes, as sized when the worker opened its store:
+  // `content.budgets.derived`, default 10% of the content filesystem
+  // clamped to 1 GiB..20 GiB. 0 means the class is off on this node, and
+  // every consumer builds what it needs on each start.
+  uint64 budget_bytes = 1;
+
+  // Bytes of disk the class holds, counted in allocated blocks, so a sparse
+  // root disk image counts what it costs and not its apparent size.
+  uint64 used_bytes = 2;
+
+  // The part of `used_bytes` held by pinned entries, which are never
+  // evicted or expired while pinned.
+  uint64 pinned_bytes = 3;
+
+  // The entries, most recently used first. At most 256 are sent; see
+  // `entry_count` for how many the node holds.
+  repeated DerivedContentEntry entries = 4;
+
+  // How many derived entries the node holds. Larger than `entries` only
+  // when the node holds more than 256.
+  uint64 entry_count = 5;
+}
+
+// One derived entry on one node.
+message DerivedContentEntry {
+  // What the entry is: `rootfs` (a sandbox image's base root disk), `cwasm`
+  // (a compiled WebAssembly module), `preinit-image`, `preinit-entry`
+  // (pre-initialized language images and task entries), or `vm-base` (a
+  // base memory snapshot of a booted VM). Only `rootfs` is built today.
+  string kind = 1;
+
+  // The entry's recipe key: 64 lowercase hex characters, the SHA-256 of the
+  // kind, every input, and the builder version. Two entries with the same
+  // kind and key hold the same bytes on any node, but a key is an identity
+  // within a node, not a fetchable address.
+  string key = 2;
+
+  // Bytes of disk the entry uses (allocated blocks).
+  uint64 bytes = 3;
+
+  // What the entry was built from, by input name. Every value is a content
+  // digest (`sha256:<hex>`), a decimal number, or the SHA-256 fingerprint of
+  // an input that is not content (written `sha256:<hex>` too). A recipe
+  // never holds raw text, so nothing here can be a secret or anything of
+  // one allocation. For `rootfs`: `layer.0000`, `layer.0001`, ... (the
+  // image's layer digests, bottom first), `guestBinary` (a fingerprint of
+  // the guest agent binary's identity), and `headroomMib`.
+  map<string, string> inputs = 4;
+
+  // The version of the code that built it. For an in-tree builder this is
+  // the Legion version and the builder's format (`legion-0.1.0+rootfs.1`);
+  // for a compiler, the engine's version. It is part of the key, so a new
+  // builder never reuses an old builder's entry.
+  string builder_version = 5;
+
+  // True when the entry was built by a confined builder process, which is
+  // required for builds that parse or execute untrusted input. Root disks
+  // are built in the worker, so this is false for `rootfs`.
+  bool confined = 6;
+
+  // When the entry was committed, in Unix seconds.
+  int64 created_at = 7;
+
+  // When the entry was last used (cloned for a start, or found by a
+  // prefetch), in Unix seconds. Eviction takes the least recently used
+  // unpinned entry first, and an unpinned entry unused for `content.ttl`
+  // (default 72h) is removed.
+  int64 last_used_at = 8;
+
+  // True while at least one owner pins the entry.
+  bool pinned = 9;
 }
 
 // Content locality. One piece of content a node holds.
@@ -11559,6 +11658,16 @@ message GetNodeContentReply {
   // (fetched for a restore or a fork, or warmed by WarmSnapshot). Rows on
   // jobs the caller has no `snapshot:read` on are left out.
   repeated NodeSnapshotContent snapshots = 8;
+
+  // The node's derived content as it last reported it: what Legion built on
+  // the node and can build again (sandbox base root disks), with the class
+  // budget and totals. Derived entries are never in `entries` and never
+  // count toward `advertised_bytes`, because no node fetches one.
+  //
+  // Absent when `index_reported` is false, when the node's worker has no
+  // content store, or when it predates derived content. A present report
+  // with `budget_bytes` 0 means the class is turned off on that node.
+  optional DerivedContentReport derived = 9;
 }
 
 // One piece of content a node advertises.

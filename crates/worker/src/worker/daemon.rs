@@ -2740,10 +2740,15 @@ pub async fn heartbeat_tick(
             let store = task_manager.lock().expect("task manager").content_store();
             match crate::worker::content_report::advertised_set(store.as_deref()) {
                 Ok(current) => {
-                    let mut pending = CONTENT_ADVERTISER
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .prepare(current);
+                    let mut pending = {
+                        let advertiser =
+                            CONTENT_ADVERTISER.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut pending = advertiser.prepare(current);
+                        // What the node built and holds as derived content,
+                        // sent only when it changed.
+                        advertiser.attach_derived(&mut pending, store.as_deref());
+                        pending
+                    };
                     // Checkpoint headroom rides every report: the
                     // manager shows it and keeps new memory-checkpoint
                     // instances off a node whose budget is full.

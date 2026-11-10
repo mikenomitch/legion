@@ -19459,6 +19459,23 @@ export class ContentLocationReport extends Message<ContentLocationReport> {
    */
   snapshotBudget?: SnapshotBudget;
 
+  /**
+   * The node's derived content: what Legion built on it from verified
+   * inputs and can build again (see `DerivedContentReport`). Present on
+   * every full report from a node with a content store, and on a delta only
+   * when the node's derived set, a size in it, or a pin on it changed since
+   * the last report this manager acknowledged. Absent on a delta means
+   * "unchanged": the manager keeps what it holds. Absent on a full report
+   * means the node has no content store, and the manager drops what it held.
+   *
+   * This is a listing for operators, never a location: derived entries are
+   * not in `added`, the scheduler does not score on them, and no node
+   * fetches one from another.
+   *
+   * @generated from field: optional legion.DerivedContentReport derived = 7;
+   */
+  derived?: DerivedContentReport;
+
   constructor(data?: PartialMessage<ContentLocationReport>) {
     super();
     proto3.util.initPartial(data, this);
@@ -19473,6 +19490,7 @@ export class ContentLocationReport extends Message<ContentLocationReport> {
     { no: 4, name: "added", kind: "message", T: ContentLocation, repeated: true },
     { no: 5, name: "removed", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 6, name: "snapshot_budget", kind: "message", T: SnapshotBudget, opt: true },
+    { no: 7, name: "derived", kind: "message", T: DerivedContentReport, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ContentLocationReport {
@@ -19489,6 +19507,220 @@ export class ContentLocationReport extends Message<ContentLocationReport> {
 
   static equals(a: ContentLocationReport | PlainMessage<ContentLocationReport> | undefined, b: ContentLocationReport | PlainMessage<ContentLocationReport> | undefined): boolean {
     return proto3.util.equals(ContentLocationReport, a, b);
+  }
+}
+
+/**
+ * The `derived` class of one node's content store, as the node reports it
+ * (docs/artifacts.md, "Derived content"). Derived content is everything
+ * Legion builds on a node from content the node already verified: today the
+ * base root disk of each sandbox image. An entry is expensive to build, the
+ * same for every unit of its inputs on the node, and safe to discard, so
+ * the class has one byte budget (`content.budgets.derived`) and one
+ * least-recently-used order across every kind.
+ *
+ * Derived content is built on its node and stays there. No RPC puts an
+ * entry, reads one off a node, or publishes one.
+ *
+ * @generated from message legion.DerivedContentReport
+ */
+export class DerivedContentReport extends Message<DerivedContentReport> {
+  /**
+   * The class budget in bytes, as sized when the worker opened its store:
+   * `content.budgets.derived`, default 10% of the content filesystem
+   * clamped to 1 GiB..20 GiB. 0 means the class is off on this node, and
+   * every consumer builds what it needs on each start.
+   *
+   * @generated from field: uint64 budget_bytes = 1;
+   */
+  budgetBytes = protoInt64.zero;
+
+  /**
+   * Bytes of disk the class holds, counted in allocated blocks, so a sparse
+   * root disk image counts what it costs and not its apparent size.
+   *
+   * @generated from field: uint64 used_bytes = 2;
+   */
+  usedBytes = protoInt64.zero;
+
+  /**
+   * The part of `used_bytes` held by pinned entries, which are never
+   * evicted or expired while pinned.
+   *
+   * @generated from field: uint64 pinned_bytes = 3;
+   */
+  pinnedBytes = protoInt64.zero;
+
+  /**
+   * The entries, most recently used first. At most 256 are sent; see
+   * `entry_count` for how many the node holds.
+   *
+   * @generated from field: repeated legion.DerivedContentEntry entries = 4;
+   */
+  entries: DerivedContentEntry[] = [];
+
+  /**
+   * How many derived entries the node holds. Larger than `entries` only
+   * when the node holds more than 256.
+   *
+   * @generated from field: uint64 entry_count = 5;
+   */
+  entryCount = protoInt64.zero;
+
+  constructor(data?: PartialMessage<DerivedContentReport>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DerivedContentReport";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "budget_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "used_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "pinned_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "entries", kind: "message", T: DerivedContentEntry, repeated: true },
+    { no: 5, name: "entry_count", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DerivedContentReport {
+    return new DerivedContentReport().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DerivedContentReport {
+    return new DerivedContentReport().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DerivedContentReport {
+    return new DerivedContentReport().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DerivedContentReport | PlainMessage<DerivedContentReport> | undefined, b: DerivedContentReport | PlainMessage<DerivedContentReport> | undefined): boolean {
+    return proto3.util.equals(DerivedContentReport, a, b);
+  }
+}
+
+/**
+ * One derived entry on one node.
+ *
+ * @generated from message legion.DerivedContentEntry
+ */
+export class DerivedContentEntry extends Message<DerivedContentEntry> {
+  /**
+   * What the entry is: `rootfs` (a sandbox image's base root disk), `cwasm`
+   * (a compiled WebAssembly module), `preinit-image`, `preinit-entry`
+   * (pre-initialized language images and task entries), or `vm-base` (a
+   * base memory snapshot of a booted VM). Only `rootfs` is built today.
+   *
+   * @generated from field: string kind = 1;
+   */
+  kind = "";
+
+  /**
+   * The entry's recipe key: 64 lowercase hex characters, the SHA-256 of the
+   * kind, every input, and the builder version. Two entries with the same
+   * kind and key hold the same bytes on any node, but a key is an identity
+   * within a node, not a fetchable address.
+   *
+   * @generated from field: string key = 2;
+   */
+  key = "";
+
+  /**
+   * Bytes of disk the entry uses (allocated blocks).
+   *
+   * @generated from field: uint64 bytes = 3;
+   */
+  bytes = protoInt64.zero;
+
+  /**
+   * What the entry was built from, by input name. Every value is a content
+   * digest (`sha256:<hex>`), a decimal number, or the SHA-256 fingerprint of
+   * an input that is not content (written `sha256:<hex>` too). A recipe
+   * never holds raw text, so nothing here can be a secret or anything of
+   * one allocation. For `rootfs`: `layer.0000`, `layer.0001`, ... (the
+   * image's layer digests, bottom first), `guestBinary` (a fingerprint of
+   * the guest agent binary's identity), and `headroomMib`.
+   *
+   * @generated from field: map<string, string> inputs = 4;
+   */
+  inputs: { [key: string]: string } = {};
+
+  /**
+   * The version of the code that built it. For an in-tree builder this is
+   * the Legion version and the builder's format (`legion-0.1.0+rootfs.1`);
+   * for a compiler, the engine's version. It is part of the key, so a new
+   * builder never reuses an old builder's entry.
+   *
+   * @generated from field: string builder_version = 5;
+   */
+  builderVersion = "";
+
+  /**
+   * True when the entry was built by a confined builder process, which is
+   * required for builds that parse or execute untrusted input. Root disks
+   * are built in the worker, so this is false for `rootfs`.
+   *
+   * @generated from field: bool confined = 6;
+   */
+  confined = false;
+
+  /**
+   * When the entry was committed, in Unix seconds.
+   *
+   * @generated from field: int64 created_at = 7;
+   */
+  createdAt = protoInt64.zero;
+
+  /**
+   * When the entry was last used (cloned for a start, or found by a
+   * prefetch), in Unix seconds. Eviction takes the least recently used
+   * unpinned entry first, and an unpinned entry unused for `content.ttl`
+   * (default 72h) is removed.
+   *
+   * @generated from field: int64 last_used_at = 8;
+   */
+  lastUsedAt = protoInt64.zero;
+
+  /**
+   * True while at least one owner pins the entry.
+   *
+   * @generated from field: bool pinned = 9;
+   */
+  pinned = false;
+
+  constructor(data?: PartialMessage<DerivedContentEntry>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DerivedContentEntry";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "inputs", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 5, name: "builder_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "confined", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "created_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 8, name: "last_used_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 9, name: "pinned", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DerivedContentEntry {
+    return new DerivedContentEntry().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DerivedContentEntry {
+    return new DerivedContentEntry().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DerivedContentEntry {
+    return new DerivedContentEntry().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DerivedContentEntry | PlainMessage<DerivedContentEntry> | undefined, b: DerivedContentEntry | PlainMessage<DerivedContentEntry> | undefined): boolean {
+    return proto3.util.equals(DerivedContentEntry, a, b);
   }
 }
 
@@ -22788,6 +23020,20 @@ export class GetNodeContentReply extends Message<GetNodeContentReply> {
    */
   snapshots: NodeSnapshotContent[] = [];
 
+  /**
+   * The node's derived content as it last reported it: what Legion built on
+   * the node and can build again (sandbox base root disks), with the class
+   * budget and totals. Derived entries are never in `entries` and never
+   * count toward `advertised_bytes`, because no node fetches one.
+   *
+   * Absent when `index_reported` is false, when the node's worker has no
+   * content store, or when it predates derived content. A present report
+   * with `budget_bytes` 0 means the class is turned off on that node.
+   *
+   * @generated from field: optional legion.DerivedContentReport derived = 9;
+   */
+  derived?: DerivedContentReport;
+
   constructor(data?: PartialMessage<GetNodeContentReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -22804,6 +23050,7 @@ export class GetNodeContentReply extends Message<GetNodeContentReply> {
     { no: 6, name: "can_publish", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 7, name: "can_checkpoint", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 8, name: "snapshots", kind: "message", T: NodeSnapshotContent, repeated: true },
+    { no: 9, name: "derived", kind: "message", T: DerivedContentReport, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNodeContentReply {

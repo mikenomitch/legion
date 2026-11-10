@@ -312,30 +312,48 @@ How it behaves:
   being built wait for that build and then copy it, instead of each
   extracting and formatting the same image at the same time.
 - **A base is shared only when nothing in it differs.** A base is keyed by
-  the image's layer digests, the guest binary, and the task's
-  `rootfs_headroom_mib`. A new guest binary, or a task with different
-  headroom, gets its own base.
+  the image's layer digests, the guest binary, the task's
+  `rootfs_headroom_mib`, and the Legion version that built it. A new guest
+  binary, a task with different headroom, or a new Legion release gets its
+  own base.
 - **Nothing per sandbox is in a base.** Env (which can hold secrets),
   hostname, instance id, and the generated init are written into each
   sandbox's own copy, after it is made. A base is read-only, and a copy
   shares nothing with it that a write can reach.
-- **It is bounded.** The cache keeps at most its budget, counting the blocks
-  each base actually uses, and evicts the least recently used base first. A
-  base larger than the whole budget is never kept, and none is kept while the
-  disk is below the content store's `minFreeDisk`. Evicting a base never
-  touches a running sandbox, whose disk is its own copy.
+- **It is bounded.** Bases are [derived content](artifacts.md#derived-content)
+  in the node content store, and share that class's budget. The class keeps
+  at most its budget, counting the blocks each base actually uses, and evicts
+  the least recently used entry first. A base larger than the whole budget is
+  never kept, and none is kept while the disk is below the content store's
+  `minFreeDisk`. Evicting a base never touches a running sandbox, whose disk
+  is its own copy.
 
-The budget is set per worker with `LEGION_SANDBOX_ROOTFS_CACHE`:
+The budget is `content.budgets.derived` in the worker type's `content` block:
+
+```nickel
+content = {
+  budgets = { derived = "40GiB" },
+},
+```
 
 | Value | Meaning |
 | --- | --- |
-| unset (default) | 10% of the filesystem holding the worker's state dir, clamped to 1 GiB to 20 GiB |
-| a size, such as `40GiB` | that many bytes |
-| a share, such as `15%` | that share of the filesystem |
-| `off` or `0` | no cache: every start builds its disk |
+| unset (default) | 10% of the filesystem holding the content store, clamped to 1 GiB to 20 GiB |
+| a size, such as `"40GiB"` | that many bytes |
+| a share, such as `"15%"` | that share of the filesystem |
+| `"0"` or `"off"` | no cache: every start builds its disk |
 
-The cache lives at `<worker state dir>/rootfs-cache/`, beside the allocation
-dirs, so a copy can be a reflink. Put the data dir on XFS (`reflink=1`, the
+A worker with `content.enabled = false` has no cache either.
+
+The `LEGION_SANDBOX_ROOTFS_CACHE` environment variable that used to set this
+budget is gone, and a worker that still has it set ignores it. A worker's
+first start also deletes the directory the cache used to live in
+(`<worker state dir>/rootfs-cache/`), so each image's base is built once more
+on its first start after the change.
+
+The bases live at `<worker state dir>/content/derived/rootfs/`, on the same
+filesystem as the allocation dirs, so a copy can be a reflink. `legion node
+content <node>` lists them. Put the data dir on XFS (`reflink=1`, the
 default since xfsprogs 5.1) or btrfs to get near-instant copies. On ext4 the
 copy is a byte copy of the blocks the base uses: still much cheaper than a
 build, but it scales with the image. The worker logs where each disk came

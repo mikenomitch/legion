@@ -827,8 +827,9 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion node content <ID>",
             grpc: Some("Manager/GetNodeContent"),
             summary: "Show what a node holds for content locality: the content it advertises to \
-                 the manager's location index, which snapshot each entry belongs to, and its \
-                 snapshots with how many of their parts it holds.",
+                 the manager's location index, which snapshot each entry belongs to, its \
+                 snapshots with how many of their parts it holds, and its derived content \
+                 (what Legion built there and can rebuild, such as sandbox base root disks).",
             mutates: false,
             read_only_safe: true,
         },

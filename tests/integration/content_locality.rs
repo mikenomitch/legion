@@ -132,6 +132,7 @@ async fn a_delta_the_manager_cannot_place_asks_for_a_full_report() -> R<()> {
                 }],
                 removed: Vec::new(),
                 snapshot_budget: None,
+                derived: None,
             }),
             ..Default::default()
         }))

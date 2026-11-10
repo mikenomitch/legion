@@ -11,7 +11,8 @@ import { jobPath } from '../utils/namespaces'
  * The worker page's "Content and locality" card, from GetNodeContent: what
  * the node advertises to the manager's location index, which snapshot each
  * entry belongs to, and the snapshots captured here or fetched here with how
- * many of their parts the node holds (suspend/resume UI plan §6.7).
+ * many of their parts the node holds (suspend/resume UI plan §6.7), and the
+ * node's derived content (what Legion built there and can rebuild).
  *
  * The index is soft state on the manager that receives the node's
  * heartbeats, so an empty card says why rather than reading as "empty".
@@ -178,7 +179,78 @@ export function NodeContentCard(props: { content: GetNodeContentReply; budgets?:
         </TableShell>
       </Show>
 
-      <Show when={props.content.snapshots.length === 0 && props.content.entries.length === 0}>
+      <Show when={props.content.derived}>
+        {(derived) => {
+          const percent = () => percentOf(Number(derived().usedBytes), Number(derived().budgetBytes))
+          return (
+            <div class="border-t border-line">
+              <div class="px-4 py-3">
+                <div class="mb-0.5 flex justify-between text-xs text-muted">
+                  <span title="What Legion built on this node from verified inputs and can build again, such as sandbox base root disks. Never fetched from or published to another node.">
+                    Derived content
+                  </span>
+                  <Show when={Number(derived().budgetBytes) > 0} fallback={<span class="text-faint">off on this node (content.budgets.derived = "0")</span>}>
+                    <span class="font-mono text-2xs tabular-nums">
+                      {String(derived().entryCount)} {Number(derived().entryCount) === 1 ? 'entry' : 'entries'} · {formatBytes(Number(derived().usedBytes))} of{' '}
+                      {formatBytes(Number(derived().budgetBytes))} · {percent()}%
+                    </span>
+                  </Show>
+                </div>
+                <Show when={Number(derived().budgetBytes) > 0}>
+                  <Meter percent={percent()} tone={fillTone(percent())} label="derived budget" />
+                </Show>
+              </div>
+              <Show when={derived().entries.length > 0}>
+                <TableShell class="border-t border-line">
+                  <table class={tableClass}>
+                    <thead class={theadClass}>
+                      <tr>
+                        <th class={thClass}>Kind</th>
+                        <th class={thClass} title="The recipe key: a hash of what the entry was built from and the builder's version">
+                          Key
+                        </th>
+                        <th class={thClass}>Built by</th>
+                        <th class={thClass + ' text-right'}>Size</th>
+                        <th class={thClass + ' text-right'}>Last used</th>
+                      </tr>
+                    </thead>
+                    <tbody class="divide-y divide-line">
+                      <For each={derived().entries}>
+                        {(entry) => (
+                          <tr class={trHoverClass}>
+                            <td class={tdClass}>
+                              <Badge tone="neutral">{entry.kind}</Badge>
+                              <Show when={entry.pinned}>
+                                <Badge tone="accent" class="ml-1.5" title="Pinned: never evicted or expired while an owner holds it">
+                                  pinned
+                                </Badge>
+                              </Show>
+                            </td>
+                            <td class={tdClass}>
+                              <MonoBadge
+                                title={[entry.key, ...Object.entries(entry.inputs).sort().map(([name, value]) => `${name} = ${value}`)].join('\n')}
+                              >
+                                {entry.key.slice(0, 12)}…
+                              </MonoBadge>
+                            </td>
+                            <td class={tdClass + ' font-mono text-2xs text-muted'}>{entry.builderVersion}</td>
+                            <td class={tdClass + ' text-right font-mono text-xs tabular-nums text-muted'}>{formatBytes(Number(entry.bytes))}</td>
+                            <td class={tdClass + ' text-right font-mono text-xs tabular-nums text-muted'}>
+                              {Number(entry.lastUsedAt) > 0 ? new Date(Number(entry.lastUsedAt) * 1000).toLocaleString() : '-'}
+                            </td>
+                          </tr>
+                        )}
+                      </For>
+                    </tbody>
+                  </table>
+                </TableShell>
+              </Show>
+            </div>
+          )
+        }}
+      </Show>
+
+      <Show when={props.content.snapshots.length === 0 && props.content.entries.length === 0 && !props.content.derived}>
         <p class="px-4 py-3 text-sm text-muted">No snapshots or advertised content on this node.</p>
       </Show>
     </SectionCard>

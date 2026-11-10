@@ -7273,6 +7273,7 @@ mod tests {
                 added,
                 removed: Vec::new(),
                 snapshot_budget: None,
+                derived: None,
             };
             let now = std::time::Instant::now();
             assert_eq!(

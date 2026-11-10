@@ -673,6 +673,55 @@ fn render_node_content(reply: &GetNodeContentReply) -> String {
         out.push('\n');
     }
 
+    // Derived content: what Legion built on the node and can build again.
+    #[derive(Tabled)]
+    struct DerivedRow {
+        #[tabled(rename = "KIND")]
+        kind: String,
+        #[tabled(rename = "KEY")]
+        key: String,
+        #[tabled(rename = "MiB")]
+        mib: String,
+        #[tabled(rename = "BUILDER")]
+        builder: String,
+        #[tabled(rename = "PINNED")]
+        pinned: &'static str,
+    }
+    if let Some(derived) = reply.derived.as_ref() {
+        out.push('\n');
+        if derived.budget_bytes == 0 {
+            out.push_str("Derived content: off on this node (content.budgets.derived = \"0\")\n");
+        } else {
+            out.push_str(&format!(
+                "Derived content: {} entries, {} of {} MiB\n",
+                derived.entry_count,
+                usage_display::mib(derived.used_bytes),
+                usage_display::mib(derived.budget_bytes),
+            ));
+        }
+        if !derived.entries.is_empty() {
+            let rows: Vec<DerivedRow> = derived
+                .entries
+                .iter()
+                .map(|entry| DerivedRow {
+                    kind: entry.kind.clone(),
+                    key: entry.key.chars().take(12).collect(),
+                    mib: usage_display::mib(entry.bytes),
+                    builder: entry.builder_version.clone(),
+                    pinned: if entry.pinned { "yes" } else { "no" },
+                })
+                .collect();
+            out.push_str(&Table::new(rows).with(Style::blank()).to_string());
+            out.push('\n');
+        }
+        if derived.entry_count > derived.entries.len() as u64 {
+            out.push_str(&format!(
+                "({} more not listed)\n",
+                derived.entry_count - derived.entries.len() as u64
+            ));
+        }
+    }
+
     #[derive(Tabled)]
     struct SnapshotRow {
         #[tabled(rename = "SNAPSHOT")]
@@ -1408,8 +1457,30 @@ mod tests {
                 parts_total: 2,
                 bytes_here: 512 * 1024 * 1024,
             }],
+            derived: Some(crate::structs::DerivedContentReport {
+                budget_bytes: 20 * 1024 * 1024 * 1024,
+                used_bytes: 900 * 1024 * 1024,
+                pinned_bytes: 0,
+                entry_count: 3,
+                entries: vec![crate::structs::DerivedContentEntry {
+                    kind: "rootfs".into(),
+                    key: "0123456789abcdef".repeat(4),
+                    bytes: 900 * 1024 * 1024,
+                    builder_version: "legion-0.1.0+rootfs.1".into(),
+                    ..Default::default()
+                }],
+            }),
         };
         let out = render_node_content(&reply);
+        assert!(
+            out.contains("Derived content: 3 entries, 900 of 20480 MiB"),
+            "{out}"
+        );
+        assert!(
+            out.contains("rootfs") && out.contains("0123456789ab "),
+            "{out}"
+        );
+        assert!(out.contains("(2 more not listed)"), "{out}");
         assert!(
             out.contains("Advertises 1 entries, 512 MiB (epoch 3)"),
             "{out}"
@@ -1422,6 +1493,13 @@ mod tests {
             ..Default::default()
         });
         assert!(empty.contains("No content report"), "{empty}");
+        assert!(!empty.contains("Derived content"), "{empty}");
+        let off = render_node_content(&GetNodeContentReply {
+            index_reported: true,
+            derived: Some(Default::default()),
+            ..Default::default()
+        });
+        assert!(off.contains("Derived content: off on this node"), "{off}");
         assert!(empty.contains("No snapshots on this node."), "{empty}");
     }
 

@@ -2448,8 +2448,10 @@ export const Manager = {
      * it, and says so with `index_reported = false`. Only entries of at least
      * 1 MiB are advertised, so small artifacts never appear.
      *
-     * The content store's byte budgets and per-class totals are not part of
-     * this reply: the index carries digests, not classes.
+     * The byte budgets and totals of the `artifacts` and `snapshots` classes
+     * are not part of this reply: the index carries digests, not classes. The
+     * `derived` class is reported whole in `derived`, because its entries are
+     * never advertised by digest.
      *
      * ACL: node:read, scoped to the node's pool (checked unscoped before the
      * lookup, so a caller with no node access cannot probe which nodes exist).

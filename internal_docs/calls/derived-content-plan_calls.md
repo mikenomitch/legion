@@ -113,3 +113,162 @@ node rebuilds its bases once.
 **Why (simplicity).** Legion has no installed base to protect, and an alias
 named for root disks that sizes compiled modules too would mislead. The PR
 says what broke.
+
+---
+
+*Entries 7 to 14 were made while building Phase 1 (2026-11-10). Each ranks
+below the design calls above, so none of those was renumbered.*
+
+## 7. No content store, no root disk cache
+
+**Call.** The root disk cache now exists only on a worker with a node content
+store. `content.enabled = false`, or a store that cannot open, turns it off,
+and the worker says so at start:
+
+```text
+Sandbox root disk cache off (this node has no content store)
+```
+
+**Alternatives.** (a) Open a private derived-only store when the content
+store is disabled, so root disks stay cached as they were. (b) Keep the old
+standalone cache as a fallback.
+
+**Trade-off.** An operator who disabled the content store to stop artifact
+caching now also pays a root disk build on every sandbox start. Before this,
+the two were independent.
+
+**Why (simplicity).** The plan's point is one place and one budget for
+rebuildable content. (a) and (b) both keep a second cache with its own
+directory and eviction for a configuration that asks for no caching. The
+public page states the dependency under Limitations.
+
+## 8. The builder version is the Legion version plus the builder's format
+
+**Call.** A root disk base's recipe is built by
+`legion-<crate version>+rootfs.<format>`. The plan says "Legion's version for
+in-tree builders"; the format number the old cache keyed on is kept beside
+it.
+
+**Alternatives.** (a) The format number alone, as before: a release that does
+not change the base layout reuses every base. (b) The crate version alone.
+
+**Trade-off.** Every release rebuilds each image's base once per node, even
+when nothing about bases changed.
+
+**Why (simplicity, safety).** A release changes the guest binary anyway, and
+the guest binary is already an input, so (a) saves little in practice. The
+version makes "a new builder never reuses an old builder's output" true
+without anyone remembering to bump a constant. (b) loses the bump for
+development builds, which all share one crate version.
+
+## 9. A confined recipe is refused in-process, and Phase 1 ships no confined builder
+
+**Call.** `Recipe::confined()` marks a build that parses or executes
+untrusted input. `ContentStore::ensure_derived`, which builds in the worker
+process, refuses such a recipe. A confined builder commits its output with
+the staged form (`derived_stage` and `derived_commit`), and the entry records
+`confined = true`.
+
+```text
+derived content of kind cwasm is built from untrusted input and needs a confined builder; it cannot be built in the worker process
+```
+
+**Alternatives.** (a) Build the confined builder process now, with nothing to
+run in it. (b) Leave `confined` out until Phase 2.
+
+**Trade-off.** Until the isolate runtime brings its compiler, a `cwasm` or
+`preinit-*` recipe cannot be built at all.
+
+**Why (security).** The builder is the isolate plan's `legion-isolate
+compile` role, and its seccomp profile and limits depend on what it runs; (a)
+would be a sandbox designed around no workload. (b) would let the first
+consumer build in-process by default. Failing closed means the unsafe path
+does not exist to be taken by accident.
+
+## 10. The derived listing rides the content report, whole, only when it changed
+
+**Call.** `GetNodeContent` lists derived entries from what the node sent on
+its heartbeat: `ContentLocationReport.derived`, the whole listing (at most
+256 entries, most recently used first), present on a full report and on a
+delta only when the derived set, a size, or a pin changed.
+
+**Alternatives.** (a) The manager asks the worker over the worker plane when
+`GetNodeContent` is called. (b) Send derived entries as ordinary
+`added`/`removed` deltas in the location index. (c) Send the listing on
+every heartbeat.
+
+**Trade-off.** The listing is as stale as the last change the manager
+acknowledged, last-used times are those of the last send (a use is not a
+change), and a node with more than 256 entries shows only the newest.
+
+**Why (performance, security).** (b) would put derived entries in the index
+the scheduler scores and peers fetch by, which is exactly what entry 1
+forbids. (a) adds a manager-to-worker call to a read path that has none. (c)
+costs every heartbeat of every node for a listing that changes when an image
+is first used.
+
+## 11. A recipe's inputs are digests, numbers, and fingerprints, under static names
+
+**Call.** "A type that cannot carry a secret" is `Recipe`: an input is a
+`ContentDigest`, a `u64`, or bytes the recipe hashes itself, and every name
+is a `&'static str`. The guest binary's identity (its path, size, and mtime)
+is recorded as its SHA-256.
+
+**Alternatives.** (a) A free-form string map with a deny list of suspicious
+names. (b) Digests only, which cannot express a headroom or a binary's
+identity.
+
+**Trade-off.** `legion node content -j` shows `guestBinary` as a hash, not a
+path, so an operator cannot read which binary a base was built with.
+
+**Why (security).** With (a) the guarantee is a convention. Here the recorded
+value is never caller text, so nothing reaches the index, the heartbeat, or
+the API that a build could have been handed by mistake.
+
+## 12. Root disks keep their own fill path over the store's primitives
+
+**Call.** `rootfs_cache.rs` does not call `ensure_derived`. It uses the
+store's claim, stage, and commit directly, so a miss still builds the start's
+own disk first and offers a reflink of it (or a background second format) to
+the cache afterwards.
+
+**Alternatives.** Build into the store with `ensure_derived` and clone from
+the entry, which is simpler and makes every miss wait for the commit.
+
+**Trade-off.** Two ways to fill the class exist, and the root disk tests
+needed five mechanical line edits (the directory names, the in-flight check,
+and marking a base used through the store instead of a file's mtime). The
+plan asked for them unchanged.
+
+**Why (performance).** "A miss is never slower than a start without the
+cache" is the root disk cache's stated contract, and the plan requires its
+behavior not to change.
+
+## 13. Only a derived share the operator sets counts toward the 100% rule
+
+**Call.** `artifacts`, `snapshots`, and an explicit `derived` share must add
+up to at most 100%. The default derived share (10%) is not counted.
+
+**Alternatives.** Count the default, as the other two classes' defaults are.
+
+**Trade-off.** `artifacts = "75%"` with defaults passes validation though
+the three shares read as 105%.
+
+**Why (ease of use).** The default is capped at 20 GiB, so on any disk where
+the sum matters it is a rounding error, and counting it would reject configs
+that worked before this change for no real risk. `minFreeDisk` remains the
+floor.
+
+## 14. Derived pins share the blob pin table, and the class gets its own gauge
+
+**Call.** A derived pin is a row in the existing `pin` table under
+`derived:<kind>:<key>`, so `release_owner` drops an owner's derived pins with
+its blob pins. The class's bytes are exported as `legion_derived_bytes`.
+
+**Alternatives.** A separate pin table; no gauge (the plan says "in the
+existing content-store gauges", and there are none).
+
+**Trade-off.** A pin's `digest` column no longer always holds a digest.
+
+**Why (simplicity).** One release path cannot forget a kind of pin. The
+gauge is the smallest thing that makes the budget observable.

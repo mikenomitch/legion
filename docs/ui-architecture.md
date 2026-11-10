@@ -529,8 +529,10 @@ Known limitations:
   each instance row still shows its own last stop.
 - Instances, including from a snapshot (`legion instance create
   --from-snapshot`), are created and destroyed from the CLI only.
-- The content card shows no content store budgets: `GetNodeContent` reads
-  the location index, which carries digests and sizes but not classes.
+- The content card shows the `derived` class's budget and entries, which the
+  node reports whole, and the `snapshots` budget from `GetNodeUsage`. It shows
+  no `artifacts` budget: for advertised content `GetNodeContent` reads the
+  location index, which carries digests and sizes but not classes.
 - A macOS worker reports no usage, so the idle countdown and populated usage
   are only visible on Linux workers with enforcement on, and on `/testing`.
 

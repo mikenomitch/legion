@@ -992,6 +992,18 @@ that has never taken a provisional start.
 
 - **`legion_provisional_starts_total{origin,gate}`** (counter): provisional
   allocations admitted, by `origin` (`manager` | `edge`) and gate.
+- **`legion_derived_builds_total{kind,outcome}`** (counter):
+  [derived content](artifacts.md#derived-content) builds on this node, by
+  `kind` (`rootfs` today) and `outcome`: `built` (the entry was kept), or why
+  it was not (`oversized`, `below_min_free`, `no_room`, `duplicate`,
+  `disabled`, `error`). A build that is not kept still served the start that
+  needed it.
+- **`legion_derived_build_seconds{kind}`** (histogram): how long one build
+  took. For `rootfs` this is extracting the image and formatting the disk.
+- **`legion_derived_hits_total{kind}`** (counter): uses served by an entry
+  already on the node. Hits against builds is the class's hit rate.
+- **`legion_derived_bytes`** (gauge): disk the derived class holds, in
+  allocated blocks. Compare it with `content.budgets.derived`.
 - **`legion_runtime_disabled_refusals_total{runtime}`** (counter): starts
   this worker refused because their runtime is
   [disabled](runtime-disable.md): placements, session starts, claims,
