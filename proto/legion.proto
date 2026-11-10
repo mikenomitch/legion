@@ -14420,6 +14420,31 @@ message StartSessionReply {
   string moved_from = 7;
 }
 
+// The workload channel: what a workload asks its own node's worker, over
+// the per-allocation API socket (`$LEGION_SECRETS_DIR/legion.sock`,
+// docs/workload-identity.md, "The API socket"). The same socket proxies the
+// `Manager` service to the managers with the allocation's identity token;
+// calls to this service never leave the node and carry no token. The worker
+// attributes every connection to the socket's allocation (by cgroup where
+// every task has a leaf, by the directory's modes otherwise), so a caller
+// acts for its own allocation and no other.
+service Workload {
+  // Runs once in a fresh, single-use session of a session task of the
+  // caller's own job, on the caller's node (see `Manager.RunSession` for
+  // the steps and the reply; docs/session-runs.md).
+  //
+  // Authorization is the jobspec's, not a credential's: the worker admits
+  // the run only when the calling allocation's task is allowed to start
+  // the target task. `job_id` may be empty and must be the caller's job
+  // when set; `ticket`, `node_id`, and `command` are refused (replacing the
+  // command needs `exec:write`, which only a manager checks).
+  //
+  // Errors: as `Worker.RunSession`, plus PermissionDenied for another job,
+  // a `command`, or a task the caller's task may not run, and NotFound when
+  // the socket's allocation is no longer running.
+  rpc RunSession (RunSessionRequest) returns (RunSessionResponse);
+}
+
 // Request payload for Manager.RunSession and Worker.RunSession: one run in
 // a fresh, single-use session (docs/session-runs.md).
 message RunSessionRequest {

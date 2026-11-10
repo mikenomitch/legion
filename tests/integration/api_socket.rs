@@ -88,6 +88,7 @@ async fn the_socket_proxies_calls_with_the_allocations_token_test() -> R<()> {
         channel: tonic::transport::Endpoint::from_shared(address)?.connect_lazy(),
         managers: None,
         peer_check: PeerCheck::FileMode,
+        workload: None,
     };
     // A deep task directory: the socket path is longer than a socket
     // address holds, which the worker and the client both get around.
@@ -146,6 +147,7 @@ async fn an_unreachable_manager_fails_the_socket_over_test() -> R<()> {
             .connect_lazy(),
         managers: Some(managers.clone()),
         peer_check: PeerCheck::FileMode,
+        workload: None,
     };
     let root = tempfile::Builder::new()
         .prefix("legion-api-socket-failover-")
@@ -194,6 +196,7 @@ fn another_allocations_process_is_refused_by_the_peer_cgroup_check_test() -> R<(
             peer_check: PeerCheck::Cgroup {
                 parent: parent.clone(),
             },
+            workload: None,
         };
         let socket = serve(context, 7, dir.path(), Some(admin))?;
         let connect_from = |leaf: &str| -> R<bool> {

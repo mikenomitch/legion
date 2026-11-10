@@ -76,8 +76,14 @@ struct Cluster {
 }
 
 impl Cluster {
-    /// A cluster whose session task carries this `run` block.
+    /// A cluster whose `exec` session task carries this `run` block.
     async fn new(run: Value) -> R<Self> {
+        Self::with_task("exec", json!({ "command": ["sleep", "600"] }), run).await
+    }
+
+    /// A cluster whose session task has this runtime, config, and `run`
+    /// block.
+    async fn with_task(runtime: &str, task_config: Value, run: Value) -> R<Self> {
         let dir = tempfile::tempdir()?;
         let mut config = ManagerConfigFull {
             store_path: dir.path().join("store").to_str().context("utf-8")?.into(),
@@ -183,7 +189,7 @@ impl Cluster {
             issuer,
             dir,
         };
-        cluster.submit(run)?;
+        cluster.submit(runtime, task_config, run)?;
         cluster.wait_for_envelope().await?;
         Ok(cluster)
     }
@@ -192,13 +198,13 @@ impl Cluster {
         &self.svc.store
     }
 
-    fn submit(&self, run: Value) -> R<()> {
+    fn submit(&self, runtime: &str, task_config: Value, run: Value) -> R<()> {
         let config: JobConfig = serde_json::from_value(json!({
             "name": JOB,
             "task": {
                 "name": TASK,
-                "runtime": "exec",
-                "config": { "command": ["sleep", "600"] },
+                "runtime": runtime,
+                "config": task_config,
                 "resources": { "cpu": 100, "memory": 64 },
                 "stateful": {
                     "mode": "session",
@@ -670,4 +676,68 @@ async fn a_run_session_without_its_driver_is_swept_test() -> R<()> {
     assert_eq!(ended, 1);
     assert_eq!(cluster.sessions(), 0);
     Ok(())
+}
+
+/// The contract every runtime with a root filesystem of its own shares:
+/// files staged under `/legion/run/` through the unit (a container's
+/// namespaces, a sandbox's guest agent), the command run there, and
+/// `result.json` and a named file read back out.
+async fn runs_inside_its_own_root(runtime: &str, task_config: Value) -> R<()> {
+    let cluster = Cluster::with_task(
+        runtime,
+        task_config,
+        json!({ "command": ["sh", "/legion/run/main.sh"], "wall": "60s" }),
+    )
+    .await?;
+    let reply = cluster
+        .run(RunSessionRequest {
+            files: vec![
+                script(
+                    "test \"$LEGION_RUN_DIR\" = /legion/run || exit 90\n\
+                     tr a-z A-Z < /legion/run/data/in.txt > /legion/run/out.txt\n\
+                     printf '{\"ok\": true}' > /legion/run/result.json\n\
+                     cat \"$LEGION_RUN_INPUT\"\n",
+                ),
+                RunFile {
+                    path: "data/in.txt".into(),
+                    content: b"hello".to_vec(),
+                    executable: false,
+                },
+            ],
+            input: Some(r#"{"n":1}"#.into()),
+            get: vec!["out.txt".into()],
+            wait_timeout_seconds: Some(300),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(reply.exit, Some(0), "{reply:?}");
+    assert_eq!(reply.stdout, br#"{"n":1}"#);
+    assert_eq!(reply.result, r#"{"ok": true}"#);
+    assert_eq!(reply.files[0].content, b"HELLO");
+    assert_eq!(cluster.sessions(), 0);
+    Ok(())
+}
+
+/// Needs runc or crun and network access to pull the image:
+/// `sudo -E cargo test --test integration session_runs::a_container_run -- --ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs an OCI runtime (runc or crun), root, and a registry"]
+async fn a_container_run_stages_and_collects_inside_the_container_test() -> R<()> {
+    runs_inside_its_own_root(
+        "container",
+        json!({ "image": "alpine:3.20", "command": ["sleep", "600"] }),
+    )
+    .await
+}
+
+/// Needs KVM, a VMM (firecracker or cloud-hypervisor), and a registry:
+/// `sudo -E cargo test --test integration session_runs::a_sandbox_run -- --ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs KVM, a VMM, root, and a registry"]
+async fn a_sandbox_run_stages_and_collects_through_the_guest_agent_test() -> R<()> {
+    runs_inside_its_own_root(
+        "sandbox",
+        json!({ "image": "alpine:3.20", "command": ["sleep", "600"] }),
+    )
+    .await
 }

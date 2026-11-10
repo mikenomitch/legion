@@ -44,6 +44,11 @@ pub const RUN_ORIGIN: &str = "run";
 const DEFAULT_START_WAIT: Duration = Duration::from_secs(60);
 const MAX_START_WAIT: Duration = Duration::from_secs(600);
 
+/// How long a run waits for a unit that reports `running` to accept its
+/// first exec. A container exists a moment after its runtime was spawned,
+/// and a guest's agent listens a moment after the VM booted.
+const EXEC_READY_WAIT: Duration = Duration::from_secs(20);
+
 /// The deadline of one staging or collection exec.
 const TRANSFER_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -347,6 +352,34 @@ impl WorkerTaskManager {
             .map(|claim| claim.instance_id)
             .filter(|session_id| !self.run_registry.owns(session_id))
             .collect()
+    }
+}
+
+/// Whether a workload of `caller` may run `target`, a session task of the
+/// same job, through its API socket with no credential (the `Workload`
+/// service). The jobspec decides, never the caller: a task runs a sibling
+/// task only when it declares it.
+///
+/// A task may always run a fresh session of itself. Nothing in the jobspec
+/// declares any other pair yet, so every other pair is refused.
+pub fn workload_may_run(caller: &TaskConfig, target: &TaskConfig) -> Result<(), String> {
+    if caller.name == target.name {
+        return Ok(());
+    }
+    Err(format!(
+        "task {} may not run task {}: a workload runs a sibling task only when its own task \
+         declares it; send the run through a manager with a token that holds job:write",
+        caller.name, target.name
+    ))
+}
+
+impl WorkerTaskManager {
+    /// The job and task of a running allocation, by the manager's id.
+    pub fn allocation_task(&self, allocation_id: i64) -> Option<(String, TaskConfig)> {
+        let local = self.local_key(allocation_id);
+        let allocation = self.allocations.get(&local)?;
+        let task = self.task_configs.get(&local)?;
+        Some((allocation.job_id.clone(), task.clone()))
     }
 }
 
@@ -995,6 +1028,44 @@ fn execute(
         .run_target(session_id)
         .ok_or_else(gone)?;
 
+    // A unit with its own root is entered through its runtime, which can
+    // lag the session's `running` by a moment: wait until it takes an exec.
+    if !target.host_root {
+        let waited = Instant::now();
+        loop {
+            let probe = exec_capture(
+                task_manager,
+                session_id,
+                target.local_key,
+                shell(":", &[]),
+                None,
+                TRANSFER_DEADLINE,
+                4096,
+            );
+            let why = match probe {
+                Ok(probe) if probe.exit == Some(0) => break,
+                Ok(probe) if probe.session_gone => return Err(gone()),
+                Ok(probe) => format!(
+                    "{}: {}",
+                    match probe.exit {
+                        Some(code) => format!("exit {code}"),
+                        None => "timed out".to_string(),
+                    },
+                    text(&probe.stderr)
+                ),
+                Err(err) => format!("{err:#}"),
+            };
+            if waited.elapsed() >= EXEC_READY_WAIT {
+                return Err(Status::failed_precondition(format!(
+                    "the run's session did not accept an exec within {}s ({why})\nHint: a run \
+                     needs /bin/sh in the task's image",
+                    EXEC_READY_WAIT.as_secs()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     // Stage.
     for (relative, content, executable) in &prepared.files {
         let path = format!("{}/{relative}", target.run_dir);
@@ -1293,6 +1364,16 @@ mod tests {
         let later = 2_500 + RUN_REPLY_TTL.as_millis() as i64 + 1;
         assert!(matches!(second.begin("run-e", later), Begin::Run(_)));
         Ok(())
+    }
+
+    #[test]
+    fn a_workload_runs_only_what_its_task_may_test() {
+        let caller = task();
+        workload_may_run(&caller, &caller).unwrap();
+        let mut other = task();
+        other.name = "tools".into();
+        let refusal = workload_may_run(&caller, &other).unwrap_err();
+        assert!(refusal.contains("task machine may not run task tools"));
     }
 
     #[test]

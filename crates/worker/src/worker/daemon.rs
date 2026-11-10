@@ -633,6 +633,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         .expect("task manager")
         .resource_enforcement_enabled()
         || kernel_guard == crate::worker::netd::kernel_guard::Availability::Active;
+    let workload_launch_pool = Arc::new(std::sync::OnceLock::new());
     let api_sockets = crate::worker::api_socket::ApiSocketContext {
         channel: managers.channel(),
         managers: Some(managers.clone()),
@@ -640,6 +641,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             leaves_guaranteed,
             &enforcement_config.cgroup_parent,
         ),
+        // The workload channel: node-local calls the worker answers itself
+        // (docs/workload-identity.md, "The API socket").
+        workload: Some(crate::worker::api_socket::WorkloadChannel {
+            task_manager: task_manager.clone(),
+            launch_pool: workload_launch_pool.clone(),
+            node_id: name.clone(),
+        }),
     };
     let identity_manager = Arc::new(
         WorkerIdentityManager::new(Arc::new(ManagerTokenIssuer {
@@ -757,6 +765,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let launch_pool = Arc::new(crate::worker::launch_pool::LaunchPool::from_config(
         &edge_boot_config,
     ));
+    let _ = workload_launch_pool.set(launch_pool.clone());
 
     let mut fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
     // The manager loads no storage drivers of its own, so this is its only

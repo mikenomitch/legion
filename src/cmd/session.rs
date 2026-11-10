@@ -241,6 +241,17 @@ pub fn config() -> Command {
                     "Edge form: a session ticket from `legion boot-ticket create --scope session`",
                 ),
         )
+        .arg(
+            Arg::new("local")
+                .long("local")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with_all(["node", "on-node", "command"])
+                .help(
+                    "Inside a task: ask this node's worker over the allocation's API socket \
+                     (LEGION_ADDR = unix://...), with no token. The jobspec decides what the \
+                     task may run; --task is required",
+                ),
+        )
         .arg(json_flag())
         .arg(
             Arg::new("command")
@@ -615,7 +626,22 @@ async fn run(matches: &ArgMatches) -> R<()> {
             .cloned()
             .unwrap_or_default(),
     };
-    let result = if matches.get_one::<String>("node").is_some() {
+    let result = if matches.get_flag("local") {
+        let address = crate::cmd::helpers::manager_address();
+        let path = crate::cmd::helpers::unix_socket_path(&address).ok_or_else(|| {
+            local(format!(
+                "--local needs the allocation's API socket: LEGION_ADDR is {address}, not a \
+                 unix:// address (the task declares no `legion` identity, or this is not a task)"
+            ))
+        })?;
+        // The worker checks the job against the socket's allocation.
+        crate::structs::workload_client::WorkloadClient::new(
+            crate::cmd::helpers::unix_socket_channel(path, None),
+        )
+        .run_session(request)
+        .await
+        .map(tonic::Response::into_inner)
+    } else if matches.get_one::<String>("node").is_some() {
         let mut client = edge_client(matches).await?;
         client
             .run_session(request)
