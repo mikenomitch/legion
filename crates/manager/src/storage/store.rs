@@ -30,8 +30,8 @@ mod read_model_check;
 // Phase 6: fork, create-from-snapshot, and snapshot names.
 mod blocked_evals;
 mod child_ops;
-pub use child_ops::{EndedChild, KeyedChildOutcome, OwnerEnd};
 pub use blocked_evals::{BlockedEval, CAPACITY_REPLAY_WINDOW};
+pub use child_ops::{EndedChild, KeyedChildOutcome, OwnerEnd};
 mod eval_claims;
 // What `plan_submission` keeps: rejections and staged plans, id-windowed.
 mod plan_records;
@@ -31302,7 +31302,10 @@ mod tests {
         let child = keyed_child(&store, job_id, "ws-1", "instance:agent-a", 2)?;
         assert_eq!(child.owner.as_deref(), Some("instance:agent-a"));
         let owner = child.owner_ref().context("typed owner")?;
-        assert_eq!((owner.kind.as_str(), owner.id.as_str()), ("instance", "agent-a"));
+        assert_eq!(
+            (owner.kind.as_str(), owner.id.as_str()),
+            ("instance", "agent-a")
+        );
         assert_eq!(
             store
                 .keyed_children_of("instance:agent-a")?

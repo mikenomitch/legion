@@ -1,9 +1,10 @@
 # Child Sessions
 
-A **child** is a [session](session-mode.md) that another unit of the same
-job started and owns. It ends when its owner ends, is charged to its own
-task's envelope, runs under its own task's resources and network policy,
-carries a reference to its owner, and is listed under it.
+A **child** is a [session](session-mode.md) or a
+[keyed instance](stateful-workloads.md) that another unit of the same job
+started and owns. It ends when its owner ends, is charged to its own task's
+envelope or reservation, runs under its own task's resources and network
+policy, carries a reference to its owner, and is listed under it.
 
 ```console
 $ legion instance create agents --task machine --owner agent-q4n7c2rd.01jbx... -j
@@ -22,11 +23,13 @@ for itself which unit asked for which.
 - [Declaring children](#declaring-children)
 - [Owners](#owners)
 - [Starting a child](#starting-a-child)
+- [Keyed children](#keyed-children)
 - [When an owner ends](#when-an-owner-ends)
 - [Promotion](#promotion)
 - [Listing, and learning that a child is gone](#listing-and-learning-that-a-child-is-gone)
 - [What a child runs as](#what-a-child-runs-as)
 - [Addressing](#addressing)
+- [Connection handoff](#connection-handoff)
 - [Failure modes](#failure-modes)
 - [Limitations](#limitations)
 
@@ -103,10 +106,13 @@ Callers may leave the kind out; Legion works it out from the id. An
 allocation that belongs to an instance is always owned through the
 instance, so the reference survives a reschedule.
 
-The reference is stored **with the child**: in its node's session table
-(`sessions.db`, so a restarted worker still knows it) and in the session
-report the node sends the managers. Nothing about ownership is written to
-the replicated store, whatever the owner is.
+The reference is stored **with the child**, wherever the child's own
+record lives:
+
+| Child | Where the reference lives | Raft cost |
+| --- | --- | --- |
+| session | its node's session table (`sessions.db`, so a restarted worker still knows it) and the session report the node sends the managers | none |
+| keyed instance | an indexed `owner` column on its instance row, written by the create | none beyond the create |
 
 ## Starting a child
 
@@ -154,7 +160,7 @@ Refusals:
 | Code | When |
 | --- | --- |
 | `RESOURCE_EXHAUSTED` (retryable) | The owner already has `max` children, or no envelope for the child task has room (an [elastic envelope](session-mode.md#elastic-envelopes) grows, and the next try may fit) |
-| `FAILED_PRECONDITION` | The owner's task does not declare the child task; the owner is itself a child; or the request names an `instance_id` (a child is an unnamed session) |
+| `FAILED_PRECONDITION` | The owner's task does not declare the child task; the owner is itself a child; or a session would own a keyed child |
 | `NOT_FOUND` | Nothing with the owner's id runs in this job (through a manager) or on this node (at a node). The message is the same whether the id never existed or belongs to another job |
 | `UNAVAILABLE` (retryable) | The child task's runtime is [disabled](runtime-disable.md) |
 
@@ -162,6 +168,65 @@ Refusals:
 FAILED_PRECONDITION: task agent of job agents does not declare scratch as a child task; add `children = { tasks = ["scratch"] }` to agent
 RESOURCE_EXHAUSTED: session agent-q4n7c2rd.01jbx... already owns 2 children (children.max = 2); stop one first
 ```
+
+## Keyed children
+
+A keyed task named in `children.tasks` gives **keyed children**: durable
+instances with a row, a volume if the task declares one, and an identity,
+owned by a keyed or slot instance or by an allocation.
+
+```console
+$ legion instance create agents --task workspace --id ws-42 --owner user-42 -j
+{"ok":true,"data":{"instanceIds":["ws-42"],"mode":"keyed","durable":true,"deduplicated":false,
+ "owner":{"kind":"instance","id":"user-42"}}}
+
+$ legion instance create workspace --owner self        # inside a task, no token
+Created instance workspace-5h3k..., a child of instance user-42 (stopped when its owner is stopped, destroyed when it is destroyed)
+```
+
+- **Who may own one.** An `instance` or an `allocation`. A session cannot:
+  it can vanish with its node, and nothing durable would know. Promote the
+  session first, or make the owner task keyed.
+
+  ```text
+  FAILED_PRECONDITION: task agent is a session task and workspace is keyed: a session cannot own a durable child (promote the session, or make agent keyed)
+  ```
+
+- **From inside a task.** `legion instance create <task> --owner self`
+  calls `Workload.CreateChildInstance` on the
+  [API socket](workload-identity.md#the-api-socket). A keyed instance is a
+  replicated row, so the worker asks a manager, vouching for which of its
+  allocations asked (`Manager.CreateChildInstance`, a worker-plane call).
+  No token of the task's is read, and the manager checks that the
+  allocation really is placed on the calling node.
+- **`max` counts both kinds.** An owner's session children and keyed
+  children share one `children.max`. Keyed children are counted in the
+  create's own write, so two concurrent creates cannot both pass.
+- **Placement.** The scheduler places a keyed child like any keyed
+  instance and prefers its owner's node for the first placement. It is a
+  preference: when that node cannot take the child, it goes wherever the
+  task fits, and a later reschedule does not move it back.
+- **The cascade.** `legion instance stop <owner>` stops the owner's keyed
+  children and `legion instance destroy <owner>` destroys them, in the same
+  replicated entry as the owner, children first. A stopped child keeps its
+  row, its volume, and its owner, and can be started again on its own; the
+  owner's volumes stay, and so do its children's. Suspending, archiving, or
+  rescheduling the owner ends nothing.
+- **Other ends.** An owner can also end without an instance stop or
+  destroy: an allocation completes, fails, or is lost; a job is stopped; a
+  slot is scaled away. The manager leading the scheduler lane looks for
+  keyed children of ended owners every 5 seconds and ends them in one
+  entry (stopped, or destroyed when the owner's row is gone). The event
+  `instance.child_ended` records each child either path ends, and
+  `legion_keyed_children_ended_total{end}` counts the sweep's.
+- **Identity.** A keyed child's
+  [workload identity](workload-identity.md) tokens carry two extra claims,
+  `legion.io/owner` and `legion.io/root`, both `kind:id`
+  (`instance:user-42`), so an upstream can attribute a request to the unit
+  that owns the caller. With children one level deep the root is the
+  owner.
+- **`from_snapshot` and batch creates** (`--count`, several `--id`) cannot
+  be combined with `--owner`.
 
 ## When an owner ends
 
@@ -180,8 +245,11 @@ Whoever holds the child's record ends it:
   first and the owner second, so no child outlives the report of its
   owner's stop. An owner whose workload exits on its own takes its children
   with it at the node's next heartbeat.
-- **An instance or allocation owner.** The managers read the owner's state
-  from the store. Every heartbeat reply to a node that reports a child of
+- **An instance or allocation owner of keyed children.** See
+  [Keyed children](#keyed-children): in the owner's own entry for an
+  instance stop or destroy, within 5 seconds otherwise.
+- **An instance or allocation owner of session children.** The managers
+  read the owner's state from the store. Every heartbeat reply to a node that reports a child of
   an ended owner carries an **owner notice**, and the same notice is pushed
   on the node's work stream within a second. The notice is repeated until
   the node's report no longer lists the child, so a lost one is corrected
@@ -219,8 +287,13 @@ instance, so ownership has to survive it.
   either of them runs. Children on the owner's node are re-keyed when the
   node adopts the promoted session; children on other nodes by an owner
   notice. No extra raft write is made.
-- **Promoting a child** detaches it. It becomes an ordinary keyed instance
-  with no owner, and its former owner's end no longer touches it.
+- **Promoting a child of an instance or an allocation** keeps the
+  reference: the promotion writes it into the new instance row in its own
+  entry, and the child is a keyed child from then on, ended as
+  [keyed children](#keyed-children) are.
+- **Promoting a child of a session** detaches it. It becomes an ordinary
+  keyed instance with no owner, and its former owner's end no longer
+  touches it (a durable child of an ephemeral owner is not allowed).
 
 ## Listing, and learning that a child is gone
 
@@ -236,10 +309,15 @@ children (2):
   machine-7k2qd9x4.01jc1...  machine  w-03  active
 ```
 
+Each child in the `-j` output has a `kind`: `session`, or `instance` for a
+keyed child, whose `state` is then its instance state (`pending`, `active`,
+`suspended`, `rescheduling`, `stopped`).
+
 The instance page in the UI shows the same two things.
 
 Inside the owner, `legion session children` (`Workload.ListChildren`) lists
-its children on its node, including the ones that ended in the last ten
+its session children on its node (a node knows the sessions it holds, not
+the store's rows, so keyed children are listed by `legion instance get`), including the ones that ended in the last ten
 minutes, with the reason:
 
 ```console
@@ -285,7 +363,68 @@ which it needs to be stopped, exec'd into, and listed, and is reached:
 2. **by an operator** with the usual permissions on the job (`legion
    instance get`, `legion exec`, `legion instance stop` on the child's id).
 
-Legion does not re-point an owner's address at a child.
+Legion does not re-point an owner's address at a child, and the gateway
+never routes to one. For the bytes of one connection, an owner can hand the
+connection over instead.
+
+## Connection handoff
+
+Forwarding every byte through the owner is wrong for a large upload or a
+long-lived stream. An owner can **hand an inbound connection it accepted to
+a port of one of its children**: the worker joins the client's connection
+to the child's port and moves the bytes with the
+[datapath](network-handlers.md)'s own copy (`splice(2)` on Linux once a
+flow turns bulk, a plain copy elsewhere), and the owner leaves the byte
+path. The owner keeps the decision; the worker moves the bytes.
+
+```console
+$ legion session handoff machine-q4n7c2rd.01jbz... --port http --fd 5 --wait -j
+{"ok":true,"data":{"handedOff":true,"closed":{"sent":10485760,"received":211,"error":null}}}
+```
+
+`--fd` is the accepted connection, a file descriptor the command inherits
+from the process that accepted it. Without `--wait` the command returns as
+soon as the worker has taken the connection; with it, when the connection
+has closed, with the bytes moved to the child (`sent`) and back
+(`received`).
+
+A descriptor cannot ride a gRPC call, so handoff has its own socket,
+`legion-handoff.sock`, beside `legion.sock` in `$LEGION_SECRETS_DIR` and
+admitted by the same rule (the caller is the socket's allocation). A
+workload that does not want to run the CLI speaks it directly; one
+connection is one handoff:
+
+1. Connect, and send one line of JSON with the descriptor attached to its
+   first byte as `SCM_RIGHTS`:
+   `{"child":"<session id>","port":"<port label>"}`. Close your own copy of
+   the descriptor afterwards, or the client never sees the child's close.
+2. Read one line: `{"ok":true}`, or
+   `{"ok":false,"code":"not_found","message":"..."}` and the socket closes.
+3. Read one more line when the connection ends:
+   `{"closed":true,"sent":N,"received":M}`, with `"error"` when the flow
+   ended early.
+
+```python
+import json, socket
+control = socket.socket(socket.AF_UNIX)
+control.connect(os.environ["LEGION_SECRETS_DIR"] + "/legion-handoff.sock")
+line = json.dumps({"child": child_id, "port": "http"}).encode() + b"\n"
+socket.send_fds(control, [line], [conn.fileno()])
+conn.close()
+accepted = json.loads(control.makefile().readline())
+```
+
+| Refusal `code` | When |
+| --- | --- |
+| `not_found` | The id is not a child of the caller on this node. The answer is the same for another owner's child and for an id that never existed |
+| `failed_precondition` | The child is suspended or not running yet, or declares no port with that label (the message lists the ports it has) |
+| `invalid_argument` | No descriptor came with the line, the descriptor is not a connected TCP or Unix stream socket, or the line is not the JSON above |
+| `unavailable` | The worker could not connect to the child's port |
+
+Bytes the owner already read from the connection are not replayed: hand
+the connection off before reading the body, or send what you read to the
+child yourself first. `legion_child_handoffs_total` counts handoffs on a
+node.
 
 ## Failure modes
 
@@ -300,37 +439,49 @@ Legion does not re-point an owner's address at a child.
 
 ## Limitations
 
-- **Sessions only.** A child is an unnamed session. A keyed task can be
-  named in `children.tasks`, but creating a keyed instance as a child
-  (`--owner` with `--id`) is refused.
 - **Depth 1.** A child cannot own children, and a child task cannot
   declare a `children` block.
 - **Same job.** An owner and its children are tasks of one job, so the
   jobspec that grants the right also defines what is granted.
 - **Children do not move with their owner.** An owner that resumes on
-  another node keeps its children where they are.
+  another node keeps its children where they are, and a keyed child placed
+  beside its owner is not moved after the owner is rescheduled.
+- **No gateway route to a child.** A child is reached through its owner, by
+  an operator on its id, or by a [handoff](#connection-handoff).
 - **A child that moves is detached.** A child with `suspend.durability =
   "store"` that is resumed on another node becomes an ordinary session
   there: the session manifest does not carry its owner.
-- **No workload identity claims.** Session tasks cannot declare
-  `identities` ([session mode](session-mode.md#limitations)), so a child
-  has no token to carry its owner in. Attribution comes from the session
-  report and `legion instance get`.
+- **Session children have no identity claims.** Session tasks cannot
+  declare `identities` ([session mode](session-mode.md#limitations)), so a
+  session child has no token to carry its owner in; its attribution comes
+  from the session report and `legion instance get`. Keyed children carry
+  `legion.io/owner` and `legion.io/root`.
 - **No tenant label and no usage rollup by owner.** Sessions carry no
   tenant label for a child to inherit; group usage by the `owner` of each
   session in `legion instance list -j`.
 - **A session task has no API socket** (the socket needs the `legion`
   identity), so a session owner's children are started from outside, with
-  `--owner <session id>`. `--owner self` works for service, batch, slot,
-  and keyed tasks that declare the `legion` identity.
+  `--owner <session id>`, and a session owner cannot hand a connection
+  off. `--owner self` and handoff work for service, batch, slot, and keyed
+  tasks that declare the `legion` identity.
 - **`max` is exact on one node and approximate across nodes.** The owner's
   node counts its own children exactly. Children on other nodes are counted
   from the session index of the manager that routes the start, which can
   lag by a heartbeat.
 - **Children are never restarted.** The owner decides whether to start
   another.
-- **No connection handoff.** An owner that forwards requests to a child
-  carries the bytes itself.
+- **Handoff reaches a running session child on the owner's own node.** A
+  child the router placed on another node, a suspended child, and a keyed
+  child are refused; proxy to those, or start the child where the owner
+  can hand off. Handoff throughput was not benchmarked on its own: it is
+  the datapath's L4 copy.
+- **A keyed child of an allocation owner outlives it by up to 5 seconds**,
+  the sweep's interval. An instance owner's stop and destroy have no such
+  gap.
+- **A keyed child's own stop or destroy is not refused.** An operator with
+  `job:write` can stop, start, or destroy a child by its id; starting a
+  stopped child of a stopped owner leaves it running until the owner is
+  stopped or destroyed again, or the sweep sees the owner's row gone.
 - **`suspendWithOwner` for an instance owner is sent once**, when a manager
   first sees the instance suspended. A manager failover at that moment can
   miss it; the children then follow their own idle policy.

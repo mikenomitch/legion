@@ -289,10 +289,9 @@ impl ManagerDaemonService {
                     0
                 };
                 if keyed >= block.max {
-                    return Err(Status::resource_exhausted(crate::structs::children::at_max(
-                        &resolved.owner,
-                        block.max,
-                    )));
+                    return Err(Status::resource_exhausted(
+                        crate::structs::children::at_max(&resolved.owner, block.max),
+                    ));
                 }
                 Some(sessions::ChildStart {
                     owner: resolved.owner,
@@ -343,10 +342,9 @@ impl ManagerDaemonService {
         // owner that is a session by kind (a promoted task's leftover) is
         // refused the same way.
         if !children::raft_owned(&resolved.owner) {
-            return Err(Status::failed_precondition(children::keyed_child_of_session(
-                &resolved.task_name,
-                &task.name,
-            )));
+            return Err(Status::failed_precondition(
+                children::keyed_child_of_session(&resolved.task_name, &task.name),
+            ));
         }
         self.store
             .check_namespace_quota_growth(&config.name, config.priority, &task.resources, 1)

@@ -30,9 +30,9 @@
 //! otherwise cross the worker plane, which is a proxy, not a handoff.
 
 use crate::prelude::*;
-use serde::{Deserialize, Serialize};
 use crate::worker::netd::listen::Stream;
 use crate::worker::task_manager::WorkerTaskManager;
+use serde::{Deserialize, Serialize};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use tokio::io::{AsyncWriteExt, Interest};
@@ -179,8 +179,7 @@ pub async fn serve_with(
         port = %request.port,
         "Handed a connection to a child"
     );
-    let transfer =
-        crate::worker::netd::splice::bidirectional(&mut client, &mut upstream).await;
+    let transfer = crate::worker::netd::splice::bidirectional(&mut client, &mut upstream).await;
     let closed = HandoffClosed {
         closed: true,
         sent: transfer.sent,
@@ -308,7 +307,9 @@ fn adopt(descriptor: OwnedFd) -> R<Stream> {
         bail!("the descriptor sent is not a socket");
     }
     if kind != libc::SOCK_STREAM {
-        bail!("the descriptor sent is not a stream socket; only TCP and Unix streams are handed off");
+        bail!(
+            "the descriptor sent is not a stream socket; only TCP and Unix streams are handed off"
+        );
     }
     // SAFETY: zeroed is a valid `sockaddr_storage`.
     let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -573,7 +574,8 @@ mod handoff_test {
     async fn a_request_without_a_descriptor_is_refused_test() -> R<()> {
         let (ours, theirs) = UnixStream::pair()?;
         let mut ours = ours;
-        ours.write_all(b"{\"child\":\"c\",\"port\":\"http\"}\n").await?;
+        ours.write_all(b"{\"child\":\"c\",\"port\":\"http\"}\n")
+            .await?;
         let err = read_request(&theirs).await.expect_err("no descriptor");
         assert!(err.to_string().contains("no file descriptor"), "{err:#}");
         Ok(())

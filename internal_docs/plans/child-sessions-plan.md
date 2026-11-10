@@ -2,36 +2,60 @@
 
 > **Judgement calls:** [child-sessions-plan_calls.md](../calls/child-sessions-plan_calls.md)
 
-**Status: IN EXECUTION** (written 2026-10-28; ownership generalized
-2026-11-07, see calls entry 1). **Phases 1 and 2 are built** (2026-11-10):
-the `children` block, the typed owner reference for all three owner kinds,
-session children started from outside (`CreateInstance.owner`, a ticket)
-and from inside any runtime over the API socket, the cascade for session
-owners on the node and for instance, allocation, and remote session owners
-through the managers' owner notices, promotion that carries ownership, the
-router's fallback to another node, and listing. Public doc:
-[docs/child-sessions.md](../../docs/child-sessions.md).
+**Status: SHIPPED** (2026-11-10; written 2026-10-28, ownership generalized
+2026-11-07, see calls entry 1). All four phases are built:
 
-Not built: Phase 3 (keyed children) and Phase 4 (connection handoff). The
-isolate host's start path (§6.3, first row) belongs to the isolate runtime.
+- **Phases 1 and 2:** the `children` block, the typed owner reference for
+  all three owner kinds, session children started from outside
+  (`CreateInstance.owner`, a ticket) and from inside any runtime over the
+  API socket, the cascade for session owners on the node and for instance,
+  allocation, and remote session owners through the managers' owner
+  notices, promotion that carries ownership, the router's fallback to
+  another node, and listing.
+- **Phase 3:** keyed children. An indexed `owner` column on the instance
+  row; `legion instance create --owner <id|self>`; the cascade in the
+  owner's own entry for an instance stop or destroy, and a leader sweep for
+  every other end; `max` across both kinds; the owner's node preferred at
+  first placement; `owner` and `root` identity claims; a promoted child of
+  an instance or allocation keeps its owner.
+- **Phase 4:** connection handoff, on `legion-handoff.sock` beside the API
+  socket (`legion session handoff`).
+
+Public doc: [docs/child-sessions.md](../../docs/child-sessions.md).
+
+Not built, and why: the isolate host's start path (§6.3, first row), which
+belongs to the isolate runtime and does not exist without it. No
+throughput benchmark was run for Phase 4; the handoff uses the datapath's
+own copy, whose numbers are the datapath plan's.
 
 Where the build differs from the text below (each is a calls entry):
 
 - A session owner on another node is asked about by the managers, not by
   the child's node (§6.4; calls entry 10).
+- Only an instance owner's stop and destroy cascade to keyed children in
+  the same entry; an allocation owner's end, and an instance ended by a job
+  stop or scale-down, are swept by the leader within 5 seconds (§6.4;
+  entry 11).
 - Raft-owned owners are judged on every heartbeat and pushed on a
-  one-second stream tick, not from the owner's apply (§6.4; entry 11).
-- No `owner` / `root` identity claims and no tenant label: sessions have
-  neither identities nor labels (§6.6, §6.9; entry 13).
-- A child that moves nodes is detached (entry 14).
+  one-second stream tick, not from the owner's apply (§6.4; entry 12).
+- A task creates a keyed child through its worker, which vouches for the
+  allocation (`Manager.CreateChildInstance`); the task's identity token is
+  not involved (§6.3; entry 13).
+- Handoff has its own socket and a line protocol, because a descriptor
+  cannot ride gRPC (§6.8; entry 14), and reaches only a running session
+  child on the owner's node (entry 25).
 - Through a manager a child is started with `legion instance create
   --owner`, not `legion session start --owner` (§6.3; entry 15).
+- Keyed children carry the `owner` and `root` claims; session children
+  carry none and no tenant label, because sessions have neither identities
+  nor labels (§6.6, §6.9; entry 16).
+- A child that moves nodes is detached (entry 18).
+- A keyed child's owner node is a preference, not a pin (§6.3; entry 20).
+- A promoted child of a session is detached; of an instance or allocation
+  it keeps its owner (§6.5; entry 21). The Phase 1 refusal to promote an
+  owner with children was never shipped: Phase 2's carrying landed with it.
 - `child_gone` is a ten-minute record the owner lists, not an event
-  (§6.4; entry 16).
-- Promoting a child detaches it whatever its owner, until Phase 3 gives the
-  instance row an `owner` column (§6.5; entry 17). The Phase 1 refusal to
-  promote an owner with children was never shipped: Phase 2's carrying
-  landed with it.
+  (§6.4; entry 22).
 
 A **child** is a session or keyed instance of one task that another unit
 started and owns. It ends when its owner ends, is charged to its own task's

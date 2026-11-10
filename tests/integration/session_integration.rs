@@ -386,6 +386,9 @@ impl Worker for FakeNode {
 }
 
 struct Cluster {
+    /// Whether the job also has a `ci` service task whose allocations may
+    /// own sessions of the session task (docs/child-sessions.md).
+    owner_task: bool,
     svc: ManagerDaemonService,
     job: String,
     /// `stateful.envelope.resources`, and one session's `resources`.
@@ -452,6 +455,35 @@ impl Cluster {
         suspend: Option<serde_json::Value>,
         envelope_max: Option<serde_json::Value>,
     ) -> R<Self> {
+        Self::build_with(job, nodes, envelope, session, suspend, envelope_max, false).await
+    }
+
+    /// [`Cluster::new`] with a `ci` service task that declares the session
+    /// task as its child task.
+    async fn with_owner_task(job: &str, nodes: &[&str]) -> R<Self> {
+        // The envelope leaves room for the `ci` allocation beside it (a
+        // node here has 2000 MHz), and holds three sessions.
+        Self::build_with(
+            job,
+            nodes,
+            json!({ "cpu": 1500, "memory": 2048 }),
+            json!({ "cpu": 500, "memory": 512 }),
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    async fn build_with(
+        job: &str,
+        nodes: &[&str],
+        envelope: serde_json::Value,
+        session: serde_json::Value,
+        suspend: Option<serde_json::Value>,
+        envelope_max: Option<serde_json::Value>,
+        owner_task: bool,
+    ) -> R<Self> {
         let dir = tempfile::tempdir()?;
         let mut config = ManagerConfigFull {
             store_path: dir.path().join("store").to_str().context("utf-8")?.into(),
@@ -468,6 +500,7 @@ impl Cluster {
         let mut cluster = Cluster {
             svc: ManagerDaemonService::new(store),
             job: job.to_string(),
+            owner_task,
             sizes: (envelope, session),
             suspend,
             envelope_max,
@@ -560,10 +593,25 @@ impl Cluster {
         if let Some(max) = &self.envelope_max {
             task["stateful"]["envelope"]["max"] = max.clone();
         }
-        let config: JobConfig = serde_json::from_value(json!({
-            "name": self.job,
-            "task": task,
-        }))?;
+        let config: JobConfig = if self.owner_task {
+            serde_json::from_value(json!({
+                "name": self.job,
+                "tasks": [
+                    task,
+                    {
+                        "name": "ci",
+                        "runtime": "noop",
+                        "resources": { "cpu": 100, "memory": 64 },
+                        "children": { "tasks": [TASK], "max": 4 },
+                    },
+                ],
+            }))?
+        } else {
+            serde_json::from_value(json!({
+                "name": self.job,
+                "task": task,
+            }))?
+        };
         tokio::task::block_in_place(|| -> R<()> {
             self.store().handle_job_submit(
                 &config,
@@ -729,6 +777,89 @@ async fn a_refusing_node_sends_the_session_to_the_next_test() -> R<()> {
     for _ in 0..2 {
         assert_eq!(cluster.create(None).await?.node_id, "n2");
     }
+    Ok(())
+}
+
+/// Child sessions, placement (docs/child-sessions.md): a child goes to its
+/// owner's node first, and the router falls back to another node with room
+/// when that node refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_goes_to_its_owners_node_and_falls_back_when_it_is_full_test() -> R<()> {
+    let cluster = Cluster::with_owner_task("agents-children", &["n1", "n2"]).await?;
+    // The envelope task is placed on every eligible node; give the
+    // scheduler the passes it needs with a second task in the job.
+    for _ in 0..3 {
+        if legion::manager::sessions::envelope_nodes(cluster.store(), &cluster.job, TASK)?.len()
+            == 2
+        {
+            break;
+        }
+        tokio::task::block_in_place(|| -> R<()> {
+            let config_id = cluster.store().get_job_config(&cluster.job)?.id();
+            cluster.store().enqueue_eval(
+                "job_reschedule",
+                Some(&cluster.job),
+                Some(&config_id),
+                None,
+                None,
+            )?;
+            while let Some(eval) = cluster.store().claim_eval()? {
+                eval.handle(cluster.store())?;
+                cluster.store().complete_eval(&eval.id, true)?;
+            }
+            Ok(())
+        })?;
+    }
+    let owner = cluster
+        .store()
+        .allocs_for_job(&cluster.job)?
+        .into_iter()
+        .find(|allocation| {
+            cluster
+                .store()
+                .shared_task_configs_for_job_config(&allocation.job_config_id)
+                .is_ok_and(|tasks| {
+                    tasks
+                        .iter()
+                        .any(|(id, task)| *id == allocation.task_config_id && task.name == "ci")
+                })
+        })
+        .context("the ci allocation")?;
+    let other = if owner.node_id == "n1" { "n2" } else { "n1" };
+    let child = || async {
+        cluster
+            .svc
+            .create_instance(Request::new(CreateInstanceRequest {
+                job_id: cluster.job.clone(),
+                owner: Some(legion::structs::children::owner_ref(
+                    legion::structs::children::OWNER_ALLOCATION,
+                    &owner.id.to_string(),
+                )),
+                ..Default::default()
+            }))
+            .await
+            .map(Response::into_inner)
+    };
+    // Most-room-first alone would send the second start to the other node.
+    let mut landed = Vec::new();
+    for _ in 0..2 {
+        let reply = child().await?;
+        assert_eq!(
+            reply.owner.as_ref().map(|owner| owner.kind.as_str()),
+            Some("allocation")
+        );
+        landed.push(reply.node_id);
+    }
+    assert_eq!(
+        landed,
+        vec![owner.node_id.clone(), owner.node_id.clone()],
+        "both beside their owner (envelopes on {:?})",
+        legion::manager::sessions::envelope_nodes(cluster.store(), &cluster.job, TASK)
+    );
+    // The owner's node has no room left: the router picks another.
+    cluster.node(&owner.node_id).lock().full = true;
+    let reply = child().await?;
+    assert_eq!(reply.node_id, other, "fell back: {reply:?}");
     Ok(())
 }
 

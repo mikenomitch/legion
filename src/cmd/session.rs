@@ -897,7 +897,10 @@ async fn handoff(matches: &ArgMatches) -> R<()> {
     let socket = std::path::Path::new(&api_socket).with_file_name(handoff::HANDOFF_SOCKET_NAME);
     let request = handoff::HandoffRequest {
         child: matches.get_one::<String>("id").cloned().unwrap_or_default(),
-        port: matches.get_one::<String>("port").cloned().unwrap_or_default(),
+        port: matches
+            .get_one::<String>("port")
+            .cloned()
+            .unwrap_or_default(),
     };
     let fd = matches.get_one::<i32>("fd").copied().unwrap_or(-1);
     let wait = matches.get_flag("wait");

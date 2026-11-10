@@ -8,6 +8,8 @@ its own at their rank. Entry 1 revises the first draft (2026-10-28), which
 limited ownership to sessions; it says what it replaced, and entries 5 to 7
 follow from it.
 
+---
+
 ## 1. Ownership is a typed reference stored with the child, for every owner kind (revised)
 
 **Call.** A child stores `owner = { kind, id }`, where `kind` is
@@ -226,10 +228,6 @@ worker-plane forwarding, which are their own phase.
 
 ---
 
-*Entries 10 to 20 were added 2026-11-10 while building Phases 1 and 2. They
-rank below the design calls above, so they are appended and no earlier
-entry was renumbered.*
-
 ## 10. The managers ask about a session owner on another node; the child's node does not
 
 **Call.** A child whose `session` owner is not on its node (it was placed
@@ -254,7 +252,43 @@ managers already hold the node list, the tag map, the mTLS client, and
 `sessions::locate`, which returns exactly the three answers the rule needs
 (found, not found, unreachable).
 
-## 11. Raft-owned owners are judged on every heartbeat, and pushed on a one-second stream tick
+---
+
+## 11. An instance owner's stop and destroy end its keyed children in the same entry; every other end is swept by the leader
+
+*Added 2026-11-10, with Phase 3.*
+
+**Call.** `stop_keyed_instance` and `destroy_keyed_instance` end the
+owner's keyed children inside their own apply, before the owner's rows
+change, applying the owner's verb. Owners that end any other way (an
+`allocation` owner that completes, fails, or is lost; an instance ended by
+its job's stop or a scale-down) are found by a sweep the scheduler lane's
+leader runs every 5 seconds, which ends their children in one entry.
+
+```console
+$ legion instance stop user-42      # its keyed children are stopped in this entry
+$ legion instance destroy user-42   # ... and destroyed in this one
+```
+
+**Alternatives.** (a) The plan's letter (§6.4): every terminal transition of
+every owner kind cascades in its own transaction. (b) Sweep only, no
+in-entry cascade.
+
+**Trade-off.** A keyed child of an allocation owner outlives it by up to 5
+seconds, and one more scheduler-lane entry is written when that happens. A
+manager that loses leadership mid-sweep leaves the rest to the next leader.
+
+**Why (simplicity, performance).** An allocation reaches a terminal state
+through a dozen store paths (node loss, completion, eviction, job stop,
+rollouts), most of them hot; an indexed lookup for children in each would
+tax every allocation removal for a feature few jobs use, and one missed
+path would leak a child for ever. The two explicit instance verbs are the
+ones an operator types and expects to be atomic, so they are. The sweep is
+one indexed read of a partial index that is empty in almost every cluster.
+
+---
+
+## 12. Raft-owned owners are judged on every heartbeat, and pushed on a one-second stream tick
 
 **Call.** `owner_notices(store, node)` reads the owners of the children a
 node's last report lists and the owners' rows in the store, on every
@@ -278,50 +312,67 @@ path away from a leak. Reading the owner's state where the notice is sent
 has one code path, is correct on every manager, and makes the backstop
 every beat instead of every thirtieth.
 
-## 12. The owner reference rides in the session's launch payload
+---
 
-**Call.** `ProvisionalAllocation.session` (`SessionStart`) carries `owner`,
-`owner_remote`, and `suspend_with_owner`. The worker already persists a
-session's launch payload in its `sessions.db` row, so the reference
-survives a restart with no schema change; an in-memory index
-(`session_owners`) is rebuilt from the payloads.
+## 13. A worker vouches for its allocation to create a keyed child; the task's identity token is not used
 
-**Alternatives.** A column on the session row, or a field on `ClaimRecord`.
+*Added 2026-11-10, with Phase 3.*
 
-**Trade-off.** Re-keying an owner rewrites its children's payloads and
-rows. `SessionStart` is no longer `Copy`.
+**Call.** `legion instance create <task> --owner self` inside a task calls
+`Workload.CreateChildInstance` on the API socket. The worker attributes the
+connection to its allocation, as for every workload-channel call, and asks a
+manager with its own node credential (`Manager.CreateChildInstance`,
+worker-plane). The manager checks the allocation is placed on that node and
+applies the `children` block.
 
-**Why (simplicity).** The payload is the one record every path already
-carries from admission to the log to a resume.
+**Alternatives.** (a) Proxy `Manager.CreateInstance` with the allocation's
+`legion` identity token and teach the manager to read `owner = self` from
+the token. (b) Require a token with `job:write` in the task.
 
-## 13. No `owner` and `root` identity claims, and no tenant label, for session children
+**Trade-off.** One more Manager RPC, and a compromised worker can create
+keyed children for any allocation placed on it (bounded by each job's
+`children` block and `max`).
 
-**Call.** Not built. Session tasks cannot declare `identities` and carry no
-tenant label, so a session child has no token and no label to inherit.
+**Why (security, simplicity).** The plan's point is that the owner needs no
+credential (calls entry 2). (a) would make the right depend on the task
+declaring a `legion` identity and on a grant for it, a second way to get
+attribution wrong; (b) puts `job:write` where a prompt-injected agent can
+use it. A worker already holds everything on its node, so vouching for its
+own allocations adds no new trust.
 
-**Alternatives.** Issue identities to sessions first.
+---
 
-**Trade-off.** An upstream cannot attribute a child's request to its owner
-from a token. Attribution is in the session report and `legion instance
-get`.
+## 14. Connection handoff passes the descriptor on a second socket with a line protocol, not through gRPC
 
-**Why (scope).** Workload identity for sessions is its own limitation with
-its own design (tokens for units with no raft allocation). The claims
-belong with keyed children, whose allocations already get tokens.
+*Added 2026-11-10, with Phase 4.*
 
-## 14. A child that moves to another node is detached
+**Call.** The owner sends one JSON line and the accepted connection's
+descriptor (`SCM_RIGHTS`) on `legion-handoff.sock`, beside `legion.sock` and
+admitted by the same rule. The worker answers one line, splices, and writes
+a last line when the connection closes. `legion session handoff <child>
+--port <label> --fd <n> [--wait]` wraps it.
 
-**Call.** A `store` child resumed on another node becomes an ordinary
-session there. The session manifest does not carry the owner.
+```text
+-> {"child":"machine-q4n7c2rd.01jc0","port":"http"}      (+ the descriptor)
+<- {"ok":true}
+<- {"closed":true,"sent":10485760,"received":211}
+```
 
-**Alternatives.** Add the owner to the manifest format.
+**Alternatives.** (a) A gRPC call that returns a one-time token, then a
+second connection that presents the token with the descriptor. (b) The
+worker accepts the client connection itself and the owner only decides
+(an L7 router in the worker). (c) The owner proxies through the worker
+(no handoff; the owner stays in the path).
 
-**Trade-off.** A moved child no longer ends with its owner.
+**Trade-off.** One call of the workload channel is not gRPC, so it has its
+own tiny client (the CLI, or ten lines in any language with `sendmsg`).
 
-**Why (scope).** The manifest is a published, versioned format that other
-nodes and the gateway read. Changing it for a case the plan lists beside
-"moving children with their owner" (a non-goal) was not worth a format
-version.
+**Why (performance, simplicity).** A descriptor cannot ride HTTP/2, and (a)
+is two round trips and a token store to pass one fd. (b) moves the routing
+decision into the worker, which the plan refuses: the owner keeps the
+decision, the worker moves the bytes. (c) is what handoff exists to avoid.
+
+---
 
 ## 15. A child is started through a manager with `CreateInstance.owner`, not a new RPC
 
@@ -340,7 +391,128 @@ ticket); `legion instance create` without `--id` is how every unnamed
 session is started through a manager. A child is that call with one more
 field, so it inherits its ACL, idempotency, and MCP tool.
 
-## 16. `child_gone` is a record the owner reads, not an event
+---
+
+## 16. Keyed children carry `owner` and `root` identity claims; session children carry none, and no tenant label
+
+*Revised 2026-11-10 with Phase 3: the claims now exist for keyed children.*
+
+**Call.** A keyed child's workload identity token carries `legion.io/owner`
+and `legion.io/root` (`instance:user-42`), read from its row. A session
+child has no token to carry them: sessions cannot declare `identities`
+(the managers mint tokens for allocations in the store, and a session has
+none), and no unit carries a tenant label to inherit.
+
+**Alternatives.** Issue identities to sessions first.
+
+**Trade-off.** An upstream cannot attribute a session child's request to
+its owner from a token. Attribution is in the session report and `legion
+instance get`.
+
+**Why (scope).** Workload identity for sessions is its own limitation with
+its own design (tokens for units with no raft allocation).
+
+---
+
+## 17. The owner reference rides in the session's launch payload
+
+**Call.** `ProvisionalAllocation.session` (`SessionStart`) carries `owner`,
+`owner_remote`, and `suspend_with_owner`. The worker already persists a
+session's launch payload in its `sessions.db` row, so the reference
+survives a restart with no schema change; an in-memory index
+(`session_owners`) is rebuilt from the payloads.
+
+**Alternatives.** A column on the session row, or a field on `ClaimRecord`.
+
+**Trade-off.** Re-keying an owner rewrites its children's payloads and
+rows. `SessionStart` is no longer `Copy`.
+
+**Why (simplicity).** The payload is the one record every path already
+carries from admission to the log to a resume.
+
+---
+
+## 18. A child that moves to another node is detached
+
+**Call.** A `store` child resumed on another node becomes an ordinary
+session there. The session manifest does not carry the owner.
+
+**Alternatives.** Add the owner to the manifest format.
+
+**Trade-off.** A moved child no longer ends with its owner.
+
+**Why (scope).** The manifest is a published, versioned format that other
+nodes and the gateway read. Changing it for a case the plan lists beside
+"moving children with their owner" (a non-goal) was not worth a format
+version.
+
+---
+
+## 19. `children.max` is exact on the owner's node and approximate across nodes
+
+**Call.** The owner's node counts the children it holds and adds the count
+of children elsewhere that the routing manager's index reported
+(`SessionStart.owner_children_elsewhere`).
+
+**Alternatives.** A raft counter per owner.
+
+**Trade-off.** Two managers routing children of one owner to two other
+nodes within a heartbeat can exceed `max` by the overlap.
+
+**Why (performance).** No session child writes to raft (the plan's goal).
+The common case, children on the owner's node, is exact.
+
+*Added 2026-11-10 with Phase 3:* keyed children are counted in the create's
+own write, so two concurrent keyed creates cannot both pass; the session
+children an owner has are still the index's count, and a session start is
+told `max` less the keyed count.
+
+---
+
+## 20. A keyed child's owner node is a placement preference bound to that child, not a pin
+
+*Added 2026-11-10, with Phase 3.*
+
+**Call.** For a keyed child awaiting its first placement the scheduler
+narrows the eligible nodes to its owner's node when that node is eligible,
+and binds the placement to that child, the way a floating restore is bound.
+When the owner's node is not eligible the child goes wherever the task
+fits.
+
+**Alternatives.** (a) A hard pin, failing the placement when the owner's
+node is full. (b) A scoring term, so the owner's node is merely likelier.
+
+**Trade-off.** A child can land away from its owner, and a later reschedule
+does not bring it back. The lookup adds one indexed read per eval of a
+keyed task (empty unless a child is pending).
+
+**Why (simplicity).** (a) turns a full node into an unplaceable child for
+something that is a convenience (the owner reaches the child either way).
+(b) needs the scoring cache to carry a per-instance term, where every
+existing term is per task; the floating-restore path already binds one
+instance to one narrowed candidate set.
+
+---
+
+## 21. Promoting a child keeps its owner when the managers judge that owner, and detaches it otherwise
+
+*Revised 2026-11-10 with Phase 3, which added the `owner` column.*
+
+**Call.** A promoted child of an `instance` or `allocation` owner keeps the
+reference: the promotion writes it into the new row, in its own entry. A
+promoted child of a `session` owner is detached.
+
+**Alternatives.** Refuse to promote a child of a session.
+
+**Trade-off.** A promoted child of a session no longer ends with it, and
+nothing says so beyond the docs.
+
+**Why (simplicity).** A durable child of an ephemeral owner is not allowed
+(entry 6); detaching is what promotion means for it ("keep this one").
+
+---
+
+## 22. `child_gone` is a record the owner reads, not an event
 
 **Call.** A node remembers each ended child for ten minutes with a reason.
 `Workload.ListChildren` lists them as `gone`, and a read of the id answers
@@ -356,33 +528,9 @@ limitations), and an owner inside a task has no stream to receive one on.
 Listing and stopping are the smallest surface that lets an owner manage
 what the jobspec lets it start.
 
-## 17. Promoting a child always detaches it, until keyed children exist
+---
 
-**Call.** A promoted child loses its owner whatever the owner's kind.
-
-**Alternatives.** The plan (§6.5) keeps the reference when the owner is an
-instance or allocation, in the new instance row.
-
-**Trade-off.** A promoted child of a durable owner no longer ends with it.
-
-**Why (scope).** The instance row has no `owner` column before Phase 3.
-Phase 3 adds it and should then keep the reference in this case.
-
-## 18. `children.max` is exact on the owner's node and approximate across nodes
-
-**Call.** The owner's node counts the children it holds and adds the count
-of children elsewhere that the routing manager's index reported
-(`SessionStart.owner_children_elsewhere`).
-
-**Alternatives.** A raft counter per owner.
-
-**Trade-off.** Two managers routing children of one owner to two other
-nodes within a heartbeat can exceed `max` by the overlap.
-
-**Why (performance).** No session child writes to raft (the plan's goal).
-The common case, children on the owner's node, is exact.
-
-## 19. A node's refusal for the owner's sake is final for the router
+## 23. A node's refusal for the owner's sake is final for the router
 
 **Call.** A refusal that starts with `child refused: ` (not declared, at
 `max`, the owner is a child) ends the start; the router does not try
@@ -395,7 +543,9 @@ another node.
 **Why (correctness).** Another node would not know the owner and would
 admit the child on the manager's word, defeating the owner node's check.
 
-## 20. `suspendWithOwner` for an instance owner is sent on the change, once per manager
+---
+
+## 24. `suspendWithOwner` for an instance owner is sent on the change, once per manager
 
 **Call.** A manager sends the `suspended` notice the first time it sees an
 owner instance suspended, and not again until it has seen it not suspended.
@@ -406,3 +556,41 @@ owner instance suspended, and not again until it has seen it not suspended.
 
 **Why (correctness).** A child that was resumed on demand must stay
 resumed; repeating the notice would suspend it again every beat.
+
+---
+
+## 25. A handoff reaches only a running session child on the owner's own node
+
+*Added 2026-11-10, with Phase 4.*
+
+**Call.** The handoff socket resolves a child among the sessions this node
+holds for the calling owner. A child on another node, a suspended child,
+and a keyed child are refused.
+
+**Alternatives.** Dial a remote child over the worker plane; wake a
+suspended child first; look keyed children up through a manager.
+
+**Trade-off.** An owner whose child the router placed on another node must
+proxy to it, or start it where it can hand off.
+
+**Why (performance, scope).** Across nodes the worker would be a proxy on
+the worker plane, not a splice between two local sockets, which is not the
+thing the plan measured. Waking on handoff is wake-on-connect, which
+belongs to the suspend plan's Phase 8.
+
+---
+
+## 26. `legion.io/root` equals `legion.io/owner`
+
+*Added 2026-11-10, with Phase 3.*
+
+**Call.** A keyed child's identity token carries both claims with the same
+value, `kind:id`.
+
+**Alternatives.** Emit only `owner` until grandchildren exist.
+
+**Trade-off.** Two claims say one thing today.
+
+**Why (extensibility).** An upstream that attributes by `root` keeps working
+if depth ever grows; adding the claim later would change tokens under
+verifiers that already pin their claim set.

@@ -529,6 +529,15 @@ across them. See [session-mode.md](session-mode.md).
   later copy of a session id running on two nodes).
 - **`legion_session_promotions_total`** (counter): running sessions promoted
   to keyed instances, one scheduler-lane raft entry each.
+- **`legion_keyed_children_ended_total{end}`** (counter): keyed
+  [children](child-sessions.md#keyed-children) the scheduler lane's leader
+  ended because their owner ended some way other than an instance stop or
+  destroy (an allocation that completed or was lost, a job stop), by what
+  was applied: `stopped` or `destroyed`. An instance owner's own stop and
+  destroy end its children in the same entry and are not counted here.
+- **`legion_child_handoffs_total`** (counter, on workers): inbound
+  connections an owner handed to one of its children's ports
+  ([connection handoff](child-sessions.md#connection-handoff)).
 - **`legion_envelope_resizes_total{direction, outcome}`** (counter): elastic
   envelope resizes nodes asked this manager for
   ([elastic envelopes](session-mode.md#elastic-envelopes)), by `direction`

@@ -7523,12 +7523,6 @@ impl Manager for ManagerDaemonService {
         let inner = request.into_inner();
         tracing::Span::current().record("node_id", inner.node_id.as_str());
         tracing::Span::current().record("allocation_id", inner.allocation_id);
-        if !identity.is_management && identity.principal != format!("node:{}", inner.node_id) {
-            return Err(Status::permission_denied(format!(
-                "worker {:?} may not create children for node {:?}",
-                identity.principal, inner.node_id
-            )));
-        }
         let not_here = || {
             Status::not_found(format!(
                 "allocation {} does not run on node {:?}",
@@ -7541,6 +7535,14 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Error loading allocation", e))?
             .filter(|allocation| allocation.node_id == inner.node_id)
             .ok_or_else(not_here)?;
+        // Bound to the authenticated principal, as IssueWorkloadIdentityToken
+        // is: a worker speaks only for allocations placed on its own node.
+        if !identity.is_management && identity.principal != format!("node:{}", inner.node_id) {
+            return Err(Status::permission_denied(format!(
+                "worker {:?} may not create children for node {:?}",
+                identity.principal, inner.node_id
+            )));
+        }
         let idempotency_key = scoped_idempotency_key(
             &identity,
             "create_child_instance",

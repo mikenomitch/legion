@@ -258,7 +258,11 @@ impl WorkerTaskManager {
         }
         let network = allocation.network.clone().unwrap_or_default();
         let Some(port) = network.ports.iter().find(|port| port.name == label) else {
-            let declared: Vec<&str> = network.ports.iter().map(|port| port.name.as_str()).collect();
+            let declared: Vec<&str> = network
+                .ports
+                .iter()
+                .map(|port| port.name.as_str())
+                .collect();
             return Err(Status::failed_precondition(format!(
                 "child {child} declares no port {label:?} (its ports: {})",
                 if declared.is_empty() {
@@ -392,7 +396,7 @@ impl WorkerTaskManager {
                 .iter()
                 .filter(|(_, gone)| same_owner(&gone.owner, owner))
                 .map(|(id, gone)| ChildInfo {
-                kind: crate::structs::children::CHILD_SESSION.into(),
+                    kind: crate::structs::children::CHILD_SESSION.into(),
                     session_id: id.clone(),
                     task_name: gone.task_name.clone(),
                     node_id: node_id.to_string(),

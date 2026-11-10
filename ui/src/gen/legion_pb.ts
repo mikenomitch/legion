@@ -11096,23 +11096,33 @@ export class CreateInstanceRequest extends Message<CreateInstanceRequest> {
   fromSnapshot?: string;
 
   /**
-   * Start the unnamed session as a child of this unit
-   * (docs/child-sessions.md): it ends when its owner ends, and is listed
-   * under it. Session tasks only, and only without `instance_id`. The
-   * owner must be a running unit of the same job whose task names this
-   * task in `children.tasks`. Needs `job:write` like any create.
+   * Create the unit as a child of this unit (docs/child-sessions.md): it
+   * ends when its owner ends, and is listed under it. The owner must be a
+   * running unit of the same job whose task names this task in
+   * `children.tasks`. Needs `job:write` like any create.
+   *
+   * - On a session task without `instance_id`, the child is an unnamed
+   *   session. It goes to its owner's node when that node's envelope for
+   *   this task has room, and to another node with room otherwise.
+   * - On a keyed task (or a session task with `instance_id`, which makes a
+   *   keyed instance), the child is a keyed instance whose row stores the
+   *   reference. The owner must be an `instance` or an `allocation`: a
+   *   session cannot own a durable child. Stopping the owner stops the
+   *   child and destroying it destroys the child, in the owner's own
+   *   replicated entry; suspending, archiving, or rescheduling the owner
+   *   does neither. The scheduler prefers the owner's node for the child's
+   *   first placement. `from_snapshot` is refused with `owner`.
    *
    * `kind` is `session` (a session id), `instance` (a keyed or slot
    * instance id), or `allocation` (an allocation id, for owners with no
    * instance identity); empty asks the manager to work it out from `id`.
-   * The child goes to its owner's node when that node's envelope for this
-   * task has room, and to another node with room otherwise.
    *
    * Errors: NotFound when no running unit has the id; FailedPrecondition
    * when the owner's task does not declare this task, when the owner is
-   * itself a child (depth 1 only), or when the task is keyed;
-   * ResourceExhausted (retryable) when the owner already has
-   * `children.max` children or no envelope has room.
+   * itself a child (depth 1 only), or when a session would own a keyed
+   * child; ResourceExhausted (retryable) when the owner already has
+   * `children.max` children (session and keyed children counted together)
+   * or, for a session child, no envelope has room.
    *
    * @generated from field: optional legion.OwnerRef owner = 7;
    */
@@ -11149,6 +11159,83 @@ export class CreateInstanceRequest extends Message<CreateInstanceRequest> {
 
   static equals(a: CreateInstanceRequest | PlainMessage<CreateInstanceRequest> | undefined, b: CreateInstanceRequest | PlainMessage<CreateInstanceRequest> | undefined): boolean {
     return proto3.util.equals(CreateInstanceRequest, a, b);
+  }
+}
+
+/**
+ * Request payload for Manager.CreateChildInstance (worker-plane).
+ *
+ * @generated from message legion.CreateChildInstanceRequest
+ */
+export class CreateChildInstanceRequest extends Message<CreateChildInstanceRequest> {
+  /**
+   * The calling node: the one the owning allocation runs on.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * The allocation whose workload asked, as the node attributed the
+   * connection on its API socket.
+   *
+   * @generated from field: int64 allocation_id = 2;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The keyed task to create a child of. It must be a task of the
+   * allocation's job that the allocation's task names in `children.tasks`.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Optional key for the child, as `CreateInstanceRequest.instance_id`.
+   * Empty mints an unnamed id.
+   *
+   * @generated from field: string instance_id = 4;
+   */
+  instanceId = "";
+
+  /**
+   * Optional retry key, scoped to the owning allocation: a repeat returns
+   * the instance the first call created with `deduplicated = true`.
+   *
+   * @generated from field: string idempotency_key = 5;
+   */
+  idempotencyKey = "";
+
+  constructor(data?: PartialMessage<CreateChildInstanceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CreateChildInstanceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateChildInstanceRequest {
+    return new CreateChildInstanceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CreateChildInstanceRequest {
+    return new CreateChildInstanceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CreateChildInstanceRequest {
+    return new CreateChildInstanceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CreateChildInstanceRequest | PlainMessage<CreateChildInstanceRequest> | undefined, b: CreateChildInstanceRequest | PlainMessage<CreateChildInstanceRequest> | undefined): boolean {
+    return proto3.util.equals(CreateChildInstanceRequest, a, b);
   }
 }
 
@@ -31099,6 +31186,66 @@ export class StartSessionReply extends Message<StartSessionReply> {
 }
 
 /**
+ * `Workload.CreateChildInstance`.
+ *
+ * @generated from message legion.WorkloadCreateChildInstanceRequest
+ */
+export class WorkloadCreateChildInstanceRequest extends Message<WorkloadCreateChildInstanceRequest> {
+  /**
+   * The keyed task to create a child of. It must be a task of the caller's
+   * job that the caller's task names in `children.tasks`.
+   *
+   * @generated from field: string task_name = 1;
+   */
+  taskName = "";
+
+  /**
+   * Optional key for the child (`[A-Za-z0-9._-]{1,128}`). Empty mints an
+   * unnamed id.
+   *
+   * @generated from field: string instance_id = 2;
+   */
+  instanceId = "";
+
+  /**
+   * Optional retry key: a repeat returns the same instance with
+   * `deduplicated = true`.
+   *
+   * @generated from field: string idempotency_key = 3;
+   */
+  idempotencyKey = "";
+
+  constructor(data?: PartialMessage<WorkloadCreateChildInstanceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.WorkloadCreateChildInstanceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkloadCreateChildInstanceRequest {
+    return new WorkloadCreateChildInstanceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): WorkloadCreateChildInstanceRequest {
+    return new WorkloadCreateChildInstanceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): WorkloadCreateChildInstanceRequest {
+    return new WorkloadCreateChildInstanceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: WorkloadCreateChildInstanceRequest | PlainMessage<WorkloadCreateChildInstanceRequest> | undefined, b: WorkloadCreateChildInstanceRequest | PlainMessage<WorkloadCreateChildInstanceRequest> | undefined): boolean {
+    return proto3.util.equals(WorkloadCreateChildInstanceRequest, a, b);
+  }
+}
+
+/**
  * A typed reference to the unit that owns a child (docs/child-sessions.md).
  * It is stored with the child, wherever the child's own record lives, and
  * whoever holds that record ends the child when the owner's authority says
@@ -31239,7 +31386,8 @@ export class OwnerNotice extends Message<OwnerNotice> {
  */
 export class ChildInfo extends Message<ChildInfo> {
   /**
-   * The child's session id.
+   * The child's id: a session id for a session child, an instance id for a
+   * keyed child (`kind` says which).
    *
    * @generated from field: string session_id = 1;
    */
@@ -31274,6 +31422,17 @@ export class ChildInfo extends Message<ChildInfo> {
    */
   reason = "";
 
+  /**
+   * `session` for a session child, whose record is its node's, or
+   * `instance` for a keyed child, whose record is a replicated row
+   * (`state` is then the instance state: `pending`, `active`, `suspended`,
+   * `rescheduling`, or `stopped`). Only `GetInstance` lists keyed children:
+   * a node knows the sessions it holds, not the rows.
+   *
+   * @generated from field: string kind = 6;
+   */
+  kind = "";
+
   constructor(data?: PartialMessage<ChildInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -31287,6 +31446,7 @@ export class ChildInfo extends Message<ChildInfo> {
     { no: 3, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ChildInfo {

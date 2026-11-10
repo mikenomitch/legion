@@ -185,6 +185,7 @@ impl Cluster {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn set(&self, request: SetRuntimeEnabledRequest) -> Result<SetRuntimeEnabledReply, Status> {
         self.runtime
             .block_on(self.svc.set_runtime_enabled(Request::new(request)))
@@ -207,6 +208,7 @@ impl Cluster {
         })?)
     }
 
+    #[allow(clippy::result_large_err)]
     fn enable(&self, runtime: &str, namespaces: &[&str]) -> Result<SetRuntimeEnabledReply, Status> {
         self.set(SetRuntimeEnabledRequest {
             runtime: runtime.into(),
@@ -331,7 +333,7 @@ fn a_disable_blocks_placement_with_the_reason_and_enable_places_it() -> R<()> {
     let status = cluster.status()?;
     assert_eq!(status.len(), 1);
     assert!(status[0].blocked_evals >= 1);
-    assert_eq!(status[0].running.clone().context("running")?.allocations, 2);
+    assert_eq!(status[0].running.context("running")?.allocations, 2);
     assert!(status[0].unaware_nodes.is_empty());
 
     // Enable: blocked work places on its own.

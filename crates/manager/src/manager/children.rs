@@ -205,11 +205,7 @@ pub async fn children_of(store: &Store, job_id: &str, owner: &OwnerRef) -> Vec<C
 
 /// An owner's session children across the cluster, as every manager's
 /// session index lists them.
-pub async fn session_children_of(
-    store: &Store,
-    job_id: &str,
-    owner: &OwnerRef,
-) -> Vec<ChildInfo> {
+pub async fn session_children_of(store: &Store, job_id: &str, owner: &OwnerRef) -> Vec<ChildInfo> {
     let mut found: HashMap<String, ChildInfo> = store
         .sessions()
         .children_of(&owner.kind, &owner.id)
@@ -698,7 +694,13 @@ mod children_test {
 
         // A shorter orphanAfter on the task ends it sooner.
         let mut entry = watched(Duration::from_secs(61));
-        settle_probe(&mut entry, "agent-1", &unreachable, Duration::from_secs(60), grace);
+        settle_probe(
+            &mut entry,
+            "agent-1",
+            &unreachable,
+            Duration::from_secs(60),
+            grace,
+        );
         assert!(entry.ended.is_some());
     }
 

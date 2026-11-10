@@ -912,13 +912,21 @@ async fn a_keyed_owner_owns_keyed_children_test() -> R<()> {
 
     // A child cannot own (depth 1), and a session cannot own a keyed child.
     let nested = cluster
-        .create_keyed(WORKSPACE, "ws-nested", Some(owner_ref(OWNER_INSTANCE, "ws-1")))
+        .create_keyed(
+            WORKSPACE,
+            "ws-nested",
+            Some(owner_ref(OWNER_INSTANCE, "ws-1")),
+        )
         .await
         .expect_err("a child owns nothing");
     assert_eq!(nested.code(), Code::FailedPrecondition, "{nested}");
     let agent = cluster.start(AGENT, None).await?;
     let durable_of_session = cluster
-        .create_keyed(WORKSPACE, "ws-of-session", Some(session(&agent.instance_id)))
+        .create_keyed(
+            WORKSPACE,
+            "ws-of-session",
+            Some(session(&agent.instance_id)),
+        )
         .await
         .expect_err("a session cannot own a durable child");
     assert_eq!(
@@ -1048,9 +1056,15 @@ async fn a_worker_creates_a_keyed_child_for_its_allocation_test() -> R<()> {
     // The allocation ends: nothing cascades in its own entry, so the
     // leader's sweep stops the child.
     cluster.run_evals()?;
-    assert_eq!(legion::manager::children::sweep_keyed_children(cluster.store())?, 0);
+    assert_eq!(
+        legion::manager::children::sweep_keyed_children(cluster.store())?,
+        0
+    );
     tokio::task::block_in_place(|| cluster.store().remove_allocation_by_id(ci))?;
-    assert_eq!(legion::manager::children::sweep_keyed_children(cluster.store())?, 1);
+    assert_eq!(
+        legion::manager::children::sweep_keyed_children(cluster.store())?,
+        1
+    );
     assert_eq!(
         cluster.instance("ws-ci")?.state,
         legion::structs::InstanceState::Stopped
@@ -1084,7 +1098,10 @@ async fn a_promoted_child_of_an_allocation_stays_its_child_test() -> R<()> {
     // It ends with its owner still: here through the sweep, since an
     // allocation's end is not an instance stop.
     tokio::task::block_in_place(|| cluster.store().remove_allocation_by_id(ci))?;
-    assert_eq!(legion::manager::children::sweep_keyed_children(cluster.store())?, 1);
+    assert_eq!(
+        legion::manager::children::sweep_keyed_children(cluster.store())?,
+        1
+    );
     assert_eq!(
         cluster.instance("kept")?.state,
         legion::structs::InstanceState::Stopped

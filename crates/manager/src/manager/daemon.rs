@@ -585,7 +585,9 @@ pub async fn run_manager_with(
             .await;
             match swept {
                 Ok(Ok(_)) => {}
-                Ok(Err(err)) => debug!(error = ?err, "Keyed child sweep failed; retrying next tick"),
+                Ok(Err(err)) => {
+                    debug!(error = ?err, "Keyed child sweep failed; retrying next tick")
+                }
                 Err(join_error) => warn!("Keyed child sweep task failed: {join_error:?}"),
             }
         }

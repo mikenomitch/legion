@@ -23,7 +23,9 @@ const TERMINAL_ALLOCATION: [&str; 4] = ["complete", "failed", "stopped", "lost"]
 pub enum KeyedChildOutcome {
     Created(Box<Instance>),
     /// The owner already has this many children; nothing was written.
-    AtMax { children: u32 },
+    AtMax {
+        children: u32,
+    },
 }
 
 /// The verb an owner's end applies to its keyed children.
@@ -166,7 +168,10 @@ impl Store {
 
     /// Resolve each `(child, owner)` to `(child, owner's node)`, dropping
     /// children whose owner is placed nowhere right now.
-    fn owner_nodes_on(conn: &Connection, pending: Vec<(String, String)>) -> R<Vec<(String, String)>> {
+    fn owner_nodes_on(
+        conn: &Connection,
+        pending: Vec<(String, String)>,
+    ) -> R<Vec<(String, String)>> {
         let mut preferences = Vec::with_capacity(pending.len());
         for (instance_id, owner) in pending {
             let Some((kind, id)) = owner.split_once(':') else {
@@ -344,7 +349,9 @@ impl Store {
         for (instance_id, owner, state) in rows {
             match Self::raft_owner_end_on(&conn, &owner)? {
                 Some(OwnerEnd::Destroyed) => orphaned.push((instance_id, owner)),
-                Some(OwnerEnd::Stopped) if state != "stopped" => orphaned.push((instance_id, owner)),
+                Some(OwnerEnd::Stopped) if state != "stopped" => {
+                    orphaned.push((instance_id, owner))
+                }
                 _ => {}
             }
         }
