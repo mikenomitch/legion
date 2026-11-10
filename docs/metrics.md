@@ -290,14 +290,6 @@ See [adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md).
   so it sits near zero while the fleet is stable. A rate that tracks the plan
   rate means nodes are changing under every plan, and each plan pays an
   O(fleet) rebuild.
-- **`legion_scheduler_lazy_sample_fallback_total`** (counter):
-  **retired, always 0.** It counted plans that re-ran with the eager
-  whole-fleet epoch sample because the read model changed mid-plan.
-  Plans now take their fence epochs from their own capacity snapshot and
-  never re-run (see "The epoch sample comes from the plan's own snapshot"
-  in [scheduler-and-eval-loop.md](scheduler-and-eval-loop.md)). Nothing
-  increments it anymore. It is still exported so dashboards that graph it
-  don't break.
 
 ### Content locality
 
@@ -672,12 +664,16 @@ CPU sits idle and no single operation is slow. These two families name that
 condition directly. Without them, everything just looks slow for no clear
 reason.
 
+- **`process_resident_memory_bytes`** (gauge): the manager process's
+  resident set size, read from `/proc/self/status` at each scrape. It keeps
+  the conventional Prometheus name (no `legion_` prefix) so stock process
+  dashboards pick it up. Linux only: it reads 0 on macOS.
 - **`legion_runtime_worker_threads`** (gauge): worker threads in the
   runtime. Set once at startup. This is the ceiling on concurrent blocking
   handlers and the denominator for `legion_grpc_in_flight`.
-- **`legion_runtime_spawn_delay_seconds`** (histogram): a probe task is
-  spawned once a second and records how long it waited before its first
-  poll. Tens of microseconds is a healthy runtime. Milliseconds means no
+- **`legion_runtime_spawn_delay_seconds`** (histogram): once a second a
+  timer wakes the probe, which spawns a task and records how long after the
+  timer's deadline that task was first polled. Tens of microseconds is a healthy runtime. Milliseconds means no
   worker thread was free to pick up trivial work. That points to blocking
   handlers, not load: the delay lands on unrelated RPCs, so a do-nothing
   endpoint's p99 rises along with an expensive one's. Buckets start at 50µs,

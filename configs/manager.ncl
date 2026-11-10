@@ -409,12 +409,6 @@
     # ONLY — never read back as liveness. "0s" disables it entirely, and
     # non-leaders then show no time rather than an approximate one.
     checkpointInterval = "30s",
-
-    # Accumulation window for the heartbeat group commit. "0ms" (the
-    # default) is commit-while-you-can batching. A steady-state heartbeat
-    # does not commit at all, so this applies only to the checkpoint and to
-    # the mixed-version forwarding fallback.
-    # batchWindow = "0ms",
   },
   # Auth & ACLs (on by default; see docs/auth-and-acls.md). At first start
   # the manager mints the initial management token itself and writes it to

@@ -11,7 +11,6 @@ Legion's running to-do list. Open work is at the top, by area; shipped work is i
 
 | PR | What it lands |
 | --- | --- |
-| [#71](https://github.com/mikenomitch/legion/pull/71) | Legion as five crates (`legion-proto` → `-common` → `-worker` → `-manager` → the binary), so builds and tests fit in memory; moves most of `src/` under `crates/` (the entries under "Developer workflow & CI" at the bottom describe it as landed) |
 | [#70](https://github.com/mikenomitch/legion/pull/70) | Smaller shipping binary (97.3 → 89.1 MB): packed relocations, size-optimized config crates, trimmed dependency features |
 | [#73](https://github.com/mikenomitch/legion/pull/73) | Runtime disable, derived content, session runs, child sessions, and resize, built from #63's plans (carries those plan documents; merge after #70) |
 | [#63](https://github.com/mikenomitch/legion/pull/63) | The isolate-runtime plan |

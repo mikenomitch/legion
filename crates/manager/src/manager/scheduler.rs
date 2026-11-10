@@ -1725,15 +1725,6 @@ impl<'a> Scheduler<'a> {
         scheduler.plan_candidates = scheduler.plan_candidates_setting()?;
         scheduler.preemption =
             PreemptionSettings::from_scheduler_settings(store.scheduler_settings.as_ref())?;
-        if scheduler.retired_lazy_version_sample().is_some() {
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                warn!(
-                    "schedulerSettings.lazy_version_sample is retired and has no effect: \
-                     plans now sample the fence epochs from their own snapshot"
-                );
-            });
-        }
         Ok(scheduler)
     }
 
@@ -6278,20 +6269,6 @@ impl<'a> Scheduler<'a> {
         Ok(Some(ScoreSample { min_nodes, sample }))
     }
 
-    /// `schedulerSettings.lazy_version_sample`, RETIRED: plans now sample
-    /// the fence epochs out of their own capacity snapshot, which has the
-    /// eager sample's guarantee at the lazy sample's cost, so there is no
-    /// longer a choice to make (plan-path-fleet-scaling plan § 6.1). The key
-    /// still parses so existing configs keep loading; `Scheduler::new`
-    /// warns once per process when it is set.
-    fn retired_lazy_version_sample(&self) -> Option<bool> {
-        self.store
-            .scheduler_settings
-            .as_ref()
-            .and_then(|settings| settings.get("lazy_version_sample"))
-            .and_then(Value::as_bool)
-    }
-
     fn nodes_considered_setting(&self) -> R<Option<NodesConsidered>> {
         if !matches!(self.policy.name(), "bin_pack" | "spread") {
             return Ok(None);
@@ -10279,8 +10256,6 @@ mod tests {
         store.insert_node(make_node_msg("node-a", json!({})))?;
 
         let scheduler = Scheduler::new(&store)?;
-        assert_eq!(scheduler.retired_lazy_version_sample(), None);
-
         let first = submit_job(&store, "job-lazy-a", vec![TaskConfig::new("api", "noop")])?;
         let outcome = scheduler.plan_and_apply(&first, PlanMode::Fresh)?;
         assert_eq!(outcome.allocations.len(), 1);
@@ -10426,24 +10401,6 @@ mod tests {
             sampled <= 32,
             "best-of-8 packing must stay within the quality bound: used {sampled} nodes"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn retired_lazy_version_sample_setting_still_parses_and_plans() -> R<()> {
-        // Existing configs that set the retired key must keep loading and
-        // planning; the key no longer changes how the fence is sampled.
-        let store =
-            setup_store_with_scheduler("bin_pack", Some(json!({ "lazy_version_sample": false })))?;
-        store.insert_node(make_node_msg("node-a", json!({})))?;
-
-        let scheduler = Scheduler::new(&store)?;
-        assert_eq!(scheduler.retired_lazy_version_sample(), Some(false));
-
-        let job_config_id = submit_job(&store, "job-eager", vec![TaskConfig::new("api", "noop")])?;
-        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
-        assert_eq!(outcome.allocations.len(), 1);
-
         Ok(())
     }
 

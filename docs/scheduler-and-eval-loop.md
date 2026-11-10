@@ -372,14 +372,6 @@ invisible to it, so the plan-apply compare-and-set rejects only the plans
 whose scopes moved. A plan never re-runs because something unrelated
 committed.
 
-`schedulerSettings.lazy_version_sample` is **retired**. It still parses,
-so existing configs keep loading, but it has no effect, and the manager
-logs one warning when it is set:
-
-```text
-WARN schedulerSettings.lazy_version_sample is retired and has no effect: plans now sample the fence epochs from their own snapshot
-```
-
 ### Group commit
 
 Concurrent plan applies (parallel eval workers) coalesce into **one**

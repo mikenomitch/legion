@@ -983,13 +983,6 @@ impl HeartbeatConfigFull {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LivenessConfig {
-    /// Accumulation window for the heartbeat group commit. `0ms` (the
-    /// default) is commit-while-you-can batching. Once liveness is in leader
-    /// memory a steady-state heartbeat does not commit at all, so this
-    /// applies only to the checkpoint and to the mixed-version forwarding
-    /// fallback.
-    #[serde(default)]
-    pub batch_window: Option<String>,
     /// After acquiring status-lane leadership (or starting the process), mark
     /// nothing lost for this long. Default `60s`. A new leader inherits no
     /// liveness state and rebuilds it from incoming heartbeats, so an
@@ -1021,7 +1014,6 @@ pub struct LivenessConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LivenessConfigFull {
-    pub batch_window: String,
     pub failover_grace: String,
     pub digest_interval: String,
     pub peer_digest_grace: String,
@@ -1031,7 +1023,6 @@ pub struct LivenessConfigFull {
 impl Default for LivenessConfigFull {
     fn default() -> Self {
         LivenessConfigFull {
-            batch_window: "0ms".into(),
             failover_grace: format!("{DEF_LIVENESS_FAILOVER_GRACE_SEC}s"),
             digest_interval: format!("{DEF_LIVENESS_DIGEST_INTERVAL_SEC}s"),
             peer_digest_grace: format!("{DEF_LIVENESS_PEER_DIGEST_GRACE_SEC}s"),
@@ -1044,7 +1035,6 @@ impl LivenessConfig {
     pub fn with_defaults(&self) -> LivenessConfigFull {
         let defaults = LivenessConfigFull::default();
         LivenessConfigFull {
-            batch_window: self.batch_window.clone().unwrap_or(defaults.batch_window),
             failover_grace: self
                 .failover_grace
                 .clone()
@@ -1068,7 +1058,6 @@ impl LivenessConfig {
 impl From<LivenessConfigFull> for LivenessConfig {
     fn from(val: LivenessConfigFull) -> Self {
         LivenessConfig {
-            batch_window: Some(val.batch_window),
             failover_grace: Some(val.failover_grace),
             digest_interval: Some(val.digest_interval),
             peer_digest_grace: Some(val.peer_digest_grace),
@@ -1088,9 +1077,6 @@ pub struct LivenessSettings {
     pub peer_digest_grace: std::time::Duration,
     /// How often the leader replicates a display checkpoint. `None` = off.
     pub checkpoint_interval: Option<std::time::Duration>,
-    /// Accumulation window for the heartbeat group commit. Zero (the default)
-    /// is today's commit-while-you-can batching.
-    pub batch_window: std::time::Duration,
 }
 
 impl Default for LivenessSettings {
@@ -1102,16 +1088,11 @@ impl Default for LivenessSettings {
             checkpoint_interval: Some(std::time::Duration::from_secs(
                 DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC,
             )),
-            batch_window: std::time::Duration::ZERO,
         }
     }
 }
 
 impl LivenessConfigFull {
-    pub fn parsed_batch_window(&self) -> Duration {
-        parse_humantime_or(&self.batch_window, "0ms")
-    }
-
     pub fn parsed_failover_grace(&self) -> Duration {
         parse_humantime_or(
             &self.failover_grace,
@@ -1149,7 +1130,6 @@ impl LivenessConfigFull {
             digest_interval: self.parsed_digest_interval(),
             peer_digest_grace: self.parsed_peer_digest_grace(),
             checkpoint_interval: self.parsed_checkpoint_interval(),
-            batch_window: self.parsed_batch_window(),
         }
     }
 
