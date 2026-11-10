@@ -20,6 +20,7 @@
 //! slices of 150 nodes, jobs needing 4 allocations each, spread policy,
 //! local-disk persistence (the mechanism does not need raft).
 
+use legion::manager::eval::EvalExt;
 use legion::prelude::R;
 use legion::storage::store::Store;
 use legion::structs::config::ManagerConfigFull;

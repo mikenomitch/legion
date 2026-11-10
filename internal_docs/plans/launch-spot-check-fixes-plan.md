@@ -140,7 +140,7 @@ report's reading) and what changed. Tests named here fail on the old code.
   binds `0.0.0.0` and advertises an auto-detected `https://` address
   (`--advertise-addr`, `LEGION_WORKER_ADVERTISE_ADDR`); the listener is mutual
   TLS with per-RPC caller classes (`WORKER_RPC_CALLERS`); one manager-side
-  factory (`src/manager/worker_plane.rs`) dials every worker and verifies
+  factory (`crates/manager/src/manager/worker_plane.rs`) dials every worker and verifies
   `<node>.node.legion`; node keys are issued by CSR and never leave the node.
   `PROTOCOL_VERSION` is 3. Tests: `tests/worker_plane.rs`.
   > **Update:** the worker-plane-auth plan's full implementation replaced
@@ -199,7 +199,7 @@ report's reading) and what changed. Tests named here fail on the old code.
   `raft::physical_group`; workers learn every manager from registration and
   heartbeat replies, persist the set, and fail over.
 - **P2-5.** Followers replay a write the leader must handle to the leader
-  (`src/manager/leader_forward.rs`, one hop), which also fixes
+  (`crates/manager/src/manager/leader_forward.rs`, one hop), which also fixes
   `WorkerRegister` on a follower.
 - **P0-6.** Re-registration kept `unavailable`; the repair heartbeat hit the
   P0-5 bug; and loss/recovery are two writes a leadership change can split.

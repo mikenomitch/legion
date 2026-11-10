@@ -7,7 +7,7 @@ Entries are ranked by project impact, highest first; the number is the rank.
 ## 1. The ingress runs one per node wherever it is placed, not on every node of the cluster
 
 ```nickel
-# src/apps/bundled/ingress.ncl
+# crates/common/src/bundled_apps/ingress.ncl
 replicas = "per-node",
 ```
 

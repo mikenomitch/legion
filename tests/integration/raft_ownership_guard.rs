@@ -15,6 +15,7 @@
 //! path. Any single-writer-lane violation surfaces as an op error and fails
 //! the test.
 
+use legion::manager::eval::EvalExt;
 use std::collections::BTreeMap;
 
 use legion::prelude::{json, Context, R};

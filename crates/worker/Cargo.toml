@@ -1,0 +1,70 @@
+[package]
+name = "legion-worker"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Legion's worker: the node agent, task runtimes, artifacts, and the network datapath"
+repository = "https://github.com/mikenomitch/legion"
+
+[lib]
+# No doc tests: running rustdoc over the crate on every `cargo test` finds
+# none.
+doctest = false
+
+[dependencies]
+legion-common.workspace = true
+legion-guest.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+futures.workspace = true
+hickory-proto.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+humantime.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+jsonschema.workspace = true
+jsonwebtoken.workspace = true
+libc.workspace = true
+libloading.workspace = true
+object_store.workspace = true
+oci-client.workspace = true
+portable-pty.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+rusqlite.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+rustyriver.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sysinfo.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tracing.workspace = true
+url.workspace = true
+wasmi.workspace = true
+wasmi_core.workspace = true
+webpki-roots.workspace = true
+x509-parser.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya.workspace = true
+landlock.workspace = true

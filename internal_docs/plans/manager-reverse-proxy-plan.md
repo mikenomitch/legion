@@ -98,33 +98,33 @@ Line numbers as of 2026-10-12. Several of these files are being edited.
 
 - **Main listener**: tonic with `accept_http1(true)` and the chain
   `OidcHttpLayer` → `OriginGuardLayer` → CORS → `GrpcWebLayer` → metrics
-  (`src/manager/daemon.rs:532-546`). `OidcHttpLayer` already serves plain
-  HTTP GETs ahead of gRPC (`src/manager/oidc_http.rs:8-14`). tonic cannot
+  (`crates/manager/src/manager/daemon.rs:532-546`). `OidcHttpLayer` already serves plain
+  HTTP GETs ahead of gRPC (`crates/manager/src/manager/oidc_http.rs:8-14`). tonic cannot
   upgrade (`daemon.rs:437`). Loopback origins on *any port* are always
-  allowed (`src/manager/origin.rs:10-14`, `:58-63`).
+  allowed (`crates/manager/src/manager/origin.rs:10-14`, `:58-63`).
 - **Exec WebSocket on `+ 1`**, only when `exec.enabled`
   (`daemon.rs:439-457`): raw hyper with upgrades
-  (`src/manager/exec_ws.rs:55-80`), an `Origin` check (`:117-135`), the
+  (`crates/manager/src/manager/exec_ws.rs:55-80`), an `Origin` check (`:117-135`), the
   bearer token in the first frame (`:195-208`), and a re-check every 30 s
-  (`src/manager/acl.rs:626`). It has no TLS (`exec_ws.rs:56`), though the UI
+  (`crates/manager/src/manager/acl.rs:626`). It has no TLS (`exec_ws.rs:56`), though the UI
   derives `wss://` for an `https://` manager (`ui/src/lib/execSocket.ts:18`).
   Telemetry is on `+ 2`. The UI is its own origin, holding its token in
   `localStorage` (`docs/auth-and-acls.md:216`).
 - **Exec as a manager proxy**: a coarse `exec:write` check before lookup
-  (`src/manager/exec.rs:60-76`), `exec_audit` (`:243-255`), and one worker
+  (`crates/manager/src/manager/exec.rs:60-76`), `exec_audit` (`:243-255`), and one worker
   dial per session (`:258`) to the manager-only `Worker.ExecTask`
   (`proto/legion.proto:7463`).
 - **Addresses**: workers bind and register `127.0.0.1`
-  (`src/worker/daemon.rs:177`, `:398-401`). `worker_address_host`
-  (`src/storage/store.rs:230`) feeds `AllocNetwork.address` (`:12227`) and
+  (`crates/worker/src/worker/daemon.rs:177`, `:398-401`). `worker_address_host`
+  (`crates/manager/src/storage/store.rs:230`) feeds `AllocNetwork.address` (`:12227`) and
   `ServiceEndpoint.address` (`:13588`), and the new `publicAddress` is
   display-only (`daemon.rs:82-100`). No manager can dial a worker on another
   host yet (worker-plane-auth §1.1).
 - **Ingress last hop**: `127.0.0.1:<private port>` in the task's namespace
-  (`src/worker/netd/ingress.rs:521-522`).
+  (`crates/worker/src/worker/netd/ingress.rs:521-522`).
 - **ACLs**: `exec`, `scale`, `boot`, and `snapshot` are separate resources
-  so narrow grants stay narrow (`src/structs/acl.rs:14-66`). `check_acl` is
-  at `src/manager/server.rs:1606`, and `tests/integration/acl_endpoints.rs:1489`
+  so narrow grants stay narrow (`crates/common/src/structs/acl.rs:14-66`). `check_acl` is
+  at `crates/manager/src/manager/server.rs:1606`, and `tests/integration/acl_endpoints.rs:1489`
   enforces coverage.
 - **Adjacent**: `legion start gateway` will serve
   `https://<port>-<instance>.<domain>` over the worker plane

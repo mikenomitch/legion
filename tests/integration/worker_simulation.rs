@@ -367,7 +367,7 @@ async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
     let ca = store.ensure_mesh_ca()?;
     let tls = tonic::transport::ClientTlsConfig::new()
         .ca_certificate(tonic::transport::Certificate::from_pem(ca.bundle_pem()))
-        .domain_name(legion::manager::mesh_ca::fleet_dns_name("sim-it"));
+        .domain_name(legion::mesh_ca::fleet_dns_name("sim-it"));
     let anonymous = tonic::transport::Endpoint::from_shared(fleet.worker_address().to_string())?
         .tls_config(tls)?
         .connect()

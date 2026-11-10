@@ -101,9 +101,9 @@ Non-goals:
 ## What exists today (before this work)
 
 Session mode (`docs/session-mode.md`), edge starts (`Worker.StartSession`),
-the session router (`src/manager/sessions.rs`), the sandbox runtime
-(`src/task_plugins/sandbox.rs`, `microvm.rs`), the session index
-(`src/storage/session_index.rs`), and `legion-loadgen --mode instances`,
+the session router (`crates/manager/src/manager/sessions.rs`), the sandbox runtime
+(`crates/worker/src/task_plugins/sandbox.rs`, `microvm.rs`), the session index
+(`crates/manager/src/storage/session_index.rs`), and `legion-loadgen --mode instances`,
 which measured keyed lifecycles against simulated nodes only.
 
 ## Design, as the user sees it

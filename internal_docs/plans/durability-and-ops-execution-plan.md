@@ -35,13 +35,13 @@ run before writing this plan. Load-bearing facts:
 
 ### Storage / Raft
 
-- `RaftPersistenceDriver` (`src/storage/persistence.rs:518`) is a **simulation**:
+- `RaftPersistenceDriver` (`crates/manager/src/storage/persistence.rs:518`) is a **simulation**:
   an in-process `Mutex<RaftState>` mutated by operator commands. openraft 0.9.21
   is a dependency but only `Config::default()` is ever constructed, into a dead
   field. No log, no transport, no quorum, no apply loop. Join "tokens" are
   unvalidated formatted strings.
 - **Every mutation flows through one seam**: `Store::write_connection()`
-  (`src/storage/store.rs:457`) → a single `std::sync::Mutex<Connection>`.
+  (`crates/manager/src/storage/store.rs:457`) → a single `std::sync::Mutex<Connection>`.
   ~70 public mutating methods across ~10 domains; 32 use `conn.transaction()`.
 - **The entire `Store` API is synchronous** — sync rusqlite called inline from
   async tonic handlers, no `spawn_blocking`. Any replication design that needs
@@ -53,7 +53,7 @@ run before writing this plan. Load-bearing facts:
 - The allocation-epoch CAS (`apply_plan_submission`, `store.rs:837`) already
   rejects stale plans — the designed safety valve for replication-induced lag.
 - Every one of the 30 tables has a **declared PRIMARY KEY** (verified against
-  `src/storage/migrations.rs`) — a precondition for the design in §A2.
+  `crates/manager/src/storage/migrations.rs`) — a precondition for the design in §A2.
 - Tests are **in-process** (no subprocess, no network): storage tests call
   `Store::start_storage`, service tests call `Manager` trait methods directly.
   The perf gate is `tests/integration/scheduler_benchmark_slo.rs` + `benchmarks/scheduler/slo.json`.
@@ -62,10 +62,10 @@ run before writing this plan. Load-bearing facts:
 
 | Area | Verdict |
 | --- | --- |
-| Manager/worker app logging (console + JSON file + rotation/retention) | **Implemented** (`src/tracing_util.rs`) |
-| Task log capture, rotation, size caps, disk sweep | **Implemented** (`src/worker/logs.rs`, 10 MiB × 5 files × 7 days, 10s sweep) |
-| OTLP trace export | **Implemented** (`src/otel.rs`; `docs/observability.md` wrongly says it isn't) |
-| Event stream (journal + broadcast + List/Stream RPCs + CLI/MCP/UI) | **Implemented** (`src/storage/events.rs`) |
+| Manager/worker app logging (console + JSON file + rotation/retention) | **Implemented** (`crates/common/src/tracing_util.rs`) |
+| Task log capture, rotation, size caps, disk sweep | **Implemented** (`crates/worker/src/worker/logs.rs`, 10 MiB × 5 files × 7 days, 10s sweep) |
+| OTLP trace export | **Implemented** (`crates/common/src/otel.rs`; `docs/observability.md` wrongly says it isn't) |
+| Event stream (journal + broadcast + List/Stream RPCs + CLI/MCP/UI) | **Implemented** (`crates/manager/src/storage/events.rs`) |
 | **Metrics** (any endpoint, any counters) | **Missing entirely** |
 | **Manager self-health probes** (`/healthz`, `/readyz`) | **Missing** (the `HealthCheck` RPC is worker→manager reporting, not a probe) |
 | **Node drain/cordon** | **Missing** — a `{"drain": false}` attr is written at registration and never read |
@@ -73,7 +73,7 @@ run before writing this plan. Load-bearing facts:
 | **State backup/restore** | **Missing** as an operator command |
 
 Also: node `availability` is the schedulability axis and
-`Scheduler::available_nodes()` (`src/manager/scheduler.rs:812`) is the single
+`Scheduler::available_nodes()` (`crates/manager/src/manager/scheduler.rs:812`) is the single
 placement choke point that filters on `availability == "available"` — cordon
 and drain get placement-exclusion for free by setting any other value.
 
@@ -256,7 +256,7 @@ with `topology: "lanes"` implemented and tested as **experimental**:
 | Phase | Content | Targeted verification |
 | --- | --- | --- |
 | **A-0 capture layer** ✅ | rusqlite `session` feature; savepoint conversion of all tx sites; `replicated()` seam + `Lane` classification of every mutating method (exhaustiveness test); suppression hooks; `local_disk` behavior unchanged | `tests/integration/raft_changeset_capture.rs` (capture/rollback/apply, nested savepoints, rowid fidelity, PK-required edge), `tests/integration/raft_seam.rs`; full existing suite green |
-| **A-1 engine** ✅ | `src/storage/raft/`: type config, sqlite log store, state machine (changeset apply + read-model/event projection), `RaftTransport` proto + network, `MultiRaftDriver`, single topology (lanes scaffolded, refused at start — JC-17) | `tests/integration/raft_apply_roundtrip.rs` (1- and 3-node in-process), determinism content-hash in `tests/integration/raft_durability.rs` |
+| **A-1 engine** ✅ | `crates/manager/src/storage/raft/`: type config, sqlite log store, state machine (changeset apply + read-model/event projection), `RaftTransport` proto + network, `MultiRaftDriver`, single topology (lanes scaffolded, refused at start — JC-17) | `tests/integration/raft_apply_roundtrip.rs` (1- and 3-node in-process), determinism content-hash in `tests/integration/raft_durability.rs` |
 | **A-2 lifecycle** ✅ | bootstrap-from-existing-DB, join-token → learner → voter, real operator commands, non-leader rejection + hint, config extensions, daemon wiring, leader-only scheduling loops | `tests/integration/raft_membership.rs`, `tests/integration/raft_upgrade_bootstrap.rs` (multigroup bring-up is deferred with lanes — JC-17) |
 | **A-3 durability** ✅ | snapshots + compaction + install, crash/restart recovery, `state backup`/`--restore-from`, adversarial-review fixes (JC-18..22) | `tests/integration/raft_snapshot_recovery.rs` (compaction, restart, laggard snapshot catch-up, backup/restore), `tests/integration/raft_durability.rs` (leader loss, minority partition, any-single-node loss), `tests/integration/raft_cascade_delete.rs`, `tests/integration/raft_perf_smoke.rs` |
 | **A-4 surfaces & docs** ✅ | CLI/UI real status (+ per-lane), capabilities/MCP catalog, `docs/multi-raft.md`, updates to `raft-operations.md`, `state-store.md`, `persistence-plan.md`, `upgrades.md`, `README.md`, TASK-LIST | capability-catalog test; docs review pass |
@@ -423,7 +423,7 @@ With row-changeset replication, lane independence fails in two distinct ways:
 
 **Single-writer-lane-per-table, enforced at capture time.**
 
-- **Ownership map** (`src/storage/raft/ownership.rs`): every replicated
+- **Ownership map** (`crates/manager/src/storage/raft/ownership.rs`): every replicated
   table → exactly one lane, plus a small **commutative class**: insert-only
   tables with globally-unique PKs (`scheduler_event`, `idempotency_record`)
   that any lane may INSERT into, applied with per-table `OMIT`
@@ -1271,7 +1271,7 @@ would nest inside it and be silently erased by the capture's rollback —
 destroying a committed entry on this replica. Applies (and the
 blank/membership marker writes) take the capture mutex and additionally
 fail loudly if the connection is not in autocommit. Adversarial finding;
-regressions in `src/storage/raft/capture.rs` tests.
+regressions in `crates/manager/src/storage/raft/capture.rs` tests.
 
 **JC-20 — Panic containment in the capture path.** A panic inside a
 captured body previously orphaned the open capture savepoint (every later

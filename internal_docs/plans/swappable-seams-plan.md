@@ -110,7 +110,7 @@ process split. New object-store backends. A `Vmm` trait. Splitting
 
 ## 5. Design
 
-### 5.1 `Attachment` (`src/worker/netd/attach.rs`)
+### 5.1 `Attachment` (`crates/worker/src/worker/netd/attach.rs`)
 
 ```rust
 pub enum Attachment {
@@ -126,7 +126,7 @@ pub enum Attachment {
 where any listener binds; `task_dial()` returns how ingress reaches the task.
 Every spec (`UpstreamSpec`, `DnsSpec`, `ProxySpec`) carries it.
 
-### 5.2 One listener, one dialer (`src/worker/netd/listen.rs`)
+### 5.2 One listener, one dialer (`crates/worker/src/worker/netd/listen.rs`)
 
 `ListenAddr::{Tcp { netns, addr }, Unix(path)}` binds; `spawn_accept_loop`
 runs every listener's accept loop (backoff on errors, a task per
@@ -134,7 +134,7 @@ connection); `Stream` is the accepted connection; `dial_tcp` is every
 outbound TCP dial. The four copies of accept-loop plumbing and five
 hard-coded `TcpStream::connect` calls are gone.
 
-### 5.3 The worker ↔ datapath boundary (`src/worker/netd/datapath.rs`)
+### 5.3 The worker ↔ datapath boundary (`crates/worker/src/worker/netd/datapath.rs`)
 
 ```rust
 pub enum NetdInput {
@@ -160,7 +160,7 @@ moved into `netd` (`specs.rs`, `datapath.rs`). The persisted
 `netd_state.json` is `DesiredNetwork` plus policy bodies; its on-disk shape
 is unchanged.
 
-### 5.4 Object storage (`src/storage/objects/`)
+### 5.4 Object storage (`crates/worker/src/objects/`)
 
 One URL parser, one `open(url, credential, options)` returning
 `Arc<dyn ObjectStore>`, one credential resolver; content publish, the S3
@@ -184,7 +184,7 @@ and the three bugs the unification fixed, are calls entries 3 and 6–8.
 ### 5.6 Bugs
 
 - Placement decides VIP blocks with `node_supports_vip_blocks(node os)`
-  (`src/structs/network.rs`), reading the node's `os` fingerprint.
+  (`crates/common/src/structs/network.rs`), reading the node's `os` fingerprint.
 - `specs::dialable_endpoints` carries `mesh_tls` from the feed.
 
 ## 6. Phases
@@ -221,5 +221,5 @@ VIP blocks by node OS, mesh upstreams that now work.
 - No site outside `netd` derives a listener's binding from the mode string or
   the runtime name.
 - Past constructing it, `daemon.rs` touches the datapath only through `Netd`.
-- No consumer outside `src/storage/objects/` builds an S3 client.
+- No consumer outside `crates/worker/src/objects/` builds an S3 client.
 - The tests above pass.

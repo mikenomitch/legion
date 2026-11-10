@@ -384,7 +384,7 @@ this entry now records the reversal.
   be exported to the JSON Schema that `legion job schema`, editors, and
   agents consume.
 - **For JSON Schema.** It is exactly what task runtimes already do for
-  their `config` block (`src/task_plugins/mod.rs:2134`), in the draft 7
+  their `config` block (`crates/worker/src/task_plugins/mod.rs:2134`), in the draft 7
   dialect schemars emits. Values are still written in Nickel; only the
   evaluated result is checked. Two things the existing use doesn't do must
   be built: refusing remote `$ref`s (the crate resolves them over HTTP by

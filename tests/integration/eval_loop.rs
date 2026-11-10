@@ -1,3 +1,4 @@
+use legion::manager::eval::EvalExt;
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
 use legion::structs::{

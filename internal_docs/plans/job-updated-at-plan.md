@@ -103,18 +103,18 @@ event stream, which is a different subsystem with different retention.
 
 ## 5. Background — what exists today
 
-- `src/storage/migrations.rs:37` — the `job` table: `id`, `name`, `status`,
+- `crates/manager/src/storage/migrations.rs:37` — the `job` table: `id`, `name`, `status`,
   `created_at`, later `+ restart_requested_at`.
-- `src/storage/store.rs:5434` — `submit_job_config` writes `created_at` as
+- `crates/manager/src/storage/store.rs:5434` — `submit_job_config` writes `created_at` as
   `OffsetDateTime::now_utc().unix_timestamp()` (integer seconds), and only when
   the row is missing.
-- `src/storage/store.rs` — five sites write a job's status:
+- `crates/manager/src/storage/store.rs` — five sites write a job's status:
   `stop_job_apply`, `mark_job_failed_apply`, `mark_job_failed_for_kv_apply`,
   `clear_job_failed_status_apply`, `clear_job_stopped_status_apply`. A sixth,
   `request_job_restart`, stamps `restart_requested_at`.
-- `src/manager/server.rs:3339` — `list_jobs` sorts by `name`, `status`, or
+- `crates/manager/src/manager/server.rs:3339` — `list_jobs` sorts by `name`, `status`, or
   `created_at`.
-- `src/structs/job.rs:22` — `JobPrint` renders `created_at` via `.to_string()`
+- `crates/common/src/structs/job.rs:22` — `JobPrint` renders `created_at` via `.to_string()`
   on the raw `i64`.
 - `ui/src/components/SharedIndex.tsx:212` — every index page renders a fixed
   "Updated" column from `IndexItem.updatedAt`.
@@ -122,7 +122,7 @@ event stream, which is a different subsystem with different retention.
   bug.
 
 Raft note: mutations run through `Store::replicated`, which captures the
-resulting *row values* and replicates those (`src/storage/raft/capture.rs`).
+resulting *row values* and replicates those (`crates/manager/src/storage/raft/capture.rs`).
 Calling `now()` inside an apply closure is therefore safe and already done —
 `request_job_restart` does it.
 
@@ -208,12 +208,12 @@ Templates, and Manager, all of which already default to `updated_at:desc`.
 
 ## 9. Testing plan
 
-Unit (`src/storage/store.rs` tests): a new job reports equal create/update
+Unit (`crates/manager/src/storage/store.rs` tests): a new job reports equal create/update
 times; a new spec version moves the mtime but not `created_at`; an unchanged
 resubmit moves neither; each of the four status transitions moves it; a no-op
 status clear does not; allocation churn does not.
 
-Unit (`src/storage/migrations.rs` tests): a job row written before the column
+Unit (`crates/manager/src/storage/migrations.rs` tests): a job row written before the column
 existed comes out of `to_latest` with `updated_at == created_at`, located by
 probing for the newest pre-column version so appending migrations cannot turn
 the test into a no-op.

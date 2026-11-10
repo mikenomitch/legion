@@ -1,7 +1,7 @@
 # Task Runtime: sandbox
 
-`sandbox` is a built-in task runtime implemented in `src/task_plugins/sandbox.rs`
-(with the microVM mechanics in `src/task_plugins/microvm.rs`).
+`sandbox` is a built-in task runtime implemented in `crates/worker/src/task_plugins/sandbox.rs`
+(with the microVM mechanics in `crates/worker/src/task_plugins/microvm.rs`).
 
 ## Purpose
 
@@ -155,7 +155,7 @@ workload is done. The sandbox runtime supplies that layer.
    artifact pipeline when `artifacts.containerImageDesugar` is on. Otherwise it
    reuses a layout pulled by an earlier start of this allocation, or pulls
    anonymously through the `oci://` fetcher it shares with `container`
-   (`src/task_plugins/oci_image.rs`). Either way the layers come from the
+   (`crates/worker/src/task_plugins/oci_image.rs`). Either way the layers come from the
    node's [image cache](task-runtime-container.md#image-cache), so only the
    first start of an image on a node downloads them.
 2. **Get the image's base root disk.** The base is the image's layers plus

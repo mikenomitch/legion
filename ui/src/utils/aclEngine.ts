@@ -3,10 +3,10 @@
  * imports, so the parity test (`npm run test:unit`, ui/tests/unit) can load
  * it in plain Node. `acl.ts` wraps it with the caller's identity.
  *
- * The semantics mirror `evaluate` in src/structs/acl.rs exactly, and the
+ * The semantics mirror `evaluate` in crates/common/src/structs/acl.rs exactly, and the
  * shared cases in tests/fixtures/acl_parity_cases.json are run against both
  * (here by ui/tests/unit/acl-parity.mjs, in Rust by the `parity_fixture`
- * test in src/structs/acl.rs). Change the two together, and add a case:
+ * test in crates/common/src/structs/acl.rs). Change the two together, and add a case:
  * - default deny; a matching deny rule always wins
  * - `*` is the only wildcard, and exact patterns never prefix-match
  * - a rule with a scope selector never matches a request without that

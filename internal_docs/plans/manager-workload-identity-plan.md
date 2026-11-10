@@ -154,7 +154,7 @@ phase 1 adds no CLI verb or RPC).
 
 ## 5. Background: what exists today
 
-- `src/storage/persistence.rs` `run_replica_loop` and `restore_replica_to`
+- `crates/manager/src/storage/persistence.rs` `run_replica_loop` and `restore_replica_to`
   built `ObjectStoreClient::new(ObjectStoreConfig::from_url(..))`.
   rustyriver's `from_url` reads `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
   (falling back to `LITESTREAM_*`) and its `build_store` uses
@@ -175,7 +175,7 @@ phase 1 adds no CLI verb or RPC).
   `conditional_put` is unset (`aws/mod.rs:172`).
 - rustyriver exposes `ObjectStoreClient::with_store(config, store)`, so Legion
   can build the replica store itself without forking rustyriver.
-- `src/manager/workload_identity.rs` is the manager's OIDC IdP; its keys live
+- `crates/manager/src/manager/workload_identity.rs` is the manager's OIDC IdP; its keys live
   in the `signing_key` table of the store.
 
 ## 6. Why the manager does not use Legion's own IdP
@@ -234,7 +234,7 @@ persistence.streaming = {
 }
 ```
 
-`src/storage/s3_credentials.rs` resolves one `CredentialSource`, in order:
+`crates/manager/src/storage/s3_credentials.rs` resolves one `CredentialSource`, in order:
 
 1. `persistence.streaming.credentials`.
 2. `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`).

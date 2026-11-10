@@ -33,7 +33,7 @@ Plain L4 is in the same class as other per-node proxies. Three things are
 not:
 
 - **HTTP mode opens a new upstream connection per request**
-  (`src/worker/netd/http.rs`, "no pooling yet"). With mesh mTLS on, that is a
+  (`crates/worker/src/worker/netd/http.rs`, "no pooling yet"). With mesh mTLS on, that is a
   TLS handshake per request: two extra network round trips on every call,
   even when the client keeps its own connection open. Linkerd and Istio
   pool connections between proxies.
@@ -123,14 +123,14 @@ Tensorlake write-up. We reject eBPF connect-time rewriting for now (§6.6).
 
 ## 5. What exists today
 
-- `src/worker/forwarder.rs`: `forward_connection` cloned the endpoint list
+- `crates/worker/src/worker/forwarder.rs`: `forward_connection` cloned the endpoint list
   and the in-flight map per connection, then `copy_bidirectional`.
-- `src/worker/netd/http.rs`: `attempt_request` dialed (and for mesh, ran a
+- `crates/worker/src/worker/netd/http.rs`: `attempt_request` dialed (and for mesh, ran a
   TLS handshake and wrote a PROXY v2 header) per request, then
   `hyper::client::conn::http1::handshake` per request.
-- `src/worker/netd/ingress.rs`, `proxy.rs`, `src/gateway.rs`: each ended an
+- `crates/worker/src/worker/netd/ingress.rs`, `proxy.rs`, `src/gateway.rs`: each ended an
   L4 flow with `copy_bidirectional`.
-- `src/worker/balance.rs`: `Balancer::pick(endpoints, inflight)`, no
+- `crates/worker/src/worker/balance.rs`: `Balancer::pick(endpoints, inflight)`, no
   feedback from outcomes.
 
 ## 6. Design

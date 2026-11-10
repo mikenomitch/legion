@@ -23,7 +23,7 @@ finds objects whose writers lost their rights (public page
 [docs/app-objects.md](../../docs/app-objects.md#acting-for-an-object));
 what the build decided is calls entries 44-52. **Phase O4** is built
 (2026-10-29, merged from `claude/app-objects-o4`): kinds declare CEL `rules`
-(`src/structs/object_rules.rs`, on the `cel` crate 0.15.0), evaluated in
+(`crates/common/src/structs/object_rules.rs`, on the `cel` crate 0.15.0), evaluated in
 the manager on every apply after the schema and `immutable` and before
 `requires`, fail-closed and cost-bounded, re-checked against stored objects
 on upgrade and read; the autoscaler's two kinds declare their parser's
@@ -89,8 +89,8 @@ acts on, which are not a property of any one job.
   `DeleteScalingPolicy`, `ListScalingPolicies`), `legion scaling
   apply|list|delete`, two MCP tools, ACL code that special-cases node
   groups, and a policy parser the manager links in
-  (`src/manager/server/scaling_policy_rpcs.rs`,
-  `src/storage/store/scaling_policy_ops.rs`, `src/autoscaler/policy.rs`).
+  (`crates/manager/src/manager/server/scaling_policy_rpcs.rs`,
+  `crates/manager/src/storage/store/scaling_policy_ops.rs`, `crates/common/src/autoscaler/policy.rs`).
   Every one of those lines is something a third-party app cannot have.
 - A cert manager needs a `Certificate`; an ingress app needs a `Route`; a
   backup app needs a `Schedule` that names several volumes.
@@ -307,19 +307,19 @@ already show.
 ## 5. Background: what exists today
 
 - **App manifests and records.** `AppManifest`
-  (`src/structs/app.rs:178`) keeps `extensions` as JSON so a record
+  (`crates/common/src/structs/app.rs:178`) keeps `extensions` as JSON so a record
   round-trips; `AppManifest::validate` (`:292`) parses and checks them.
   Records live in the Control-lane `app` table
-  (`src/storage/app_store.rs`); `Store::app_fingerprint` changes on every
+  (`crates/manager/src/storage/app_store.rs`); `Store::app_fingerprint` changes on every
   app write.
-- **Schemas.** `compile_schema` (`src/structs/extensions.rs:409`) compiles
+- **Schemas.** `compile_schema` (`crates/common/src/structs/extensions.rs:409`) compiles
   draft 7 with a resolver that refuses every non-local `$ref`
   (`LocalRefsOnly`, `:376`); `compiled_extension_schema` (`:441`) adds the
   "describes an object" rule and a digest-keyed cache; `fill_defaults`
   (`:472`) fills defaults the validator does not. `CompiledSchema::check`
   fills then validates, returning dotted error paths.
 - **Extension lifecycle.** `install_app_rpc`, `upgrade_app_rpc`, and
-  `uninstall_app_rpc` (`src/manager/server/app_rpcs.rs:497`, `:658`,
+  `uninstall_app_rpc` (`crates/manager/src/manager/server/app_rpcs.rs:497`, `:658`,
   `:848`) run the extension collision checks, extend the prompt with
   `lifecycle_report` (`extension_rpcs.rs:116`), and refuse uninstall with
   values unless `force`.
@@ -335,14 +335,14 @@ already show.
   and fails open on anything but a `200` within `VALIDATE_TIMEOUT` (2 s).
   The app framework answers it in `UiServer::handle_at`
   (`src/apps/ui.rs:759`).
-- **ACL.** `AclResource` (`src/structs/acl.rs:27`) is a closed list;
+- **ACL.** `AclResource` (`crates/common/src/structs/acl.rs:27`) is a closed list;
   `namespaced()` decides whether a rule must carry `namespaces`. Selectors
   are `Option<Vec<String>>` on `AclRule` matched against `AclScope`
   attributes; `reserved_glob_match` keeps `*` out of `legion-*`.
   `AclScope::unowned()` (namespace `*`) is matched only by rules reaching
   every namespace. `app` added no new selector: it reuses `names` for app
-  names (`AclScope::app`). Grant coverage (`src/structs/grant.rs:336`) and
-  the install prompt's rule wording (`src/structs/app.rs:1463`) enumerate
+  names (`AclScope::app`). Grant coverage (`crates/common/src/structs/grant.rs:336`) and
+  the install prompt's rule wording (`crates/common/src/structs/app.rs:1463`) enumerate
   selectors.
 - **Standalone scaling policies** (O2's input). One `scaling_policy` row
   per policy (`namespace` empty for a node group), versions from the
@@ -351,17 +351,17 @@ already show.
   `AclScope::job(id)`, or `operator:write` plus `node:write` for a node
   group. `WatchScalingPolicies` streams them with task policies; the
   autoscaler shards them by FNV-1a of `policy:<id>`, every node group in
-  the one `nodegroups` shard (`src/autoscaler/shard.rs`).
+  the one `nodegroups` shard (`crates/common/src/autoscaler/shard.rs`).
 - **Raft.** Every table has one writing lane (`TABLE_OWNERS`,
-  `src/storage/raft/ownership.rs:139`); a coverage test fails on an
+  `crates/manager/src/storage/raft/ownership.rs:139`); a coverage test fails on an
   unclassified table.
 - **What already lives off the Control lane.** Node liveness moved out of
   `node` into `node_health` on the Status lane (phase C-1), and the
   autoscaler's per-tick status is held in memory on the Status-lane leader,
-  never replicated (`src/manager/scaling_status.rs`); both because churn on
+  never replicated (`crates/manager/src/manager/scaling_status.rs`); both because churn on
   the Control lane slows everything else on it.
 - **Spec-aware checks already in core.** `enforce_kv_credential_read`
-  (`src/manager/server.rs:14644`) checks `kv:read` on every KV path a
+  (`crates/manager/src/manager/server.rs:14644`) checks `kv:read` on every KV path a
   jobspec's credentials name, because "job submit access would be a way to
   exfiltrate any secret in KV". Extension `requires` checks cluster-scoped
   permissions with `AclScope::none()` (`extension_rpcs.rs:296`).
@@ -369,11 +369,11 @@ already show.
   per message (`autoscale_rpcs.rs:2437`); app clients use tonic's default
   4 MiB decode limit (`cmd/helpers.rs:407`).
 - **Namespace contents.** A namespace delete counts jobs, volumes, and
-  snapshots (`NamespaceContents`, `src/storage/namespace_store.rs`), and
+  snapshots (`NamespaceContents`, `crates/manager/src/storage/namespace_store.rs`), and
   `--cascade` removes them.
 - **Strict jobspecs.** Unknown jobspec keys are errors since A6a
   (`UnknownFieldMode::Reject`, `spec_fields.rs:95`).
-- **Events.** `EventAudience::sees` (`src/manager/server.rs:1263`) shows a
+- **Events.** `EventAudience::sees` (`crates/manager/src/manager/server.rs:1263`) shows a
   tenant the events of jobs it may read and `namespace.*` events of
   namespaces it reaches; everything else is operator-only.
 
@@ -447,7 +447,7 @@ in `requires`, `immutable`, and `columns`.
   `instance`, `volume`, `snapshot`, `service`, `eval`, `rollout`, `kv`,
   `secret`, `acl`, `user`, `grant`, `event`, `action`, `exec`, `session`,
   `sandbox`, `artifact`, `plugin`, `object`, `kind`, `spec`, `status`, …;
-  `RESERVED_KIND_NOUNS` in `src/structs/app_object.rs`, calls entry 20).
+  `RESERVED_KIND_NOUNS` in `crates/common/src/structs/app_object.rs`, calls entry 20).
 - **Files and the API require the qualified kind.** A file has to mean the
   same thing forever; if it said `kind = "Repo"`, it would break
   cluster-wide the day a second app installed a `Repo`. `ApplyObject`
@@ -846,7 +846,7 @@ behind `--allow-write`). Capability entries: `object.kinds`,
   `NamespaceCounts.objects` and `NamespaceContents.objects`. Every field
   commented.
 - **Manifest.** `AppManifest.kinds` (JSON, parsed to `KindDecl` in
-  `src/structs/app_object.rs`, like `extensions`).
+  `crates/common/src/structs/app_object.rs`, like `extensions`).
 - **ACL.** `AclResource::Object` (`object`, namespaced); `AclRule.kinds`;
   `AclScope.kind`; grant coverage and rule wording learn the selector.
 - **Persistence.** One migration, three tables:
@@ -976,7 +976,7 @@ estimate (entries 54, 58).
 
 ## 9. Testing plan
 
-- **Unit** (`src/structs/app_object.rs`, `acl.rs`): kind declaration rules
+- **Unit** (`crates/common/src/structs/app_object.rs`, `acl.rs`): kind declaration rules
   (names, reserved nouns singular and plural, within-app duplicates,
   schema rules, closing, examples, access pinning, `requires` pointers,
   `immutable`, `cleanup`, `maxObjects`, `rules` refused, columns); kind

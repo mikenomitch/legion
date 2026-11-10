@@ -1,7 +1,7 @@
 //! Integration coverage for adaptive scheduler concurrency
 //! (docs/adaptive-scheduler-concurrency.md, plan Phase 3).
 //!
-//! The unit suite in `src/manager/concurrency.rs` proves the decision RULE.
+//! The unit suite in `crates/manager/src/manager/concurrency.rs` proves the decision RULE.
 //! This suite proves the two things a pure function cannot:
 //!
 //! 1. The gate is invisible to correctness. A burst pinned to one planner

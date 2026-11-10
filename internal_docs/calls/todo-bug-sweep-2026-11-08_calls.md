@@ -53,7 +53,7 @@ directory isn't already the user's (Kubernetes `OnRootMismatch`).
 ## 3. What the loser of an idempotency-key race is handed depends on the operation
 
 `deduplicated: true` now reaches the loser of a concurrent race on every keyed
-RPC (`src/manager/server/idempotency.rs`). What the loser is told depends on the
+RPC (`crates/manager/src/manager/server/idempotency.rs`). What the loser is told depends on the
 kind of operation:
 
 - **The write commits with its record** (instance verbs, fork, suspend and

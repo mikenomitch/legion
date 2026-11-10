@@ -145,9 +145,9 @@ declares nothing new over MCP; it consumes the existing `job run` surface.
 
 ## 5. Background: what exists today
 
-- External upstreams: `UpstreamConfig.to` (`src/structs/network.rs`),
+- External upstreams: `UpstreamConfig.to` (`crates/common/src/structs/network.rs`),
   parsed by `parse_upstream_target`; the forwarder opens TLS for
-  `https://` in `attempt_request` (`src/worker/netd/http.rs`) and rewrites
+  `https://` in `attempt_request` (`crates/worker/src/worker/netd/http.rs`) and rewrites
   `Host`. The task speaks plaintext to `LEGION_UPSTREAM_<NAME>`.
 - HTTP mode per request: policy, external handlers (`authz` sees headers
   minus `authorization`/`cookie`/`proxy-authorization`), `dlp`, retries,
@@ -239,7 +239,7 @@ problems on the datapath layer. No proto change to the status message.
 - `proto/legion.proto`: `GetUpstreamCredentials` RPC; messages
   `UpstreamCredentialKnown`, `GetUpstreamCredentialsRequest`,
   `UpstreamCredentialValue`, `GetUpstreamCredentialsReply`.
-- `src/structs/network.rs`: `UpstreamConfig.credentials`,
+- `crates/common/src/structs/network.rs`: `UpstreamConfig.credentials`,
   `UpstreamCredential`, `CredentialFrom`.
 - `configs/jobs/maximal.ncl`: `credentials` on the `openai` upstream.
 - No storage change: the declaration rides the existing job config and
@@ -277,18 +277,18 @@ and loopback-only sandboxes remain open.
 
 ## 9. Testing
 
-- Unit (`src/structs/network.rs`): accepts `https://` external; rejects
+- Unit (`crates/common/src/structs/network.rs`): accepts `https://` external; rejects
   `http://`, `tcp://`, `tls://`, service upstreams, hop-by-hop and `host`,
   duplicates, empty paths, missing and unknown providers, CR/LF prefixes.
-- Datapath (`src/worker/netd/http.rs`): a plaintext origin sees the injected
+- Datapath (`crates/worker/src/worker/netd/http.rs`): a plaintext origin sees the injected
   headers and none of the task's own values; a never-fetched value answers
   `503` without dialing; rotation is picked up; a transient error keeps the
   value; `absent` revokes it; leaving allocations drop their values; Debug
   redacts.
-- Manager (`src/manager/server.rs`): path derived from the declaration,
+- Manager (`crates/manager/src/manager/server.rs`): path derived from the declaration,
   `unchanged` carries no value, a bad value is refused but not `absent`, a
   deleted key and a foreign allocation are `absent`.
-- Worker (`src/worker/daemon.rs`): declared keys and upstream specs follow
+- Worker (`crates/worker/src/worker/daemon.rs`): declared keys and upstream specs follow
   the desired set.
 - ACL (`tests/integration/acl_endpoints.rs`): the RPC is classified worker-plane and
   refuses a foreign node token; RunJob needs `kv:read` on the path.

@@ -20,10 +20,12 @@
 //!   `legion` identity);
 //! - stop the body on SIGTERM or SIGINT, giving it a grace period.
 //!
-//! **Adding a bundled app** is one entry in [`BUNDLED`]: its manifest (a
-//! Nickel file under `src/apps/bundled/`) and its body, an async function
-//! from [`AppContext`] to a result. The manifest is validated by a unit test
-//! below, and seeded on clusters by the first Control leader.
+//! **Adding a bundled app** is two entries under one name: its body in
+//! [`BUNDLED`], an async function from [`AppContext`] to a result, and its
+//! manifest (a Nickel file beside `crate::bundled_apps`, listed in its
+//! `MANIFESTS`). The manifest is validated by a unit test below, which also
+//! fails when the two lists differ, and seeded on clusters by the first
+//! Control leader.
 
 pub mod autoscaler;
 pub mod autoscaler_ui;
@@ -34,12 +36,11 @@ pub mod objects;
 pub mod ui;
 
 use crate::prelude::*;
-use crate::structs::app::{AppManifest, APP_CONFIG_ENV, APP_NAME_ENV};
+use crate::structs::app::{APP_CONFIG_ENV, APP_NAME_ENV};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 /// How long a body has to finish after a stop signal before the process
@@ -57,146 +58,39 @@ pub type AppFuture = Pin<Box<dyn Future<Output = R<()>> + Send>>;
 /// should return when [`AppContext::stopped`] resolves.
 pub type AppBody = fn(AppContext) -> AppFuture;
 
-/// One app compiled into the binary.
+/// One app compiled into the binary: its name and what runs when the
+/// worker starts `legion app run <name>`. Its manifest is the manager's
+/// ([`crate::bundled_apps`]), which is what seeds and validates it.
 pub struct BundledApp {
     pub name: &'static str,
-    /// The manifest, in Nickel, evaluated once per process with imports
-    /// refused.
-    pub manifest_source: &'static str,
     pub body: AppBody,
-    /// Fills in what the manifest leaves to the app's Rust types (its
-    /// kinds' schemas), on the evaluated manifest before it is parsed.
-    pub generated: Option<fn(&mut Value)>,
-    /// Whether a new cluster seeds the app enabled. The manager config's
-    /// `apps.<name>.enabled` overrides it at seed time.
-    pub seed_enabled: bool,
 }
 
-/// Every bundled app. The first Control leader seeds a record for each
-/// (enabled as its `seed_enabled` says, unless the manager config's `apps`
-/// block says otherwise), with its manifest's permissions granted by
-/// `legion:bootstrap`.
+/// Every bundled app's body. One row per manifest in
+/// [`crate::bundled_apps::MANIFESTS`]; a test here fails when the two
+/// lists name different apps.
 pub const BUNDLED: &[BundledApp] = &[
     BundledApp {
         name: "autoscaler",
-        manifest_source: include_str!("bundled/autoscaler.ncl"),
         body: autoscaler::run,
-        generated: Some(autoscaler::objects::fill_manifest),
-        seed_enabled: true,
     },
     BundledApp {
         name: "certs",
-        manifest_source: include_str!("bundled/certs.ncl"),
         body: certs::run,
-        generated: None,
-        seed_enabled: true,
     },
     BundledApp {
         name: "gitops",
-        manifest_source: include_str!("bundled/gitops.ncl"),
         body: gitops::run,
-        generated: None,
-        seed_enabled: true,
     },
-    // Seeded off: it takes ports 80 and 443 on the nodes it runs on, which
-    // no cluster should do until someone asks (ingress plan calls entry 3).
     BundledApp {
         name: "ingress",
-        manifest_source: include_str!("bundled/ingress.ncl"),
         body: ingress::run,
-        generated: None,
-        seed_enabled: false,
     },
 ];
 
-/// The bundled manifests, evaluated and validated once.
-fn evaluated() -> &'static Result<Vec<AppManifest>, String> {
-    static MANIFESTS: OnceLock<Result<Vec<AppManifest>, String>> = OnceLock::new();
-    MANIFESTS.get_or_init(|| {
-        BUNDLED
-            .iter()
-            .map(|app| {
-                let json = crate::config_lang::eval_sandboxed(
-                    &format!("bundled/{}.ncl", app.name),
-                    app.manifest_source,
-                    None,
-                )
-                .map_err(|err| format!("bundled app {}: {err:#}", app.name))?;
-                let json = match app.generated {
-                    Some(fill) => {
-                        let mut value: Value = serde_json::from_str(&json)
-                            .map_err(|err| format!("bundled app {}: {err}", app.name))?;
-                        fill(&mut value);
-                        value.to_string()
-                    }
-                    None => json,
-                };
-                let manifest = AppManifest::from_json(&json)
-                    .map_err(|err| format!("bundled app {}: {err}", app.name))?;
-                manifest.validate(true)?;
-                if manifest.name != app.name {
-                    return Err(format!(
-                        "bundled app {} has a manifest named {}",
-                        app.name, manifest.name
-                    ));
-                }
-                Ok(manifest)
-            })
-            .collect()
-    })
-}
-
-/// The manifests compiled into this binary. An error is a build defect,
-/// which the unit tests catch; callers log it and carry on without apps.
-pub fn bundled_manifests() -> R<&'static [AppManifest]> {
-    evaluated()
-        .as_ref()
-        .map(Vec::as_slice)
-        .map_err(|err| anyhow!("{err}"))
-}
-
-/// The manifest of bundled app `name`, if this binary has one.
-pub fn bundled_manifest(name: &str) -> Option<&'static AppManifest> {
-    bundled_manifests()
-        .ok()?
-        .iter()
-        .find(|manifest| manifest.name == name)
-}
-
-/// Whether `name` is a bundled app's (installed apps may not take it).
-pub fn is_bundled(name: &str) -> bool {
-    BUNDLED.iter().any(|app| app.name == name)
-}
-
-/// The jobspec keys the bundled apps declare (the ingress's `ingress` on
-/// services), as every cluster registers them by seeding. Parsing a jobspec
-/// against it checks those keys without a manager: what the shipped example
-/// jobs are tested with.
-pub fn bundled_extension_registry() -> &'static crate::structs::extensions::ExtensionRegistry {
-    static REGISTRY: OnceLock<crate::structs::extensions::ExtensionRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(|| {
-        let records: Vec<crate::structs::app::AppRecord> = bundled_manifests()
-            .unwrap_or_default()
-            .iter()
-            .map(|manifest| crate::manager::apps::seed_record(manifest, None))
-            .collect();
-        let (registry, problems) =
-            crate::structs::extensions::ExtensionRegistry::from_records(&records);
-        for problem in problems {
-            warn!("bundled jobspec keys: {problem}");
-        }
-        registry
-    })
-}
-
-/// Whether bundled app `name` is seeded enabled on a new cluster (`true`
-/// for a name that is not bundled, which is never seeded).
-pub fn seeds_enabled(name: &str) -> bool {
-    BUNDLED
-        .iter()
-        .find(|app| app.name == name)
-        .is_none_or(|app| app.seed_enabled)
-}
+pub use crate::bundled_apps::{
+    bundled_extension_registry, bundled_manifest, bundled_manifests, is_bundled, seeds_enabled,
+};
 
 /// The health an app reports on `/healthz`.
 #[derive(Debug, Clone)]
@@ -653,7 +547,14 @@ mod tests {
     #[test]
     fn bundled_manifests_are_valid() {
         let manifests = bundled_manifests().expect("bundled manifests evaluate");
-        assert_eq!(manifests.len(), BUNDLED.len());
+        // Every manifest has a body here and every body a manifest, in the
+        // same order.
+        let bodies: Vec<&str> = BUNDLED.iter().map(|app| app.name).collect();
+        let named: Vec<&str> = manifests
+            .iter()
+            .map(|manifest| manifest.name.as_str())
+            .collect();
+        assert_eq!(bodies, named);
         for manifest in manifests {
             assert!(manifest.version.is_none(), "{}", manifest.name);
             assert!(manifest.runs_self(), "{} runs legion:self", manifest.name);

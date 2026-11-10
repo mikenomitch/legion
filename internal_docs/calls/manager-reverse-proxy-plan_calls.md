@@ -48,7 +48,7 @@ later at the gateway.
 per stream, and only the `manager` caller class may open one. The worker
 dials `127.0.0.1:<bind_port>` inside the allocation's namespace, and only
 for a port that a local, running allocation declares. That is the same last
-hop the ingress datapath uses (`src/worker/netd/ingress.rs:521`). HTTP is
+hop the ingress datapath uses (`crates/worker/src/worker/netd/ingress.rs:521`). HTTP is
 spoken at the manager, over the tunnel.
 
 **Alternatives.**
@@ -62,7 +62,7 @@ spoken at the manager, over the tunnel.
 *behind* the job's ingress chain, so ingress authz handlers and mesh mTLS
 do not apply to it (entry 3 covers what that means for grants). Multi-host
 waits on worker-plane-auth Phase 1, but (a) waits too: every
-`workerAddress` is `127.0.0.1` today (`src/worker/daemon.rs:398`).
+`workerAddress` is `127.0.0.1` today (`crates/worker/src/worker/daemon.rs:398`).
 
 **Why (simplicity, extensibility).** (a) needs the dynamic port range open
 from managers to every node, sends plaintext across the VPC, and is refused
@@ -96,7 +96,7 @@ policies grant nothing until someone edits them.
 **Why (simplicity for the security admin).** The common request is "let
 on-call see Grafana", not "give on-call a shell". The codebase already
 splits a resource out when the narrow grant is the common one: `scale`,
-`boot`, and `snapshot` all do (`src/structs/acl.rs:14-66`). (b) is far too
+`boot`, and `snapshot` all do (`crates/common/src/structs/acl.rs:14-66`). (b) is far too
 broad, because `read` is handed out widely and a proxy can `POST`. (c)
 breaks the read/write action model that every policy and the endpoint table
 assume.
@@ -152,11 +152,11 @@ exec, telemetry, proxy).
 **Why (security, simplicity).**
 - (a) fails because tonic cannot upgrade, and because proxied pages would
   share the API's origin.
-- (b) fails because that listener has no TLS (`src/manager/exec_ws.rs:56`),
+- (b) fails because that listener has no TLS (`crates/manager/src/manager/exec_ws.rs:56`),
   disappears when exec is off, and is the last origin an arbitrary workload
   page should share.
 - The `OriginPolicy` exclusion matters on its own. Loopback origins on any
-  port are trusted (`src/manager/origin.rs:58-63`), so on a dev cluster
+  port are trusted (`crates/manager/src/manager/origin.rs:58-63`), so on a dev cluster
   with ACLs off, a proxied page at `127.0.0.1:4750` could otherwise drive
   `:4747`.
 - On by default, because the proxy does nothing without a grant, and

@@ -151,7 +151,7 @@ instead of the 10 s control timeout.
   long, so one hung restore could stall every start, stop, and heartbeat on
   its node for five minutes, long enough for the managers to mark the node
   lost. That was not acceptable, so restores now launch off the lock like
-  every other start (`UnlockedLaunch` in `src/worker/task_manager.rs`), and
+  every other start (`UnlockedLaunch` in `crates/worker/src/worker/task_manager.rs`), and
   the finish records the outcome on the checkpoint channel.
 - **Why.** cloud-hypervisor serves its API socket before the restore
   finishes and queues the resume behind it, so the 10 s timeout failed every

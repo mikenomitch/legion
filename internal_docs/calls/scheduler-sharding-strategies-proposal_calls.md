@@ -21,9 +21,9 @@ capture mutex. Control and status stay in `store.sqlite`; read connections
 the one shared file and called the scaling "near-linear until aggregate
 local write work saturates one core", deferring per-file partitioning to a
 v2/v3 fork. Re-reading the pipeline showed the cycle is strictly serial per
-group — capture, `block_on(client_write)`, reply (`src/storage/raft/driver.rs:1965`,
+group — capture, `block_on(client_write)`, reply (`crates/manager/src/storage/raft/driver.rs:1965`,
 `:2064`) — with both capture and apply under the process-global mutex
-(`src/storage/raft/capture.rs:230`, `:760`). N groups over one file overlap
+(`crates/manager/src/storage/raft/capture.rs:230`, `:760`). N groups over one file overlap
 only the quorum round-trip, and after the batching work the local body of a
 batch (~20 ms at depth, phase 5) dwarfs a same-AZ round-trip (1–3 ms). The
 arithmetic (`N_max ≈ T / (W_c + W_a)`) comes out near **1.1** — a latency
@@ -156,7 +156,7 @@ C does not cover it.
 
 **Why (performance without re-litigating correctness).** Under
 row-changeset replication, single-writer ownership is what makes replicas
-provably identical (`src/storage/raft/ownership.rs:5`), and apply-time
+provably identical (`crates/manager/src/storage/raft/ownership.rs:5`), and apply-time
 revalidation through one log is what makes oversubscription impossible
 rather than repairable. Job-keyed shards put every shard's log on every
 node's capacity rows; the honest fixes collapse into one apply arbiter
@@ -182,7 +182,7 @@ pipeline, a reconciler set, and a permanent row in the operator's mental
 model — and over the shared file buys zero write concurrency (entry 1's
 arithmetic applies to lanes exactly as to shards). The write classes are ~4
 and enumerable; the residue ceiling (`ID_STRIDE = 8`,
-`src/storage/raft/mod.rs:75`) is 8. Horizontal shards within a class scale;
+`crates/manager/src/storage/raft/mod.rs:75`) is 8. Horizontal shards within a class scale;
 vertical lanes per feature only widen.
 
 ## 6. Everything is sequenced behind a measured, attributed ceiling — and Phase 0 is made nearly free
@@ -190,7 +190,7 @@ vertical lanes per feature only widen.
 **Call.** No method graduates until Phase 0 names the bottleneck *per
 fleet-size regime*. Revision 2 made Phase 0 cheap: the capture-vs-propose
 split is already metered (`legion_raft_capture_seconds` /
-`legion_raft_propose_apply_seconds`, `src/manager/telemetry.rs:872`), plus
+`legion_raft_propose_apply_seconds`, `crates/manager/src/manager/telemetry.rs:872`), plus
 one in-process micro-benchmark of N pipelines over one file versus N files.
 Revision 3 makes it cheaper again: the native submitter shipped, the
 October campaigns measured the ceiling from 1k to 50k nodes, and

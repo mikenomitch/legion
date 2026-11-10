@@ -67,10 +67,10 @@ exec is opt-in.
 and `container` tasks and on macOS dev-mode sandboxes. On Linux, the
 `sandbox` runtime reports no exec support: `exec_support()` returns false
 because "exec into a microVM needs a vsock guest agent (deferred)"
-(`src/task_plugins/sandbox.rs:1551`), and the public table shows
+(`crates/worker/src/task_plugins/sandbox.rs:1551`), and the public table shows
 `sandbox (microVM)` without exec or tty (`docs/exec-and-actions.md`,
 "Which task runtimes support exec"). The `exec` idle signal never fires on
-a microVM, and `job validate` warns about it (`src/structs/suspend.rs:713`).
+a microVM, and `job validate` warns about it (`crates/common/src/structs/suspend.rs:713`).
 
 What a platform does instead: ships its own daemon inside the guest and its
 own route to it, the way E2B ships `envd`, or runs commands through the
@@ -86,11 +86,11 @@ of that I/O on the same three processes that run raft.
 **The worker listener is unauthenticated, and only the bind protects it.**
 The worker serves `PostWork`, `ExecTask`, `GetTaskLogs`, and
 `RestartWorker` with no authentication and no TLS
-(`src/worker/server.rs:55`, `:200`, built with no interceptor at
-`src/worker/daemon.rs:318`). The proto says `ExecTask` is "called only by
+(`crates/worker/src/worker/server.rs:55`, `:200`, built with no interceptor at
+`crates/worker/src/worker/daemon.rs:318`). The proto says `ExecTask` is "called only by
 the manager" (`proto/legion.proto:7224`), and the only thing that makes it
 true is the bind: the worker listens on `127.0.0.1:4848`
-(`src/worker/daemon.rs:155`). So the gap is local, not remote. Any process
+(`crates/worker/src/worker/daemon.rs:155`). So the gap is local, not remote. Any process
 on the worker's own host can call `ExecTask` against any allocation on that
 node. That includes workloads Legion runs: an `exec` task and a
 host-network container can open a shell in their neighbors. The
@@ -275,30 +275,30 @@ security reasons.
 **The exec plumbing is complete above the runtime.**
 - `TaskPlugin::exec_support()` returns `ExecSupport { exec, pty,
   host_level }`, and `TaskPlugin::exec()` returns a `Box<dyn ExecSession>`
-  (`src/task_plugins/mod.rs:472`, `:834-848`).
+  (`crates/worker/src/task_plugins/mod.rs:472`, `:834-848`).
 - `ExecSession` is `take_output`, `write_stdin`, `close_stdin`, `resize`,
-  `wait`, `try_wait`, and `kill` (`src/task_plugins/exec_session.rs:61`),
+  `wait`, `try_wait`, and `kill` (`crates/worker/src/task_plugins/exec_session.rs:61`),
   with `ExecOptions { command, tty, winsize, cwd, env }`.
 - `Worker.ExecTask` (`proto/legion.proto:7227`) drives a session on
   dedicated threads and counts open sessions per allocation in
   `OPEN_SESSIONS`, which feeds the idle policy's `exec` signal
-  (`src/worker/exec.rs:37-70`).
+  (`crates/worker/src/worker/exec.rs:37-70`).
 - `Manager.ExecAllocation` (`proto/legion.proto:1108`) authorizes with a
   coarse `exec`/`action` gate before any lookup and the job scope after it,
   renders an action's argv from the stored spec, resolves the worker, and
-  splices the stream (`resolve_exec_start`, `src/manager/exec.rs`). The
+  splices the stream (`resolve_exec_start`, `crates/manager/src/manager/exec.rs`). The
   session re-checks its credential every 30 seconds.
 - The UI uses a WebSocket bridge on the manager port + 1 that runs the same
   core, authenticated by `ExecStart.bearer_token` in the first frame
-  (`src/manager/exec_ws.rs`).
+  (`crates/manager/src/manager/exec_ws.rs`).
 - `runtime_is_host_level("sandbox")` is false
-  (`src/task_plugins/mod.rs:459`), so the `exec` ACL without `host` already
+  (`crates/worker/src/task_plugins/mod.rs:459`), so the `exec` ACL without `host` already
   covers sandboxes.
 
 **The microVM runtime.** `exec_support()` reports exec only on a backend
 that supports it, which today is macOS dev mode
-(`src/task_plugins/sandbox.rs:1551`). Only gated sandboxes get a vsock
-device (`src/task_plugins/sandbox.rs:1128`). The guest init starts
+(`crates/worker/src/task_plugins/sandbox.rs:1551`). Only gated sandboxes get a vsock
+device (`crates/worker/src/task_plugins/sandbox.rs:1128`). The guest init starts
 `/legion/legion guest-agent`, which relays guest-initiated traffic to host
 CID 2 and holds no host-initiated listener (gated plan §5). A gated
 sandbox's vsock path is baked into its memory checkpoint until the gated
@@ -306,9 +306,9 @@ plan's `vsock_override` lands (gated plan §6.2).
 
 **Offline ticket verification exists.** Workers verify boot tickets against
 a cached JWKS with a bounded clock skew and a local spent-`jti` set that
-forgets entries when their ticket expires (`src/worker/boot_ticket.rs`).
+forgets entries when their ticket expires (`crates/worker/src/worker/boot_ticket.rs`).
 The verifier is built only when `edgeBoot.acceptClaims` is on
-(`src/worker/daemon.rs:297`).
+(`crates/worker/src/worker/daemon.rs:297`).
 
 **The worker listener** binds `127.0.0.1:4848` with no authentication
 (§1). The worker-plane-auth plan makes it mTLS on all interfaces, with
@@ -360,7 +360,7 @@ manager-only RPCs and `StartClaim` authorized by its ticket.
   allocation.
 - **The `exec` idle signal works** with no new code, because the worker
   already counts open sessions per allocation. Remove the warning at
-  `src/structs/suspend.rs:713` and the matching rows in
+  `crates/common/src/structs/suspend.rs:713` and the matching rows in
   `docs/suspend-and-resume.md`.
 - **Unchanged surfaces.** `legion exec`, `legion action run`,
   `legion_exec_run`, `legion_action_run`, and the UI terminal need no
@@ -597,7 +597,7 @@ worker-plane-auth Phase 4 (its §6.1 and §6.8, calls entry 16). So direct exec
    ticket` and still fail on an unclassified RPC.
 3. **The JWKS verifier runs on every worker that admits tickets**, not only
    when `edgeBoot.acceptClaims` is on. Today it is built only for edge
-   boot (`src/worker/daemon.rs:297`). The cache, refresh, and skew settings
+   boot (`crates/worker/src/worker/daemon.rs:297`). The cache, refresh, and skew settings
    are shared, and the spent sets are per audience.
 
 Nothing else in that plan changes. The listener still requests but does not

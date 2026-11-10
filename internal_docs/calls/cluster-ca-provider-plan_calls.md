@@ -170,7 +170,7 @@ the new list.
 field the other side reads is empty, so during a rolling upgrade a CA change
 reaches older nodes only on their 8-hour timer (buf's WIRE check passes,
 because field 14 is reserved). Plus a few lines changed in
-`src/worker/daemon.rs`. Each built-in rotation now causes a
+`crates/worker/src/worker/daemon.rs`. Each built-in rotation now causes a
 second, harmless re-issue per node when its overlap ends (the old CA left
 the bundle).
 

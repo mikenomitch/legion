@@ -80,7 +80,7 @@ rather than a hidden assumption.
 eval is released back to pending with a delay (reusing
 `release_eval_for_retry`, built for foreign-lane `NotRaftLeader`
 rejections) instead of being marked `failed` — a state that is never
-retried (`src/storage/store.rs:9525`). Terminal failure remains for
+retried (`crates/manager/src/storage/store.rs:9525`). Terminal failure remains for
 non-conflict errors.
 
 **Alternatives.** (a) Keep terminal failure but raise the default retry

@@ -167,37 +167,37 @@ new reason, and everything they already use (`instance get`, events,
 
 ## 5. Background: what exists today
 
-- **The `suspend` block** (`src/structs/suspend.rs`): `checkpoint`,
+- **The `suspend` block** (`crates/common/src/structs/suspend.rs`): `checkpoint`,
   `idle`, `wake`, session-only fields. `IdleSignal::parse` refuses `hint`
-  with a pointer at Phase 8 (`src/structs/suspend.rs:195`).
+  with a pointer at Phase 8 (`crates/common/src/structs/suspend.rs:195`).
 - **Idle detection.** The worker's usage sampler
-  (`src/worker/usage.rs:431`) feeds `IdleTracker::observe`
-  (`src/worker/idle.rs`) per allocation and reports `idle_since_unix` on
+  (`crates/worker/src/worker/usage.rs:431`) feeds `IdleTracker::observe`
+  (`crates/worker/src/worker/idle.rs`) per allocation and reports `idle_since_unix` on
   the heartbeat, only when resource enforcement is on. The manager's sweep
-  (`idle_sweep`, `src/manager/server/suspend_rpcs.rs:737`) starts a
+  (`idle_sweep`, `crates/manager/src/manager/server/suspend_rpcs.rs:737`) starts a
   suspend through `begin_automatic_suspend`. Sessions are swept on their
   node (`idle_sessions_to_suspend`,
-  `src/worker/task_manager/session_sleep.rs:200`).
+  `crates/worker/src/worker/task_manager/session_sleep.rs:200`).
 - **Local suspensions.** The memory pressure response's `suspend` step
   checkpoints and stops a keyed instance from the node with no manager
-  request (`run_local_suspension`, `src/worker/checkpoints.rs:555`). It
+  request (`run_local_suspension`, `crates/worker/src/worker/checkpoints.rs:555`). It
   holds the allocation out of relaunch, queues a `SnapshotReport` with
   `local_suspension = true`, and wakes the heartbeat. The manager applies
   it in `apply_local_suspension_tx`
-  (`src/storage/store/suspend_ops.rs:558`), which hardcodes
+  (`crates/manager/src/storage/store/suspend_ops.rs:558`), which hardcodes
   `suspend_reason = pressure`, discards a capture that lost a race with a
   SuspendInstance, and records it `deleting` when the instance moved on.
   This is the fast path a park needs.
 - **Session suspend** (`suspend_session`,
-  `src/worker/task_manager/session_sleep.rs:906`) takes a trigger string
+  `crates/worker/src/worker/task_manager/session_sleep.rs:906`) takes a trigger string
   and the kind `local_suspend_kind` picks.
 - **Checkpoint kind** (`local_suspend_kind`,
-  `src/worker/task_manager.rs:1651`): the task's `suspend.checkpoint`, else
+  `crates/worker/src/worker/task_manager.rs:1651`): the task's `suspend.checkpoint`, else
   memory when the runtime can take one of this allocation, else disk.
 - **Task directories and env** (`prepare_instance`,
-  `src/worker/task_manager.rs:2321`): `LEGION_TASK_DIR` and friends. A
+  `crates/worker/src/worker/task_manager.rs:2321`): `LEGION_TASK_DIR` and friends. A
   container sees the task dir at `/legion/task` and its env is translated
-  (`translated_worker_env`, `src/task_plugins/container.rs:537`). A worker
+  (`translated_worker_env`, `crates/worker/src/task_plugins/container.rs:537`). A worker
   that restarts re-adopts running tasks in two other places that build the
   same env.
 - **The guest agent** (`guest/src/agent.rs`) runs in every microVM. Its
@@ -206,7 +206,7 @@ new reason, and everything they already use (`instance get`, events,
   `--no-relay` (TAP and `none`), the node binds nothing a guest can dial.
   Upstream local ports are relayed to host vsock ports of the same number,
   so host ports the agent uses are refused as upstream ports at submit
-  (`validate_gated_guest_ports`, `src/structs/network.rs:425`).
+  (`validate_gated_guest_ports`, `crates/common/src/structs/network.rs:425`).
 - **The gateway** (`src/gateway.rs`) resumes a suspended keyed instance on
   a request and holds it. Sessions are not routable through it yet
   (wake-on-request plan Phase 3).
@@ -387,7 +387,7 @@ Unchanged surfaces, documented on the park page:
   env, `checkpoint=memory` is refused on the socket, and `park after=0s`
   produces a local suspension reported with reason `park`; the socket goes
   with the allocation. A session parks on its node through the worker's
-  suspender (`src/worker/task_manager.rs` tests).
+  suspender (`crates/worker/src/worker/task_manager.rs` tests).
 - **Integration (manager):** a heartbeat carrying a park local suspension
   leaves the instance `suspended` with reason `park`, emits it on
   `instance.suspended`, and resumes from the node's checkpoint

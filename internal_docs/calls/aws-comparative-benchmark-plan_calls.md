@@ -370,7 +370,7 @@ the report, which is what a fairness argument has to survive.
 ## 16. `allocation.placed` events are the unit of counting, weighted by their `count`
 
 **Call.** Legion emits one `allocation.placed` per plan apply with
-`metadata.count` allocations in it (`src/storage/events.rs:233`); the
+`metadata.count` allocations in it (`crates/manager/src/storage/events.rs:233`); the
 driver counts that weight and emits `count` identical latency samples
 per event. Nomad/K8s adapters count per-allocation/per-pod sightings —
 their watch streams are already per-object.

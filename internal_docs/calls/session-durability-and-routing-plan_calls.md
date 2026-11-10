@@ -259,7 +259,7 @@ refusal. Edge starts come in Phase 4.
 phases later.
 
 **Why (performance).** Read on `main` after #30, a node serializes every launch
-behind one lock (`src/worker/task_manager.rs:4550`, `:2796`), so its rate
+behind one lock (`crates/worker/src/worker/task_manager.rs:4550`, `:2796`), so its rate
 is about one over the launch time. Edge starts with that lock in place
 would move the ceiling from a few managers to each node, at roughly 30
 starts a second per node for a 30 ms launch, and the target needs the
@@ -287,7 +287,7 @@ common case.
 
 ## 12. Session tasks may suspend with `durability = "local"`
 
-**Call.** Relax the submit refusal at `src/structs/session.rs:408`: a
+**Call.** Relax the submit refusal at `crates/common/src/structs/session.rs:408`: a
 session may sleep on its node only, pinned until `suspend.keepFor`
 (default `24h`) or disk pressure evicts it.
 
@@ -387,7 +387,7 @@ existing converge-to-one rule covers the rare cross-node retry.
 ## 16. Phase 2 group-commits the session log instead of fsyncing each start
 
 **Call.** `sessions.db` flushes every 50 ms on a writer thread
-(`src/worker/session_log.rs`, `GROUP_COMMIT`).
+(`crates/worker/src/worker/session_log.rs`, `GROUP_COMMIT`).
 
 **Alternative.** Fsync every start before acknowledging it.
 
@@ -519,7 +519,7 @@ enforcement anyway, since the envelope is only a promise without it.
 
 **Call.** Session tickets reuse the boot-ticket store: the row's gate
 column holds `"session"` to mark the scope (`SESSION_TICKET_GATE` in
-`src/manager/edge_boot.rs`), and `ListBootTickets` reports `scope`
+`crates/manager/src/manager/edge_boot.rs`), and `ListBootTickets` reports `scope`
 from it.
 
 **Alternative.** A new `scope` column (a store migration) or a separate

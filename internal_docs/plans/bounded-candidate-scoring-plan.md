@@ -6,14 +6,14 @@ from
 Public doc in `docs/scheduler-and-eval-loop.md` ("Bounded candidate
 scoring"); the packing-quality gate is
 `score_sample_bin_pack_quality_stays_bounded` in
-`src/manager/scheduler.rs`. Default remains exact scoring (opt-in knob).
+`crates/manager/src/manager/scheduler.rs`. Default remains exact scoring (opt-in knob).
 
 > **Judgement calls:** [`../calls/bounded-candidate-scoring-plan_calls.md`](../calls/bounded-candidate-scoring-plan_calls.md)
 
 ## Problem
 
 Legion scores **every** feasible node for every placement
-(`score_nodes_with_cache`, `src/manager/scheduler.rs:2743`, plus the
+(`score_nodes_with_cache`, `crates/manager/src/manager/scheduler.rs:2743`, plus the
 eligibility and best/tie passes around it — several O(feasible) passes
 per placement, repeated `count` times per task). With the scheduling
 index armed, "feasible" is a narrowed shard, but for weakly-constrained
@@ -72,7 +72,7 @@ nodes, Kubernetes ~10% (floor 50).
 
 ## What exists today
 
-- `nodes_considered` (`src/manager/scheduler.rs:2292`, `:2481`): an
+- `nodes_considered` (`crates/manager/src/manager/scheduler.rs:2292`, `:2481`): an
   existing unconditional shuffle-and-truncate knob (int or percentage),
   applied per placement for bin_pack/spread. No threshold gating — it
   applies at any fleet size, so it cannot express "exact when cheap,

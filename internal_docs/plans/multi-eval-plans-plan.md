@@ -16,8 +16,8 @@ arrival gap (§12). It waits for a lane-bound measurement on the rig. Phase
 
 Every keyed sandbox step that places work queues an eval. `CreateInstance`
 and a resume each enqueue a `job_reschedule` for the instance's job
-(`src/manager/server.rs`, `create_instance`, and
-`src/manager/server/suspend_rpcs.rs`), and that eval reconciles the whole
+(`crates/manager/src/manager/server.rs`, `create_instance`, and
+`crates/manager/src/manager/server/suspend_rpcs.rs`), and that eval reconciles the whole
 job: a reschedule plan adds every missing keyed allocation, not one.
 
 Under load the eval loop did not use that. Each create's eval reached an
@@ -122,21 +122,21 @@ changes. Agents see the same instance and eval APIs, only faster.
 
 ## 5. What exists today
 
-- **Claims are leader memory** (`src/storage/store/eval_claims.rs`). A claim
+- **Claims are leader memory** (`crates/manager/src/storage/store/eval_claims.rs`). A claim
   takes the head of `priority DESC, id ASC` and subsumes pending duplicates
   (same kind, same job, config, and node, already ready). The settle deletes
   them in its write.
-- **The fused settle** (`arm_eval_settle`, `src/storage/store.rs`): a
+- **The fused settle** (`arm_eval_settle`, `crates/manager/src/storage/store.rs`): a
   handler that declares its plan its last write has the plan delete the
   eval row and the subsumed duplicates, and stage `eval.completed`, in the
   plan's entry. Only `job_reschedule` armed it
-  (`src/structs/eval.rs`, `handle_job_reschedule`).
-- **The eval worker loop** (`src/manager/daemon.rs`, `eval_worker_loop`)
+  (`crates/manager/src/manager/eval.rs`, `handle_job_reschedule`).
+- **The eval worker loop** (`crates/manager/src/manager/daemon.rs`, `eval_worker_loop`)
   claims a fair-share batch, runs each handler, then settles the batch and
   claims the next in one call (`complete_evals_and_claim_next`).
 - **The epoch fence** (`apply_plan_submission_on`) rejects a plan whose
   job-config epoch moved since its snapshot. Rejections commit.
-- **Conflict retries** (`plan_with_conflict_retries`, `src/structs/eval.rs`):
+- **Conflict retries** (`plan_with_conflict_retries`, `crates/manager/src/manager/eval.rs`):
   3 attempts, 25 ms base backoff plus jitter, then a 1 to 2 s requeue.
 - **The redundant settle.** A settled eval whose claim subsumed duplicates
   was written a second time by the batch settle, to delete duplicates its
@@ -252,7 +252,7 @@ into the one it took.
 
 ## 9. Testing
 
-- **Unit** (`src/storage/store/eval_claims.rs`, Phase 1 only, not
+- **Unit** (`crates/manager/src/storage/store/eval_claims.rs`, Phase 1 only, not
   merged): a busy job is skipped while other jobs are claimed, a parked
   worker does not see a busy job's evals as ready, and the next claim after
   the handler returns subsumes the whole burst. A blocked eval keeps its

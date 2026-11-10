@@ -1,3 +1,4 @@
+use legion::manager::eval::EvalExt;
 use std::collections::{HashMap, HashSet};
 
 use legion::prelude::{json, Context, R};

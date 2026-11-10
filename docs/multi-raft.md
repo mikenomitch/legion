@@ -60,7 +60,7 @@ Raft mode also gives you:
 
 All fields live under `persistence.raft` (camelCase in config files).
 Defaults come from `RaftPersistenceConfig::with_defaults` in
-`src/structs/config.rs`:
+`crates/common/src/structs/config.rs`:
 
 | Field | Default | Meaning |
 | --- | --- | --- |

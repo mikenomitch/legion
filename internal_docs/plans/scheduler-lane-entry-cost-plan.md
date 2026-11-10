@@ -115,7 +115,7 @@ grows, and nothing on the operator's side explains why.
 ## 5. Background: what exists today
 
 **The write path.** `Store::replicated` hands a closure to the lane's
-pipeline thread (`src/storage/raft/driver.rs`, `pipeline_loop`), which runs
+pipeline thread (`crates/manager/src/storage/raft/driver.rs`, `pipeline_loop`), which runs
 `execute_replicated`: confirm leadership, `capture::capture_mutation` (open
 `SAVEPOINT legion_capture`, attach a SQLite session, run the body, extract
 the changeset, roll back), check ownership and peer schemas, then
@@ -123,11 +123,11 @@ the changeset, roll back), check ownership and peer schemas, then
 and the local state machine's apply (`capture::apply_changeset_with`:
 changeset apply, applied marker, commit with `synchronous = FULL`, then
 side-effect projection). Captures and applies share one write connection
-and exclude each other through `CAPTURE_MUTEX` (`src/storage/raft/capture.rs`).
+and exclude each other through `CAPTURE_MUTEX` (`crates/manager/src/storage/raft/capture.rs`).
 
 **The keyed bind.** Every placement of a keyed task goes through
 `insert_allocation_with_data` → `assign_stateful_instance_tx` →
-`assign_keyed_instance_tx` (`src/storage/store.rs`), which picks the oldest
+`assign_keyed_instance_tx` (`crates/manager/src/storage/store.rs`), which picks the oldest
 unbound live instance of the task, with node-local volume, restore, and
 reschedule-hold preferences, and binds it in the same transaction as the
 allocation insert. Before Phase 1 the query searched

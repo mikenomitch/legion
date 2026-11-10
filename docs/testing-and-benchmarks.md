@@ -6,14 +6,20 @@ This page covers how Legion is tested and benchmarked, and how to run each suite
 
 Legion uses a mixed strategy:
 
-- Unit tests colocated in module files (`#[cfg(test)]` in `src/`).
+- Unit tests colocated in module files (`#[cfg(test)]`), one test binary per
+  crate: `legion-common`, `legion-worker`, `legion-manager`, and the binary
+  crate in `src/` ([codebase-conventions.md](codebase-conventions.md#crates)).
+  A unit test can use its own crate and the crates below it.
 - Integration tests under `tests/`, almost all of them modules of one test
-  binary, `tests/integration/main.rs`.
+  binary, `tests/integration/main.rs`. It links every crate, so this is also
+  where a test goes when it needs a crate *above* the code it exercises: the
+  `worker_*` modules run worker code (ticket verifiers, the heartbeat loop,
+  content reports) against the real manager.
 
 ### One integration binary
 
 Cargo builds every top-level `tests/*.rs` file as its own test binary, and
-each of those links all of Legion and its ~520 dependencies: about 200 MB of
+each of those links all of Legion and its ~490 dependencies: about 200 MB of
 unoptimized code and a full link per file, repeated whenever the library
 changes. With some sixty files that was most of a `cargo test` run's build
 time and most of the target directory. So the integration tests are modules
@@ -59,6 +65,13 @@ SQLite is compiled with optimizations even in dev builds, because every
 store-backed test runs the full migration chain through it. The library's
 doc-test pass and the `legion` binary's empty unit-test target are switched
 off, since both cost a full rustdoc pass or link and ran nothing.
+
+Memory is the other half. rustc holds a whole crate in one process, and
+`cargo test` compiles each crate twice at once (with and without its tests),
+so the crate layout decides what a build needs: a clean
+`cargo test --all --no-run` peaks at about 9.6 GB on four cores, and the
+largest single compile (`legion-manager` with its tests) is 4.5 GB. On a
+machine with less than about 12 GB, pass `-j 2`.
 
 ### Temporary directories
 
@@ -122,6 +135,15 @@ holds `crate::support::DYNAMIC_PORT_GATE`.
   - several autoscaler replicas split the 64 shards and rebalance after one
     dies; two forced to overlap land one `ScaleTask` and one `target/scale`
     per decision; the policy watch sends deltas for the shards asked.
+- `worker_boot_ticket`, `worker_direct_exec`, `worker_edge_overload`,
+  `worker_content_report`, `worker_daemon`, `worker_managers`
+  - worker code against the real manager: the boot- and exec-ticket
+    verifiers against tickets the manager's issuer signs, a node shedding
+    edge starts under a slow control plane, content reports against the
+    manager's content index, registration and the heartbeat loop against a
+    manager on a loopback port, and a worker's clients following a manager
+    failover. They are here, not beside the worker code, because the worker
+    crate cannot see the manager.
 
 ## Running Tests
 
@@ -131,7 +153,12 @@ Primary command:
 
 While iterating, build and run only what the change touches:
 
-- `cargo test --lib <filter>` for unit tests in `src/`.
+- `cargo test -p legion-worker <filter>` for one crate's unit tests
+  (`legion-common`, `legion-worker`, `legion-manager`, or `legion-rs` for the
+  CLI and apps). It builds that crate and the ones below it and nothing
+  else: the worker's tests never compile the manager.
+- `cargo test --lib <filter>` for unit tests wherever they are. It covers
+  every crate, so it builds every crate's unit tests first.
 - `cargo test --test integration <module>::` for one integration module.
 
 Run the tests for any Rust change. Docs-only and frontend-only changes are the usual exception.
@@ -356,8 +383,8 @@ What they measure:
   Reference numbers from this target, and what they mean for a deployment,
   are in [What the datapath costs](network-handlers.md#what-the-datapath-costs).
 
-  Datapath changes in `src/worker/forwarder.rs`, `src/worker/netd/`, or
-  `src/worker/balance.rs` should report before/after numbers from this
+  Datapath changes in `crates/worker/src/worker/forwarder.rs`, `crates/worker/src/worker/netd/`, or
+  `crates/worker/src/worker/balance.rs` should report before/after numbers from this
   target. Run it on Linux for anything that touches the copy path.
 - `scaling_rollup_bench`: the cost of each step of the
   [scaling-input rollups](autoscaling.md#scaling-inputs), at the plan's
@@ -378,7 +405,7 @@ What they measure:
   ```
 
   Everything but `edge_record` runs once per 10 seconds per manager, off the
-  heartbeat path. Changes to `src/manager/scaling_inputs.rs` should report
+  heartbeat path. Changes to `crates/manager/src/manager/scaling_inputs.rs` should report
   before/after numbers from this target.
 - `plan_contention`: N concurrent single-allocation submits against one
   pool, processed by real eval workers. It measures conflict rejections,
@@ -513,7 +540,7 @@ Scenario files encode:
 
 CI behavior:
 
-- `.github/workflows/ci.yml` runs the SLO benchmark gate only when scheduler-impacting files are changed (`src/manager/scheduler.rs`, `src/storage/store.rs`, `src/manager/daemon.rs`, benchmark scenarios, the shared runner in `tests/integration/benchmark_support/`, or the gate test itself).
+- `.github/workflows/ci.yml` runs the SLO benchmark gate only when scheduler-impacting files are changed (`crates/manager/src/manager/scheduler.rs`, `crates/manager/src/storage/store.rs`, `crates/manager/src/manager/daemon.rs`, benchmark scenarios, the shared runner in `tests/integration/benchmark_support/`, or the gate test itself).
 - The backend matrix (`scheduler_scale_benchmark`) runs manually. It stands
   up raft clusters and is too heavy for per-PR CI. Its
   `plan_timings_are_populated_and_coherent` smoke test does run in normal CI

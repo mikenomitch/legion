@@ -11,7 +11,7 @@ The default file path is `<data dir>/store.sqlite`, where the data dir is
 Startup (`Store::start_storage`):
 
 - opens writable connection
-- runs schema migrations (`src/storage/migrations.rs`)
+- runs schema migrations (`crates/manager/src/storage/migrations.rs`)
 - creates read-only connection pool
 - enables WAL mode (`synchronous = NORMAL`) and foreign keys on write
   connection
@@ -25,7 +25,7 @@ Startup (`Store::start_storage`):
 
 Migrations come in two kinds, and they run differently.
 
-**Schema steps** (`src/storage/migrations.rs`) create and change tables:
+**Schema steps** (`crates/manager/src/storage/migrations.rs`) create and change tables:
 `CREATE TABLE`/`INDEX`, `ADD COLUMN`, table rebuilds that copy every row
 (`INSERT INTO new SELECT … FROM old`), and constant seed rows. Every manager
 runs them locally at startup. Their result does not depend on when a
@@ -33,7 +33,7 @@ manager runs them, so replicas that migrate at different moments still
 agree. The schema version a manager advertises to its raft peers is the
 number of schema steps it knows.
 
-**Data steps** (`src/storage/data_migrations.rs`) rewrite existing rows: a
+**Data steps** (`crates/manager/src/storage/data_migrations.rs`) rewrite existing rows: a
 backfill of a new column, a cleanup of rows an old build left. Their
 result does depend on which rows exist when they run, so they never run
 locally on a raft replica. Instead the control-lane leader runs every

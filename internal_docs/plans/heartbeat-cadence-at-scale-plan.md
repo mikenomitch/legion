@@ -35,7 +35,7 @@ per-node operator-set cadence.
 A 3-voter raft control plane under the `lanes` topology (3× m7i.xlarge,
 4 vCPU each) sustained **~80 heartbeat RPCs/second** in the AWS benchmark
 rig. Heartbeat cadence defaults to **2 seconds**
-(`WORKER_HEARTBEAT_DURATION_SEC`, `src/constants.rs:80`). Those two
+(`WORKER_HEARTBEAT_DURATION_SEC`, `crates/common/src/constants.rs:80`). Those two
 numbers multiply out to about **160 nodes** before heartbeats start
 falling behind, on hardware an operator would reasonably call "the
 control plane".
@@ -46,8 +46,8 @@ it through:
 
 - Configured interval: 2s. Achieved effective interval: `2s / 0.22 ≈ 9.1s`.
 - Lost-node threshold: **10s**, a hard-coded constant
-  (`DEF_LOST_NODE_AT_SEC`, `src/constants.rs:72`), compared against a
-  single global cutoff in `nodes_to_mark_lost` (`src/manager/daemon.rs:974`).
+  (`DEF_LOST_NODE_AT_SEC`, `crates/common/src/constants.rs:72`), compared against a
+  single global cutoff in `nodes_to_mark_lost` (`crates/manager/src/manager/daemon.rs:974`).
 
 The fleet was running **9.1 seconds into a 10-second window**. Healthy
 nodes with healthy workers began being marked lost — not because anything
@@ -73,11 +73,11 @@ The fleet was operating **10% of margin away** from mass false loss.
 Nothing available to them is adequate:
 
 - `heartbeatSeconds` exists on the worker-type config
-  (`src/structs/config.rs:1535`), clamped to `1..=30`
-  (`heartbeat_interval_for`, `src/worker/daemon.rs:585`), jittered ±10%.
+  (`crates/common/src/structs/config.rs:1535`), clamped to `1..=30`
+  (`heartbeat_interval_for`, `crates/worker/src/worker/daemon.rs:585`), jittered ±10%.
   But the lost window **does not move with it**. Setting
   `heartbeatSeconds: 8` means one missed beat is a lost node. The manager
-  already warns above 3s (`src/manager/daemon.rs:1944`) precisely because
+  already warns above 3s (`crates/manager/src/manager/daemon.rs:1944`) precisely because
   the 10s window is fixed — so the one knob that relieves manager load is
   the same knob that destroys detection margin.
 - There is no published sizing guidance. Nothing tells an operator that
@@ -95,7 +95,7 @@ Both are load-bearing on the design and neither is currently guarded:
 1. **Status-lane leadership change has no grace period.**
    `nodes_to_mark_lost` suppresses marking for the first
    `DEF_LOST_NODE_AT_SEC` of *process uptime*
-   (`src/manager/daemon.rs:978`), measured from `started_at` in
+   (`crates/manager/src/manager/daemon.rs:978`), measured from `started_at` in
    `start_node_status_checker`. Under `lanes` topology, a manager that has
    been up for hours can *acquire* status-lane leadership mid-life and
    immediately begin marking lost, with no window for the fleet to
@@ -103,7 +103,7 @@ Both are load-bearing on the design and neither is currently guarded:
    seconds of failed heartbeats. Nomad has a dedicated
    `failover_heartbeat_ttl` for exactly this.
 2. **Stateful self-fencing is calibrated to a 2s cadence.**
-   `DEFAULT_SELF_TERMINATE_AFTER` is 90s (`src/structs/job.rs:1050`) — the
+   `DEFAULT_SELF_TERMINATE_AFTER` is 90s (`crates/common/src/structs/job.rs:1050`) — the
    worker kills its own stateful tasks after that long without manager
    contact. Any cadence at or near 90s makes a *healthy* worker self-fence
    between beats. Whatever raises the interval ceiling must validate
@@ -380,21 +380,21 @@ ordinary `--json` requirement on the one new read-only command.
 
 | Thing | Where | Today |
 | --- | --- | --- |
-| Default cadence | `src/constants.rs:80` | `WORKER_HEARTBEAT_DURATION_SEC = 2` |
-| Lost threshold | `src/constants.rs:72` | `DEF_LOST_NODE_AT_SEC = 10`, global const |
-| Cadence resolution | `src/worker/daemon.rs:585` | `heartbeat_interval_for`, worker-type `heartbeatSeconds` clamped `1..=30`, else default |
-| Jitter | `src/worker/daemon.rs:600` | `jittered_heartbeat_interval`, ±10% per beat |
-| Worker loop | `src/worker/daemon.rs:619-670` | `start_heartbeats`; failures never exit the loop, exponential backoff |
-| Config validation | `src/manager/daemon.rs:1944` | rejects outside `1..=30`, warns above 3 (naming the fixed 10s window) |
-| Handler | `src/manager/server.rs:5095` | `heartbeat`; worker-plane ACL, `update_node_heartbeat`, then reply construction |
-| Liveness tick | `src/manager/daemon.rs:~683` | status-lane leader only; `nodes_to_mark_lost` → `mark_nodes_as_lost` → `recheck_lost_nodes` |
-| Lost decision | `src/manager/daemon.rs:974-1010` | one global `unix_cutoff`; startup grace keyed on **process** uptime |
-| Cadence served to worker | `src/manager/server.rs:5248` | `worker_pre_register` copies `heartbeat_seconds` from the worker type |
+| Default cadence | `crates/common/src/constants.rs:80` | `WORKER_HEARTBEAT_DURATION_SEC = 2` |
+| Lost threshold | `crates/common/src/constants.rs:72` | `DEF_LOST_NODE_AT_SEC = 10`, global const |
+| Cadence resolution | `crates/worker/src/worker/daemon.rs:585` | `heartbeat_interval_for`, worker-type `heartbeatSeconds` clamped `1..=30`, else default |
+| Jitter | `crates/worker/src/worker/daemon.rs:600` | `jittered_heartbeat_interval`, ±10% per beat |
+| Worker loop | `crates/worker/src/worker/daemon.rs:619-670` | `start_heartbeats`; failures never exit the loop, exponential backoff |
+| Config validation | `crates/manager/src/manager/daemon.rs:1944` | rejects outside `1..=30`, warns above 3 (naming the fixed 10s window) |
+| Handler | `crates/manager/src/manager/server.rs:5095` | `heartbeat`; worker-plane ACL, `update_node_heartbeat`, then reply construction |
+| Liveness tick | `crates/manager/src/manager/daemon.rs:~683` | status-lane leader only; `nodes_to_mark_lost` → `mark_nodes_as_lost` → `recheck_lost_nodes` |
+| Lost decision | `crates/manager/src/manager/daemon.rs:974-1010` | one global `unix_cutoff`; startup grace keyed on **process** uptime |
+| Cadence served to worker | `crates/manager/src/manager/server.rs:5248` | `worker_pre_register` copies `heartbeat_seconds` from the worker type |
 | Reply carrier | `proto/legion.proto:2670` | `HeartbeatReply` — already carries desired allocations, endpoints, stop notices, claim verdicts |
 | Group commit | shipped | concurrent heartbeats coalesce into one status-lane commit, ≤128 |
-| Metrics | `src/manager/telemetry.rs:678` | `legion_heartbeats_total`; `legion_nodes{status}`; `legion_store_coalesce_*{path="heartbeat"}` |
-| Sim fleet | `src/worker/simulate.rs:282` | shares `heartbeat_interval_for` + jitter with the real worker "so the cadence contract is shared, not forked" |
-| Self-fence | `src/structs/job.rs:1050` | `DEFAULT_SELF_TERMINATE_AFTER = 90s` |
+| Metrics | `crates/manager/src/manager/telemetry.rs:678` | `legion_heartbeats_total`; `legion_nodes{status}`; `legion_store_coalesce_*{path="heartbeat"}` |
+| Sim fleet | `crates/worker/src/worker/simulate.rs:282` | shares `heartbeat_interval_for` + jitter with the real worker "so the cadence contract is shared, not forked" |
+| Self-fence | `crates/common/src/structs/job.rs:1050` | `DEFAULT_SELF_TERMINATE_AFTER = 90s` |
 
 Two facts from that table shape everything below. **The reply already
 exists and is already a rich, per-node, every-beat channel** — adding a
@@ -820,7 +820,7 @@ documentation rule:
   `suggested_heartbeat_seconds`, `adaptive_enabled`, `at_max_interval`.
   Phase 2.
 
-**Manager config** (`src/structs/config.rs`, `configs/manager.jsonnet`):
+**Manager config** (`crates/common/src/structs/config.rs`, `configs/manager.jsonnet`):
 the `heartbeat { targetRatePerSecond, minInterval, maxInterval,
 missedBeatsBeforeLost, failoverGrace }` block from §6.4. All optional;
 omitting the block reproduces today exactly.
@@ -831,7 +831,7 @@ nothing. Its clamp widens from `1..=30` to `1..=300` in phase 2, with
 validation that rejects any value where
 `missedBeatsBeforeLost × heartbeatSeconds` would exceed the smallest
 `stateful.onLost.selfTerminateAfter` in play (default 90s,
-`src/structs/job.rs:1050`) — the §1 hazard, caught at config load rather
+`crates/common/src/structs/job.rs:1050`) — the §1 hazard, caught at config load rather
 than discovered as spontaneous stateful task death.
 
 **Persistence:** `ALTER TABLE node_health ADD COLUMN lost_after_seconds
@@ -913,7 +913,7 @@ sharp edge, and they are worth having even if phase 4 never ships.
 **Integration.**
 - A worker that ignores `next_interval_seconds` (simulating an older
   build) is never marked lost while beating at its own cadence.
-- Existing grace-window tests in `src/manager/daemon.rs`, the
+- Existing grace-window tests in `crates/manager/src/manager/daemon.rs`, the
   `raft_lanes.rs` status-lane suites, and the
   `metrics_endpoint.rs` heartbeat-counter test all stay green unchanged —
   the default path must be bit-for-bit identical.

@@ -1,6 +1,6 @@
 # Task Runtime: container
 
-`container` is a built-in task runtime implemented in `src/task_plugins/container.rs`.
+`container` is a built-in task runtime implemented in `crates/worker/src/task_plugins/container.rs`.
 
 ## Purpose
 
@@ -49,7 +49,7 @@ runtime.
 ### Linux: image → bundle
 
 A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
-(`src/task_plugins/oci_bundle.rs`):
+(`crates/worker/src/task_plugins/oci_bundle.rs`):
 
 1. **Get the image's OCI layout.** If the image was staged through the
    artifact pipeline (`artifacts.containerImageDesugar`), Legion uses that

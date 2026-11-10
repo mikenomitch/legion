@@ -1,0 +1,70 @@
+[package]
+name = "legion-common"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Legion's shared layer: the domain types and jobspec, the config language, autoscaling policy, cluster TLS, and the metrics registry"
+repository = "https://github.com/mikenomitch/legion"
+
+[lib]
+# No doc tests: running rustdoc over the crate on every `cargo test` finds
+# none.
+doctest = false
+
+[dependencies]
+legion-guest.workspace = true
+legion-proto.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+bytes.workspace = true
+cel.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+clap.workspace = true
+cron.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+humantime.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+jsonschema.workspace = true
+jsonwebtoken.workspace = true
+lazy_static.workspace = true
+libc.workspace = true
+nickel-lang-core.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-proto.workspace = true
+opentelemetry_sdk.workspace = true
+prost.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+rusqlite.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+schemars.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strsim.workspace = true
+sysinfo.workspace = true
+tabled.workspace = true
+tempfile.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+x509-parser.workspace = true
+zeroize.workspace = true

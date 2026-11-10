@@ -50,7 +50,7 @@ mode, and the `legion netd` process split. Each is in §4 (non-goals) or
 **Relationship to existing plans.** This plan lifts the limitation recorded
 in [suspend plan calls 55 and 48](../calls/suspend-resume-and-oversubscription-plan_calls.md#55-gated-sandboxes-are-not-memory-checkpointable-yet)
 and executes the "`sandbox` moves to `gated` when its vsock transport lands"
-note in `resolve_network_mode` (`src/structs/network.rs:39`). It reuses the
+note in `resolve_network_mode` (`crates/common/src/structs/network.rs:39`). It reuses the
 restore machinery of
 [`suspend-resume-and-oversubscription-plan.md`](suspend-resume-and-oversubscription-plan.md)
 (device links, the identity disk, the resume handler, TAP retargeting for
@@ -105,7 +105,7 @@ except Phase 4, which is independent.
 
 **What is impossible today.** A `sandbox` task with `network.mode = "gated"`
 and memory checkpoints fails job validation
-(`src/structs/snapshot.rs:463`):
+(`crates/common/src/structs/snapshot.rs:463`):
 
 ```text
 Error: task "workspace" asks for memory checkpoints, but sandbox memory checkpoints don't support gated networking yet
@@ -113,9 +113,9 @@ Hint: set snapshots.memory = false for disk-only snapshots, or drop network gati
 ```
 
 When a stored policy imposes `gated`, the sandbox launches without checkpoint
-support (`src/task_plugins/sandbox.rs:1140`), and `SuspendInstance`,
+support (`crates/worker/src/task_plugins/sandbox.rs:1140`), and `SuspendInstance`,
 `CreateSnapshot --memory`, and `ForkInstance` fail with `FailedPrecondition`
-(`src/manager/server/suspend_rpcs.rs:113`, `snapshot_rpcs.rs:210`,
+(`crates/manager/src/manager/server/suspend_rpcs.rs:113`, `snapshot_rpcs.rs:210`,
 `sandbox_checkpoint.rs:407`).
 
 **What a platform does instead.** It runs agent sandboxes on
@@ -134,7 +134,7 @@ Legion's job, not the user's.
 
 **And the default is wrong for the use case.** A `sandbox` with no network
 config boots with loopback only. `network.mode = "auto"` resolves to `host`
-for every runtime (`src/structs/network.rs:42`), so the gated datapath an
+for every runtime (`crates/common/src/structs/network.rs:42`), so the gated datapath an
 agent sandbox most needs is opt-in, and its unit-tested code has never booted
 on a real VMM.
 
@@ -300,7 +300,7 @@ existing `instance`, `snapshot`, and `net` commands and MCP tools cover it.
 - **UDP beyond DNS, ICMP, and raw sockets** through the datapath. The proxy
   speaks TCP (HTTP `CONNECT`, absolute-URI HTTP, SOCKS5 `CONNECT`), and the
   guest agent relays only TCP 1080 and UDP 53
-  (`src/worker/netd/guest_agent.rs`, `proxy.rs:832`). The service mesh plan's Phase 7 owns
+  (`crates/worker/src/worker/netd/guest_agent.rs`, `proxy.rs:832`). The service mesh plan's Phase 7 owns
   UDP.
 - **Exec into a microVM** over the guest agent's vsock. The device and agent
   are now always present, so this gets cheaper, but it is its own plan.
@@ -318,7 +318,7 @@ existing `instance`, `snapshot`, and `net` commands and MCP tools cover it.
 
 - Launch: a gated sandbox gets `VmSpec.vsock = VsockSpec { cid:
   vsock_cid(allocation.id), socket: <alloc>/.sandbox/vsock.sock }`
-  (`src/task_plugins/sandbox.rs:1128`, `microvm.rs:367-380`). The CID is
+  (`crates/worker/src/task_plugins/sandbox.rs:1128`, `microvm.rs:367-380`). The CID is
   `3 + allocation_id % (u32::MAX - 3)`. cloud-hypervisor gets
   `--vsock cid=…,socket=…` (`microvm.rs:487`), Firecracker a `"vsock"` config
   block (`microvm.rs:546`). A TAP in config is refused at start
@@ -333,7 +333,7 @@ existing `instance`, `snapshot`, and `net` commands and MCP tools cover it.
   (`guest_agent.rs:200-292`). It holds no long-lived host connection.
 - Host: on every successful heartbeat, `apply_upstreams` binds the egress
   proxy on `<alloc>/.sandbox/vsock.sock_1080` and the resolver on `_53`,
-  derived from the allocation id alone (`src/worker/daemon.rs:2369`,
+  derived from the allocation id alone (`crates/worker/src/worker/daemon.rs:2369`,
   `2185`, `2603`), **before** reconcile launches the task in the same tick
   (`daemon.rs:1508-1550`). Both listeners create the parent dir and unlink a
   stale socket first (`proxy.rs:191`, `dns.rs:174`).
@@ -342,10 +342,10 @@ existing `instance`, `snapshot`, and `net` commands and MCP tools cover it.
   denies with `policy-pending` until the allocation's policy arrives, and
   checks the edge-boot gate first. **With no policy at all, a gated
   allocation allows everything** (`egress_connect_verdict`,
-  `src/worker/netd/policy.rs:194`), as `docs/network-handlers.md` says.
+  `crates/worker/src/worker/netd/policy.rs:194`), as `docs/network-handlers.md` says.
 - Env: a gated allocation gets `LEGION_EGRESS_PROXY`, `HTTP_PROXY`,
   `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, upper case only
-  (`src/structs/network.rs:649`).
+  (`crates/common/src/structs/network.rs:649`).
 - Status: `net_status` reports a gated sandbox's capture as ready when the
   proxy is bound. The resolver is checked only when a VIP block exists
   (`daemon.rs:2475-2510`).
@@ -353,20 +353,20 @@ existing `instance`, `snapshot`, and `net` commands and MCP tools cover it.
 **Gaps found in the recon** (each becomes a task below):
 
 - A VIP block, and so the resolver, is assigned only to allocations with
-  upstreams (`src/storage/store.rs:12160`). A gated sandbox with no
+  upstreams (`crates/manager/src/storage/store.rs:12160`). A gated sandbox with no
   `connect.upstreams` has no `_53` listener, so DNS in the guest fails. The
   same holds for gated `container` and `exec` tasks.
 - The ingress listener dials the private port inside the allocation's
-  network namespace (`src/worker/netd/ingress.rs:522`). A gated sandbox has
+  network namespace (`crates/worker/src/worker/netd/ingress.rs:522`). A gated sandbox has
   no namespace, so ingress into it cannot work, and nothing refuses the
   combination.
 - The proxy records bytes only when a splice ends
   (`copy_bidirectional` then `record_bytes`, `proxy.rs:788`). An idle sweep
   sees a long model stream at its start and its end, never during.
 - `connections` counts open ingress connections only
-  (`src/worker/netd/activity.rs`). Combined with the ingress gap, it can
+  (`crates/worker/src/worker/netd/activity.rs`). Combined with the ingress gap, it can
   never fire on a gated sandbox, though submit accepts it there
-  (`src/structs/suspend.rs:688`).
+  (`crates/common/src/structs/suspend.rs:688`).
 - The guest agent is the worker binary, which is dynamically linked against
   glibc. On a musl image such as `alpine:latest`, it does not run and the
   guest has no network (fails closed, `docs/network-handlers.md`).
@@ -383,11 +383,11 @@ existing `instance`, `snapshot`, and `net` commands and MCP tools cover it.
   `record_attached_tap`). A resume recreates it by name
   (`ensure_restore_tap`). A fork moves the NIC to its own `lgf…` device,
   through `network_overrides` on Firecracker (version-gated at 1.12 by
-  `firecracker_can_override_tap`, `src/structs/fork.rs:72`, checked in
+  `firecracker_can_override_tap`, `crates/common/src/structs/fork.rs:72`, checked in
   `fork_rpcs.rs:133`) and a rewritten copy of `config.json` on
   cloud-hypervisor (`retarget_cloud_hypervisor_tap`,
   `sandbox_checkpoint.rs:979`).
-- The resume handler (`legion guest-resume`, `src/task_plugins/guest_resume.rs`)
+- The resume handler (`legion guest-resume`, `crates/worker/src/task_plugins/guest_resume.rs`)
   polls the identity disk and, on a restore, reseeds the RNG, steps the
   clock, sets the hostname and the NIC's MAC (`ip link set eth0 address`),
   writes identity files, and runs `onResume`. It runs only when the sandbox
@@ -644,14 +644,14 @@ Remove the `gated` exclusions at launch:
 
 Remove the refusals at submit and at the API in the same phase:
 `validate_memory_checkpoint_network` and `gated_memory_checkpoint_error`
-(`src/structs/snapshot.rs:436-473`), and the gated branches in
+(`crates/common/src/structs/snapshot.rs:436-473`), and the gated branches in
 `suspend_rpcs.rs:113` and `snapshot_rpcs.rs:210`. The Firecracker floor in
 §6.2 replaces them on that VMM.
 
 ### 6.5 Gated is the sandbox default, and it denies by default
 
 **Resolution.** `network.mode = "auto"` (the default when unset) resolves
-at placement, in `effective_network_mode` (`src/storage/store.rs:12034`),
+at placement, in `effective_network_mode` (`crates/manager/src/storage/store.rs:12034`),
 which already has the node id:
 
 | Task | Node | Resolves to |
@@ -866,7 +866,7 @@ dev backend, and an explicit `dev` with `gated` is caught at submit.
 Two changes, both on the egress proxy:
 
 - **Live bytes.** Wrap both halves of every proxy splice in the activity
-  ledger's `TrackedStream` (`src/worker/netd/activity.rs`), so bytes stamp
+  ledger's `TrackedStream` (`crates/worker/src/worker/netd/activity.rs`), so bytes stamp
   the allocation's last-bytes time as they move. Today the proxy records
   bytes once, when the splice ends. The `network` signal then sees a long
   model stream throughout, instead of at its start and end. The hot-path
@@ -903,9 +903,9 @@ This gives a platform a way to reach its sandbox (a harness API, a preview
 of the dev server the agent started) without a TAP, and it makes
 `connections` see ingress on gated sandboxes too.
 
-**As built.** The handshake is `src/worker/netd/vsock.rs` (`OK <n>` or a
+**As built.** The handshake is `crates/worker/src/worker/netd/vsock.rs` (`OK <n>` or a
 failed dial, two-second budget); `TaskDial::{Loopback, Vsock, Bridge}` in
-`src/worker/netd/ingress.rs` is how every ingress connection reaches its
+`crates/worker/src/worker/netd/ingress.rs` is how every ingress connection reaches its
 task, and HTTP mode dials through the same target. The port written in
 `CONNECT` is the port the workload binds (`AllocPort::bind_port`), so the
 vsock port and the guest's loopback port are one number (calls entry 15).
@@ -920,7 +920,7 @@ fronted in the same change, at the leased guest address (calls entry 11).
 **Upstreams, added after Phase 5.** The same agent carries a gated
 sandbox's `connect.upstreams` the other way. For each upstream it listens on
 `127.0.0.1:<local port>` and the VIP, and relays to host vsock port `<local
-port>`, where `src/worker/forwarder.rs` binds the upstream's listener state
+port>`, where `crates/worker/src/worker/forwarder.rs` binds the upstream's listener state
 on a `UnixListener` (`UpstreamSpec::vsock`) instead of a loopback port, so
 HTTP mode, policy, and handlers are shared (calls entry 12). The VIP makes
 `<key>.svc.legion` work in the guest (calls entry 16). The checkpoint

@@ -114,20 +114,20 @@ Scenarios the design has to serve:
 ## 5. Background: what exists today
 
 - **Mode resolution.** `resolve_network_mode_with`
-  (`src/structs/network.rs:104`) keeps `auto` at `host` on macOS. An explicit
+  (`crates/common/src/structs/network.rs:104`) keeps `auto` at `host` on macOS. An explicit
   `gated` is placed, then refused at start by `netns::create`
-  (`src/worker/netd/netns.rs:114`) through `ensure_gated_namespace`
-  (`src/task_plugins/mod.rs:1056`).
-- **Placement.** `assign_allocation_network` (`src/storage/store.rs`) gives a
+  (`crates/worker/src/worker/netd/netns.rs:114`) through `ensure_gated_namespace`
+  (`crates/worker/src/task_plugins/mod.rs:1056`).
+- **Placement.** `assign_allocation_network` (`crates/manager/src/storage/store.rs`) gives a
   gated namespace a resolver and private twins for every port, and upstreams
   loopback ports when the node has no VIP block (macOS never does).
 - **The datapath.** It binds where `Attachment` says
-  (`src/worker/netd/attach.rs`): `Host`, `Netns`, `GuestVsock`, `GuestTap`.
+  (`crates/worker/src/worker/netd/attach.rs`): `Host`, `Netns`, `GuestVsock`, `GuestTap`.
   The gated proxy listens at `127.0.0.1:1080` inside the namespace
-  (`proxy_specs`, `src/worker/netd/specs.rs:138`). The proxy env vars name
+  (`proxy_specs`, `crates/worker/src/worker/netd/specs.rs:138`). The proxy env vars name
   that fixed address (`AllocNetwork::env_pairs`).
 - **Launches.** `exec` spawns its command directly
-  (`src/task_plugins/exec.rs:592`). Apple `container` runs are built by
+  (`crates/worker/src/task_plugins/exec.rs:592`). Apple `container` runs are built by
   `build_apple_launch` in `container.rs` and `sandbox.rs` (dev mode). Neither
   passes `--network`, so every VM lands on `default`.
 

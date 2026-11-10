@@ -116,7 +116,7 @@ Today we cannot prove it, and we only partially know it:
 - `tests/integration/raft_perf_smoke.rs`: single-node raft `put_kv` latency smoke +
   lanes-vs-single A/B; `tests/integration/raft_lanes.rs`: reusable 3-node in-process
   cluster harness (real tonic transport).
-- `src/storage/persistence.rs`: `PersistenceType::{LocalDisk, Raft,
+- `crates/manager/src/storage/persistence.rs`: `PersistenceType::{LocalDisk, Raft,
   Streaming}`; streaming = rustyriver with `file://` or `s3://` replica.
 - Scheduler timing today: one `build_plan_ms` debug log; `#[instrument]`
   spans without phase fields.

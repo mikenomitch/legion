@@ -34,6 +34,7 @@ use legion::cmd::helpers::{manager_connection_with_token, ClientTimeouts, Manage
 use legion::manager::acl::Authenticator;
 use legion::manager::apps::{AppReconciler, ReconcilerSettings};
 use legion::manager::auth_method::ControlPlaneIdentityMethod;
+use legion::manager::eval::EvalExt;
 use legion::manager::server::ManagerDaemonService;
 use legion::manager::workload_identity::{claims_for_allocation, WorkloadIdentityState};
 use legion::storage::store::Store;

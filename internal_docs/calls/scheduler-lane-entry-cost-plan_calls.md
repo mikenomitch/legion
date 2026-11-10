@@ -130,7 +130,7 @@ Appending is how every other schema change in the file is made.
 
 ## 7. The lane profiler stays out of the tree
 
-**Call.** The branch's WIP lane profiler (`src/storage/raft/lane_profile.rs`
+**Call.** The branch's WIP lane profiler (`crates/manager/src/storage/raft/lane_profile.rs`
 and its hooks in the capture, the driver, the log store, and the state
 machine) is dropped. Only the bind fix, its tests, and the `keyed_bind`
 bench ship.

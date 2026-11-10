@@ -1,8 +1,15 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Source lives in `src/`: CLI in `cmd/`, orchestration in `manager/` and `worker/`, storage helpers in `storage/`, the shared WASM embedding layer in `wasm/`, TLS helpers in `certs.rs`, tracing utilities in `tracing_util.rs`, generated proto types in `structs.rs`, constants in `constants.rs`.
-- Protobuf schema: `proto/legion.proto` compiled by `build.rs` via `tonic-build`.
+- Legion is a Cargo workspace of layered crates that build one binary. A crate may depend only on the ones below it; put new code in the lowest crate that can hold it. The full rules are in "Crates" in `docs/codebase-conventions.md`.
+  - `src/` — the `legion` binary crate (`legion-rs`): CLI and MCP server in `cmd/`, the bundled apps' code in `apps/`.
+  - `crates/manager/` — `legion-manager`: the gRPC server, eval loop, scheduler, and rollouts in `manager/`; the state store and raft in `storage/`.
+  - `crates/worker/` — `legion-worker`: the worker and datapath in `worker/`, task runtimes and jobspec validation in `task_plugins/`, artifacts, the object-store client, the WASM embedding layer in `wasm/`, the dylib plugin loader.
+  - `crates/common/` — `legion-common`: domain types in `structs/` (which re-exports the generated proto types), the config language, autoscaling policy, bundled app manifests, cluster TLS, the metrics registry in `telemetry.rs`, tracing utilities, constants.
+  - `proto/` — `legion-proto`: `proto/legion.proto` and the types `proto/build.rs` generates from it via `tonic-build`.
+  - `guest/` — `legion-guest`, the in-guest agent.
+- Each crate re-exports the modules below it, so paths are what they were as one crate: `crate::structs::Job` and `crate::prelude::*` everywhere, `legion::manager::…` in tests and plugins.
+- Across crates: an item another crate uses is `pub`, not `pub(crate)`; an inherent `impl` must be in the crate that defines the type, so behavior a lower crate's type needs from an upper crate is an extension trait beside the code that needs it (`EvalExt`, `ContentStoreTargetExt`); a lower crate never calls up — move the item down, or keep a list on each side with a test that they match.
 - Configs and examples: `configs/` (manager, worker, TLS dev certs, job demos).
 - When adding anything to job config, include it in `configs/jobs/maximal.ncl`.
 - Plugins: `plugins/<kind>/<name>/` built as `dylib` during Cargo build.
@@ -11,8 +18,8 @@
 ## Build, Test, and Development Commands
 - Build crate and plugins: `cargo build` (requires `protoc`).
 - Release build: `cargo build --release`.
-- Shipping build: `cargo build --profile dist` — adds LTO and strips symbols, cutting the binary from ~44 MB to ~26 MB at the cost of a much slower link. Output is `target/dist/legion`. See "Building a shipping binary" in `internal_docs/development.md`.
-- Run tests: `cargo test --all --locked`.
+- Shipping build: `cargo build --profile dist` — adds fat LTO and strips symbols, cutting the linux/amd64 binary from ~171 MB to ~97 MB at the cost of a slower build (~24 min against ~11 on 4 cores). Output is `target/dist/legion`. See "Building a shipping binary" in `internal_docs/development.md`.
+- Run tests: `cargo test --all --locked`. While iterating, test one crate: `cargo test -p legion-worker <filter>` builds and runs the worker's unit tests without building the manager (`-p legion-common`, `-p legion-manager`, `-p legion-rs` likewise). A bare `cargo test --lib <filter>` still works and covers every crate.
 - Run manager: `cargo run -- start manager -c configs/manager.ncl`.
 - Run worker: `cargo run -- join <TOKEN>` or `cargo run -- start worker <TOKEN>`.
 - Jobs: `cargo run -- job run configs/jobs/demo.ncl`; list with `cargo run -- job list -j`.
@@ -24,6 +31,9 @@
 
 ## Testing Guidelines
 - Use Rust `#[cfg(test)]` unit tests near code; integration data in `tests/`.
+- A unit test can use its own crate and the crates below it. A test that
+  needs a crate above the code it exercises (a worker check against a real
+  manager) is a module of `tests/integration/`.
 - **Integration tests are modules of one binary, `tests/integration/main.rs`.**
   Add a new file as `tests/integration/<name>.rs` plus a `mod <name>;` line,
   not as a new top-level `tests/*.rs` (each of those links a separate
@@ -32,7 +42,7 @@
   scheduler's concurrency gate, a `#[global_allocator]`) gets its own
   `tests/*.rs`. See "Test Layout" in `docs/testing-and-benchmarks.md`.
 - A test directory that must outlive its `TempDir` guard goes under the
-  scratch root (`tempdir_in(crate::test_scratch::root())` in `src/`,
+  scratch root (`tempdir_in(crate::test_scratch::root())` in a crate's unit tests,
   `tempdir_in(crate::support::scratch_root())` in `tests/integration/`)
   before `keep()`, so it is removed when the test process exits.
 - Name tests descriptively with `_test` modules/functions.

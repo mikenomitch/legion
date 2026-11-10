@@ -1,7 +1,7 @@
 # Worker Simulation (`legion start worker --simulate N`)
 
 **Status: SHIPPED** — all three phases landed together (engine +
-campaign knobs + docs, 2026-07-30): `src/worker/simulate.rs`, CLI flags
+campaign knobs + docs, 2026-07-30): `crates/worker/src/worker/simulate.rs`, CLI flags
 on `start worker`, `tests/integration/worker_simulation.rs`,
 `docs/worker-simulation.md`. Deliberately deferred: nothing from the
 plan; the open questions resolved as leaned (one pre-register, no
@@ -22,7 +22,7 @@ Kubernetes gets [KWOK](https://kwok.sigs.k8s.io/).
 Legion has no fake-worker mode. Today the only way to put 1,000 nodes in
 front of the scheduler over the real wire is 1,000 worker processes, each
 paying a tokio runtime, its own gRPC channel, a fingerprint pass, a
-worker gRPC server, and a state directory (`src/worker/daemon.rs:125-289`
+worker gRPC server, and a state directory (`crates/worker/src/worker/daemon.rs:125-289`
 starts all of it unconditionally). Hundreds per host is realistic;
 thousands is not. Benchmark code that inserts `NodeMsg` rows directly
 (`tests/integration/benchmark_support/mod.rs:257-280`) bypasses the wire entirely, so
@@ -100,36 +100,36 @@ existing `node list` output where sim nodes are visible.
 
 ## What exists today
 
-- `src/worker/daemon.rs:88-98` `run_worker`: decode join token →
+- `crates/worker/src/worker/daemon.rs:88-98` `run_worker`: decode join token →
   `run_worker_with_manager` (connect, pre-register for `WorkerConfig`,
   register, then spawn heartbeat/health/log/self-fence loops and the
   worker gRPC server).
-- Registration payload (`src/worker/daemon.rs:79-86,242-248`): `name`,
+- Registration payload (`crates/worker/src/worker/daemon.rs:79-86,242-248`): `name`,
   `pool`, `config_attrs` (attributes + `resources` + `reservedResources`
   + `workerAddress` + optional `maxAllocations`), `fingerprint_attrs`
-  (from `fingerprint_node`, `src/worker/node_check.rs`), `health_checks`.
-- Heartbeat round-trip (`src/worker/daemon.rs:472-635`):
+  (from `fingerprint_node`, `crates/worker/src/worker/node_check.rs`), `health_checks`.
+- Heartbeat round-trip (`crates/worker/src/worker/daemon.rs:472-635`):
   `HeartbeatRequest { id, allocation_ids, failed_allocations,
   allocation_health, volume_reports }` → `HeartbeatReply {
   desired_allocations, volume_destroy, upstream_endpoints }`. Note:
   allocation state is *declarative* — rows are `placed` at plan apply
-  (`src/storage/store.rs:6673`) and the manager currently ignores the
-  reported `allocation_ids` (`src/manager/server.rs:6973`,
+  (`crates/manager/src/storage/store.rs:6673`) and the manager currently ignores the
+  reported `allocation_ids` (`crates/manager/src/manager/server.rs:6973`,
   `_reported_allocations`); heartbeats matter for liveness
   (`update_node_heartbeat`), failure reports, and `AllocationHealth`
   snapshots (which gate health-checked rollouts and discovery).
 - Dispatch is push *and* pull: plan apply pushes `PostWork` to the
-  node's advertised `workerAddress` (`src/manager/dispatcher.rs`;
+  node's advertised `workerAddress` (`crates/manager/src/manager/dispatcher.rs`;
   address missing ⇒ dispatch skipped with a log), and every heartbeat
   reply re-delivers the desired set.
 - Liveness: heartbeats every `WORKER_HEARTBEAT_DURATION_SEC` (2s);
   the manager marks a node lost after `DEF_LOST_NODE_AT_SEC` (10s)
-  without one (`src/manager/daemon.rs:684-713`, `src/constants.rs`);
+  without one (`crates/manager/src/manager/daemon.rs:684-713`, `crates/common/src/constants.rs`);
   health-check RPCs every `WORKER_NODE_CHECK_DURATION_SEC` (30s).
 - Credentials: join secret at register, per-node `node_token` attached
-  to every worker-plane RPC afterwards (`src/worker/daemon.rs:34-63`);
+  to every worker-plane RPC afterwards (`crates/worker/src/worker/daemon.rs:34-63`);
   `Unauthenticated` heartbeats trigger re-registration
-  (`src/worker/daemon.rs:444-455`).
+  (`crates/worker/src/worker/daemon.rs:444-455`).
 - Benchmark profile schema: `NodeProfile { name, count, memory_gb,
   cpus, attrs }` (`tests/integration/benchmark_support/mod.rs:47-60`), fingerprint
   shape `{ memory_total, cpus: { "cpu-N": { frequency } } }`
@@ -174,7 +174,7 @@ $ legion node list -j | jq '.data[] | select(.attributes.simulated) | .id' | hea
 "sim-a-web-east-1"
 ```
 
-### 2. Engine (`src/worker/simulate.rs`)
+### 2. Engine (`crates/worker/src/worker/simulate.rs`)
 
 One tokio runtime for the whole process:
 
@@ -236,12 +236,12 @@ that sim nodes exercise the same manager paths as real ones.
 
 ## Testing plan
 
-- **Unit** (`src/worker/simulate.rs` `#[cfg(test)]`): profile-weighted
+- **Unit** (`crates/worker/src/worker/simulate.rs` `#[cfg(test)]`): profile-weighted
   distribution of N (exact totals, largest-remainder rounding, 1-node
   and N<profiles edge cases); deterministic naming; ack bookkeeping
   (desired → acked after ready-after, undesired → dropped).
 - **Integration** (`tests/integration/worker_simulation.rs`): serve a real
-  `ManagerDaemonService` (`src/manager/server.rs:1005`, ACLs disabled)
+  `ManagerDaemonService` (`crates/manager/src/manager/server.rs:1005`, ACLs disabled)
   over tonic on a loopback port; run a sim fleet against it; assert
   every node registers with profile-correct fingerprints and
   `simulated: true` and that `last_heartbeat` advances; submit a noop

@@ -148,7 +148,7 @@ Facts about the current codebase that shape the design:
 - **`object_store = { version = "0.11", features = ["aws"] }`** is already
   a Cargo dependency (used by persistence streaming). The `s3://` fetcher
   is therefore nearly free and covers any S3-compatible endpoint.
-- **Task plugins** (`src/task_plugins/mod.rs`) expose lifecycle hooks
+- **Task plugins** (`crates/worker/src/task_plugins/mod.rs`) expose lifecycle hooks
   (`prepare` → `start` → `stop` → `destroy`) and capability gates
   (`supports_kv_env_injection()`, `supports_identity_file()`, …). The
   worker's `run_task_allocation` calls `prepare` then `start` synchronously;
@@ -353,12 +353,12 @@ conflicts.
 
 ### 3) Fetchers: One Registry, Five Schemes
 
-`src/getter_rs` grows into `src/artifacts/` (the CLI jobspec path switches
+`src/getter_rs` grows into `crates/worker/src/artifacts/` (the CLI jobspec path switches
 to the same registry — one fetch stack in the tree, which is itself a small
 win):
 
 ```
-src/artifacts/
+crates/worker/src/artifacts/
   mod.rs        # ArtifactSpec, normalized forms, public API
   fetcher.rs    # ArtifactFetcher trait + registry
   fetchers/     # http.rs, file.rs, git.rs, s3.rs, oci.rs
@@ -595,7 +595,7 @@ put — the next fetch uses the new value, no job touch required.
 ACLs yet: any job may point `auth.kv` at any KV path. This matches the
 existing trust model for `$ref` jobspec resolution and is accepted for now,
 with three obligations this plan carries: (1) the user-facing
-`docs/artifacts.md` states it in a call-out box, (2) `src/artifacts/auth.rs`
+`docs/artifacts.md` states it in a call-out box, (2) `crates/worker/src/artifacts/auth.rs`
 carries the comment below at the credential-read site, (3) it is tracked in
 `internal_docs/TODO.md` under the ACL System item so it cannot be missed when
 ACLs land.
@@ -920,16 +920,16 @@ Proto (`proto/legion.proto`, all documented per repo convention):
 
 Structs:
 
-- `src/structs/job.rs`: `TaskConfig.artifacts: Vec<ArtifactSpec>` with
+- `crates/common/src/structs/job.rs`: `TaskConfig.artifacts: Vec<ArtifactSpec>` with
   string-shorthand deserialization + admission validation (names,
   interpolation references, auth one-of, resolve rules).
-- `src/structs/config.rs`: `ManagerConfigFull.artifacts`
+- `crates/common/src/structs/config.rs`: `ManagerConfigFull.artifacts`
   (`allowedSchemes`, `auth` matchers);
   `WorkloadIdentityConfigFull.node_identities`; worker config +=
   `artifacts.fetch`.
-- `src/task_plugins/mod.rs`: `supports_artifacts` / `implicit_artifacts` /
+- `crates/worker/src/task_plugins/mod.rs`: `supports_artifacts` / `implicit_artifacts` /
   `consume_artifact`; `TaskRuntime.staged_artifacts: Vec<StagedArtifact>`.
-- `src/artifacts/` module as laid out in §3; `src/getter_rs` folds into it
+- `crates/worker/src/artifacts/` module as laid out in §3; `src/getter_rs` folds into it
   (CLI jobspec fetching migrates to the same registry).
 
 New dependencies: `tar` + `flate2` (+ `zstd`, `zip` as warranted) for

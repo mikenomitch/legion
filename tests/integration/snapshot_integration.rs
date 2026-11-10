@@ -3,7 +3,7 @@
 //!
 //! The worker half (capture through the content store and volume drivers,
 //! restore at start) is covered against a real `exec` task and `local-dir`
-//! volume in `src/worker/task_manager.rs`
+//! volume in `crates/worker/src/worker/task_manager.rs`
 //! (`an_exec_disk_snapshot_round_trips_through_capture_and_restore`). Here
 //! the heartbeat stands in for the worker, so every manager-side transition
 //! is driven exactly as a worker would drive it.
@@ -11,6 +11,7 @@
 // Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
 #![allow(clippy::result_large_err)]
 
+use legion::manager::eval::EvalExt;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;

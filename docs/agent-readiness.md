@@ -659,8 +659,8 @@ legion scaling defaults apply defaults.ncl --idempotency-key defaults-v3
 The manager records the first outcome for a key and replays it for any later
 request with the same key. The reply's `deduplicated` field reports whether a
 result was replayed. Results are stored in the `idempotency_record` table
-([migration](../src/storage/migrations.rs), store methods in
-[`src/storage/store.rs`](../src/storage/store.rs)). An empty or absent key
+([migration](../crates/manager/src/storage/migrations.rs), store methods in
+[`crates/manager/src/storage/store.rs`](../crates/manager/src/storage/store.rs)). An empty or absent key
 disables deduplication.
 
 A key is scoped to one operation and one caller:

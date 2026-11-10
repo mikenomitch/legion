@@ -34,7 +34,7 @@ stop *cause* with the stop *ladder*. Two findings forced them apart:
 
 1. **Grace cannot be added where `stop()` is called today.** The worker's
    `reconcile_allocations` runs while holding the task-manager mutex, inside
-   the async heartbeat loop (`src/worker/daemon.rs`). A `stop()` that waits
+   the async heartbeat loop (`crates/worker/src/worker/daemon.rs`). A `stop()` that waits
    for a deadline holds that lock — the one heartbeats, the self-fence
    watchdog, health reporting and log maintenance all need — for up to
    `killAfter`. At a 2s heartbeat cadence, a 30s grace window would let the
@@ -60,15 +60,15 @@ take resources back. Concretely, today:
 
 - **A full cluster is first-come-first-kept.** When nodes are full, a new job
   — no matter how urgent — fails placement with "no available nodes matching
-  constraints, permit, or resources" (`src/manager/scheduler.rs:1354`) and its
+  constraints, permit, or resources" (`crates/manager/src/manager/scheduler.rs:1354`) and its
   eval is marked `failed`. The batch backfill that grabbed the capacity an
   hour ago keeps it. The only remedies are manual: stop someone else's job or
   add nodes.
 - **`priority` exists only on evals** and orders the eval *queue*
-  (`src/storage/store.rs:8146`), not placement. Two jobs contending for one
+  (`crates/manager/src/storage/store.rs:8146`), not placement. Two jobs contending for one
   node slot resolve by timing, never by importance.
 - **Every stop is a hard kill.** `TaskPlugin::stop`
-  (`src/task_plugins/mod.rs:370`) takes no signal, no grace, no deadline;
+  (`crates/worker/src/task_plugins/mod.rs:370`) takes no signal, no grace, no deadline;
   `stop_allocation_inner` calls `stop()` then `destroy()` back to back. A
   rollout replacement, a drain, a `job stop`, and a reschedule all terminate
   tasks with no notice. There is no `killAfter`, no SIGTERM→SIGKILL ladder,
@@ -397,10 +397,10 @@ replicas and no more; the scheduler looks elsewhere for the rest.
 Code recon (verified against `main` at the time of writing):
 
 - **Placement pipeline.** `plan_and_apply_internal`
-  (`src/manager/scheduler.rs:593`): candidate nodes → epoch sample for all
+  (`crates/manager/src/manager/scheduler.rs:593`): candidate nodes → epoch sample for all
   candidates (`:633`, the CAS fence) → capacity snapshot from the read model
   → `build_plan` (`:896`) → `insert_plan_submission` +
-  `apply_plan_submission` (`src/storage/store.rs:1676`, `:1726`). Apply
+  `apply_plan_submission` (`crates/manager/src/storage/store.rs:1676`, `:1726`). Apply
   re-reads epochs in-transaction and re-checks constraints/permit but *not*
   resources — cross-plan resource safety **is** the epoch CAS.
 - **Plans can only add.** `PlannedAllocation` (`scheduler.rs:30`) is
@@ -417,15 +417,15 @@ Code recon (verified against `main` at the time of writing):
   (`store.rs:8146`, `ORDER BY priority DESC, id ASC`); default 50 from
   manager config; `legion job run --priority N` / `--asap` set it. No
   priority field exists on `JobConfig` or `TaskConfig`
-  (`src/structs/job.rs`). `proto/legion.proto` even reserves the RunJob
+  (`crates/common/src/structs/job.rs`). `proto/legion.proto` even reserves the RunJob
   field as "future eval-priority support."
 - **Allocations have no state machine.** Stopping *is* row deletion
   (`remove_allocations`, `store.rs:7035` and siblings), which bumps epochs
   and the read model; the worker notices via the desired-set diff on its 2s
-  heartbeat and `reconcile_allocations` (`src/worker/task_manager.rs:523`)
+  heartbeat and `reconcile_allocations` (`crates/worker/src/worker/task_manager.rs:523`)
   stops whatever is no longer desired.
 - **Stops are hard kills.** `TaskPlugin::stop`/`destroy`
-  (`src/task_plugins/mod.rs:370`) take no grace parameters;
+  (`crates/worker/src/task_plugins/mod.rs:370`) take no grace parameters;
   `stop_allocation_inner` (`task_manager.rs:557`) runs them back to back.
   exec has no SIGTERM ladder; container is asymmetric (Apple `container
   stop` waits; OCI path is `delete --force`). No jobspec field for any of
@@ -451,7 +451,7 @@ Code recon (verified against `main` at the time of writing):
 - **Rollout engine owns "blocked on capacity"** (`blocked_since`,
   `capacityBlockTimeout`, `onCapacityTimeout`) — the closest existing
   blocked-work model; preemption gives rollouts a way to *unblock*.
-- **Events.** One draft function per kind in `src/storage/events.rs`;
+- **Events.** One draft function per kind in `crates/manager/src/storage/events.rs`;
   hot-path emission is in-transaction staged (see
   `docs/event-stream.md` § Performance — earlier designs cost 25–30% on the
   eval bench, so new plan-apply events must use `stage_event_locked`).
@@ -563,7 +563,7 @@ the mesh's "drain-before-SIGTERM" item (TODO) needs anyway.
   proposal had to think about:
 
   - **Normalize the band before enforcing.** Selector semantics are
-    documented in `src/structs/acl.rs`: *"a rule with a selector never matches
+    documented in `crates/common/src/structs/acl.rs`: *"a rule with a selector never matches
     a request without the attribute"*. Since absent `priority` means `normal`,
     RunJob must populate the band attribute (defaulted) before `enforce`, or
     band rules silently grant nothing and existing policies silently stop
@@ -716,7 +716,7 @@ Two deliberate properties, both from the research:
 
 ### 5) Observability
 
-- **Events** (`src/storage/events.rs` + `docs/event-stream.md` table):
+- **Events** (`crates/manager/src/storage/events.rs` + `docs/event-stream.md` table):
   - `allocation.preempted` (warn) — per victim: job, task, node, and the
     preemptor's job/allocation (the bidirectional link Kueue had to
     retrofit in [#1874](https://github.com/kubernetes-sigs/kueue/issues/1874)).
@@ -750,7 +750,7 @@ Proto (`proto/legion.proto`, every field documented publicly per repo rule):
 
 Structs and store:
 
-- `src/structs/job.rs`: `JobConfig.priority: Band` (serde default
+- `crates/common/src/structs/job.rs`: `JobConfig.priority: Band` (serde default
   `normal`), `TaskConfig.stop: Option<StopConfig>`,
   `TaskConfig.disruption: Option<DisruptionConfig>`; validation (band
   names, `killAfter <= 5m`, `minAvailable` shape).
@@ -777,7 +777,7 @@ Structs and store:
 Shipped. Public doc: [`docs/graceful-stop.md`](../../docs/graceful-stop.md).
 
 - `StopCause` vocabulary (`stop` / `update` / `drain` / `reschedule` /
-  `destroy` / `node_lost` / `preempted` / `unknown`) in `src/structs/stop.rs`.
+  `destroy` / `node_lost` / `preempted` / `unknown`) in `crates/common/src/structs/stop.rs`.
   `preempted` is defined but unused, so workers deployed now already
   understand it when Phase 3 lands.
 - `StopContext` + `TaskPlugin::stop_with`, whose default delegates to

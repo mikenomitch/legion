@@ -5,7 +5,7 @@
 //! `internal_docs/plans/heartbeat-cadence-at-scale-plan.md` §9 that need a
 //! store rather than a snapshot. The pure arithmetic — the ladder, the
 //! freshness ratio, the suppression rules — is unit-tested next to the code in
-//! `src/manager/cadence.rs` and `src/storage/liveness.rs`; the raft-level
+//! `crates/manager/src/manager/cadence.rs` and `crates/manager/src/storage/liveness.rs`; the raft-level
 //! election and digest cases live in `tests/integration/raft_lanes.rs`.
 //!
 //! The tests inject `Instant`s rather than sleeping: a liveness window is
@@ -15,6 +15,7 @@ use legion::manager::cadence::{
     cadence_report, decide_lost_nodes, freshness_ratio, LossContext, SuppressionReason,
 };
 use legion::manager::daemon::liveness_snapshot;
+use legion::manager::eval::EvalExt;
 use legion::prelude::R;
 use legion::storage::store::Store;
 use legion::structs::{

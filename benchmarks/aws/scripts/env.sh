@@ -235,7 +235,7 @@ wait_for_workers() { # wait_for_workers <count> [timeout-secs]
 # --- The sim fleet's identity, and how a cell proves it ----------------
 #
 # start-sim-fleet.sh names slice `i` with `--name-prefix sim-<i>`, and
-# src/worker/simulate.rs appends `-<profile>-<n>`, so every node this rig
+# crates/worker/src/worker/simulate.rs appends `-<profile>-<n>`, so every node this rig
 # creates is `sim-<slice>-<profile>-<n>`. Those names are REUSED run to
 # run, deliberately: Legion has no node-deregistration RPC
 # (`Store::remove_node` exists but has nothing calling it in production),
@@ -265,14 +265,14 @@ FLEET_STATE_REMOTE="${FLEET_STATE_REMOTE:-/opt/bench/runs/fleet-state.json}"
 # node name), or a real worker that wandered in. Health comes from
 # `node_health` — the `node.status` column was moved there by the
 # node/node_health split, and an absent row means `active`, which is the
-# same COALESCE every liveness query in src/storage/store.rs uses.
+# same COALESCE every liveness query in crates/manager/src/storage/store.rs uses.
 #
 # `unavailable` is counted separately because it is a different failure
 # with the same symptom: `node.availability` is the column the SCHEDULER
 # gates placement on, node loss sets it to `unavailable` on the control
 # lane, and recovery has to undo both halves. A node that came back
 # `active` but stayed `unavailable` reads as healthy everywhere and never
-# receives work — src/storage/store.rs calls that out as presenting like
+# receives work — crates/manager/src/storage/store.rs calls that out as presenting like
 # a scheduler bug and being almost impossible to diagnose from outside.
 node_census() { # node_census <manager-addr> <slice-count>
     local manager="$1" slices="$2" i like=""

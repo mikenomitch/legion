@@ -149,9 +149,9 @@ Non-goals:
 
 ## 5. Background — what exists today
 
-- Plan path: `Scheduler::plan_and_apply_internal` (`src/manager/scheduler.rs`)
+- Plan path: `Scheduler::plan_and_apply_internal` (`crates/manager/src/manager/scheduler.rs`)
   builds placements and calls `Store::submit_and_apply_plan(_with_candidates)`
-  (`src/storage/store.rs`), which group-commits into
+  (`crates/manager/src/storage/store.rs`), which group-commits into
   `submit_and_apply_plan_on`: `insert_plan_submission_on` (INSERT … RETURNING
   id) then `apply_plan_submission_on`, which SELECTs `placements, mode,
   evictions, target_instance` back by id and parses them
@@ -176,9 +176,9 @@ Non-goals:
   `score_node_with_cache` with `cached_load_bounds` (min-max over
   `assigned_count`). `common_resources` holds per-node *free* memory, cpu,
   cores, allocation slots — but not capacity. Capacity is born in
-  `ResourcePool::from_node` (`src/resources.rs`).
+  `ResourcePool::from_node` (`crates/common/src/resources.rs`).
 - Gangs: `GangConfig { min, placement_timeout, on_member_loss }`
-  (`src/structs/job.rs`), placed in `build_plan` through
+  (`crates/common/src/structs/job.rs`), placed in `build_plan` through
   `place_task_allocations` over `base_eligible` (gangs never truncate), and
   reported as `GangReport` (`scheduler.rs`, `proto/legion.proto`).
 

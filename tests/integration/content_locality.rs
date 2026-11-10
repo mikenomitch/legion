@@ -4,8 +4,8 @@
 //! (docs/artifacts.md, "Content locality").
 //!
 //! The worker half (diffing the store against the acknowledged set) is
-//! unit-tested in `src/worker/content_report.rs`; the index in
-//! `src/storage/content_index.rs`; the score term in the scheduler's tests.
+//! unit-tested in `crates/worker/src/worker/content_report.rs`; the index in
+//! `crates/manager/src/storage/content_index.rs`; the score term in the scheduler's tests.
 
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{Context, R};

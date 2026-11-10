@@ -223,7 +223,7 @@ class CountingCrossCheck(unittest.TestCase):
 class LegionEventParsing(unittest.TestCase):
     """The envelope contract: `legion events follow -j` NDJSON ->
     internal placement events. Fixture lines were captured from the
-    documented event shape (docs/event-stream.md, src/storage/events.rs)."""
+    documented event shape (docs/event-stream.md, crates/manager/src/storage/events.rs)."""
 
     def test_placed_event_with_count(self):
         line = json.dumps(

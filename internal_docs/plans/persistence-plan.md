@@ -400,7 +400,7 @@ Exit criteria:
 ### Remaining GA work (store replication path)
 
 > Status 2026-07-23: the store replication path is **implemented** by the
-> real raft engine (`src/storage/raft/`), executed per
+> real raft engine (`crates/manager/src/storage/raft/`), executed per
 > [docs/plans/durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md).
 > One deliberate deviation from this plan's §"Best way to do Raft with
 > SQLite": instead of typed `StoreOpEnvelope` command replication, the

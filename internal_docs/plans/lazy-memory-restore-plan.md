@@ -28,7 +28,7 @@ with the guest's RAM, on both VMMs, even when the checkpoint is already on
 the node:
 
 1. **Every part is rehashed before the VMM starts.**
-   `materialize_parts` (`src/worker/checkpoints.rs`) called
+   `materialize_parts` (`crates/worker/src/worker/checkpoints.rs`) called
    `ContentStore::verify` on each part, which reads and SHA-256s the whole
    blob: guest memory and the root disk. The store had already hashed those
    bytes when they came in.
@@ -38,7 +38,7 @@ the node:
    `vm.resume` can return. cloud-hypervisor is what `hypervisor = "auto"`
    picks first.
 3. **Both happen under the worker's task-manager lock.** The restore runs
-   inside `start_registered_allocation` (`src/worker/task_manager.rs`), so
+   inside `start_registered_allocation` (`crates/worker/src/worker/task_manager.rs`), so
    heartbeats and every other start and stop on the node wait for it.
 4. **A slow copy failed outright.** cloud-hypervisor serves its API socket
    before `--restore` finishes, and Legion's `vm.resume` waited with the 10 s
@@ -109,7 +109,7 @@ btrfs, XFS, and APFS and a full sparse copy on ext4.
 - **containerd's content store** verifies a blob's digest when it is
   committed and serves reads without rehashing. Legion's own OCI layer
   placement does the same: `ImageBlobCache::place`
-  (`src/artifacts/fetchers/oci.rs`) hardlinks a layer out of the node
+  (`crates/worker/src/artifacts/fetchers/oci.rs`) hardlinks a layer out of the node
   content store after `get`, and only small JSON manifests are rehashed on
   read. **Take:** the same rule for checkpoint parts.
 - Nomad and Kubernetes have no memory restore to compare with.
@@ -170,10 +170,10 @@ is ordinary task config, set like any other.
 
 ## 5. What exists today
 
-- `materialize_parts` (`src/worker/checkpoints.rs`) links each part out of
+- `materialize_parts` (`crates/worker/src/worker/checkpoints.rs`) links each part out of
   the node content store into `<alloc>/.restore`, after
   `ContentStore::verify` rehashed it.
-- `restore_microvm` (`src/task_plugins/sandbox_checkpoint.rs`) checks part
+- `restore_microvm` (`crates/worker/src/task_plugins/sandbox_checkpoint.rs`) checks part
   sizes, clones the root disk, writes the identity disk, and launches the
   VMM:
   - Firecracker: `--api-sock`, then `PUT /snapshot/load` with
@@ -182,7 +182,7 @@ is ordinary task config, set like any other.
     VM), then a resume.
   - cloud-hypervisor: `--restore source_url=file://<alloc>/.restore`, then
     `vm.resume` with `CONTROL_TIMEOUT` (10 s).
-- `restore_from_snapshot` (`src/worker/task_manager.rs`) removes
+- `restore_from_snapshot` (`crates/worker/src/worker/task_manager.rs`) removes
   `<alloc>/.restore` once the runtime returns.
 - Content store blobs are hashed on commit (`hash_and_commit`, or the
   digest check of a fetch) and made read-only (0444). Nothing writes
@@ -190,7 +190,7 @@ is ordinary task config, set like any other.
   cloud-hypervisor modes only read, and the `config.json` rewrite replaces
   the file rather than editing it.
 - Published parts are a sealed index of separately sealed chunks, 1 MiB by
-  default (`src/checkpoint_chunks.rs`,
+  default (`crates/worker/src/checkpoint_chunks.rs`,
   [chunked checkpoint publish](chunked-checkpoint-publish-plan.md)), so
   chunk *i* can be fetched and opened on its own. Phase 2 relies on that.
 

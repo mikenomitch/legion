@@ -1,6 +1,4 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto_file = "proto/legion.proto";
-
     // Explicit rerun triggers replace Cargo's default of re-running on any
     // change in the package.
     println!("cargo:rerun-if-changed=build.rs");
@@ -14,51 +12,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if build_plugins && !skip_plugins {
         println!("cargo:rerun-if-changed={plugin_root}");
     }
-
-    tonic_build::configure()
-        .build_server(true)
-        .type_attribute(".", "#[derive(serde::Deserialize, serde::Serialize)]")
-        // Every JSON key Legion emits is camelCase: the jobspec, the CLI's
-        // hand-built envelopes, and (through this) every API message the CLI
-        // `--json` and MCP tools print. Enums and oneof variants keep their
-        // names; map keys are data and are never renamed.
-        //
-        // `default`: a field missing from the JSON takes its proto3 default,
-        // as it does on the wire. Proto messages are persisted as JSON (the
-        // worker's state files among them), so without it a field added to a
-        // message made every file written before it unreadable (`missing
-        // field envelopeResources` reading `netd_state.json` after a worker
-        // upgrade). Messages only: serde rejects a container `default` on
-        // the enums and oneofs `type_attribute(".")` also reaches.
-        .message_attribute(".", "#[serde(rename_all = \"camelCase\", default)]")
-        .type_attribute("Job", "#[derive(tabled::Tabled)]")
-        .type_attribute("Submission", "#[derive(tabled::Tabled)]")
-        // A checkpoint part key must never reach a log line or a JSON dump:
-        // Debug is hand-written to redact it (src/structs/checkpoint.rs) and
-        // serde skips it.
-        .skip_debug("legion.CheckpointPartKey")
-        .field_attribute("legion.CheckpointPartKey.key", "#[serde(skip)]")
-        // The same for a session sealing key, which rides on envelope
-        // payloads: never logged, never in the state file or session log.
-        .skip_debug("legion.SessionSealKey")
-        .field_attribute("legion.SessionSealKey.key", "#[serde(skip)]")
-        // And for a job's chunk key, which rides on publish requests.
-        .skip_debug("legion.CheckpointChunkKey")
-        .field_attribute("legion.CheckpointChunkKey.key", "#[serde(skip)]")
-        // The table shows the `blocked` status; the block itself is for
-        // `-j` output and `job info`.
-        .field_attribute("legion.Job.blocked", "#[tabled(skip)]")
-        .field_attribute("legion.Job.reschedule_backoffs", "#[tabled(skip)]")
-        // The include path doubles as tonic-build's `rerun-if-changed`
-        // watch. With "." that watch was the whole repository: editing a doc,
-        // a UI file, or anything else re-ran this script and rebuilt the
-        // crate, and every no-op build walked `ui/node_modules` to find out.
-        .compile_protos(&[proto_file], &["proto"])
-        .unwrap_or_else(|e| panic!("protobuf compile error: {e}"));
-
-    // tonic_build::compile_protos("proto/legion.proto")?;
-
-    write_plugin_build_info()?;
 
     if build_plugins && !skip_plugins {
         let manifest_dir = std::path::PathBuf::from(
@@ -126,47 +79,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    Ok(())
-}
-
-/// Writes `$OUT_DIR/plugin_build_info.rs`: the toolchain and crate identity
-/// that `plugin_runtime::PLUGIN_ABI_FINGERPRINT` hashes.
-///
-/// Plugins are Rust dylibs that hand `Box<dyn Trait>` across the boundary,
-/// and Rust has no stable ABI, so a plugin is only sound when it was compiled
-/// by the same rustc against the same legion crate as the host. This build
-/// script runs in both builds (a plugin depends on this crate by path), so
-/// each side bakes in what it was built with and the loader compares the two.
-/// The profile is deliberately left out: a debug host loads release plugins
-/// in development, and the profile does not change type layout.
-fn write_plugin_build_info() -> Result<(), Box<dyn std::error::Error>> {
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let verbose = std::process::Command::new(&rustc).arg("-vV").output()?;
-    let verbose = String::from_utf8_lossy(&verbose.stdout);
-    let rustc_line = verbose.lines().next().unwrap_or("rustc unknown");
-    let commit = verbose
-        .lines()
-        .find_map(|line| line.strip_prefix("commit-hash: "))
-        .unwrap_or("unknown");
-    let info = format!(
-        "{rustc_line} [{commit}]; {} {}; target {}; panic={}",
-        std::env::var("CARGO_PKG_NAME")?,
-        std::env::var("CARGO_PKG_VERSION")?,
-        std::env::var("TARGET")?,
-        std::env::var("CARGO_CFG_PANIC").unwrap_or_else(|_| "unwind".into()),
-    );
-    // Printable ASCII only, so it embeds safely as a C string literal.
-    let info: String = info
-        .chars()
-        .map(|c| match c {
-            ' '..='~' if c != '"' && c != '\\' => c,
-            _ => '?',
-        })
-        .collect();
-    let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("plugin_build_info.rs");
-    std::fs::write(
-        out,
-        format!("pub const PLUGIN_BUILD_INFO: &std::ffi::CStr = c\"{info}\";\n"),
-    )?;
     Ok(())
 }

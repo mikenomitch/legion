@@ -34,7 +34,7 @@ The point was that the one behavioral change would land while every job was
 still in `default`, where no one could observe it. That reasoning protected
 an installed base that doesn't exist. And recon found that the plan's
 premise, "the foreign-key graph does not need to change", was false:
-`job.id` *is* the job name (`src/storage/store.rs:10545`), so every
+`job.id` *is* the job name (`crates/manager/src/storage/store.rs:10545`), so every
 `job_id` column stores the bare name.
 
 **Revised during implementation** (2026-10-19). Two refinements, both
@@ -109,7 +109,7 @@ log line. (a) adds an extra migration to protect clusters that don't exist.
 plane table (plan § 8.6) names two gaps found in recon:
 
 - Node caches serve private images without checking credentials
-  (`src/artifacts/fetchers/oci.rs:611, :701`).
+  (`crates/worker/src/artifacts/fetchers/oci.rs:611, :701`).
 - Cluster-scoped views such as `node:read`'s ledger expose every tenant's
   job ids.
 
@@ -206,7 +206,7 @@ year, and the only defense is someone reading a warning.
 This call keeps the engine's sentence true: omitted still means any. It just
 won't let a namespaced rule leave this one out. The second check also
 removes a class of silent no-op rules for free. Today `namespaces` on a
-`net` rule matches nothing (`src/manager/server.rs:13518`), and so does
+`net` rule matches nothing (`crates/manager/src/manager/server.rs:13518`), and so does
 `namespaces` on `kv`.
 
 ---
@@ -329,7 +329,7 @@ service = { port = 8443, allow = ["checkout-prod/api", "payments-*/api"] }, # ta
 them in the meantime have to keep them in the consumer's namespace.
 
 **Why (correctness, then security).** Recon showed that today's catalog
-*pools* same-named endpoints across jobs (`src/storage/store.rs:15066`). So
+*pools* same-named endpoints across jobs (`crates/manager/src/storage/store.rs:15066`). So
 under (a), namespaces would ship with team A's `connect` upstream
 load-balancing onto team B's instances. That isn't a visibility gap, it is
 misrouted traffic. It is exactly the failure Nomad users hit on Consul CE:
@@ -399,7 +399,7 @@ change could pin the old template, getting a startup warning once a second
 namespace existed. Without an installed base there is nothing to pin for.
 Recon also found that templates already have a hard uniqueness floor that
 rejects a template missing `{job}`, `{group}` or `{task}`
-(`src/structs/workload_identity.rs:543`), which makes the pin option
+(`crates/common/src/structs/workload_identity.rs:543`), which makes the pin option
 inconsistent as well as unnecessary.
 
 **Call.**
@@ -1047,7 +1047,7 @@ question.
 **Revised** (2026-10-18). The earlier version added job-name validation on
 the write path and grandfathered existing names that contain `/`. Recon
 found that `validate_object_name` already allows only `[A-Za-z0-9._-]`
-(`src/structs/job.rs:1498`). So `/` was never legal, and nothing needs
+(`crates/common/src/structs/job.rs:1498`). So `/` was never legal, and nothing needs
 grandfathering.
 
 **Call.** `payments-prod/web` is accepted anywhere a job is named: in the

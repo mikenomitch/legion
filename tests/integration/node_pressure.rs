@@ -8,9 +8,10 @@
 //!   replacement, while a `reclaim` report stops nothing.
 //!
 //! The worker half (ordering, the step runner, its triggers) is unit-tested
-//! with a fake node in `src/worker/pressure.rs`. What a real kernel does is
+//! with a fake node in `crates/worker/src/worker/pressure.rs`. What a real kernel does is
 //! in `internal_docs/suspend-resume-linux-verification.md`, "Phase 2".
 
+use legion::manager::eval::EvalExt;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;

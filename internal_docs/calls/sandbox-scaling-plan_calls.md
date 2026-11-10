@@ -1030,7 +1030,7 @@ restart record.
 about.
 
 **Why (performance).** `WorkerStateStore::save` rewrites the whole file
-on every change (`src/worker/state.rs:151`). At 10,000 sessions per node
+on every change (`crates/worker/src/worker/state.rs:151`). At 10,000 sessions per node
 with churn that is quadratic I/O. Fly's `flyd` and Nomad's client state
 both use an embedded database for this reason.
 
@@ -1250,7 +1250,7 @@ jobs.
 (`complete_evals`), but its file list was left alone, so the new
 `unblock_evals` op in `store/blocked_evals.rs` is not classified there.
 
-**Alternative.** Extend the test to every file under `src/storage/store/`.
+**Alternative.** Extend the test to every file under `crates/manager/src/storage/store/`.
 
 **Trade-off.** Ops in the store's submodules (`fork_ops`, `keyring_ops`,
 `snapshot_ops`, `suspend_ops`, and now `blocked_evals`) escape the

@@ -77,11 +77,11 @@ knowledge is kept.
 Every worker heartbeat costs a full replicated raft commit, and a raft
 commit fsyncs.
 
-The path: `Manager::heartbeat` (`src/manager/server.rs:5095`) calls
-`Store::update_node_heartbeat` (`src/storage/store.rs:5239`), which submits
-to the heartbeat coalescer (`src/storage/coalesce.rs:62`) and then commits
+The path: `Manager::heartbeat` (`crates/manager/src/manager/server.rs:5095`) calls
+`Store::update_node_heartbeat` (`crates/manager/src/storage/store.rs:5239`), which submits
+to the heartbeat coalescer (`crates/manager/src/storage/coalesce.rs:62`) and then commits
 `replicated(Lane::Status, "update_node_heartbeats", …)`
-(`src/storage/store.rs:5266`). That entry is proposed, replicated to a
+(`crates/manager/src/storage/store.rs:5266`). That entry is proposed, replicated to a
 quorum, fsync'd to the status lane's log, and applied — to write one
 integer per node.
 
@@ -109,8 +109,8 @@ Three results rule out the easy explanations:
 - **It is the commit.** The 25× gap between gp3 and NVMe on identical code
   is the fsync, and the residual serialization is that **one OS thread per
   lane** serves every replicated op on that lane — `pipeline_loop`
-  (`src/storage/raft/driver.rs:1449`), spawned once per lane at
-  `src/storage/raft/driver.rs:3026-3038`. Heartbeats do not merely cost a
+  (`crates/manager/src/storage/raft/driver.rs:1449`), spawned once per lane at
+  `crates/manager/src/storage/raft/driver.rs:3026-3038`. Heartbeats do not merely cost a
   commit; they queue behind, and in front of, every other status-lane write.
 
 ### What changed while this plan was being written
@@ -121,7 +121,7 @@ called the blocking `Store::update_node_heartbeat` inline on a tokio worker
 thread, which parked that thread for the whole commit *and* left every other
 heartbeat stuck in the gRPC layer where the coalescer could not see it — so
 batches never formed and `HEARTBEAT_BATCH_MAX = 128` was never approached.
-Moved to `spawn_blocking` (`src/manager/server.rs:5108-5130`), the queue
+Moved to `spawn_blocking` (`crates/manager/src/manager/server.rs:5108-5130`), the queue
 builds, batches form, and one fsync amortizes across many beats. **7× on
 gp3, to 84% of cadence.**
 
@@ -187,7 +187,7 @@ system. That is the problem.
   now does, or
 - raise `heartbeatSeconds` — which cannot exceed 3 without shrinking
   detection margin to nothing, because the lost window is the fixed
-  `DEF_LOST_NODE_AT_SEC = 10` (`src/constants.rs:72`), or
+  `DEF_LOST_NODE_AT_SEC = 10` (`crates/common/src/constants.rs:72`), or
 - cap the fleet at roughly `R × I` nodes per control plane, where `R` is a
   number they have to measure on their own hardware and which moves with
   their disk.
@@ -348,7 +348,7 @@ correct and honest about staleness.
   the one hard goal; everything else serves or protects it.
 - **No false node loss** across leader election, rolling manager restart, or
   a manager-to-manager partition. Stronger than today, not merely equal:
-  today's process-uptime grace (`src/manager/daemon.rs:978`) already fails
+  today's process-uptime grace (`crates/manager/src/manager/daemon.rs:978`) already fails
   the election case.
 - **Every manager still answers "is this node alive?" identically**, from
   replicated state, with no read forwarding.
@@ -399,23 +399,23 @@ Only the last row is high-frequency. It is also the only row that is
 
 ### 5.2 The finding that makes this tractable: the scheduler never reads liveness
 
-`Store::available_node_arcs` (`src/storage/store.rs:2094`) is the
+`Store::available_node_arcs` (`crates/manager/src/storage/store.rs:2094`) is the
 scheduler's per-plan node snapshot, and it filters on
 `node.availability == "available"` — a **control-lane** column. So does
-`available_node_ids` (`src/storage/store.rs:2079`), and so does the
+`available_node_ids` (`crates/manager/src/storage/store.rs:2079`), and so does the
 reconcile path. `set_node_availability`'s own doc comment names it:
 *"the scheduler's single placement chokepoint … and the store's reconcile
 path both filter on `availability == \"available\"`"*
-(`src/storage/store.rs:4570-4573`).
+(`crates/manager/src/storage/store.rs:4570-4573`).
 
 `node_health.last_heartbeat` has **no** consumer in the scheduler, the eval
 loop, the dispatcher, or the rollout engine. Its only readers are:
 
 | Reader | Where | Uses it for |
 | --- | --- | --- |
-| The liveness tick | `src/manager/daemon.rs:711` via `get_node_ids_and_heartbeats` (`src/storage/store.rs:4777`) | The lost decision |
-| `GET_NODES` → `NodeMsg.last_heartbeat` | `src/storage/queries.rs:18` | Display |
-| `legion node list --sort-by last_heartbeat` | `src/manager/server.rs:5398` | Display |
+| The liveness tick | `crates/manager/src/manager/daemon.rs:711` via `get_node_ids_and_heartbeats` (`crates/manager/src/storage/store.rs:4777`) | The lost decision |
+| `GET_NODES` → `NodeMsg.last_heartbeat` | `crates/manager/src/storage/queries.rs:18` | Display |
+| `legion node list --sort-by last_heartbeat` | `crates/manager/src/manager/server.rs:5398` | Display |
 | UI nodes page / deep view / homepage | `ui/src/pages/Nodes.tsx:85,101`, `ui/src/components/NodeDeepView.tsx:619`, `ui/src/pages/Homepage.tsx:204` | Display |
 | `legion state` dump | `src/cmd/state.rs:34` | Display |
 
@@ -426,26 +426,26 @@ leader.
 ### 5.3 The write path, precisely
 
 ```
-Manager::heartbeat                       src/manager/server.rs:5095
-  └─ spawn_blocking (f24c6e0)            src/manager/server.rs:5123-5130
-     └─ Store::update_node_heartbeat     src/storage/store.rs:5239
-       └─ Coalescer::submit("heartbeat") src/storage/coalesce.rs:62
-            └─ run_heartbeat_batch       src/storage/store.rs:5253
+Manager::heartbeat                       crates/manager/src/manager/server.rs:5095
+  └─ spawn_blocking (f24c6e0)            crates/manager/src/manager/server.rs:5123-5130
+     └─ Store::update_node_heartbeat     crates/manager/src/storage/store.rs:5239
+       └─ Coalescer::submit("heartbeat") crates/manager/src/storage/coalesce.rs:62
+            └─ run_heartbeat_batch       crates/manager/src/storage/store.rs:5253
                  ├─ batch of 1  → update_node_heartbeat_forwarding  :5313
                  │                  └─ NotRaftLeader → ForwardLaneWrite
                  │                       (ForwardableLaneWrite::NodeHeartbeat,
-                 │                        src/storage/raft/forward.rs:54)
+                 │                        crates/manager/src/storage/raft/forward.rs:54)
                  └─ batch of N  → replicated(Lane::Status,
                                     "update_node_heartbeats")        :5266
                                    └─ pipeline_loop (ONE thread/lane)
-                                        src/storage/raft/driver.rs:1449
+                                        crates/manager/src/storage/raft/driver.rs:1449
 ```
 
 Two properties of the coalescer matter for §6.6(b). It has
-**`max_batch = HEARTBEAT_BATCH_MAX = 128`** (`src/storage/store.rs:684`),
+**`max_batch = HEARTBEAT_BATCH_MAX = 128`** (`crates/manager/src/storage/store.rs:684`),
 and it has **no timer** — by design: *"Requests arriving while a commit is
 running form the next batch — natural batching with no timer"*
-(`src/storage/coalesce.rs:8-9`). Timer-free batching needs a queue to batch
+(`crates/manager/src/storage/coalesce.rs:8-9`). Timer-free batching needs a queue to batch
 *from*, which is the insight `f24c6e0` acted on: before the offload the
 queue lived in the gRPC layer where the coalescer could not see it, so
 batches stayed at ~1 and `max_batch` was never approached. Whether it is
@@ -453,14 +453,14 @@ approached *now*, at load, is exactly what phase 1 measures.
 
 ### 5.4 The liveness tick and its grace hazard
 
-`start_node_status_checker` (`src/manager/daemon.rs:683`) runs every
-`worker_check_seconds` (default 2, `src/constants.rs:63`). It gates on
+`start_node_status_checker` (`crates/manager/src/manager/daemon.rs:683`) runs every
+`worker_check_seconds` (default 2, `crates/common/src/constants.rs:63`). It gates on
 `store.is_raft_leader(Lane::Status)` (`:705`) and calls
 `nodes_to_mark_lost(store.get_node_ids_and_heartbeats()?, started_at.elapsed())`
 (`:711-712`).
 
-`started_at` is set once, at `src/manager/daemon.rs:685`, from **process
-start**. `nodes_to_mark_lost` (`src/manager/daemon.rs:974`) opens with:
+`started_at` is set once, at `crates/manager/src/manager/daemon.rs:685`, from **process
+start**. `nodes_to_mark_lost` (`crates/manager/src/manager/daemon.rs:974`) opens with:
 
 ```rust
 if manager_uptime < Duration::from_secs(DEF_LOST_NODE_AT_SEC as u64) {
@@ -478,7 +478,7 @@ bearing half of §6.4, not a side quest.
 
 ### 5.5 Lane leadership under `lanes`
 
-`Lane` is `Control | Scheduler | Status` (`src/storage/raft/mod.rs:41-48`),
+`Lane` is `Control | Scheduler | Status` (`crates/manager/src/storage/raft/mod.rs:41-48`),
 three independent raft groups. The engine's convergence loop pulls lanes
 onto the control anchor, but convergence is explicitly **best effort** —
 openraft 0.9 has no leader-transfer API — and `tests/integration/raft_lanes.rs` asserts
@@ -498,17 +498,17 @@ changes. `docs/multi-raft.md:314-323`:
 > succeeds only after the forwarded write commits**.
 
 Cross-lane composites already exist and already forward:
-`mark_nodes_as_lost` (`src/storage/store.rs:4805`) commits the status half,
+`mark_nodes_as_lost` (`crates/manager/src/storage/store.rs:4805`) commits the status half,
 then `sync_node_availability(ids, "unavailable")` on the control lane, then
 one scheduler-lane reschedule eval per node. `mark_node_ready`
-(`src/storage/store.rs:4370`) is the mirror image. Both wrap their halves in
+(`crates/manager/src/storage/store.rs:4370`) is the mirror image. Both wrap their halves in
 `ForwardLaneWrite` so they complete from whichever manager runs them.
 
 ### 5.6 Manager-to-manager transport
 
-`RaftTransport` (`src/storage/raft/server.rs`) already exists as an
+`RaftTransport` (`crates/manager/src/storage/raft/server.rs`) already exists as an
 authenticated manager-plane service — shared-secret auth in
-`authenticate()` (`src/storage/raft/server.rs:70`), payloads versioned by
+`authenticate()` (`crates/manager/src/storage/raft/server.rs:70`), payloads versioned by
 `PROTOCOL_VERSION`. `ForwardLaneWrite` rides it. Adding a manager-plane RPC
 here costs no new listener, no new auth scheme, and no ACL vocabulary; it
 degrades against an older peer exactly the way `ForwardLaneWrite` does
@@ -516,7 +516,7 @@ degrades against an older peer exactly the way `ForwardLaneWrite` does
 
 ### 5.7 Metrics that exist
 
-`legion_heartbeats_total` (`src/manager/telemetry.rs:678`),
+`legion_heartbeats_total` (`crates/manager/src/manager/telemetry.rs:678`),
 `legion_nodes{status}` (`:681`),
 `legion_store_coalesce_batch_size{path}` / `_wait_seconds{path,role}` /
 `_commit_seconds{path}` (`:686-693`),
@@ -543,7 +543,7 @@ shares:
   timestamp answers exactly one question ("no"), which the *status*
   transition already answers durably.
 - **It cannot be trusted across a control-plane gap anyway.** The existing
-  startup-grace comment (`src/manager/daemon.rs:956-964`) says it outright:
+  startup-grace comment (`crates/manager/src/manager/daemon.rs:956-964`) says it outright:
   *"time the manager spent down must not count as missed heartbeats: right
   after a manager restart every persisted heartbeat looks stale."* Legion
   **already** throws the persisted timestamps away after a restart. Making
@@ -563,10 +563,10 @@ refreshes on an already-active node. Nothing else.
 **Still replicated, because it is a transition:** `lost → active`. When a
 heartbeat arrives from a node the store believes is lost, that is *new
 information no reconciler can re-derive*, and it takes the existing
-`mark_node_ready` composite (`src/storage/store.rs:4370`) — status lane
+`mark_node_ready` composite (`crates/manager/src/storage/store.rs:4370`) — status lane
 then control lane, so the node becomes schedulable again. This is the
 `active` branch of `update_node_heartbeats_apply`'s existing
-`transitioning` set (`src/storage/store.rs:5372-5392`), lifted out of the
+`transitioning` set (`crates/manager/src/storage/store.rs:5372-5392`), lifted out of the
 common path. Transitions are rare by construction: a node transitions twice
 per outage, not 30 times a minute.
 
@@ -595,10 +595,10 @@ struct LivenessTable {
 A heartbeat that arrives at the status-lane leader becomes one map write.
 No lock beyond the shard, no commit, no fsync, no pipeline-thread hop.
 
-The liveness tick (`src/manager/daemon.rs:711`) reads the table instead of
+The liveness tick (`crates/manager/src/manager/daemon.rs:711`) reads the table instead of
 `get_node_ids_and_heartbeats()`, and `nodes_to_mark_lost` keeps its exact
 shape — a pure function over `(node id, last seen, grace)` — so its existing
-unit tests (`src/manager/daemon.rs:1459`) survive as-is with the clock
+unit tests (`crates/manager/src/manager/daemon.rs:1459`) survive as-is with the clock
 swapped.
 
 ### 6.3 The lanes complication, and where liveness lives
@@ -690,9 +690,9 @@ runs the tick, it marks the entire fleet lost. Nomad's answer, adapted:
 1. **`responsible_since` resets on leadership acquisition**, not only on
    process start. The status checker already detects acquisition — it logs
    *"Raft status-lane leadership acquired; node status checker resuming"*
-   at `src/manager/daemon.rs:708` — so the hook exists and is one line from
+   at `crates/manager/src/manager/daemon.rs:708` — so the hook exists and is one line from
    the fix. **This supersedes the process-uptime grace at
-   `src/manager/daemon.rs:978`** and closes `internal_docs/TODO.md:369-378`.
+   `crates/manager/src/manager/daemon.rs:978`** and closes `internal_docs/TODO.md:369-378`.
 2. **On acquisition, seed every registered active node at `now`.** The set
    comes from replicated state (`node` LEFT JOIN `node_health` WHERE status
    is active — the existing `get_node_ids_and_heartbeats` query minus its
@@ -761,7 +761,7 @@ On the status-lane leader the column is live. On any other manager it is
 marked `(checkpoint)` and is accurate to within `checkpointInterval`. A new
 `NodeMsg.heartbeat_source` field (`live` | `checkpoint` | `none`) carries
 this, `--json` emits it, and the UI renders the same distinction. Sorting by
-`last_heartbeat` (`src/manager/server.rs:5398`) keeps working; it sorts on
+`last_heartbeat` (`crates/manager/src/manager/server.rs:5398`) keeps working; it sorts on
 whatever value that manager holds, which is documented.
 
 Setting `checkpointInterval: "0s"` turns checkpoints off entirely — zero
@@ -796,7 +796,7 @@ compaction and snapshot load nobody has measured yet.
 #### (b) Keep replicating, but batch harder — **mostly already done by `f24c6e0`; the residue is a measurement, not a plan**
 
 *What it is:* make one fsync serve many beats. The coalescer has no
-accumulation window by design (`src/storage/coalesce.rs:8-9`) — a batch forms
+accumulation window by design (`crates/manager/src/storage/coalesce.rs:8-9`) — a batch forms
 only from requests that arrive *while a commit is in flight*. That is a
 self-limiting equilibrium, and it was the arithmetic behind the original
 number:
@@ -819,7 +819,7 @@ separating by measurement before either is worth building:
 1. **The fsync itself** — irreducible while heartbeats are replicated, and
    the thing (a) removes.
 2. **The single `pipeline_loop` thread per lane**
-   (`src/storage/raft/driver.rs:1449`) — every status-lane op, heartbeat or
+   (`crates/manager/src/storage/raft/driver.rs:1449`) — every status-lane op, heartbeat or
    not, serialized through one OS thread.
 
 An explicit accumulation window (`liveness.batchWindow`) is still available
@@ -853,7 +853,7 @@ with its own corruption, migration, and backup story
 
 *What it buys:* liveness survives a restart of *the same* manager. Legion
 already handles that case, and handles it better: the startup grace
-(`src/manager/daemon.rs:978`) deliberately discards persisted timestamps
+(`crates/manager/src/manager/daemon.rs:978`) deliberately discards persisted timestamps
 after a restart, because a manager that was down cannot distinguish "the
 node died" from "I was not listening".
 
@@ -934,7 +934,7 @@ documentation rule:
   (with `leader_hint`, so a stale sender re-targets exactly as
   `ForwardLaneWrite` callers do). **Manager-plane, not user-facing.**
   Authenticated by the existing `RaftTransport` shared secret
-  (`src/storage/raft/server.rs:70`) — it is not a `Manager` RPC, so it takes
+  (`crates/manager/src/storage/raft/server.rs:70`) — it is not a `Manager` RPC, so it takes
   no ACL row and `tests/integration/acl_endpoints.rs::every_manager_rpc_is_classified`
   is unaffected. That exemption is stated in the proto comment so the next
   reader does not have to infer it.
@@ -943,7 +943,7 @@ documentation rule:
   accurate to within `liveness.checkpointInterval`), or `""` (checkpoints
   disabled). Additive; an older client ignores it and sees today's field.
 
-**Manager config** (`src/structs/config.rs`, `configs/manager.jsonnet`) —
+**Manager config** (`crates/common/src/structs/config.rs`, `configs/manager.jsonnet`) —
 one new block, every field optional, omitting the block reproducing today:
 
 ```jsonnet
@@ -1004,7 +1004,7 @@ touches no on-disk format has no downgrade hazard beyond staleness (§10).
 `docs/agent-readiness.md` gets one paragraph on `heartbeat_source`, because
 an agent reading node output needs to know the freshness caveat.
 
-**Metrics** (`src/manager/telemetry.rs`, `docs/metrics.md`):
+**Metrics** (`crates/manager/src/manager/telemetry.rs`, `docs/metrics.md`):
 
 - `legion_liveness_tracked_nodes` — gauge, nodes in the leader's table; `0`
   on non-leaders. Should equal `legion_nodes{status="active"}`.
@@ -1038,7 +1038,7 @@ whether one config knob is worth adding at all.
 
 **Phase 2 — Fix the grace clock and make suppression visible.**
 `responsible_since` resets on status-lane leadership acquisition (the hook
-at `src/manager/daemon.rs:708` already exists); `failoverGrace` config;
+at `crates/manager/src/manager/daemon.rs:708` already exists); `failoverGrace` config;
 seed-active-nodes-at-`now` on acquisition;
 `legion_liveness_loss_suppressed_total` and
 `legion_liveness_responsible_seconds`. Still fully raft-backed. *Valuable
@@ -1078,7 +1078,7 @@ is a performance regression relative to phase 3, never a correctness one.
 
 - `nodes_to_mark_lost` keeps its pure-function shape; its existing test
   `nodes_to_mark_lost_waits_for_startup_heartbeat_grace`
-  (`src/manager/daemon.rs:1459`) must pass unchanged in meaning with
+  (`crates/manager/src/manager/daemon.rs:1459`) must pass unchanged in meaning with
   `responsible_since` swapped for `started_at`.
 - The grace clock: acquisition at `t` on a process that started at `t - 6h`
   suppresses marking until `t + failoverGrace`, then resumes. **This is the
@@ -1176,7 +1176,7 @@ then workers; managers within a raft cluster tolerate skew during the roll
 
 - **New manager, old peers.** `ReportNodeLiveness` returns `unimplemented`
   from an older peer. The sender falls back to today's per-heartbeat
-  `ForwardLaneWrite::NodeHeartbeat` (`src/storage/raft/forward.rs:54`) and
+  `ForwardLaneWrite::NodeHeartbeat` (`crates/manager/src/storage/raft/forward.rs:54`) and
   counts `legion_liveness_digest_rpcs_total{outcome="unimplemented"}`. This
   is the identical degradation `ForwardLaneWrite` itself shipped with, and
   the identical remedy: finish the roll.

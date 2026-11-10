@@ -209,6 +209,7 @@ When one is required and what goes in it:
 | [swappable-seams-plan.md](plans/swappable-seams-plan.md) | shipped (2026-10-14: one attachment type for the datapath, one listener and dialer, the typed worker ↔ `netd` boundary, one object-storage layer, DNS on hickory-proto, the egress proxy on hyper, and the VIP and mesh-TLS fixes; the `legion netd` process split, a `NetdInput` wire encoding, GCS/Azure, and a `Vmm` trait deferred) |
 | [data-dir-env-plan.md](plans/data-dir-env-plan.md) | shipped (`LEGION_DATA_DIR`; no config-file field, by design) |
 | [revisions-and-watches-plan.md](plans/revisions-and-watches-plan.md) | in execution: built (review ST2, ST3, ST5, AI5): revisions on job/allocation/KV reads and writes, blocking reads, `Manager.Watch` with resume and resync-required, failover-safe event ids, follower read-after-write, linearizable reads, `StreamWork` resume from a revision, the heartbeat offload, `RunJob` compare-and-set, plan diffs, and MCP `legion_watch`/`legion_job_run` wait; `WatchObjects` on the journal, a persisted modify revision, and watches on other kinds deferred |
+| [workspace-crate-split-plan.md](plans/workspace-crate-split-plan.md) | shipped (2026-11-10): five crates in a chain (`legion-proto` → `-core` → `-worker` → `-manager` → the binary); a clean build peaks at 5.0 GB where it took 9.0, and the test build, which a 16 GB machine could not finish, fits. Deferred: the store out of the manager crate, a datapath crate, a plugin API crate, publishing |
 
 ## Judgement calls
 
@@ -325,4 +326,5 @@ by project impact. The full template and a worked example:
 - [volume-plugin-system-plan_calls.md](calls/volume-plugin-system-plan_calls.md)
 - [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md)
 - [worker-simulation-plan_calls.md](calls/worker-simulation-plan_calls.md)
+- [workspace-crate-split-plan_calls.md](calls/workspace-crate-split-plan_calls.md)
 - [workload-identity-oidc-plan_calls.md](calls/workload-identity-oidc-plan_calls.md)

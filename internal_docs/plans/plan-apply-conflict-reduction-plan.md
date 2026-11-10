@@ -50,7 +50,7 @@ Two independent mechanisms, both in code that was correct when written.
 
 ### 2.1 The overlap coupling edge collapses candidate lists
 
-`Scheduler::decouple_plan_components` (`src/manager/scheduler.rs`) unions
+`Scheduler::decouple_plan_components` (`crates/manager/src/manager/scheduler.rs`) unions
 any two placements whose candidate lists share a node, then shrinks every
 non-singleton component to a **one-element** list. The intent was safety:
 two independent fallbacks onto a shared node might oversubscribe it.
@@ -151,11 +151,11 @@ with counts, groups, and rollouts in ways that need their own plan.
 
 ## 6. Background — what exists today
 
-- `src/manager/scheduler.rs` — `build_plan` → `decouple_plan_components`
+- `crates/manager/src/manager/scheduler.rs` — `build_plan` → `decouple_plan_components`
   (coupling components), `select_node_candidates` →
   `ranked_candidate_list` (rank 0 argmax, band-sampled tail, deterministic
   below-band fill), `candidate_budget` (index truncation budget).
-- `src/storage/store.rs` — `apply_plan_submission_on` (job-config epoch
+- `crates/manager/src/storage/store.rs` — `apply_plan_submission_on` (job-config epoch
   gate, eviction savepoint, per-candidate walk), `free_pool_for_node_tx`,
   `run_plan_batch_txn` (group commit, per-plan savepoints).
 - `docs/late-binding-plan-apply.md` — the public contract, which said in

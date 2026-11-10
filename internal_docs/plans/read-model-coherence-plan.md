@@ -9,7 +9,7 @@ and widening the scrub to task configs.
 ## 1. Problem
 
 The manager plans from an in-memory `SchedulingReadModel`
-(`src/storage/store.rs`): nodes, each node's allocations, task configs,
+(`crates/manager/src/storage/store.rs`): nodes, each node's allocations, task configs,
 free pools, and the scope-epoch mirror. SQLite is the truth. Every write
 has to reach both, and nothing checked that it did.
 

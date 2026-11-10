@@ -183,7 +183,7 @@ touching it widens the diff of an already cross-cutting change.
 
 **Why.** "Nearly unreachable" is doing real work in that sentence:
 `submit_job_config` has a documented race between the existence check and the
-insert (`src/storage/store.rs`, "There is a race condition here with the
+insert (`crates/manager/src/storage/store.rs`, "There is a race condition here with the
 version"), so two concurrent submits of a new job can land on the conflict
 branch — and the losing one would silently reset the job's birth time. Since
 this change is what makes `created_at` load-bearing (it is now the thing that

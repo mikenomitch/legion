@@ -41,24 +41,6 @@ use crate::structs::{
     ScalingPauseInfo,
 };
 
-/// Fill the kinds' `schema` and `status.schema` into the bundled
-/// autoscaler's evaluated manifest (`BundledApp::generated`), from the
-/// types the parser reads.
-pub fn fill_manifest(manifest: &mut Value) {
-    let Some(kinds) = manifest.get_mut("kinds").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for kind in kinds {
-        let schema = match kind.get("name").and_then(Value::as_str) {
-            Some(SCALING_POLICY_KIND) => standalone::scaling_policy_schema(),
-            Some(NODE_GROUP_KIND) => standalone::node_group_schema(),
-            _ => continue,
-        };
-        kind["schema"] = schema;
-        kind["status"] = json!({ "schema": standalone::status_fields_schema() });
-    }
-}
-
 /// What one of the autoscaler's objects runs as, once resolved.
 #[derive(Debug, Clone)]
 pub(crate) enum Plan {

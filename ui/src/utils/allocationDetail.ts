@@ -93,7 +93,7 @@ export const healthView = (healthy: boolean | undefined, status: string | undefi
 
 /**
  * The name a worker gives a check when reporting it (`TaskCheck::default_name`
- * in src/structs/job.rs): the declared name, or one built from its kind.
+ * in crates/common/src/structs/job.rs): the declared name, or one built from its kind.
  */
 export const checkReportName = (check: JobTaskCheck): string | undefined => {
   if (check.name) return check.name

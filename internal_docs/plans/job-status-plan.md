@@ -67,9 +67,9 @@ persisted derived column.
 
 - `job.status` column, written by `handle_job_submit_tx`, `stop_job_apply`,
   `mark_job_failed_for_kv_apply`, `clear_job_failed_status_apply`,
-  `clear_job_stopped_status_apply` (`src/storage/store.rs`).
+  `clear_job_stopped_status_apply` (`crates/manager/src/storage/store.rs`).
 - Allocation statuses `placed` / `complete` / `failed` / `failed:<reason>` /
-  `suspended` (`src/constants.rs`). Terminal allocations keep their row.
+  `suspended` (`crates/common/src/constants.rs`). Terminal allocations keep their row.
 - `task_status`: one row per task of each job config, `pending` → `running`
   → `success`/`complete`/`failed`, maintained on placement and on worker exit
   reports (`complete_allocation_apply`). DAG `dependsOn` conditions read it.
@@ -138,7 +138,7 @@ until their next lifecycle write, which the derivation treats like `active`.
 ## 9. Testing
 
 Unit tests for every row of the precedence table
-(`src/storage/store/job_status_ops.rs`); a store test that drives a service
+(`crates/manager/src/storage/store/job_status_ops.rs`); a store test that drives a service
 and a batch job through placement and exit and checks both the single and
 the list read; the existing `ListJobs` filter test asserts unplaced jobs
 count as `pending`.

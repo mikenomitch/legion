@@ -119,7 +119,7 @@ lands, on today's listener, and document the local gap.
 does a shell into sandboxes.
 
 **Why (security).** Today the worker binds `127.0.0.1:4848` with no
-authentication (`src/worker/daemon.rs:155`, `src/worker/server.rs:200`), so
+authentication (`crates/worker/src/worker/daemon.rs:155`, `crates/worker/src/worker/server.rs:200`), so
 any process on the worker's host can call `ExecTask` against any
 allocation on the node, including an `exec` task or a host-network
 container. Sandboxes are exempt only because they cannot be exec'd into.

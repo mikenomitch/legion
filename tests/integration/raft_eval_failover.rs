@@ -25,6 +25,7 @@
 //! the belt-and-braces reconciler itself live in `tests/integration/eval_regen_failover.rs`
 //! and `tests/integration/node_drain.rs`; they need no cluster.
 
+use legion::manager::eval::EvalExt;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 

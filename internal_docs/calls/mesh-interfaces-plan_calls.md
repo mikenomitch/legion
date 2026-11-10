@@ -1508,7 +1508,7 @@ in every proxy test: about 280 lines for a path nothing configured.
 
 ## 59. The WASM embedding layer lives at the crate root, interpreter included
 
-**Call.** `src/wasm/` holds what any embedder needs:
+**Call.** `crates/worker/src/wasm/` holds what any embedder needs:
 - the engine and memory cap;
 - failure descriptions and guest memory;
 - the WASI shim, which now takes real `args` and `environ`;

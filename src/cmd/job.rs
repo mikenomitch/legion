@@ -962,10 +962,10 @@ async fn job_schema(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-/// The compiled-in jobspec JSON Schema (`crate::structs::job_schema`):
+/// The compiled-in jobspec JSON Schema (`crate::task_plugins::job_schema`):
 /// what `legion job schema` prints when no manager is reachable.
 pub(crate) fn build_jobspec_schema() -> Value {
-    crate::structs::job_schema::core_jobspec_schema()
+    crate::task_plugins::job_schema::core_jobspec_schema()
 }
 
 pub(crate) fn priority_arg() -> Arg {

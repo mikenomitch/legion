@@ -233,13 +233,13 @@ See `proto/legion.proto` for the authoritative message documentation.
 - Code emits each event through one named method per event kind on the
   recorder facade, such as `store.events().job_stopped(name)`. This keeps
   scheduler code readable. The `EventRecorder` in
-  [`src/storage/events.rs`](../src/storage/events.rs) is the authoritative
+  [`crates/manager/src/storage/events.rs`](../crates/manager/src/storage/events.rs) is the authoritative
   catalog of kinds. It owns each event's message, level, scopes, and metadata
   shape.
 - Under the hood, `Store::emit_event` writes the event to the
   `scheduler_event` table and publishes it on an in-process
   `tokio::sync::broadcast` channel
-  ([`src/storage/store.rs`](../src/storage/store.rs)).
+  ([`crates/manager/src/storage/store.rs`](../crates/manager/src/storage/store.rs)).
 - Emission is **best-effort**. Scheduling work never fails because an event
   could not be recorded. Errors are logged and swallowed.
 - Every manager can emit. Events raised while handling a worker's heartbeat

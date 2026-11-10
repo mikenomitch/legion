@@ -2,7 +2,7 @@
 
 `exec` is a built-in task runtime that runs a process directly on the host.
 Use it when your workload is a binary or script that doesn't need a container
-image. It is implemented in `src/task_plugins/exec.rs`.
+image. It is implemented in `crates/worker/src/task_plugins/exec.rs`.
 
 ## Purpose
 

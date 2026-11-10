@@ -253,7 +253,7 @@ default behavior or it does not count for this plan.
 
 - Non-truncatable tasks (`count.per`, `distinct`, volume-pinned,
   multi-task groups). They still scan the fleet in `scan_base_eligible`
-  and the `group_candidates` pass (`src/manager/scheduler.rs:2016`).
+  and the `group_candidates` pass (`crates/manager/src/manager/scheduler.rs:2016`).
   Follow-up item, named in TODO.md.
 - Default scoring or sampling changes (see §2 "What we reject").
 - The `evalThreads` default ([`eval-thread-default-plan.md`](eval-thread-default-plan.md)
@@ -276,12 +276,12 @@ Every term below is per eval. Ranked by expected payoff at 10k nodes.
 `plan_and_apply_internal` plans lazily by default: it reads capacity and
 the read-model `generation` under one guard, plans, then samples epochs
 for only the affected scopes if `generation` has not moved
-(`Store::expected_versions_if_unchanged`, `src/storage/store.rs:3749-3772`).
+(`Store::expected_versions_if_unchanged`, `crates/manager/src/storage/store.rs:3749-3772`).
 If it moved, the scheduler sets `eager_sample = true`
-(`src/manager/scheduler.rs:1602`) and **re-runs the whole attempt**:
+(`crates/manager/src/manager/scheduler.rs:1602`) and **re-runs the whole attempt**:
 `available_nodes`, task fetch, capacity snapshot, and `build_plan`, plus
 the eager O(fleet) sample (`allocation_version_vector_for_candidates`,
-`src/storage/store.rs:3701-3725`, one formatted `node:<id>` key and one
+`crates/manager/src/storage/store.rs:3701-3725`, one formatted `node:<id>` key and one
 `BTreeMap` insert per available node).
 
 The generation is global. Every allocation publish bumps it: the full
@@ -335,14 +335,14 @@ rate (more threads, more status writes). Not with fill per se.
 ### 5.2 `build_plan` materializes and re-verifies the whole index shard per task (est. ~10-15 ms)
 
 The default `fit` index partitions by `pool` only
-(`default_fit_spec`, `src/scheduling_index.rs:153-169`), and simulated
+(`default_fit_spec`, `crates/common/src/scheduling_index.rs:153-169`), and simulated
 fleets put every node in one pool. So for every task the shard is the
 whole fleet. Per task, per eval:
 
 - `IndexSet::query_with_order` is called with `budget: None`
   (`scheduler.rs:2400`), ranks the shard's cells, then **clones every
   node id in the shard** into a `Vec<(String, u32)>`
-  (`src/scheduling_index.rs:789`), all under the read-model *read* lock
+  (`crates/common/src/scheduling_index.rs:789`), all under the read-model *read* lock
   (`Store::scheduling_index_query`, `store.rs:3639`).
 - The scheduler looks up every returned id in `node_lookup` and
   re-verifies constraints, permit, and volume drivers on every one
@@ -429,11 +429,11 @@ without touching it. Phase 3 checks before anything is built here.
 
 ### 5.6 Per-eval time outside planning (estimated ~12 → ~48 ms)
 
-The handler (`Eval::handle_job_submit`, `src/structs/eval.rs:131`) also
+The handler (`Eval::handle_job_submit`, `crates/manager/src/manager/eval.rs:131`) also
 reads the previous config, runs `dispatch_allocations`
-(`src/manager/dispatcher.rs:57`), and schedules follow-ups. The eval
+(`crates/manager/src/manager/dispatcher.rs:57`), and schedules follow-ups. The eval
 loop then settles the batch in one `complete_evals_and_claim_next` round
-(`src/manager/daemon.rs:2127`). None of this obviously walks the fleet.
+(`crates/manager/src/manager/daemon.rs:2127`). None of this obviously walks the fleet.
 The estimated 4× growth may be the same CPU and lock pressure as H1/H2.
 Phase 0 replaces the estimate with `eval_handle_seconds`.
 
@@ -811,7 +811,7 @@ nodes, 16.7k jobs, 100k allocations) and times each step.
    on `job_id`, `name`, or `created_at`, and `job_update` none on
    `to_job_config_id`:
    - the plan apply's own-usage read (`own_allocation_usage_tx`,
-     `src/storage/store.rs`), run on every fresh plan, under the write
+     `crates/manager/src/storage/store.rs`), run on every fresh plan, under the write
      connection, scanned `job_config` for the job's configs. At 4,166 jobs
      `apply` was 1.45 ms and the eval cycle 2.7 ms. After the index they
      are 0.67 ms and 1.3 ms, flat out to 16.7k jobs (1.38 ms).
@@ -910,7 +910,7 @@ before the indexes, 1.3 ms after, and 1.4 ms at 16.7k jobs.
 - `sync_missing_task_volume_claims` still does one task-config query per
   active job per checker tick (TODO.md).
 - In-place rollout ticks build an O(fleet) exclusion set and so a filtered
-  node-set copy (`src/manager/rollout.rs`, TODO.md).
+  node-set copy (`crates/manager/src/manager/rollout.rs`, TODO.md).
 - `build_plan` still grows mildly with nodes (240 → 398 µs from 5k to 50k);
   not located.
 

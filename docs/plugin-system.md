@@ -140,14 +140,14 @@ fingerprint with its own and refuses the plugin when they differ:
 ```text
 scheduling plugin random was built differently from this legion binary and cannot be
 loaded safely: Rust plugins have no stable ABI. Plugin: rustc 1.96.0 (...) [...];
-legion-rs 0.1.0; target aarch64-apple-darwin; panic=unwind (fingerprint ...). Host: ...
+legion-worker 0.1.0; target aarch64-apple-darwin; panic=unwind (fingerprint ...). Host: ...
 ```
 
 A plugin that exports no fingerprint is refused too, with an error naming the
 macro to add. The fingerprint hashes:
 
 - the `rustc` version and commit hash,
-- the `legion` crate name and version,
+- the name and version of the crate the loader lives in (`legion-worker`),
 - the target triple and panic strategy,
 - the size and alignment of the types that cross the boundary (`Value`,
   `Map`, `anyhow::Error`, `Allocation`, `TaskConfig`, `JobConfig`,
@@ -220,12 +220,12 @@ Known limitations:
 Purpose: run workload tasks on workers.
 
 - Built-in implementations in-process:
-  - `exec` (`src/task_plugins/exec.rs`)
-  - `container` (`src/task_plugins/container.rs`)
+  - `exec` (`crates/worker/src/task_plugins/exec.rs`)
+  - `container` (`crates/worker/src/task_plugins/container.rs`)
 - Dynamically loaded examples/shipped plugins:
   - `noop` (`plugins/tasks/noop/`)
 
-Entry trait: `TaskPlugin` in `src/task_plugins/mod.rs`.
+Entry trait: `TaskPlugin` in `crates/worker/src/task_plugins/mod.rs`.
 
 ## 2) Scheduling Policy Plugins
 
@@ -237,7 +237,7 @@ Purpose: choose the node placement strategy.
 - Dynamic example plugin:
   - `random` (`plugins/scheduling/random/`)
 
-Entry trait: `SchedulingPolicy` in `src/manager/scheduler/policy.rs`.
+Entry trait: `SchedulingPolicy` in `crates/manager/src/manager/scheduler/policy.rs`.
 
 ## 3) Node Check Plugins
 
@@ -252,7 +252,7 @@ Purpose: extend worker fingerprinting and node health checks.
   - `example` (`plugins/node_checks/example/`), named in a worker type's
     `additionalNodeChecks`
 
-Entry trait: `NodeChecker` in `src/worker/node_check.rs`:
+Entry trait: `NodeChecker` in `crates/worker/src/worker/node_check.rs`:
 
 ```rust
 pub trait NodeChecker: Send + Sync {
@@ -296,7 +296,7 @@ Purpose: transform or resolve rollout config before the rollout runs.
 - Dynamic example plugin:
   - `slow_start` (`plugins/rollouts/slow_start/`)
 
-Entry trait: `RolloutStrategyPlugin` in `src/manager/rollout_strategy.rs`.
+Entry trait: `RolloutStrategyPlugin` in `crates/worker/src/rollout_strategy.rs`.
 
 ## 5) Artifact Fetcher Plugins
 
@@ -305,12 +305,12 @@ Purpose: serve artifact source schemes beyond the built-ins
 [docs/artifacts.md](artifacts.md) for the artifact system itself.
 
 - Built-in fetchers register in `FetcherRegistry::with_builtins()`
-  (`src/artifacts/fetcher.rs`, implementations in `src/artifacts/fetchers/`).
+  (`crates/worker/src/artifacts/fetcher.rs`, implementations in `crates/worker/src/artifacts/fetchers/`).
 - Dynamic example plugin:
   - `demo` (`plugins/artifacts/demo/`) serves `demo://` and writes the
     URL's `content` query parameter out as a staged file.
 
-Entry trait: `ArtifactFetcher` in `src/artifacts/fetcher.rs`.
+Entry trait: `ArtifactFetcher` in `crates/worker/src/artifacts/fetcher.rs`.
 
 Contract details (everything else follows the common pattern above):
 
@@ -340,10 +340,10 @@ Purpose: materialize persistent storage for stateful tasks (and volume claims
 on any task). See [docs/volumes.md](volumes.md) for the user-facing doc.
 
 - Built-in drivers (in-process, ship in the binary):
-  `local-dir` (the default), `host`, `nfs`, `tmpfs` (`src/volumes/builtins.rs`).
+  `local-dir` (the default), `host`, `nfs`, `tmpfs` (`crates/common/src/volumes/builtins.rs`).
 - Reference exec plugin: `plugins/volumes/example/` (a ~60-line shell script).
 
-Entry trait: `VolumeDriver` in `src/volumes/mod.rs`. In the jobspec and API you
+Entry trait: `VolumeDriver` in `crates/common/src/volumes/mod.rs`. In the jobspec and API you
 select a **driver** (`storage = { driver = "nfs" }`). "Plugin" refers to the
 packaging that delivers one (`plugins/volumes/<name>/` with a `plugin.json`).
 
@@ -397,19 +397,21 @@ collide on a host that runs both:
 
 ## Build Behavior
 
-`build.rs` behavior:
+Three build scripts, one per job:
 
-- Protobuf always compiles.
-- Plugins build only when `LEGION_BUILD_PLUGINS=1`.
+- `proto/build.rs` compiles the protobuf schema, always.
+- The root `build.rs` builds the plugins, and only when
+  `LEGION_BUILD_PLUGINS=1`.
 - Plugin builds are skipped if `LEGION_SKIP_PLUGIN_BUILD` is set.
 - When `build.rs` builds plugins, it uses a separate `CARGO_TARGET_DIR`
   under `target/plugin-build/...`.
 - At runtime, dynamic loading still looks in plugin crate-local paths such as
   `plugins/<kind>/<name>/target/release/lib<name>.<ext>`.
-- `build.rs` also records the `rustc` version, crate version, target, and
-  panic strategy for the [build fingerprint](#build-fingerprint-required-for-dynamic-plugins).
-  It runs in both the host and plugin builds, since plugins depend on the
-  `legion` crate.
+- `crates/worker/build.rs` records the `rustc` version, crate version,
+  target, and panic strategy for the
+  [build fingerprint](#build-fingerprint-required-for-dynamic-plugins). It
+  runs in both the host and plugin builds, since a plugin depends on the
+  `legion` crate and so on `legion-worker`, where the loader is.
 
 This lets normal core builds skip the cost of building plugins.
 
@@ -418,7 +420,7 @@ This lets normal core builds skip the cost of building plugins.
 ### Auth Methods
 
 Identity sources for the ACL system (username/password, JWT, OIDC, webhook) implement
-the `AuthMethod` trait in `src/manager/auth_method.rs`, the same
+the `AuthMethod` trait in `crates/manager/src/manager/auth_method.rs`, the same
 trait-plus-built-ins shape as the categories above. You can register custom
 methods in code when you embed Legion as a library
 (`Authenticator::register_method`).

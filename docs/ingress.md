@@ -679,7 +679,7 @@ balancer's address to `X-Forwarded-For`, after the client's.
 
 ## Reference
 
-- The manifest: `src/apps/bundled/ingress.ncl` (`legion app config schema
+- The manifest: `crates/common/src/bundled_apps/ingress.ncl` (`legion app config schema
   ingress` prints the config schema).
 - The key: `legion app extensions ingress`, `legion job schema`.
 - Bundled apps, settings, and the trust model: [apps.md](apps.md).

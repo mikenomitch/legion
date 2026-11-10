@@ -110,7 +110,7 @@ Workers and managers exchange versions during registration
 
 - The worker sends `build_version` (its Cargo package version, e.g.
   `"0.1.0"`) and `protocol_version` (the wire-contract version it speaks,
-  `PROTOCOL_VERSION` in `src/constants.rs`).
+  `PROTOCOL_VERSION` in `crates/common/src/constants.rs`).
 - The manager replies with `manager_build_version` and
   `manager_protocol_version`.
 

@@ -31,7 +31,7 @@ what was built:
   §11 matrix on the current build, and that build has yet to show a
   conflict-bound cell at all.
 
-What exists: the pure controller (`src/manager/concurrency.rs`) with its
+What exists: the pure controller (`crates/manager/src/manager/concurrency.rs`) with its
 rule suite and the §11.1 replay; the `ConflictWindow` wired to both
 `legion_plan_apply_total` call sites; the 500 ms tick loop on the
 scheduler-lane leader; `GetSchedulerConcurrency` +
@@ -83,19 +83,19 @@ the symptom.
 Legion's plan-apply path is optimistic (Omega-style): a planner works
 against a snapshot, submits placements plus a version vector, and the
 applier rejects the plan if any sampled epoch moved
-(`src/storage/store.rs:3340` increments
+(`crates/manager/src/storage/store.rs:3340` increments
 `legion_plan_apply_total{outcome="rejected"}`). A rejected plan costs a
-full replan — `plan_with_conflict_retries` (`src/structs/eval.rs:322`)
+full replan — `plan_with_conflict_retries` (`crates/manager/src/manager/eval.rs:322`)
 re-runs the entire `plan_and_apply_with_exclusions`
-(`src/manager/scheduler.rs:1189`) after a 25–500 ms backoff, up to
-`plan_conflict_max_retries` (default 3, `src/structs/eval.rs:413`), and
+(`crates/manager/src/manager/scheduler.rs:1189`) after a 25–500 ms backoff, up to
+`plan_conflict_max_retries` (default 3, `crates/manager/src/manager/eval.rs:413`), and
 then requeues the eval with a further ~1 s jittered delay
-(`src/manager/daemon.rs:2314`).
+(`crates/manager/src/manager/daemon.rs:2314`).
 
 How many planners run at once is a static operator guess:
-`evalThreads` (`src/structs/config.rs:1381`), defaulting to
-`available_parallelism()` (`src/structs/config.rs:1889`), fixes the
-eval-worker pool size once at startup (`src/manager/daemon.rs:426` →
+`evalThreads` (`crates/common/src/structs/config.rs:1381`), defaulting to
+`available_parallelism()` (`crates/common/src/structs/config.rs:1889`), fixes the
+eval-worker pool size once at startup (`crates/manager/src/manager/daemon.rs:426` →
 `:1457` → the `for worker_id in 0..max_threads` spawn at `:1575`). The
 operator has no way to know the right number, because the right number
 depends on fleet size, job shape, and offered load — all of which move.
@@ -137,7 +137,7 @@ them is uncomfortable:
   are `task_count_per_task: 4` and `2`
   (`benchmarks/scheduler/scenarios/web_fleet.json`) on a single pool —
   which makes each job **one coupling component**, and
-  `decouple_plan_components` (`src/manager/scheduler.rs:2090`) shrinks
+  `decouple_plan_components` (`crates/manager/src/manager/scheduler.rs:2090`) shrinks
   every non-singleton component's list to its chosen node. Late binding
   is switched off by design on exactly this workload. **§10 is where
   that leads.**
@@ -198,7 +198,7 @@ active transactions and queue the rest.
   recreate workers.
 - **Reject:** per-transaction adaptive backoff as the primary lever.
   Legion already has it (`adaptive_retry_delay`,
-  `src/structs/eval.rs:459`) and the measurement shows it is not enough:
+  `crates/manager/src/manager/eval.rs:459`) and the measurement shows it is not enough:
   backoff spaces retries but does nothing about the *arrival* rate of
   first attempts.
 
@@ -241,7 +241,7 @@ service work.
 ### In-repo prior art: the heartbeat cadence controller
 
 Legion already has an adaptive control loop with all the properties this
-one needs. `src/manager/cadence.rs` is **pure functions over a
+one needs. `crates/manager/src/manager/cadence.rs` is **pure functions over a
 snapshot** — no store access, no clock reads (`cadence.rs:1-19`) —
 driven by a daemon loop that applies the verdict. It steps on a
 **quantized ladder** rather than continuously (`CADENCE_LADDER`,
@@ -374,19 +374,19 @@ untouched.
 ## 6. Background — What Exists Today
 
 **Concurrency is set once, at startup.**
-`ManagerConfigFull::eval_threads` (`src/structs/config.rs:1381`, default
+`ManagerConfigFull::eval_threads` (`crates/common/src/structs/config.rs:1381`, default
 `available_parallelism()` at `:1889`) flows to
 `start_eval_loop(store, full_config.eval_threads)`
-(`src/manager/daemon.rs:426`). `start_eval_loop`
-(`src/manager/daemon.rs:1457`) clamps it to `>= 1`, emits
-`scheduler_started` (`src/storage/events.rs:1325`, meta
+(`crates/manager/src/manager/daemon.rs:426`). `start_eval_loop`
+(`crates/manager/src/manager/daemon.rs:1457`) clamps it to `>= 1`, emits
+`scheduler_started` (`crates/manager/src/storage/events.rs:1325`, meta
 `{"evalThreads": n}`), then spawns exactly that many workers
 (`:1575`) and supervises them forever, replacing any that exit
 (`restart_eval_worker_after_exit`, `:1590`). There is no path that
 changes the count afterwards.
 
 **Each worker is a claim-execute loop.** `eval_worker_loop`
-(`src/manager/daemon.rs:1623`) checks scheduler-lane raft leadership
+(`crates/manager/src/manager/daemon.rs:1623`) checks scheduler-lane raft leadership
 (`:1637`, followers idle), calls `store.claim_eval()` (`:1653`), and
 runs the handler on the blocking pool (`:1671`) because the handler is
 synchronous end-to-end and its conflict-retry backoff can park a thread
@@ -396,7 +396,7 @@ So the natural throttle point already exists: the worker decides, once
 per iteration, whether to pull work.
 
 **Claiming is priority-then-FIFO, and collapses duplicates.**
-`Store::claim_eval` (`src/storage/store.rs:12183`) is a replicated
+`Store::claim_eval` (`crates/manager/src/storage/store.rs:12183`) is a replicated
 scheduler-lane op wrapping `claim_eval_apply` (`:12187`), which does an
 `UPDATE ... WHERE id = (SELECT id ... ORDER BY priority DESC, id ASC
 LIMIT 1)` (`:12200`) — so equal-priority work is strict FIFO by
@@ -407,34 +407,34 @@ is **no kind filter** on the claim today; a worker takes whatever is at
 the head.
 
 **Conflict handling is per-eval, reactive, and already tuned to its
-limit.** `plan_with_conflict_retries` (`src/structs/eval.rs:322`) loops
-`plan_and_apply_with_exclusions` (`src/manager/scheduler.rs:1189`) up to
-`max_plan_conflict_retries` (`src/structs/eval.rs:413`; default 3,
+limit.** `plan_with_conflict_retries` (`crates/manager/src/manager/eval.rs:322`) loops
+`plan_and_apply_with_exclusions` (`crates/manager/src/manager/scheduler.rs:1189`) up to
+`max_plan_conflict_retries` (`crates/manager/src/manager/eval.rs:413`; default 3,
 clamped to 20) with `adaptive_retry_delay` (`:459`; base 25 ms, cap
 500 ms, 35 ms jitter, `:426`). On exhaustion the eval is *not* failed —
-`handle_claimed_eval` (`src/manager/daemon.rs:2257`) matches the
+`handle_claimed_eval` (`crates/manager/src/manager/daemon.rs:2257`) matches the
 conflict arm at `:2314` and calls `release_eval_for_retry`
-(`src/storage/store.rs:12683`) with
-`plan_conflict_requeue_delay` (`src/structs/eval.rs:397`; default 1 s,
+(`crates/manager/src/storage/store.rs:12683`) with
+`plan_conflict_requeue_delay` (`crates/manager/src/manager/eval.rs:397`; default 1 s,
 jittered), counting `legion_eval_conflict_requeues_total`
-(`src/manager/telemetry.rs:713`). All of this reacts *after* a plan has
+(`crates/manager/src/manager/telemetry.rs:713`). All of this reacts *after* a plan has
 already been computed and discarded.
 
 **The measurement the controller needs already exists.**
-`legion_plan_apply_total{outcome}` (`src/manager/telemetry.rs:709`,
+`legion_plan_apply_total{outcome}` (`crates/manager/src/manager/telemetry.rs:709`,
 defined at `:846`) is incremented at exactly two places:
-`src/storage/store.rs:3340` for `rejected`, and `src/storage/store.rs:3693`
+`crates/manager/src/storage/store.rs:3340` for `rejected`, and `crates/manager/src/storage/store.rs:3693`
 for `applied` (every placement bound rank 0) versus `fallback` (at least
 one placement slid down its candidate list). Alongside it,
 `legion_scheduler_plan_candidate_rank`
-(`src/manager/telemetry.rs:711`, defined at `:854`) records the bound
+(`crates/manager/src/manager/telemetry.rs:711`, defined at `:854`) records the bound
 rank per placement. **`fallback` is a race that was absorbed; `rejected`
 is a race that was lost.** That distinction is the controller's whole
 input signal, and it is already free.
 
 **Candidate lists, and where they are switched off.**
 `plan_candidates` defaults to `{count: 8, band: 0.01}`
-(`src/manager/scheduler.rs:60`). `ranked_candidate_list` (`:2959`) puts
+(`crates/manager/src/manager/scheduler.rs:60`). `ranked_candidate_list` (`:2959`) puts
 the true argmax at rank 0 and fills the tail from the near-tie band,
 extending below the band in score order when the band is thin (`:3029`)
 — so lists are length 8 whenever 8 nodes are feasible. But
@@ -443,15 +443,15 @@ size > 1 back to singleton lists: **any job with `count > 1` on one pool
 gets no fallback at all.** This is why the measured rejects said "all 1
 candidate(s) were stale".
 
-**The control-loop pattern to copy.** `src/manager/cadence.rs` (pure
+**The control-loop pattern to copy.** `crates/manager/src/manager/cadence.rs` (pure
 decision functions; `advance_ladder` at `:323`; asymmetric
 `LADDER_STEP_DOWN_DWELL` at `:37`), driven from the status checker in
 `daemon.rs`, surfaced by `legion node cadence`
 (`src/cmd/node.rs:263`) over a dedicated read-only RPC.
 
 **Where settings live.** `scheduler_settings: Option<Value>`
-(`src/structs/config.rs:1387`) is free-form JSON read ad hoc by each
-consumer (`Eval::max_plan_conflict_retries` at `src/structs/eval.rs:413`
+(`crates/common/src/structs/config.rs:1387`) is free-form JSON read ad hoc by each
+consumer (`Eval::max_plan_conflict_retries` at `crates/manager/src/manager/eval.rs:413`
 is the pattern). `preemption.mode = enforce | observe | off`
 (`configs/manager.ncl`) is the house precedent for a three-state
 "evidence before action" switch.
@@ -498,7 +498,7 @@ attempts/tick).
 
 Where the counts come from: a process-global `ConflictWindow` of
 relaxed atomics in `manager::concurrency`, incremented from the two
-existing metric call sites (`src/storage/store.rs:3340` and `:3693`).
+existing metric call sites (`crates/manager/src/storage/store.rs:3340` and `:3693`).
 No new plumbing through the store, and no extra work on the apply path
 beyond two atomic adds.
 
@@ -512,7 +512,7 @@ The controller owns one integer, `limit ∈ [floor, ceiling]`:
 - **floor** = 1, overridable by `adaptive_concurrency.min`.
 
 `limit` gates **admission to planning**, via a permit counter checked in
-`eval_worker_loop` (`src/manager/daemon.rs:1623`) immediately before
+`eval_worker_loop` (`crates/manager/src/manager/daemon.rs:1623`) immediately before
 `claim_eval` (`:1653`):
 
 ```
@@ -639,7 +639,7 @@ be able to notice that its own remedy did nothing and stop applying it.
 
 Copy the cadence architecture exactly:
 
-- **`src/manager/concurrency.rs`** — pure functions and plain data. No
+- **`crates/manager/src/manager/concurrency.rs`** — pure functions and plain data. No
   store access, no clock reads, no leadership checks:
   ```rust
   pub struct ConcurrencyState { limit, ewma_conflict, ewma_goodput,
@@ -653,8 +653,8 @@ Copy the cadence architecture exactly:
   is unit-testable without a cluster — the property that makes the
   cadence tests possible.
 - **`ConflictWindow`** — the atomic counters, incremented at
-  `src/storage/store.rs:3340` and `:3693`.
-- **`start_concurrency_controller`** in `src/manager/daemon.rs` — a
+  `crates/manager/src/storage/store.rs:3340` and `:3693`.
+- **`start_concurrency_controller`** in `crates/manager/src/manager/daemon.rs` — a
   500 ms tick that drains the window, calls `advance`, and publishes
   `limit` into the gate. Scheduler-lane-leader-only, for the same reason
   the eval workers are (`:1637`): a follower does no planning, so its
@@ -781,7 +781,7 @@ recorded conflict-rate trace through the pure `advance` function.
 ### 8.2 Queue ordering and starvation
 
 `claim_eval` is `ORDER BY priority DESC, id ASC`
-(`src/storage/store.rs:12200`), so equal-priority work is FIFO.
+(`crates/manager/src/storage/store.rs:12200`), so equal-priority work is FIFO.
 
 - **Within planning kinds, nothing is reordered.** The gate reduces the
   rate of claims; each claim still takes the head. A throttled cluster
@@ -801,12 +801,12 @@ recorded conflict-rate trace through the pure `advance` function.
   page, and bounded: it is a priority inversion between *classes* of
   work, never within one.
 - **Delayed evals are unaffected.** The `ready_at <= :now` predicate and
-  `wait_for_next_eval` (`src/manager/daemon.rs:1702`) are untouched; a
+  `wait_for_next_eval` (`crates/manager/src/manager/daemon.rs:1702`) are untouched; a
   throttled worker that finds no non-planning work parks exactly as
   today, with the gate-release notify added to its wakeup set.
 - **A second-order benefit worth naming:** throttling lengthens the
   queue, and a longer queue collapses *more* redundant work at claim
-  time — the dedupe sweep at `src/storage/store.rs:12231` deletes
+  time — the dedupe sweep at `crates/manager/src/storage/store.rs:12231` deletes
   pending same-entity same-kind evals. Under a burst of repeated
   reconciliation for the same jobs, throttling reduces total work, not
   just concurrent work.
@@ -915,7 +915,7 @@ conflict rate, and by running the fixed-limit sweep that separates
 - **Cold start.** An empty window means `attempts < MIN_ATTEMPTS`, so
   the controller holds at the startup limit until real traffic arrives.
 - **Metric double-counting.** `plan_apply_coalescing`
-  (`src/storage/store.rs:857`) group-commits plans; the counters are
+  (`crates/manager/src/storage/store.rs:857`) group-commits plans; the counters are
   per-plan-outcome and stay so. The controller must read outcomes, not
   commits, or a batch of 16 reads as one attempt.
 - **`observe` mode must be free.** The shadow limit is computed but the
@@ -939,14 +939,14 @@ conflict rate, and by running the fixed-limit sweep that separates
 - **Manager config:** `schedulerSettings.adaptiveConcurrency`
   (`{mode, min, max, highWatermark, lowWatermark}`), read from the
   existing free-form `scheduler_settings: Option<Value>`
-  (`src/structs/config.rs:1387`) with the clamped-getter pattern of
-  `Eval::max_plan_conflict_retries` (`src/structs/eval.rs:413`).
+  (`crates/common/src/structs/config.rs:1387`) with the clamped-getter pattern of
+  `Eval::max_plan_conflict_retries` (`crates/manager/src/manager/eval.rs:413`).
   Documented in `configs/manager.ncl`.
 - **Job config:** none. Nothing goes in `configs/jobs/maximal.ncl`.
-- **New module:** `src/manager/concurrency.rs` (pure decision
-  functions), mirroring `src/manager/cadence.rs`.
+- **New module:** `crates/manager/src/manager/concurrency.rs` (pure decision
+  functions), mirroring `crates/manager/src/manager/cadence.rs`.
 - **Store:** one new read path, `claim_eval_non_planning` — the existing
-  `claim_eval_apply` (`src/storage/store.rs:12187`) with a kind filter
+  `claim_eval_apply` (`crates/manager/src/storage/store.rs:12187`) with a kind filter
   on the inner `SELECT`, sharing the dedupe sweep and the queue-depth
   gauge. Still a replicated scheduler-lane op. No schema change, no
   migration, nothing persisted.
@@ -970,7 +970,7 @@ should ship first.**
 The measured conflicts are overwhelmingly from *coupled components*:
 `web_fleet`'s jobs are `count: 4` and `count: 2` on one pool
 (`benchmarks/scheduler/scenarios/web_fleet.json`), so
-`decouple_plan_components` (`src/manager/scheduler.rs:2090`) shrinks
+`decouple_plan_components` (`crates/manager/src/manager/scheduler.rs:2090`) shrinks
 their candidate lists to singletons and the plan reverts to today's
 all-or-nothing epoch CAS. The reject reason recorded in the run — *"all
 1 candidate(s) were stale"* — is that mechanism, verbatim. Late binding
@@ -1123,7 +1123,7 @@ Each phase ships and stands alone.
   it is the "which static number should I set" answer operators want
   today, and it is the data every later constant is fitted to.
 - **Phase 1 — The controller, as pure functions.** `ConflictWindow` +
-  `src/manager/concurrency.rs` + `advance()`, with the full unit suite
+  `crates/manager/src/manager/concurrency.rs` + `advance()`, with the full unit suite
   including the recorded-trace hunting test. Wired to nothing. Ships a
   tested, reviewable decision rule, and lets Phase 0's traces be replayed
   through it offline.
@@ -1172,7 +1172,7 @@ Each phase ships and stands alone.
 - **Store (Phase 3):** `claim_eval_non_planning` skips planning kinds,
   preserves `ORDER BY priority DESC, id ASC` among the rest, and applies
   the same dedupe sweep and queue-depth gauge as `claim_eval`
-  (`src/storage/store.rs:12231`, `:12253`).
+  (`crates/manager/src/storage/store.rs:12231`, `:12253`).
 - **Integration (Phase 3):** a burst against a headroom pool with the
   limit pinned to 1 versus the ceiling — same allocations placed, same
   resource validity, different wall time; a `job stop` issued while

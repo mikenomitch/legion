@@ -349,7 +349,7 @@ async fn mint_cmd(matches: &ArgMatches) -> R<()> {
         println!("Worker:      {}", reply.worker_address);
         println!(
             "Verify as:   {}",
-            crate::manager::mesh_ca::node_dns_name(&reply.node)
+            crate::mesh_ca::node_dns_name(&reply.node)
         );
         println!("Redeem by:   {}", reply.expires_at);
         println!("Session cap: {}s", reply.max_session_seconds);
@@ -377,7 +377,7 @@ pub async fn worker_client(reply: &MintExecTicketReply) -> R<WorkerClient<Channe
     if reply.ca_pem.trim().is_empty() {
         bail!("the manager returned no cluster CA to verify the worker with");
     }
-    let name = crate::manager::mesh_ca::node_dns_name(&reply.node);
+    let name = crate::mesh_ca::node_dns_name(&reply.node);
     let roots = crate::cluster_tls::SwappableRoots::from_pem(&reply.ca_pem)?;
     let verifier = crate::cluster_tls::NamedServerVerifier::new(roots, &name)?;
     let config = crate::cluster_tls::client_config(verifier, None)?;

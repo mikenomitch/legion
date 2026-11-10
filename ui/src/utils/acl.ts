@@ -6,7 +6,7 @@
  * every click fail with PermissionDenied.
  *
  * The rule engine itself is `aclEngine.ts`, which mirrors
- * src/structs/acl.rs and is checked against it by shared parity cases
+ * crates/common/src/structs/acl.rs and is checked against it by shared parity cases
  * (tests/fixtures/acl_parity_cases.json). This file adds the caller.
  */
 import { managerIdentity } from './connection'

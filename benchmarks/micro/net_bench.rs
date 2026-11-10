@@ -765,6 +765,7 @@ mod kernel {
             &legion::structs::host_guard::HostGuardConfig {
                 allow: vec![format!("{ip}:{backend_port}")],
                 deny: vec![],
+                counter_interval: None,
             },
         )
         .unwrap();
