@@ -5435,15 +5435,15 @@ export const Worker = {
  *
  * Wire contract:
  * - `payload` fields carry opaque, serde-encoded openraft 0.9 protocol types
- *   (serialized with serde_json — see `src/storage/raft/network.rs` /
- *   `src/storage/raft/server.rs` for the exact types on each RPC). Their
+ *   (serialized with serde_json — see `crates/manager/src/storage/raft/network.rs` /
+ *   `crates/manager/src/storage/raft/server.rs` for the exact types on each RPC). Their
  *   layout is an internal detail of the openraft version compiled into the
  *   manager binary and is versioned by `PROTOCOL_VERSION`
- *   (`src/constants.rs`) together with the rest of the manager plane:
+ *   (`crates/common/src/constants.rs`) together with the rest of the manager plane:
  *   managers with incompatible protocol versions must not be mixed in one
  *   cluster (docs/upgrades.md — managers upgrade first).
  * - `group_id` selects the raft group ("lane"). Values are the lane wire
- *   names defined by `Lane` in `src/storage/raft/mod.rs`: "control",
+ *   names defined by `Lane` in `crates/manager/src/storage/raft/mod.rs`: "control",
  *   "scheduler", "status". In the default `single` topology one group
  *   (the control lane) carries all tables.
  * - Every RPC must carry the cluster secret in request metadata under
@@ -5516,7 +5516,7 @@ export const RaftTransport = {
      * `legion raft join-token` (which embeds the cluster id, the leader's
      * advertise address, and the cluster secret) plus its own identity. The
      * leader validates the token, derives the joiner's deterministic raft id
-     * (`fnv1a64(node_id)` — see `src/storage/raft/types.rs`), adds it as a
+     * (`fnv1a64(node_id)` — see `crates/manager/src/storage/raft/types.rs`), adds it as a
      * learner to every configured group so it catches up via snapshot install,
      * and later promotes it to voter. The reply reports the assigned raft id
      * and the current membership of every group so the joiner can seed its

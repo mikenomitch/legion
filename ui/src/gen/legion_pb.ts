@@ -44137,7 +44137,7 @@ export class RaftMemberInfo extends Message<RaftMemberInfo> {
 
   /**
    * The member's manager string id (decoded from the "name@host:port"
-   * openraft BasicNode address — see `src/storage/raft/types.rs`).
+   * openraft BasicNode address — see `crates/manager/src/storage/raft/types.rs`).
    *
    * @generated from field: string node_id = 2;
    */
