@@ -11,6 +11,7 @@ Legion's running to-do list. Open work is at the top, by area; shipped work is i
 
 | PR | What it lands |
 | --- | --- |
+| [#71](https://github.com/mikenomitch/legion/pull/71) | Legion as five crates (`legion-proto` → `-common` → `-worker` → `-manager` → the binary), so builds and tests fit in memory; moves most of `src/` under `crates/` (the entries under "Developer workflow & CI" at the bottom describe it as landed) |
 | [#63](https://github.com/mikenomitch/legion/pull/63) | The isolate-runtime plan |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again (likely closes "Plugin lockfiles are stale") |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly (closes "Stopping the macOS manager leaves its Apple containers running") |
