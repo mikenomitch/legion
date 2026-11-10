@@ -4469,6 +4469,120 @@ mod tests {
         exec_over_vsock("cloud-hypervisor")
     }
 
+    /// The last `avail=N` (the guest's `MemAvailable`, in kB) on a console.
+    fn last_available_kb(log: &Path) -> Option<u64> {
+        std::fs::read_to_string(log)
+            .ok()?
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("avail="))
+            .filter_map(|n| n.trim().parse().ok())
+            .next_back()
+    }
+
+    /// A 2 GiB guest reserved at 512 MiB has its ceiling resized down to
+    /// 1 GiB (the balloon takes the difference, and the guest sees less
+    /// memory available), back up to its boot size (the guest gets it
+    /// back), and past its boot size (`needs_restart`, with the guest left
+    /// running and untouched). docs/resize.md, "Sandboxes".
+    fn ceiling_resize_within_the_boot_size(hypervisor: &str) -> R<()> {
+        use crate::structs::resize::{ResizeAnswer, ResizeChange};
+        const MIB_KB: u64 = 1024;
+        let plugin = SandboxTaskPlugin;
+        let image = std::env::var("LEGION_SANDBOX_TEST_IMAGE")
+            .unwrap_or_else(|_| "alpine:latest".to_string());
+        let mut task = task_with(json!({
+            "image": image,
+            "hypervisor": hypervisor,
+            "memory_mib": 2048,
+            "command": ["/bin/sh", "-c",
+                        "while true; do echo avail=$(awk '/MemAvailable/ {print $2}' /proc/meminfo); sleep 0.5; done"],
+        }));
+        let booted = json!({ "memory": 512, "memoryMax": 2048 });
+        task.resources = booted.clone();
+        let tmp = tempfile::tempdir()?;
+        let allocation = alloc();
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().join("allocs/7")),
+            log_dir: Some(tmp.path().join("logs7")),
+            ..TaskInstance::default()
+        };
+        let log = tmp.path().join("logs7/stdout.log");
+        plugin.prepare(&allocation, &task, &mut instance)?;
+        plugin.start(&allocation, &task, &mut instance)?;
+        wait_for("the guest to report its memory", || {
+            last_available_kb(&log).is_some_and(|kb| kb > 1500 * MIB_KB)
+        })?;
+
+        let change = |from: &Value, to: Value| ResizeChange {
+            from: from.clone(),
+            to,
+            force: false,
+            dry_run: false,
+        };
+        // Down to 1 GiB: the balloon inflates by 1 GiB.
+        let down = json!({ "memory": 512, "memoryMax": 1024 });
+        assert_eq!(
+            plugin.resize(
+                &allocation,
+                &task,
+                &mut instance,
+                &change(&booted, down.clone())
+            )?,
+            ResizeAnswer::Applied
+        );
+        wait_for("the guest to see its memory shrink", || {
+            last_available_kb(&log).is_some_and(|kb| kb < 1100 * MIB_KB)
+        })?;
+        // Back up to the boot size: the balloon deflates.
+        assert_eq!(
+            plugin.resize(
+                &allocation,
+                &task,
+                &mut instance,
+                &change(&down, booted.clone())
+            )?,
+            ResizeAnswer::Applied
+        );
+        wait_for("the guest to get its memory back", || {
+            last_available_kb(&log).is_some_and(|kb| kb > 1500 * MIB_KB)
+        })?;
+        // Past the boot size: an answer, and the guest keeps running.
+        let past = plugin.resize(
+            &allocation,
+            &task,
+            &mut instance,
+            &change(&booted, json!({ "memory": 512, "memoryMax": 4096 })),
+        )?;
+        match past {
+            ResizeAnswer::NeedsRestart(message) => {
+                assert!(
+                    message.contains("booted with a 2048 MiB guest"),
+                    "{message}"
+                );
+                assert!(message.contains(hypervisor), "{message}");
+            }
+            other => panic!("expected needs_restart, got {other:?}"),
+        }
+        let seen = last_available_kb(&log);
+        wait_for("the guest to keep reporting", || {
+            last_available_kb(&log) != seen
+        })?;
+        plugin.stop(&allocation, &task, &mut instance)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Resize Phase 2: requires KVM + Firecracker + a guest kernel with virtio-balloon"]
+    fn sandbox_ceiling_resizes_through_the_balloon_firecracker() -> R<()> {
+        ceiling_resize_within_the_boot_size("firecracker")
+    }
+
+    #[test]
+    #[ignore = "Resize Phase 2: requires KVM + cloud-hypervisor + a guest kernel with virtio-balloon"]
+    fn sandbox_ceiling_resizes_through_the_balloon_cloud_hypervisor() -> R<()> {
+        ceiling_resize_within_the_boot_size("cloud-hypervisor")
+    }
+
     /// The highest `counter=N` a guest has printed to its console so far.
     fn last_counter(log: &Path) -> Option<u64> {
         std::fs::read_to_string(log)

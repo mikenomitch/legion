@@ -1304,7 +1304,7 @@ an isolate that "grows into" a VM past a size threshold. Burst is mostly
 about capability (a subprocess, a native package), not size, and an isolate
 that only needs memory gets a higher ceiling in microseconds. Converting a
 unit's runtime mid-life would weld size and capability into one operation
-nothing else builds on (resize calls entry 6).
+nothing else builds on (resize calls entry 9).
 
 ## 7. The surface
 

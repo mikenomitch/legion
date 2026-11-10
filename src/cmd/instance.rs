@@ -1328,6 +1328,12 @@ async fn get_instance(arg_matches: &ArgMatches) -> R<()> {
                 for line in ownership_lines(&instance) {
                     println!("{line}");
                 }
+                for line in crate::cmd::resize::resource_lines(
+                    &instance.resources,
+                    &instance.resources_override,
+                ) {
+                    println!("{line}");
+                }
             }
             None => println!("Instance not found"),
         }

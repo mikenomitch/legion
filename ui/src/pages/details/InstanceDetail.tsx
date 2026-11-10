@@ -5,6 +5,7 @@ import { AccessGate } from '../../components/AccessGate'
 import { EventTimeline, createEventFeed, eventCategory } from '../../components/EventTimeline'
 import { InstanceActionButtons, createInstanceActions } from '../../components/InstanceActions'
 import { CheckpointCell, IdleCell, InstanceStateCell, instanceMemory, type InstanceRow } from '../../components/InstancesTable'
+import { resizeOverrideNote } from '../../lib/resize'
 import { SnapshotsTable } from '../../components/SnapshotsPanel'
 import {
   Badge,
@@ -939,6 +940,13 @@ function ResourcesCard(props: { row: InstanceRow }) {
             Not measured: its worker sends no usage reports (resourceEnforcement off, always so on macOS), or none since it started.
           </p>
         </Show>
+      </Show>
+      <Show when={resizeOverrideNote(instance().resourcesOverride)}>
+        {(note) => (
+          <p class="mt-3 text-xs text-muted" title="legion instance resize set these in place of the spec's amounts; the override ends with the allocation">
+            {note()}
+          </p>
+        )}
       </Show>
     </SectionCard>
   )

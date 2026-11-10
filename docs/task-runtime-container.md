@@ -995,6 +995,7 @@ grant on job:write)
 | Signal delivery | ✅ to the container init, both platforms |
 | Graceful stop (`stop { signal, killAfter }`) | ✅ both platforms |
 | Memory / CPU limits | ✅ macOS (guest sizing). ✅ Linux with `resourceEnforcement.enabled` (cgroup v2). See [docs/resource-enforcement.md](resource-enforcement.md) |
+| Resize in place (`memory`, `memoryMax`, `cpu`) | ✅ Linux, live: `memory.low`, `memory.max`, and `cpu.weight` are rewritten on the container's cgroup. A ceiling below current use is refused unless `--force`. ❌ macOS (the guest VM's size is fixed at start; a resize there is an accounting change). See [docs/resize.md](resize.md) |
 | Exclusive cores (`resources.cores`) | ✅ Linux (cpuset pinning). macOS sizes the guest instead |
 | Port publishing | ✅ macOS (`--publish`). Linux: ingress listeners forward each host port into the gated namespace (`to`, or the same port); not applied in `host` mode |
 | Volumes (`volumes[]`, `stateful.storage`) | ✅ bind-mounted at the declared `path`. See [docs/volumes.md](volumes.md) |

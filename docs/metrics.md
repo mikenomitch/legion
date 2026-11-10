@@ -538,6 +538,13 @@ across them. See [session-mode.md](session-mode.md).
 - **`legion_child_handoffs_total`** (counter, on workers): inbound
   connections an owner handed to one of its children's ports
   ([connection handoff](child-sessions.md#connection-handoff)).
+- **`legion_resizes_total{unit, outcome}`** (counter): in-place
+  [resizes](resize.md) this manager answered, by `unit` (`allocation`,
+  `instance`, or `session`) and `outcome`: `applied`, `deferred`, `refused`,
+  `needs_restart`, `not_supported`, `stale` (a shrink whose row changed
+  under it), or `error` (the unit's node did not answer). Dry runs are not
+  counted. An applied allocation or instance resize is one scheduler-lane
+  write; a session resize writes nothing.
 - **`legion_envelope_resizes_total{direction, outcome}`** (counter): elastic
   envelope resizes nodes asked this manager for
   ([elastic envelopes](session-mode.md#elastic-envelopes)), by `direction`

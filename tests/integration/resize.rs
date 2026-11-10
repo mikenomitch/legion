@@ -52,6 +52,8 @@ const NODE: &str = "w-03";
 struct Cluster {
     svc: ManagerDaemonService,
     task_manager: Arc<Mutex<WorkerTaskManager>>,
+    /// The `machine` task's `stateful.envelope` block.
+    envelope: Value,
     _dir: tempfile::TempDir,
 }
 
@@ -61,6 +63,14 @@ impl Cluster {
     }
 
     async fn with_capabilities(capabilities: Value) -> R<Self> {
+        Self::with(
+            capabilities,
+            json!({ "resources": { "cpu": 400, "memory": 256 } }),
+        )
+        .await
+    }
+
+    async fn with(capabilities: Value, envelope: Value) -> R<Self> {
         let dir = tempfile::tempdir()?;
         let mut config = ManagerConfigFull {
             store_path: dir.path().join("store").to_str().context("utf-8")?.into(),
@@ -147,6 +157,7 @@ impl Cluster {
         let cluster = Cluster {
             svc,
             task_manager,
+            envelope,
             _dir: dir,
         };
         cluster.submit(json!({ "cpu": 1000, "memory": 1024 }))?;
@@ -182,10 +193,7 @@ impl Cluster {
                     "runtime": "exec",
                     "config": sleep,
                     "resources": { "cpu": 100, "memory": 64 },
-                    "stateful": {
-                        "mode": "session",
-                        "envelope": { "resources": { "cpu": 400, "memory": 256 } },
-                    },
+                    "stateful": { "mode": "session", "envelope": self.envelope },
                 },
             ],
         }))?;
@@ -793,5 +801,69 @@ async fn a_running_allocation_converges_to_its_committed_size_test() -> R<()> {
     assert!(pending.is_empty(), "nothing is relaunched: {pending:?}");
     assert_eq!(cluster.running_size(web).cpu, Some(3000.0));
     assert_eq!(cluster.pid(web), pid_before);
+    Ok(())
+}
+
+/// A session grow its elastic envelope has no room for yet is `deferred`:
+/// the node asks its manager for the room on its next heartbeat, as it does
+/// for a session start, and the retry is applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grow_an_elastic_envelope_can_hold_is_deferred_until_it_grows_test() -> R<()> {
+    let cluster = Cluster::with(
+        json!(["sessions", "resize"]),
+        json!({
+            "resources": { "cpu": 400, "memory": 256 },
+            "max": { "cpu": 1600, "memory": 1024 },
+        }),
+    )
+    .await?;
+    let session = cluster.start_session().await?;
+    let to = amounts(Some(512.0), None, None);
+
+    let deferred = cluster
+        .resize_instance(&session, to, ResizeInstanceRequest::default())
+        .await?;
+    assert_eq!(deferred.outcome, "deferred", "{}", deferred.message);
+    assert!(deferred.retryable);
+    assert!(deferred.message.contains("elastic"), "{}", deferred.message);
+
+    // Past the envelope's ceiling there is nothing to wait for.
+    let refused = cluster
+        .resize_instance(
+            &session,
+            amounts(Some(2048.0), None, None),
+            ResizeInstanceRequest::default(),
+        )
+        .await?;
+    assert_eq!(refused.outcome, "refused", "{}", refused.message);
+
+    // The node's next heartbeat: it asks for the room the grow waits for,
+    // the manager commits it, and the node learns its envelope's new size.
+    let now = std::time::Instant::now();
+    let requests = cluster
+        .task_manager
+        .lock()
+        .expect("task manager")
+        .envelope_resize_requests(now);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let asked: Value = serde_json::from_str(&requests[0].to)?;
+    assert!(
+        asked["memory"].as_f64().unwrap_or(0.0) >= 512.0,
+        "the envelope is asked to hold the grow: {asked}"
+    );
+    let results = tokio::task::block_in_place(|| {
+        legion::manager::sessions::apply_envelope_resizes(cluster.store(), NODE, &requests)
+    });
+    assert_eq!(results[0].outcome, "applied", "{}", results[0].message);
+    cluster
+        .task_manager
+        .lock()
+        .expect("task manager")
+        .apply_envelope_resize_results(&results, now);
+
+    let applied = cluster
+        .resize_instance(&session, to, ResizeInstanceRequest::default())
+        .await?;
+    assert_eq!(applied.outcome, "applied", "{}", applied.message);
     Ok(())
 }

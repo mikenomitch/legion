@@ -863,6 +863,16 @@ lower node id, and the other node is asked to end its copy:
 This is converge-to-one, not at-most-one. A session that needs at most one
 copy at every instant should be promoted (or created with `--id`).
 
+## Resizing a session
+
+A running session's `memory`, `memoryMax`, and `cpu` can be changed in place
+with `legion instance resize <SESSION>` ([Resize](resize.md#a-session)). The
+resize is decided on the session's node: a grow is admitted against the
+envelope's free room, exactly as a start is, and nothing is written to the
+replicated store. A grow the envelope cannot hold is `refused` with the
+room it has, or `deferred` when the envelope is elastic and can grow to
+hold it. The new size survives a suspend and resume.
+
 ## Elastic envelopes
 
 A fixed envelope makes you pick one size for the whole day. Sized for the

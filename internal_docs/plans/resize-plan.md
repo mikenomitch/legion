@@ -2,7 +2,33 @@
 
 > **Judgement calls:** [resize-plan_calls.md](../calls/resize-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-28). Nothing here is built.
+**Status: IN EXECUTION** (written 2026-10-28; Phases 1 and 2 built
+2026-11-10). Public page: [docs/resize.md](../../docs/resize.md).
+
+- **Built, Phase 1:** `ResizeAllocation`, `ResizeInstance`,
+  `Worker.ResizeSession`, and `Workload.ResizeChildSession`; `legion alloc
+  resize` and `legion instance resize` with `--dry-run`, `--force`,
+  `--reason`, and idempotency keys; the compare-and-set on the allocation
+  row with `resources_override`; node-local session resizes against the
+  envelope, with `deferred` for an elastic one; `TaskPlugin::resize_support`
+  and `resize` (live on `exec` and `container`); effective resources on
+  `GetInstance`, the ledger, the CLI, and the UI; `allocation.resized` and
+  `instance.resized`; MCP tools and catalog entries.
+- **Built, Phase 2:** sandboxes on both VMMs: the reservation and CPU live,
+  the ceiling through the balloon within the boot size, `needs_restart`
+  above it. The KVM tests are written and `#[ignore]`d; nothing here has
+  been run against a real guest.
+- **Not built:** Phase 3 (`legion job resize`, the task-level override,
+  submit arbitration), Phase 4 (`--move`), and the autoscaler's vertical
+  strategies. The `isolate` row of §6.3 waits on the isolate runtime.
+- **Where the build differs from this text** (each is a calls entry):
+  the row's `resources` are the effective amounts and `resources_override`
+  is only the record (3); the manager calls the node directly and the
+  desired set converges a missed call (4); a unit override ends with its
+  allocation, so a keyed instance resumes at its spec (7);
+  `Worker.ResizeSession` also takes an allocation id (10); a session's
+  resize emits no event and records no key (11); the `needs_restart` hint
+  does not offer `--move` until Phase 4 (16).
 
 Today a running unit's size can change only through its ceiling
 (`memoryMax`) or by replacing it with a deploy. This plan adds **resize**:
@@ -127,7 +153,7 @@ allocation's effective resources and its resize events.
 - **Preempting other work to make room.** A grow takes free room only, as
   an envelope grow does.
 - **Changing a runtime** (an isolate becoming a VM). That is not a size
-  change; see [child sessions](child-sessions-plan.md) and calls entry 6.
+  change; see [child sessions](child-sessions-plan.md) and calls entry 9.
 
 ## 5. Background: what exists today
 

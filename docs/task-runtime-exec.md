@@ -178,6 +178,7 @@ verified on macOS hardware).
 | Signal delivery | ✅ |
 | Graceful stop (`stop { signal, killAfter }`) | ✅ |
 | Memory / CPU limits, exclusive cores | ✅ Linux with `resourceEnforcement.enabled` (see [docs/resource-enforcement.md](resource-enforcement.md)) |
+| Resize in place (`memory`, `memoryMax`, `cpu`) | ✅ live, with `resourceEnforcement.enabled`: `memory.low`, `memory.max`, and `cpu.weight` are rewritten on the task's cgroup. A ceiling below current use is refused unless `--force`. See [docs/resize.md](resize.md) |
 | Exit reporting / restart policy | ✅ (see [Task Supervision](task-supervision.md)) |
 | Artifacts | ✅ (File/Tree + interpolation + env) |
 | Exec / interactive PTY | ✅ / ✅, host-level (see [docs/exec-and-actions.md](exec-and-actions.md)) |

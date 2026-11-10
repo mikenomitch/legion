@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AppExtensionEvent, ApplyNamespacePolicyReply, ApplyNamespacePolicyRequest, ApplyNamespaceReply, ApplyNamespaceRequest, ApplyObjectReply, ApplyObjectRequest, ApplyScalingDefaultsReply, ApplyScalingDefaultsRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateChildInstanceRequest, CreateChildTokenReply, CreateChildTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DecideApprovalReply, DecideApprovalRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNamespacePolicyReply, DeleteNamespacePolicyRequest, DeleteNamespaceReply, DeleteNamespaceRequest, DeleteNetPluginReply, DeleteNetPluginRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteObjectReply, DeleteObjectRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForgetNodeReply, ForgetNodeRequest, ForkInstanceReply, ForkInstanceRequest, ForwardAppRequestReply, ForwardAppRequestRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetAppPageReply, GetAppPageRequest, GetAppReply, GetAppRequest, GetApprovalReply, GetApprovalRequest, GetAppViewReply, GetAppViewRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetCallerCapabilitiesReply, GetCallerCapabilitiesRequest, GetCapacityDemandReply, GetCapacityDemandRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSchemaReply, GetJobSchemaRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNamespacePolicyReply, GetNamespacePolicyRequest, GetNamespaceReply, GetNamespaceRequest, GetNetPluginReply, GetNetPluginRequest, GetNetPluginStatusReply, GetNetPluginStatusRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObjectReply, GetObjectRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetScaleHistoryReply, GetScaleHistoryRequest, GetScalingDefaultsReply, GetScalingDefaultsRequest, GetScalingInputsReply, GetScalingInputsRequest, GetScalingStatusReply, GetScalingStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetUsageReply, GetUsageRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, InstallAppReply, InstallAppRequest, InvokeAppActionReply, InvokeAppActionRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListApprovalsReply, ListApprovalsRequest, ListAppsReply, ListAppsRequest, ListAuditEventsReply, ListAuditEventsRequest, ListBootTicketsReply, ListBootTicketsRequest, ListChildrenReply, ListChildrenRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListGrantsReply, ListGrantsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNamespacePoliciesReply, ListNamespacePoliciesRequest, ListNamespacesReply, ListNamespacesRequest, ListNetPluginsReply, ListNetPluginsRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListObjectKindsReply, ListObjectKindsRequest, ListObjectsReply, ListObjectsRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListRuntimeStatesReply, ListRuntimeStatesRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListUiExtensionsReply, ListUiExtensionsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, ObjectEvent, PatchKvReply, PatchKvRequest, PauseScalingReply, PauseScalingRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, RecordScalingActionReply, RecordScalingActionRequest, ReleaseKvLockReply, ReleaseKvLockRequest, ReleaseObjectReply, ReleaseObjectRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ReportScalingStatusReply, ReportScalingStatusRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RevokeGrantReply, RevokeGrantRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, RunSessionRequest, RunSessionResponse, ScaleTaskReply, ScaleTaskRequest, ScalingPolicySet, SchedulerEvent, SetAppConfigReply, SetAppConfigRequest, SetAppEnabledReply, SetAppEnabledRequest, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetRuntimeEnabledReply, SetRuntimeEnabledRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartChildSessionRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopChildSessionReply, StopChildSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UninstallAppReply, UninstallAppRequest, UpdateAppSettingsReply, UpdateAppSettingsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpdateObjectStatusReply, UpdateObjectStatusRequest, UpgradeAppReply, UpgradeAppRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPluginReply, UpsertNetPluginRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WatchAppExtensionsRequest, WatchEvent, WatchObjectsRequest, WatchRequest, WatchScalingPoliciesRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest, WorkloadCreateChildInstanceRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AppExtensionEvent, ApplyNamespacePolicyReply, ApplyNamespacePolicyRequest, ApplyNamespaceReply, ApplyNamespaceRequest, ApplyObjectReply, ApplyObjectRequest, ApplyScalingDefaultsReply, ApplyScalingDefaultsRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateChildInstanceRequest, CreateChildTokenReply, CreateChildTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DecideApprovalReply, DecideApprovalRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNamespacePolicyReply, DeleteNamespacePolicyRequest, DeleteNamespaceReply, DeleteNamespaceRequest, DeleteNetPluginReply, DeleteNetPluginRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteObjectReply, DeleteObjectRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForgetNodeReply, ForgetNodeRequest, ForkInstanceReply, ForkInstanceRequest, ForwardAppRequestReply, ForwardAppRequestRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetAppPageReply, GetAppPageRequest, GetAppReply, GetAppRequest, GetApprovalReply, GetApprovalRequest, GetAppViewReply, GetAppViewRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetCallerCapabilitiesReply, GetCallerCapabilitiesRequest, GetCapacityDemandReply, GetCapacityDemandRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSchemaReply, GetJobSchemaRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNamespacePolicyReply, GetNamespacePolicyRequest, GetNamespaceReply, GetNamespaceRequest, GetNetPluginReply, GetNetPluginRequest, GetNetPluginStatusReply, GetNetPluginStatusRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObjectReply, GetObjectRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetScaleHistoryReply, GetScaleHistoryRequest, GetScalingDefaultsReply, GetScalingDefaultsRequest, GetScalingInputsReply, GetScalingInputsRequest, GetScalingStatusReply, GetScalingStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetUsageReply, GetUsageRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, InstallAppReply, InstallAppRequest, InvokeAppActionReply, InvokeAppActionRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListApprovalsReply, ListApprovalsRequest, ListAppsReply, ListAppsRequest, ListAuditEventsReply, ListAuditEventsRequest, ListBootTicketsReply, ListBootTicketsRequest, ListChildrenReply, ListChildrenRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListGrantsReply, ListGrantsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNamespacePoliciesReply, ListNamespacePoliciesRequest, ListNamespacesReply, ListNamespacesRequest, ListNetPluginsReply, ListNetPluginsRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListObjectKindsReply, ListObjectKindsRequest, ListObjectsReply, ListObjectsRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListRuntimeStatesReply, ListRuntimeStatesRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListUiExtensionsReply, ListUiExtensionsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, ObjectEvent, PatchKvReply, PatchKvRequest, PauseScalingReply, PauseScalingRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, RecordScalingActionReply, RecordScalingActionRequest, ReleaseKvLockReply, ReleaseKvLockRequest, ReleaseObjectReply, ReleaseObjectRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ReportScalingStatusReply, ReportScalingStatusRequest, ResetKeyringReply, ResetKeyringRequest, ResizeAllocationRequest, ResizeChildSessionRequest, ResizeInstanceRequest, ResizeReply, ResizeSessionReply, ResizeSessionRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RevokeGrantReply, RevokeGrantRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, RunSessionRequest, RunSessionResponse, ScaleTaskReply, ScaleTaskRequest, ScalingPolicySet, SchedulerEvent, SetAppConfigReply, SetAppConfigRequest, SetAppEnabledReply, SetAppEnabledRequest, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetRuntimeEnabledReply, SetRuntimeEnabledRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartChildSessionRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopChildSessionReply, StopChildSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UninstallAppReply, UninstallAppRequest, UpdateAppSettingsReply, UpdateAppSettingsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpdateObjectStatusReply, UpdateObjectStatusRequest, UpgradeAppReply, UpgradeAppRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPluginReply, UpsertNetPluginRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WatchAppExtensionsRequest, WatchEvent, WatchObjectsRequest, WatchRequest, WatchScalingPoliciesRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest, WorkloadCreateChildInstanceRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -1650,6 +1650,73 @@ export const Manager = {
       name: "PromoteInstance",
       I: PromoteInstanceRequest,
       O: PromoteInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resizes one running top-level allocation in place: its `memory`
+     * (reservation), `memoryMax` (ceiling), and `cpu`, as an override over the
+     * task's spec (docs/resize.md). No new job version and no rollout.
+     *
+     * One scheduler-lane compare-and-set on the allocation's row commits the
+     * new size (`from` is the effective size this manager read, `to` the new
+     * one), and the allocation's node applies it through the task runtime. A
+     * grow (a larger `memory` or `cpu`) is reserved first and takes only free
+     * room on the node; it never preempts. A shrink is applied on the node
+     * first and released after. A runtime that cannot make the change live
+     * answers `needs_restart` or `not_supported` and nothing changes: Legion
+     * never restarts a unit to resize it.
+     *
+     * The reply always reports an `outcome`; only `applied` changed anything.
+     * A resize back to the spec's own amounts removes the override. The
+     * override ends with the allocation: a replacement starts at the spec.
+     *
+     * ACL: `scale:write` on the allocation's job (the caller needs
+     * `scale:write` on some job before the allocation is looked up, so its
+     * existence is not probeable).
+     *
+     * Errors:
+     * - NotFound: no live allocation has this id.
+     * - InvalidArgument: no amount given, a non-positive amount, or a ceiling
+     *   below the reservation.
+     * - FailedPrecondition: the allocation is a session envelope (it resizes
+     *   through `stateful.envelope`), is not running, or its row changed under
+     *   this call (`stale`; read it again).
+     * - Unavailable: the allocation's node could not be reached. Nothing was
+     *   committed for a shrink; a grow's reservation is rolled back.
+     *
+     * @generated from rpc legion.Manager.ResizeAllocation
+     */
+    resizeAllocation: {
+      name: "ResizeAllocation",
+      I: ResizeAllocationRequest,
+      O: ResizeReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resizes one instance in place: a keyed or slot instance (its current
+     * allocation, exactly as `ResizeAllocation`) or a running session, named
+     * by its id (docs/resize.md).
+     *
+     * A session's resize is node-local and writes nothing to the replicated
+     * store: the manager routes it to the node the session id's tag names
+     * (`Worker.ResizeSession`), which admits a grow against the session
+     * task's envelope and tells the runtime. A grow the envelope has no room
+     * for answers `refused` with the room it has, or `deferred` when the
+     * envelope is elastic and is growing to make room.
+     *
+     * ACL: `scale:write` on the instance's job, checked after a coarse
+     * `scale:write` gate.
+     *
+     * Errors: as `ResizeAllocation`, plus FailedPrecondition when a keyed
+     * instance is suspended or stopped (it has no running allocation), and
+     * Unavailable when a session's node cannot be reached.
+     *
+     * @generated from rpc legion.Manager.ResizeInstance
+     */
+    resizeInstance: {
+      name: "ResizeInstance",
+      I: ResizeInstanceRequest,
+      O: ResizeReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -5476,6 +5543,29 @@ export const Worker = {
       kind: MethodKind.Unary,
     },
     /**
+     * Resizes one unit this node runs, in place (docs/resize.md): a session,
+     * admitted against its task's envelope with nothing written to the
+     * replicated store, or a top-level allocation whose new size a manager
+     * has already committed. The node tells the task runtime, which changes
+     * what it can live and answers `needs_restart` or `not_supported` for
+     * the rest; nothing is restarted.
+     *
+     * Caller class: `manager`. `Manager.ResizeInstance` and
+     * `Manager.ResizeAllocation` are the only callers.
+     *
+     * Errors: NotFound when the node runs no such session or allocation
+     * (with `wrong_node` in the message when a session id's tag names
+     * another node); InvalidArgument for a malformed request.
+     *
+     * @generated from rpc legion.Worker.ResizeSession
+     */
+    resizeSession: {
+      name: "ResizeSession",
+      I: ResizeSessionRequest,
+      O: ResizeSessionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Suspends sessions on this node (session durability plan §6.6,
      * docs/session-mode.md "Idle sessions"). A manager calls it to route
      * `legion instance suspend <session>` to the node the session id's tag
@@ -5735,6 +5825,25 @@ export const Workload = {
       name: "CreateChildInstance",
       I: WorkloadCreateChildInstanceRequest,
       O: CreateInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resizes one of the caller's own child sessions in place
+     * (docs/resize.md): how a child grows after it starts. Admitted against
+     * the child task's envelope on this node, exactly as
+     * `Manager.ResizeInstance` on a session, with no token: the socket's
+     * attribution names the owner, and only its own children are reachable.
+     *
+     * Errors: NotFound when the session is not a child of the caller (so
+     * another owner's child is not probeable); FailedPrecondition when the
+     * child runs on another node (resize it through a manager).
+     *
+     * @generated from rpc legion.Workload.ResizeChildSession
+     */
+    resizeChildSession: {
+      name: "ResizeChildSession",
+      I: ResizeChildSessionRequest,
+      O: ResizeSessionReply,
       kind: MethodKind.Unary,
     },
   }

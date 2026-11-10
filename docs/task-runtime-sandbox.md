@@ -979,6 +979,7 @@ isolated filesystem cannot see the host task dir at all.
 | Identity env / file delivery | ✅ / ✅ (under `/legion/identity`, refreshed with no restart) |
 | Signal delivery | ❌ (needs a guest agent) |
 | Memory / CPU limits, exclusive cores | ✅ with `resourceEnforcement.enabled` on Linux. The VMM runs in the allocation's worker cgroup, with `memory.max` = the [guest size](#guest-size) + the worker's `sandbox.vmmOverheadMiB` (default 64) and `memory.low` = `resources.memory`. `cpu` and `cores` govern the VMM's threads. See [resource-enforcement.md](resource-enforcement.md#sandbox-tasks). |
+| Resize in place (`memory`, `memoryMax`, `cpu`) | ✅ `memory` and `cpu` live on the VMM's cgroup. `memoryMax` moves down and back up to the [guest size](#guest-size) through the balloon; above the guest size, and on a guest booted without a balloon, the answer is `needs_restart`. vCPUs never change while the guest runs. See [resize.md](resize.md#sandboxes) |
 | Measured usage | ✅ with enforcement on: memory, CPU, and idle time in `legion node usage` and `instance list` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
 | Artifacts | ✅ image, file, tree, layers |
 | Exec / interactive PTY | ✅ / ✅ on the microVM path, through the guest agent over vsock ([Exec](#exec)). ✅ / ✅ in macOS dev mode. ❌ in Linux dev mode. |
@@ -1293,6 +1294,16 @@ the VMM starts, and `onRestoreFailure` decides what happens next:
 ```text
 checkpoint snap-dfaf943bf48d859c reopens its disks under /var/lib/legion/vmdev/sbx-…, but this node keeps device links under /opt/legion/vmdev/sbx-…: Firecracker restores a guest's disks only at the paths it captured, so the capturing and restoring nodes need the same data directory (LEGION_DATA_DIR)
 ```
+
+## Resizing a running guest
+
+`legion instance resize` changes a running sandbox's `memory`, `memoryMax`,
+and `cpu` without restarting it ([Resize](resize.md#sandboxes)). The
+reservation and the CPU weight are the VMM cgroup's and change at once. The
+ceiling is the guest's usable memory: the balloon inflates to lower it and
+deflates to raise it again, up to the size the guest booted with. Nothing
+grows a guest past its boot size while it runs; that answer is
+`needs_restart`, and the guest is left as it was.
 
 ## Guest memory under pressure
 

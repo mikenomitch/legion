@@ -125,6 +125,12 @@ pub fn instance_resize_command() -> Command {
                     .value_name("INSTANCE")
                     .help("Keyed instance id or session id")
                     .required(true),
+            )
+            .arg(
+                Arg::new("local")
+                    .long("local")
+                    .action(ArgAction::SetTrue)
+                    .help("From inside a task: resize one of this workload's own child sessions through its node's API socket, with no token (docs/child-sessions.md)"),
             ),
     )
 }
@@ -200,6 +206,41 @@ pub async fn resize_instance(arg_matches: &ArgMatches) -> R<()> {
         .get_one::<String>("id")
         .context("Must provide an instance id")?
         .clone();
+    if arg_matches.get_flag("local") {
+        // The workload channel: the socket's attribution names the owner,
+        // and only its own children are reachable.
+        let mut client = crate::cmd::session::workload_client(format, "--local")?;
+        let done = output::resolve(
+            format,
+            "failed to resize child session",
+            client
+                .resize_child_session(crate::structs::ResizeChildSessionRequest {
+                    session_id: instance_id.clone(),
+                    to: Some(requested(format, arg_matches)?),
+                    force: arg_matches.get_flag("force"),
+                    dry_run: arg_matches.get_flag("dry-run"),
+                })
+                .await,
+        )?
+        .into_inner();
+        let reply = ResizeReply {
+            retryable: done.outcome == "deferred"
+                || (done.outcome == "refused" && !done.free.is_empty()),
+            outcome: done.outcome,
+            from: done.from.clone(),
+            to: done.to,
+            // The node knows the session's size, not its task's spec.
+            spec: done.from,
+            node_id: done.node_id,
+            message: done.message,
+            free: done.free,
+            instance_id: instance_id.clone(),
+            job_id: done.job_id,
+            dry_run: arg_matches.get_flag("dry-run"),
+            ..Default::default()
+        };
+        return report(format, "instance", &instance_id, &reply);
+    }
     let request = tonic::Request::new(ResizeInstanceRequest {
         instance_id: instance_id.clone(),
         to: Some(requested(format, arg_matches)?),
@@ -281,6 +322,57 @@ fn describe_spec(spec: &Value, to: &Value) -> String {
     } else {
         format!("override active; spec {}", differs.join(", "))
     }
+}
+
+/// The lines `legion instance get` prints for a unit's size: its effective
+/// resources, and the override when a resize left one.
+pub fn resource_lines(resources: &str, resources_override: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let effective = ResourceSize::of(&parsed(resources));
+    if effective.is_empty() {
+        return lines;
+    }
+    let show = |name: &str, amount: Option<f64>| {
+        amount.map(|amount| format!("{name} {}", json_amount(amount)))
+    };
+    let amounts: Vec<String> = [
+        show("cpu", effective.cpu),
+        show("memory", effective.memory),
+        show("memoryMax", effective.memory_max),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    lines.push(format!("\nresources: {} (effective)", amounts.join(", ")));
+    let record = parsed(resources_override);
+    if let Ok(record) = serde_json::from_value::<crate::structs::resize::ResourcesOverride>(record)
+    {
+        if !record.size.is_empty() {
+            let spec: Vec<String> = [
+                record.size.cpu.and(show("cpu", record.spec.cpu)),
+                record.size.memory.and(show("memory", record.spec.memory)),
+                record
+                    .size
+                    .memory_max
+                    .and(show("memoryMax", record.spec.memory_max)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let mut line = format!("resized: override active; spec {}", spec.join(", "));
+            if !record.reason.is_empty() {
+                line.push_str(&format!("; reason: {}", record.reason));
+            }
+            if !record.by.is_empty() {
+                line.push_str(&format!("; by {}", record.by));
+            }
+            if !record.at.is_empty() {
+                line.push_str(&format!(" at {}", record.at));
+            }
+            lines.push(line);
+        }
+    }
+    lines
 }
 
 fn report(format: OutputFormat, kind: &str, id: &str, reply: &ResizeReply) -> R<()> {
@@ -429,6 +521,22 @@ mod tests {
         assert_eq!(describe_spec(&spec, &to), "override active; spec cpu 1000");
         assert_eq!(describe_spec(&spec, &spec), "at spec");
         assert_eq!(describe_change(&spec, &spec), "no change");
+    }
+
+    #[test]
+    fn instance_get_shows_effective_resources_and_the_override_test() {
+        assert!(resource_lines("", "").is_empty());
+        let lines = resource_lines(r#"{"cpu":2000,"memory":1024}"#, "");
+        assert_eq!(lines, ["\nresources: cpu 2000, memory 1024 (effective)"]);
+        let lines = resource_lines(
+            r#"{"cpu":2000,"memory":1024}"#,
+            r#"{"cpu":2000.0,"spec":{"cpu":1000.0,"memory":1024.0},"reason":"batch week","by":"accessor:7f3c","at":"2026-11-10T12:00:00Z"}"#,
+        );
+        assert_eq!(
+            lines[1],
+            "resized: override active; spec cpu 1000; reason: batch week; by accessor:7f3c at \
+             2026-11-10T12:00:00Z"
+        );
     }
 
     #[test]

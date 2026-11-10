@@ -12896,6 +12896,28 @@ export class InstanceInfo extends Message<InstanceInfo> {
    */
   children: ChildInfo[] = [];
 
+  /**
+   * The instance's effective resizable resources, as a JSON object of
+   * `memory` and `memoryMax` (MiB) and `cpu` (MHz): the spec's amounts with
+   * any resize laid over them (docs/resize.md). Set on GetInstance for an
+   * instance with a running allocation and for a running session; empty
+   * otherwise.
+   *
+   * @generated from field: string resources = 50;
+   */
+  resources = "";
+
+  /**
+   * The resize override on the instance's current allocation, as a JSON
+   * object: the overridden amounts (`memory`, `memoryMax`, `cpu`), the
+   * spec's amounts under `spec`, and `reason`, `by` (the accessor that
+   * resized), and `at` (RFC 3339). Empty when the instance runs at its
+   * spec, and for sessions, whose node keeps their size.
+   *
+   * @generated from field: string resources_override = 51;
+   */
+  resourcesOverride = "";
+
   constructor(data?: PartialMessage<InstanceInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -12953,6 +12975,8 @@ export class InstanceInfo extends Message<InstanceInfo> {
     { no: 47, name: "reschedule_backoff", kind: "message", T: RescheduleBackoff, opt: true },
     { no: 48, name: "owner", kind: "message", T: OwnerRef, opt: true },
     { no: 49, name: "children", kind: "message", T: ChildInfo, repeated: true },
+    { no: 50, name: "resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 51, name: "resources_override", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceInfo {
@@ -30256,6 +30280,17 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
    */
   taskName = "";
 
+  /**
+   * The resize override on this allocation, as a JSON object (the
+   * overridden `memory`, `memoryMax`, `cpu`, the spec's amounts under
+   * `spec`, and `reason`, `by`, `at`); empty when the allocation runs at
+   * its spec. `resources` above is always the effective reservation
+   * (docs/resize.md).
+   *
+   * @generated from field: string resources_override = 12;
+   */
+  resourcesOverride = "";
+
   constructor(data?: PartialMessage<LedgerAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -30275,6 +30310,7 @@ export class LedgerAllocation extends Message<LedgerAllocation> {
     { no: 8, name: "artifact_states", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 9, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 11, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "resources_override", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): LedgerAllocation {
@@ -51787,6 +51823,646 @@ export class JobFieldChange extends Message<JobFieldChange> {
 
   static equals(a: JobFieldChange | PlainMessage<JobFieldChange> | undefined, b: JobFieldChange | PlainMessage<JobFieldChange> | undefined): boolean {
     return proto3.util.equals(JobFieldChange, a, b);
+  }
+}
+
+/**
+ * The amounts a resize sets. An unset field is left as it is. At least one
+ * must be set.
+ *
+ * @generated from message legion.ResizeResources
+ */
+export class ResizeResources extends Message<ResizeResources> {
+  /**
+   * The reservation in MiB: what the scheduler packs on, and the cgroup's
+   * `memory.low`.
+   *
+   * @generated from field: optional double memory = 1;
+   */
+  memory?: number;
+
+  /**
+   * The ceiling in MiB: the cgroup's `memory.max`, or the memory a sandbox
+   * guest can use (its balloon). Never below `memory`.
+   *
+   * @generated from field: optional double memory_max = 2;
+   */
+  memoryMax?: number;
+
+  /**
+   * CPU in MHz: the scheduler's reservation and the cgroup's `cpu.weight`.
+   *
+   * @generated from field: optional double cpu = 3;
+   */
+  cpu?: number;
+
+  constructor(data?: PartialMessage<ResizeResources>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResizeResources";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "memory", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
+    { no: 2, name: "memory_max", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
+    { no: 3, name: "cpu", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeResources {
+    return new ResizeResources().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResizeResources {
+    return new ResizeResources().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResizeResources {
+    return new ResizeResources().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResizeResources | PlainMessage<ResizeResources> | undefined, b: ResizeResources | PlainMessage<ResizeResources> | undefined): boolean {
+    return proto3.util.equals(ResizeResources, a, b);
+  }
+}
+
+/**
+ * Request payload for `Manager.ResizeAllocation`.
+ *
+ * @generated from message legion.ResizeAllocationRequest
+ */
+export class ResizeAllocationRequest extends Message<ResizeAllocationRequest> {
+  /**
+   * The allocation to resize. Required.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The new amounts. Required; unset amounts keep their current value.
+   *
+   * @generated from field: legion.ResizeResources to = 2;
+   */
+  to?: ResizeResources;
+
+  /**
+   * Why, recorded on the override and the `allocation.resized` event.
+   * Optional.
+   *
+   * @generated from field: string reason = 3;
+   */
+  reason = "";
+
+  /**
+   * Allow a shrink of the ceiling below what the unit uses now. The
+   * runtime may reclaim memory or the kernel may kill the task. Default
+   * false: such a shrink is `refused`.
+   *
+   * @generated from field: bool force = 4;
+   */
+  force = false;
+
+  /**
+   * Answer whether the resize would fit and whether the runtime can make
+   * it, without changing anything. The reply's `outcome` is what a real
+   * call would answer.
+   *
+   * @generated from field: bool dry_run = 5;
+   */
+  dryRun = false;
+
+  /**
+   * Optional retry key. A repeat with the same key and request returns the
+   * first reply with `deduplicated = true` and changes nothing.
+   *
+   * @generated from field: optional string idempotency_key = 6;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<ResizeAllocationRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResizeAllocationRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "to", kind: "message", T: ResizeResources },
+    { no: 3, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeAllocationRequest {
+    return new ResizeAllocationRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResizeAllocationRequest {
+    return new ResizeAllocationRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResizeAllocationRequest {
+    return new ResizeAllocationRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResizeAllocationRequest | PlainMessage<ResizeAllocationRequest> | undefined, b: ResizeAllocationRequest | PlainMessage<ResizeAllocationRequest> | undefined): boolean {
+    return proto3.util.equals(ResizeAllocationRequest, a, b);
+  }
+}
+
+/**
+ * Request payload for `Manager.ResizeInstance`.
+ *
+ * @generated from message legion.ResizeInstanceRequest
+ */
+export class ResizeInstanceRequest extends Message<ResizeInstanceRequest> {
+  /**
+   * A keyed or slot instance id, or a running session's id. Required.
+   *
+   * @generated from field: string instance_id = 1;
+   */
+  instanceId = "";
+
+  /**
+   * The new amounts. Required; unset amounts keep their current value.
+   *
+   * @generated from field: legion.ResizeResources to = 2;
+   */
+  to?: ResizeResources;
+
+  /**
+   * Why, recorded on the override and the `instance.resized` event.
+   *
+   * @generated from field: string reason = 3;
+   */
+  reason = "";
+
+  /**
+   * As `ResizeAllocationRequest.force`.
+   *
+   * @generated from field: bool force = 4;
+   */
+  force = false;
+
+  /**
+   * As `ResizeAllocationRequest.dry_run`.
+   *
+   * @generated from field: bool dry_run = 5;
+   */
+  dryRun = false;
+
+  /**
+   * As `ResizeAllocationRequest.idempotency_key`. For a session the key is
+   * remembered by the manager that took the call, as for session runs.
+   *
+   * @generated from field: optional string idempotency_key = 6;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<ResizeInstanceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResizeInstanceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "to", kind: "message", T: ResizeResources },
+    { no: 3, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeInstanceRequest {
+    return new ResizeInstanceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResizeInstanceRequest {
+    return new ResizeInstanceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResizeInstanceRequest {
+    return new ResizeInstanceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResizeInstanceRequest | PlainMessage<ResizeInstanceRequest> | undefined, b: ResizeInstanceRequest | PlainMessage<ResizeInstanceRequest> | undefined): boolean {
+    return proto3.util.equals(ResizeInstanceRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for `Manager.ResizeAllocation` and `Manager.ResizeInstance`.
+ *
+ * @generated from message legion.ResizeReply
+ */
+export class ResizeReply extends Message<ResizeReply> {
+  /**
+   * What happened: `applied` (the unit runs at the new size), `deferred`
+   * (its elastic envelope is growing to make room; retry), `refused` (it
+   * does not fit, or a shrink would go below current use), `needs_restart`
+   * (the runtime cannot make this change while the unit runs), or
+   * `not_supported` (the runtime, or the node's worker, cannot resize).
+   * Only `applied` changed anything.
+   *
+   * @generated from field: string outcome = 1;
+   */
+  outcome = "";
+
+  /**
+   * The unit's effective resizable resources before the call, as a JSON
+   * object (`memory`, `memoryMax`, `cpu`).
+   *
+   * @generated from field: string from = 2;
+   */
+  from = "";
+
+  /**
+   * The effective resources the call asked for (and, when `applied`, the
+   * unit now has), as a JSON object.
+   *
+   * @generated from field: string to = 3;
+   */
+  to = "";
+
+  /**
+   * The spec's own amounts for the unit's task, as a JSON object, so a
+   * caller can show "override active; spec 1000".
+   *
+   * @generated from field: string spec = 4;
+   */
+  spec = "";
+
+  /**
+   * The node the unit runs on.
+   *
+   * @generated from field: string node_id = 5;
+   */
+  nodeId = "";
+
+  /**
+   * Why, when `outcome` is not `applied`: the runtime's or the scheduler's
+   * own account ("node w-03 has 11264 MiB free; the grow needs 63 GiB more").
+   *
+   * @generated from field: string message = 6;
+   */
+  message = "";
+
+  /**
+   * What to do about it, when there is something ("resize to at most ...,
+   * or move the allocation").
+   *
+   * @generated from field: string hint = 7;
+   */
+  hint = "";
+
+  /**
+   * The free room a refused grow was checked against, as a JSON object of
+   * amounts by resource (`memory`, `cpu`): the node's for an allocation,
+   * the envelope's for a session. Empty otherwise.
+   *
+   * @generated from field: string free = 8;
+   */
+  free = "";
+
+  /**
+   * True when this reply was replayed for a repeated `idempotency_key`.
+   *
+   * @generated from field: bool deduplicated = 9;
+   */
+  deduplicated = false;
+
+  /**
+   * The allocation resized, when the unit has one (0 for a session).
+   *
+   * @generated from field: int64 allocation_id = 10;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The instance or session id, when the unit has one.
+   *
+   * @generated from field: string instance_id = 11;
+   */
+  instanceId = "";
+
+  /**
+   * The unit's job.
+   *
+   * @generated from field: string job_id = 12;
+   */
+  jobId = "";
+
+  /**
+   * True when the request was a dry run: nothing changed whatever
+   * `outcome` says.
+   *
+   * @generated from field: bool dry_run = 13;
+   */
+  dryRun = false;
+
+  /**
+   * Whether retrying the same request later may succeed (`deferred`, and a
+   * `refused` grow, which fits once room frees up).
+   *
+   * @generated from field: bool retryable = 14;
+   */
+  retryable = false;
+
+  constructor(data?: PartialMessage<ResizeReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResizeReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "outcome", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "to", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "spec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "free", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 10, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 11, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 14, name: "retryable", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeReply {
+    return new ResizeReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResizeReply {
+    return new ResizeReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResizeReply {
+    return new ResizeReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResizeReply | PlainMessage<ResizeReply> | undefined, b: ResizeReply | PlainMessage<ResizeReply> | undefined): boolean {
+    return proto3.util.equals(ResizeReply, a, b);
+  }
+}
+
+/**
+ * Request payload for `Worker.ResizeSession`.
+ *
+ * @generated from message legion.ResizeSessionRequest
+ */
+export class ResizeSessionRequest extends Message<ResizeSessionRequest> {
+  /**
+   * The session to resize. Set this or `allocation_id`.
+   *
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  /**
+   * A top-level allocation to resize, when a manager applies a resize it
+   * committed (or, for a shrink, is about to release). 0 with `session_id`.
+   *
+   * @generated from field: int64 allocation_id = 2;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The new amounts; unset amounts keep their current value.
+   *
+   * @generated from field: legion.ResizeResources to = 3;
+   */
+  to?: ResizeResources;
+
+  /**
+   * Allow a shrink below current use.
+   *
+   * @generated from field: bool force = 4;
+   */
+  force = false;
+
+  /**
+   * Decide and answer without changing anything.
+   *
+   * @generated from field: bool dry_run = 5;
+   */
+  dryRun = false;
+
+  /**
+   * Why, for the node's log.
+   *
+   * @generated from field: string reason = 6;
+   */
+  reason = "";
+
+  constructor(data?: PartialMessage<ResizeSessionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResizeSessionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "to", kind: "message", T: ResizeResources },
+    { no: 4, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeSessionRequest {
+    return new ResizeSessionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResizeSessionRequest {
+    return new ResizeSessionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResizeSessionRequest {
+    return new ResizeSessionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResizeSessionRequest | PlainMessage<ResizeSessionRequest> | undefined, b: ResizeSessionRequest | PlainMessage<ResizeSessionRequest> | undefined): boolean {
+    return proto3.util.equals(ResizeSessionRequest, a, b);
+  }
+}
+
+/**
+ * Request payload for `Workload.ResizeChildSession`.
+ *
+ * @generated from message legion.ResizeChildSessionRequest
+ */
+export class ResizeChildSessionRequest extends Message<ResizeChildSessionRequest> {
+  /**
+   * The child session to resize: one this caller owns.
+   *
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  /**
+   * The new amounts; unset amounts keep their current value.
+   *
+   * @generated from field: legion.ResizeResources to = 2;
+   */
+  to?: ResizeResources;
+
+  /**
+   * Allow a shrink below current use.
+   *
+   * @generated from field: bool force = 3;
+   */
+  force = false;
+
+  /**
+   * Decide and answer without changing anything.
+   *
+   * @generated from field: bool dry_run = 4;
+   */
+  dryRun = false;
+
+  constructor(data?: PartialMessage<ResizeChildSessionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResizeChildSessionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "to", kind: "message", T: ResizeResources },
+    { no: 3, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeChildSessionRequest {
+    return new ResizeChildSessionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResizeChildSessionRequest {
+    return new ResizeChildSessionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResizeChildSessionRequest {
+    return new ResizeChildSessionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResizeChildSessionRequest | PlainMessage<ResizeChildSessionRequest> | undefined, b: ResizeChildSessionRequest | PlainMessage<ResizeChildSessionRequest> | undefined): boolean {
+    return proto3.util.equals(ResizeChildSessionRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for `Worker.ResizeSession` and `Workload.ResizeChildSession`.
+ *
+ * @generated from message legion.ResizeSessionReply
+ */
+export class ResizeSessionReply extends Message<ResizeSessionReply> {
+  /**
+   * As `ResizeReply.outcome`.
+   *
+   * @generated from field: string outcome = 1;
+   */
+  outcome = "";
+
+  /**
+   * The unit's effective resizable resources before the call (JSON).
+   *
+   * @generated from field: string from = 2;
+   */
+  from = "";
+
+  /**
+   * The effective resources asked for (JSON).
+   *
+   * @generated from field: string to = 3;
+   */
+  to = "";
+
+  /**
+   * Why, when `outcome` is not `applied`.
+   *
+   * @generated from field: string message = 4;
+   */
+  message = "";
+
+  /**
+   * The envelope's free room a refused or deferred session grow was
+   * checked against (JSON amounts by resource). Empty otherwise.
+   *
+   * @generated from field: string free = 5;
+   */
+  free = "";
+
+  /**
+   * This node's id.
+   *
+   * @generated from field: string node_id = 6;
+   */
+  nodeId = "";
+
+  /**
+   * The unit's job and task, so the manager can record the event and
+   * enforce the caller's scope.
+   *
+   * @generated from field: string job_id = 7;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string task_name = 8;
+   */
+  taskName = "";
+
+  /**
+   * The unit's task runtime (`exec`, `container`, `sandbox`, ...).
+   *
+   * @generated from field: string runtime = 9;
+   */
+  runtime = "";
+
+  constructor(data?: PartialMessage<ResizeSessionReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResizeSessionReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "outcome", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "to", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "free", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "runtime", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResizeSessionReply {
+    return new ResizeSessionReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResizeSessionReply {
+    return new ResizeSessionReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResizeSessionReply {
+    return new ResizeSessionReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResizeSessionReply | PlainMessage<ResizeSessionReply> | undefined, b: ResizeSessionReply | PlainMessage<ResizeSessionReply> | undefined): boolean {
+    return proto3.util.equals(ResizeSessionReply, a, b);
   }
 }
 

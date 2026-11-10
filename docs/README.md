@@ -83,6 +83,12 @@ Plans, roadmaps, to-do lists, and development notes live in
   started and owns. Covers the `children` block, the typed owner reference,
   starting a child with `--owner` or from inside a task with no credential,
   when an owner's end ends its children, promotion, and the limits.
+- [Resize](resize.md): `legion alloc resize` and `legion instance resize`,
+  which change a running unit's `memory`, `memoryMax`, or `cpu` in place as
+  an override over the spec. Covers what each runtime can change live, the
+  grow and shrink ordering, sessions inside their envelope, the outcomes
+  (`applied`, `deferred`, `refused`, `needs_restart`, `not_supported`), and
+  the limits.
 - [Volumes](volumes.md): persistent storage for stateful tasks. Covers plugins,
   the driver contract, node pinning, and reclaim.
 - [Suspend and Resume](suspend-and-resume.md): suspending a keyed instance to

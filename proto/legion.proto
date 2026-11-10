@@ -20723,8 +20723,10 @@ message ResizeInstanceRequest {
   // As `ResizeAllocationRequest.dry_run`.
   bool dry_run = 5;
 
-  // As `ResizeAllocationRequest.idempotency_key`. For a session the key is
-  // remembered by the manager that took the call, as for session runs.
+  // As `ResizeAllocationRequest.idempotency_key`, for a keyed or slot
+  // instance. A session's resize records no key: it sets absolute amounts
+  // on one node, so repeating it is safe and answers `applied` with `from`
+  // equal to `to`, and `deduplicated` stays false.
   optional string idempotency_key = 6;
 }
 

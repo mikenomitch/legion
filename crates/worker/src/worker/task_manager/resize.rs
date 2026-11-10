@@ -358,6 +358,11 @@ impl WorkerTaskManager {
             }
             self.log_running_session(local);
         } else {
+            // A promoted session still runs inside its envelope: what it
+            // holds there follows its new size.
+            if let Some(claim) = self.claims.by_local_key(local).cloned() {
+                self.claims.set_resources(&claim.claim_id, to.clone());
+            }
             self.resize_converged.remove(&local);
             self.persist_state();
         }
