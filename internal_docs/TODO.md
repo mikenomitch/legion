@@ -1135,7 +1135,8 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
 - [ ] **Share one target dir across plugin builds** (each rebuilds ~470 crates).
 - [ ] **Decide whether the UI ships inside the binary.**
 - [ ] **Test hygiene:** sweep stale `legion-tests-*` roots; find the test leaking
-      `.tmp*`; move `legion-loadgen` to its own crate
+      `.tmp*`; `crates/manager/.legion/bootstrap-token` is checked in and the
+      manager's unit tests rewrite it (untrack it and write it under the scratch root); move `legion-loadgen` to its own crate
       ([development.md](development.md#keeping-builds-and-test-runs-small)); fold the
       raft-ops tests into `tests/integration/` ([calls 1](calls/test-build-footprint_calls.md)).
 
