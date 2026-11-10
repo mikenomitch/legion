@@ -43,6 +43,7 @@ fn the_snapshot_budget_reports_the_snapshots_class_and_what_is_pinned() -> R<()>
             budgets: ContentBudgets {
                 artifacts: 10 * MIB,
                 snapshots: 8 * MIB,
+                derived: 0,
             },
             ttl: None,
             min_free_disk: 3 * MIB,

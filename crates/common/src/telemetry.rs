@@ -2303,6 +2303,18 @@ pub struct WorkerMetrics {
     /// `legion_runtime_disabled_refusals_total{runtime}` — starts this
     /// worker refused because their runtime is disabled.
     pub runtime_disabled_refusals_total: Arc<CounterVec>,
+    /// `legion_derived_builds_total{kind,outcome}` — derived content builds
+    /// (docs/artifacts.md, "Derived content"): `built` (committed), or the
+    /// reason the output was not kept (`oversized`, `below_min_free`,
+    /// `no_room`, `duplicate`, `disabled`, `error`).
+    pub derived_builds_total: Arc<CounterVec>,
+    /// `legion_derived_build_seconds{kind}` — how long a build took.
+    pub derived_build_seconds: Arc<HistogramVec>,
+    /// `legion_derived_hits_total{kind}` — uses served by an entry already
+    /// on the node.
+    pub derived_hits_total: Arc<CounterVec>,
+    /// `legion_derived_bytes` — disk the derived class holds.
+    pub derived_bytes: Arc<Gauge>,
     /// `legion_provisional_refused_total{reason}` — ratifications refused.
     pub provisional_refused_total: Arc<CounterVec>,
     /// `legion_provisional_killed_total{cause}` — provisional work killed
@@ -2427,6 +2439,40 @@ impl WorkerMetrics {
                 labels: &["runtime"],
             },
             series: Series::new(),
+        });
+        let derived_builds_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_derived_builds_total",
+                help: "Derived content builds on this node, by kind (rootfs|cwasm|preinit-image|preinit-entry|vm-base) and outcome (built|oversized|below_min_free|no_room|duplicate|disabled|error).",
+                labels: &["kind", "outcome"],
+            },
+            series: Series::new(),
+        });
+        let derived_build_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_derived_build_seconds",
+                help: "Time to build one derived content entry, by kind.",
+                labels: &["kind"],
+            },
+            bounds: CHECKPOINT_DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let derived_hits_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_derived_hits_total",
+                help: "Uses of derived content served by an entry already on this node, by kind.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+        });
+        let derived_bytes = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_derived_bytes",
+                help:
+                    "Bytes of disk the node content store's derived class holds (allocated blocks).",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
         });
         let provisional_starts_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -2697,6 +2743,10 @@ impl WorkerMetrics {
             Arc::clone(&provisional_refused_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_starts_total) as Arc<dyn RenderMetric>,
             Arc::clone(&runtime_disabled_refusals_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&derived_builds_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&derived_build_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&derived_hits_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&derived_bytes) as Arc<dyn RenderMetric>,
             Arc::clone(&pressure_actions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&parks_total) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_nodes) as Arc<dyn RenderMetric>,
@@ -2714,6 +2764,10 @@ impl WorkerMetrics {
             parks_total,
             provisional_starts_total,
             runtime_disabled_refusals_total,
+            derived_builds_total,
+            derived_build_seconds,
+            derived_hits_total,
+            derived_bytes,
             provisional_refused_total,
             provisional_killed_total,
             provisional_ratify_seconds,

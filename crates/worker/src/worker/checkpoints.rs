@@ -1528,6 +1528,7 @@ mod tests {
                 budgets: ContentBudgets {
                     artifacts: 8 * MIB,
                     snapshots: 8 * MIB,
+                    derived: 0,
                 },
                 ttl: None,
                 min_free_disk: MIB,

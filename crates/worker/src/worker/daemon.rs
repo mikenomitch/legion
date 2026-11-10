@@ -498,19 +498,15 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     );
     let content_store = open_content_store(&content_dir, content_config);
     // Sandbox base root disks (docs/task-runtime-sandbox.md, "The root disk
-    // cache"). Only a Linux node boots microVMs, so only one keeps them. It
-    // honors the content store's free-disk floor.
-    if cfg!(target_os = "linux") {
-        let min_free = content_store
-            .as_ref()
-            .map(|store| store.config().min_free_disk)
-            .or_else(|| {
-                crate::structs::parse_byte_size(crate::content_store::DEF_CONTENT_MIN_FREE_DISK)
-                    .ok()
-            })
-            .unwrap_or(0);
+    // cache") are derived content in the node store. Only a Linux node boots
+    // microVMs, so only one keeps them. The directory an older worker kept
+    // them in is removed either way.
+    {
+        let store = cfg!(target_os = "linux")
+            .then(|| content_store.clone())
+            .flatten();
         tokio::task::spawn_blocking(move || {
-            crate::task_plugins::rootfs_cache::init(&rootfs_cache_dir, min_free)
+            crate::task_plugins::rootfs_cache::init(store, &rootfs_cache_dir)
         })
         .await
         .ok();
@@ -2156,6 +2152,7 @@ fn open_content_store(
         filesystem_bytes = filesystem_bytes.unwrap_or(0),
         artifacts_budget_bytes = config.budgets.artifacts,
         snapshots_budget_bytes = config.budgets.snapshots,
+        derived_budget_bytes = config.budgets.derived,
         min_free_disk_bytes = config.min_free_disk,
         "Sized node content store budgets"
     );
