@@ -34,6 +34,7 @@ pub mod net_plugin;
 pub mod node;
 pub mod object;
 pub mod oidc;
+pub mod operator;
 pub mod output;
 pub mod raft;
 pub mod sandbox;
@@ -104,6 +105,7 @@ fn base_cli() -> Command {
         .subcommand(snapshot::config())
         .subcommand(state::config())
         .subcommand(raft::config())
+        .subcommand(operator::config())
         .subcommand(scheduler::config())
         .subcommand(acl::config())
         .subcommand(exec::config())

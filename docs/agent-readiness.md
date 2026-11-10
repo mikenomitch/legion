@@ -259,7 +259,13 @@ mirrors the gRPC status code (`NotFound`, `Unavailable`, `InvalidArgument`, …)
 except where the server names a more specific one: `WORKER_UNREACHABLE`
 (retryable) when a manager can't dial the worker running the target of an
 exec, logs, or restart call. Its hint points at `legion node info <node>`,
-which shows the manager's reachability probe for that node. `OVERLOADED`
+which shows the manager's reachability probe for that node.
+`RUNTIME_DISABLED` (retryable) means an operator disabled the task's runtime
+for the job's namespace ([Runtime Disable](runtime-disable.md)): the message
+carries the reason, and the same call succeeds once the runtime is enabled,
+so back off rather than change the request. The switch itself
+(`legion operator runtime disable|enable|status`) is in the CLI, the gRPC
+API, and `legion capabilities`, and is deliberately not an MCP tool. `OVERLOADED`
 (retryable) comes from `legion sandbox start` when the edge node is shedding
 starts because ratification is behind. Back off before retrying, as
 [edge-boot.md](edge-boot.md#overload) describes. `APPROVAL_REQUIRED` (not

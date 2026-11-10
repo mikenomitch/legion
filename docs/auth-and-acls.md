@@ -112,7 +112,7 @@ reports `aclEnabled: false`.
 | `node` | worker nodes, pools, ledger, join tokens | list/inspect, list join tokens, capacity demand (`GetCapacityDemand`, scoped by each template's pool; it names only jobs you can `job:read`) | restart, drain/attrs, forget (`ForgetNode`), create and revoke join tokens |
 | `kv` | KV entries and locks | get/list | put/patch/delete/locks |
 | `state` | raw state store, saved queries | SQL reads, schema | SQL writes, saved queries |
-| `operator` | raft, manager configs, observability | status/history/logs | raft commands, raft join tokens |
+| `operator` | raft, manager configs, observability, [runtime disables](runtime-disable.md) | status/history/logs, `operator runtime status` | raft commands, raft join tokens, `operator runtime disable` / `enable` |
 | `acl` | tokens, policies, users, delegated exec keys | list/get | create/update/delete |
 | `exec` | exec into a running allocation | n/a | open a session, or mint an exec ticket for one (`host = true` for host-level runtimes) |
 | `action` | run declared actions on an allocation | n/a | run an action (scope with `actionNames`) |

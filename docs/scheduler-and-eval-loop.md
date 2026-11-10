@@ -973,6 +973,9 @@ for a task:
 - the node holding an instance's node-local storage, or a resume's
   checkpoint, is unavailable;
 - the cluster has no schedulable node at all;
+- the task's runtime is [disabled](runtime-disable.md) for the job's
+  namespace. The job's other tasks still place; the eval blocks under
+  `runtime_disabled:<runtime>` only when nothing of the plan could place;
 - a [gang](gang-scheduling.md) task cannot reach its quorum. The plan then
   places nothing, and the eval blocks under the key of the gang's first
   missing replica, with the gang's report in its detail. A gang that sets
@@ -1010,6 +1013,7 @@ The key says what the eval waits for:
 | `class:pool=<pool>[,<attr>=<value>...]` | The task's pool and the attributes its constraints pin with `=`. `pool=*` when the permit's pool rule is not a plain `=` | Capacity on a node the task's permit and constraints accept |
 | `node:<id>` | A resume or restore pinned to the node holding its checkpoint or node-local storage | Capacity on that node only |
 | `escaped` | No schedulable node at all, so no class to wait on | Any capacity anywhere |
+| `runtime_disabled:<runtime>` | The task's runtime is [disabled](runtime-disable.md) for the job's namespace | `legion operator runtime enable`, never capacity |
 
 The match is exact rather than by key string: the wake pass re-runs the
 blocked task's own permit and constraint checks, and the node's namespace

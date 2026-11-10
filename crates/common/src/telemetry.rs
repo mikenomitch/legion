@@ -1097,7 +1097,7 @@ impl Metrics {
         let evals_blocked = Arc::new(GaugeVec {
             meta: FamilyMeta {
                 name: "legion_evals_blocked",
-                help: "Evals waiting blocked on capacity, by the kind of key they wait under: `class` (a pool and pinned attributes), `node` (a resume pinned to the node holding its checkpoint), `escaped` (no schedulable node at all). Set by the scheduler-lane leader's wake pass; zero elsewhere.",
+                help: "Evals waiting blocked on capacity, by the kind of key they wait under: `class` (a pool and pinned attributes), `node` (a resume pinned to the node holding its checkpoint), `escaped` (no schedulable node at all), `runtime` (the task's runtime is disabled; only enabling it wakes the eval). Set by the scheduler-lane leader's wake pass; zero elsewhere.",
                 labels: &["key_kind"],
             },
             series: Series::new(),
@@ -1137,7 +1137,7 @@ impl Metrics {
         let evals_unblocked_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_evals_unblocked_total",
-                help: "Blocked evals returned to the pending queue, by what woke them: `register` (a node joined), `node` (a node's pool, availability, or attributes changed), `ready` (a node became ready), `freed` (allocations left a node), `missed` (capacity appeared while the eval was running, so it never blocked), `startup` (a manager starting as the scheduler's writer gives every blocked eval one more look).",
+                help: "Blocked evals returned to the pending queue, by what woke them: `register` (a node joined), `node` (a node's pool, availability, or attributes changed), `ready` (a node became ready), `freed` (allocations left a node), `missed` (capacity appeared while the eval was running, so it never blocked), `startup` (a manager starting as the scheduler's writer gives every blocked eval one more look), `runtime_enabled` (the task runtime the eval was blocked on was enabled again).",
                 labels: &["event"],
             },
             series: Series::new(),
@@ -1370,7 +1370,7 @@ impl Metrics {
         let session_starts_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_session_starts_total",
-                help: "Session creates this manager's session router answered, by outcome (started|deduplicated|no_envelope|no_room|refused). None writes the replicated store.",
+                help: "Session creates this manager's session router answered, by outcome (started|deduplicated|no_envelope|no_room|refused|runtime_disabled). None writes the replicated store.",
                 labels: &["outcome"],
             },
             series: Series::new(),
@@ -2300,6 +2300,9 @@ pub struct WorkerMetrics {
     /// `legion_provisional_starts_total{origin,gate}` — provisional
     /// allocations admitted on this node (docs/edge-boot.md).
     pub provisional_starts_total: Arc<CounterVec>,
+    /// `legion_runtime_disabled_refusals_total{runtime}` — starts this
+    /// worker refused because their runtime is disabled.
+    pub runtime_disabled_refusals_total: Arc<CounterVec>,
     /// `legion_provisional_refused_total{reason}` — ratifications refused.
     pub provisional_refused_total: Arc<CounterVec>,
     /// `legion_provisional_killed_total{cause}` — provisional work killed
@@ -2417,6 +2420,14 @@ impl WorkerMetrics {
             cell: CounterCell::default(),
         });
 
+        let runtime_disabled_refusals_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_runtime_disabled_refusals_total",
+                help: "Starts this worker refused because their task runtime is disabled (`legion operator runtime disable`): placements, session starts, claims, resumes, and restarts.",
+                labels: &["runtime"],
+            },
+            series: Series::new(),
+        });
         let provisional_starts_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_provisional_starts_total",
@@ -2685,6 +2696,7 @@ impl WorkerMetrics {
             Arc::clone(&provisional_ratify_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_refused_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&runtime_disabled_refusals_total) as Arc<dyn RenderMetric>,
             Arc::clone(&pressure_actions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&parks_total) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_nodes) as Arc<dyn RenderMetric>,
@@ -2701,6 +2713,7 @@ impl WorkerMetrics {
             pressure_actions_total,
             parks_total,
             provisional_starts_total,
+            runtime_disabled_refusals_total,
             provisional_refused_total,
             provisional_killed_total,
             provisional_ratify_seconds,

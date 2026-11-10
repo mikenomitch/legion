@@ -2606,6 +2606,17 @@ fn migration_list() -> Vec<M<'static>> {
         );",
         )
         .down("DROP TABLE IF EXISTS store_revision;"),
+        // Runtime disables (docs/runtime-disable.md): one row per disabled
+        // task runtime, `object` the `RuntimeDisable` as JSON (scope, reason,
+        // since, who, drain). Control lane: operator intent, like namespace
+        // policies.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS runtime_state (
+            runtime STRING PRIMARY KEY,
+            object TEXT NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS runtime_state;"),
     ]
 }
 

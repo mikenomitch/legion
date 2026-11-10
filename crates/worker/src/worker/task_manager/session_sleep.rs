@@ -599,6 +599,23 @@ impl WorkerTaskManager {
     /// manifest ([`super::session_store::claim_held_for_resume`]); the row
     /// carries it from here on, so a failed launch leaves a row the bucket
     /// still names this node for.
+    /// The refusal a resume of the suspended session `session_id` would get
+    /// because its runtime is disabled. `Ok` for a session this node does
+    /// not hold suspended (the resume itself answers that).
+    pub fn idle_session_runtime_refusal(
+        &self,
+        session_id: &str,
+    ) -> Result<(), crate::structs::runtime_state::RuntimeDisabledRefusal> {
+        match self
+            .idle_sessions
+            .get(session_id)
+            .and_then(|row| row.payload.as_ref())
+        {
+            Some(payload) => self.runtime_refusal(payload),
+            None => Ok(()),
+        }
+    }
+
     pub fn begin_session_resume(
         &mut self,
         session_id: &str,
@@ -631,6 +648,9 @@ impl WorkerTaskManager {
             ))
             .into());
         };
+        // A resume is a start (docs/runtime-disable.md): refused before
+        // anything is admitted, and the session stays suspended.
+        self.runtime_refusal(&payload)?;
         let provisional = payload
             .provisional
             .clone()
@@ -1079,6 +1099,12 @@ pub fn resume_session(
     session_id: &str,
     cold: bool,
 ) -> R<ResumeOutcome> {
+    // A disabled runtime resumes nothing (docs/runtime-disable.md), and the
+    // refusal comes before a `store` session spends a generation on it.
+    manager
+        .lock()
+        .expect("task manager")
+        .idle_session_runtime_refusal(session_id)?;
     // A `store` session claims its next generation before its gate opens
     // (session durability plan §6.7); a lost claim ends the stale row.
     let claimed = super::session_store::claim_held_for_resume(manager, session_id)?;

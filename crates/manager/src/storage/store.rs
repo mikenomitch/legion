@@ -1626,6 +1626,10 @@ pub struct Store {
     // change nothing is known, so the first freed capacity runs one pass,
     // which clears it if nothing waits.
     capacity_waiters: Arc<AtomicBool>,
+    // This manager's view of the runtime disables
+    // (`storage/runtime_state_store.rs`): the set every plan and heartbeat
+    // reads, reloaded by the changeset projection. Shared across clones.
+    pub(crate) runtime_states: Arc<crate::storage::runtime_state_store::RuntimeStateHub>,
     // The timed read-model scrub's own rotation (`scrub_read_model_slice`):
     // the nodes and job configs still to visit this sweep, each refilled
     // from committed AND cached ids so an entry missing from either side is
@@ -2345,6 +2349,7 @@ impl Store {
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             capacity_waiters: Arc::new(AtomicBool::new(true)),
+            runtime_states: Arc::new(Default::default()),
             read_model_scrub_queue: Arc::new(std::sync::Mutex::new(Default::default())),
             external_write_baseline: Arc::new(std::sync::Mutex::new(None)),
             keyring,
@@ -12572,6 +12577,7 @@ impl Store {
         }
         self.work_log.resync_all();
         self.endpoint_index.mark_all();
+        self.runtime_states_changed();
         // Rows changed under the journal too: every watch resyncs.
         self.reset_revisions();
         if keyring {
@@ -12633,6 +12639,9 @@ impl Store {
         // key, a reset): this replica must unwrap the new rows before it can
         // read values written under them.
         let mut keyring_changed = false;
+        // A runtime disable was written or lifted
+        // (`storage/runtime_state_store.rs`).
+        let mut runtime_state_changed = false;
 
         // Column positions come from the live schema (changeset records use
         // the table's declared column order), so this cannot drift from
@@ -12651,6 +12660,7 @@ impl Store {
             let action = op.code();
             match table.as_str() {
                 "keyring_key" => keyring_changed = true,
+                "runtime_state" => runtime_state_changed = true,
                 "node" | "node_health" => {
                     // A node_health change patches the SAME cached Node —
                     // liveness hydrates from the node ⟕ node_health join
@@ -13044,6 +13054,10 @@ impl Store {
 
         if keyring_changed && !read_model_only {
             self.keyring_rows_changed();
+        }
+        // In `local_disk` mode too: the set is part of what plans read.
+        if runtime_state_changed {
+            self.runtime_states_changed();
         }
 
         // Resolve rows whose owning scope was not carried by the update

@@ -346,6 +346,49 @@ fn local(nodes: &[(&str, usize)]) -> R<Local> {
     })
 }
 
+/// docs/runtime-disable.md, "How workers learn": a disable is pushed to an
+/// open stream the moment it commits, outside the node's sequence; a
+/// stream that opens while a disable is in force gets the set ahead of its
+/// resync; and the enable pushes the empty set.
+#[test]
+fn a_runtime_disable_is_pushed_to_streaming_workers() -> R<()> {
+    let cluster = local(&[("w-1", 200)])?;
+    let probe = Probe::open(&cluster.rt, cluster.addr, "w-1", (0, 0), true)?;
+    let first = probe.expect("the opening resync");
+    assert!(first.resync);
+    assert!(
+        first.runtime_states.is_none(),
+        "nothing is disabled, so nothing is pushed"
+    );
+
+    cluster
+        .store
+        .disable_runtime("sandbox", vec!["tenants-*".into()], "GHSA-1", "test", true)?;
+    let push = probe.expect("the pushed set");
+    assert!(push.push_only, "outside the sequence");
+    assert_eq!(push.seq, 0);
+    let states = push.runtime_states.expect("the set").states;
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].runtime, "sandbox");
+    assert_eq!(states[0].namespaces, ["tenants-*"]);
+    assert!(states[0].drain);
+
+    // A stream that opens now holds the disable before any work.
+    let late = Probe::open(&cluster.rt, cluster.addr, "w-1", (0, 0), true)?;
+    let opening = late.expect("the set, first");
+    assert!(opening.push_only);
+    assert_eq!(opening.runtime_states.expect("the set").states.len(), 1);
+    assert!(late.expect("then the resync").resync);
+
+    cluster.store.enable_runtime("sandbox", vec![], "test")?;
+    let cleared = late.expect("the cleared set");
+    assert!(cleared.push_only);
+    assert!(cleared.runtime_states.expect("the set").states.is_empty());
+    probe.close();
+    late.close();
+    Ok(())
+}
+
 /// Phase 2's headline: with no heartbeat running at all, each placement
 /// reaches its worker's stream within one round trip of the commit. The
 /// bound asserted here is loose (CI runs debug builds on shared cores); the

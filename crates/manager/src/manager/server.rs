@@ -147,6 +147,7 @@ mod node_content_rpcs;
 mod node_group_rpcs;
 mod object_rpcs;
 mod plugin_rpcs;
+mod runtime_state_rpcs;
 mod scaling_objects;
 mod scaling_rpcs;
 mod session_rpcs;
@@ -3115,6 +3116,7 @@ impl ManagerDaemonService {
                 .chain(self.gated_egress_submit_warnings(&config))
                 .chain(self.tcp_upstream_submit_warnings(&config))
                 .chain(crate::task_plugins::container_security_warnings(&config))
+                .chain(runtime_state_rpcs::submit_warnings(&self.store, &config))
                 .collect(),
         })
     }
@@ -6648,6 +6650,7 @@ impl Manager for ManagerDaemonService {
                 .chain(self.gated_egress_submit_warnings(&config))
                 .chain(self.tcp_upstream_submit_warnings(&config))
                 .chain(crate::task_plugins::container_security_warnings(&config))
+                .chain(runtime_state_rpcs::submit_warnings(&self.store, &config))
                 .collect(),
             gang_reports: gang_reports
                 .iter()
@@ -6864,6 +6867,22 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::DeleteNamespaceRequest>,
     ) -> Result<Response<crate::structs::DeleteNamespaceReply>, Status> {
         self.delete_namespace_rpc(request).await
+    }
+
+    // Runtime disables live in `runtime_state_rpcs`; each handler states
+    // its ACL check.
+    async fn set_runtime_enabled(
+        &self,
+        request: Request<crate::structs::SetRuntimeEnabledRequest>,
+    ) -> Result<Response<crate::structs::SetRuntimeEnabledReply>, Status> {
+        self.set_runtime_enabled_rpc(request).await
+    }
+
+    async fn list_runtime_states(
+        &self,
+        request: Request<crate::structs::ListRuntimeStatesRequest>,
+    ) -> Result<Response<crate::structs::ListRuntimeStatesReply>, Status> {
+        self.list_runtime_states_rpc(request).await
     }
 
     // Namespace policies live in `namespace_policy_rpcs`; each handler
@@ -9483,6 +9502,17 @@ impl Manager for ManagerDaemonService {
 
         let (exec_keys, exec_keys_version) = self.exec_keys_for(&req.exec_keys_version);
 
+        // Starts the node refused for a disabled runtime, for
+        // `ListRuntimeStates` (docs/runtime-disable.md).
+        if !req.runtime_refusals.is_empty() {
+            let refusals: Vec<(String, u64)> = req
+                .runtime_refusals
+                .iter()
+                .map(|entry| (entry.runtime.clone(), entry.count))
+                .collect();
+            self.store.note_runtime_refusals(&refusals);
+        }
+
         let reply = HeartbeatReply {
             net_policies,
             message: "ack".into(),
@@ -9507,6 +9537,10 @@ impl Manager for ManagerDaemonService {
             retry_terminated_allocations,
             retry_failed_allocations,
             envelope_resizes,
+            // The whole set on every beat (docs/runtime-disable.md): the
+            // record workers refuse starts from, and the backstop for a
+            // lost `StreamWork` push.
+            runtime_states: Some(self.store.runtime_disables().to_proto()),
         };
 
         Ok(Response::new(reply))

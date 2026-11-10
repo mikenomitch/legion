@@ -208,6 +208,7 @@ fn worker_capabilities(publishing: bool, edge_sessions: bool) -> Vec<String> {
         // (docs/session-mode.md). Envelope tasks require it, so a worker
         // that predates sessions is never given one.
         crate::structs::session::SESSIONS_CAPABILITY.to_string(),
+        crate::structs::runtime_state::RUNTIME_DISABLE_CAPABILITY.to_string(),
     ];
     if publishing {
         capabilities.push(crate::structs::snapshot::CONTENT_PUBLISH_CAPABILITY.to_string());
@@ -2801,7 +2802,13 @@ pub async fn heartbeat_tick(
         } else {
             (allocations, allocation_health.clone(), allocation_health)
         };
+        // Starts refused for a disabled runtime since the last acknowledged
+        // beat (docs/runtime-disable.md); put back if this one is lost.
+        let runtime_gate = task_manager.lock().expect("task manager").runtime_gate();
+        let runtime_refusals = runtime_gate.take_refusals();
+        let runtime_refusals_for_redrive = runtime_refusals.clone();
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
+            runtime_refusals,
             // What the node holds of its endpoint feed, so the reply carries
             // only what changed (mesh-control-path plan §6.1).
             endpoint_feed: Some(netd.feed_report()),
@@ -2860,6 +2867,7 @@ pub async fn heartbeat_tick(
                 // And the direct exec audit, so a dead connection loses no
                 // record of who opened a shell.
                 crate::worker::direct_exec::restore_audit(exec_audit);
+                runtime_gate.restore_refusals(runtime_refusals_for_redrive);
                 netd.redrive(net_redrive);
                 // Pressure actions too: an eviction the manager never hears
                 // about would leave it waiting on an allocation that is gone.
@@ -2907,6 +2915,11 @@ pub async fn heartbeat_tick(
         }
         crate::worker::direct_exec::apply_revocations(&reply.revoked_exec_sessions);
         crate::worker::direct_exec::apply_exec_keys(&reply.exec_keys_version, &reply.exec_keys);
+        // The runtimes an operator disabled (docs/runtime-disable.md): held
+        // before the reconcile below starts anything from this reply.
+        if let Some(states) = reply.runtime_states.as_ref() {
+            apply_runtime_states(task_manager, states);
+        }
         // The cluster's manager set, refreshed every beat and persisted when
         // it changes, so failover (and a restart) can reach any manager.
         if let Some(managers) = managers {
@@ -3722,6 +3735,40 @@ pub(crate) fn wake_heartbeat() {
 }
 
 /// Act on one applied work-stream message: start the checkpoint work it
+/// Replace the runtime disables this worker holds with the managers' set
+/// (docs/runtime-disable.md), and, when a disable asks for a drain, take
+/// this node's running sessions of that runtime off it on a blocking
+/// thread. The drain is level-triggered: every set that still asks for one
+/// runs a pass, so a session that was busy, or started in a race with the
+/// disable, is taken by a later one.
+fn apply_runtime_states(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    states: &crate::structs::RuntimeStateSet,
+) {
+    let gate = task_manager.lock().expect("task manager").runtime_gate();
+    gate.replace(crate::structs::runtime_state::RuntimeDisableSet::from_proto(states));
+    if !gate.any_drain() {
+        return;
+    }
+    let task_manager = Arc::clone(task_manager);
+    let drain = move || {
+        let drained = crate::worker::runtime_state::drain_sessions(&task_manager);
+        if !drained.suspended.is_empty() || !drained.stopped.is_empty() {
+            info!(
+                suspended = drained.suspended.len(),
+                stopped = drained.stopped.len(),
+                "Drained sessions of a disabled runtime"
+            );
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn_blocking(drain);
+        }
+        Err(_) => drain(),
+    }
+}
+
 /// pushed and the allocations it added, and wake the heartbeat's reconcile
 /// when it stopped or changed anything. A resync's additions go through the
 /// reconcile too, which knows what a restarted worker restored and what it
@@ -3730,6 +3777,10 @@ fn launch_streamed_work(
     launcher: &Arc<WorkerDaemonService>,
     applied: crate::worker::work_stream::Applied,
 ) {
+    // A pushed set of runtime disables: held now, not at the next beat.
+    if let Some(states) = applied.runtime_states.as_ref() {
+        apply_runtime_states(&launcher.task_manager, states);
+    }
     if applied.reconcile {
         HEARTBEAT_WAKE.notify_one();
     }

@@ -48,6 +48,9 @@ pub trait ClaimRatifier: Send + Sync {
 fn admission_status(err: &anyhow::Error) -> Status {
     use crate::worker::task_manager::session_sleep::SessionSleepError;
     use crate::worker::task_manager::SessionRefusal;
+    if let Some(status) = runtime_disabled_status(err) {
+        return status;
+    }
     if let Some(sleep) = err.downcast_ref::<SessionSleepError>() {
         if let Some(status) = store_status(sleep) {
             return status;
@@ -57,6 +60,15 @@ fn admission_status(err: &anyhow::Error) -> Status {
         Some(SessionRefusal::EnvelopeFull { .. }) => Status::resource_exhausted(format!("{err:#}")),
         _ => Status::failed_precondition(format!("{err:#}")),
     }
+}
+
+/// The status a start refused because its runtime is disabled answers with
+/// (docs/runtime-disable.md): `UNAVAILABLE`, retryable, tagged
+/// `runtime_disabled`, with the disable's own sentence. `None` for any other
+/// error.
+pub(crate) fn runtime_disabled_status(err: &anyhow::Error) -> Option<Status> {
+    crate::structs::runtime_state::RuntimeDisabledRefusal::in_chain(err)
+        .map(|refusal| refusal.to_status())
 }
 
 /// The status an edge start refused by the claim window answers with:
@@ -523,6 +535,20 @@ impl Worker for WorkerDaemonService {
             .map_err(|_| Status::internal("Task manager lock poisoned"))?
             .claim_window();
 
+        // A disabled runtime starts nothing (docs/runtime-disable.md):
+        // refused before the claim takes window room or a launch slot, with
+        // the ticket unspent. A dry run gets the same answer a start would.
+        let refused = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .runtime_gate()
+            .check(&task.runtime, &claims.job);
+        if let Err(refusal) = refused {
+            edge_boot.verifier.unspend(&claims.jti);
+            return Err(refusal.to_status());
+        }
+
         if req.dry_run {
             // Verify and report, hold nothing, boot nothing. The self-correct
             // path an agent or a router wants before it mutates a cluster.
@@ -630,7 +656,10 @@ impl Worker for WorkerDaemonService {
             // The start never happened, so the ticket was not really
             // redeemed; let an operator's retry work.
             edge_boot.verifier.unspend(&claims.jti);
-            Status::resource_exhausted(format!("{err:#}"))
+            // A disabled runtime is UNAVAILABLE, with the disable's reason
+            // (docs/runtime-disable.md); anything else is room.
+            runtime_disabled_status(&err)
+                .unwrap_or_else(|| Status::resource_exhausted(format!("{err:#}")))
         })?;
         edge_boot.verifier.spend(&claims, now_unix);
 
@@ -1112,6 +1141,9 @@ impl WorkerDaemonService {
     pub(crate) fn session_sleep_status(&self, session_id: &str, err: &anyhow::Error) -> Status {
         use crate::worker::task_manager::session_sleep::SessionSleepError;
         use crate::worker::task_manager::SessionRefusal;
+        if let Some(status) = runtime_disabled_status(err) {
+            return status;
+        }
         if let Some(sleep) = err.downcast_ref::<SessionSleepError>() {
             return match sleep {
                 SessionSleepError::NotHere | SessionSleepError::Evicted(_) => {

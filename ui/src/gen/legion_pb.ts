@@ -18172,6 +18172,19 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   endpointFeed?: EndpointFeedState;
 
+  /**
+   * Starts this node refused since its last acknowledged heartbeat because
+   * their runtime is disabled (docs/runtime-disable.md): session starts,
+   * claims, restarts, and placements that raced the disable. One entry per
+   * runtime with a non-zero count. The manager adds them to the count
+   * `ListRuntimeStates` reports as `edge_refusals`.
+   *
+   * Default: empty.
+   *
+   * @generated from field: repeated legion.RuntimeRefusals runtime_refusals = 23;
+   */
+  runtimeRefusals: RuntimeRefusals[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -18202,6 +18215,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 20, name: "envelope_resizes", kind: "message", T: EnvelopeResize, repeated: true },
     { no: 21, name: "net_plugins", kind: "message", T: NetPluginNodeStatus, repeated: true },
     { no: 22, name: "endpoint_feed", kind: "message", T: EndpointFeedState },
+    { no: 23, name: "runtime_refusals", kind: "message", T: RuntimeRefusals, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -18218,6 +18232,56 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
 
   static equals(a: HeartbeatRequest | PlainMessage<HeartbeatRequest> | undefined, b: HeartbeatRequest | PlainMessage<HeartbeatRequest> | undefined): boolean {
     return proto3.util.equals(HeartbeatRequest, a, b);
+  }
+}
+
+/**
+ * Starts one node refused for one disabled runtime. See
+ * `HeartbeatRequest.runtime_refusals`.
+ *
+ * @generated from message legion.RuntimeRefusals
+ */
+export class RuntimeRefusals extends Message<RuntimeRefusals> {
+  /**
+   * The disabled runtime.
+   *
+   * @generated from field: string runtime = 1;
+   */
+  runtime = "";
+
+  /**
+   * How many starts were refused since the last acknowledged heartbeat.
+   *
+   * @generated from field: uint64 count = 2;
+   */
+  count = protoInt64.zero;
+
+  constructor(data?: PartialMessage<RuntimeRefusals>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RuntimeRefusals";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "runtime", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "count", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RuntimeRefusals {
+    return new RuntimeRefusals().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RuntimeRefusals {
+    return new RuntimeRefusals().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RuntimeRefusals {
+    return new RuntimeRefusals().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RuntimeRefusals | PlainMessage<RuntimeRefusals> | undefined, b: RuntimeRefusals | PlainMessage<RuntimeRefusals> | undefined): boolean {
+    return proto3.util.equals(RuntimeRefusals, a, b);
   }
 }
 
@@ -19021,6 +19085,19 @@ export class StreamWorkReply extends Message<StreamWorkReply> {
   pushOnly = false;
 
   /**
+   * Every runtime disable in force (docs/runtime-disable.md), pushed on a
+   * `push_only` message when the stream opens while any disable is in force
+   * (ahead of the replay), and the moment the set changes on this manager's
+   * replica. The worker replaces the set it holds.
+   * A hint, like `endpoint_feed`: never replayed and not counted in
+   * `digest`; the heartbeat reply carries the same set on every beat. Unset
+   * on every other message.
+   *
+   * @generated from field: legion.RuntimeStateSet runtime_states = 10;
+   */
+  runtimeStates?: RuntimeStateSet;
+
+  /**
    * The revision this message reflects: the node's desired set after
    * applying it includes every committed change up to this revision. A
    * worker keeps the revision of the last message it applied and sends it as
@@ -19061,6 +19138,7 @@ export class StreamWorkReply extends Message<StreamWorkReply> {
     { no: 7, name: "checkpoint_requests", kind: "message", T: CheckpointRequest, repeated: true },
     { no: 8, name: "endpoint_feed", kind: "message", T: EndpointFeed },
     { no: 9, name: "push_only", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 10, name: "runtime_states", kind: "message", T: RuntimeStateSet },
     { no: 20, name: "revision", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 21, name: "resumed_from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
@@ -20524,6 +20602,20 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   endpointFeed?: EndpointFeed;
 
+  /**
+   * Every runtime disable in force (docs/runtime-disable.md), as the
+   * answering manager's replica holds it. Sent on every beat, so a disable
+   * reaches every node within one heartbeat interval even when its
+   * `StreamWork` push was lost; the worker replaces the set it holds and
+   * refuses starts of a disabled runtime from then on.
+   *
+   * Unset by a manager that predates runtime disables; a worker then keeps
+   * the set it holds. Set with no `states` when nothing is disabled.
+   *
+   * @generated from field: legion.RuntimeStateSet runtime_states = 26;
+   */
+  runtimeStates?: RuntimeStateSet;
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -20555,6 +20647,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 22, name: "envelope_resizes", kind: "message", T: EnvelopeResizeResult, repeated: true },
     { no: 23, name: "cluster_ca_pins", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 25, name: "endpoint_feed", kind: "message", T: EndpointFeed },
+    { no: 26, name: "runtime_states", kind: "message", T: RuntimeStateSet },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -20609,6 +20702,9 @@ export class StopNotice extends Message<StopNotice> {
    *   this allocation was surplus.
    * - `restore` — the allocation's instance is being rolled back to a
    *   snapshot (RestoreInstance); a replacement restores from it.
+   * - `runtime_disabled` — the allocation's runtime was disabled with a
+   *   drain (docs/runtime-disable.md); nothing replaces it until the runtime
+   *   is enabled again.
    *
    * Workers treat an unrecognized value as `unknown` and stop the allocation
    * anyway, so the manager may add causes without a coordinated upgrade.
@@ -47657,6 +47753,578 @@ export class DeleteNamespacePolicyReply extends Message<DeleteNamespacePolicyRep
 
   static equals(a: DeleteNamespacePolicyReply | PlainMessage<DeleteNamespacePolicyReply> | undefined, b: DeleteNamespacePolicyReply | PlainMessage<DeleteNamespacePolicyReply> | undefined): boolean {
     return proto3.util.equals(DeleteNamespacePolicyReply, a, b);
+  }
+}
+
+/**
+ * One runtime disable: the replicated record `SetRuntimeEnabled` writes,
+ * and what managers send workers on every heartbeat reply and push on
+ * `StreamWork`.
+ *
+ * @generated from message legion.RuntimeState
+ */
+export class RuntimeState extends Message<RuntimeState> {
+  /**
+   * The task runtime that may not start: a task's `runtime` value (`exec`,
+   * `container`, `sandbox`, `noop`, or a runtime plugin's name).
+   *
+   * @generated from field: string runtime = 1;
+   */
+  runtime = "";
+
+  /**
+   * The namespace globs the disable covers (`tenants-*`; `*` stands for any
+   * run of characters). Empty means the whole cluster. As in namespace
+   * policies, a glob that does not itself start with `legion-` never covers
+   * a reserved `legion-` namespace; an empty list covers every namespace,
+   * reserved ones included.
+   *
+   * @generated from field: repeated string namespaces = 2;
+   */
+  namespaces: string[] = [];
+
+  /**
+   * Why, as the operator gave it (an advisory id, usually). Shown in every
+   * refusal. Empty when none was given.
+   *
+   * @generated from field: string reason = 3;
+   */
+  reason = "";
+
+  /**
+   * When the runtime was first disabled, RFC 3339 UTC. Widening the scope
+   * later does not move it.
+   *
+   * @generated from field: string since = 4;
+   */
+  since = "";
+
+  /**
+   * Who disabled it: `accessor:<token accessor id>`, or the caller's
+   * principal when it has no token accessor (`acl-disabled` on a cluster
+   * running with ACLs off). Never a token secret.
+   *
+   * @generated from field: string by = 5;
+   */
+  by = "";
+
+  /**
+   * True when the disable also drains: each node suspends the sessions of
+   * the runtime in scope that can be suspended and stops the rest, for as
+   * long as the record stands. The managers drain allocations when the
+   * disable is written.
+   *
+   * @generated from field: bool drain = 6;
+   */
+  drain = false;
+
+  constructor(data?: PartialMessage<RuntimeState>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RuntimeState";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "runtime", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "since", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "drain", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RuntimeState {
+    return new RuntimeState().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RuntimeState {
+    return new RuntimeState().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RuntimeState {
+    return new RuntimeState().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RuntimeState | PlainMessage<RuntimeState> | undefined, b: RuntimeState | PlainMessage<RuntimeState> | undefined): boolean {
+    return proto3.util.equals(RuntimeState, a, b);
+  }
+}
+
+/**
+ * The whole set of runtime disables in force, as one manager sees it. A
+ * snapshot, never a delta: a worker replaces the set it holds with this one.
+ * A worker that reaches no manager keeps the last set it was given, across
+ * its own restarts too.
+ *
+ * @generated from message legion.RuntimeStateSet
+ */
+export class RuntimeStateSet extends Message<RuntimeStateSet> {
+  /**
+   * Every disable in force, by runtime. Empty when nothing is disabled.
+   *
+   * @generated from field: repeated legion.RuntimeState states = 1;
+   */
+  states: RuntimeState[] = [];
+
+  constructor(data?: PartialMessage<RuntimeStateSet>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RuntimeStateSet";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "states", kind: "message", T: RuntimeState, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RuntimeStateSet {
+    return new RuntimeStateSet().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RuntimeStateSet {
+    return new RuntimeStateSet().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RuntimeStateSet {
+    return new RuntimeStateSet().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RuntimeStateSet | PlainMessage<RuntimeStateSet> | undefined, b: RuntimeStateSet | PlainMessage<RuntimeStateSet> | undefined): boolean {
+    return proto3.util.equals(RuntimeStateSet, a, b);
+  }
+}
+
+/**
+ * What a `--drain` did when the disable was written.
+ *
+ * @generated from message legion.RuntimeDrainSummary
+ */
+export class RuntimeDrainSummary extends Message<RuntimeDrainSummary> {
+  /**
+   * Keyed instances whose suspend was started (their task has a `suspend`
+   * block). Each finishes as any suspend does; `legion instance get` shows
+   * it.
+   *
+   * @generated from field: uint32 suspending = 1;
+   */
+  suspending = 0;
+
+  /**
+   * Allocations removed for a graceful stop (cause `runtime_disabled`).
+   *
+   * @generated from field: uint32 stopping = 2;
+   */
+  stopping = 0;
+
+  /**
+   * Allocations in scope that could be neither suspended nor stopped, each
+   * as `<allocation id>: <why>`. They keep running; run the disable again
+   * with `drain` to retry.
+   *
+   * @generated from field: repeated string failed = 3;
+   */
+  failed: string[] = [];
+
+  constructor(data?: PartialMessage<RuntimeDrainSummary>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RuntimeDrainSummary";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "suspending", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "stopping", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "failed", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RuntimeDrainSummary {
+    return new RuntimeDrainSummary().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RuntimeDrainSummary {
+    return new RuntimeDrainSummary().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RuntimeDrainSummary {
+    return new RuntimeDrainSummary().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RuntimeDrainSummary | PlainMessage<RuntimeDrainSummary> | undefined, b: RuntimeDrainSummary | PlainMessage<RuntimeDrainSummary> | undefined): boolean {
+    return proto3.util.equals(RuntimeDrainSummary, a, b);
+  }
+}
+
+/**
+ * Request payload for SetRuntimeEnabled.
+ *
+ * @generated from message legion.SetRuntimeEnabledRequest
+ */
+export class SetRuntimeEnabledRequest extends Message<SetRuntimeEnabledRequest> {
+  /**
+   * The task runtime to disable or enable.
+   *
+   * @generated from field: string runtime = 1;
+   */
+  runtime = "";
+
+  /**
+   * False disables the runtime; true enables it again.
+   *
+   * @generated from field: bool enabled = 2;
+   */
+  enabled = false;
+
+  /**
+   * Namespace globs to scope the call to. Empty means the whole cluster.
+   *
+   * @generated from field: repeated string namespaces = 3;
+   */
+  namespaces: string[] = [];
+
+  /**
+   * Why (disable only), at most 512 bytes. Shown in refusals, in
+   * `ListRuntimeStates`, and in the `runtime.disabled` event.
+   *
+   * @generated from field: string reason = 4;
+   */
+  reason = "";
+
+  /**
+   * Disable only: also take running work in scope off the runtime (see the
+   * RPC). Refused on an enable.
+   *
+   * @generated from field: bool drain = 5;
+   */
+  drain = false;
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 6;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<SetRuntimeEnabledRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SetRuntimeEnabledRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "runtime", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 4, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "drain", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetRuntimeEnabledRequest {
+    return new SetRuntimeEnabledRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SetRuntimeEnabledRequest {
+    return new SetRuntimeEnabledRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SetRuntimeEnabledRequest {
+    return new SetRuntimeEnabledRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SetRuntimeEnabledRequest | PlainMessage<SetRuntimeEnabledRequest> | undefined, b: SetRuntimeEnabledRequest | PlainMessage<SetRuntimeEnabledRequest> | undefined): boolean {
+    return proto3.util.equals(SetRuntimeEnabledRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for SetRuntimeEnabled.
+ *
+ * @generated from message legion.SetRuntimeEnabledReply
+ */
+export class SetRuntimeEnabledReply extends Message<SetRuntimeEnabledReply> {
+  /**
+   * The record after a disable, or after an enable that left some
+   * namespaces disabled. Unset when the runtime is now enabled everywhere.
+   *
+   * @generated from field: legion.RuntimeState state = 1;
+   */
+  state?: RuntimeState;
+
+  /**
+   * True when the call changed the record. False for a disable that
+   * repeated what was already in force and for an enable of a runtime that
+   * was not disabled.
+   *
+   * @generated from field: bool changed = 2;
+   */
+  changed = false;
+
+  /**
+   * What is running on the runtime in scope right now, as the managers see
+   * it: allocations in the store and sessions in the session index. A
+   * disable without `drain` leaves all of it running.
+   *
+   * @generated from field: legion.RuntimeRunning running = 3;
+   */
+  running?: RuntimeRunning;
+
+  /**
+   * What the drain started. Unset unless the request set `drain`.
+   *
+   * @generated from field: legion.RuntimeDrainSummary drained = 4;
+   */
+  drained?: RuntimeDrainSummary;
+
+  /**
+   * True when this reply was replayed from an earlier request with the same
+   * `idempotency_key`. A replay carries the record as it stands now and no
+   * `drained` summary: the drain ran once.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
+   * @generated from field: bool deduplicated = 5;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<SetRuntimeEnabledReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SetRuntimeEnabledReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "state", kind: "message", T: RuntimeState },
+    { no: 2, name: "changed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "running", kind: "message", T: RuntimeRunning },
+    { no: 4, name: "drained", kind: "message", T: RuntimeDrainSummary },
+    { no: 5, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetRuntimeEnabledReply {
+    return new SetRuntimeEnabledReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SetRuntimeEnabledReply {
+    return new SetRuntimeEnabledReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SetRuntimeEnabledReply {
+    return new SetRuntimeEnabledReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SetRuntimeEnabledReply | PlainMessage<SetRuntimeEnabledReply> | undefined, b: SetRuntimeEnabledReply | PlainMessage<SetRuntimeEnabledReply> | undefined): boolean {
+    return proto3.util.equals(SetRuntimeEnabledReply, a, b);
+  }
+}
+
+/**
+ * Work running on a runtime in a disable's scope.
+ *
+ * @generated from message legion.RuntimeRunning
+ */
+export class RuntimeRunning extends Message<RuntimeRunning> {
+  /**
+   * Live allocations (not `complete` or `failed`) whose task uses the
+   * runtime, in scope.
+   *
+   * @generated from field: uint32 allocations = 1;
+   */
+  allocations = 0;
+
+  /**
+   * Sessions of the runtime in scope that nodes report (sandbox sessions;
+   * sessions of other runtimes are not reported to managers and are not
+   * counted).
+   *
+   * @generated from field: uint32 sessions = 2;
+   */
+  sessions = 0;
+
+  constructor(data?: PartialMessage<RuntimeRunning>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RuntimeRunning";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocations", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "sessions", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RuntimeRunning {
+    return new RuntimeRunning().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RuntimeRunning {
+    return new RuntimeRunning().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RuntimeRunning {
+    return new RuntimeRunning().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RuntimeRunning | PlainMessage<RuntimeRunning> | undefined, b: RuntimeRunning | PlainMessage<RuntimeRunning> | undefined): boolean {
+    return proto3.util.equals(RuntimeRunning, a, b);
+  }
+}
+
+/**
+ * Request payload for ListRuntimeStates.
+ *
+ * @generated from message legion.ListRuntimeStatesRequest
+ */
+export class ListRuntimeStatesRequest extends Message<ListRuntimeStatesRequest> {
+  constructor(data?: PartialMessage<ListRuntimeStatesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListRuntimeStatesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRuntimeStatesRequest {
+    return new ListRuntimeStatesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListRuntimeStatesRequest {
+    return new ListRuntimeStatesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListRuntimeStatesRequest {
+    return new ListRuntimeStatesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListRuntimeStatesRequest | PlainMessage<ListRuntimeStatesRequest> | undefined, b: ListRuntimeStatesRequest | PlainMessage<ListRuntimeStatesRequest> | undefined): boolean {
+    return proto3.util.equals(ListRuntimeStatesRequest, a, b);
+  }
+}
+
+/**
+ * One disable with what waits on it.
+ *
+ * @generated from message legion.RuntimeStateStatus
+ */
+export class RuntimeStateStatus extends Message<RuntimeStateStatus> {
+  /**
+   * The disable.
+   *
+   * @generated from field: legion.RuntimeState state = 1;
+   */
+  state?: RuntimeState;
+
+  /**
+   * Evals blocked under `runtime_disabled:<runtime>` right now. Each is a
+   * job that places on its own when the runtime is enabled.
+   *
+   * @generated from field: uint32 blocked_evals = 2;
+   */
+  blockedEvals = 0;
+
+  /**
+   * Starts nodes have refused because of this disable since it was written
+   * (session starts, claims, restarts, and placements that raced it), summed
+   * from heartbeats as the answering manager received them. A count, not a
+   * record: it restarts from zero when that manager restarts.
+   *
+   * @generated from field: uint64 edge_refusals = 3;
+   */
+  edgeRefusals = protoInt64.zero;
+
+  /**
+   * What is running on the runtime in scope right now.
+   *
+   * @generated from field: legion.RuntimeRunning running = 4;
+   */
+  running?: RuntimeRunning;
+
+  /**
+   * Ready nodes whose worker predates runtime disables and so ignores them:
+   * placement still refuses work for them, but a session ticket presented to
+   * one of them starts. Upgrade them, or drain them for the incident.
+   *
+   * @generated from field: repeated string unaware_nodes = 5;
+   */
+  unawareNodes: string[] = [];
+
+  constructor(data?: PartialMessage<RuntimeStateStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RuntimeStateStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "state", kind: "message", T: RuntimeState },
+    { no: 2, name: "blocked_evals", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "edge_refusals", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "running", kind: "message", T: RuntimeRunning },
+    { no: 5, name: "unaware_nodes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RuntimeStateStatus {
+    return new RuntimeStateStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RuntimeStateStatus {
+    return new RuntimeStateStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RuntimeStateStatus {
+    return new RuntimeStateStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RuntimeStateStatus | PlainMessage<RuntimeStateStatus> | undefined, b: RuntimeStateStatus | PlainMessage<RuntimeStateStatus> | undefined): boolean {
+    return proto3.util.equals(RuntimeStateStatus, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListRuntimeStates.
+ *
+ * @generated from message legion.ListRuntimeStatesReply
+ */
+export class ListRuntimeStatesReply extends Message<ListRuntimeStatesReply> {
+  /**
+   * Every disable in force, by runtime. Empty when nothing is disabled.
+   *
+   * @generated from field: repeated legion.RuntimeStateStatus disabled = 1;
+   */
+  disabled: RuntimeStateStatus[] = [];
+
+  constructor(data?: PartialMessage<ListRuntimeStatesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListRuntimeStatesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "disabled", kind: "message", T: RuntimeStateStatus, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRuntimeStatesReply {
+    return new ListRuntimeStatesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListRuntimeStatesReply {
+    return new ListRuntimeStatesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListRuntimeStatesReply {
+    return new ListRuntimeStatesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListRuntimeStatesReply | PlainMessage<ListRuntimeStatesReply> | undefined, b: ListRuntimeStatesReply | PlainMessage<ListRuntimeStatesReply> | undefined): boolean {
+    return proto3.util.equals(ListRuntimeStatesReply, a, b);
   }
 }
 

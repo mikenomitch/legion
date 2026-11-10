@@ -153,6 +153,33 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Runtime disable (docs/runtime-disable.md) ---
+        // Deliberately not MCP tools: a cluster-wide stop of a runtime is an
+        // incident action for a human holding an `operator` token.
+        Capability {
+            name: "operator.runtime.disable",
+            cli: "legion operator runtime disable <RUNTIME> [--namespace <GLOB>]... [--reason <TEXT>] [--drain]",
+            grpc: Some("Manager/SetRuntimeEnabled"),
+            summary: "Refuse every new start of a task runtime (placements, session starts, edge claims, restarts), cluster-wide or for namespaces matching the globs: the switch for a runtime with a published escape. Running work is untouched unless --drain, which suspends what has a `suspend` block and gracefully stops the rest. Needs operator:write. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "operator.runtime.enable",
+            cli: "legion operator runtime enable <RUNTIME> [--namespace <GLOB>]...",
+            grpc: Some("Manager/SetRuntimeEnabled"),
+            summary: "Enable a disabled runtime again, everywhere or for the named globs of a scoped disable; blocked evals place on their own and refused callers succeed on retry. Needs operator:write. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "operator.runtime.status",
+            cli: "legion operator runtime status",
+            grpc: Some("Manager/ListRuntimeStates"),
+            summary: "List disabled runtimes with scope, reason, who and since, what is still running on each, the evals blocked on it, and the starts nodes refused. Needs operator:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- App objects (docs/app-objects.md) ---
         Capability {
             name: "object.kinds",

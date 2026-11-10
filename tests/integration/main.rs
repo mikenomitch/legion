@@ -103,6 +103,7 @@ mod resource_scoring;
 mod restore_placement_indexed;
 mod revisions_watch;
 mod rollout_integration;
+mod runtime_disable;
 mod sandbox_bridge_placement;
 mod scaling_inputs;
 mod scaling_plugins;

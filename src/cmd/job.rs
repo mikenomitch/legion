@@ -3197,6 +3197,16 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
                         );
                     }
                 }
+                // Not short of room: the task's runtime is disabled
+                // (docs/runtime-disable.md), and only the enable helps.
+                None if crate::structs::runtime_state::blocked_key_runtime(&blocked.key)
+                    .is_some() =>
+                {
+                    println!(
+                        "Blocked on {} since {}: task {} waits for its runtime to be enabled",
+                        blocked.key, since, blocked.task
+                    )
+                }
                 None => println!(
                     "Blocked on {} since {}: task {} needs {} per placement",
                     blocked.key, since, blocked.task, per_placement

@@ -972,6 +972,9 @@ pub struct WorkerTaskManager {
     /// The launch payload of each running session, by session id, so a
     /// suspend records what its resume relaunches.
     session_payloads: HashMap<String, TaskAllocation>,
+    /// The runtime disables this worker holds (docs/runtime-disable.md):
+    /// every start path asks it first.
+    runtime_gate: Arc<crate::worker::runtime_state::RuntimeGate>,
     /// Each running session's pid and when that process started, by session
     /// id, read off the lock as its launch finished (see
     /// [`UnlockedLaunch::run`]), for its row in the session log.
@@ -1051,6 +1054,9 @@ impl WorkerTaskManager {
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| alloc_root.clone());
+        let runtime_gate = Arc::new(crate::worker::runtime_state::RuntimeGate::beside(
+            state_store.path(),
+        ));
         Self {
             devices: Arc::new(crate::devices::plugin::DeviceManager::default()),
             registry: TaskPluginRegistry::new(),
@@ -1119,6 +1125,7 @@ impl WorkerTaskManager {
             idle_sessions: HashMap::new(),
             session_specs: HashMap::new(),
             session_payloads: HashMap::new(),
+            runtime_gate,
             session_pid_starts: HashMap::new(),
             session_checkpoints: HashMap::new(),
             session_captures: Default::default(),
@@ -3863,6 +3870,9 @@ impl WorkerTaskManager {
         task: &TaskConfig,
         gate: Gate,
     ) -> R<()> {
+        // The last look before anything runs (docs/runtime-disable.md): a
+        // start staged before its runtime was disabled does not run after.
+        self.runtime_gate.check(&task.runtime, &allocation.job_id)?;
         let plugin = self
             .registry
             .plugin(&task.runtime)
@@ -4686,6 +4696,52 @@ impl WorkerTaskManager {
         }
     }
 
+    /// The runtime disables this worker holds.
+    pub fn runtime_gate(&self) -> Arc<crate::worker::runtime_state::RuntimeGate> {
+        Arc::clone(&self.runtime_gate)
+    }
+
+    /// The refusal a start of `payload` would get right now, counted, when
+    /// its runtime is disabled for its job.
+    pub fn runtime_refusal(
+        &self,
+        payload: &TaskAllocation,
+    ) -> Result<(), crate::structs::runtime_state::RuntimeDisabledRefusal> {
+        self.runtime_gate
+            .check(&payload.task_runtime, &payload.job_id)
+    }
+
+    /// Running sessions whose runtime a disable drains, by id.
+    pub fn running_sessions_to_drain(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .claims_snapshot()
+            .into_iter()
+            .filter(|claim| claim.is_session() && !claim.is_ratified())
+            .filter(|claim| {
+                self.session_payloads
+                    .get(&claim.instance_id)
+                    .is_some_and(|payload| {
+                        self.runtime_gate
+                            .drains(&payload.task_runtime, &payload.job_id)
+                    })
+            })
+            .map(|claim| claim.instance_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// End one running session. Unlike [`Self::stop_sessions`], a suspended
+    /// session is left alone: its checkpoint is what a drain is keeping.
+    pub fn stop_running_session(&mut self, session_id: &str, reason: &str) -> bool {
+        let claim_id = crate::structs::session::session_claim_id(session_id);
+        let running = self
+            .claims
+            .get(&claim_id)
+            .is_some_and(|claim| claim.is_session() && !claim.is_ratified());
+        running && self.kill_claim(&claim_id, reason).is_some()
+    }
+
     /// End sessions by id. Ids this node does not run as sessions (or that
     /// were promoted, and are allocations now) are ignored. Returns the ids
     /// it ended.
@@ -4763,6 +4819,10 @@ impl WorkerTaskManager {
                 return Ok(BeginOutcome::Adopted);
             }
         }
+        // A disabled runtime starts nothing (docs/runtime-disable.md):
+        // refused before anything is fetched, prepared, or held.
+        self.runtime_gate
+            .check(&allocation.task_runtime, &allocation.job_id)?;
         let (alloc, task) = task_from_allocation(allocation)?;
         // A session keeps the payload it launched from, so a suspend can
         // record what its resume relaunches (docs/session-mode.md, "Idle
@@ -5471,6 +5531,8 @@ impl WorkerTaskManager {
             .task_configs
             .get(&allocation_id)
             .context("Task config missing for restart")?;
+        // A restart is a start (docs/runtime-disable.md).
+        self.runtime_gate.check(&task.runtime, &allocation.job_id)?;
         let instance = self
             .instances
             .get_mut(&allocation_id)
@@ -9559,6 +9621,146 @@ mod tests {
             guard.session_status("workspace-b").expect("listed").state,
             "running"
         );
+        Ok(())
+    }
+
+    fn exec_disable(drain: bool) -> crate::structs::runtime_state::RuntimeDisableSet {
+        crate::structs::runtime_state::RuntimeDisableSet::new(vec![
+            crate::structs::runtime_state::RuntimeDisable {
+                runtime: "exec".into(),
+                namespaces: Vec::new(),
+                reason: "GHSA-test".into(),
+                since: "2026-11-07T18:04:11Z".into(),
+                by: "anonymous".into(),
+                drain,
+            },
+        ])
+    }
+
+    fn is_runtime_refusal(err: &anyhow::Error) -> bool {
+        crate::structs::runtime_state::RuntimeDisabledRefusal::in_chain(err).is_some()
+    }
+
+    /// docs/runtime-disable.md: once the worker holds a disable, every start
+    /// path refuses (a placement, a session start, a restart, a resume),
+    /// running work is untouched, and each works again after the enable.
+    #[test]
+    fn a_disabled_runtime_refuses_every_start_path_test() -> R<()> {
+        use crate::worker::task_manager::session_sleep::{
+            resume_session, suspend_session, ResumeOutcome,
+        };
+        let temp_dir = TempDir::new()?;
+        let manager = worker_with_store(&temp_dir, None)?;
+        manager
+            .lock()
+            .expect("task manager")
+            .begin_task_allocation(&envelope_payload(100))?;
+        let a = start_sleepy_session(&manager, "workspace-a")?;
+        let gate = manager.lock().expect("task manager").runtime_gate();
+        gate.replace(exec_disable(false));
+
+        // A placement the manager sent in a race with the disable.
+        let err = launch_task_allocation(&manager, &provisional_payload(77)).unwrap_err();
+        assert!(is_runtime_refusal(&err), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("runtime \"exec\" is disabled in namespace default"),
+            "{err:#}"
+        );
+        // A session start: refused, and its claim holds nothing afterwards.
+        let err = start_sleepy_session(&manager, "workspace-c").unwrap_err();
+        assert!(is_runtime_refusal(&err), "{err:#}");
+        {
+            let mut guard = manager.lock().expect("task manager");
+            assert!(guard.session_status("workspace-c").is_none());
+            // Running work is untouched, but a restart is a start.
+            assert_eq!(
+                guard.session_status("workspace-a").expect("listed").state,
+                "running"
+            );
+            let err = guard.restart_allocation(a.local_key).unwrap_err();
+            assert!(is_runtime_refusal(&err), "{err:#}");
+            assert_eq!(
+                guard.session_status("workspace-a").expect("listed").state,
+                "running"
+            );
+        }
+        // A resume is a start too, and the session keeps its checkpoint.
+        suspend_session(&manager, "workspace-a", "manual")?;
+        let err = resume_session(&manager, "workspace-a", false).unwrap_err();
+        assert!(is_runtime_refusal(&err), "{err:#}");
+        assert_eq!(
+            manager
+                .lock()
+                .expect("task manager")
+                .session_status("workspace-a")
+                .expect("listed")
+                .state,
+            "suspended"
+        );
+        assert_eq!(
+            gate.take_refusals()
+                .iter()
+                .map(|entry| entry.count)
+                .sum::<u64>(),
+            4,
+            "the placement, the session start, the restart, and the resume"
+        );
+
+        // Enabled: the refused resume and the refused start both succeed.
+        gate.replace(Default::default());
+        assert!(matches!(
+            resume_session(&manager, "workspace-a", false)?,
+            ResumeOutcome::Resumed { .. }
+        ));
+        start_sleepy_session(&manager, "workspace-c")?;
+        stop_and_reap(&manager);
+        Ok(())
+    }
+
+    /// Phase 2 of the runtime-disable plan: a disable with `drain` suspends
+    /// the node's sessions that can be suspended (their checkpoints kept)
+    /// and stops the rest, and a later pass leaves the suspended ones be.
+    #[test]
+    fn a_drain_suspends_sessions_that_can_and_stops_the_rest_test() -> R<()> {
+        use crate::worker::runtime_state::drain_sessions;
+        let temp_dir = TempDir::new()?;
+        let manager = worker_with_store(&temp_dir, None)?;
+        manager
+            .lock()
+            .expect("task manager")
+            .begin_task_allocation(&envelope_payload(100))?;
+        start_sleepy_session(&manager, "workspace-a")?;
+        start_session(&mut manager.lock().expect("task manager"), "workspace-b")?;
+        // Without a drain nothing running is touched.
+        let gate = manager.lock().expect("task manager").runtime_gate();
+        gate.replace(exec_disable(false));
+        assert_eq!(drain_sessions(&manager), Default::default());
+
+        gate.replace(exec_disable(true));
+        let drained = drain_sessions(&manager);
+        assert_eq!(drained.suspended, ["workspace-a"]);
+        assert_eq!(drained.stopped, ["workspace-b"]);
+        {
+            let guard = manager.lock().expect("task manager");
+            assert_eq!(
+                guard.session_status("workspace-a").expect("listed").state,
+                "suspended"
+            );
+            assert!(guard.session_status("workspace-b").is_none());
+        }
+        // The record stands, so passes keep running; the suspended session
+        // and its checkpoint are not theirs to end.
+        assert_eq!(drain_sessions(&manager), Default::default());
+        assert_eq!(
+            manager
+                .lock()
+                .expect("task manager")
+                .session_status("workspace-a")
+                .expect("listed")
+                .state,
+            "suspended"
+        );
+        stop_and_reap(&manager);
         Ok(())
     }
 

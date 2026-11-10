@@ -223,6 +223,8 @@ impl Store {
             Some(seq) => seq - 1,
             None => log.last_seq,
         };
+        drop(log);
+        self.request_runtime_wake();
     }
 
     /// Every blocked eval, oldest first.
@@ -293,6 +295,29 @@ impl Store {
         blocked: &PlacementBlocked,
         event: EventDraft,
     ) -> EvalCompletion {
+        if let Some(runtime) = crate::structs::runtime_state::blocked_key_runtime(&blocked.key) {
+            // Enabled while the eval ran: straight back to the queue.
+            if self
+                .runtime_disables()
+                .refusing(runtime, &eval.job_id)
+                .is_none()
+            {
+                crate::telemetry::metrics()
+                    .evals_unblocked_total
+                    .inc(&["missed"]);
+                return EvalCompletion::Released {
+                    delay: Duration::ZERO,
+                    event: Some(crate::storage::events::drafts::eval_unblocked(
+                        &eval.id,
+                        &eval.job_id,
+                        &blocked.key,
+                        "missed",
+                        "",
+                    )),
+                };
+            }
+            self.note_runtime_blocked();
+        }
         let since = self.claim_capacity_seq(&eval.id);
         if let Some((node_id, cause)) = self.first_helpful_node(
             &blocked.key,
@@ -455,12 +480,13 @@ impl Store {
     /// help to `pending` in one scheduler-lane entry. Returns how many woke.
     #[instrument(err, skip_all)]
     pub fn wake_blocked_evals(&self) -> R<usize> {
+        let runtime_woken = self.wake_runtime_blocked_evals()?;
         let (processed, upto) = {
             let log = self.lock_capacity_events();
             (log.processed, log.last_seq)
         };
         if upto == processed {
-            return Ok(0);
+            return Ok(runtime_woken);
         }
         let nodes = self.capacity_nodes_after(processed);
         let blocked = self.blocked_evals()?;
@@ -514,7 +540,78 @@ impl Store {
         self.lock_capacity_events().processed = upto;
         let woken_ids: HashSet<&str> = woken.iter().map(|(eval, _, _)| eval.id.as_str()).collect();
         self.publish_blocked_gauge(&blocked, &woken_ids);
-        Ok(woken.len())
+        Ok(woken.len() + runtime_woken)
+    }
+
+    /// The runtime half of the wake pass (docs/runtime-disable.md): after a
+    /// runtime disable was lifted or narrowed, return to `pending` every
+    /// eval blocked under `runtime_disabled:<runtime>` that the current set
+    /// no longer refuses, and every eval blocked for another reason whose
+    /// job also has a task of a lifted runtime (its plan listed that task
+    /// after the one it blocked on). Jobs that placed part of their work
+    /// and left a disabled task unplaced are not blocked evals: a capacity
+    /// pass re-plans them. Does nothing unless a disable changed.
+    fn wake_runtime_blocked_evals(&self) -> R<usize> {
+        let Some(lifted) = self.take_runtime_wake() else {
+            return Ok(0);
+        };
+        let woken = self.wake_runtime_blocked_evals_for(&lifted);
+        if woken.is_err() {
+            self.restore_runtime_wake(lifted);
+        }
+        woken
+    }
+
+    fn wake_runtime_blocked_evals_for(&self, lifted: &HashSet<String>) -> R<usize> {
+        let set = self.runtime_disables();
+        let blocked = self.blocked_evals()?;
+        let mut wakes: Vec<(String, String, String, &'static str, String)> = Vec::new();
+        for eval in &blocked {
+            let wake = match crate::structs::runtime_state::blocked_key_runtime(&eval.key) {
+                Some(runtime) => set.refusing(runtime, &eval.job_id).is_none(),
+                None => {
+                    !lifted.is_empty()
+                        && self
+                            .cached_task_configs_for_job_config(&eval.job_config_id)
+                            .map(|tasks| {
+                                tasks.iter().any(|(_, task)| {
+                                    lifted.contains(&task.runtime)
+                                        && set.refusing(&task.runtime, &eval.job_id).is_none()
+                                })
+                            })
+                            .unwrap_or(false)
+                }
+            };
+            if wake {
+                wakes.push((
+                    eval.id.clone(),
+                    eval.job_id.clone(),
+                    eval.key.clone(),
+                    "runtime_enabled",
+                    String::new(),
+                ));
+            }
+        }
+        let woken = wakes.len();
+        if woken > 0 {
+            self.replicated(Lane::Scheduler, "unblock_evals", move |s| {
+                s.unblock_evals_apply(wakes)
+            })?;
+            crate::telemetry::metrics()
+                .evals_unblocked_total
+                .inc_by(&["runtime_enabled"], woken as u64);
+            info!(woken, "Unblocked evals after a runtime was enabled");
+        }
+        if !lifted.is_empty() {
+            self.note_capacity_waiters();
+            if let Err(error) = self.request_capacity_reconcile() {
+                debug!(
+                    error = %format!("{error:#}"),
+                    "Could not queue a capacity pass after a runtime was enabled"
+                );
+            }
+        }
+        Ok(woken)
     }
 
     /// Return every blocked eval to `pending` (cause `startup`): run once

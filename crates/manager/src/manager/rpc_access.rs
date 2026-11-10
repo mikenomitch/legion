@@ -88,6 +88,8 @@ pub const RPC_ACCESS: &[(&str, Access)] = &[
     ("GetNamespacePolicy", Access::Protected("acl", "read")),
     ("ApplyNamespacePolicy", Access::Protected("acl", "write")),
     ("DeleteNamespacePolicy", Access::Protected("acl", "write")),
+    ("SetRuntimeEnabled", Access::Protected("operator", "write")),
+    ("ListRuntimeStates", Access::Protected("operator", "read")),
     ("UpsertJobTemplate", Access::Protected("template", "write")),
     ("ListJobTemplates", Access::Protected("template", "read")),
     ("GetJobTemplate", Access::Protected("template", "read")),

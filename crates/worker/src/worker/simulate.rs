@@ -1390,11 +1390,15 @@ async fn register_sim_node_inner(
         build_id: String::new(),
         protocol_version: PROTOCOL_VERSION,
         // A simulated node runs nothing it could checkpoint, unless it was
-        // asked to fake the checkpoint channel.
-        capabilities: if fleet.checkpoints {
-            vec![crate::structs::snapshot::CHECKPOINT_CAPABILITY.to_string()]
-        } else {
-            Vec::new()
+        // asked to fake the checkpoint channel. It starts nothing either, so
+        // it honors every runtime disable by construction.
+        capabilities: {
+            let mut capabilities =
+                vec![crate::structs::runtime_state::RUNTIME_DISABLE_CAPABILITY.to_string()];
+            if fleet.checkpoints {
+                capabilities.push(crate::structs::snapshot::CHECKPOINT_CAPABILITY.to_string());
+            }
+            capabilities
         },
         join_attributes: Default::default(),
     });
@@ -1465,6 +1469,8 @@ async fn heartbeat_sim_node(
         exec_audit: Vec::new(),
         exec_sessions: Vec::new(),
         exec_keys_version: String::new(),
+        // Simulated nodes start nothing, so they refuse nothing.
+        runtime_refusals: Vec::new(),
         pressure_actions: Vec::new(),
         net_denials: Vec::new(),
         net_status: Vec::new(),

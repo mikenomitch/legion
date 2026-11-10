@@ -81,6 +81,10 @@ pub struct Applied {
     /// Endpoint sets a push-only message carried (mesh-control-path plan
     /// §6.1), for the datapath to apply now. Not part of the mirror.
     pub endpoint_feed: Option<crate::structs::EndpointFeed>,
+    /// The runtime disables a push-only message carried
+    /// (docs/runtime-disable.md): the whole set, replacing what the worker
+    /// holds. Not part of the mirror.
+    pub runtime_states: Option<crate::structs::RuntimeStateSet>,
     /// The message was a resume that does not continue from this mirror's
     /// revision: the stream must be reopened with no position.
     pub resume_refused: bool,
@@ -281,6 +285,7 @@ where
         if message.push_only {
             on_applied(Applied {
                 endpoint_feed: message.endpoint_feed,
+                runtime_states: message.runtime_states,
                 ..Default::default()
             });
             continue;

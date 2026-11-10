@@ -293,6 +293,7 @@ starts an unnamed session. The reply carries `mode = "session"`,
 | `FAILED_PRECONDITION` "no node runs an envelope" | The envelopes have not been placed yet. Check `legion job status <JOB>`: are there eligible workers with the `sessions` capability? |
 | `RESOURCE_EXHAUSTED` "every envelope ... is full" | No envelope has room. Retryable once sessions end; raise `envelope.resources` or add nodes. When the envelopes are [elastic](#elastic-envelopes), the message says so: they grow within a heartbeat, so retry in a few seconds |
 | `RESOURCE_EXHAUSTED` "no node accepted the session" | The three nodes tried all refused, with each node's reason |
+| `UNAVAILABLE` "runtime ... is disabled" (code `RUNTIME_DISABLED`) | An operator [disabled the task's runtime](runtime-disable.md) for the job's namespace. Retryable once it is enabled. The same refusal answers an edge start and a resume of a suspended session, which stays suspended |
 
 A create that finds no room is refused rather than queued, so size
 envelopes for the peak you want to absorb, or make them

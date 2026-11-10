@@ -2,7 +2,36 @@
 
 > **Judgement calls:** [runtime-disable-plan_calls.md](../calls/runtime-disable-plan_calls.md)
 
-**Status: PLANNED** (written 2026-11-07). Nothing here is built.
+**Status: SHIPPED** (written 2026-11-07; Phases 1 and 2 built 2026-11-10).
+Public doc: [docs/runtime-disable.md](../../docs/runtime-disable.md).
+
+What was built, and where it differs from the text below:
+
+- **Phase 1 and Phase 2 (`--drain`) are built**: the record, both RPCs, the
+  CLI and catalog entries, refusal on every start path on managers and
+  workers, blocked evals that wake on enable, the submit warning, events,
+  and the drain.
+- **One record per runtime**, not one row per disable (§7); how scopes
+  combine is calls entry 2.
+- **A job's other groups still place** while one task's runtime is
+  disabled; the eval blocks on the runtime only when nothing placed, and a
+  rollout or restart of such a job waits whole, so running work is never
+  replaced by work that cannot start (calls entry 6).
+- **Workers persist the set** across their own restarts (calls entry 8).
+- **`--drain` is split**: managers drain allocations when the disable is
+  written, nodes drain their sessions from the record (calls entry 4).
+- **§6.5 (a runtime reacting to its own disable) is not built**: it is the
+  isolate runtime's behavior, and that runtime does not exist. The state it
+  needs is delivered: a worker's `RuntimeGate` holds the set.
+- **§10's version-skew report is built** as `unawareNodes` in `status`.
+- **The public doc is its own page**, `docs/runtime-disable.md`, not a
+  section of `docs/task-supervision.md`.
+- The drain's suspend path for sandbox VMs is exercised here only through
+  the manager's capture request and the worker's session suspend on `exec`;
+  it reuses the suspend machinery whose KVM runs are tracked under Verify in
+  `TODO.md`.
+- Still deferred, as §4 names: per-node or per-pool disables, automatic
+  disables, and disabling for untrusted workloads only.
 
 When a sandbox boundary has a published escape (a runc CVE, a VMM CVE, a
 wasmtime advisory), an operator needs to stop new work from starting on

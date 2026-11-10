@@ -272,9 +272,29 @@ impl ManagerDaemonService {
         );
 
         let endpoint_wake = store.endpoint_index().node_wake(&node_id);
+        // The runtime disables (docs/runtime-disable.md): pushed when the
+        // stream opens while any is in force, and again whenever this
+        // replica's set changes. A stream that opens with nothing disabled
+        // gets no push; the heartbeat reply carries the (empty) set.
+        let mut runtime_states = store.runtime_state_watch();
         tokio::spawn(async move {
             let log = attached.log;
             let session = attached.session;
+            // Ahead of the replay: the node must hold a disable before it
+            // is handed work it could start.
+            let disables = store.runtime_disables();
+            if !disables.is_empty() {
+                let push = StreamWorkReply {
+                    epoch: store.work_log().epoch(),
+                    push_only: true,
+                    runtime_states: Some(disables.to_proto()),
+                    ..Default::default()
+                };
+                if tx.send(Ok(push)).await.is_err() {
+                    work_log.detach(&node_id, session);
+                    return;
+                }
+            }
             for message in attached.replay {
                 if tx.send(Ok(message)).await.is_err() {
                     work_log.detach(&node_id, session);
@@ -284,10 +304,30 @@ impl ManagerDaemonService {
             let mut reauth = tokio::time::interval(credential.interval);
             reauth.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             reauth.tick().await; // the first tick fires immediately
+                                 // Set when the wait below saw the set of runtime disables
+                                 // change (awaiting the change marks it seen).
+            let mut runtime_states_changed = false;
             loop {
                 if !WorkLog::is_current(&log, session) {
                     // A newer stream for the node took over.
                     break;
+                }
+                // A changed set of runtime disables, ahead of any work the
+                // node could start: push-only, outside the sequence, never
+                // replayed.
+                if std::mem::take(&mut runtime_states_changed)
+                    || runtime_states.has_changed().unwrap_or(false)
+                {
+                    runtime_states.borrow_and_update();
+                    let push = StreamWorkReply {
+                        epoch: store.work_log().epoch(),
+                        push_only: true,
+                        runtime_states: Some(store.runtime_disables().to_proto()),
+                        ..Default::default()
+                    };
+                    if tx.send(Ok(push)).await.is_err() {
+                        break;
+                    }
                 }
                 // Changed endpoint sets first (mesh-control-path plan §6.1):
                 // a backend that went away should leave the node's lists
@@ -346,6 +386,11 @@ impl ManagerDaemonService {
                 tokio::select! {
                     _ = log.wake.notified() => {}
                     _ = endpoint_wake.notified() => {}
+                    // A closed channel means the store is going away.
+                    changed = runtime_states.changed() => match changed {
+                        Ok(()) => runtime_states_changed = true,
+                        Err(_) => break,
+                    },
                     frame = inbound.message() => match frame {
                         Ok(Some(StreamWorkRequest {
                             frame: Some(stream_work_request::Frame::Ack(ack)),

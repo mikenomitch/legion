@@ -256,6 +256,11 @@ impl InstanceLastStop {
                     .to_string()
             }
             StopCause::Failed => format!("Failed on node {node_id}."),
+            StopCause::RuntimeDisabled => {
+                "Stopped because its runtime was disabled with a drain; it places again \
+                 when the runtime is enabled."
+                    .to_string()
+            }
             StopCause::Unknown => "Stopped.".to_string(),
         };
         Self {

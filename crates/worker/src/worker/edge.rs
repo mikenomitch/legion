@@ -94,6 +94,13 @@ pub fn admit_and_launch(
     } else {
         serde_json::from_str(&payload.task_resources).unwrap_or_else(|_| serde_json::json!({}))
     };
+    // A disabled runtime admits nothing (docs/runtime-disable.md): refused
+    // here, before the claim holds any room, so the caller gets the refusal
+    // as its answer rather than a launch that fails behind it.
+    task_manager
+        .lock()
+        .expect("task manager")
+        .runtime_refusal(payload)?;
     let record = record_from_payload(payload, provisional, resources);
     let gate = record.gate;
     if gate == Gate::Off {

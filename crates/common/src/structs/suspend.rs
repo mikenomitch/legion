@@ -1189,6 +1189,10 @@ pub const SUSPEND_REASON_MAKE_ROOM: &str = "make_room";
 /// node suspended it at the park's deadline.
 pub const SUSPEND_REASON_PARK: &str = "park";
 
+/// A drain of the instance's runtime suspended it (`legion operator runtime
+/// disable --drain`, docs/runtime-disable.md).
+pub const SUSPEND_REASON_RUNTIME_DISABLED: &str = "runtime_disabled";
+
 /// `instance.pending_op` while a suspend capture is outstanding.
 pub const PENDING_SUSPEND: &str = "suspend";
 /// `instance.pending_op` while a resume waits for its restore to report.

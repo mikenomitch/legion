@@ -605,6 +605,10 @@ purpose:
 For `pools.allowed`, `runtimes` and `hostVolumes`, **unset allows
 everything and an empty list allows nothing.**
 
+`runtimes` is a standing rule checked when a job is submitted. To stop a
+runtime from starting anything during an incident, for jobs already
+admitted too, use [`legion operator runtime disable`](runtime-disable.md).
+
 **Several policies may match one namespace, and all of them apply.** Each
 quota and count is checked independently against its own aggregate;
 allowlists intersect, so a second policy can only narrow. There is no

@@ -128,6 +128,8 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetNamespacePolicy", Plane::Protected("acl:read")),
         ("ApplyNamespacePolicy", Plane::Protected("acl:write")),
         ("DeleteNamespacePolicy", Plane::Protected("acl:write")),
+        ("SetRuntimeEnabled", Plane::Protected("operator:write")),
+        ("ListRuntimeStates", Plane::Protected("operator:read")),
         ("UpsertJobTemplate", Plane::Protected("template:write")),
         ("ListJobTemplates", Plane::Protected("template:read")),
         ("GetJobTemplate", Plane::Protected("template:read")),
@@ -905,6 +907,21 @@ async fn call_endpoint(
                 },
                 token,
             ))
+            .await
+            .map(|_| ()),
+        "SetRuntimeEnabled" => svc
+            .set_runtime_enabled(req(
+                SetRuntimeEnabledRequest {
+                    runtime: "acl-probe-runtime".into(),
+                    enabled: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListRuntimeStates" => svc
+            .list_runtime_states(req(ListRuntimeStatesRequest::default(), token))
             .await
             .map(|_| ()),
         "UpsertNetPolicy" => svc

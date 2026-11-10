@@ -381,6 +381,65 @@ pub mod drafts {
         .meta(json!({ "key": key, "cause": cause }))
     }
 
+    /// `runtime.disabled` — an operator disabled a task runtime, or widened
+    /// a disable (docs/runtime-disable.md). Warn: new work of the runtime
+    /// stops starting in scope.
+    pub fn runtime_disabled(state: &crate::structs::runtime_state::RuntimeDisable) -> EventDraft {
+        let reason = if state.reason.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", state.reason)
+        };
+        EventDraft::warn(
+            "runtime.disabled",
+            format!(
+                "Runtime {} disabled for {} by {}{}{reason}",
+                state.runtime,
+                state.scope(),
+                state.by,
+                if state.drain { " (draining)" } else { "" },
+            ),
+        )
+        .meta(json!({
+            "runtime": state.runtime,
+            "namespaces": state.namespaces,
+            "scope": state.scope(),
+            "reason": state.reason,
+            "since": state.since,
+            "by": state.by,
+            "drain": state.drain,
+        }))
+    }
+
+    /// `runtime.enabled` — an operator enabled a runtime again, everywhere
+    /// (`namespaces` empty) or for the named globs of a scoped disable.
+    /// `held` is the disable as it stood before.
+    pub fn runtime_enabled(
+        held: &crate::structs::runtime_state::RuntimeDisable,
+        namespaces: &[String],
+        by: &str,
+    ) -> EventDraft {
+        let scope = if namespaces.is_empty() {
+            held.scope()
+        } else {
+            namespaces.join(", ")
+        };
+        EventDraft::info(
+            "runtime.enabled",
+            format!(
+                "Runtime {} enabled for {scope} by {by} (disabled since {})",
+                held.runtime, held.since
+            ),
+        )
+        .meta(json!({
+            "runtime": held.runtime,
+            "namespaces": namespaces,
+            "scope": scope,
+            "disabledSince": held.since,
+            "by": by,
+        }))
+    }
+
     /// `allocation.placed` — a plan was applied. One event per apply with up
     /// to 20 placements detailed in metadata. `None` when nothing was placed.
     ///
@@ -2269,6 +2328,9 @@ pub mod drafts {
             crate::structs::suspend::SUSPEND_REASON_IDLE => " (idle)",
             crate::structs::suspend::SUSPEND_REASON_PRESSURE => " (node memory pressure)",
             crate::structs::suspend::SUSPEND_REASON_MAKE_ROOM => " (making room for a resume)",
+            crate::structs::suspend::SUSPEND_REASON_RUNTIME_DISABLED => {
+                " (its runtime was disabled with a drain)"
+            }
             _ => "",
         };
         let mut draft = snapshot_draft(

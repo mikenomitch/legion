@@ -645,6 +645,14 @@ pub async fn resume_store_session(
     force_move: bool,
     skip: Option<&str>,
 ) -> Result<StoreResume, Status> {
+    // A disabled runtime starts no session (docs/runtime-disable.md). The
+    // nodes would refuse it too; refusing here names the reason once
+    // instead of once per node tried.
+    if let Some(disable) = store.runtime_disables().refusing(&task.runtime, job_id) {
+        return Err(
+            crate::structs::runtime_state::RuntimeDisabledRefusal::new(disable, job_id).to_status(),
+        );
+    }
     refresh_room(store, job_id, &task.name).await?;
     let needs = resource_amounts(&task.resources);
     let placement = crate::structs::session::placement(task);
@@ -1454,6 +1462,15 @@ pub async fn start(
                 deduplicated: true,
             });
         }
+    }
+    // A disabled runtime starts no session (docs/runtime-disable.md). The
+    // nodes would refuse it too; refusing here names the reason once
+    // instead of once per node tried.
+    if let Some(disable) = store.runtime_disables().refusing(&task.runtime, job_id) {
+        metrics.session_starts_total.inc(&["runtime_disabled"]);
+        return Err(
+            crate::structs::runtime_state::RuntimeDisabledRefusal::new(disable, job_id).to_status(),
+        );
     }
     refresh_room(store, job_id, &task.name).await?;
     let needs = resource_amounts(&task.resources);

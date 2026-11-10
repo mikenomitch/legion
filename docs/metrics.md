@@ -151,8 +151,9 @@ neighbor rules a cause in or out, and which knob to turn), see
   to the pending queue after exhausting their plan-conflict retry budget,
   instead of failing terminally (the requeue backstop).
 - **`legion_evals_blocked{key_kind}`** (gauge): evals waiting blocked on
-  capacity, by the kind of key they wait under: `class`, `node`, or
-  `escaped` (see
+  capacity, by the kind of key they wait under: `class`, `node`,
+  `escaped`, or `runtime` (the task's runtime is
+  [disabled](runtime-disable.md)) (see
   [Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). Set by the
   scheduler-lane leader's wake pass, so it reads 0 on other managers and is
   refreshed when a capacity event arrives. A rising `class` count is a
@@ -175,7 +176,8 @@ neighbor rules a cause in or out, and which knob to turn), see
   availability, or attributes changed), `ready`, `freed` (allocations left a
   node), `recovered` (a changeset projection failed, so every available node
   counted as changed), `missed` (capacity appeared while the eval ran, so it
-  never blocked), `startup`, or `timeout` (a gang past its `placementTimeout`,
+  never blocked), `startup`, `runtime_enabled` (the disabled runtime the eval
+  waited on was enabled), or `timeout` (a gang past its `placementTimeout`,
   woken for its last attempt).
 - **`legion_blocked_wait_seconds`** (histogram): how long a blocked eval
   waited, from the entry that blocked it to the one that woke it. Buckets run
@@ -512,7 +514,9 @@ across them. See [session-mode.md](session-mode.md).
   session router answered, by `outcome`: `started`, `deduplicated` (an
   idempotent retry found the session running), `no_envelope` (no node holds
   an envelope for the task yet), `no_room` (every envelope was full by the
-  router's view), or `refused` (the nodes tried all refused). None of them
+  router's view), `refused` (the nodes tried all refused), or
+  `runtime_disabled` (the task's runtime is
+  [disabled](runtime-disable.md)). None of them
   writes the replicated store. A rising `no_room` or `refused` rate means
   the envelopes are too small for the arrival rate.
 - **`legion_session_stops_total{reason}`** (counter): sessions this manager
@@ -988,6 +992,10 @@ that has never taken a provisional start.
 
 - **`legion_provisional_starts_total{origin,gate}`** (counter): provisional
   allocations admitted, by `origin` (`manager` | `edge`) and gate.
+- **`legion_runtime_disabled_refusals_total{runtime}`** (counter): starts
+  this worker refused because their runtime is
+  [disabled](runtime-disable.md): placements, session starts, claims,
+  resumes, and restarts. Zero on a node that never held a disable.
 - **`legion_provisional_refused_total{reason}`** (counter): ratifications
   refused. A rising `instance_claimed` rate points to a routing problem (two
   edges racing for one sandbox) rather than a cluster problem. `no_capacity`

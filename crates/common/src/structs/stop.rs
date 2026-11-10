@@ -75,6 +75,11 @@ pub enum StopCause {
     /// reschedule (or, with the move budget spent, to fail the job). The
     /// instance's `last_stop` carries the worker's failure reason.
     Failed,
+    /// The allocation's runtime was disabled with a drain
+    /// (`legion operator runtime disable --drain`, docs/runtime-disable.md):
+    /// the managers removed it, and nothing replaces it until the runtime is
+    /// enabled again.
+    RuntimeDisabled,
     /// No cause was recorded for this stop.
     ///
     /// This is a legitimate steady-state value, not only a bug: stop causes
@@ -103,6 +108,7 @@ impl StopCause {
             StopCause::Suspended => "suspended",
             StopCause::Gang => "gang",
             StopCause::Failed => "failed",
+            StopCause::RuntimeDisabled => "runtime_disabled",
             StopCause::Unknown => "unknown",
         }
     }
@@ -126,6 +132,7 @@ impl StopCause {
             "suspended" => StopCause::Suspended,
             "gang" => StopCause::Gang,
             "failed" => StopCause::Failed,
+            "runtime_disabled" => StopCause::RuntimeDisabled,
             _ => StopCause::Unknown,
         }
     }
@@ -247,6 +254,7 @@ mod stop_cause_test {
             StopCause::ScaleIn,
             StopCause::Preempted,
             StopCause::NodePressure,
+            StopCause::RuntimeDisabled,
             StopCause::Unknown,
         ] {
             assert_eq!(StopCause::from_wire(cause.as_str()), cause);

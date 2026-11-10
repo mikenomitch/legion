@@ -169,6 +169,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   isolation boundary), qualified ids, `-n`/`LEGION_NAMESPACE`, delegated
   creation, crossing namespaces in the mesh, and namespace policies (aggregate
   quota per band, counts, allowed pools, runtimes and host volumes).
+- [Runtime Disable](runtime-disable.md): `legion operator runtime disable`,
+  the cluster-wide switch for a task runtime with a published escape: no new
+  placement, session start, edge claim, resume, or restart in scope, an
+  optional drain, and blocked work that places again on `enable`.
 - [The Cluster CA](cluster-ca.md): the CA behind the worker plane, manager
   certificates, join tokens, and the mesh. Built in by default; or an
   intermediate from your own PKI (`file`) or an external signer such as

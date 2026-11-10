@@ -202,6 +202,9 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // Namespace policies: cluster governance objects, read by admission
     // inside the control-lane submit and namespace-create entries.
     ("namespace_policy", Owner::Lane(Lane::Control)),
+    // Runtime disables (docs/runtime-disable.md): the operator's incident
+    // switch, written by SetRuntimeEnabled.
+    ("runtime_state", Owner::Lane(Lane::Control)),
     ("net_mesh_ca", Owner::Lane(Lane::Control)),
     // The leader's view of the cluster CA (docs/cluster-ca.md): written
     // when the control-lane leader's provider reports a new CA.
