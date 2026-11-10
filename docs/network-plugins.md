@@ -238,7 +238,7 @@ and gives its `config`.
 | `limits.memory` | `16Mi` | the most linear memory an instance may grow to (64 KiB to 256 MiB) |
 | `limits.deadline` | `10ms` | how long one callback may run (at most `1s`) |
 | `limits.maxBodyBytes` | `1Mi` | the most of a body the plugin buffers (at most 64 MiB) |
-| `configSchema` | any config | a JSON Schema every reference's `config` is checked against at submit |
+| `configSchema` | any config | a JSON Schema every reference's `config` is checked against at submit. Only local `$ref`s (`"#/…"`) resolve: a ref to a URL or a file is never fetched, and a config checked against it is refused |
 | `targets` | none | `dispatch_http_call` targets by name, each `http(s)://host[:port]`. At most 16 |
 | `credentials` | none | `legion_sign` keys by name, each `{ kv = "<path>" }`. At most 16 |
 
@@ -580,6 +580,8 @@ may be referenced.
   `file://`.** `oci://` modules (a WASM module published as an OCI artifact)
   are not supported yet, because the node content store caches single files
   only.
+- **Modules are binary WebAssembly.** The text format (`.wat`) is not loaded;
+  compile it to `.wasm` first (`wat2wasm`, `wasm-tools parse`).
 - **Request bodies are buffered, not streamed, when a `body` stage runs.**
   The `body` stage sees the whole body (up to `maxBodyBytes`) in one
   callback, with `end_of_stream = true`; a larger body is refused unread

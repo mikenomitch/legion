@@ -65,6 +65,11 @@ webpki-roots.workspace = true
 x509-parser.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+# Tests write their guest modules as WebAssembly text; the shipping binary
+# only loads binary modules.
+wasmi = { workspace = true, features = ["wat"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 aya.workspace = true
 landlock.workspace = true

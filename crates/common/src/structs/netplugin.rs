@@ -555,6 +555,33 @@ mod netplugin_test {
         })
     }
 
+    /// A `configSchema` with a remote `$ref` must never make Legion open a
+    /// connection: jsonschema is built without its HTTP resolver, so the ref
+    /// fails the check instead. The listener stands in for the remote host
+    /// and must see nobody connect.
+    #[test]
+    fn a_remote_ref_in_a_config_schema_is_never_fetched_test() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/schema.json", listener.local_addr().unwrap());
+
+        let mut value = sample();
+        value["configSchema"] = json!({ "$ref": url });
+        let checked = serde_json::from_value::<NetPluginObject>(value)
+            .map_err(anyhow::Error::from)
+            .and_then(|mut plugin| {
+                plugin.normalize_and_validate()?;
+                plugin.check_config("policy", Some(&json!({ "budget": 1 })))
+            });
+
+        assert!(checked.is_err(), "a remote $ref was accepted");
+        let attempt = listener.accept();
+        assert!(
+            matches!(&attempt, Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+            "validating the schema connected to the remote host: {attempt:?}"
+        );
+    }
+
     #[test]
     fn a_plugin_normalizes_its_defaults_and_stage_order_test() {
         let plugin = object(sample()).unwrap();
