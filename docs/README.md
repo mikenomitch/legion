@@ -75,6 +75,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   start and stop with no raft write inside per-node envelopes, the session
   index and its `complete` flag, duplicates, and promotion to a keyed
   instance in place.
+- [Session Runs](session-runs.md): `legion session run`, one call that runs
+  code once in a fresh, single-use session of a task with a `run` block and
+  returns stdout, stderr, the exit status, a JSON result, and named files;
+  stopped runs as data, per-node idempotency, and who may run what.
 - [Volumes](volumes.md): persistent storage for stateful tasks. Covers plugins,
   the driver contract, node pinning, and reclaim.
 - [Suspend and Resume](suspend-and-resume.md): suspending a keyed instance to

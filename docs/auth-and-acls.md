@@ -108,7 +108,7 @@ reports `aclEnabled: false`.
 
 | Resource | Covers | `read` | `write` |
 | --- | --- | --- | --- |
-| `job` | jobs, specs, plans, rollouts | list/inspect/plan | submit/stop/destroy/advance |
+| `job` | jobs, specs, plans, rollouts | list/inspect/plan | submit/stop/destroy/advance, and [session runs](session-runs.md#who-may-run-what) of a task's own `run.command` (a run that replaces the command also needs `exec:write`) |
 | `node` | worker nodes, pools, ledger, join tokens | list/inspect, list join tokens, capacity demand (`GetCapacityDemand`, scoped by each template's pool; it names only jobs you can `job:read`) | restart, drain/attrs, forget (`ForgetNode`), create and revoke join tokens |
 | `kv` | KV entries and locks | get/list | put/patch/delete/locks |
 | `state` | raw state store, saved queries | SQL reads, schema | SQL writes, saved queries |

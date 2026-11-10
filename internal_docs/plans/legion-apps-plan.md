@@ -958,6 +958,13 @@ other plans use it rather than adding their own:
   impersonate tenants of its own cordon, which already share its process,
   and nothing beyond it.
 
+*Built 2026-11-10:* the worker serves a `Workload` gRPC service on the
+socket beside the proxied `Manager` service
+(`crates/worker/src/worker/api_socket.rs`), with `RunSession` as its first
+call ([session-runs calls entry 14](../calls/session-runs-plan_calls.md)).
+The per-call workload name for a multiplexing host is not built; it waits
+for the isolate runtime's host.
+
 ### 6.5 UI extensions
 
 **Tier 1: declarative views** (calls entry 8). An app declares **slots** in

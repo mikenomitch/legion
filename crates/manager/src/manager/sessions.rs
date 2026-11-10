@@ -1697,7 +1697,9 @@ pub async fn run(
     let pinned = if !request.node_id.trim().is_empty() {
         Some(request.node_id.trim().to_string())
     } else if !key.is_empty() {
-        remembered_run_node(&key)
+        // A node that has left the cluster holds no reply to find: route
+        // the retry afresh rather than fail it for the rest of the window.
+        remembered_run_node(&key).filter(|node_id| store.get_node(node_id).is_ok())
     } else {
         None
     };

@@ -510,6 +510,11 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
 Counted on the manager that served the request, so with several managers sum
 across them. See [session-mode.md](session-mode.md).
 
+- **`legion_session_runs_total{outcome}`** (counter):
+  [session runs](session-runs.md) this manager routed, by `outcome`: `ran`,
+  `deduplicated` (a node answered from a kept reply), `refused` (no node
+  took it: no envelope, or every one full), `failed` (the node it ran on
+  answered an error), and `runtime_disabled`.
 - **`legion_session_starts_total{outcome}`** (counter): session creates the
   session router answered, by `outcome`: `started`, `deduplicated` (an
   idempotent retry found the session running), `no_envelope` (no node holds
@@ -1047,6 +1052,11 @@ Session starts on the node ([session-mode.md](session-mode.md)) add two:
 - **`legion_worker_edge_session_starts_total`** (counter): sessions this
   node started from a session ticket (`Worker.StartSession`), not counting
   deduplicated retries.
+- **`legion_worker_session_runs_total{outcome}`** (counter):
+  [session runs](session-runs.md) this node drove, by `outcome`: `ran` (the
+  command exited, with any status), `stopped` (`run.wall`, memory, or the
+  session ending stopped it), `failed` (the run could not start or finish).
+  A retry answered from a kept reply is not counted.
 
 Every task start on the node adds one histogram:
 

@@ -969,6 +969,7 @@ fetch at all, until asked, when the job's envelopes could hold more than
 Sessions use the same surfaces as keyed instances: `legion_instance_create`
 (omit `instance_id`), `legion_instance_list`, `legion_instance_get`,
 `legion_instance_stop`, and `legion_instance_promote` over MCP, plus
+`legion_session_run` for [one-shot runs](session-runs.md),
 `legion_session_nodes` for the edge node list and
 `legion_boot_ticket_create` with `scope = "session"`, and the
 `--json` envelope on the CLI. An agent should always pass an idempotency
@@ -976,6 +977,13 @@ key on create, read `durable` before relying on a unit surviving a node,
 and treat `complete = false` on a listing as "some sessions may be
 missing", not as "these are all of them". See
 [agent readiness](agent-readiness.md).
+
+## Running code once
+
+A session task that declares a `run` block also takes **runs**: `legion
+session run` starts a fresh session, stages the caller's files, executes the
+task's command once, returns its output, and ends the session, in one call
+and with no raft write. See [Session Runs](session-runs.md).
 
 ## Upgrades
 

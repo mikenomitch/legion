@@ -30984,6 +30984,576 @@ export class StartSessionReply extends Message<StartSessionReply> {
 }
 
 /**
+ * Request payload for Manager.RunSession and Worker.RunSession: one run in
+ * a fresh, single-use session (docs/session-runs.md).
+ *
+ * @generated from message legion.RunSessionRequest
+ */
+export class RunSessionRequest extends Message<RunSessionRequest> {
+  /**
+   * The job. Required for `Manager.RunSession`; for `Worker.RunSession`
+   * with a ticket it defaults to the ticket's job and must match it when
+   * set.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * The session task to run in. May be empty when the job has exactly one
+   * session task with a `run` block (a ticket's task, for the ticket
+   * class).
+   *
+   * @generated from field: string task_name = 2;
+   */
+  taskName = "";
+
+  /**
+   * Files staged in the run directory before the command runs. Together
+   * with `input`, at most 3 MiB.
+   *
+   * @generated from field: repeated legion.RunFile files = 3;
+   */
+  files: RunFile[] = [];
+
+  /**
+   * A JSON document staged as `input.json` in the run directory; its path
+   * is in the command's `LEGION_RUN_INPUT`. Must parse as JSON.
+   *
+   * @generated from field: optional string input = 4;
+   */
+  input?: string;
+
+  /**
+   * Files to return after the command exits, named relative to the run
+   * directory (or absolute under `/legion/run/`). A file the command did
+   * not write is answered with `missing = true`. Together they return at
+   * most `run.output` bytes; a file that does not fit is `truncated`.
+   *
+   * @generated from field: repeated string get = 5;
+   */
+  get: string[] = [];
+
+  /**
+   * Replaces the task's `run.command` for this run. Needs
+   * `run.allowCommand = true` on the task and `exec:write` on the job;
+   * refused for the ticket class.
+   *
+   * @generated from field: repeated string command = 6;
+   */
+  command: string[] = [];
+
+  /**
+   * Optional idempotency key, per node (see `Manager.RunSession`). The
+   * reply is kept for 10 minutes.
+   *
+   * @generated from field: optional string idempotency_key = 7;
+   */
+  idempotencyKey?: string;
+
+  /**
+   * How long to wait for the session to reach `running` before giving up
+   * (default 60, at most 600). The command's own deadline is `run.wall`.
+   *
+   * @generated from field: optional uint32 wait_timeout_seconds = 8;
+   */
+  waitTimeoutSeconds?: number;
+
+  /**
+   * Answer which node would take the run and whether its envelope has
+   * room, without starting anything (`RunSessionResponse.dry_run`).
+   *
+   * @generated from field: bool dry_run = 9;
+   */
+  dryRun = false;
+
+  /**
+   * `Worker.RunSession`, ticket class: the session ticket.
+   *
+   * @generated from field: string ticket = 10;
+   */
+  ticket = "";
+
+  /**
+   * `Manager.RunSession` only: run on this node rather than the one the
+   * router would pick. A retry of a call that named a node in its reply or
+   * error sets it, so an idempotency key finds the first attempt.
+   *
+   * @generated from field: string node_id = 11;
+   */
+  nodeId = "";
+
+  constructor(data?: PartialMessage<RunSessionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RunSessionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "files", kind: "message", T: RunFile, repeated: true },
+    { no: 4, name: "input", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "get", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 6, name: "command", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 8, name: "wait_timeout_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 9, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 10, name: "ticket", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunSessionRequest {
+    return new RunSessionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RunSessionRequest {
+    return new RunSessionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RunSessionRequest {
+    return new RunSessionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RunSessionRequest | PlainMessage<RunSessionRequest> | undefined, b: RunSessionRequest | PlainMessage<RunSessionRequest> | undefined): boolean {
+    return proto3.util.equals(RunSessionRequest, a, b);
+  }
+}
+
+/**
+ * One file staged for a run.
+ *
+ * @generated from message legion.RunFile
+ */
+export class RunFile extends Message<RunFile> {
+  /**
+   * Where it goes, relative to the run directory (`main.py`,
+   * `data/in.csv`) or absolute under `/legion/run/`. No `..`.
+   *
+   * @generated from field: string path = 1;
+   */
+  path = "";
+
+  /**
+   * Its bytes.
+   *
+   * @generated from field: bytes content = 2;
+   */
+  content = new Uint8Array(0);
+
+  /**
+   * Make it executable (mode 0755 rather than 0644).
+   *
+   * @generated from field: bool executable = 3;
+   */
+  executable = false;
+
+  constructor(data?: PartialMessage<RunFile>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RunFile";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "content", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+    { no: 3, name: "executable", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunFile {
+    return new RunFile().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RunFile {
+    return new RunFile().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RunFile {
+    return new RunFile().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RunFile | PlainMessage<RunFile> | undefined, b: RunFile | PlainMessage<RunFile> | undefined): boolean {
+    return proto3.util.equals(RunFile, a, b);
+  }
+}
+
+/**
+ * One file returned from a run (`RunSessionRequest.get`).
+ *
+ * @generated from message legion.RunOutputFile
+ */
+export class RunOutputFile extends Message<RunOutputFile> {
+  /**
+   * The path as the request named it.
+   *
+   * @generated from field: string path = 1;
+   */
+  path = "";
+
+  /**
+   * Its bytes, cut at the remaining `run.output` budget.
+   *
+   * @generated from field: bytes content = 2;
+   */
+  content = new Uint8Array(0);
+
+  /**
+   * True when the file was larger than the budget left.
+   *
+   * @generated from field: bool truncated = 3;
+   */
+  truncated = false;
+
+  /**
+   * True when the command left no readable file at the path.
+   *
+   * @generated from field: bool missing = 4;
+   */
+  missing = false;
+
+  constructor(data?: PartialMessage<RunOutputFile>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RunOutputFile";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "content", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+    { no: 3, name: "truncated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "missing", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunOutputFile {
+    return new RunOutputFile().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RunOutputFile {
+    return new RunOutputFile().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RunOutputFile {
+    return new RunOutputFile().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RunOutputFile | PlainMessage<RunOutputFile> | undefined, b: RunOutputFile | PlainMessage<RunOutputFile> | undefined): boolean {
+    return proto3.util.equals(RunOutputFile, a, b);
+  }
+}
+
+/**
+ * Why a run was stopped before its command exited by itself. A stopped run
+ * is a successful call: the caller's code hit a limit, Legion did not fail.
+ *
+ * @generated from message legion.RunStop
+ */
+export class RunStop extends Message<RunStop> {
+  /**
+   * `wall` (the command outlived `run.wall`) or `session_ended` (the
+   * session was ended under the run: stopped by an operator, killed for
+   * memory, or its runtime exited).
+   *
+   * @generated from field: string reason = 1;
+   */
+  reason = "";
+
+  /**
+   * The limit that stopped it, as the jobspec wrote it (`"30s"`). Empty
+   * for `session_ended`.
+   *
+   * @generated from field: string limit = 2;
+   */
+  limit = "";
+
+  /**
+   * What happened, in a sentence.
+   *
+   * @generated from field: string detail = 3;
+   */
+  detail = "";
+
+  /**
+   * What to change.
+   *
+   * @generated from field: string hint = 4;
+   */
+  hint = "";
+
+  constructor(data?: PartialMessage<RunStop>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RunStop";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "limit", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunStop {
+    return new RunStop().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RunStop {
+    return new RunStop().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RunStop {
+    return new RunStop().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RunStop | PlainMessage<RunStop> | undefined, b: RunStop | PlainMessage<RunStop> | undefined): boolean {
+    return proto3.util.equals(RunStop, a, b);
+  }
+}
+
+/**
+ * What a dry run answers (`RunSessionRequest.dry_run`).
+ *
+ * @generated from message legion.RunDryRun
+ */
+export class RunDryRun extends Message<RunDryRun> {
+  /**
+   * The node that would take the run.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Whether that node's envelope has room for one more session of the
+   * task right now.
+   *
+   * @generated from field: bool has_room = 2;
+   */
+  hasRoom = false;
+
+  /**
+   * Why not, when `has_room` is false.
+   *
+   * @generated from field: string reason = 3;
+   */
+  reason = "";
+
+  /**
+   * The command the run would execute.
+   *
+   * @generated from field: repeated string command = 4;
+   */
+  command: string[] = [];
+
+  /**
+   * `run.wall` and `run.output` as they would apply.
+   *
+   * @generated from field: string wall = 5;
+   */
+  wall = "";
+
+  /**
+   * @generated from field: uint64 output_bytes = 6;
+   */
+  outputBytes = protoInt64.zero;
+
+  constructor(data?: PartialMessage<RunDryRun>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RunDryRun";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "has_room", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "command", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "wall", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "output_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunDryRun {
+    return new RunDryRun().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RunDryRun {
+    return new RunDryRun().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RunDryRun {
+    return new RunDryRun().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RunDryRun | PlainMessage<RunDryRun> | undefined, b: RunDryRun | PlainMessage<RunDryRun> | undefined): boolean {
+    return proto3.util.equals(RunDryRun, a, b);
+  }
+}
+
+/**
+ * Reply payload for Manager.RunSession and Worker.RunSession.
+ *
+ * @generated from message legion.RunSessionResponse
+ */
+export class RunSessionResponse extends Message<RunSessionResponse> {
+  /**
+   * The node the run happened on. Keep retries there.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * The id of the run's session. It has ended by the time this arrives;
+   * the id is for correlating events and logs.
+   *
+   * @generated from field: string session_id = 2;
+   */
+  sessionId = "";
+
+  /**
+   * The task that ran.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * The command's exit status. Unset when the run was stopped.
+   *
+   * @generated from field: optional int32 exit = 4;
+   */
+  exit?: number;
+
+  /**
+   * The command's stdout and stderr, together at most `run.output` bytes.
+   *
+   * @generated from field: bytes stdout = 5;
+   */
+  stdout = new Uint8Array(0);
+
+  /**
+   * @generated from field: bytes stderr = 6;
+   */
+  stderr = new Uint8Array(0);
+
+  /**
+   * True when stdout or stderr was cut at `run.output`.
+   *
+   * @generated from field: bool truncated = 7;
+   */
+  truncated = false;
+
+  /**
+   * The contents of `result.json` in the run directory, when the command
+   * wrote one that parses as JSON and fits `run.output`. Empty otherwise.
+   *
+   * @generated from field: string result = 8;
+   */
+  result = "";
+
+  /**
+   * The files named in `get`, in request order.
+   *
+   * @generated from field: repeated legion.RunOutputFile files = 9;
+   */
+  files: RunOutputFile[] = [];
+
+  /**
+   * Wall-clock time the command ran, in milliseconds.
+   *
+   * @generated from field: uint64 wall_ms = 10;
+   */
+  wallMs = protoInt64.zero;
+
+  /**
+   * CPU time the run's session used, in milliseconds, where the node
+   * meters it (resource enforcement on); 0 otherwise.
+   *
+   * @generated from field: uint64 cpu_ms = 11;
+   */
+  cpuMs = protoInt64.zero;
+
+  /**
+   * Set when the run was stopped by a limit rather than exiting.
+   *
+   * @generated from field: legion.RunStop stopped = 12;
+   */
+  stopped?: RunStop;
+
+  /**
+   * True when this reply was kept from an earlier call with the same
+   * idempotency key and nothing ran now.
+   *
+   * Also true for the loser of two concurrent requests carrying the
+   * same key (see "Idempotency keys" in docs/agent-readiness.md for
+   * what each operation hands the loser).
+   *
+   * @generated from field: bool deduplicated = 13;
+   */
+  deduplicated = false;
+
+  /**
+   * Set for a dry run; every other field but `node_id` and `task_name` is
+   * then empty.
+   *
+   * @generated from field: legion.RunDryRun dry_run = 14;
+   */
+  dryRun?: RunDryRun;
+
+  /**
+   * The run's id: derived from the idempotency key, or minted.
+   *
+   * @generated from field: string run_id = 15;
+   */
+  runId = "";
+
+  constructor(data?: PartialMessage<RunSessionResponse>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RunSessionResponse";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "exit", kind: "scalar", T: 5 /* ScalarType.INT32 */, opt: true },
+    { no: 5, name: "stdout", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+    { no: 6, name: "stderr", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+    { no: 7, name: "truncated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "result", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "files", kind: "message", T: RunOutputFile, repeated: true },
+    { no: 10, name: "wall_ms", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 11, name: "cpu_ms", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 12, name: "stopped", kind: "message", T: RunStop },
+    { no: 13, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 14, name: "dry_run", kind: "message", T: RunDryRun },
+    { no: 15, name: "run_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunSessionResponse {
+    return new RunSessionResponse().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RunSessionResponse {
+    return new RunSessionResponse().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RunSessionResponse {
+    return new RunSessionResponse().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RunSessionResponse | PlainMessage<RunSessionResponse> | undefined, b: RunSessionResponse | PlainMessage<RunSessionResponse> | undefined): boolean {
+    return proto3.util.equals(RunSessionResponse, a, b);
+  }
+}
+
+/**
  * Request payload for Worker.StopSession.
  *
  * @generated from message legion.StopSessionRequest

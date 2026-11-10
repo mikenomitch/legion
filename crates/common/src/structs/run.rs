@@ -297,28 +297,45 @@ mod tests {
         assert!(empty.resolve().unwrap_err().contains("run.command"));
     }
 
+    /// The first task of a job parsed as a jobspec is, which is what turns
+    /// `stateful.mode = "session"` into the stored form validation sees.
+    fn parsed_task(task: serde_json::Value) -> crate::structs::TaskConfig {
+        let config: crate::structs::JobConfig =
+            serde_json::from_value(serde_json::json!({ "name": "code-runner", "task": task }))
+                .unwrap();
+        config.tasks[0].clone()
+    }
+
     #[test]
     fn run_needs_a_session_task_on_a_supported_runtime_test() {
-        let mut task: crate::structs::TaskConfig = serde_json::from_value(serde_json::json!({
+        let session = serde_json::json!({
+            "mode": "session",
+            "envelope": { "resources": { "cpu": 400, "memory": 256 } },
+        });
+        let run = serde_json::json!({ "command": ["true"], "wall": "5s" });
+        let plain = parsed_task(serde_json::json!({
             "name": "machine",
             "runtime": "exec",
-            "config": { "command": "sleep", "args": ["600"] },
-            "run": { "command": ["true"], "wall": "5s" },
-        }))
-        .unwrap();
-        assert!(validate_run(&task)
+            "config": { "command": ["sleep", "600"] },
+            "run": run,
+        }));
+        assert!(validate_run(&plain)
             .unwrap_err()
             .contains("needs a session task"));
-        task = serde_json::from_value(serde_json::json!({
+        let mut task = parsed_task(serde_json::json!({
             "name": "machine",
             "runtime": "noop",
-            "stateful": { "mode": "session", "envelope": { "resources": { "cpu": 100, "memory": 64 } } },
-            "run": { "command": ["true"], "wall": "5s" },
-        }))
-        .unwrap();
+            "resources": { "cpu": 100, "memory": 64 },
+            "stateful": session,
+            "run": run,
+        }));
         assert!(validate_run(&task).unwrap_err().contains("not \"noop\""));
         task.runtime = "exec".into();
         validate_run(&task).unwrap();
+        task.run.as_mut().unwrap().wall.clear();
+        assert!(validate_run(&task)
+            .unwrap_err()
+            .contains("task machine: run.wall"));
         task.run = None;
         validate_run(&task).unwrap();
     }

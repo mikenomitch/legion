@@ -155,6 +155,7 @@ $ legion operator runtime disable sandbox --namespace 'tenants-*' --reason "stil
 | Restarting such a job (`job run --force-reschedule`, a batch schedule's next run) | Waits whole, blocked under `runtime_disabled:<runtime>`: nothing is stopped, and the restart happens after the enable |
 | Session starts through a manager (`legion instance create` on a session task) | Refused by the manager, before any node is asked |
 | Session starts and claims at the edge (a ticket presented to a node) | Refused by the node. The ticket is not spent |
+| [Session runs](session-runs.md) (`legion session run`) | Refused like the session start a run begins with: by the manager when routed, by the node at the edge |
 | Resuming a suspended instance or session | Refused. It stays suspended with its checkpoint |
 | Restarts (the task's `restart` policy, health-check restarts) | Refused by the node. The allocation is reported failed, and nothing replaces it while the runtime is disabled |
 | Running work | Untouched, unless `--drain` |

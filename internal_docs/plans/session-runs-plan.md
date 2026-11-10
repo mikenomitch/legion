@@ -2,7 +2,35 @@
 
 > **Judgement calls:** [session-runs-plan_calls.md](../calls/session-runs-plan_calls.md)
 
-**Status: PLANNED** (written 2026-11-07). Nothing here is built.
+**Status: SHIPPED** (Phases 1 and 2, 2026-11-10; written 2026-11-07). Public
+page: [docs/session-runs.md](../../docs/session-runs.md).
+
+Built: the `run` block; `Manager.RunSession` and `Worker.RunSession` on
+`exec`, `container`, and `sandbox` session tasks; the five steps; the reply
+with stopped runs as data; per-node idempotency with the reply kept in
+`sessions.db`; `--dry-run`; `legion session run`; the MCP tool
+`legion_session_run`; and the `Workload` service on the per-allocation API
+socket (apps calls entry 130).
+
+Not built, and why:
+
+- **Phase 3 (prepared VMs).** It needs sandbox-scaling Phase 8, which is not
+  built. A sandbox run boots its VM.
+- **The isolate fields** (`--source`, `tier`, `tierReason`, `nextTier`, and
+  isolate tasks answering `RunSession` natively). They belong to the isolate
+  runtime, which does not exist; the proto has none of them.
+- **Sibling runs over the API socket.** The call is served, but only the
+  child-sessions plan's `children.tasks` can declare that one task may run
+  another (calls entry 14).
+
+Where the build differs from the text below: output beyond `run.output` is
+truncated rather than a stop (calls entry 10); files are staged and read
+through an exec in the session on every runtime (entry 6); on `exec` the run
+directory is `<task dir>/run` (entry 7); `--get` and `--file` stay inside
+the run directory (entry 8); `run.output` is at most 1 MiB (entry 9); the
+MCP tool is `legion_session_run`; and the sandbox path is covered by an
+`#[ignore]`d test, since CI has no KVM (the container path was run for real
+with runc).
 
 A **run** is one call that executes something in a fresh, single-use
 session and returns its outcome: start the session, put the caller's files

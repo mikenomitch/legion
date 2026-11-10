@@ -1013,6 +1013,23 @@ worker listens on it and proxies gRPC to the managers:
   out at all. The socket is the allocation's own resource, so neither
   applies.
 
+**Calls the worker answers itself.** The socket is the one way a workload
+reaches its node's worker, so the worker also serves a second gRPC service
+on it, `Workload`, beside the proxied `Manager` service. A `Workload` call
+never leaves the node and carries no token: the worker acts for the socket's
+allocation, whatever the request says, and the jobspec decides what that
+allocation's task may ask for.
+
+| Call | What it does | Allowed when |
+| --- | --- | --- |
+| `Workload.RunSession` (`legion session run --local`) | A [session run](session-runs.md) of a session task of the caller's own job, on the caller's node | the calling task is the task being run |
+
+A call for another job, or one that replaces the run's command, is refused
+with `PERMISSION_DENIED`. A session task cannot declare identities and so
+has no socket, which leaves no pair this rule admits: a workload that
+needs a run of a sibling task sends it through the `Manager` service on the
+same socket, where its `legion` identity needs `job:write`.
+
 **Who may connect.** Tasks can share a user, so the file's mode is not enough.
 Where every task is guaranteed a cgroup leaf (Linux with cgroup v2, and either
 resource enforcement or the kernel host guard on), the worker reads the
