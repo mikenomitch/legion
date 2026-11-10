@@ -1448,6 +1448,7 @@ impl WorkerTaskManager {
         content_store_target: Option<crate::content_publish::ContentStoreTarget>,
         egress: Option<Arc<crate::structs::host_guard::HostGuard>>,
     ) {
+        crate::task_plugins::set_pull_egress_guard(egress.clone());
         self.stager = Arc::new(
             ArtifactStager::new(config, credentials)
                 .with_content_store(self.content_store.clone())
@@ -5596,6 +5597,59 @@ impl WorkerTaskManager {
         self.terminal_outcomes.insert(allocation_id, outcome);
     }
 
+    /// The half of [`Self::restore_allocations`] for allocations whose task
+    /// is gone (fenced at boot, or died while no worker ran). A boot-fenced
+    /// one is reported failed with its fence reason, the way a runtime
+    /// self-fence is ([`Self::self_fence_expired_allocations`]); either way
+    /// its volumes are unmounted, except one a restored allocation still
+    /// uses (a shared, multi-reader volume). Called after the restore loop,
+    /// so `volume_specs` holds every surviving allocation's volumes.
+    fn release_died_allocations(
+        &mut self,
+        died: Vec<PersistedAllocation>,
+        boot_fenced: &std::collections::BTreeMap<i64, String>,
+    ) {
+        let in_use: std::collections::HashSet<String> = self
+            .volume_specs
+            .values()
+            .flatten()
+            .map(|mount| mount.volume_id.clone())
+            .collect();
+        for record in died {
+            if let Some(reason) = boot_fenced.get(&record.allocation.id) {
+                // A ratified provisional allocation is known to the manager
+                // by its external id; an unratified one is not known at all.
+                let reported = record.external_id.unwrap_or(record.allocation.id);
+                if reported > 0 {
+                    warn!(
+                        allocation_id = reported,
+                        task_name = %record.task.name,
+                        "Reporting an allocation the boot fence killed as self-fenced"
+                    );
+                    self.failed.push(FailedAllocationReport {
+                        allocation_id: reported,
+                        reason: reason.clone(),
+                        artifact_states: None,
+                    });
+                }
+            }
+            let mounts: Vec<VolumeMount> = record
+                .volumes
+                .iter()
+                .filter(|mount| !in_use.contains(&mount.volume_id))
+                .cloned()
+                .collect();
+            if !mounts.is_empty() {
+                let instance = crate::worker::volumes::instance_ref_from_task(
+                    &record.allocation,
+                    &record.task,
+                );
+                self.volumes
+                    .release_persisted(&record.allocation, instance.as_ref(), &mounts);
+            }
+        }
+    }
+
     pub fn restore_allocations(&mut self) -> R<Vec<(Allocation, TaskConfig)>> {
         let loaded = self.state_store.load_records()?;
         if !loaded.unreadable.is_empty() {
@@ -5626,6 +5680,11 @@ impl WorkerTaskManager {
         let mut restored = Vec::new();
         let mut restored_claims: Vec<(i64, i64, TaskConfig, String, bool)> = Vec::new();
         let mut resumed_stops = Vec::new();
+        // What the boot fence killed before this process reached a manager,
+        // and the records whose task died while no worker ran: both are
+        // gone, but their volumes are still mounted (audit W6).
+        let boot_fenced = self.state_store.boot_fenced();
+        let mut died: Vec<PersistedAllocation> = Vec::new();
 
         for mut record in persisted {
             if let Some(terminal) = record.terminal.clone() {
@@ -5673,6 +5732,7 @@ impl WorkerTaskManager {
                         killed_orphans = killed,
                         "Skipping persisted allocation with dead pid"
                     );
+                    died.push(record);
                     continue;
                 }
                 PersistedProcess::Recycled => {
@@ -5688,6 +5748,7 @@ impl WorkerTaskManager {
                         pid,
                         "Skipping persisted allocation whose pid now belongs to another process"
                     );
+                    died.push(record);
                     continue;
                 }
             };
@@ -5796,6 +5857,8 @@ impl WorkerTaskManager {
             active.push(record.clone());
             restored.push((record.allocation, record.task));
         }
+        self.release_died_allocations(died, &boot_fenced);
+        self.state_store.clear_boot_fenced();
 
         // Seed the key counter below every restored key before rebuilding the
         // aliases, so a claim admitted after the restart cannot be handed a
@@ -6511,6 +6574,8 @@ pub fn fence_persisted_allocations(
     let mut registry = TaskPluginRegistry::new();
     load_builtin_plugins_into(&mut registry);
     let mut fenced = Vec::with_capacity(expired.len());
+    let mut reasons = Vec::with_capacity(expired.len());
+    let lost_for = std::time::Duration::from_secs(since_last_contact.as_secs());
     for (record, pid) in expired {
         warn!(
             allocation_id = record.allocation.id,
@@ -6534,9 +6599,27 @@ pub fn fence_persisted_allocations(
             );
             continue;
         }
+        let window = std::time::Duration::from_secs(record.self_terminate_after_secs.unwrap_or(0));
+        reasons.push((record.allocation.id, boot_fence_reason(lost_for, window)));
         fenced.push(record.allocation.id);
     }
+    // The restore that follows reports these the way a runtime self-fence
+    // is reported, and releases their volumes (audit W6).
+    if let Err(err) = state_store.record_boot_fenced(&reasons) {
+        warn!(error = ?err, "Failed to record boot-fenced allocations; the manager will learn of them only from their absence");
+    }
     Ok(fenced)
+}
+
+/// The failure reason a boot-fenced allocation is reported with: the
+/// runtime self-fence's, saying where it happened.
+fn boot_fence_reason(lost_for: std::time::Duration, window: std::time::Duration) -> String {
+    format!(
+        "self-fenced: worker lost manager contact for {} (> onLost.selfTerminateAfter {}); \
+         fenced at worker boot, before it reached a manager",
+        humantime::format_duration(lost_for),
+        humantime::format_duration(window)
+    )
 }
 
 /// Where removed allocation directories wait for [`remove_dir_later`]'s
@@ -12033,6 +12116,87 @@ mod tests {
             .load()?
             .iter()
             .all(|record| record.pid_start_time == Some(started)));
+        Ok(())
+    }
+
+    /// Regression (audit W6): a task the boot fence killed was never
+    /// reported, so the manager learned of it only from its absence, and the
+    /// volumes of any task that died while no worker ran stayed mounted.
+    /// The restore now reports a boot-fenced allocation as self-fenced and
+    /// unmounts every dead allocation's volumes, except one a survivor still
+    /// uses.
+    #[test]
+    fn restore_reports_boot_fenced_allocations_and_releases_their_volumes_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let live_pid = std::process::id();
+        let started = process_start_time(live_pid).context("test process start time")?;
+        // A child that has exited and been reaped: its pid names no process
+        // (and, being no group leader, no process group). A recycled one
+        // would carry another start time and be skipped all the same.
+        let dead_pid = {
+            let mut child = std::process::Command::new("true").spawn()?;
+            child.wait()?;
+            child.id()
+        };
+        let mount = |volume_id: &str| VolumeMount {
+            volume_id: volume_id.into(),
+            name: "data".into(),
+            driver: "local-dir".into(),
+            mode: crate::volumes::VolumeMode::Filesystem,
+            params: Default::default(),
+            attrs: Default::default(),
+            path: None,
+            read_only: false,
+            instance_volume: true,
+        };
+        let record = |id: i64, pid: u32, volumes: Vec<VolumeMount>| PersistedAllocation {
+            allocation: Allocation { id, ..alloc() },
+            task: TaskConfig::new("exec-task", "exec"),
+            pid: Some(pid),
+            pid_start_time: Some(started),
+            self_terminate_after_secs: Some(30),
+            volumes,
+            external_id: None,
+            in_envelope: false,
+            resource_assignment: None,
+            stopping: None,
+            terminal: None,
+        };
+        store.save(&[
+            // Fenced at boot: its own volume, and one it shared with 9.
+            record(7, dead_pid, vec![mount("vol-7"), mount("vol-shared")]),
+            // Died while no worker ran, unfenced.
+            record(8, dead_pid, vec![mount("vol-8")]),
+            // Survived, still using the shared volume.
+            record(9, live_pid, vec![mount("vol-shared")]),
+        ])?;
+        store.record_boot_fenced(&[(7, "self-fenced: at boot".to_string())])?;
+
+        let mut restarted = WorkerTaskManager::with_state_store(store.clone());
+        let restored = restarted.restore_allocations()?;
+        assert_eq!(
+            restored.iter().map(|(a, _)| a.id).collect::<Vec<_>>(),
+            vec![9]
+        );
+        let failures = restarted.drain_failures();
+        assert_eq!(failures.len(), 1, "only the fenced one is reported");
+        assert_eq!(failures[0].allocation_id, 7);
+        assert_eq!(failures[0].reason, "self-fenced: at boot");
+        assert!(store.boot_fenced().is_empty(), "the record is consumed");
+
+        let unmounted: Vec<String> = restarted
+            .drain_volume_reports()
+            .into_iter()
+            .filter(|report| report.op == "unmount")
+            .map(|report| report.volume_id)
+            .collect();
+        assert!(unmounted.contains(&"vol-7".to_string()), "{unmounted:?}");
+        assert!(unmounted.contains(&"vol-8".to_string()), "{unmounted:?}");
+        assert!(
+            !unmounted.contains(&"vol-shared".to_string()),
+            "a survivor's volume stays mounted: {unmounted:?}"
+        );
         Ok(())
     }
 

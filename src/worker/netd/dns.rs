@@ -189,6 +189,33 @@ impl NetDns {
         }
     }
 
+    /// Bind `specs`' resolvers now, ahead of the next [`Self::sync`],
+    /// leaving every other resolver alone (`Netd::bind_launch`, for a gated
+    /// task delivered by push or the work stream). One already serving
+    /// exactly its spec is kept, a stale one replaced; the next `sync`
+    /// keeps or stops it like any other.
+    pub async fn ensure(&self, specs: &[DnsSpec]) {
+        if !crate::structs::platform_supports_vip_blocks() {
+            return;
+        }
+        for spec in specs {
+            let stale = {
+                let mut servers = lock(&self.servers);
+                match servers.get(&spec.allocation_id) {
+                    Some(server) if server.spec == *spec && server.is_running() => continue,
+                    _ => servers.remove(&spec.allocation_id),
+                }
+            };
+            if let Some(mut stale) = stale {
+                for task in [stale.udp.take(), stale.tcp.take()].into_iter().flatten() {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+            self.start(spec.clone()).await;
+        }
+    }
+
     /// Allocations whose resolver is bound.
     pub fn active(&self) -> Vec<i64> {
         let servers = lock(&self.servers);

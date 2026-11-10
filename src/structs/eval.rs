@@ -2307,7 +2307,10 @@ mod tests {
         store.place_alloc("node-1", v2_task)?;
         store.set_node_availability("node-1", "drained")?;
 
-        assert!(crate::manager::rollout::stop_rollout(&store, rollout.id, true, 50).is_err());
+        // The stop itself succeeds: the rollout is terminal and the new
+        // version gone, and the old version's placement is retried.
+        let stopped = crate::manager::rollout::stop_rollout(&store, rollout.id, true, 50)?;
+        assert_eq!(stopped.status, "cancelled");
         assert!(store.allocs_for_job("revert")?.is_empty());
         assert_eq!(pending_reschedules(&store, &v1)?, 1);
         Ok(())

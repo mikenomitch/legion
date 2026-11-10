@@ -56,7 +56,8 @@ struct CapacityEvent {
     seq: u64,
     at: Instant,
     node_id: String,
-    /// `register`, `node`, `ready`, or `freed`.
+    /// `register`, `node`, `ready`, `freed`, or `recovered` (a failed
+    /// changeset projection, [`Store::note_capacity_recovered`]).
     kind: &'static str,
 }
 
@@ -159,6 +160,28 @@ impl Store {
             }
         }
         self.capacity_notify.notify_one();
+    }
+
+    /// A committed changeset's projection failed, so whatever capacity
+    /// events it carried were never recorded. Record one `recovered` event
+    /// for every available node instead (after the read model was rebuilt):
+    /// the wake pass then re-matches every blocked eval against the whole
+    /// fleet, as though each node had just changed. Blocked evals that no
+    /// node can help stay blocked; the rest re-plan once.
+    pub(crate) fn note_capacity_recovered(&self) {
+        let nodes: Vec<(String, &'static str)> = match self.read_model_reader() {
+            Ok(model) => model
+                .nodes
+                .values()
+                .filter(|node| node.availability == "available")
+                .map(|node| (node.id.clone(), "recovered"))
+                .collect(),
+            Err(err) => {
+                warn!(error = ?err, "Failed reading nodes for the post-recovery capacity wake");
+                return;
+            }
+        };
+        self.note_capacity_events(nodes);
     }
 
     /// The capacity log's position: a claim records it so a blocking eval
@@ -623,6 +646,53 @@ mod blocked_evals_test {
         store.lock_capacity_events().processed = 3;
         store.begin_blocked_wake_leadership();
         assert_eq!(store.lock_capacity_events().processed, 0);
+        Ok(())
+    }
+
+    fn node_msg(id: &str, availability: &str) -> crate::structs::NodeMsg {
+        crate::structs::NodeMsg {
+            id: id.to_string(),
+            pool: "default".into(),
+            status: "active".into(),
+            availability: availability.into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: "{}".into(),
+            health_checks: r#"{"worker":"pass"}"#.into(),
+            last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
+        }
+    }
+
+    /// A failed projection loses the capacity events its changeset carried,
+    /// so the recovery records one for every available node: a blocked eval
+    /// waiting on that room is re-matched instead of waiting for the next
+    /// unrelated event.
+    #[test]
+    fn a_failed_projection_records_a_capacity_event_per_available_node() -> R<()> {
+        let (_dir, store) = store()?;
+        store.insert_node(node_msg("node-a", "available"))?;
+        store.insert_node(node_msg("node-b", "unavailable"))?;
+        let before = store.capacity_seq();
+
+        FAIL_NEXT_PROJECTION.with(|fail| fail.set(true));
+        store.insert_node(node_msg("node-c", "available"))?;
+        assert!(
+            !FAIL_NEXT_PROJECTION.with(|fail| fail.get()),
+            "the injected failure fired"
+        );
+
+        let mut events = store.capacity_nodes_after(before);
+        events.retain(|(_, kind)| *kind == "recovered");
+        events.sort();
+        assert_eq!(
+            events,
+            vec![
+                ("node-a".to_string(), "recovered"),
+                ("node-c".to_string(), "recovered"),
+            ],
+            "every available node, from the rebuilt read model"
+        );
         Ok(())
     }
 }

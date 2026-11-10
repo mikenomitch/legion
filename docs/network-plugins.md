@@ -266,9 +266,24 @@ the policies' configs no longer satisfy, or a dropped stage they rely on, is
 refused there and not discovered on the datapath. A plugin a policy still
 references cannot be deleted.
 
-Jobs already submitted are not re-checked when a plugin changes. If the new
-version no longer suits a job, its hops keep running with the config the job
-gave, or fail with `not on this node` after a delete.
+Applying a plugin re-checks every job that uses it the same way: the latest
+config of each job that is not stopped must still pass the checks it passed
+at submit (stages its paths run, a config the schema accepts, `usableBy =
+"jobs"`). If one would not, the write is refused, `--dry-run` included:
+
+```
+job 'metered' uses plugin 'llm-token-meter' and the new object would refuse it:
+task main connect.upstreams entry 'openai' handlers[0]: config does not match ...
+Update or stop the job first
+```
+
+The error names the job only when the caller may read it, and says "a job
+you cannot read" otherwise. A stopped job is not checked; its next `job run`
+is. The check reads every running job's config, which is fine for an
+operator action but makes a plugin write slower on a cluster with many jobs.
+
+Deleting a plugin checks policies only. A job that still references a
+deleted plugin keeps running, and its hops fail with `not on this node`.
 
 ### How a plugin reaches a node
 
@@ -568,7 +583,8 @@ may be referenced.
 - **Request bodies are buffered, not streamed, when a `body` stage runs.**
   The `body` stage sees the whole body (up to `maxBodyBytes`) in one
   callback, with `end_of_stream = true`; a larger body is refused unread
-  (`403`, or `413` with `onError = "allow"`). A route with no body stage
+  (`403`), or, when every body hop on the route sets `onError = "allow"`,
+  streamed to the upstream without the `body` stage seeing it. A route with no body stage
   streams request bodies ([Request
   bodies](network-handlers.md#request-bodies)). Response bodies stream.
 - **A plugin cannot change where a request goes.** It may rewrite `:path`

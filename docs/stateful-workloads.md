@@ -349,6 +349,17 @@ together, one on each side of the partition.
    watchdog takes over. Registration resets the node's loss on the manager
    too, so both clocks restart together.
 
+   A task fenced this way is reported like one the watchdog fences. The
+   worker records it (`boot_fenced.json`, beside `worker_state.json`), and
+   the restore after registration reports it failed with
+   `self-fenced: worker lost manager contact for <d> (> onLost.selfTerminateAfter <w>);
+   fenced at worker boot, before it reached a manager`. Its volumes are
+   unmounted then too. So are the volumes of any task that died while the
+   worker was down, except a volume a surviving allocation on the node
+   still uses. A worker that crashes between that restore and its next
+   heartbeat loses the report, and the manager learns of the fence only
+   from the allocation's absence.
+
    Because this record is a wall clock, a large clock step on the worker
    host while the worker is down moves the restart-time fence. A step
    forward fences early, which is safe. A step backward delays the fence by

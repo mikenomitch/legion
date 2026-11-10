@@ -3527,7 +3527,59 @@ async fn template_scoped_policy_gates_submission_channel() -> R<()> {
         ))
         .await
         .expect_err("collision guard must block hijacking unrelated jobs");
-    assert_eq!(status.code(), Code::FailedPrecondition);
+    // This token cannot read the job it collided with, so the refusal must
+    // not confirm that the job exists: a plain denial naming the rule.
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert!(
+        !status.message().contains("exist"),
+        "the refusal must not reveal that '{JOB_NAME}' exists: {}",
+        status.message()
+    );
+
+    // A runner that may read the job is told what collided.
+    svc.store.upsert_acl_policy(
+        "template-runner-reader",
+        "",
+        &format!(
+            r#"[
+                {{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"],
+                  "templates": ["acl-hijack"]}},
+                {{"resources": ["job"], "namespaces": ["*"], "actions": ["read"],
+                  "names": ["{JOB_NAME}"]}}
+            ]"#
+        ),
+    )?;
+    let (_, reader) = authenticator
+        .mint_token(
+            &svc.store,
+            "template-runner-reader",
+            "client",
+            &["template-runner-reader".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+    let status = svc
+        .run_job_template(req(
+            RunJobTemplateRequest {
+                namespace: Default::default(),
+                name: "acl-hijack".into(),
+                version: None,
+                variables_json: "{}".into(),
+                priority: None,
+                force_reschedule: false,
+                idempotency_key: None,
+                allow_unknown_fields: Default::default(),
+            },
+            Some(&reader),
+        ))
+        .await
+        .expect_err("collision guard still applies to a reader");
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    assert!(
+        status.message().contains("already exists"),
+        "a caller who may read the job is told it exists: {}",
+        status.message()
+    );
     Ok(())
 }
 

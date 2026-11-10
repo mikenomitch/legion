@@ -1554,7 +1554,7 @@ fn resource_limits(assignment: &crate::task_plugins::ResourceAssignment) -> Valu
 /// the image and the command: what the container is called, what is mounted
 /// into it, and how the node decided to confine it.
 pub(crate) struct BundleContext<'a> {
-    /// Container hostname (and OCI container id): `legion-<alloc>`.
+    /// Container hostname (and OCI container id): `legion-<node>-<alloc>`.
     pub(crate) hostname: &'a str,
     /// Volumes the worker mounted for this allocation.
     pub(crate) volumes: &'a [crate::task_plugins::MountedVolume],

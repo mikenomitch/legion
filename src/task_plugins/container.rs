@@ -614,17 +614,42 @@ fn check_node_capabilities(
 /// call that addresses the container by name (launch, stale cleanup, signal,
 /// exec, stop) goes through this, so they cannot disagree.
 ///
-/// On macOS the name carries the node, `legion-<node>-<alloc>`: Apple
-/// container names are global to the Mac, and two local clusters (or one
-/// reset with `rm -rf .legion`) both number allocations from 1. A bare
-/// `legion-<alloc>` let one cluster's launch replace the other's running
-/// container. Linux keeps `legion-<alloc>`, which is also the cgroup leaf
-/// name (`src/worker/resources.rs`) and the guest hostname.
+/// The name carries the node, `legion-<node>-<alloc>`, on both platforms.
+/// Apple container names are global to the Mac, and OCI ids are global to
+/// the runtime's state dir (`/run/runc`), which every cluster on a host
+/// shares. Two clusters (or one reset with `rm -rf .legion`) both number
+/// allocations from 1, so a bare `legion-<alloc>` let one cluster's launch
+/// replace the other's running container. The node id is stable across a
+/// worker restart (it is the worker's name), so a restarted worker still
+/// addresses the containers it re-adopts.
+///
+/// On Linux the id is also the container's hostname, so it is bounded to
+/// [`OCI_ID_MAX`]. The cgroup leaf stays `legion-<alloc>`: it lives under
+/// this worker's own cgroup root (`src/worker/resources.rs`).
 fn container_name(oci_runtime: &ContainerRuntime, allocation: &Allocation) -> String {
     match oci_runtime {
         ContainerRuntime::AppleContainer => apple_container::node_scoped_name("legion", allocation),
-        ContainerRuntime::Oci { .. } => format!("legion-{}", allocation.id),
+        ContainerRuntime::Oci { .. } => oci_container_id(allocation),
     }
+}
+
+/// The kernel's hostname limit (`HOST_NAME_MAX` is 64 with the NUL), which
+/// the OCI container id has to fit because it is also the hostname.
+const OCI_ID_MAX: usize = 63;
+
+/// `legion-<node>-<alloc>`, with the node part cut short when the whole
+/// would not fit [`OCI_ID_MAX`]. The allocation id is never cut, so two
+/// allocations of one node can never share an id.
+fn oci_container_id(allocation: &Allocation) -> String {
+    let name = apple_container::node_scoped_name("legion", allocation);
+    if name.len() <= OCI_ID_MAX {
+        return name;
+    }
+    let suffix = format!("-{}", allocation.id);
+    // `node_scoped_name` keeps only ASCII, so any byte offset is a char
+    // boundary.
+    let head = name[..OCI_ID_MAX.saturating_sub(suffix.len())].trim_end_matches('-');
+    format!("{head}{suffix}")
 }
 
 /// Where the allocation's host task directory is mounted inside the
@@ -884,23 +909,96 @@ fn build_signal_command(
 /// previous start was not torn down cleanly (worker crash, or a `--rm` run
 /// killed before the runtime could reap it).
 ///
-/// On macOS only a container labeled as this node's is removed (see
-/// [`apple_container::remove_stale`]). An OCI runtime has no labels, so it
-/// deletes by name as before, ignoring "no such container". Either way a
-/// hung CLI fails the start with an error naming the command instead of
-/// blocking it.
-fn remove_stale_container(oci_runtime: &ContainerRuntime, allocation: &Allocation) -> R<()> {
+/// Only a container this node owns is removed. On macOS that is one
+/// labeled as this node's (see [`apple_container::remove_stale`]). An OCI
+/// runtime has no labels, so ownership is the bundle: `<runtime> state`
+/// reports the bundle a container was created from, and only one created
+/// from this allocation's own bundle directory (under this worker's data
+/// dir) is deleted (see [`remove_stale_oci_with`]). Either way a hung CLI
+/// fails the start with an error naming the command instead of blocking it.
+fn remove_stale_container(
+    oci_runtime: &ContainerRuntime,
+    allocation: &Allocation,
+    instance: &TaskInstance,
+) -> R<()> {
     let name = container_name(oci_runtime, allocation);
     match oci_runtime {
         ContainerRuntime::AppleContainer => apple_container::remove_stale(&name, allocation),
-        ContainerRuntime::Oci { binary, .. } => {
-            crate::util::output_with_timeout(
-                Command::new(binary).args(["delete", "--force", &name]),
-                crate::util::RUNTIME_CLI_TIMEOUT,
-            )?;
-            Ok(())
-        }
+        ContainerRuntime::Oci { binary, .. } => remove_stale_oci_with(
+            binary,
+            crate::util::RUNTIME_CLI_TIMEOUT,
+            &name,
+            &work_root(allocation, instance).join("bundle"),
+        ),
     }
+}
+
+/// Who an OCI container found under an allocation's id belongs to.
+#[derive(Debug, PartialEq, Eq)]
+enum OciOwner {
+    /// This allocation's own bundle: a previous start's leftover.
+    Ours,
+    /// Anything else, described for the error.
+    Other(String),
+}
+
+/// Read the owner out of `<runtime> state` output: runc and crun both
+/// report the absolute `bundle` path the container was created from.
+fn oci_owner_from_state(stdout: &[u8], expected_bundle: &std::path::Path) -> OciOwner {
+    let Ok(state) = serde_json::from_slice::<Value>(stdout) else {
+        return OciOwner::Other("its state could not be read".to_string());
+    };
+    let Some(bundle) = state.get("bundle").and_then(Value::as_str) else {
+        return OciOwner::Other("its state names no bundle".to_string());
+    };
+    let bundle = std::path::Path::new(bundle);
+    let same = bundle == expected_bundle
+        || matches!(
+            (bundle.canonicalize(), expected_bundle.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        );
+    if same {
+        OciOwner::Ours
+    } else {
+        OciOwner::Other(format!("it was created from bundle {}", bundle.display()))
+    }
+}
+
+/// [`remove_stale_container`] for an OCI runtime, against any runc-shaped
+/// CLI (for tests). `state` failing means no container holds the id.
+fn remove_stale_oci_with(
+    binary: &str,
+    timeout: std::time::Duration,
+    name: &str,
+    expected_bundle: &std::path::Path,
+) -> R<()> {
+    let state =
+        crate::util::output_with_timeout(Command::new(binary).args(["state", name]), timeout)?;
+    if !state.status.success() {
+        // "container does not exist": nothing holds the id.
+        return Ok(());
+    }
+    if let OciOwner::Other(why) = oci_owner_from_state(&state.stdout, expected_bundle) {
+        bail!(
+            "an OCI container with id {name} already exists in {binary}'s state and is not \
+             this allocation's ({why}), so Legion will not remove it; if it is stale, remove \
+             it with `{binary} delete --force {name}`"
+        );
+    }
+    let deleted = crate::util::output_with_timeout(
+        Command::new(binary).args(["delete", "--force", name]),
+        timeout,
+    )?;
+    if !deleted.status.success() {
+        // Reaped between the state and the delete; if it is still there,
+        // `run` reports the id conflict itself.
+        debug!(
+            container = name,
+            stderr = %String::from_utf8_lossy(&deleted.stderr).trim(),
+            "delete of a stale OCI container failed"
+        );
+    }
+    Ok(())
 }
 
 /// Builds the argv that execs `command` inside the allocation's container.
@@ -1371,7 +1469,7 @@ impl TaskPlugin for ContainerTaskPlugin {
 
         // A container still holding this allocation's name would make `run`
         // fail; restarts and worker crashes both leave one behind.
-        remove_stale_container(&oci_runtime, allocation)?;
+        remove_stale_container(&oci_runtime, allocation, instance)?;
 
         // The uid/gid the Linux container runs as, to hand it its logs.
         let mut log_owner: Option<(u32, u32)> = None;
@@ -1927,12 +2025,156 @@ mod tests {
             build_exec_command(&apple, &allocation, false, &[], &Default::default())
                 .contains(&args[name_idx + 1])
         );
-        // Linux keeps `legion-<alloc>`, shared with the cgroup leaf name.
+        // Linux carries the node too: OCI ids are global to the runtime's
+        // state dir, which every cluster on the host shares.
         let oci = ContainerRuntime::Oci {
             binary: "runc".into(),
             class: None,
         };
-        assert_eq!(container_name(&oci, &allocation), "legion-5");
+        assert_eq!(container_name(&oci, &allocation), "legion-node-1-5");
+        Ok(())
+    }
+
+    /// The OCI id is also the hostname, so a long node id is cut to fit the
+    /// kernel's 63 bytes, and the allocation id is never the part cut.
+    #[test]
+    fn oci_container_id_fits_a_hostname_and_keeps_the_allocation_test() {
+        let mut allocation = alloc_with_id(123456);
+        allocation.node_id = "Worker_A.example".into();
+        assert_eq!(
+            oci_container_id(&allocation),
+            "legion-worker-a-example-123456"
+        );
+
+        allocation.node_id = "n".repeat(100);
+        let id = oci_container_id(&allocation);
+        assert_eq!(id.len(), OCI_ID_MAX, "{id}");
+        assert!(id.starts_with("legion-nnn"), "{id}");
+        assert!(id.ends_with("n-123456"), "{id}");
+
+        // A cut that lands on a separator does not leave `--`.
+        allocation.node_id = format!("{}-{}", "a".repeat(48), "b".repeat(40));
+        let id = oci_container_id(&allocation);
+        assert!(id.len() <= OCI_ID_MAX, "{id}");
+        assert!(!id.contains("--"), "{id}");
+        assert!(id.ends_with("-123456"), "{id}");
+
+        // No node id: the bare form, still unique on its own node.
+        allocation.node_id = String::new();
+        assert_eq!(oci_container_id(&allocation), "legion-123456");
+    }
+
+    #[test]
+    fn oci_owner_is_the_allocations_own_bundle_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("alloc-5/.container/bundle");
+        std::fs::create_dir_all(&ours).unwrap();
+        let state = |bundle: &std::path::Path| {
+            serde_json::to_vec(&json!({
+                "ociVersion": "1.0.2",
+                "id": "legion-node-1-5",
+                "pid": 42,
+                "status": "running",
+                "bundle": bundle,
+            }))
+            .unwrap()
+        };
+        assert_eq!(oci_owner_from_state(&state(&ours), &ours), OciOwner::Ours);
+        // The same directory spelled through a `..` is still ours.
+        let spelled = dir.path().join("alloc-5/.container/../.container/bundle");
+        assert_eq!(
+            oci_owner_from_state(&state(&spelled), &ours),
+            OciOwner::Ours
+        );
+        // Another cluster's data dir is not, even under the same id.
+        let theirs = std::path::Path::new("/srv/other-cluster/alloc-5/.container/bundle");
+        assert!(matches!(
+            oci_owner_from_state(&state(theirs), &ours),
+            OciOwner::Other(why) if why.contains("/srv/other-cluster")
+        ));
+        assert!(matches!(
+            oci_owner_from_state(b"not json", &ours),
+            OciOwner::Other(_)
+        ));
+        assert!(matches!(
+            oci_owner_from_state(br#"{"id":"x"}"#, &ours),
+            OciOwner::Other(_)
+        ));
+    }
+
+    /// A fake runc: `state` prints `state_json` (or fails when it is
+    /// empty), and every call is appended to `calls.log`.
+    fn fake_oci_cli(dir: &std::path::Path, state_json: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("calls.log");
+        let script = dir.join("runc");
+        let state = if state_json.is_empty() {
+            "echo 'container does not exist' >&2; exit 1".to_string()
+        } else {
+            format!("printf '%s' '{state_json}'")
+        };
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\ncase \"$1\" in\n  state) {state} ;;\nesac\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script.display().to_string()
+    }
+
+    fn fake_calls(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The finding: stale cleanup ran `delete --force legion-<alloc>`
+    /// unconditionally, so a second cluster on the host deleted the first's
+    /// running container. Now only this allocation's own leftover is deleted.
+    #[test]
+    fn oci_stale_cleanup_deletes_only_its_own_container_test() -> R<()> {
+        let timeout = std::time::Duration::from_secs(10);
+        let bundle_root = tempfile::tempdir()?;
+        let ours = bundle_root.path().join("bundle");
+        std::fs::create_dir_all(&ours)?;
+
+        // Nothing holds the id: no delete.
+        let dir = tempfile::tempdir()?;
+        let cli = fake_oci_cli(dir.path(), "");
+        remove_stale_oci_with(&cli, timeout, "legion-node-1-5", &ours)?;
+        assert_eq!(fake_calls(dir.path()), vec!["state legion-node-1-5"]);
+
+        // Our own leftover: deleted.
+        let dir = tempfile::tempdir()?;
+        let state = format!(
+            r#"{{"id":"legion-node-1-5","bundle":"{}"}}"#,
+            ours.display()
+        );
+        let cli = fake_oci_cli(dir.path(), &state);
+        remove_stale_oci_with(&cli, timeout, "legion-node-1-5", &ours)?;
+        assert_eq!(
+            fake_calls(dir.path()),
+            vec!["state legion-node-1-5", "delete --force legion-node-1-5"]
+        );
+
+        // Someone else's: refused by name, and left alone.
+        let dir = tempfile::tempdir()?;
+        let cli = fake_oci_cli(
+            dir.path(),
+            r#"{"id":"legion-node-1-5","bundle":"/srv/other/bundle"}"#,
+        );
+        let err = remove_stale_oci_with(&cli, timeout, "legion-node-1-5", &ours)
+            .expect_err("a foreign container is not removed");
+        let message = format!("{err:#}");
+        assert!(message.contains("legion-node-1-5"), "{message}");
+        assert!(message.contains("/srv/other/bundle"), "{message}");
+        assert!(message.contains("delete --force"), "{message}");
+        assert_eq!(fake_calls(dir.path()), vec!["state legion-node-1-5"]);
         Ok(())
     }
 
@@ -2563,7 +2805,7 @@ mod tests {
                     "--tty",
                     "--env",
                     "TERM=xterm",
-                    "legion-42",
+                    "legion-node-1-42",
                     "-l",
                     "--color",
                 ]
@@ -2581,7 +2823,7 @@ mod tests {
                 &["/bin/true".to_string()],
                 &Default::default(),
             );
-            assert_eq!(argv, vec![binary, "exec", "legion-42", "/bin/true"]);
+            assert_eq!(argv, vec![binary, "exec", "legion-node-1-42", "/bin/true"]);
         }
     }
 
@@ -2945,7 +3187,7 @@ mod tests {
                 &allocation,
                 "SIGHUP",
             )?,
-            vec!["crun", "kill", "legion-11", "SIGHUP"]
+            vec!["crun", "kill", "legion-node-1-11", "SIGHUP"]
         );
 
         // A signal Legion cannot deliver is rejected before it reaches a CLI.

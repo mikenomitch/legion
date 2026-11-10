@@ -57,6 +57,10 @@ pub(super) struct RecordedStart {
     pub resuming_from: String,
     #[serde(default)]
     pub node_id: String,
+    /// Not recorded: set when this is the reply of a concurrent request
+    /// that won the same idempotency key (see `resume_with`).
+    #[serde(skip)]
+    pub deduplicated: bool,
 }
 
 impl RecordedStart {
@@ -142,17 +146,13 @@ pub(super) fn sandbox_vmm_on_node(task: &TaskConfig, node: &Node) -> (String, Op
             .map(str::to_string)
     };
     let default = attr(ATTR_SANDBOX_VMM).unwrap_or_default();
-    let vmm = match task
+    let vmm = task
         .config
         .get("hypervisor")
         .and_then(Value::as_str)
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("firecracker" | "fc") => "firecracker".to_string(),
-        Some("cloud-hypervisor" | "cloudhypervisor" | "ch") => "cloud-hypervisor".to_string(),
-        _ => default.clone(),
-    };
+        .and_then(crate::structs::checkpoint::SandboxVmm::parse)
+        .map(|vmm| vmm.as_str().to_string())
+        .unwrap_or_else(|| default.clone());
     let version = attr(&vmm_version_attr(&vmm)).or_else(|| {
         (vmm == default)
             .then(|| attr(ATTR_SANDBOX_VMM_VERSION))
@@ -468,10 +468,18 @@ impl ManagerDaemonService {
             let record = record.clone();
             self.store
                 .scheduler_group_commit("suspend_instance", move |s| {
-                    let snapshot = s.begin_suspend_local(new)?;
-                    s.idempotency_record(&key, "suspend_instance", &record)?;
-                    Ok(snapshot)
+                    claimed_body(s, |s| {
+                        let snapshot = s.begin_suspend_local(new)?;
+                        // A concurrent suspend with this key that committed
+                        // first rolls this one back.
+                        claim_idempotency_key(s, &key, "suspend_instance", &record)?;
+                        Ok(snapshot)
+                    })
                 })
+        };
+        let replay = |winner: String| {
+            let winner: RecordedSuspend = serde_json::from_str(&winner).unwrap_or_default();
+            Ok(Response::new(winner.into_reply(true)))
         };
         let snapshot = match fused {
             Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
@@ -479,12 +487,19 @@ impl ManagerDaemonService {
                     .store
                     .begin_suspend(new)
                     .map_err(|e| map_store_error("Error suspending instance", e))?;
-                self.store
-                    .idempotency_record(&idempotency_key, "suspend_instance", &record)
-                    .map_err(|e| map_store_error("Error recording idempotency", e))?;
+                let (winner, deduplicated) =
+                    self.record_idempotent(&idempotency_key, "suspend_instance", record)?;
+                if deduplicated {
+                    return replay(winner);
+                }
                 snapshot
             }
-            other => other.map_err(|e| map_store_error("Error suspending instance", e))?,
+            other => {
+                match self.claimed_write(&idempotency_key, "Error suspending instance", other)? {
+                    Ok(snapshot) => snapshot,
+                    Err(winner) => return replay(winner),
+                }
+            }
         };
         info!(
             instance_id = %instance.instance_id,
@@ -584,67 +599,81 @@ impl ManagerDaemonService {
         let resumed = self
             .store
             .scheduler_group_commit("resume_instance", move |s| {
-                let recorded = match resume(s)? {
-                    ResumeOutcome::RestoreUnavailable { reason } => return Ok(Err(reason)),
-                    ResumeOutcome::Resuming {
-                        snapshot_id,
-                        node_id,
-                    } => RecordedStart {
-                        message: match node_id.as_deref() {
-                            Some(node_id) => format!(
+                claimed_body(s, |s| {
+                    let recorded = match resume(s)? {
+                        ResumeOutcome::RestoreUnavailable { reason } => return Ok(Err(reason)),
+                        ResumeOutcome::Resuming {
+                            snapshot_id,
+                            node_id,
+                        } => RecordedStart {
+                            message: match node_id.as_deref() {
+                                Some(node_id) => format!(
                                 "Resuming instance {instance_id} from {snapshot_id} on {node_id}"
                             ),
-                            None => format!(
+                                None => format!(
                                 "Resuming instance {instance_id} from published {snapshot_id} on \
                                  any compatible node"
                             ),
+                            },
+                            resuming_from: snapshot_id,
+                            node_id: node_id.unwrap_or_default(),
+                            deduplicated: false,
                         },
-                        resuming_from: snapshot_id,
-                        node_id: node_id.unwrap_or_default(),
-                    },
-                    ResumeOutcome::Cold { reason, discarded } => {
-                        if let (Some(reason), Some(snapshot_id)) =
-                            (reason.as_deref(), discarded.as_deref())
-                        {
-                            s.events().instance_restore_failed(
-                                snapshot_id,
-                                &job_id,
-                                &instance_id,
-                                None,
-                                None,
-                                reason,
-                                true,
-                            );
-                        }
-                        RecordedStart {
-                            message: match reason {
-                                Some(reason) => {
-                                    format!("Started instance {instance_id} cold: {reason}")
-                                }
-                                None => format!(
+                        ResumeOutcome::Cold { reason, discarded } => {
+                            if let (Some(reason), Some(snapshot_id)) =
+                                (reason.as_deref(), discarded.as_deref())
+                            {
+                                s.events().instance_restore_failed(
+                                    snapshot_id,
+                                    &job_id,
+                                    &instance_id,
+                                    None,
+                                    None,
+                                    reason,
+                                    true,
+                                );
+                            }
+                            RecordedStart {
+                                message: match reason {
+                                    Some(reason) => {
+                                        format!("Started instance {instance_id} cold: {reason}")
+                                    }
+                                    None => format!(
                                     "Started instance {instance_id} cold (discarded checkpoint {})",
                                     discarded.as_deref().unwrap_or("-")
                                 ),
-                            },
-                            ..Default::default()
+                                },
+                                ..Default::default()
+                            }
                         }
-                    }
-                };
-                s.enqueue_eval(
-                    "job_reschedule",
-                    Some(&job_id),
-                    Some(&config_id),
-                    None,
-                    Some(priority),
-                )?;
-                s.idempotency_record(
-                    &key,
-                    "start_instance",
-                    &serde_json::to_string(&recorded).unwrap_or_default(),
-                )?;
-                Ok(Ok(recorded))
-            })
-            .map_err(|e| map_store_error("Error resuming instance", e))?;
+                    };
+                    s.enqueue_eval(
+                        "job_reschedule",
+                        Some(&job_id),
+                        Some(&config_id),
+                        None,
+                        Some(priority),
+                    )?;
+                    // A concurrent start with this key that committed first
+                    // rolls this resume back whole.
+                    claim_idempotency_key(
+                        s,
+                        &key,
+                        "start_instance",
+                        &serde_json::to_string(&recorded).unwrap_or_default(),
+                    )?;
+                    Ok(Ok(recorded))
+                })
+            });
+        let resumed =
+            match self.claimed_write(idempotency_key, "Error resuming instance", resumed)? {
+                Ok(resumed) => resumed,
+                Err(winner) => {
+                    let mut winner = RecordedStart::from_record(winner);
+                    winner.deduplicated = true;
+                    return Ok(winner);
+                }
+            };
         resumed.map_err(|reason| {
             Status::failed_precondition(format!(
                 "instance {shown_id} cannot resume: {reason}\nHint: `legion instance start \

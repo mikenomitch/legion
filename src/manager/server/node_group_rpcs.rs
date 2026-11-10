@@ -315,13 +315,12 @@ impl ManagerDaemonService {
             volumes_orphaned = outcome.volumes_orphaned,
             "Node forgotten"
         );
-        self.store
-            .idempotency_record(&idempotency_key, "forget_node", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "forget_node", message)?;
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
         Ok(Response::new(ForgetNodeReply {
             message,
-            deduplicated: false,
+            deduplicated,
             allocations_removed: count(outcome.allocations_removed),
             tokens_revoked: count(outcome.tokens_revoked),
             volumes_orphaned: count(outcome.volumes_orphaned),

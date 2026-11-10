@@ -815,12 +815,11 @@ impl ManagerDaemonService {
                 .map_err(|e| map_store_error("Error enqueueing scale eval", e))?;
         }
 
-        self.store
-            .idempotency_record(&idempotency_key, "scale_task", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "scale_task", message)?;
         Ok(Response::new(ScaleTaskReply {
             message,
-            deduplicated: false,
+            deduplicated,
             deferred,
             version: outcome.version,
             pinned_until_unix_ms: pinned_until,
@@ -1238,16 +1237,15 @@ impl ManagerDaemonService {
             accessor_id = identity.accessor_id.as_deref().unwrap_or("-"),
             "Scaling defaults applied"
         );
-        self.store
-            .idempotency_record(&idempotency_key, "apply_scaling_defaults", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "apply_scaling_defaults", message)?;
         Ok(Response::new(ApplyScalingDefaultsReply {
             message,
             applied: true,
             version,
             changes,
             invalid,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -2349,12 +2347,11 @@ impl ManagerDaemonService {
                 until,
             )
         };
-        self.store
-            .idempotency_record(&idempotency_key, "pause_scaling", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "pause_scaling", message)?;
         Ok(Response::new(PauseScalingReply {
             message,
-            deduplicated: false,
+            deduplicated,
             until_unix_ms: until,
         }))
     }

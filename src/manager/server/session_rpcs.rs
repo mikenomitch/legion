@@ -803,25 +803,41 @@ impl ManagerDaemonService {
         let promoted = self
             .store
             .scheduler_group_commit("promote_instance", move |s| {
-                let promoted = s.promote_session(&promote)?;
-                s.events().instance_promoted(
-                    &promote.job_id,
-                    &promoted.instance.instance_id,
-                    &promote.session_id,
-                    &promote.node_id,
-                    promoted.allocation.id,
-                );
-                let recorded = RecordedPromotion {
-                    instance_id: promoted.instance.instance_id.clone(),
-                    promoted_from: promote.session_id.clone(),
-                    node_id: promote.node_id.clone(),
-                    allocation_id: promoted.allocation.id,
-                };
-                s.idempotency_record(&key, "promote_instance", &serde_json::to_string(&recorded)?)?;
-                Ok((promoted, recorded))
-            })
-            .map_err(|e| map_store_error("Error promoting session", e))?;
-        let (promoted, recorded) = promoted;
+                claimed_body(s, |s| {
+                    let promoted = s.promote_session(&promote)?;
+                    let recorded = RecordedPromotion {
+                        instance_id: promoted.instance.instance_id.clone(),
+                        promoted_from: promote.session_id.clone(),
+                        node_id: promote.node_id.clone(),
+                        allocation_id: promoted.allocation.id,
+                    };
+                    // Claimed before the event: a concurrent promote with this
+                    // key that committed first rolls this one back whole.
+                    claim_idempotency_key(
+                        s,
+                        &key,
+                        "promote_instance",
+                        &serde_json::to_string(&recorded)?,
+                    )?;
+                    s.events().instance_promoted(
+                        &promote.job_id,
+                        &promoted.instance.instance_id,
+                        &promote.session_id,
+                        &promote.node_id,
+                        promoted.allocation.id,
+                    );
+                    Ok((promoted, recorded))
+                })
+            });
+        let (promoted, recorded) =
+            match self.claimed_write(&idempotency_key, "Error promoting session", promoted)? {
+                Ok(promoted) => promoted,
+                Err(winner) => {
+                    let winner: RecordedPromotion =
+                        serde_json::from_str(&winner).unwrap_or_default();
+                    return Ok(Response::new(winner.into_reply(true)));
+                }
+            };
         // The session is an allocation from here on; its node stops listing
         // it once it adopts it.
         self.store

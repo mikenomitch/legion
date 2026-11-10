@@ -9,12 +9,15 @@
 //! one interval's worth), and a full queue drops records (counted on
 //! `legion_governance_events_total{event="audit_dropped"}`).
 //!
-//! A raft manager that leads no lane cannot write the journal (the table is
-//! commutative, but every insert still rides some lane's log). The requests
-//! that END on such a manager are the ones it refuses itself — denials and
-//! validation errors, since writes are forwarded to the leader and journaled
-//! there — and their records go to the `audit` tracing target instead,
-//! counted as `audit_unjournaled`.
+//! A raft manager that leads no lane cannot write the journal itself (the
+//! table is commutative, but every insert still rides some lane's log). The
+//! requests that END on such a manager are the ones it refuses itself —
+//! denials and validation errors, since writes are forwarded to the leader
+//! and journaled there — so it forwards their batch to the status-lane
+//! leader (`ForwardableLaneWrite::AppendAudit`), which journals it. Only
+//! when that forward cannot complete (no leader known, unreachable) do the
+//! records go to the `audit` tracing target instead, counted as
+//! `audit_unjournaled`.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -144,29 +147,33 @@ async fn write(
         record.parent_accessor_id = parents[&record.accessor_id].clone();
     }
     let count = batch.len() as u64;
-    if !store.can_write_audit() {
-        for record in &batch {
-            info!(
-                target: "audit",
-                operation = %record.operation,
-                principal = %record.principal,
-                accessor_id = %record.accessor_id,
-                target = %record.target,
-                outcome = %record.outcome,
-                "audit record (this manager leads no raft lane, so it is not journaled)"
-            );
-        }
-        crate::manager::telemetry::metrics()
-            .governance_events_total
-            .inc_by(&["audit_unjournaled"], count);
-        return;
-    }
+    // A manager leading no lane forwards the batch to a lane leader; kept
+    // so the records can still be logged if the forward does not complete.
+    let forwarding = (!store.can_write_audit()).then(|| batch.clone());
     let store = store.clone();
     let result = tokio::task::spawn_blocking(move || store.append_audit_events(batch)).await;
     match result {
         Ok(Ok(())) => crate::manager::telemetry::metrics()
             .governance_events_total
             .inc_by(&["audit_written"], count),
+        Ok(Err(err)) if forwarding.is_some() => {
+            debug!(target: "audit", error = %err, records = count, "audit batch could not be forwarded to a lane leader");
+            for record in forwarding.iter().flatten() {
+                info!(
+                    target: "audit",
+                    operation = %record.operation,
+                    principal = %record.principal,
+                    accessor_id = %record.accessor_id,
+                    target = %record.target,
+                    outcome = %record.outcome,
+                    "audit record (this manager leads no raft lane and could not reach a lane \
+                     leader, so it is not journaled)"
+                );
+            }
+            crate::manager::telemetry::metrics()
+                .governance_events_total
+                .inc_by(&["audit_unjournaled"], count);
+        }
         Ok(Err(err)) => {
             warn!(target: "audit", error = %err, records = count, "audit batch could not be journaled");
             crate::manager::telemetry::metrics()

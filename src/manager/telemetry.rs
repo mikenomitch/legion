@@ -1895,7 +1895,7 @@ impl Metrics {
         let governance_events_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_governance_events_total",
-                help: "Agent-governance events on this manager, by event: 'audit_written' (records journaled), 'audit_dropped' (records lost to a full queue), 'audit_unjournaled' (records this manager could not write because it leads no raft lane; logged to the `audit` tracing target instead), 'rate_limited' (writes refused with RATE_LIMITED), 'approval_required' (writes refused with APPROVAL_REQUIRED), 'approval_invalid', and 'approval_used'.",
+                help: "Agent-governance events on this manager, by event: 'audit_written' (records journaled), 'audit_dropped' (records lost to a full queue), 'audit_unjournaled' (records this manager could not write because it leads no raft lane, and could not forward to a lane leader; logged to the `audit` tracing target instead), 'rate_limited' (writes refused with RATE_LIMITED), 'approval_required' (writes refused with APPROVAL_REQUIRED), 'approval_invalid', and 'approval_used'.",
                 labels: &["event"],
             },
             series: Series::new(),

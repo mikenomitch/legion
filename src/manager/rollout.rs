@@ -157,6 +157,9 @@ struct TickOutcome {
     message: String,
     next_delay: Option<Duration>,
     event_group: Option<String>,
+    /// Every group only waited: the tick placed, retired, and advanced
+    /// nothing.
+    waited: bool,
 }
 
 #[derive(Debug, Default)]
@@ -291,10 +294,10 @@ pub fn handle_rollout_tick(eval: &Eval, store: &Store) -> R<String> {
         now,
     )?;
 
-    if rollout.status != outcome.status
+    let changed = rollout.status != outcome.status
         || rollout.incomplete != outcome.incomplete
-        || rollout.message != outcome.message
-    {
+        || rollout.message != outcome.message;
+    if changed {
         let level = if outcome.status == "failed" {
             "error"
         } else if matches!(
@@ -321,6 +324,17 @@ pub fn handle_rollout_tick(eval: &Eval, store: &Store) -> R<String> {
         );
     }
 
+    // A tick that only waited, released no dependents, and left the
+    // rollout's status, message, and step state exactly as it found them
+    // did nothing anyone can see. Its successor rides the same eval row
+    // (released back to pending, below) instead of an `eval.completed` and
+    // an `eval.enqueued` per poll.
+    let no_op = outcome.waited
+        && released == 0
+        && !changed
+        && serde_json::from_str::<serde_json::Value>(&rollout.config_json).ok()
+            == serde_json::to_value(&envelope).ok();
+
     let config_json = serde_json::to_string(&envelope)?;
     store.update_rollout_config_json(rollout.id, &config_json)?;
     store.update_rollout_status(
@@ -345,6 +359,9 @@ pub fn handle_rollout_tick(eval: &Eval, store: &Store) -> R<String> {
                 outcome.status.as_str(),
                 "waiting_manual_start" | "waiting_manual_advance" | "paused"
             )
+            // Outside the eval loop (a test, a one-shot caller) there is no
+            // eval row to release, so the successor is enqueued as usual.
+            && !(no_op && crate::storage::store::request_quiet_requeue(delay))
         {
             store.enqueue_eval_after_delay(
                 "rollout_tick",
@@ -495,18 +512,52 @@ pub fn stop_rollout(store: &Store, rollout_id: i64, revert: bool, priority: i64)
         return Ok(rollout);
     }
 
-    if revert {
-        let scheduler = Scheduler::new(store)?;
-        let to_config = store.get_job_config_by_id(&rollout.to_job_config_id)?;
-        rollback_rollout(store, &scheduler, &rollout, &to_config)?;
-    }
-
     let message = if revert {
         "Rollout stopped and reverted"
     } else {
         "Rollout stopped"
     };
-    store.update_rollout_status(rollout.id, "cancelled", false, Some(message))?;
+    // The rollout ends first, and for a revert the new version is removed in
+    // the same op, so no tick can find it live and place the new version
+    // again, whatever happens to the re-placement below. If this op fails
+    // nothing changed and the stop can simply be retried.
+    store.cancel_rollout(
+        rollout.id,
+        message,
+        revert.then_some(rollout.to_job_config_id.as_str()),
+    )?;
+
+    // Re-placing the previous version is reconciliation from here on, not
+    // part of the stop: a failure queues a `job_reschedule` retry of the
+    // previous version (`replace_previous_version`), and with the rollout
+    // `cancelled` and the new version gone, a new leader's regeneration
+    // pass converges the job to the previous version too
+    // (`Store::settled_convergence_config`).
+    let mut replacement_error = None;
+    if revert {
+        if let Some(from_config_id) = rollout.from_job_config_id.as_deref() {
+            let replaced = match Scheduler::new(store) {
+                Ok(scheduler) => {
+                    replace_previous_version(store, &scheduler, &rollout, from_config_id)
+                }
+                Err(error) => {
+                    let _ = store.queue_reschedule_retry(&rollout.job_id, from_config_id, &error);
+                    Err(error)
+                }
+            };
+            if let Err(error) = replaced {
+                warn!(
+                    rollout_id = rollout.id,
+                    job_id = %rollout.job_id,
+                    job_config_id = %from_config_id,
+                    error = %format!("{error:#}"),
+                    "Reverted rollout could not re-place the previous version yet"
+                );
+                replacement_error = Some(error);
+            }
+        }
+    }
+
     // A cancelled rollout releases deferred scale-ins too.
     store.apply_pending_scales_after_rollout(&rollout.job_id, &rollout.to_job_config_id)?;
     let metadata = json!({
@@ -523,6 +574,26 @@ pub fn stop_rollout(store: &Store, rollout_id: i64, revert: bool, priority: i64)
         message,
         Some(&metadata),
     );
+    if let Some(error) = replacement_error {
+        let retry = if crate::storage::raft::driver::NotRaftLeader::in_chain(&error) {
+            "the scheduler leader's reconciliation re-places it"
+        } else {
+            "a job_reschedule retry is queued"
+        };
+        let detail = format!(
+            "{message}; the new version is removed, but re-placing the previous version \
+             failed ({error:#}), so {retry}"
+        );
+        let _ = store.update_rollout_status(rollout.id, "cancelled", false, Some(&detail));
+        let _ = store.append_rollout_event(
+            rollout.id,
+            &rollout.job_id,
+            None,
+            "warn",
+            &detail,
+            Some(&json!({ "status": "cancelled", "revert": true }).to_string()),
+        );
+    }
 
     store
         .get_rollout(rollout.id)?
@@ -548,6 +619,7 @@ fn execute_tick(
             message: "No groups to roll out".to_string(),
             next_delay: None,
             event_group: None,
+            waited: false,
         });
     }
 
@@ -588,6 +660,7 @@ fn execute_tick(
                     message,
                     next_delay: Some(delay),
                     event_group: Some(plan.name.clone()),
+                    waited: false,
                 });
             }
             GroupAction::Wait { delay, message } => {
@@ -634,6 +707,7 @@ fn execute_tick(
                     message,
                     next_delay: None,
                     event_group: Some(plan.name.clone()),
+                    waited: false,
                 });
             }
         }
@@ -646,6 +720,7 @@ fn execute_tick(
             message: "Rollout completed".to_string(),
             next_delay: None,
             event_group: None,
+            waited: false,
         });
     }
 
@@ -668,6 +743,7 @@ fn execute_tick(
             message: "Waiting for manual rollout advance".to_string(),
             next_delay: None,
             event_group: None,
+            waited: false,
         });
     }
 
@@ -677,6 +753,7 @@ fn execute_tick(
         message: pending_message,
         next_delay: Some(pending_wait.unwrap_or(DEFAULT_RETRY_DELAY)),
         event_group: None,
+        waited: true,
     })
 }
 
@@ -1197,6 +1274,22 @@ fn try_place_for_group(
                 });
             }
 
+            // Replacements of a failed allocation (on this version or the
+            // one being replaced) wait out its reschedule backoff. That is
+            // not a capacity shortage, so it does not arm
+            // `capacityBlockTimeout`; the group looks again when the
+            // soonest hold lapses (at most 30s, so a lifted hold is seen).
+            if !outcome.backoff_held.is_empty() {
+                return Ok(GroupAction::Wait {
+                    delay: backoff_wait_delay(store, &rollout.job_id)?,
+                    message: format!(
+                        "Group {} waiting for {} to wait out a reschedule backoff",
+                        plan.name,
+                        outcome.backoff_held.join(", ")
+                    ),
+                });
+            }
+
             on_placement_wait(
                 store,
                 scheduler,
@@ -1364,6 +1457,18 @@ fn on_placement_wait(
         delay: placement_wait_delay(elapsed, remaining),
         message,
     })
+}
+
+/// How long a group whose replacements wait out a reschedule backoff waits
+/// before its next tick: until the job's soonest hold lapses, at least 1s
+/// and at most [`MAX_PLACEMENT_WAIT_DELAY`].
+fn backoff_wait_delay(store: &Store, job_id: &str) -> R<Duration> {
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let until_lapse = store
+        .next_reschedule_hold_lapse(job_id)?
+        .map(|lapse| Duration::from_secs(lapse.saturating_sub(now).max(0) as u64))
+        .unwrap_or(DEFAULT_RETRY_DELAY);
+    Ok(until_lapse.clamp(Duration::from_secs(1), MAX_PLACEMENT_WAIT_DELAY))
 }
 
 /// How long a capacity-blocked group waits before its next tick: 2s at
@@ -1832,21 +1937,37 @@ fn rollback_rollout(
     if let Some(from_config_id) = rollout.from_job_config_id.as_ref() {
         // The new version is already gone. If the old one cannot be placed
         // back (no capacity, a lost conflict race), the failed tick marks
-        // the rollout terminal and nothing would retry it, so queue a
-        // reschedule of the old version first. A NotRaftLeader rejection is
-        // the exception: the tick is released and re-runs this rollback.
-        let outcome = scheduler
-            .plan_and_apply(from_config_id, PlanMode::Reschedule)
-            .inspect_err(|error| {
-                if !crate::storage::raft::driver::NotRaftLeader::in_chain(error) {
-                    let _ = store.queue_reschedule_retry(&rollout.job_id, from_config_id, error);
-                }
-            })?;
-        if !outcome.allocations.is_empty() {
-            dispatch_allocations(store, &outcome.allocations)?;
-        }
+        // the rollout terminal and nothing would retry it, so
+        // `replace_previous_version` queues a reschedule of the old version
+        // first. A NotRaftLeader rejection is the exception: the tick is
+        // released and re-runs this rollback.
+        replace_previous_version(store, scheduler, rollout, from_config_id)?;
     }
 
+    Ok(())
+}
+
+/// Place a rolled-back or reverted rollout's previous version back to
+/// count. Its new version must already be gone. A failed placement queues a
+/// `job_reschedule` retry of the previous version before returning the
+/// error (except on NotRaftLeader, which writes nothing here and is
+/// recovered by whoever leads the scheduler lane).
+fn replace_previous_version(
+    store: &Store,
+    scheduler: &Scheduler<'_>,
+    rollout: &Rollout,
+    from_config_id: &str,
+) -> R<()> {
+    let outcome = scheduler
+        .plan_and_apply(from_config_id, PlanMode::Reschedule)
+        .inspect_err(|error| {
+            if !crate::storage::raft::driver::NotRaftLeader::in_chain(error) {
+                let _ = store.queue_reschedule_retry(&rollout.job_id, from_config_id, error);
+            }
+        })?;
+    if !outcome.allocations.is_empty() {
+        dispatch_allocations(store, &outcome.allocations)?;
+    }
     Ok(())
 }
 
@@ -3448,7 +3569,7 @@ mod tests {
                     // Inside the backoff the tick waits instead of placing.
                     let waiting = tick(&store, "fullstack", &v2_id)?;
                     assert!(
-                        waiting.contains("waiting for placement capacity"),
+                        waiting.contains("to wait out a reschedule backoff"),
                         "{case}: {waiting}"
                     );
                     assert!(store.allocs_for_job_config(&v2_id)?.is_empty(), "{case}");
@@ -3463,6 +3584,237 @@ mod tests {
                 assert_eq!(placed[0].instance_id.as_deref(), Some("fullstack-db-0"));
             }
         }
+        Ok(())
+    }
+
+    /// A revert removes the new version and ends the rollout in one op, so
+    /// a re-placement of the previous version that fails cannot leave the
+    /// rollout live for a tick to place the new version again: the stop
+    /// succeeds, says what is pending, and a `job_reschedule` of the
+    /// previous version is queued.
+    #[test]
+    fn a_revert_that_cannot_re_place_still_ends_the_rollout_test() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let job = |version: u32| JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "revert-stuck".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                config: json!({ "version": version }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
+        };
+        store.handle_job_submit(&job(1), &[submission()])?;
+        let v1_id = store.get_job_config("revert-stuck")?.id();
+        store.handle_job_submit(&job(2), &[submission()])?;
+        let v2_id = store.get_job_config("revert-stuck")?.id();
+        let v2_task = store.get_task_configs_for_job_config(&v2_id)?[0].0;
+        store.place_alloc("node-a", v2_task)?;
+        let rollout = store.create_rollout(
+            "revert-stuck",
+            Some(&v1_id),
+            &v2_id,
+            "running",
+            None,
+            None,
+            None,
+            None,
+            "{}",
+        )?;
+        // Nowhere to put v1 back.
+        store.set_node_availability("node-a", "drained")?;
+
+        let stopped = stop_rollout(&store, rollout.id, true, 50)?;
+        assert_eq!(stopped.status, "cancelled");
+        assert!(
+            stopped.message.contains("a job_reschedule retry is queued"),
+            "{}",
+            stopped.message
+        );
+        assert!(store.allocs_for_job_config(&v2_id)?.is_empty());
+        assert!(
+            store
+                .get_evals()?
+                .iter()
+                .any(|eval| eval.kind == "job_reschedule" && eval.job_config_id == v1_id),
+            "the previous version's re-placement is retried"
+        );
+
+        // A tick the rollout had queued finds it terminal and places
+        // nothing, even once there is room again.
+        store.set_node_availability("node-a", "available")?;
+        let message = tick(&store, "revert-stuck", &v2_id)?;
+        assert!(message.contains("terminal"), "{message}");
+        assert!(store.allocs_for_job_config(&v2_id)?.is_empty());
+        // Stopping again is a no-op on the terminal rollout.
+        assert_eq!(
+            stop_rollout(&store, rollout.id, true, 50)?.status,
+            "cancelled"
+        );
+        Ok(())
+    }
+
+    /// A failure on the version being replaced owes a backoff, and the new
+    /// version's replacement of that task waits it out instead of placing
+    /// at once (one undelayed retry per rollout before). The wait does not
+    /// count as a capacity block.
+    #[test]
+    fn a_rollout_honors_the_previous_versions_backoff_test() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let job = |version: u32| JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "crashy".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                count: crate::structs::TaskCount::new(2),
+                config: json!({ "version": version }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
+        };
+        store.handle_job_submit(&job(1), &[submission()])?;
+        let v1_id = store.get_job_config("crashy")?.id();
+        let placed = Scheduler::new(&store)?.plan_and_apply(&v1_id, PlanMode::Fresh)?;
+        assert_eq!(placed.allocations.len(), 2);
+        fail_allocation(&store, &placed.allocations[0])?;
+
+        store.handle_job_submit(&job(2), &[submission()])?;
+        let v2_id = store.get_job_config("crashy")?.id();
+        create_default_rollout(&store, "crashy", &v1_id, &v2_id)?;
+
+        let mut log = Vec::new();
+        for _ in 0..4 {
+            log.push(tick(&store, "crashy", &v2_id)?);
+        }
+        assert_eq!(
+            store.allocs_for_job_config(&v2_id)?.len(),
+            1,
+            "the replacement of the failed v1 allocation waits: {log:#?}"
+        );
+        let last = log.last().context("ticked")?;
+        assert!(
+            last.contains("api (1) to wait out a reschedule backoff"),
+            "{log:#?}"
+        );
+        let rollout = store
+            .latest_rollout_for_job_config(&v2_id)?
+            .context("rollout")?;
+        let envelope = parse_rollout_envelope(&rollout.config_json)?;
+        assert!(
+            envelope
+                .runtime
+                .groups
+                .values()
+                .all(|group| group.blocked_since.is_none()),
+            "a backoff is not a capacity block"
+        );
+
+        // Once the hold lapses the rollout places it.
+        store
+            .write_connection()?
+            .execute("UPDATE reschedule_hold SET not_before_unix = 0;", [])?;
+        tick(&store, "crashy", &v2_id)?;
+        assert_eq!(store.allocs_for_job_config(&v2_id)?.len(), 2);
+        Ok(())
+    }
+
+    /// A rollout tick that only waits and changes nothing is released back
+    /// to pending by the eval loop, with no `eval.completed` and no
+    /// successor `eval.enqueued`; a tick that changed something completes
+    /// and re-arms as before.
+    #[test]
+    fn a_no_op_rollout_tick_requeues_quietly_test() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let job = |version: u32| JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "quiet".into(),
+            tasks: vec![TaskConfig {
+                group: "web".into(),
+                config: json!({ "version": version }),
+                ..TaskConfig::new("api", "noop")
+            }],
+            version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
+        };
+        store.handle_job_submit(&job(1), &[submission()])?;
+        let v1_id = store.get_job_config("quiet")?.id();
+        Scheduler::new(&store)?.plan_and_apply(&v1_id, PlanMode::Fresh)?;
+        store.handle_job_submit(&job(2), &[submission()])?;
+        let v2_id = store.get_job_config("quiet")?.id();
+        create_default_rollout(&store, "quiet", &v1_id, &v2_id)?;
+
+        let ticks = |store: &Store| -> R<usize> {
+            Ok(store
+                .get_evals()?
+                .iter()
+                .filter(|eval| eval.kind == "rollout_tick")
+                .count())
+        };
+        // Through the eval loop's own path, as a claimed eval. The outcome is
+        // not written, so the tick's own row stays: a tick that queues its
+        // successor adds two rows, a quiet one adds only its own.
+        let run_tick = |store: &Store| -> R<crate::storage::store::EvalCompletion> {
+            store.enqueue_eval("rollout_tick", Some("quiet"), Some(&v2_id), None, Some(100))?;
+            let claimed = store.claim_eval()?.context("the tick is claimable")?;
+            assert_eq!(claimed.kind, "rollout_tick");
+            Ok(crate::manager::daemon::resolve_claimed_eval(
+                store, 0, &claimed,
+            ))
+        };
+        use crate::storage::store::EvalCompletion;
+
+        // Place the new version (direct ticks, outside the eval loop).
+        let mut log = Vec::new();
+        for _ in 0..5 {
+            if !store.allocs_for_job_config(&v2_id)?.is_empty() {
+                break;
+            }
+            log.push(tick(&store, "quiet", &v2_id)?);
+        }
+        assert_eq!(store.allocs_for_job_config(&v2_id)?.len(), 1, "{log:#?}");
+
+        // The first wait for health changes the rollout's message: still an
+        // event-worthy tick.
+        let before = ticks(&store)?;
+        let first_wait = run_tick(&store)?;
+        assert!(
+            matches!(
+                first_wait,
+                EvalCompletion::Finished {
+                    succeeded: true,
+                    ..
+                }
+            ),
+            "{first_wait:?}"
+        );
+        assert_eq!(ticks(&store)?, before + 2);
+
+        // The same wait again is a no-op: released quietly, nothing queued.
+        let before = ticks(&store)?;
+        let again = run_tick(&store)?;
+        match again {
+            EvalCompletion::Released { delay, event } => {
+                assert!(event.is_none(), "no eval event for a no-op tick");
+                assert!(delay > Duration::ZERO);
+            }
+            other => panic!("expected a quiet release, got {other:?}"),
+        }
+        assert_eq!(ticks(&store)?, before + 1, "no successor eval was enqueued");
         Ok(())
     }
 }

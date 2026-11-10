@@ -28,6 +28,20 @@
 //! A claimed eval's row reads `pending` in the store. [`Store::get_evals`]
 //! overlays `in_flight` for the evals this manager has claimed, so listings
 //! on the leader still show work in progress.
+//!
+//! **Claim epochs.** Forgetting every claim ([`Store::clear_eval_claims`],
+//! on losing or gaining scheduler-lane leadership) does not stop a handler
+//! that is already running: it finishes and settles. If leadership left
+//! and came back meanwhile, its eval may have been claimed again by
+//! another worker, and the old handler's settle would write over the new
+//! claimant's (delete a row it still holds, mark `failed` work it is about
+//! to retry, release its claim). So every clear starts a new epoch, every
+//! claim records the epoch it was taken in, and the eval loop settles
+//! through [`Store::complete_claimed_evals_and_claim_next`], which writes
+//! an outcome only while the eval is still claimed in the epoch the
+//! worker claimed it in. A stale outcome is dropped: the row is still
+//! `pending`, and whoever holds it now (or the next claim) runs it, which
+//! is the same recovery an abandoned batch gets.
 
 use super::*;
 
@@ -42,6 +56,10 @@ pub(crate) struct EvalClaims {
     /// that blocks can see the capacity that appeared while it ran
     /// (`store/blocked_evals.rs`, "Missed unblocks").
     capacity_seq: HashMap<String, u64>,
+    /// The current claim epoch: bumped by every clear (see the module docs).
+    epoch: u64,
+    /// The epoch each claimed eval was claimed in.
+    claim_epoch: HashMap<String, u64>,
 }
 
 /// How often the O(pending) full count may refresh `legion_eval_queue_depth`.
@@ -122,7 +140,7 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn claim_eval(&self) -> R<Option<Eval>> {
         let one = EvalBatchLimits { max: 1, workers: 1 };
-        Ok(self.claim_up_to(one, ClaimScope::Any)?.into_iter().next())
+        Ok(self.claim_up_to(one, ClaimScope::Any)?.0.into_iter().next())
     }
 
     /// Claim a fair-share batch of ready evals ([`EvalBatchLimits`]).
@@ -140,6 +158,20 @@ impl Store {
     /// can see, and duplicate collapse, are identical.
     #[instrument(err, skip_all)]
     pub fn claim_evals(&self, limits: EvalBatchLimits, scope: ClaimScope) -> R<Vec<Eval>> {
+        Ok(self.claim_up_to(limits, scope)?.0)
+    }
+
+    /// [`Self::claim_evals`], also returning the claim epoch the batch was
+    /// taken in, read under the same lock as the claims themselves. Settle
+    /// the batch with [`Self::complete_claimed_evals_and_claim_next`] and
+    /// that epoch, so a settle that outlived a leadership flap cannot write
+    /// over a newer claim of the same eval.
+    #[instrument(err, skip_all)]
+    pub fn claim_evals_in_epoch(
+        &self,
+        limits: EvalBatchLimits,
+        scope: ClaimScope,
+    ) -> R<(Vec<Eval>, u64)> {
         self.claim_up_to(limits, scope)
     }
 
@@ -150,10 +182,11 @@ impl Store {
     /// index order, and the duplicate lookup is an equality seek on the
     /// pending-scope index. `EXPLAIN QUERY PLAN` for each is pinned by
     /// `eval_claims_test::claim_queries_use_their_indexes`.
-    fn claim_up_to(&self, limits: EvalBatchLimits, scope: ClaimScope) -> R<Vec<Eval>> {
+    fn claim_up_to(&self, limits: EvalBatchLimits, scope: ClaimScope) -> R<(Vec<Eval>, u64)> {
         let started = Instant::now();
         let capacity_seq = self.capacity_seq();
         let mut claims = self.lock_eval_claims();
+        let epoch = claims.epoch;
         let conn = self.read_connection()?;
         let now = Self::sortable_now()?;
         let held = claims.held.len() as i64;
@@ -169,7 +202,7 @@ impl Store {
             if exact {
                 crate::manager::telemetry::metrics().eval_queue_depth.set(0);
             }
-            return Ok(Vec::new());
+            return Ok((Vec::new(), epoch));
         }
         let take = limits.share_of(unclaimed);
         let candidates: Vec<Eval> = {
@@ -213,6 +246,7 @@ impl Store {
             claims.held.extend(subsumed.iter().cloned());
             claims.claimed.insert(eval.id.clone(), subsumed);
             claims.capacity_seq.insert(eval.id.clone(), capacity_seq);
+            claims.claim_epoch.insert(eval.id.clone(), epoch);
             eval.status = "in_flight".to_string();
             claimed.push(eval);
         }
@@ -234,7 +268,7 @@ impl Store {
                 "Claimed evals"
             );
         }
-        Ok(claimed)
+        Ok((claimed, epoch))
     }
 
     /// Pending rows, counted no further than `cap`: exact below it, `cap`
@@ -289,7 +323,52 @@ impl Store {
             }
             claims.held.remove(eval_id);
             claims.capacity_seq.remove(eval_id);
+            claims.claim_epoch.remove(eval_id);
         }
+    }
+
+    /// [`Self::release_eval_claims`], but only for the evals still claimed
+    /// in `epoch`: a worker whose claims were cleared under it must not
+    /// release a newer claim of the same eval.
+    pub(crate) fn release_eval_claims_from_epoch<'a>(
+        &self,
+        eval_ids: impl IntoIterator<Item = &'a str>,
+        epoch: u64,
+    ) {
+        let current: Vec<&str> = {
+            let claims = self.lock_eval_claims();
+            eval_ids
+                .into_iter()
+                .filter(|id| claims.claim_epoch.get(*id) == Some(&epoch))
+                .collect()
+        };
+        self.release_eval_claims(current);
+    }
+
+    /// Split `completions` into those whose eval is still claimed in
+    /// `epoch` and the ids of those that are not (their claim was cleared,
+    /// and perhaps taken again, while the handler ran).
+    pub(crate) fn completions_claimed_in_epoch(
+        &self,
+        completions: Vec<(String, EvalCompletion)>,
+        epoch: u64,
+    ) -> (Vec<(String, EvalCompletion)>, Vec<String>) {
+        let claims = self.lock_eval_claims();
+        let mut current = Vec::with_capacity(completions.len());
+        let mut stale = Vec::new();
+        for (id, completion) in completions {
+            if claims.claim_epoch.get(&id) == Some(&epoch) {
+                current.push((id, completion));
+            } else {
+                stale.push(id);
+            }
+        }
+        (current, stale)
+    }
+
+    /// The current claim epoch (see the module docs).
+    pub fn eval_claim_epoch(&self) -> u64 {
+        self.lock_eval_claims().epoch
     }
 
     /// Forget every claim: this manager stopped leading the scheduler lane,
@@ -299,6 +378,10 @@ impl Store {
         claims.claimed.clear();
         claims.held.clear();
         claims.capacity_seq.clear();
+        claims.claim_epoch.clear();
+        // Handlers already running keep their old epoch, so their settles
+        // can no longer touch whatever is claimed from here on.
+        claims.epoch = claims.epoch.wrapping_add(1);
     }
 
     /// The capacity log's position when `eval_id` was claimed; the current
@@ -487,6 +570,56 @@ mod eval_claims_test {
         assert_eq!(again.id, claimed.id);
         store.clear_eval_claims();
         assert_eq!(store.claim_eval()?.context("after clear")?.id, claimed.id);
+        Ok(())
+    }
+
+    /// A handler that outlived a clear of the claims (leadership lost and
+    /// regained while it ran) settles against the epoch it claimed in, so
+    /// its outcome cannot delete, fail, or release a newer claim of the
+    /// same eval; the newer claimant's settle still lands.
+    #[test]
+    fn a_settle_from_a_cleared_epoch_cannot_touch_a_newer_claim() -> R<()> {
+        let (_dir, store) = store()?;
+        let eval = store.enqueue_eval("job_submit", Some("web"), Some("jc-1"), None, Some(50))?;
+        let limits = EvalBatchLimits { max: 1, workers: 1 };
+        let (old, old_epoch) = store.claim_evals_in_epoch(limits, ClaimScope::Any)?;
+        assert_eq!(old[0].id, eval.id);
+
+        store.clear_eval_claims();
+        let (new, new_epoch) = store.claim_evals_in_epoch(limits, ClaimScope::Any)?;
+        assert_eq!(new[0].id, eval.id, "claimed again in the new epoch");
+        assert_ne!(old_epoch, new_epoch);
+
+        let done = |claimed: &Eval| EvalCompletion::Finished {
+            succeeded: true,
+            event: crate::storage::events::drafts::eval_completed(claimed, "done", Duration::ZERO),
+        };
+        let (next, _) = store.complete_claimed_evals_and_claim_next(
+            vec![(eval.id.clone(), done(&old[0]))],
+            old_epoch,
+            limits,
+            ClaimScope::Any,
+        )?;
+        assert!(next.is_empty());
+        assert_eq!(pending(&store)?, 1, "the stale settle wrote nothing");
+        assert!(
+            store.eval_is_claimed(&eval.id),
+            "nor released the newer claim"
+        );
+        store.release_eval_claims_from_epoch([eval.id.as_str()], old_epoch);
+        assert!(
+            store.eval_is_claimed(&eval.id),
+            "a stale release is ignored too"
+        );
+
+        store.complete_claimed_evals_and_claim_next(
+            vec![(eval.id.clone(), done(&new[0]))],
+            new_epoch,
+            limits,
+            ClaimScope::Any,
+        )?;
+        assert_eq!(pending(&store)?, 0, "the current claimant settles it");
+        assert!(!store.eval_is_claimed(&eval.id));
         Ok(())
     }
 }

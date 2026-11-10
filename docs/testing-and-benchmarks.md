@@ -147,9 +147,27 @@ ulimit -n 65536
 cargo test --all --locked
 ```
 
+### UI unit tests
+
+The SPA has no unit-test framework; its one unit test is plain Node, with
+no dependencies to install:
+
+```bash
+cd ui
+npm run test:unit
+```
+
+It checks the UI's client-side ACL mirror (`ui/src/utils/aclEngine.ts`,
+which decides which controls to show) against the cases in
+`tests/fixtures/acl_parity_cases.json`. The Rust engine runs the same cases
+(`cargo test --lib parity_fixture`), so a change to either engine that
+changes an answer fails one side. Change the two engines together, and add
+a case for the behavior you changed. It needs Node 22.18 or later (Node
+loads the TypeScript file directly), and CI runs it in the UI job.
+
 ### UI smoke tests
 
-The SPA has no unit-test runner. Its smoke tests drive the built UI in a
+The SPA has no unit-test framework. Its smoke tests drive the built UI in a
 real browser instead, against a fake manager that answers the SPA's
 gRPC-Web calls inside the browser (Playwright's request routing), so no
 Legion process is needed:

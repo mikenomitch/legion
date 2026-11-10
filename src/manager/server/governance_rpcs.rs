@@ -318,13 +318,12 @@ impl ManagerDaemonService {
             .store
             .decide_approval(id, req.approve, &identity.principal, req.reason.trim(), now)
             .map_err(|e| map_store_error("Error deciding approval", e))?;
-        self.store
-            .idempotency_record(&idempotency_key, "decide_approval", id)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (_, deduplicated) =
+            self.record_idempotent(&idempotency_key, "decide_approval", id.to_string())?;
         info!(approval = %id, approve = req.approve, "approval decided");
         Ok(Response::new(DecideApprovalReply {
             approval: Some(approval_to_proto(&decided, now)),
-            deduplicated: false,
+            deduplicated,
         }))
     }
 

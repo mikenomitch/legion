@@ -244,29 +244,7 @@ impl ManagerDaemonService {
             .idempotency_lookup(&idempotency_key)
             .map_err(|e| map_store_error("Error checking idempotency", e))?
         {
-            let recorded: RecordedFork = serde_json::from_str(&recorded).unwrap_or_default();
-            let pause_ms = self
-                .store
-                .get_snapshot(&recorded.snapshot)
-                .ok()
-                .flatten()
-                .map(|snapshot| snapshot.pause_ms)
-                .unwrap_or_default();
-            return Ok(Response::new(ForkInstanceReply {
-                origin: recorded.origin,
-                snapshot: recorded.snapshot,
-                pause_ms,
-                instances: recorded.instances,
-                kind: recorded.kind,
-                node_id: recorded.node_id,
-                deduplicated: true,
-                durability: if recorded.durability.is_empty() {
-                    SnapshotDurability::Local.as_str().to_string()
-                } else {
-                    recorded.durability
-                },
-                notes: Vec::new(),
-            }));
+            return Ok(Response::new(self.fork_replay(&recorded)));
         }
 
         let Some(instance) = self
@@ -419,23 +397,32 @@ impl ManagerDaemonService {
         let recorded = self
             .store
             .scheduler_group_commit("fork_instance", move |s| {
-                let created = s.begin_fork(new, count, require_id)?;
-                let recorded = RecordedFork {
-                    origin,
-                    snapshot: created.snapshot.snapshot_id.clone(),
-                    kind: kind.as_str().to_string(),
-                    node_id,
-                    instances: created.instances,
-                    durability: durability.as_str().to_string(),
-                };
-                s.idempotency_record(
-                    &key,
-                    "fork_instance",
-                    &serde_json::to_string(&recorded).unwrap_or_default(),
-                )?;
-                Ok(recorded)
-            })
-            .map_err(|e| map_store_error("Error forking instance", e))?;
+                claimed_body(s, |s| {
+                    let created = s.begin_fork(new, count, require_id)?;
+                    let recorded = RecordedFork {
+                        origin,
+                        snapshot: created.snapshot.snapshot_id.clone(),
+                        kind: kind.as_str().to_string(),
+                        node_id,
+                        instances: created.instances,
+                        durability: durability.as_str().to_string(),
+                    };
+                    // A concurrent fork with this key that committed first
+                    // rolls this one back: one key, one set of forks.
+                    claim_idempotency_key(
+                        s,
+                        &key,
+                        "fork_instance",
+                        &serde_json::to_string(&recorded).unwrap_or_default(),
+                    )?;
+                    Ok(recorded)
+                })
+            });
+        let recorded =
+            match self.claimed_write(&idempotency_key, "Error forking instance", recorded)? {
+                Ok(recorded) => recorded,
+                Err(winner) => return Ok(Response::new(self.fork_replay(&winner))),
+            };
         let notes = if kind == SnapshotKind::Memory {
             super::suspend_rpcs::gated_capture_note(
                 &task,
@@ -459,6 +446,33 @@ impl ManagerDaemonService {
             durability: recorded.durability,
             notes,
         }))
+    }
+
+    /// The reply a keyed `ForkInstance` replays from its idempotency record.
+    fn fork_replay(&self, recorded: &str) -> ForkInstanceReply {
+        let recorded: RecordedFork = serde_json::from_str(recorded).unwrap_or_default();
+        let pause_ms = self
+            .store
+            .get_snapshot(&recorded.snapshot)
+            .ok()
+            .flatten()
+            .map(|snapshot| snapshot.pause_ms)
+            .unwrap_or_default();
+        ForkInstanceReply {
+            origin: recorded.origin,
+            snapshot: recorded.snapshot,
+            pause_ms,
+            instances: recorded.instances,
+            kind: recorded.kind,
+            node_id: recorded.node_id,
+            deduplicated: true,
+            durability: if recorded.durability.is_empty() {
+                SnapshotDurability::Local.as_str().to_string()
+            } else {
+                recorded.durability
+            },
+            notes: Vec::new(),
+        }
     }
 
     /// Resolve and check the snapshot a `from_snapshot` create restores
@@ -575,13 +589,21 @@ impl ManagerDaemonService {
             snapshot_id: snapshot.snapshot_id,
             previous_snapshot_id: outcome.previous.unwrap_or_default(),
         };
-        self.store
-            .idempotency_record(
-                &idempotency_key,
-                "set_snapshot_alias",
-                &serde_json::to_string(&recorded).unwrap_or_default(),
-            )
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        // Pointing a name at the same snapshot again converges, so a
+        // concurrent call with the same key that recorded first is what
+        // this caller is handed.
+        let (winner, deduplicated) = self.record_idempotent(
+            &idempotency_key,
+            "set_snapshot_alias",
+            serde_json::to_string(&recorded).unwrap_or_default(),
+        )?;
+        if deduplicated {
+            let mut reply: SetSnapshotAliasReply = serde_json::from_str::<RecordedAlias>(&winner)
+                .unwrap_or_default()
+                .into();
+            reply.deduplicated = true;
+            return Ok(Response::new(reply));
+        }
         Ok(Response::new(recorded.into()))
     }
 
@@ -622,12 +644,11 @@ impl ManagerDaemonService {
             Some(snapshot_id) => format!("Removed {name} (it pointed at {snapshot_id})"),
             None => format!("No snapshot name {name} in job {}", inner.job_id),
         };
-        self.store
-            .idempotency_record(&idempotency_key, "delete_snapshot_alias", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "delete_snapshot_alias", message)?;
         Ok(Response::new(DeleteSnapshotAliasReply {
             message,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 }

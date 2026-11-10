@@ -230,6 +230,17 @@ checkpointing. It then runs the capture/upload loop every `syncInterval`.
 `Replica::sync()` uploads new LTX files to `replicaUrl`. Legion skips this
 when `replicaUrl` is empty.
 
+rustyriver decides when the WAL is checkpointed: a `PASSIVE` checkpoint once
+the WAL passes 1,000 pages or a minute after the last one, always after it
+has captured the frames being checkpointed. So with a `replicaUrl` set, the
+manager does not start the once-a-second background checkpointer it runs in
+the other modes. A checkpoint rustyriver had not captured, followed by a WAL
+restart, would break the replica's LTX chain and force a full snapshot
+upload. The manager's own write connection still checkpoints if its WAL
+ever reaches 4,000 pages. That only happens if rustyriver's loop stalls, and
+it keeps the WAL bounded in that case. A standby (and a manager without a
+`replicaUrl`) writes too little for this to matter.
+
 If `lease.provider = "none"`, the manager is primary from startup and ships
 immediately.
 

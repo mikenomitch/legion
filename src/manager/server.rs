@@ -135,6 +135,8 @@ pub mod endpoint_feed;
 mod extension_rpcs;
 mod fork_rpcs;
 mod governance_rpcs;
+mod idempotency;
+use idempotency::{claim_idempotency_key, claimed_body};
 mod make_room;
 mod material_rpcs;
 mod namespace_policy_rpcs;
@@ -178,6 +180,20 @@ fn signing_error_status(err: anyhow::Error, message: &str) -> Status {
     }
     error!(error = ?err, "{message}");
     Status::internal(message.to_string())
+}
+
+/// The template collision guard's refusal for a caller who may not read the
+/// job (see `enforce_template_collision_guard`). It depends only on the job
+/// name and the template, never on the job's state, so it reads the same
+/// whatever is stored under the name.
+pub(crate) fn template_collision_denied(job_name: &str, template: &str) -> Status {
+    Status::permission_denied(format!(
+        "permission denied: a run of template '{template}' may create job '{job_name}' or \
+         update it only while its latest config came from that template; any other write \
+         to it needs job:write on the job\n\
+         Hint: ask for job:write on '{job_name}', or render a job name of your own \
+         (docs/job-templates.md, \"The collision guard\")"
+    ))
 }
 
 pub(crate) fn map_store_error(action: &str, err: anyhow::Error) -> Status {
@@ -3401,6 +3417,11 @@ impl ManagerDaemonService {
     /// plain `job:write` on the job name. Without this, any template whose
     /// rendered job name is user-influenced would let a template-only
     /// identity overwrite unrelated jobs.
+    ///
+    /// The refusal names the collision ("already exists") only to a caller
+    /// who may read the job anyway. Anyone else gets a `PERMISSION_DENIED`
+    /// that states the rule without saying whether the job exists, so the
+    /// guard is not a cheaper existence probe than `job:read` would be.
     fn enforce_template_collision_guard(
         &self,
         identity: &AclIdentity,
@@ -3429,11 +3450,21 @@ impl ManagerDaemonService {
         if identity.allows(AclResource::Job, AclAction::Write, &AclScope::job(job_name)) {
             return Ok(());
         }
-        Err(Status::failed_precondition(format!(
-            "job '{job_name}' already exists and was not created from template \
-             '{}'; updating it through this template requires job:write on the job",
-            template.name
-        )))
+        // Read scope as the read endpoints build it: the job's stored
+        // provenance feeds `templates`-scoped read rules.
+        let read_scope = AclScope::job(job_name).with_template(
+            provenance
+                .as_ref()
+                .map(|provenance| provenance.name.clone()),
+        );
+        if identity.allows(AclResource::Job, AclAction::Read, &read_scope) {
+            return Err(Status::failed_precondition(format!(
+                "job '{job_name}' already exists and was not created from template \
+                 '{}'; updating it through this template requires job:write on the job",
+                template.name
+            )));
+        }
+        Err(template_collision_denied(job_name, &template.name))
     }
 
     /// Join gate for worker registration: when ACLs are enforced, callers
@@ -4346,6 +4377,13 @@ impl ManagerDaemonService {
     /// a worker would: KV credentials are read directly from the store the
     /// manager owns. Identity-authed resolution needs token issuance (WI plan
     /// phases 2/4); until then it fails with the documented suggestion.
+    ///
+    /// The lookup goes to a host the job chose, from the manager, so it is
+    /// judged like a worker's fetch (docs/artifacts.md, "What the host guard
+    /// checks"): the fetcher resolves the host once, refuses loopback, the
+    /// unspecified address, link-local and cloud metadata, and the manager's
+    /// own addresses, and holds the connection to the addresses it judged.
+    /// The manager has no `hostGuard.allow`, so nothing opens those.
     fn resolve_pin(
         &self,
         spec: &crate::structs::ArtifactSpec,
@@ -4376,7 +4414,10 @@ impl ManagerDaemonService {
             .lock()
             .expect("fetcher registry")
             .fetcher(&parsed.scheme)?;
-        let limits = FetchLimits::default();
+        let limits = FetchLimits {
+            egress: Some(Arc::new(manager_pin_guard())),
+            ..FetchLimits::default()
+        };
         let redacted = spec.redacted_source();
         let request = FetchRequest {
             scheme: &parsed.scheme,
@@ -4387,9 +4428,22 @@ impl ManagerDaemonService {
             credential: credential.as_ref(),
             limits: &limits,
         };
-        fetcher
-            .resolve(&request)?
-            .with_context(|| format!("{redacted} has no resolvable identity"))
+        let resolved = fetcher.resolve(&request).map_err(|err| {
+            // The fetcher's refusal names the worker's `hostGuard.allow`,
+            // which does not apply here.
+            if format!("{err:#}").contains("the host guard refuses") {
+                err.context(format!(
+                    "the manager will not look up {redacted} at submit: its host guard \
+                     refuses loopback, link-local and cloud metadata addresses, and the \
+                     manager's own, and no setting opens them for a pin lookup. Pin the \
+                     digest or commit yourself, or set resolve: \"always\" so the worker \
+                     resolves it, where hostGuard.allow applies"
+                ))
+            } else {
+                err
+            }
+        })?;
+        resolved.with_context(|| format!("{redacted} has no resolvable identity"))
     }
 
     /// Set the debounce window for KV-driven job reconciliation
@@ -4568,6 +4622,39 @@ pub(crate) fn reconcile_missing_rollouts(store: &Store) -> anyhow::Result<u64> {
         }
     }
     Ok(created)
+}
+
+/// Move a job's allocations from the config before `new_job_config_id` to
+/// it, without replacing them, when the two schedule the same way (a KV
+/// re-render changes only env and file content). `false` when there is no
+/// previous config or the two are not schedule-equivalent; nothing moved.
+fn move_allocations_in_place(
+    store: &Store,
+    job_id: &str,
+    new_job_config_id: &str,
+) -> Result<bool, Status> {
+    let Some(previous) = store
+        .previous_job_config_id(new_job_config_id)
+        .map_err(|e| map_store_error("Error loading previous job config", e))?
+    else {
+        return Ok(false);
+    };
+    if !store
+        .job_configs_schedule_equivalent(&previous, new_job_config_id)
+        .map_err(|e| map_store_error("Error comparing job configs", e))?
+    {
+        return Ok(false);
+    }
+    let moved = store
+        .migrate_allocations_to_job_config(&previous, new_job_config_id)
+        .map_err(|e| map_store_error("Error updating allocations in place", e))?;
+    info!(
+        job_id = %job_id,
+        job_config_id = %new_job_config_id,
+        allocations = moved.len(),
+        "KV change applied to the allocations in place"
+    );
+    Ok(true)
 }
 
 fn create_rollout_for_update(
@@ -4924,68 +5011,65 @@ fn reconcile_kv_changes(store: &Store, changes: &[(String, bool)]) -> Result<(),
             };
 
         match action {
-            KvInjectionAction::None => {}
+            KvInjectionAction::None => {
+                // Nothing is replaced and nothing is rewritten: the running
+                // allocations move to the new render in place, so whatever
+                // replaces them next starts from it. Left on the previous
+                // config, the job would match the signature
+                // `reconcile_missing_rollouts` repairs (a newest config with
+                // no allocations and no rollout), and that pass would roll
+                // it out. A failed job stays as it is: `job run` recovers it.
+                if job_status.as_deref() != Some("failed")
+                    && !move_allocations_in_place(store, &job_id, &new_job_config_id)?
+                {
+                    // Defensive: a KV re-render only changes env and file
+                    // content, which is always schedule-equivalent.
+                    warn!(
+                        job_id = %job_id,
+                        "KV re-render under onChange none changed scheduling inputs; \
+                         the next rollout pass will roll the job out"
+                    );
+                }
+            }
             KvInjectionAction::Update => {
                 // Repoint the running allocations at the re-rendered config
                 // without stopping them; their workers rewrite the marked
                 // files on the next heartbeat. Done here, synchronously,
                 // rather than through a `job_submit` eval: until the
                 // allocations move, the job matches the signature
-                // `reconcile_missing_rollouts` repairs (a newest config
-                // with no allocations and no rollout), and that pass would
+                // `reconcile_missing_rollouts` repairs, and that pass would
                 // turn this update into a rollout.
-                let previous = store
-                    .previous_job_config_id(&new_job_config_id)
-                    .map_err(|e| map_store_error("Error loading previous job config", e))?;
-                let in_place = match previous.as_deref() {
-                    Some(previous) => store
-                        .job_configs_schedule_equivalent(previous, &new_job_config_id)
-                        .map_err(|e| map_store_error("Error comparing job configs", e))?,
-                    None => false,
-                };
-                match previous {
-                    Some(previous) if in_place => {
-                        let moved = store
-                            .migrate_allocations_to_job_config(&previous, &new_job_config_id)
-                            .map_err(|e| {
-                                map_store_error("Error updating allocations in place", e)
-                            })?;
-                        info!(
-                            job_id = %job_id,
-                            job_config_id = %new_job_config_id,
-                            allocations = moved.len(),
-                            "KV update applied in place"
-                        );
-                    }
+                if !move_allocations_in_place(store, &job_id, &new_job_config_id)? {
                     // Defensive: a files-only re-render is always
                     // schedule-equivalent. If it ever is not, fall back to a
                     // rollout rather than strand the allocations.
-                    _ => {
-                        warn!(
-                            job_id = %job_id,
-                            "KV update changed scheduling inputs; rolling out instead"
-                        );
-                        let is_manual = create_rollout_for_update(
-                            store,
-                            &job_id,
-                            previous.as_deref(),
-                            &new_job_config_id,
-                            &updated_config,
-                            "Error creating rollout for kv update",
-                        )?;
-                        if !is_manual {
-                            store
-                                .enqueue_eval(
-                                    "rollout_tick",
-                                    Some(&job_id),
-                                    Some(&new_job_config_id),
-                                    None,
-                                    Some(store.default_eval_priority),
-                                )
-                                .map_err(|e| {
-                                    map_store_error("Error scheduling kv update rollout", e)
-                                })?;
-                        }
+                    let previous = store
+                        .previous_job_config_id(&new_job_config_id)
+                        .map_err(|e| map_store_error("Error loading previous job config", e))?;
+                    warn!(
+                        job_id = %job_id,
+                        "KV update changed scheduling inputs; rolling out instead"
+                    );
+                    let is_manual = create_rollout_for_update(
+                        store,
+                        &job_id,
+                        previous.as_deref(),
+                        &new_job_config_id,
+                        &updated_config,
+                        "Error creating rollout for kv update",
+                    )?;
+                    if !is_manual {
+                        store
+                            .enqueue_eval(
+                                "rollout_tick",
+                                Some(&job_id),
+                                Some(&new_job_config_id),
+                                None,
+                                Some(store.default_eval_priority),
+                            )
+                            .map_err(|e| {
+                                map_store_error("Error scheduling kv update rollout", e)
+                            })?;
                     }
                 }
             }
@@ -5542,16 +5626,32 @@ impl Manager for ManagerDaemonService {
                 job_name: submitted.job_name.clone(),
                 job_config_id: submitted.job_config_id.clone(),
             };
-            self.store
-                .idempotency_record(
-                    &idempotency_key,
-                    "run_job_template",
-                    &serde_json::to_string(&record)
-                        .unwrap_or_else(|_| submitted.message.to_string()),
-                )
-                .map_err(|e| map_store_error("Error recording idempotency", e))?;
-            Ok::<_, Status>(submitted)
+            // A concurrent run with the same key that recorded first wins:
+            // resubmitting the same render resolved to `Unchanged`, so this
+            // caller is handed the winner's reply, as a retry would be.
+            let (recorded, deduplicated) = self.record_idempotent(
+                &idempotency_key,
+                "run_job_template",
+                serde_json::to_string(&record).unwrap_or_else(|_| submitted.message.to_string()),
+            )?;
+            Ok::<_, Status>((submitted, deduplicated.then_some(recorded)))
         })?;
+        let (submitted, winner) = submitted;
+        if let Some(recorded) = winner {
+            let record: TemplateRunRecord =
+                serde_json::from_str(&recorded).unwrap_or(TemplateRunRecord {
+                    message: recorded,
+                    job_name: String::new(),
+                    job_config_id: String::new(),
+                });
+            return Ok(Response::new(RunJobTemplateReply {
+                warnings: warnings_from_message(&record.message),
+                message: record.message,
+                deduplicated: true,
+                job_name: record.job_name,
+                job_config_id: record.job_config_id,
+            }));
+        }
 
         Ok(Response::new(RunJobTemplateReply {
             message: submitted.message_with_warnings(),
@@ -5990,9 +6090,25 @@ impl Manager for ManagerDaemonService {
             .insert_exec_key(&key)
             .map_err(|e| map_store_error("Error storing exec key", e))?;
         if !idempotency_key.is_empty() {
-            self.store
-                .idempotency_record(&idempotency_key, "create_exec_key", &key.id)
-                .map_err(|e| map_store_error("Error recording idempotency", e))?;
+            let (recorded, deduplicated) =
+                self.record_idempotent(&idempotency_key, "create_exec_key", key.id.clone())?;
+            // A concurrent create with the same key recorded first. Two keys
+            // where the caller asked for one is what the key exists to
+            // prevent, so this one is withdrawn and the winner's handed back.
+            if deduplicated {
+                self.store
+                    .delete_exec_key(&key.id)
+                    .map_err(|e| map_store_error("Error withdrawing duplicate exec key", e))?;
+                *self.exec_keys.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                let winner = self
+                    .store
+                    .get_exec_key(&recorded)
+                    .map_err(|e| map_store_error("Error loading exec key", e))?;
+                return Ok(Response::new(CreateExecKeyReply {
+                    key: winner,
+                    deduplicated: true,
+                }));
+            }
         }
         *self.exec_keys.lock().unwrap_or_else(|p| p.into_inner()) = None;
         info!(
@@ -6056,11 +6172,8 @@ impl Manager for ManagerDaemonService {
         self.store
             .delete_exec_key(&req.id)
             .map_err(|e| map_store_error("Error deleting exec key", e))?;
-        if !idempotency_key.is_empty() {
-            self.store
-                .idempotency_record(&idempotency_key, "delete_exec_key", &req.id)
-                .map_err(|e| map_store_error("Error recording idempotency", e))?;
-        }
+        let (_, deduplicated) =
+            self.record_idempotent(&idempotency_key, "delete_exec_key", req.id.clone())?;
         *self.exec_keys.lock().unwrap_or_else(|p| p.into_inner()) = None;
         info!(
             target: "exec_audit",
@@ -6069,9 +6182,7 @@ impl Manager for ManagerDaemonService {
             key_id = %req.id,
             "exec key deleted"
         );
-        Ok(Response::new(DeleteExecKeyReply {
-            deduplicated: false,
-        }))
+        Ok(Response::new(DeleteExecKeyReply { deduplicated }))
     }
     #[instrument(skip_all)]
     async fn list_job_actions(
@@ -6249,12 +6360,17 @@ impl Manager for ManagerDaemonService {
         let rollout = stop_rollout_state(&self.store, request.id, request.revert, priority)
             .map_err(|e| Status::invalid_argument(format!("Error stopping rollout: {e}")))?;
 
+        // The rollout's own message: a revert whose re-placement failed says
+        // so there, and that the previous version is being retried.
+        let message = if !rollout.message.is_empty() {
+            rollout.message.clone()
+        } else if request.revert {
+            "Rollout stopped and reverted".to_string()
+        } else {
+            "Rollout stopped".to_string()
+        };
         Ok(Response::new(StopRolloutReply {
-            message: if request.revert {
-                "Rollout stopped and reverted".to_string()
-            } else {
-                "Rollout stopped".to_string()
-            },
+            message,
             rollout: Some(rollout),
         }))
     }
@@ -6966,12 +7082,14 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Error stopping job", e))?;
 
         let message = format!("Stopped {}", name);
-        self.store
-            .idempotency_record(&idempotency_key, "stop_job", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        // A concurrent stop with the same key that recorded first wins; a
+        // second stop changed nothing, so this caller is told it was
+        // deduplicated.
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "stop_job", message)?;
         let reply = StopJobReply {
             message,
-            deduplicated: false,
+            deduplicated,
         };
 
         Ok(Response::new(reply))
@@ -7143,12 +7261,11 @@ impl Manager for ManagerDaemonService {
 
         // TODO: Conditionalize
         let message = format!("Destroyed {}", name);
-        self.store
-            .idempotency_record(&idempotency_key, "destroy_job", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "destroy_job", message)?;
         let reply = DestroyJobReply {
             message,
-            deduplicated: false,
+            deduplicated,
         };
 
         Ok(Response::new(reply))
@@ -7195,21 +7312,7 @@ impl Manager for ManagerDaemonService {
             .idempotency_lookup(&idempotency_key)
             .map_err(|e| map_store_error("Error checking idempotency", e))?
         {
-            // Recorded as `<id>`, or `<id> <snapshot>` for a create from a
-            // snapshot (ids never contain spaces).
-            let (instance_id, restoring_from) = recorded
-                .split_once(' ')
-                .map(|(id, snapshot)| (id.to_string(), snapshot.to_string()))
-                .unwrap_or((recorded, String::new()));
-            return Ok(Response::new(CreateInstanceReply {
-                instance_id,
-                deduplicated: true,
-                restoring_from,
-                mode: InstanceMode::Keyed.to_string(),
-                durable: true,
-                node_id: String::new(),
-                state: String::new(),
-            }));
+            return Ok(Response::new(create_instance_replay(recorded)));
         }
 
         let config = keyed_job_config(&self.store, &inner.job_id)?;
@@ -7292,42 +7395,56 @@ impl Manager for ManagerDaemonService {
         let instance_id = self
             .store
             .scheduler_group_commit("create_instance", move |s| {
-                let instance_id = match seed_snapshot.as_deref() {
-                    Some(snapshot_id) => {
-                        let requested: Vec<String> = requested.into_iter().collect();
-                        let mint = u32::from(requested.is_empty());
-                        s.create_keyed_instances_from_snapshot(
-                            &job_id,
-                            &group,
-                            &task_name,
-                            &requested,
-                            mint,
-                            snapshot_id,
-                        )?
-                        .into_iter()
-                        .next()
-                        .context("create from snapshot created nothing")?
-                    }
-                    None => {
-                        s.create_keyed_instance(&job_id, &group, &task_name, requested.as_deref())?
+                claimed_body(s, |s| {
+                    let instance_id = match seed_snapshot.as_deref() {
+                        Some(snapshot_id) => {
+                            let requested: Vec<String> = requested.into_iter().collect();
+                            let mint = u32::from(requested.is_empty());
+                            s.create_keyed_instances_from_snapshot(
+                                &job_id,
+                                &group,
+                                &task_name,
+                                &requested,
+                                mint,
+                                snapshot_id,
+                            )?
+                            .into_iter()
+                            .next()
+                            .context("create from snapshot created nothing")?
+                        }
+                        None => {
+                            s.create_keyed_instance(
+                                &job_id,
+                                &group,
+                                &task_name,
+                                requested.as_deref(),
+                            )?
                             .instance_id
-                    }
-                };
-                s.enqueue_eval(
-                    "job_reschedule",
-                    Some(&job_id),
-                    Some(&config_id),
-                    None,
-                    Some(priority),
-                )?;
-                let recorded = match seed_snapshot.as_deref() {
-                    Some(snapshot_id) => format!("{instance_id} {snapshot_id}"),
-                    None => instance_id.clone(),
-                };
-                s.idempotency_record(&key, "create_instance", &recorded)?;
-                Ok(instance_id)
-            })
-            .map_err(|e| map_store_error("Error creating instance", e))?;
+                        }
+                    };
+                    s.enqueue_eval(
+                        "job_reschedule",
+                        Some(&job_id),
+                        Some(&config_id),
+                        None,
+                        Some(priority),
+                    )?;
+                    let recorded = match seed_snapshot.as_deref() {
+                        Some(snapshot_id) => format!("{instance_id} {snapshot_id}"),
+                        None => instance_id.clone(),
+                    };
+                    // Claimed in the same entry: a concurrent create with this
+                    // key that committed first rolls this one back, so the key
+                    // never yields two instances.
+                    claim_idempotency_key(s, &key, "create_instance", &recorded)?;
+                    Ok(instance_id)
+                })
+            });
+        let instance_id =
+            match self.claimed_write(&idempotency_key, "Error creating instance", instance_id)? {
+                Ok(instance_id) => instance_id,
+                Err(recorded) => return Ok(Response::new(create_instance_replay(recorded))),
+            };
 
         Ok(Response::new(CreateInstanceReply {
             instance_id,
@@ -7382,22 +7499,7 @@ impl Manager for ManagerDaemonService {
             .idempotency_lookup(&idempotency_key)
             .map_err(|e| map_store_error("Error checking idempotency", e))?
         {
-            // The recorded replay is the comma-joined created ids (the id
-            // charset cannot contain commas, so the join is unambiguous),
-            // then ` <snapshot>` for a create from a snapshot.
-            let (ids, restoring_from) = recorded
-                .split_once(' ')
-                .map(|(ids, snapshot)| (ids.to_string(), snapshot.to_string()))
-                .unwrap_or((recorded, String::new()));
-            return Ok(Response::new(CreateInstancesReply {
-                instance_ids: ids
-                    .split(',')
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                deduplicated: true,
-                restoring_from,
-            }));
+            return Ok(Response::new(create_instances_replay(recorded)));
         }
 
         if inner.instance_ids.is_empty() && inner.count == 0 {
@@ -7493,34 +7595,40 @@ impl Manager for ManagerDaemonService {
         let created = self
             .store
             .scheduler_group_commit("create_instances", move |s| {
-                let created = match seed_snapshot.as_deref() {
-                    Some(snapshot_id) => s.create_keyed_instances_from_snapshot(
-                        &job_id,
-                        &group,
-                        &task_name,
-                        &requested,
-                        count,
-                        snapshot_id,
-                    )?,
-                    None => {
-                        s.create_keyed_instances(&job_id, &group, &task_name, &requested, count)?
-                    }
-                };
-                s.enqueue_eval(
-                    "job_reschedule",
-                    Some(&job_id),
-                    Some(&config_id),
-                    None,
-                    Some(priority),
-                )?;
-                let recorded = match seed_snapshot.as_deref() {
-                    Some(snapshot_id) => format!("{} {snapshot_id}", created.join(",")),
-                    None => created.join(","),
-                };
-                s.idempotency_record(&key, "create_instances", &recorded)?;
-                Ok(created)
-            })
-            .map_err(|e| map_store_error("Error creating instances", e))?;
+                claimed_body(s, |s| {
+                    let created = match seed_snapshot.as_deref() {
+                        Some(snapshot_id) => s.create_keyed_instances_from_snapshot(
+                            &job_id,
+                            &group,
+                            &task_name,
+                            &requested,
+                            count,
+                            snapshot_id,
+                        )?,
+                        None => s.create_keyed_instances(
+                            &job_id, &group, &task_name, &requested, count,
+                        )?,
+                    };
+                    s.enqueue_eval(
+                        "job_reschedule",
+                        Some(&job_id),
+                        Some(&config_id),
+                        None,
+                        Some(priority),
+                    )?;
+                    let recorded = match seed_snapshot.as_deref() {
+                        Some(snapshot_id) => format!("{} {snapshot_id}", created.join(",")),
+                        None => created.join(","),
+                    };
+                    claim_idempotency_key(s, &key, "create_instances", &recorded)?;
+                    Ok(created)
+                })
+            });
+        let created =
+            match self.claimed_write(&idempotency_key, "Error creating instances", created)? {
+                Ok(created) => created,
+                Err(recorded) => return Ok(Response::new(create_instances_replay(recorded))),
+            };
 
         Ok(Response::new(CreateInstancesReply {
             instance_ids: created,
@@ -7620,18 +7728,29 @@ impl Manager for ManagerDaemonService {
         let message = self
             .store
             .scheduler_group_commit("stop_instance", move |s| {
-                let message = match s.stop_keyed_instance(&instance_id)? {
-                    StopInstanceOutcome::Stopped { .. } => {
-                        format!("Stopped instance {instance_id}")
-                    }
-                    StopInstanceOutcome::AlreadyStopped => {
-                        format!("Instance {instance_id} already stopped")
-                    }
-                };
-                s.idempotency_record(&key, "stop_instance", &message)?;
-                Ok(message)
-            })
-            .map_err(|e| map_store_error("Error stopping instance", e))?;
+                claimed_body(s, |s| {
+                    let message = match s.stop_keyed_instance(&instance_id)? {
+                        StopInstanceOutcome::Stopped { .. } => {
+                            format!("Stopped instance {instance_id}")
+                        }
+                        StopInstanceOutcome::AlreadyStopped => {
+                            format!("Instance {instance_id} already stopped")
+                        }
+                    };
+                    claim_idempotency_key(s, &key, "stop_instance", &message)?;
+                    Ok(message)
+                })
+            });
+        let message =
+            match self.claimed_write(&idempotency_key, "Error stopping instance", message)? {
+                Ok(message) => message,
+                Err(recorded) => {
+                    return Ok(Response::new(StopInstanceReply {
+                        message: recorded,
+                        deduplicated: true,
+                    }))
+                }
+            };
         // A stop discards an archived checkpoint like any other.
         if let Some(url) = manifest_url.as_deref() {
             archive::delete_manifest_logged(&self.store, url, &inner.instance_id).await;
@@ -7722,7 +7841,8 @@ impl Manager for ManagerDaemonService {
             // The row is back, so the manifest is no longer the record: a
             // later destroy must not leave it to resume the id again.
             archive::delete_manifest_logged(&self.store, &url, &inner.instance_id).await;
-            return Ok(Response::new(recorded.into_reply(false)));
+            let deduplicated = recorded.deduplicated;
+            return Ok(Response::new(recorded.into_reply(deduplicated)));
         };
         acl::enforce(
             &identity,
@@ -7789,7 +7909,8 @@ impl Manager for ManagerDaemonService {
             if let Some(url) = manifest_url.as_deref() {
                 archive::delete_manifest_logged(&self.store, url, &inner.instance_id).await;
             }
-            return Ok(Response::new(recorded.into_reply(false)));
+            let deduplicated = recorded.deduplicated;
+            return Ok(Response::new(recorded.into_reply(deduplicated)));
         }
 
         // One scheduler-lane entry: the start, its placement eval (placed
@@ -7806,37 +7927,47 @@ impl Manager for ManagerDaemonService {
         let message = self
             .store
             .scheduler_group_commit("start_instance", move |s| {
-                let message = match s.start_keyed_instance(&instance_id)? {
-                    StartInstanceOutcome::Started => {
-                        s.enqueue_eval(
-                            "job_reschedule",
-                            Some(&job_id),
-                            Some(&config_id),
-                            None,
-                            Some(priority),
-                        )?;
-                        format!("Started instance {instance_id}")
-                    }
-                    StartInstanceOutcome::BackoffLifted => {
-                        s.enqueue_eval(
-                            "job_reschedule",
-                            Some(&job_id),
-                            Some(&config_id),
-                            None,
-                            Some(priority),
-                        )?;
-                        format!(
+                claimed_body(s, |s| {
+                    let message = match s.start_keyed_instance(&instance_id)? {
+                        StartInstanceOutcome::Started => {
+                            s.enqueue_eval(
+                                "job_reschedule",
+                                Some(&job_id),
+                                Some(&config_id),
+                                None,
+                                Some(priority),
+                            )?;
+                            format!("Started instance {instance_id}")
+                        }
+                        StartInstanceOutcome::BackoffLifted => {
+                            s.enqueue_eval(
+                                "job_reschedule",
+                                Some(&job_id),
+                                Some(&config_id),
+                                None,
+                                Some(priority),
+                            )?;
+                            format!(
                             "Retrying instance {instance_id} now: lifted its reschedule backoff"
                         )
-                    }
-                    StartInstanceOutcome::AlreadyRunning => {
-                        format!("Instance {instance_id} already running")
-                    }
-                };
-                s.idempotency_record(&key, "start_instance", &message)?;
-                Ok(message)
-            })
-            .map_err(|e| map_store_error("Error starting instance", e))?;
+                        }
+                        StartInstanceOutcome::AlreadyRunning => {
+                            format!("Instance {instance_id} already running")
+                        }
+                    };
+                    claim_idempotency_key(s, &key, "start_instance", &message)?;
+                    Ok(message)
+                })
+            });
+        let message =
+            match self.claimed_write(&idempotency_key, "Error starting instance", message)? {
+                Ok(message) => message,
+                Err(recorded) => {
+                    return Ok(Response::new(
+                        suspend_rpcs::RecordedStart::from_record(recorded).into_reply(true),
+                    ))
+                }
+            };
 
         Ok(Response::new(StartInstanceReply {
             message,
@@ -7920,15 +8051,29 @@ impl Manager for ManagerDaemonService {
             let message = format!("Destroyed instance {}", inner.instance_id);
             let key = idempotency_key.clone();
             let recorded = message.clone();
-            self.store
+            // Deleting the manifest again is what a second request did, so
+            // a lost claim only changes what this caller is told.
+            let committed = self
+                .store
                 .scheduler_group_commit("destroy_instance", move |s| {
-                    s.idempotency_record(&key, "destroy_instance", &recorded)
-                })
-                .map_err(|e| map_store_error("Error destroying instance", e))?;
-            return Ok(Response::new(DestroyInstanceReply {
-                message,
-                deduplicated: false,
-            }));
+                    claim_idempotency_key(s, &key, "destroy_instance", &recorded)
+                });
+            return Ok(Response::new(
+                match self.claimed_write(
+                    &idempotency_key,
+                    "Error destroying instance",
+                    committed,
+                )? {
+                    Ok(()) => DestroyInstanceReply {
+                        message,
+                        deduplicated: false,
+                    },
+                    Err(recorded) => DestroyInstanceReply {
+                        message: recorded,
+                        deduplicated: true,
+                    },
+                },
+            ));
         };
         acl::enforce(
             &identity,
@@ -7951,18 +8096,29 @@ impl Manager for ManagerDaemonService {
         let message = self
             .store
             .scheduler_group_commit("destroy_instance", move |s| {
-                let message = match s.destroy_keyed_instance(&instance_id)? {
-                    DestroyInstanceOutcome::Destroyed { .. } => {
-                        format!("Destroyed instance {instance_id}")
-                    }
-                    DestroyInstanceOutcome::AlreadyTerminated => {
-                        format!("Instance {instance_id} already terminated")
-                    }
-                };
-                s.idempotency_record(&key, "destroy_instance", &message)?;
-                Ok(message)
-            })
-            .map_err(|e| map_store_error("Error destroying instance", e))?;
+                claimed_body(s, |s| {
+                    let message = match s.destroy_keyed_instance(&instance_id)? {
+                        DestroyInstanceOutcome::Destroyed { .. } => {
+                            format!("Destroyed instance {instance_id}")
+                        }
+                        DestroyInstanceOutcome::AlreadyTerminated => {
+                            format!("Instance {instance_id} already terminated")
+                        }
+                    };
+                    claim_idempotency_key(s, &key, "destroy_instance", &message)?;
+                    Ok(message)
+                })
+            });
+        let message =
+            match self.claimed_write(&idempotency_key, "Error destroying instance", message)? {
+                Ok(message) => message,
+                Err(recorded) => {
+                    return Ok(Response::new(DestroyInstanceReply {
+                        message: recorded,
+                        deduplicated: true,
+                    }))
+                }
+            };
         // An archived instance's checkpoint went with it.
         if let Some(url) = manifest_url.as_deref() {
             archive::delete_manifest_logged(&self.store, url, &inner.instance_id).await;
@@ -8085,13 +8241,12 @@ impl Manager for ManagerDaemonService {
             "Replacing instance {}: freed allocation {alloc_id} on lost node {}",
             inner.instance_id, allocation.node_id
         );
-        self.store
-            .idempotency_record(&idempotency_key, "replace_instance", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "replace_instance", message)?;
 
         Ok(Response::new(ReplaceInstanceReply {
             message,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -8599,19 +8754,32 @@ impl Manager for ManagerDaemonService {
                 volume.volume_id, volume.driver
             )
         };
+        let mut message = message;
+        let mut deduplicated = false;
         if !idempotency_key.is_empty() {
-            if let Err(err) =
-                self.store
-                    .idempotency_record(&idempotency_key, "DeleteVolume", &message)
+            match self
+                .store
+                .idempotency_record(&idempotency_key, "DeleteVolume", &message)
             {
-                warn!(error = ?err, "Failed recording idempotency key for DeleteVolume");
+                Ok(true) => {}
+                // A concurrent delete with the same key recorded first; a
+                // second delete of the same volume changed nothing.
+                Ok(false) => {
+                    deduplicated = true;
+                    if let Ok(Some(recorded)) = self.store.idempotency_lookup(&idempotency_key) {
+                        message = recorded;
+                    }
+                }
+                Err(err) => {
+                    warn!(error = ?err, "Failed recording idempotency key for DeleteVolume");
+                }
             }
         }
 
         Ok(Response::new(DeleteVolumeReply {
             volume: Some(volume_info(volume)),
             message,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -9932,14 +10100,13 @@ impl Manager for ManagerDaemonService {
         };
         info!(%node_id, %availability, evict, "Node availability changed");
 
-        self.store
-            .idempotency_record(&idempotency_key, "set_node_availability", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "set_node_availability", message)?;
 
         Ok(Response::new(SetNodeAvailabilityReply {
             node: Some(node.into()),
             message,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -10727,13 +10894,23 @@ impl Manager for ManagerDaemonService {
         // The keyring loop starts the background rewrap right away.
         self.store.keyring().wake();
         let message = json!({ "keyId": row.key_id, "retiredKeyId": retired_key_id }).to_string();
-        self.store
-            .idempotency_record(&idempotency_key, "rotate_data_key", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        // A concurrent rotation with the same key recorded first, and this
+        // one ran too: the keyring rotated twice. The reply names the key
+        // that is active now (this one's), not the winner's, which this
+        // rotation retired.
+        let (_, deduplicated) =
+            self.record_idempotent(&idempotency_key, "rotate_data_key", message)?;
+        if deduplicated {
+            warn!(
+                key_id = %row.key_id,
+                "A concurrent RotateDataKey with the same idempotency key also rotated; the \
+                 keyring rotated twice"
+            );
+        }
         Ok(Response::new(RotateDataKeyReply {
             key_id: row.key_id,
             retired_key_id,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -10769,14 +10946,14 @@ impl Manager for ManagerDaemonService {
             .run_rewrap(req.plaintext)
             .map_err(|e| map_store_error("Error rewrapping kv values", e))?;
         let message = json!({ "rewrapped": run.rewrapped, "remaining": run.remaining }).to_string();
-        self.store
-            .idempotency_record(&idempotency_key, "rewrap_kv", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        // A rewrap pass converges, so a concurrent one with the same key
+        // only changes what this caller is told; its own counts stand.
+        let (_, deduplicated) = self.record_idempotent(&idempotency_key, "rewrap_kv", message)?;
         Ok(Response::new(RewrapKvReply {
             rewrapped: run.rewrapped,
             remaining: run.remaining,
             collected_keys: run.collected_keys,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -10819,14 +10996,13 @@ impl Manager for ManagerDaemonService {
             .rewrap_root_key()
             .map_err(|e| map_store_error("Error rewrapping the KV keyring", e))?;
         let message = json!({ "keys": outcome.rows, "rootKeyId": outcome.root_key_id }).to_string();
-        self.store
-            .idempotency_record(&idempotency_key, "rewrap_root_key", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (_, deduplicated) =
+            self.record_idempotent(&idempotency_key, "rewrap_root_key", message)?;
         Ok(Response::new(RewrapRootKeyReply {
             keys: outcome.rows as i64,
             root_key_id: outcome.root_key_id,
             skipped: outcome.skipped,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 
@@ -12822,13 +12998,22 @@ impl Manager for ManagerDaemonService {
             revoked: u32::try_from(revoked).unwrap_or(u32::MAX),
             deduplicated: false,
         };
-        self.store
-            .idempotency_record(
-                &idempotency_key,
-                "revoke_grant",
-                &serde_json::to_string(&reply).unwrap_or_else(|_| reply.message.clone()),
-            )
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        // A concurrent revoke with the same key that recorded first did the
+        // revoking (this one found nothing left): hand back its reply.
+        let (recorded, deduplicated) = self.record_idempotent(
+            &idempotency_key,
+            "revoke_grant",
+            serde_json::to_string(&reply).unwrap_or_else(|_| reply.message.clone()),
+        )?;
+        if deduplicated {
+            let mut winner: RevokeGrantReply =
+                serde_json::from_str(&recorded).unwrap_or(RevokeGrantReply {
+                    message: recorded,
+                    ..Default::default()
+                });
+            winner.deduplicated = true;
+            return Ok(Response::new(winner));
+        }
         Ok(Response::new(reply))
     }
 
@@ -13119,22 +13304,6 @@ impl Manager for ManagerDaemonService {
         let jti = minted.record.jti.clone();
         tracing::Span::current().record("jti", jti.as_str());
 
-        self.store
-            .insert_boot_ticket(&minted.record)
-            .map_err(|e| map_store_error("Error recording boot ticket", e))?;
-        self.store.events().boot_ticket_issued(
-            &minted.record.jti,
-            &minted.record.job,
-            &minted.record.task,
-            &minted.record.job_config_id,
-            &minted.record.instance_id,
-            &minted.record.instance_prefix,
-            &minted.record.pool,
-            &minted.record.gate,
-            &minted.record.accessor_id,
-            minted.record.expires_at_unix,
-        );
-
         let reply = IssueBootTicketReply {
             ticket: minted.token,
             jti: minted.record.jti.clone(),
@@ -13151,9 +13320,45 @@ impl Manager for ManagerDaemonService {
             expires_at_unix: reply.expires_at_unix,
         })
         .map_err(|e| Status::internal(format!("failed to record idempotency: {e}")))?;
-        self.store
-            .idempotency_record(&idempotency_key, "issue_boot_ticket", &record)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        // The ticket row and the idempotency claim commit together: a
+        // concurrent mint with the same key that recorded first rolls this
+        // one back, so its ticket never becomes spendable (a ticket is good
+        // only while its row exists) and the caller is handed the winner's.
+        let ticket_row = minted.record.clone();
+        let key = idempotency_key.clone();
+        let committed = self
+            .store
+            .scheduler_group_commit("issue_boot_ticket", move |s| {
+                claimed_body(s, |s| {
+                    s.insert_boot_ticket(&ticket_row)?;
+                    claim_idempotency_key(s, &key, "issue_boot_ticket", &record)
+                })
+            });
+        if let Err(recorded) =
+            self.claimed_write(&idempotency_key, "Error recording boot ticket", committed)?
+        {
+            let winner: MintedTicketRecord = serde_json::from_str(&recorded)
+                .map_err(|e| Status::internal(format!("corrupt idempotency record: {e}")))?;
+            return Ok(Response::new(IssueBootTicketReply {
+                ticket: winner.ticket,
+                jti: winner.jti,
+                job_config_id: winner.job_config_id,
+                expires_at_unix: winner.expires_at_unix,
+                deduplicated: true,
+            }));
+        }
+        self.store.events().boot_ticket_issued(
+            &minted.record.jti,
+            &minted.record.job,
+            &minted.record.task,
+            &minted.record.job_config_id,
+            &minted.record.instance_id,
+            &minted.record.instance_prefix,
+            &minted.record.pool,
+            &minted.record.gate,
+            &minted.record.accessor_id,
+            minted.record.expires_at_unix,
+        );
 
         info!(jti = %reply.jti, job = %req.job, task = %req.task, "Boot ticket issued");
         Ok(Response::new(reply))
@@ -13464,6 +13669,55 @@ fn request_fingerprint(request: &impl serde::Serialize) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// The host guard the manager judges its own `resolve = "pin"` lookups with:
+/// the guard's built-in classes (loopback, unspecified, link-local, cloud
+/// metadata) and this manager's interface addresses, with no `allow` or
+/// `deny` entries (those are worker settings).
+fn manager_pin_guard() -> crate::structs::host_guard::HostGuard {
+    let guard = crate::structs::host_guard::HostGuard::default();
+    guard.set_node_addrs(crate::structs::host_guard::interface_addresses());
+    guard
+}
+
+/// The reply a keyed `CreateInstance` replays from its idempotency record:
+/// `<id>`, or `<id> <snapshot>` for a create from a snapshot (ids never
+/// contain spaces).
+fn create_instance_replay(recorded: String) -> CreateInstanceReply {
+    let (instance_id, restoring_from) = recorded
+        .split_once(' ')
+        .map(|(id, snapshot)| (id.to_string(), snapshot.to_string()))
+        .unwrap_or((recorded, String::new()));
+    CreateInstanceReply {
+        instance_id,
+        deduplicated: true,
+        restoring_from,
+        mode: InstanceMode::Keyed.to_string(),
+        durable: true,
+        node_id: String::new(),
+        state: String::new(),
+    }
+}
+
+/// The reply a keyed `CreateInstances` replays from its idempotency record:
+/// the comma-joined created ids (the id charset cannot contain commas, so
+/// the join is unambiguous), then ` <snapshot>` for a create from a
+/// snapshot.
+fn create_instances_replay(recorded: String) -> CreateInstancesReply {
+    let (ids, restoring_from) = recorded
+        .split_once(' ')
+        .map(|(ids, snapshot)| (ids.to_string(), snapshot.to_string()))
+        .unwrap_or((recorded, String::new()));
+    CreateInstancesReply {
+        instance_ids: ids
+            .split(',')
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .collect(),
+        deduplicated: true,
+        restoring_from,
+    }
 }
 
 /// The scope a volume write is checked against. A job's volume belongs to
@@ -18241,6 +18495,119 @@ mod tests {
             files[0]["liveUpdate"],
             json!({ "changeMode": "signal", "changeSignal": "SIGHUP", "splay": "5s" })
         );
+        Ok(())
+    }
+
+    /// UpsertNetPlugin re-checks the jobs that use the plugin, as it does the
+    /// policies: a change a running job could no longer be submitted with
+    /// is refused and names the job; a compatible change and a stopped job
+    /// pass.
+    #[tokio::test]
+    async fn upsert_net_plugin_rechecks_jobs_that_use_it_test() -> R<()> {
+        use crate::structs::netplugin::NetPluginObject;
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let object = |stages: Value, usable_by: &str| -> Value {
+            json!({
+                "name": "meter",
+                "module": {
+                    "source": "https://x/meter.wasm",
+                    "checksum": format!("sha256:{}", "c".repeat(64))
+                },
+                "stages": stages,
+                "usableBy": usable_by,
+            })
+        };
+        let mut stored: NetPluginObject =
+            serde_json::from_value(object(json!(["request"]), "jobs"))?;
+        stored.normalize_and_validate()?;
+        store.upsert_net_plugin(stored)?;
+        run_jobspec(
+            &manager,
+            json!({
+                "name": "metered",
+                "task": {
+                    "runtime": "exec",
+                    "config": { "command": ["echo", "hi"] },
+                    "connect": { "upstreams": [{
+                        "name": "openai",
+                        "to": "https://api.openai.com",
+                        "handlers": [{ "plugin": { "name": "meter" } }]
+                    }] }
+                }
+            }),
+        )
+        .await?;
+        let upsert = |object: Value, dry_run: bool| {
+            let manager = &manager;
+            async move {
+                manager
+                    .upsert_net_plugin(Request::new(UpsertNetPluginRequest {
+                        object_json: object.to_string(),
+                        dry_run,
+                        idempotency_key: None,
+                    }))
+                    .await
+            }
+        };
+
+        // No longer usable by jobs: refused, dry run or not, naming the job.
+        for dry_run in [true, false] {
+            let err = upsert(object(json!(["request"]), "policies"), dry_run)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+            assert!(err.message().contains("job 'metered'"), "{err:?}");
+            assert!(err.message().contains("usableBy"), "{err:?}");
+        }
+        // A compatible change is applied.
+        upsert(object(json!(["request", "response"]), "jobs"), false).await?;
+        // A stopped job is not held to it; its next run is.
+        manager.store.stop_job("metered")?;
+        upsert(object(json!(["request"]), "policies"), false).await?;
+        Ok(())
+    }
+
+    /// `onChange = "none"` stores the re-rendered config and replaces
+    /// nothing: the running allocations move to it in place (so the next
+    /// replacement starts from the new render), and the failover pass that
+    /// repairs an acknowledged update with no rollout finds nothing to do.
+    #[tokio::test]
+    async fn kv_put_with_on_change_none_never_becomes_a_rollout_test() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+
+        put_kv_entry(&manager, "none/key", "v1").await?;
+        run_jobspec(
+            &manager,
+            watched_env_jobspec("kv-none", "none/key", "none", "none"),
+        )
+        .await?;
+        insert_node(&store, "node-1")?;
+        let first_config = store.get_job_config("kv-none")?.id();
+        let (task_id, _) = store
+            .get_task_configs_for_job_config(&first_config)?
+            .into_iter()
+            .next()
+            .context("task config")?;
+        let alloc = store.place_alloc("node-1", task_id)?;
+
+        put_kv_entry(&manager, "none/key", "v2").await?;
+
+        let latest = store.get_job_config("kv-none")?;
+        assert_ne!(latest.id(), first_config, "the new render is stored");
+        assert_eq!(task_env_value(&store, "kv-none", 0, "WATCHED")?, "v2");
+        let moved = store
+            .allocs_for_job("kv-none")?
+            .into_iter()
+            .find(|candidate| candidate.id == alloc.id)
+            .context("allocation must survive a none put")?;
+        assert_eq!(moved.job_config_id, latest.id());
+        assert_eq!(evals_of_kind(&store, "kv-none", "job_update")?, 0);
+        assert_eq!(evals_of_kind(&store, "kv-none", "rollout_tick")?, 0);
+        assert!(store.list_rollouts(Some("kv-none"), false)?.is_empty());
+        assert_eq!(reconcile_missing_rollouts(&store)?, 0);
+        assert!(store.list_rollouts(Some("kv-none"), false)?.is_empty());
         Ok(())
     }
 

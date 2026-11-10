@@ -2121,6 +2121,13 @@ async fn start_node_status_checker(store: Store, config: LivenessCheckerConfig) 
                 ),
                 Err(err) => warn!(error = ?err, "Failed sweeping orphaned allocation_health rows"),
             }
+            // node_alloc_usage rows of departed nodes, on the scheduler-lane
+            // leader (a no-op elsewhere). A cache, so failures only delay it.
+            match store.prune_node_alloc_usage_orphans() {
+                Ok(0) => {}
+                Ok(swept) => info!(swept, "Swept node_alloc_usage rows of removed nodes"),
+                Err(err) => warn!(error = ?err, "Failed sweeping node_alloc_usage rows"),
+            }
             // An object's status rows (Status lane) outlive its delete
             // (Control lane); swept here once they are past a grace period
             // (docs/app-objects.md, "Status").
@@ -2943,6 +2950,71 @@ fn publish_concurrency_metrics(state: &crate::manager::concurrency::ConcurrencyS
         .set(state.ewma_goodput.unwrap_or(0.0));
 }
 
+/// Recovery a manager process runs once when it starts as the scheduler's
+/// writer (the scheduler-lane leader in raft mode, always in `local_disk`
+/// and `streaming` mode): drop superseded evals, requeue the ones a crash
+/// left claimed, give every blocked eval one more look, and re-derive the
+/// work replicated state still describes but nothing has queued.
+///
+/// The last step is what heals a crash between two writes of a multi-step
+/// operation, such as a lost-node reschedule that removed allocations and
+/// died before it reconciled them. A raft cluster runs the same
+/// reconciliation on every leadership acquisition; without it here, a
+/// single-node manager would never run it at all.
+fn recover_scheduler_at_startup(store: &Store) -> R<()> {
+    // Stale rows referencing superseded configs are dropped BEFORE the
+    // requeue: reviving them would execute old-config work and suppress
+    // regeneration for the same jobs (see Store::prune_stale_evals).
+    let pruned = store.prune_stale_evals()?;
+    if pruned > 0 {
+        warn!(
+            pruned,
+            "Dropped stale evals for superseded job configs at startup"
+        );
+    }
+    let requeued = store.requeue_in_flight_evals()?;
+    if requeued > 0 {
+        warn!(requeued, "Recovered stale in-flight evals at startup");
+        store.events().scheduler_recovered(requeued);
+    }
+    // A fresh process has no capacity-event log to replay, so every
+    // blocked eval gets one more look (docs/scheduler-and-eval-loop.md,
+    // "Blocked evals").
+    match store.wake_all_blocked_evals() {
+        Ok(0) => {}
+        Ok(woken) => info!(woken, "Returned blocked evals to the queue at startup"),
+        Err(err) => warn!(error = ?err, "Failed waking blocked evals at startup"),
+    }
+    reconcile_scheduling_state(store, "startup");
+    Ok(())
+}
+
+/// Re-derive scheduling work from replicated state (belt-and-braces, plan
+/// §7-C2 JC-41): create rollouts an update lost, then enqueue an eval for
+/// every scope whose state still needs work and has none queued. Every
+/// regenerated eval is an idempotent pass. Best effort: failures are logged.
+fn reconcile_scheduling_state(store: &Store, trigger: &'static str) {
+    // Missing rollouts are derived BEFORE eval regeneration (plan §8, D1):
+    // once a job's rollout exists, the regeneration pass excludes the job
+    // from its blanket `job_submit` fallback — which places the new config
+    // at full count with no canary/manual gating — so the order is what
+    // preserves rollout semantics for updates whose scheduler-lane tail was
+    // lost.
+    match crate::manager::server::reconcile_missing_rollouts(store) {
+        Ok(created) if created > 0 => info!(trigger, created, "Created missing rollouts"),
+        Ok(_) => {}
+        Err(err) => warn!(trigger, error = ?err, "Failed reconciling missing rollouts"),
+    }
+    match store.regenerate_scheduling_evals() {
+        Ok(enqueued) if enqueued > 0 => info!(
+            trigger,
+            enqueued, "Reconciled pending scheduling evals from replicated state"
+        ),
+        Ok(_) => {}
+        Err(err) => warn!(trigger, error = ?err, "Failed regenerating scheduling evals"),
+    }
+}
+
 #[instrument(err, skip_all)]
 async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     let max_threads = max_threads.max(1);
@@ -2958,29 +3030,7 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     if is_raft_follower {
         info!("Skipping in-flight eval requeue on raft non-leader manager");
     } else {
-        // Stale rows referencing superseded configs are dropped BEFORE the
-        // requeue: reviving them would execute old-config work and suppress
-        // regeneration for the same jobs (see Store::prune_stale_evals).
-        let pruned = store.prune_stale_evals()?;
-        if pruned > 0 {
-            warn!(
-                pruned,
-                "Dropped stale evals for superseded job configs at startup"
-            );
-        }
-        let requeued = store.requeue_in_flight_evals()?;
-        if requeued > 0 {
-            warn!(requeued, "Recovered stale in-flight evals at startup");
-            store.events().scheduler_recovered(requeued);
-        }
-        // A fresh process has no capacity-event log to replay, so every
-        // blocked eval gets one more look (docs/scheduler-and-eval-loop.md,
-        // "Blocked evals").
-        match store.wake_all_blocked_evals() {
-            Ok(0) => {}
-            Ok(woken) => info!(woken, "Returned blocked evals to the queue at startup"),
-            Err(err) => warn!(error = ?err, "Failed waking blocked evals at startup"),
-        }
+        recover_scheduler_at_startup(&store)?;
         store.events().scheduler_started(max_threads);
     }
     // Raft mode: queue recovery must survive leader FAILOVER, not just
@@ -3033,36 +3083,7 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
                             "Failed requeuing in-flight evals after leadership acquisition"
                         ),
                     }
-                    // Missing rollouts are derived BEFORE eval regeneration
-                    // (plan §8, D1): once a job's rollout exists, the
-                    // regeneration pass excludes the job from its blanket
-                    // `job_submit` fallback — which places the new config at
-                    // full count with no canary/manual gating — so the order
-                    // is what preserves rollout semantics for updates whose
-                    // scheduler-lane tail was lost.
-                    match crate::manager::server::reconcile_missing_rollouts(&recovery_store) {
-                        Ok(created) if created > 0 => info!(
-                            created,
-                            "Created missing rollouts after raft leadership acquisition"
-                        ),
-                        Ok(_) => {}
-                        Err(err) => warn!(
-                            error = ?err,
-                            "Failed reconciling missing rollouts after leadership acquisition"
-                        ),
-                    }
-                    match recovery_store.regenerate_scheduling_evals() {
-                        Ok(enqueued) if enqueued > 0 => info!(
-                            enqueued,
-                            "Reconciled pending scheduling evals after raft leadership \
-                             acquisition (belt-and-braces, plan §7-C2 JC-41)"
-                        ),
-                        Ok(_) => {}
-                        Err(err) => warn!(
-                            error = ?err,
-                            "Failed regenerating scheduling evals after leadership acquisition"
-                        ),
-                    }
+                    reconcile_scheduling_state(&recovery_store, "leadership_acquisition");
                 }
                 was_leader = is_leader;
             }
@@ -3232,6 +3253,9 @@ async fn eval_worker_loop(
     // scheduler-lane rounds: the round that finished the last batch also
     // claimed this one. Empty means "ask the queue".
     let mut claimed_ahead: Vec<Eval> = Vec::new();
+    // The claim epoch `claimed_ahead` was taken in (store/eval_claims.rs,
+    // "Claim epochs").
+    let mut claimed_ahead_epoch = 0_u64;
     loop {
         // Leader-only scheduling (raft mode, JC-41): the eval queue is
         // REPLICATED — followers hold every eval row but never ACT on the
@@ -3281,7 +3305,7 @@ async fn eval_worker_loop(
         // resized, only how many of its members may plan at once.
         let claim_started = std::time::Instant::now();
         let carried_ahead = !claimed_ahead.is_empty();
-        let (batch, mut permit, throttled) = if carried_ahead {
+        let (batch, claim_epoch, mut permit, throttled) = if carried_ahead {
             // Already ours, claimed by the previous round's fused
             // settle-and-claim (and already metered by that round). If any of
             // it plans, WAIT for a permit rather than run over the limit: the
@@ -3293,7 +3317,7 @@ async fn eval_worker_loop(
             } else {
                 None
             };
-            (batch, permit, false)
+            (batch, claimed_ahead_epoch, permit, false)
         } else {
             let admission = crate::manager::concurrency::gate().admit();
             let throttled = admission.is_throttled();
@@ -3305,7 +3329,7 @@ async fn eval_worker_loop(
             // the claims themselves were what serialized the loop.
             let store_for_claim = store.clone();
             let claimed = tokio::task::spawn_blocking(move || {
-                claim_eval_batch(&store_for_claim, throttled, batch_limits)
+                claim_eval_batch_in_epoch(&store_for_claim, throttled, batch_limits)
             })
             .await
             .unwrap_or_else(|join_error| {
@@ -3314,8 +3338,8 @@ async fn eval_worker_loop(
             crate::manager::telemetry::metrics()
                 .eval_queue_round_seconds
                 .observe(&["claim"], claim_started.elapsed().as_secs_f64());
-            let batch = match claimed {
-                Ok(batch) => batch,
+            let (batch, claim_epoch) = match claimed {
+                Ok(claimed) => claimed,
                 Err(e) => {
                     error!(
                         worker_id,
@@ -3341,7 +3365,7 @@ async fn eval_worker_loop(
             crate::manager::telemetry::metrics()
                 .eval_claim_total
                 .inc(&[if batch.is_empty() { "empty" } else { "claimed" }]);
-            (batch, admission.into_permit(), throttled)
+            (batch, claim_epoch, admission.into_permit(), throttled)
         };
 
         if batch.is_empty() {
@@ -3471,9 +3495,13 @@ async fn eval_worker_loop(
             let store_for_settle = store.clone();
             let completions_for_attempt = completions.clone();
             let settle_started = std::time::Instant::now();
+            // Settled only while still claimed in the epoch this batch was
+            // claimed in: a handler that outlived a leadership flap must not
+            // write over a newer claim of its eval.
             let outcome = tokio::task::spawn_blocking(move || {
-                store_for_settle.complete_evals_and_claim_next(
+                store_for_settle.complete_claimed_evals_and_claim_next(
                     completions_for_attempt,
+                    claim_epoch,
                     batch_limits,
                     scope,
                 )
@@ -3486,9 +3514,10 @@ async fn eval_worker_loop(
                 .eval_queue_round_seconds
                 .observe(&["settle"], settle_started.elapsed().as_secs_f64());
             match outcome {
-                Ok(next) => {
+                Ok((next, next_epoch)) => {
                     note_narrow_claim(scope, &next);
                     claimed_ahead = next;
+                    claimed_ahead_epoch = next_epoch;
                     error_backoff = ERROR_BACKOFF_MIN;
                     break;
                 }
@@ -3513,7 +3542,10 @@ async fn eval_worker_loop(
                         // Nothing was written, so every member is still a
                         // `pending` row. Drop the claims so it runs again
                         // rather than sitting held forever.
-                        store.release_eval_claims(batch.iter().map(|eval| eval.id.as_str()));
+                        store.release_eval_claims_from_epoch(
+                            batch.iter().map(|eval| eval.id.as_str()),
+                            claim_epoch,
+                        );
                         break;
                     }
                 }
@@ -3522,7 +3554,10 @@ async fn eval_worker_loop(
         // A member whose handler panicked has no observed outcome and was
         // left out of the settle; releasing its claim lets it run again
         // instead of staying held (settled members are already released).
-        store.release_eval_claims(batch.iter().map(|eval| eval.id.as_str()));
+        // Only claims still from this batch's epoch: a newer claim of the
+        // same eval belongs to whoever took it.
+        store
+            .release_eval_claims_from_epoch(batch.iter().map(|eval| eval.id.as_str()), claim_epoch);
         // The permit ends with the batch; a carried-ahead batch asks again.
         drop(permit);
     }
@@ -3554,10 +3589,21 @@ fn note_narrow_claim(scope: ClaimScope, batch: &[Eval]) {
 /// `tests/adaptive_scheduler_concurrency.rs` drives this function rather than
 /// testing a copy of it.
 pub fn claim_eval_batch(store: &Store, throttled: bool, limits: EvalBatchLimits) -> R<Vec<Eval>> {
+    Ok(claim_eval_batch_in_epoch(store, throttled, limits)?.0)
+}
+
+/// [`claim_eval_batch`], also returning the claim epoch the batch was taken
+/// in, which the eval loop settles it against
+/// ([`Store::complete_claimed_evals_and_claim_next`]).
+pub fn claim_eval_batch_in_epoch(
+    store: &Store,
+    throttled: bool,
+    limits: EvalBatchLimits,
+) -> R<(Vec<Eval>, u64)> {
     let scope = claim_scope(throttled);
-    let batch = store.claim_evals(limits, scope)?;
+    let (batch, epoch) = store.claim_evals_in_epoch(limits, scope)?;
     note_narrow_claim(scope, &batch);
-    Ok(batch)
+    Ok((batch, epoch))
 }
 
 /// Wait until the gate admits this worker, for a batch it already holds.
@@ -3738,8 +3784,8 @@ pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> Eva
         kind = %eval.kind,
         "Dispatching claimed eval"
     );
-    let (result, settled) =
-        crate::storage::store::with_eval_settle_scope(eval, || eval.handle(store));
+    let (result, exit) = crate::storage::store::with_eval_settle_scope(eval, || eval.handle(store));
+    let settled = exit.settled;
     crate::manager::telemetry::metrics()
         .evals_processed_total
         .inc(&[&eval.kind, if result.is_ok() { "ok" } else { "error" }]);
@@ -3756,6 +3802,22 @@ pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> Eva
             );
             clear_not_leader_attempts(&eval.id);
             EvalCompletion::Settled
+        }
+        // The handler found nothing to do and looks again later (a rollout
+        // tick waiting on health, capacity, or a backoff): back to pending
+        // with no event, rather than an `eval.completed` and an
+        // `eval.enqueued` per poll.
+        Ok(message) if exit.quiet_requeue.is_some() => {
+            let delay = exit.quiet_requeue.unwrap_or_default();
+            debug!(
+                worker_id,
+                eval_id = %eval.id,
+                kind = %eval.kind,
+                delay_ms = delay.as_millis() as u64,
+                "Eval {} found nothing to do; requeued quietly: {}", eval.id, message
+            );
+            clear_not_leader_attempts(&eval.id);
+            EvalCompletion::Released { delay, event: None }
         }
         Ok(message) => {
             info!(
@@ -4769,6 +4831,76 @@ mod tests {
         let store = Store::start_storage(&store_config)?;
         store.reset_all_tables()?;
         Ok(store)
+    }
+
+    /// Single-node (`local_disk`) mode has no leadership acquisition, so
+    /// startup is where a crash mid-reschedule heals: the allocations were
+    /// removed and the process died before it reconciled the job, leaving
+    /// replicated state that describes missing replicas and an empty queue.
+    #[test]
+    fn startup_recovery_heals_a_crash_mid_reschedule_in_local_mode() -> R<()> {
+        use crate::structs::job::{JobConfig, TaskConfig, TaskCount};
+        use crate::structs::Submission;
+
+        let store = setup_store()?;
+        assert!(store.raft_status().is_none(), "local_disk mode");
+        store.insert_node(NodeMsg {
+            config_attrs: r#"{"maxAllocations":10,"resources":{}}"#.into(),
+            fingerprint_attrs:
+                r#"{"memory_total":"4294967296","cpus":{"cpu-1":{"frequency":2400.0}}}"#.into(),
+            ..node_msg("w1", rfc3339_seconds_ago(0)?)
+        })?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "healme".into(),
+            tasks: vec![TaskConfig {
+                resources: serde_json::json!({ "memory": 64 }),
+                count: TaskCount::new(2),
+                ..TaskConfig::new("svc", "noop")
+            }],
+            version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "healme.ncl".into(),
+                content: "healme".into(),
+                is_primary: true,
+            }],
+        )?;
+        let drain = |store: &Store| -> R<()> {
+            let mut handled = 0;
+            while let Some(eval) = store.claim_eval()? {
+                let ok = eval.handle(store).is_ok();
+                store.complete_eval(&eval.id, ok)?;
+                handled += 1;
+                assert!(handled < 50, "queue not draining");
+            }
+            Ok(())
+        };
+        let config_id = store.get_job_config("healme")?.id();
+        store.enqueue_eval("job_submit", Some("healme"), Some(&config_id), None, None)?;
+        drain(&store)?;
+        assert_eq!(store.get_allocs()?.len(), 2, "placed before the crash");
+
+        // The crash: the reschedule's first write landed, its reconcile
+        // never ran, and nothing is queued.
+        store.remove_allocs_for_node("w1")?;
+        assert!(store.get_allocs()?.is_empty());
+        assert!(store.claim_eval()?.is_none(), "nothing queued to heal it");
+
+        recover_scheduler_at_startup(&store)?;
+        drain(&store)?;
+        assert_eq!(
+            store.get_allocs()?.len(),
+            2,
+            "startup recovery re-derived the missing replicas"
+        );
+        Ok(())
     }
 
     fn rfc3339_seconds_ago(seconds: i64) -> R<String> {

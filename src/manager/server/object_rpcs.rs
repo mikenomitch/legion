@@ -1316,9 +1316,8 @@ impl ManagerDaemonService {
                 "Object applied"
             );
         }
-        self.store
-            .idempotency_record(&idempotency_key, "apply_object", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "apply_object", message)?;
         Ok(Response::new(ApplyObjectReply {
             object: Some(self.read_proto(&row, Some(&kind), &mut seen)?),
             created,
@@ -1326,7 +1325,7 @@ impl ManagerDaemonService {
             diff,
             warnings,
             message,
-            deduplicated: false,
+            deduplicated,
             dry_run: false,
         }))
     }
@@ -1746,12 +1745,11 @@ impl ManagerDaemonService {
             accessor_id = identity.accessor_id.as_deref().unwrap_or("-"),
             "Object delete"
         );
-        self.store
-            .idempotency_record(&idempotency_key, "delete_object", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "delete_object", message)?;
         Ok(Response::new(DeleteObjectReply {
             message,
-            deduplicated: false,
+            deduplicated,
             object: Some(object),
             deleted,
             deleting,
@@ -2313,13 +2311,12 @@ impl ManagerDaemonService {
             if written { "written" } else { "unchanged" },
             inner.observed_generation
         );
-        self.store
-            .idempotency_record(&idempotency_key, "update_object_status", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "update_object_status", message)?;
         Ok(Response::new(UpdateObjectStatusReply {
             object: Some(reply_object(self, &row)?),
             written,
-            deduplicated: false,
+            deduplicated,
             message,
         }))
     }
@@ -2392,12 +2389,11 @@ impl ManagerDaemonService {
             .events()
             .object_deleted(&event_ref(&row, kind.access.as_str()), &identity.principal);
         let message = format!("{qualified} {id}: released and deleted");
-        self.store
-            .idempotency_record(&idempotency_key, "release_object", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) =
+            self.record_idempotent(&idempotency_key, "release_object", message)?;
         Ok(Response::new(ReleaseObjectReply {
             message,
-            deduplicated: false,
+            deduplicated,
         }))
     }
 }

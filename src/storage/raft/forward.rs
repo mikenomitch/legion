@@ -191,6 +191,15 @@ pub(crate) enum ForwardableLaneWrite {
     EmitEvent {
         draft: crate::storage::events::EventDraft,
     },
+    /// `Store::append_audit_events` — status lane. A batch of audit
+    /// journal records from a manager that leads no lane (every follower in
+    /// the default `single` topology): the denials and validation errors it
+    /// answered itself (docs/audit-journal.md, "Durability"). The records
+    /// travel whole; their ids are minted by the origin, so a retried
+    /// forward inserts nothing twice (`INSERT OR IGNORE`).
+    AppendAudit {
+        records: Vec<crate::storage::governance_store::AuditRecord>,
+    },
     /// `Store::resize_envelope` — scheduler lane. A node's elastic envelope
     /// resize, from its heartbeat, which can land on any manager. Returns
     /// the outcome.
@@ -211,7 +220,8 @@ impl ForwardableLaneWrite {
             | ForwardableLaneWrite::MarkNodeLost { .. }
             | ForwardableLaneWrite::AllocationHealthSnapshots { .. }
             | ForwardableLaneWrite::SetTaskStatus { .. }
-            | ForwardableLaneWrite::EmitEvent { .. } => Lane::Status,
+            | ForwardableLaneWrite::EmitEvent { .. }
+            | ForwardableLaneWrite::AppendAudit { .. } => Lane::Status,
             ForwardableLaneWrite::SyncNodeAvailability { .. }
             | ForwardableLaneWrite::MarkJobFailed { .. }
             | ForwardableLaneWrite::UpsertManagerConfig { .. }
@@ -258,6 +268,7 @@ impl ForwardableLaneWrite {
             ForwardableLaneWrite::ApplySnapshotReport { .. } => "apply_snapshot_report",
             ForwardableLaneWrite::BeginSuspend { .. } => "begin_suspend",
             ForwardableLaneWrite::EmitEvent { .. } => "emit_event",
+            ForwardableLaneWrite::AppendAudit { .. } => "append_audit_events",
             ForwardableLaneWrite::ResizeEnvelope { .. } => "resize_envelope",
         }
     }
@@ -404,6 +415,9 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
         }
         ForwardableLaneWrite::BeginSuspend { new } => done(store.begin_suspend_local(new)),
         ForwardableLaneWrite::EmitEvent { draft } => done(store.emit_event_on(Lane::Status, draft)),
+        ForwardableLaneWrite::AppendAudit { records } => {
+            done(store.append_audit_events_on(Lane::Status, records))
+        }
         ForwardableLaneWrite::ResizeEnvelope { node_id, request } => {
             done(store.resize_envelope_local(&node_id, &request))
         }
@@ -528,6 +542,16 @@ mod tests {
                     suspend_reason: Some("idle".into()),
                     durability: crate::structs::snapshot::SnapshotDurability::Local,
                 },
+            },
+            ForwardableLaneWrite::AppendAudit {
+                records: vec![crate::storage::governance_store::AuditRecord {
+                    id: "a1".into(),
+                    ts_ms: 1,
+                    operation: "RunJob".into(),
+                    kind: "denied".into(),
+                    outcome: "PERMISSION_DENIED".into(),
+                    ..Default::default()
+                }],
             },
             ForwardableLaneWrite::EmitEvent {
                 draft: crate::storage::events::EventDraft::warn("node.pressure", "evicted")

@@ -280,14 +280,20 @@ override `onChange` while inheriting `watch = true` from the task, or set
 `watch = false` to opt out entirely.
 
 A put resolves through `onChange` and a delete through `onDelete`. Edges with
-`watch = false` (the default) never act. A put still refreshes the rendered
-value in the stored desired config, and the task picks it up on its next
-restart or update. When one KV change matches several edges of a job, the
+`watch = false` (the default) never act: a put to their key is handled as
+`none` below. When one KV change matches several edges of a job, the
 strongest action wins: `none < update < restart < rollout < fail`.
 
 Actions:
 
-- `none`: re-render and store the desired state. Nothing is scheduled.
+- `none`: re-render and store the desired state, and replace nothing. The
+  running allocations are moved to the new config in place (like `update`,
+  but no file is rewritten and no signal is sent), so they keep running with
+  the values they started with. The new value reaches a task only when its
+  allocation is next replaced: a `restart` or `rollout` from another edge or
+  a later `job run`, a rescheduling after a node failure, or any other
+  placement. A running process never sees it. On a `failed` job, nothing
+  moves (see below).
 - `update` (files only): re-render, then rewrite the file under the running
   task and apply its `changeMode`. The allocation is not replaced. See
   [Live file updates](#live-file-updates).

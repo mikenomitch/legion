@@ -761,6 +761,19 @@ task still places right away. Holds are replicated, so every manager reports
 them, and the move history they record survives a manager restart or a
 change of leader.
 
+A hold belongs to the task, not to one version of the job. When a
+[rollout](rollouts.md) replaces a version whose allocation failed, the new
+version's replacement of that task (matched by group and task name) waits out
+the same hold instead of placing at once, so a crash-looping task does not
+get an undelayed retry from every resubmit. The rollout group reports
+`Group <name> waiting for <task> (<n>) to wait out a reschedule backoff` and
+looks again when the hold lapses. The wait is not a capacity block:
+`capacityBlockTimeout` does not run during it. The backoff chain and the
+`moveCount` budget are still counted per version, so a new version's first
+failure starts a new chain at `moveDelay`. To place the new version without
+waiting, `legion job run <spec> --force-reschedule` drops the holds as
+described below.
+
 Operators see a deferred replacement in three places:
 
 - an `allocation.reschedule_deferred` event (warn) per deferral, with the

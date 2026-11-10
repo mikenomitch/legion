@@ -172,8 +172,9 @@ neighbor rules a cause in or out, and which knob to turn), see
 - **`legion_evals_unblocked_total{event}`** (counter): blocked evals returned
   to the pending queue, by what woke them: `register`, `node` (pool,
   availability, or attributes changed), `ready`, `freed` (allocations left a
-  node), `missed` (capacity appeared while the eval ran, so it never
-  blocked), `startup`, or `timeout` (a gang past its `placementTimeout`,
+  node), `recovered` (a changeset projection failed, so every available node
+  counted as changed), `missed` (capacity appeared while the eval ran, so it
+  never blocked), `startup`, or `timeout` (a gang past its `placementTimeout`,
   woken for its last attempt).
 - **`legion_blocked_wait_seconds`** (histogram): how long a blocked eval
   waited, from the entry that blocked it to the one that woke it. Buckets run
@@ -413,7 +414,8 @@ while admitted work is still placing.
   [approvals and rate limits](approvals-and-rate-limits.md)).
   `audit_written` counts journaled records; `audit_dropped` records lost
   to a full queue or a failed batch (alert on any); `audit_unjournaled`
-  records a follower that leads no raft lane logged to the `audit`
+  records a follower that leads no raft lane could not forward to a lane
+  leader (no leader known, or unreachable) and logged to the `audit`
   tracing target instead; `rate_limited`, `approval_required`,
   `approval_invalid` and `approval_used` count the gates' answers.
 

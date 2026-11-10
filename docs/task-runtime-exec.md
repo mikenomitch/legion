@@ -62,6 +62,13 @@ Optional:
   symlinks. The worker creates alloc and task directories as owner-only to
   isolate allocations on a node from each other. The tree has to be handed
   over so the lower-privilege process can use its own cwd and artifacts.
+  Each `local-dir` volume the task mounts is handed over the same way: its
+  per-volume directory (`<state dir>/local-volumes/<volume_id>/`, owner-only)
+  and the data inside it (`$LEGION_VOLUME_<NAME>`). The data tree is walked
+  only when its top directory is not the user's already, so a restart on a
+  large volume costs one `stat`. A `host`, `nfs`, or `tmpfs` volume is never
+  chowned: its owner is the operator's to set. A `local-dir` volume used by
+  `exec` tasks with different `user`s belongs to whichever started last.
   The worker needs the privileges to chown to another user, and to set
   uid/gid at all.
 - `oom_adj` / `oom_score_adj` (linux): one of these, range `-1000..1000`.

@@ -134,6 +134,17 @@ pub trait PersistenceDriver: Send + Sync + Debug {
         self.start()
     }
 
+    /// Whether this backend checkpoints the SQLite WAL itself, so the
+    /// store must not run its own background checkpointer
+    /// (`Store::spawn_wal_checkpointer`). Only streaming with a replica
+    /// does: rustyriver, like Litestream, decides when the WAL is
+    /// checkpointed, because frames checkpointed and then overwritten by a
+    /// WAL restart before it captured them break its LTX chain and force a
+    /// full snapshot. Every other backend leaves it to the store.
+    fn owns_wal_checkpointing(&self) -> bool {
+        false
+    }
+
     fn status(&self) -> PersistenceStatus;
 
     /// Why this manager must not write right now, or `None` when it may.
@@ -490,6 +501,15 @@ impl PersistenceDriver for StreamingPersistenceDriver {
             },
             lease_held,
         }
+    }
+
+    /// rustyriver owns checkpointing on the primary whenever there is a
+    /// replica to ship to (`start_replication` skips it without one). A
+    /// standby writes almost nothing until it is promoted and starts
+    /// rustyriver, and the write connection's raised `wal_autocheckpoint`
+    /// still bounds its WAL, so the choice is made once, at startup.
+    fn owns_wal_checkpointing(&self) -> bool {
+        !self.cfg.replica_url.trim().is_empty()
     }
 
     fn write_refusal(&self) -> Option<String> {
@@ -1075,6 +1095,32 @@ mod tests {
         assert_eq!(status.backend, "local_disk");
         assert_eq!(status.role, PersistenceRole::Primary);
         assert!(status.lease_held);
+    }
+
+    /// rustyriver owns WAL checkpointing only in streaming mode with a
+    /// replica; every other configuration keeps the store's checkpointer.
+    #[test]
+    fn only_streaming_with_a_replica_owns_wal_checkpointing() {
+        let path = std::path::PathBuf::from("/tmp/store.sqlite");
+        let streaming = |replica_url: &str| {
+            let mut config = PersistenceConfigFull {
+                r#type: PersistenceType::Streaming,
+                ..Default::default()
+            };
+            config.streaming.replica_url = replica_url.to_string();
+            build_persistence_driver(&config, path.clone(), "mgr").owns_wal_checkpointing()
+        };
+        assert!(streaming("s3://bucket/legion"));
+        assert!(
+            !streaming("  "),
+            "no replica: rustyriver never opens the db"
+        );
+        let mut config = PersistenceConfigFull::default();
+        assert!(matches!(config.r#type, PersistenceType::LocalDisk));
+        config.streaming.replica_url = "s3://bucket/legion".into();
+        assert!(!build_persistence_driver(&config, path.clone(), "mgr").owns_wal_checkpointing());
+        config.r#type = PersistenceType::Raft;
+        assert!(!build_persistence_driver(&config, path.clone(), "mgr").owns_wal_checkpointing());
     }
 
     #[test]

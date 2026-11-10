@@ -76,6 +76,13 @@ pub struct ProxyTarget {
     pub addr: String,
     /// Prepend a PROXY v2 header (TCP) — `proxyProtocol`, default true.
     pub proxy_protocol: bool,
+    /// The picked endpoint terminates mesh TLS (the proxy service's port is
+    /// `mesh = true`): the node it runs on, whose certificate the dial
+    /// verifies. `None` for a plain endpoint or a sidecar `port`.
+    pub mesh_node: Option<String>,
+    /// The picked endpoint runs on another node (or this node's id is not
+    /// known yet). A sidecar `port` is never remote.
+    pub remote: bool,
 }
 
 /// What the handlers decided.
@@ -148,6 +155,37 @@ pub trait Handler: Send + Sync {
 /// The body type the HTTP paths answer with.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type HopBody = http_body_util::combinators::BoxBody<bytes::Bytes, BoxError>;
+
+/// A request body read for the body hops, up to their cap.
+pub enum CappedBody {
+    /// The whole body: at most the cap.
+    Whole(bytes::Bytes),
+    /// Larger than the cap: the bytes read so far, and the rest of the
+    /// client's stream, unread. Only a chain whose body hops all fail open
+    /// sends it on (unchecked); any other answers it locally.
+    Over(bytes::Bytes, hyper::body::Incoming),
+}
+
+/// Read `body` whole when it is at most `cap` bytes; past `cap`, stop and
+/// keep what was read with the unread rest, so the request can still go on.
+/// Trailers are dropped, as when a body is collected whole.
+pub async fn read_capped(
+    mut body: hyper::body::Incoming,
+    cap: u64,
+) -> Result<CappedBody, hyper::Error> {
+    use http_body_util::BodyExt;
+    let mut kept = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(data) = frame?.into_data() else {
+            continue;
+        };
+        kept.extend_from_slice(&data);
+        if kept.len() as u64 > cap {
+            return Ok(CappedBody::Over(kept.freeze(), body));
+        }
+    }
+    Ok(CappedBody::Whole(kept.freeze()))
+}
 
 /// The request head the HTTP-stage hops see, and a plugin may rewrite.
 #[derive(Debug, Clone, Default)]
@@ -1206,7 +1244,9 @@ mod tests {
             HopOutcome::Proxy(ProxyTarget {
                 source: "upstream/api#0".into(),
                 addr: "10.0.0.2:9000".into(),
-                proxy_protocol: false
+                proxy_protocol: false,
+                mesh_node: None,
+                remote: false,
             })
         );
         assert!(matches!(
