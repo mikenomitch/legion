@@ -148,6 +148,7 @@ mod node_group_rpcs;
 mod object_rpcs;
 mod plugin_rpcs;
 mod resize_rpcs;
+pub use resize_rpcs::MOVE_RESUME_TIMEOUT_MS;
 mod runtime_state_rpcs;
 mod scaling_objects;
 mod scaling_rpcs;
@@ -8665,6 +8666,15 @@ impl Manager for ManagerDaemonService {
         // ACL: `scale:write` on the instance's job, after a coarse
         // `scale:write` gate; enforced in `resize_instance_rpc`.
         self.resize_instance_rpc(request).await
+    }
+
+    #[instrument(err, skip_all, fields(job_id = %request.get_ref().job_id))]
+    async fn resize_task(
+        &self,
+        request: Request<crate::structs::ResizeTaskRequest>,
+    ) -> Result<Response<crate::structs::ResizeTaskReply>, Status> {
+        // ACL: `scale:write` on the job; enforced in `resize_task_rpc`.
+        self.resize_task_rpc(request).await
     }
 
     #[instrument(err, skip_all, fields(job_id = %request.get_ref().job_id))]

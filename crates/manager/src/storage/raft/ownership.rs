@@ -233,6 +233,10 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // reconciling `job_scale` eval is its own sequential scheduler-lane
     // enqueue, exactly the JC-33 wrapper-sequential shape stop_job uses.
     ("task_scale", Owner::Lane(Lane::Control)),
+    // The task-level size override (`legion job resize`) is arbitrated by
+    // the submit exactly as the count override is, so it is control-owned
+    // for the same reason. The scheduler lane only reads it.
+    ("task_resize", Owner::Lane(Lane::Control)),
     // Task autoscaling's state rides Control beside `task_scale` (plan
     // non-goal: no new lane): every autoscaler write is a `task_scale`
     // write plus its history row in one entry, and the defaults and pauses

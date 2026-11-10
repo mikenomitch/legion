@@ -1984,6 +1984,7 @@ impl<'a> Scheduler<'a> {
         // Count overrides apply to dry-run plans too, so `job plan` previews
         // what a submit would actually converge to (job id == job name).
         Self::apply_count_overrides(self.store, &job_config.name, &mut tasks)?;
+        Self::apply_resource_overrides(self.store, &job_config.name, &mut tasks)?;
         // Keyed tasks plan against live instances, not count.num, even for
         // not-yet-submitted configs (a fresh job simply has zero instances).
         Self::apply_keyed_instance_counts(self.store, &job_config.name, &mut tasks)?;
@@ -5598,6 +5599,7 @@ impl<'a> Scheduler<'a> {
             // comes from live instances and must win (scaling keyed tasks
             // is rejected at the ScaleTask RPC anyway).
             Self::apply_count_overrides(self.store, &job_id, &mut ready.ready)?;
+            Self::apply_resource_overrides(self.store, &job_id, &mut ready.ready)?;
             Self::apply_keyed_instance_counts(self.store, &job_id, &mut ready.ready)?;
         }
         Ok(ready)
@@ -5622,6 +5624,41 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
             *desired = store.effective_task_count(job_id, &task.group, &task.name, *desired)?;
+        }
+        Ok(())
+    }
+
+    /// Overlay size overrides (docs/resize.md): a task-level override
+    /// (`legion job resize`) replaces the spec's `memory`, `memoryMax`, and
+    /// `cpu` for everything this plan places, and a keyed task is packed at
+    /// the largest size any of its instances still waiting for an
+    /// allocation carries, so the node chosen has room for whichever one
+    /// binds. The row is written at the unit's exact size by the insert
+    /// (`Store::placement_size_tx`). Session envelopes are never resized
+    /// this way.
+    fn apply_resource_overrides(
+        store: &Store,
+        job_id: &str,
+        tasks: &mut [(i64, TaskConfig, u32)],
+    ) -> R<()> {
+        for (_task_id, task, _desired) in tasks.iter_mut() {
+            if crate::structs::session::envelope_serves(task).is_some() {
+                continue;
+            }
+            let keyed = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed);
+            let effective = store.effective_task_resources(
+                job_id,
+                &task.group,
+                &task.name,
+                &task.resources,
+                keyed,
+            )?;
+            if effective != task.resources {
+                task.resources = effective;
+            }
         }
         Ok(())
     }

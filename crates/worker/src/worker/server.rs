@@ -784,6 +784,16 @@ impl Worker for WorkerDaemonService {
                 ))
             }
         };
+        // A keyed session resize this node already applied is answered
+        // from what it kept, not applied again.
+        let keyed = (!request.dry_run && !request.session_id.is_empty())
+            .then(|| request.idempotency_key.clone())
+            .unwrap_or_default();
+        if let Some(kept) =
+            crate::worker::task_manager::resize::recall_resize(&request.session_id, &keyed)
+        {
+            return Ok(Response::new(kept));
+        }
         let size = requested_size(request.to.as_ref());
         let task_manager = self.task_manager.clone();
         let force = request.force;
@@ -800,7 +810,17 @@ impl Worker for WorkerDaemonService {
         .await
         .map_err(|err| Status::internal(format!("resize task failed: {err}")))?;
         match done {
-            Ok(done) => Ok(Response::new(wire_reply(&done, &self.node_id))),
+            Ok(done) => {
+                let reply = wire_reply(&done, &self.node_id);
+                if done.outcome == crate::structs::resize::ResizeOutcome::Applied {
+                    crate::worker::task_manager::resize::remember_resize(
+                        &request.session_id,
+                        &keyed,
+                        &reply,
+                    );
+                }
+                Ok(Response::new(reply))
+            }
             Err(err) => {
                 let status = resize_status(err);
                 // A session this node does not hold: say whose it is, as
@@ -945,6 +965,11 @@ impl Worker for WorkerDaemonService {
             cold,
             origin: "manager".into(),
             ticket_jti: String::new(),
+            resize: request
+                .resize
+                .as_ref()
+                .map(|to| crate::worker::task_manager::resize::requested_size(Some(to)))
+                .filter(|size| !size.is_empty()),
         };
         let outcome = tokio::task::spawn_blocking(move || {
             let _slot = slot;
@@ -1353,6 +1378,7 @@ impl WorkerDaemonService {
             cold: false,
             origin: "edge".into(),
             ticket_jti: claims.jti.clone(),
+            resize: None,
         };
         let mut outcome = self.run_move(move_request.clone(), None).await;
         let elsewhere = outcome.as_ref().err().and_then(running_elsewhere);

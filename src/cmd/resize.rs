@@ -1,6 +1,6 @@
-//! `legion alloc resize` and `legion instance resize` (docs/resize.md):
-//! change a running unit's `memory`, `memoryMax`, or `cpu` in place, as an
-//! override over the spec.
+//! `legion alloc resize`, `legion instance resize`, and `legion job resize`
+//! (docs/resize.md): change a running unit's, or every unit of a task's,
+//! `memory`, `memoryMax`, or `cpu` in place, as an override over the spec.
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
@@ -9,7 +9,8 @@ use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::resize::{json_amount, parse_memory_mib, ResourceSize};
 use crate::structs::{
-    ResizeAllocationRequest, ResizeInstanceRequest, ResizeReply, ResizeResources,
+    ResizeAllocationRequest, ResizeInstanceRequest, ResizeReply, ResizeResources, ResizeTaskReply,
+    ResizeTaskRequest,
 };
 
 /// The flags every resize form takes.
@@ -131,8 +132,204 @@ pub fn instance_resize_command() -> Command {
                     .long("local")
                     .action(ArgAction::SetTrue)
                     .help("From inside a task: resize one of this workload's own child sessions through its node's API socket, with no token (docs/child-sessions.md)"),
+            )
+            .arg(
+                Arg::new("move")
+                    .long("move")
+                    .action(ArgAction::SetTrue)
+                    .conflicts_with("local")
+                    .help("Resize by moving: suspend the unit and resume it at the new size on a node with room. For a keyed instance whose task has a suspend block, or a session with suspend.durability = \"store\"; also needs job:write"),
             ),
     )
+}
+
+/// `legion job resize`.
+pub fn job_resize_command() -> Command {
+    resize_args(
+        Command::new("resize")
+            .about(
+                "\
+                Resize every allocation of a task, without a deploy\n\
+                \n\
+                Sets a size override on the task (memory, memoryMax, cpu),\n\
+                laid over its spec the way `legion job scale` lays a count\n\
+                over it: no new job version and no rollout. Each running\n\
+                allocation is resized in place where its node and runtime\n\
+                allow; one that cannot change in place keeps its old size\n\
+                until it is next replaced, or is stopped and replaced now\n\
+                with --replace. New allocations start at the overridden\n\
+                size. A submit that changes the task's resources drops the\n\
+                override. --reset removes it. Needs scale:write on the job.\n\
+                \n\
+                Examples:\n\
+                  legion job resize web --memory 1GiB\n\
+                  legion job resize web --task api --cpu 2000 --replace -j\n\
+                  legion job resize web --reset\
+                ",
+            )
+            .arg(
+                Arg::new("job")
+                    .value_name("JOB")
+                    .help("Job name")
+                    .required(true),
+            )
+            .arg(
+                Arg::new("task")
+                    .long("task")
+                    .value_name("TASK")
+                    .help("The task to resize (optional when the job has one task)"),
+            )
+            .arg(
+                Arg::new("group")
+                    .long("group")
+                    .value_name("GROUP")
+                    .help("The task's group, when the task name is not unique in the job"),
+            )
+            .arg(
+                Arg::new("reset")
+                    .long("reset")
+                    .action(ArgAction::SetTrue)
+                    .conflicts_with_all(["memory", "memory-max", "cpu"])
+                    .help("Remove the override: back to the spec's size"),
+            )
+            .arg(
+                Arg::new("replace")
+                    .long("replace")
+                    .action(ArgAction::SetTrue)
+                    .help("Stop each allocation that cannot be resized in place, so its replacement is placed at the new size"),
+            ),
+    )
+}
+
+pub async fn resize_job(arg_matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(arg_matches);
+    let job_id = arg_matches
+        .get_one::<String>("job")
+        .context("Must provide a job name")?
+        .clone();
+    let reset = arg_matches.get_flag("reset");
+    let request = tonic::Request::new(ResizeTaskRequest {
+        job_id: job_id.clone(),
+        task_group: arg_matches
+            .get_one::<String>("group")
+            .cloned()
+            .unwrap_or_default(),
+        task_name: arg_matches
+            .get_one::<String>("task")
+            .cloned()
+            .unwrap_or_default(),
+        to: if reset {
+            None
+        } else {
+            Some(requested(format, arg_matches)?)
+        },
+        reset,
+        replace: arg_matches.get_flag("replace"),
+        reason: arg_matches
+            .get_one::<String>("reason")
+            .cloned()
+            .unwrap_or_default(),
+        force: arg_matches.get_flag("force"),
+        dry_run: arg_matches.get_flag("dry-run"),
+        idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
+    });
+    let mut client = connect_manager_client().await?;
+    let reply = output::resolve(
+        format,
+        "failed to resize task",
+        client.resize_task(request).await,
+    )?
+    .into_inner();
+    report_task(format, &reply);
+    Ok(())
+}
+
+/// One allocation's line in a task resize.
+fn allocation_entry(reply: &ResizeReply) -> Value {
+    let mut entry = json!({
+        "allocation": reply.allocation_id,
+        "node": reply.node_id,
+        "outcome": reply.outcome,
+        "from": parsed(&reply.from),
+        "to": parsed(&reply.to),
+    });
+    if !reply.instance_id.is_empty() {
+        entry["instance"] = json!(reply.instance_id);
+    }
+    if !reply.message.is_empty() {
+        entry["message"] = json!(reply.message);
+    }
+    if !reply.free.is_empty() {
+        entry["free"] = parsed(&reply.free);
+    }
+    entry
+}
+
+fn report_task(format: OutputFormat, reply: &ResizeTaskReply) {
+    let (from, to, spec) = (parsed(&reply.from), parsed(&reply.to), parsed(&reply.spec));
+    if format.is_json() {
+        let mut data = json!({
+            "job": reply.job_id,
+            "group": reply.task_group,
+            "task": reply.task_name,
+            "from": from,
+            "to": to,
+            "spec": spec,
+            "overrideActive": reply.override_active,
+            "applied": reply.applied,
+            "pending": reply.pending,
+            "replaced": reply.replaced,
+            "allocations": reply.allocations.iter().map(allocation_entry).collect::<Vec<_>>(),
+            "deduplicated": reply.deduplicated,
+        });
+        if reply.dry_run {
+            data["dryRun"] = json!(true);
+        }
+        if !reply.hint.is_empty() {
+            data["hint"] = json!(reply.hint);
+        }
+        output::print_success(&data);
+        return;
+    }
+    let label = format!("{}/{}", reply.job_id, reply.task_name);
+    let change = describe_change(&from, &to);
+    println!(
+        "{label}: {}{}{}",
+        if reply.dry_run { "would resize: " } else { "" },
+        if change.is_empty() {
+            "size unchanged".to_string()
+        } else {
+            change
+        },
+        if reply.override_active {
+            format!(" (override active; {})", describe_spec(&spec, &to))
+        } else {
+            " (at the spec's size; no override)".to_string()
+        }
+    );
+    println!(
+        "  allocations: {} resized in place, {} kept their size, {} replaced{}",
+        reply.applied,
+        reply.pending,
+        reply.replaced,
+        if reply.deduplicated {
+            " [deduplicated]"
+        } else {
+            ""
+        }
+    );
+    for allocation in &reply.allocations {
+        if allocation.outcome == "applied" {
+            continue;
+        }
+        println!(
+            "  alloc {} on {}: {}: {}",
+            allocation.allocation_id, allocation.node_id, allocation.outcome, allocation.message
+        );
+    }
+    if !reply.hint.is_empty() {
+        println!("  hint: {}", reply.hint);
+    }
 }
 
 pub async fn handle_alloc(matches: &ArgMatches) -> R<()> {
@@ -251,6 +448,7 @@ pub async fn resize_instance(arg_matches: &ArgMatches) -> R<()> {
         force: arg_matches.get_flag("force"),
         dry_run: arg_matches.get_flag("dry-run"),
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
+        move_unit: arg_matches.get_flag("move"),
     });
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -427,6 +625,12 @@ fn report(format: OutputFormat, kind: &str, id: &str, reply: &ResizeReply) -> R<
         if kind == "instance" && reply.allocation_id != 0 {
             data["allocation"] = json!(reply.allocation_id);
         }
+        if !reply.moved_to.is_empty() {
+            data["movedTo"] = json!(reply.moved_to);
+        }
+        if reply.dry_run && applied && !reply.message.is_empty() {
+            data["message"] = json!(reply.message);
+        }
         output::print_success(&data);
         return Ok(());
     }
@@ -451,9 +655,14 @@ fn report(format: OutputFormat, kind: &str, id: &str, reply: &ResizeReply) -> R<
         return Ok(());
     }
     println!(
-        "{kind} {id}: {} ({}){}",
+        "{kind} {id}: {} ({}){}{}",
         describe_change(&from, &to),
         describe_spec(&spec, &to),
+        if reply.moved_to.is_empty() {
+            String::new()
+        } else {
+            format!(" [moved to {}]", reply.moved_to)
+        },
         if reply.deduplicated {
             " [deduplicated]"
         } else {
@@ -466,6 +675,64 @@ fn report(format: OutputFormat, kind: &str, id: &str, reply: &ResizeReply) -> R<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_resize_parses_sizes_reset_and_replace_test() -> R<()> {
+        let matches = job_resize_command().try_get_matches_from([
+            "resize",
+            "web",
+            "--task",
+            "api",
+            "--memory",
+            "1GiB",
+            "--replace",
+            "-j",
+        ])?;
+        assert_eq!(
+            matches.get_one::<String>("job").map(String::as_str),
+            Some("web")
+        );
+        assert_eq!(
+            matches.get_one::<String>("task").map(String::as_str),
+            Some("api")
+        );
+        assert!(matches.get_flag("replace"));
+        let reset = job_resize_command().try_get_matches_from(["resize", "web", "--reset"])?;
+        assert!(reset.get_flag("reset"));
+        // A reset names no size.
+        assert!(job_resize_command()
+            .try_get_matches_from(["resize", "web", "--reset", "--memory", "1GiB"])
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn instance_resize_takes_move_but_not_with_local_test() -> R<()> {
+        let matches = instance_resize_command()
+            .try_get_matches_from(["resize", "user-42", "--memory", "4GiB", "--move"])?;
+        assert!(matches.get_flag("move"));
+        assert!(instance_resize_command()
+            .try_get_matches_from(["resize", "user-42", "--memory", "4GiB", "--move", "--local"])
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_task_resize_lists_each_allocation_that_kept_its_size_test() {
+        let entry = allocation_entry(&ResizeReply {
+            allocation_id: 7,
+            node_id: "w-1".into(),
+            outcome: "refused".into(),
+            from: r#"{"memory":256}"#.into(),
+            to: r#"{"memory":4096}"#.into(),
+            message: "node w-1 has 1GiB free".into(),
+            free: r#"{"memory":1024}"#.into(),
+            ..Default::default()
+        });
+        assert_eq!(entry["allocation"], json!(7));
+        assert_eq!(entry["outcome"], json!("refused"));
+        assert_eq!(entry["free"]["memory"], json!(1024));
+    }
 
     #[test]
     fn alloc_resize_parses_sizes_and_flags_test() -> R<()> {

@@ -20,7 +20,7 @@
 //! (`legion_job_run`, `legion_job_stop`, `legion_job_scale`, `legion_scaling_pause`,
 //! `legion_job_destroy`, `legion_instance_create`, `legion_session_run`, `legion_instance_stop`,
 //! `legion_instance_start`, `legion_instance_promote`,
-//! `legion_instance_resize`, `legion_alloc_resize`,
+//! `legion_instance_resize`, `legion_alloc_resize`, `legion_job_resize`,
 //! `legion_instance_destroy`) are gated behind `--allow-write`, mirroring the
 //! `read_only_safe` flag in the capabilities catalog. Even with
 //! `--allow-write`, `legion_state_query` always runs in read-only mode (no SQL
@@ -1559,9 +1559,34 @@ fn core_tool_defs() -> Vec<ToolDef> {
                     "reason": { "type": "string", "description": "Why, recorded on the override and the event." },
                     "force": { "type": "boolean", "description": "Allow a ceiling below current use (the kernel may reclaim or kill)." },
                     "dry_run": { "type": "boolean", "description": "Answer what would happen without changing anything." },
-                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." },
+                    "move": { "type": "boolean", "description": "Resize by moving: suspend the unit and resume it at the new size on a node with room. Only a keyed instance whose task has a suspend block, or a session with suspend.durability = \"store\"; also needs job:write. The unit is interrupted for one suspend and resume, and is put back at its old size when no node has room (outcome refused)." }
                 },
                 "required": ["instance_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_job_resize",
+            description: "Resize every allocation of a task without a deploy (docs/resize.md, \"Resizing a task\"): sets a task-level size override (memory and memory_max in MiB, cpu in MHz) laid over the task's spec, the way legion_job_scale lays a count over it. No new job version and no rollout. Each running allocation is resized in place where its node and runtime allow, and the reply's `allocations` has one answer per allocation; one that cannot change in place keeps its old size until it is next replaced (`pending`), or with replace is stopped now so its replacement is placed at the new size (`replaced`). New allocations start at the overridden size. reset removes the override and returns the allocations to the spec's size. A later submit that changes the task's resources drops the override. Session tasks are refused (resize each session with legion_instance_resize). dry_run answers allocation by allocation without changing anything. Needs scale:write on the job. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Job name." },
+                    "task_name": { "type": "string", "description": "Task to resize; optional when the job has one task." },
+                    "task_group": { "type": "string", "description": "The task's group, when the task name is not unique." },
+                    "memory": { "type": "number", "description": "New reservation in MiB." },
+                    "memory_max": { "type": "number", "description": "New ceiling in MiB (never below memory)." },
+                    "cpu": { "type": "number", "description": "New CPU in MHz." },
+                    "reset": { "type": "boolean", "description": "Remove the override (no amounts with it)." },
+                    "replace": { "type": "boolean", "description": "Stop each allocation that cannot be resized in place so it is replaced at the new size." },
+                    "reason": { "type": "string", "description": "Why, recorded on the override and the event." },
+                    "force": { "type": "boolean", "description": "Allow a ceiling below current use on each allocation." },
+                    "dry_run": { "type": "boolean", "description": "Answer what would happen without changing anything." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["job_id"],
                 "additionalProperties": false
             }),
             mutates: true,
@@ -2794,8 +2819,35 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     force: bool_flag(&args, "force"),
                     dry_run: bool_flag(&args, "dry_run"),
                     idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                    move_unit: bool_flag(&args, "move"),
                 }),
             )
+            .await
+        }
+        "legion_job_resize" => {
+            let job_id = str_arg(&args, "job_id")?;
+            let reset = bool_flag(&args, "reset");
+            let to = match resize_amounts(&args) {
+                Ok(_) if reset => {
+                    return Err("reset takes no memory, memory_max, or cpu".to_string())
+                }
+                Ok(to) => Some(to),
+                Err(_) if reset => None,
+                Err(err) => return Err(err),
+            };
+            let mut client = connect().await?;
+            grpc(client.resize_task(crate::structs::ResizeTaskRequest {
+                job_id,
+                task_group: opt_str_arg(&args, "task_group").unwrap_or_default(),
+                task_name: opt_str_arg(&args, "task_name").unwrap_or_default(),
+                to,
+                reset,
+                replace: bool_flag(&args, "replace"),
+                reason: opt_str_arg(&args, "reason").unwrap_or_default(),
+                force: bool_flag(&args, "force"),
+                dry_run: bool_flag(&args, "dry_run"),
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            }))
             .await
         }
         "legion_alloc_resize" => {
@@ -4339,6 +4391,7 @@ mod tests {
         assert!(!names.contains(&"legion_instance_promote"));
         assert!(!names.contains(&"legion_instance_resize"));
         assert!(!names.contains(&"legion_alloc_resize"));
+        assert!(!names.contains(&"legion_job_resize"));
         assert!(!names.contains(&"legion_instance_destroy"));
     }
 
@@ -4438,6 +4491,7 @@ mod tests {
         assert!(names.contains(&"legion_instance_promote"));
         assert!(names.contains(&"legion_instance_resize"));
         assert!(names.contains(&"legion_alloc_resize"));
+        assert!(names.contains(&"legion_job_resize"));
         assert!(names.contains(&"legion_instance_destroy"));
     }
 

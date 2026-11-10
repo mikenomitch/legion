@@ -2643,6 +2643,33 @@ fn migration_list() -> Vec<M<'static>> {
              CREATE INDEX IF NOT EXISTS allocation_resources_override ON allocation (id) WHERE resources_override IS NOT NULL;",
         )
         .down(""),
+        // Resize, task level (`legion job resize`, docs/resize.md): one row
+        // per task whose size is overridden, beside the count override in
+        // `task_scale` and control-owned like it. `size` is the overridden
+        // amounts and `base` the task's declared amounts when it was set,
+        // both JSON; the override binds only while the spec declares `base`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS task_resize (
+            job_id STRING NOT NULL,
+            task_group STRING NOT NULL,
+            task_name STRING NOT NULL,
+            size TEXT NOT NULL,
+            base TEXT NOT NULL,
+            reason STRING NOT NULL DEFAULT '',
+            principal STRING NOT NULL DEFAULT '',
+            updated_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (job_id, task_group, task_name)
+        )",
+        )
+        .down("DROP TABLE IF EXISTS task_resize;"),
+        // Resize, unit level: the size a resize gave one instance, kept
+        // with the instance so its next allocation (a resume, a restart, a
+        // move) starts at it. Same JSON shape as the allocation's column.
+        M::up(
+            "ALTER TABLE instance ADD COLUMN resources_override TEXT;
+             CREATE INDEX IF NOT EXISTS instance_resources_override ON instance (job_id, task_name) WHERE resources_override IS NOT NULL;",
+        )
+        .down(""),
     ]
 }
 

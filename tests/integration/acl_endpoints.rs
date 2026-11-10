@@ -216,6 +216,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         // after the lookup, so the coarse gate is `scale:write` on any job.
         ("ResizeAllocation", Plane::Protected("scale:write")),
         ("ResizeInstance", Plane::Protected("scale:write")),
+        ("ResizeTask", Plane::Protected("scale:write")),
         ("ListSessionNodes", Plane::Protected("job:read")),
         // A run of the task's own command; a request that replaces the
         // command also needs `exec:write` (the matrix is in
@@ -1419,6 +1420,20 @@ async fn call_endpoint(
                     allocation_id: 987_654,
                     to: Some(legion::structs::ResizeResources {
                         memory: Some(64.0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ResizeTask" => svc
+            .resize_task(req(
+                legion::structs::ResizeTaskRequest {
+                    job_id: "acl-probe".into(),
+                    to: Some(legion::structs::ResizeResources {
+                        memory: Some(512.0),
                         ..Default::default()
                     }),
                     ..Default::default()

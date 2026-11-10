@@ -1354,6 +1354,38 @@ service Manager {
   // Unavailable when a session's node cannot be reached.
   rpc ResizeInstance (ResizeInstanceRequest) returns (ResizeReply);
 
+  // Resizes a task: sets (or, with `reset`, removes) a task-level size
+  // override laid over the task's `resources`, the way `ScaleTask` lays a
+  // count override over `count` (docs/resize.md, "Resizing a task").
+  //
+  // The override is one record per task. While it stands, every new
+  // allocation of the task is placed at the overridden size, and this call
+  // also brings the task's running allocations to it: each one is resized
+  // in place exactly as `ResizeAllocation` would, and the reply lists the
+  // answer for each. An allocation that cannot change in place (no room on
+  // its node, or a runtime that answers `needs_restart` or
+  // `not_supported`) keeps running at its old size and takes the new one
+  // when it is next replaced; with `replace` it is stopped now so the
+  // scheduler places its replacement at the new size. Nothing is ever
+  // restarted without `replace`.
+  //
+  // No job version is created and no rollout starts. A later submit whose
+  // spec changes the task's `resources` drops the override (the author's
+  // new spec wins, the arbitration count overrides follow); a submit that
+  // leaves them alone keeps it. Session tasks are refused: a session's
+  // room is its envelope (`stateful.envelope`), and each session is resized
+  // on its own with `ResizeInstance`.
+  //
+  // ACL: `scale:write` on the job.
+  //
+  // Errors:
+  // - NotFound: the job or task does not exist.
+  // - InvalidArgument: no amount given without `reset`, amounts given with
+  //   `reset`, a non-positive amount, a ceiling below the reservation, or
+  //   `task_name` left empty on a job with more than one task.
+  // - FailedPrecondition: the task is a session task or a session envelope.
+  rpc ResizeTask (ResizeTaskRequest) returns (ResizeTaskReply);
+
   // Lists every node that holds an envelope for a session task, for a
   // picker (Envoy, HAProxy, or a platform's own code) that starts sessions
   // at the nodes directly with a session ticket (`Worker.StartSession`,
@@ -5696,6 +5728,12 @@ message TaskScaleStatus {
   // The override row's version (`ScaleTaskRequest.expected_version`); 0
   // when no row exists.
   uint64 version = 16;
+
+  // The task-level size override `ResizeTask` set (docs/resize.md), as a
+  // JSON object: the overridden amounts (`memory`, `memoryMax`, `cpu`), the
+  // `spec` amounts it was laid over, `reason`, `by`, and `at`. Empty when
+  // the task runs at its spec size.
+  string resources_override = 17;
 }
 
 // A time-boxed pin on an autoscaled task (`legion job scale --for`).
@@ -15192,6 +15230,14 @@ message ResumeSessionRequest {
   // `running_elsewhere`, naming the node and generation, so the manager can
   // probe that node first.
   bool force_move = 5;
+
+  // Resume the session at this size instead of the size it was suspended
+  // at (`ResizeInstanceRequest.move_unit`, docs/resize.md). The amounts are
+  // laid over the session's resources before it is admitted into this
+  // node's envelope, so a size the envelope has no room for refuses with
+  // RESOURCE_EXHAUSTED and the checkpoint stays. Honoured only for a
+  // resume from a manifest (`job_id` set).
+  ResizeResources resize = 6;
 }
 
 // Reply payload for Worker.ResumeSession.
@@ -20726,8 +20772,120 @@ message ResizeInstanceRequest {
   // As `ResizeAllocationRequest.idempotency_key`, for a keyed or slot
   // instance. A session's resize records no key: it sets absolute amounts
   // on one node, so repeating it is safe and answers `applied` with `from`
-  // equal to `to`, and `deduplicated` stays false.
+  // equal to `to`. With a key, the session's node keeps the answer for 10
+  // minutes and a retry that reaches the same node gets it back with
+  // `deduplicated` set; the key is per node, as for session runs.
   optional string idempotency_key = 6;
+
+  // Resize by moving (docs/resize.md, "When it does not fit: move"): the
+  // unit is suspended, its new size is recorded with it, and it is resumed
+  // at that size on a node with room, through the paths a suspend and a
+  // resume already use. Only units that can move take it: a keyed instance
+  // whose task has a `suspend` block, and a session whose task sets
+  // `suspend.durability = "store"`. Any other unit is refused with
+  // FailedPrecondition naming what is missing. A move interrupts the unit
+  // for one suspend and resume; without it nothing is ever interrupted.
+  //
+  // When no node has room for the new size the unit is put back: a session
+  // is resumed at its old size on the node it came from, and a keyed
+  // instance's size record is cleared and it is started again. The reply's
+  // outcome is then `refused`.
+  bool move_unit = 7;
+}
+
+// Request payload for `Manager.ResizeTask`.
+message ResizeTaskRequest {
+  // The job. Required.
+  string job_id = 1;
+
+  // The task's group. Empty means the task's own group when `task_name` is
+  // unique in the job.
+  string task_group = 2;
+
+  // The task to resize. May be left empty when the job has exactly one
+  // task.
+  string task_name = 3;
+
+  // The new amounts for every allocation of the task. Unset amounts keep
+  // the spec's value. Required unless `reset` is set.
+  ResizeResources to = 4;
+
+  // Remove the task-level override and bring the task's allocations back
+  // to the spec's size. Mutually exclusive with `to`.
+  bool reset = 5;
+
+  // Stop each allocation that could not be resized in place, so the
+  // scheduler replaces it at the new size. Without it such an allocation
+  // keeps its old size until something else replaces it.
+  bool replace = 6;
+
+  // Why, recorded on the override, on each allocation's override, and on
+  // the `task.resized` event.
+  string reason = 7;
+
+  // As `ResizeAllocationRequest.force`, for each allocation.
+  bool force = 8;
+
+  // Answer what the call would do, allocation by allocation, without
+  // writing the override or changing anything.
+  bool dry_run = 9;
+
+  // Optional caller-chosen key that makes the call retry-safe: a repeat
+  // with the same key answers the first call's reply with `deduplicated`
+  // set, without touching any allocation again.
+  optional string idempotency_key = 10;
+}
+
+// Reply payload for `Manager.ResizeTask`.
+message ResizeTaskReply {
+  // The job, group, and task the override is on.
+  string job_id = 1;
+  string task_group = 2;
+  string task_name = 3;
+
+  // The task's spec resources (`memory`, `memoryMax`, `cpu`) as a JSON
+  // object, with cluster defaults folded in.
+  string spec = 4;
+
+  // The task-level size before this call, as a JSON object: the previous
+  // override laid over the spec, or the spec when there was none.
+  string from = 5;
+
+  // The task-level size after this call, as a JSON object. Equal to `spec`
+  // after a reset.
+  string to = 6;
+
+  // Whether an override stands after this call. False after a reset, and
+  // after a resize whose amounts equal the spec's.
+  bool override_active = 7;
+
+  // One answer per live allocation of the task, in allocation-id order,
+  // each shaped as a `ResizeAllocation` reply. An allocation this call
+  // stopped for replacement has outcome `replaced`; an allocation that
+  // could not be reached has outcome `error` with the cause in `message`.
+  repeated ResizeReply allocations = 8;
+
+  // How many allocations now run at the new size.
+  uint32 applied = 9;
+
+  // How many allocations kept their old size (refused, deferred,
+  // `needs_restart`, `not_supported`, or unreachable). Each takes the new
+  // size when it is next replaced.
+  uint32 pending = 10;
+
+  // How many allocations were stopped for replacement (`replace`).
+  uint32 replaced = 11;
+
+  // Echo of the request's `dry_run`.
+  bool dry_run = 12;
+
+  // True when this reply repeats an earlier call with the same
+  // idempotency key.
+  bool deduplicated = 13;
+
+  // What to do about the allocations that kept their old size, when there
+  // are any.
+  string hint = 14;
 }
 
 // Reply payload for `Manager.ResizeAllocation` and `Manager.ResizeInstance`.
@@ -20787,6 +20945,11 @@ message ResizeReply {
   // Whether retrying the same request later may succeed (`deferred`, and a
   // `refused` grow, which fits once room frees up).
   bool retryable = 14;
+
+  // Set when the unit was resized by moving (`move_unit`): the node it was
+  // resumed on. Empty for an in-place resize, and for a move that found no
+  // room and put the unit back.
+  string moved_to = 15;
 }
 
 // Request payload for `Worker.ResizeSession`.
@@ -20809,6 +20972,12 @@ message ResizeSessionRequest {
 
   // Why, for the node's log.
   string reason = 6;
+
+  // Optional key for a session's resize. The node keeps the answer of an
+  // applied resize for 10 minutes; a repeat with the same key returns it
+  // with `deduplicated` set instead of resizing again. Ignored for an
+  // allocation's resize, whose key the manager records.
+  string idempotency_key = 7;
 }
 
 // Request payload for `Workload.ResizeChildSession`.
@@ -20854,4 +21023,8 @@ message ResizeSessionReply {
 
   // The unit's task runtime (`exec`, `container`, `sandbox`, ...).
   string runtime = 9;
+
+  // True when this answer repeats an earlier call with the same
+  // idempotency key.
+  bool deduplicated = 10;
 }

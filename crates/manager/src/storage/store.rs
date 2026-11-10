@@ -43,8 +43,10 @@ mod session_ops;
 // Elastic session envelopes: a node's in-place envelope resize.
 mod envelope_ops;
 mod resize_ops;
+mod task_resize_ops;
 pub use envelope_ops::{EnvelopeResizeOutcome, EnvelopeResizeRequest};
 pub use resize_ops::{AllocationResizeOutcome, AllocationResizeRequest, AllocationSize};
+pub use task_resize_ops::{PlacementSizeUnavailable, TaskResize};
 mod snapshot_ops;
 mod suspend_ops;
 // Device assignment at allocation insert (docs/devices.md).
@@ -6525,7 +6527,8 @@ impl Store {
                     Err(error)
                         if error
                             .downcast_ref::<crate::devices::DevicesUnavailable>()
-                            .is_some() =>
+                            .is_some()
+                            || error.downcast_ref::<PlacementSizeUnavailable>().is_some() =>
                     {
                         if first_skip_reason.is_none() {
                             first_skip_reason = Some(format!("{error:#}"));
@@ -10234,6 +10237,7 @@ impl Store {
         tx.execute(delete_sql, [name])?;
         // Count overrides die with the job (control-owned, same capture).
         tx.execute("DELETE FROM task_scale WHERE job_id = ?;", [&job.id])?;
+        tx.execute("DELETE FROM task_resize WHERE job_id = ?;", [&job.id])?;
         // A destroyed job's scaling record goes with it (a recreated job of
         // the same name starts with no history and no pause).
         tx.execute("DELETE FROM scale_history WHERE job_id = ?;", [&job.id])?;
@@ -11946,6 +11950,18 @@ impl Store {
                  AND task_config.name = task_scale.task_name);",
             params![job.id, job_config_id],
         )?;
+        // Size overrides follow the same rule (docs/resize.md): a submit
+        // that changes a task's `resources` drops its override.
+        for (group, task) in
+            self.arbitrate_task_resizes_tx(&tx, &job.id, &job_config_id, &config.tasks)?
+        {
+            scale_reset_events.push(drafts::resize_reset(
+                &job.id,
+                &group,
+                &task,
+                "resubmit changed the task's resources; the spec owns the size again",
+            ));
+        }
 
         // Initial task_status rows are seeded by the status-lane half of
         // the submit composite (`seed_task_statuses`, plan §7-C2, C-2) —
@@ -15037,8 +15053,39 @@ impl Store {
         // Stateful tasks: pick (or re-materialize) the instance this
         // allocation will fulfill before writing the row, so the binding is
         // atomic with the placement.
-        let instance_id =
-            self.assign_stateful_instance_tx(tx, task_id, node_id, target_instance)?;
+        // The binding can write (a slot re-activated, a keyed instance set
+        // active); a savepoint lets a unit whose own size does not fit this
+        // node be refused with nothing left behind.
+        tx.execute_batch("SAVEPOINT placement_size;")?;
+        let sized = self
+            .assign_stateful_instance_tx(tx, task_id, node_id, target_instance)
+            .and_then(|instance_id| {
+                // Resize overrides (docs/resize.md): the unit's own size
+                // over the task's override over what the caller packed.
+                let (sized, record) =
+                    self.placement_size_tx(tx, task_id, instance_id.as_deref(), resources)?;
+                let grows = crate::structs::resize::ResourceSize::of(resources)
+                    .grows_to(&crate::structs::resize::ResourceSize::of(&sized));
+                if grows && !self.node_fits_tx(tx, node_id, &sized)? {
+                    bail!(PlacementSizeUnavailable(format!(
+                        "node {node_id} has no room for {} at its resized size {}",
+                        instance_id.as_deref().unwrap_or("the task's unit"),
+                        crate::structs::resize::ResourceSize::of(&sized).to_json()
+                    )));
+                }
+                Ok((instance_id, sized, record))
+            });
+        let (instance_id, sized_resources, resize_record) = match sized {
+            Ok(sized) => {
+                tx.execute_batch("RELEASE placement_size;")?;
+                sized
+            }
+            Err(err) => {
+                tx.execute_batch("ROLLBACK TO placement_size; RELEASE placement_size;")?;
+                return Err(err);
+            }
+        };
+        let resources = &sized_resources;
 
         let params = named_params! {
             ":status": "placed",
@@ -15058,6 +15105,10 @@ impl Store {
         let allocation = tx
             .prepare_cached(&INSERT_ALLOCATION)?
             .query_row(params, |row| self.allocation_from_row(row))?;
+        if let Some(record) = resize_record {
+            tx.prepare_cached("UPDATE allocation SET resources_override = ?1 WHERE id = ?2;")?
+                .execute(params![record, allocation.id])?;
+        }
 
         if let Some(instance_id) = allocation.instance_id.as_deref() {
             let now = Self::now_rfc3339()?;
@@ -16011,6 +16062,15 @@ impl Store {
                 tracker.insert_from_node(&row?);
             }
             Some(tracker)
+        };
+
+        // A task-level size override (docs/resize.md) is what the row
+        // will hold, so it is what the capacity recheck packs.
+        let resources = {
+            let (group, name): (String, String) = tx
+                .prepare_cached("SELECT group_name, name FROM task_config WHERE id = ?;")?
+                .query_row([task_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            self.task_resources_with_override_tx(tx, &job_id, &group, &name, resources)?
         };
 
         Ok(AllocationTaskState {

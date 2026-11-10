@@ -384,6 +384,7 @@ pub fn config() -> Command {
         .subcommand(list_cmd)
         .subcommand(stop_cmd)
         .subcommand(scale_cmd)
+        .subcommand(crate::cmd::resize::job_resize_command())
         .subcommand(spec_cmd)
         .subcommand(destroy_cmd)
         .subcommand(logs_cmd)
@@ -1324,6 +1325,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("run", matches)) => run_job(matches).await,
         Some(("stop", matches)) => stop_job(matches).await,
         Some(("scale", matches)) => scale_job(matches).await,
+        Some(("resize", matches)) => crate::cmd::resize::resize_job(matches).await,
         Some(("spec", matches)) => get_job_spec(matches).await,
         Some(("destroy", matches)) => destroy_job(matches).await,
         Some(("list", matches)) => list_jobs(matches).await,

@@ -81,7 +81,13 @@ pub(crate) fn task_scale_statuses(
                 (Some(entry), true) => entry.state.clone(),
                 (None, true) => "not-evaluated".to_string(),
             };
+            let resources_override = store
+                .task_resize_for(job_id, &task.group, &task.name)?
+                .filter(|resize| resize.binds_to(store.declared_size(&task.resources)))
+                .and_then(|resize| serde_json::to_string(&resize.record()).ok())
+                .unwrap_or_default();
             Ok(TaskScaleStatus {
+                resources_override,
                 autoscaled: is_autoscaled,
                 policy_summary,
                 pin: scale

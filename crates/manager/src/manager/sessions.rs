@@ -567,6 +567,7 @@ pub async fn resume_on_node(
     cold: bool,
     from_manifest: Option<(&str, &str)>,
     force_move: bool,
+    resize: Option<crate::structs::ResizeResources>,
 ) -> Result<crate::structs::ResumeSessionReply, Status> {
     let (mut client, target) = worker_client(store, node_id)?;
     let (job_id, task_name) = from_manifest.unwrap_or_default();
@@ -576,6 +577,7 @@ pub async fn resume_on_node(
         job_id: job_id.to_string(),
         task_name: task_name.to_string(),
         force_move,
+        resize,
     });
     request.set_timeout(SLEEP_CALL_TIMEOUT);
     client
@@ -635,7 +637,10 @@ fn node_is_down(store: &Store, node_id: &str) -> bool {
 /// caller passed `force_move`, and otherwise answers UNAVAILABLE.
 ///
 /// `skip` is a node that already refused the resume for room (the session's
-/// own node, asked first), so no attempt is spent on it again.
+/// own node, asked first), so no attempt is spent on it again. `resize`
+/// resumes the session at a new size (a resize by moving, docs/resize.md);
+/// the caller passes `task` with that size already laid over its resources,
+/// so the router reserves the room the session will take.
 pub async fn resume_store_session(
     store: &Store,
     job_id: &str,
@@ -644,6 +649,7 @@ pub async fn resume_store_session(
     cold: bool,
     force_move: bool,
     skip: Option<&str>,
+    resize: Option<crate::structs::ResizeResources>,
 ) -> Result<StoreResume, Status> {
     // A disabled runtime starts no session (docs/runtime-disable.md). The
     // nodes would refuse it too; refusing here names the reason once
@@ -688,6 +694,7 @@ pub async fn resume_store_session(
                 cold,
                 Some((job_id, &task.name)),
                 force,
+                resize,
             )
             .await;
             let status = match answer {

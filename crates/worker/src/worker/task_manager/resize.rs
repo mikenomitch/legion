@@ -118,6 +118,50 @@ pub fn wire_reply(done: &UnitResize, node_id: &str) -> crate::structs::ResizeSes
         job_id: done.job_id.clone(),
         task_name: done.task_name.clone(),
         runtime: done.runtime.clone(),
+        deduplicated: false,
+    }
+}
+
+/// How long a node keeps the answer of a keyed session resize, the window
+/// session runs keep theirs for.
+const RESIZE_REPLY_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+type KeptReplies =
+    HashMap<(String, String), (std::time::Instant, crate::structs::ResizeSessionReply)>;
+
+fn kept_replies() -> &'static std::sync::Mutex<KeptReplies> {
+    static KEPT: std::sync::OnceLock<std::sync::Mutex<KeptReplies>> = std::sync::OnceLock::new();
+    KEPT.get_or_init(Default::default)
+}
+
+/// The answer this node gave an applied session resize under `key`, when
+/// it still keeps it: a retry gets it back instead of resizing again.
+/// Per node and in memory, so a worker restart forgets it; a session
+/// resize sets absolute amounts, so the repeat that follows is harmless.
+pub fn recall_resize(session_id: &str, key: &str) -> Option<crate::structs::ResizeSessionReply> {
+    if key.is_empty() {
+        return None;
+    }
+    let mut kept = kept_replies().lock().ok()?;
+    let now = std::time::Instant::now();
+    kept.retain(|_, (at, _)| now.duration_since(*at) < RESIZE_REPLY_TTL);
+    kept.get(&(session_id.to_string(), key.to_string()))
+        .map(|(_, reply)| crate::structs::ResizeSessionReply {
+            deduplicated: true,
+            ..reply.clone()
+        })
+}
+
+/// Keep an applied session resize's answer under its idempotency key.
+pub fn remember_resize(session_id: &str, key: &str, reply: &crate::structs::ResizeSessionReply) {
+    if key.is_empty() {
+        return;
+    }
+    if let Ok(mut kept) = kept_replies().lock() {
+        kept.insert(
+            (session_id.to_string(), key.to_string()),
+            (std::time::Instant::now(), reply.clone()),
+        );
     }
 }
 

@@ -1462,6 +1462,21 @@ pub mod drafts {
         }))
     }
 
+    /// `resize.reset`: a submit changed a task's `resources`, so its
+    /// task-level size override was dropped (docs/resize.md).
+    pub fn resize_reset(job_id: &str, task_group: &str, task_name: &str, why: &str) -> EventDraft {
+        EventDraft::info(
+            "resize.reset",
+            format!("Job {job_id} task {task_group}/{task_name} size override dropped: {why}"),
+        )
+        .job(job_id)
+        .meta(json!({
+            "group": task_group,
+            "task": task_name,
+            "why": why,
+        }))
+    }
+
     /// `rollout.event` — mirror of one rollout event into the unified stream,
     /// so consumers see rollout activity without polling per-rollout history.
     pub fn rollout_event(

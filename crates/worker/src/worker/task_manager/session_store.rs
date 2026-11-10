@@ -84,6 +84,9 @@ pub struct MoveRequest {
     /// `manager` or `edge`, and the ticket's `jti` for an edge resume.
     pub origin: String,
     pub ticket_jti: String,
+    /// Resume at this size instead of the size the manifest records (a
+    /// resize by moving, docs/resize.md).
+    pub resize: Option<crate::structs::resize::ResourceSize>,
 }
 
 impl WorkerTaskManager {
@@ -781,8 +784,23 @@ pub fn resume_moved(
             ..Default::default()
         });
     }
-    let resources: Value =
+    let mut resources: Value =
         serde_json::from_str(&payload.task_resources).unwrap_or_else(|_| serde_json::json!({}));
+    // The session's size travels with it (docs/resize.md): the amounts its
+    // manifest records, which a resize in place changed, and over them the
+    // size a resize by moving asks for. Admission below charges the result.
+    let carried = serde_json::from_str::<Value>(&current.resources)
+        .map(|held| crate::structs::resize::ResourceSize::of(&held))
+        .unwrap_or_default();
+    for size in [Some(carried), request.resize].into_iter().flatten() {
+        if size.is_empty() {
+            continue;
+        }
+        if let Ok(sized) = size.apply_to(&resources) {
+            resources = sized;
+        }
+    }
+    payload.task_resources = resources.to_string();
     let mut record = crate::worker::edge::record_from_payload(&payload, &provisional, resources);
     record.session = Some(crate::worker::claims::SessionClaim {
         lease_issued_at_unix_ms: current.lease_issued_at_unix_ms,

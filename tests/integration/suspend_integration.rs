@@ -1828,3 +1828,138 @@ async fn a_full_snapshot_budget_keeps_new_memory_suspend_instances_off_the_node(
     assert!(cluster.info().await?.current_alloc_id.is_some());
     Ok(())
 }
+
+/// Drive a resize by moving to its end: report the capture the suspend asks
+/// for, then run the evals that place the resumed instance.
+async fn drive_move(cluster: &Cluster, first_alloc: i64) -> R<()> {
+    let mut captured = false;
+    for _ in 0..600 {
+        let info = cluster.info().await?;
+        if !captured && info.pending_op.as_deref() == Some("suspending") {
+            let asked = cluster.heartbeat(Vec::new()).await?;
+            if let Some(request) = asked.checkpoint_requests.first() {
+                cluster
+                    .heartbeat(vec![capture_ok(&request.snapshot_id, first_alloc, "disk")])
+                    .await?;
+                captured = true;
+            }
+        } else if captured {
+            cluster.reschedule()?;
+            if cluster
+                .info()
+                .await?
+                .current_alloc_id
+                .is_some_and(|id| id != first_alloc)
+            {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    anyhow::bail!("the move never finished")
+}
+
+/// `legion instance resize --move` (docs/resize.md): the instance is
+/// suspended, its new size is recorded with it, and its resume is placed at
+/// that size as a new allocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_by_moving_suspends_and_resumes_at_the_new_size() -> R<()> {
+    let cluster = Cluster::new()?;
+    cluster.add_node(json!(["checkpoint"]))?;
+    cluster.submit(job_with(
+        "exec",
+        Some(SuspendConfig::default()),
+        json!({ "cpu": 500, "memory": 512 }),
+    ))?;
+    let first_alloc = cluster.active_instance()?;
+
+    let request = |memory: f64, dry_run: bool| {
+        Request::new(legion::structs::ResizeInstanceRequest {
+            instance_id: ID.into(),
+            to: Some(legion::structs::ResizeResources {
+                memory: Some(memory),
+                ..Default::default()
+            }),
+            reason: "needs more".into(),
+            move_unit: true,
+            dry_run,
+            ..Default::default()
+        })
+    };
+    // A dry run changes nothing.
+    let dry = cluster
+        .svc
+        .resize_instance(request(4096.0, true))
+        .await?
+        .into_inner();
+    assert!(dry.message.contains("would suspend"), "{}", dry.message);
+    assert_eq!(cluster.info().await?.pending_op, None);
+
+    let (moved, driven) = tokio::join!(
+        cluster.svc.resize_instance(request(4096.0, false)),
+        drive_move(&cluster, first_alloc)
+    );
+    driven?;
+    let moved = moved?.into_inner();
+    assert_eq!(moved.outcome, "applied", "{}", moved.message);
+    assert_eq!(moved.moved_to, NODE);
+    let second_alloc = cluster.info().await?.current_alloc_id.context("resumed")?;
+    assert_ne!(second_alloc, first_alloc);
+    assert_eq!(moved.allocation_id, second_alloc);
+    let view = cluster
+        .store()
+        .allocation_size(second_alloc)?
+        .context("resumed row")?;
+    assert_eq!(view.effective["memory"], json!(4096));
+    assert_eq!(
+        view.resources_override.context("record")?["reason"],
+        json!("needs more")
+    );
+    assert!(cluster
+        .events("instance.resized")?
+        .iter()
+        .any(|meta| meta["movedTo"] == NODE));
+    Ok(())
+}
+
+/// A move no node has room for puts the instance back: its size record is
+/// restored, and it resumes at the size it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_by_moving_with_no_room_puts_the_instance_back() -> R<()> {
+    legion::manager::server::MOVE_RESUME_TIMEOUT_MS
+        .store(3_000, std::sync::atomic::Ordering::Relaxed);
+    let cluster = Cluster::new()?;
+    cluster.add_node(json!(["checkpoint"]))?;
+    cluster.submit(job_with(
+        "exec",
+        Some(SuspendConfig::default()),
+        json!({ "cpu": 500, "memory": 512 }),
+    ))?;
+    let first_alloc = cluster.active_instance()?;
+    // More memory than the node has.
+    let (moved, driven) = tokio::join!(
+        cluster
+            .svc
+            .resize_instance(Request::new(legion::structs::ResizeInstanceRequest {
+                instance_id: ID.into(),
+                to: Some(legion::structs::ResizeResources {
+                    memory: Some(1_000_000.0),
+                    ..Default::default()
+                }),
+                move_unit: true,
+                ..Default::default()
+            })),
+        drive_move(&cluster, first_alloc)
+    );
+    let moved = moved?.into_inner();
+    assert_eq!(moved.outcome, "refused", "{}", moved.message);
+    assert!(moved.retryable);
+    assert!(cluster.store().instance_size(ID)?.is_none());
+    // The driver keeps running evals; once the record is gone the instance
+    // is placed at the size it had.
+    driven?;
+    let back = cluster.info().await?.current_alloc_id.context("placed")?;
+    let view = cluster.store().allocation_size(back)?.context("row")?;
+    assert_eq!(view.effective["memory"], json!(512));
+    Ok(())
+}

@@ -35,8 +35,9 @@ use legion::structs::manager_server::Manager;
 use legion::structs::resize::ResourceSize;
 use legion::structs::worker_server::WorkerServer;
 use legion::structs::{
-    CreateInstanceRequest, GetInstanceRequest, Node, NodeMsg, ResizeAllocationRequest,
-    ResizeInstanceRequest, ResizeReply, ResizeResources, Submission,
+    CreateInstanceRequest, GetInstanceRequest, GetJobScaleStatusRequest, Node, NodeMsg,
+    ResizeAllocationRequest, ResizeInstanceRequest, ResizeReply, ResizeResources, ResizeTaskReply,
+    ResizeTaskRequest, Submission,
 };
 use legion::worker::server::WorkerDaemonService;
 use legion::worker::state::WorkerStateStore;
@@ -290,6 +291,29 @@ impl Cluster {
             }))
             .await
             .map(|reply| reply.into_inner())
+    }
+
+    async fn resize_task(&self, request: ResizeTaskRequest) -> Result<ResizeTaskReply, Status> {
+        self.svc
+            .resize_task(Request::new(ResizeTaskRequest {
+                job_id: JOB.into(),
+                ..request
+            }))
+            .await
+            .map(|reply| reply.into_inner())
+    }
+
+    /// Stop `allocation_id` and let the scheduler place its replacement:
+    /// what a restart, a reschedule, or a node loss does to it.
+    fn replace(&self, allocation_id: i64) -> R<()> {
+        tokio::task::block_in_place(|| -> R<()> {
+            self.store()
+                .replace_allocations_for_resize(&[allocation_id])?;
+            let config_id = self.store().get_job_config(JOB)?.id();
+            self.store()
+                .enqueue_eval("job_reschedule", Some(JOB), Some(&config_id), None, None)?;
+            self.run_evals()
+        })
     }
 
     /// What the worker runs `allocation_id` at.
@@ -879,5 +903,371 @@ async fn a_grow_an_elastic_envelope_can_hold_is_deferred_until_it_grows_test() -
         .resize_instance(&session, to, ResizeInstanceRequest::default())
         .await?;
     assert_eq!(applied.outcome, "applied", "{}", applied.message);
+    Ok(())
+}
+
+/// `legion job resize`: one override on the task, every running allocation
+/// brought to it in place, new allocations placed at it, and `--reset`
+/// back to the spec. No job version is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_resize_changes_running_allocations_and_sizes_new_ones_test() -> R<()> {
+    let cluster = Cluster::new().await?;
+    let web = cluster.allocation_of("web")?;
+    let version = cluster.store().get_job_config(JOB)?.id();
+
+    // A dry run answers allocation by allocation and writes nothing.
+    let dry = cluster
+        .resize_task(ResizeTaskRequest {
+            task_name: "web".into(),
+            to: Some(amounts(Some(2048.0), None, None)),
+            dry_run: true,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!((dry.applied, dry.pending), (1, 0));
+    assert!(cluster
+        .store()
+        .task_resize_for(JOB, "default", "web")?
+        .is_none());
+    assert_eq!(cluster.reserved_size(web)?.memory, Some(1024.0));
+
+    let reply = cluster
+        .resize_task(ResizeTaskRequest {
+            task_name: "web".into(),
+            to: Some(amounts(Some(2048.0), None, None)),
+            reason: "batch week".into(),
+            idempotency_key: Some("resize-1".into()),
+            ..Default::default()
+        })
+        .await?;
+    assert!(reply.override_active);
+    assert_eq!((reply.applied, reply.pending, reply.replaced), (1, 0, 0));
+    assert_eq!(size(&reply.from).memory, Some(1024.0));
+    assert_eq!(size(&reply.to).memory, Some(2048.0));
+    assert_eq!(reply.allocations.len(), 1);
+    assert_eq!(reply.allocations[0].outcome, "applied");
+    assert_eq!(cluster.reserved_size(web)?.memory, Some(2048.0));
+    assert_eq!(cluster.running_size(web).memory, Some(2048.0));
+    assert_eq!(
+        cluster.store().get_job_config(JOB)?.id(),
+        version,
+        "no new job version"
+    );
+
+    // A retry with the same key changes nothing and says so.
+    let again = cluster
+        .resize_task(ResizeTaskRequest {
+            task_name: "web".into(),
+            to: Some(amounts(Some(2048.0), None, None)),
+            reason: "batch week".into(),
+            idempotency_key: Some("resize-1".into()),
+            ..Default::default()
+        })
+        .await?;
+    assert!(again.deduplicated);
+
+    // The override shows beside the count override.
+    let status = cluster
+        .svc
+        .get_job_scale_status(Request::new(GetJobScaleStatusRequest { name: JOB.into() }))
+        .await?
+        .into_inner();
+    let shown = status
+        .tasks
+        .iter()
+        .find(|task| task.task_name == "web")
+        .context("web status")?;
+    let record: Value = serde_json::from_str(&shown.resources_override)?;
+    assert_eq!(record["memory"], json!(2048.0));
+    assert_eq!(record["reason"], json!("batch week"));
+
+    // A replacement is placed at the overridden size, with the record on
+    // its row, and the worker starts it at that size.
+    cluster.replace(web)?;
+    let replacement = cluster.allocation_of("web")?;
+    assert_ne!(replacement, web);
+    assert_eq!(cluster.reserved_size(replacement)?.memory, Some(2048.0));
+    let view = cluster
+        .store()
+        .allocation_size(replacement)?
+        .context("replacement row")?;
+    assert_eq!(
+        view.resources_override.context("record")?["reason"],
+        json!("batch week")
+    );
+
+    // Reset: the override goes and what runs returns to the spec.
+    for _ in 0..200 {
+        if cluster
+            .task_manager
+            .lock()
+            .expect("task manager")
+            .allocation_pid(replacement)
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let reset = cluster
+        .resize_task(ResizeTaskRequest {
+            task_name: "web".into(),
+            reset: true,
+            ..Default::default()
+        })
+        .await?;
+    assert!(!reset.override_active);
+    assert_eq!(reset.applied, 1, "{:?}", reset.allocations);
+    assert_eq!(cluster.reserved_size(replacement)?.memory, Some(1024.0));
+    assert!(cluster
+        .store()
+        .task_resize_for(JOB, "default", "web")?
+        .is_none());
+    assert!(cluster
+        .store()
+        .allocation_size(replacement)?
+        .context("row")?
+        .resources_override
+        .is_none());
+
+    // A session task is resized session by session, never as a task.
+    let refused = cluster
+        .resize_task(ResizeTaskRequest {
+            task_name: "machine".into(),
+            to: Some(amounts(Some(128.0), None, None)),
+            ..Default::default()
+        })
+        .await
+        .expect_err("a session task");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    // And a reset names no size.
+    let invalid = cluster
+        .resize_task(ResizeTaskRequest {
+            task_name: "web".into(),
+            to: Some(amounts(Some(128.0), None, None)),
+            reset: true,
+            ..Default::default()
+        })
+        .await
+        .expect_err("reset with a size");
+    assert_eq!(invalid.code(), Code::InvalidArgument);
+    let events = cluster
+        .store()
+        .list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("task.resized".into()),
+            ..Default::default()
+        })?;
+    assert_eq!(events.len(), 2, "{events:?}");
+    Ok(())
+}
+
+/// An allocation that cannot change in place keeps its size and is named;
+/// `replace` stops it so its replacement starts at the new size.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_resize_keeps_or_replaces_what_cannot_change_in_place_test() -> R<()> {
+    // This node's worker cannot resize, so nothing changes in place.
+    let cluster = Cluster::with_capabilities(json!(["sessions"])).await?;
+    let web = cluster.allocation_of("web")?;
+    let kept = cluster
+        .resize_task(ResizeTaskRequest {
+            task_name: "web".into(),
+            to: Some(amounts(Some(2048.0), None, None)),
+            ..Default::default()
+        })
+        .await?;
+    assert!(kept.override_active);
+    assert_eq!((kept.applied, kept.pending, kept.replaced), (0, 1, 0));
+    assert_eq!(kept.allocations[0].outcome, "not_supported");
+    assert!(kept.hint.contains("--replace"), "{}", kept.hint);
+    assert_eq!(cluster.reserved_size(web)?.memory, Some(1024.0));
+    assert_eq!(cluster.allocation_of("web")?, web, "nothing was restarted");
+
+    let replaced = cluster
+        .resize_task(ResizeTaskRequest {
+            task_name: "web".into(),
+            to: Some(amounts(Some(2048.0), None, None)),
+            replace: true,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(
+        (replaced.applied, replaced.pending, replaced.replaced),
+        (0, 0, 1)
+    );
+    assert_eq!(replaced.allocations[0].outcome, "replaced");
+    tokio::task::block_in_place(|| cluster.run_evals())?;
+    let replacement = cluster.allocation_of("web")?;
+    assert_ne!(replacement, web);
+    assert_eq!(cluster.reserved_size(replacement)?.memory, Some(2048.0));
+    Ok(())
+}
+
+/// Submit arbitration: a submit that leaves the task's `resources` alone
+/// keeps the override, and one that changes them drops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_submit_that_changes_resources_drops_the_task_override_test() -> R<()> {
+    let cluster = Cluster::new().await?;
+    cluster
+        .resize_task(ResizeTaskRequest {
+            task_name: "web".into(),
+            to: Some(amounts(None, None, Some(2000.0))),
+            ..Default::default()
+        })
+        .await?;
+    let declared = json!({ "cpu": 1000, "memory": 1024 });
+    let effective = |cluster: &Cluster, declared: &Value| -> R<ResourceSize> {
+        Ok(ResourceSize::of(
+            &cluster
+                .store()
+                .effective_task_resources(JOB, "default", "web", declared, false)?,
+        ))
+    };
+    assert_eq!(effective(&cluster, &declared)?.cpu, Some(2000.0));
+
+    // The same resources again: the override stays.
+    cluster.submit(declared.clone())?;
+    assert!(cluster
+        .store()
+        .task_resize_for(JOB, "default", "web")?
+        .is_some());
+    assert_eq!(effective(&cluster, &declared)?.cpu, Some(2000.0));
+
+    // New resources: the author's spec wins.
+    let changed = json!({ "cpu": 1500, "memory": 1024 });
+    cluster.submit(changed.clone())?;
+    assert!(cluster
+        .store()
+        .task_resize_for(JOB, "default", "web")?
+        .is_none());
+    assert_eq!(effective(&cluster, &changed)?.cpu, Some(1500.0));
+    let events = cluster
+        .store()
+        .list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("resize.reset".into()),
+            ..Default::default()
+        })?;
+    assert_eq!(events.len(), 1, "{events:?}");
+    Ok(())
+}
+
+/// A resized instance keeps its size when its allocation is replaced, and
+/// a unit that cannot move says what it lacks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instance_keeps_its_size_across_allocations_test() -> R<()> {
+    let cluster = Cluster::new().await?;
+    cluster
+        .svc
+        .create_instance(Request::new(CreateInstanceRequest {
+            job_id: JOB.into(),
+            task: Some("cart".into()),
+            instance_id: Some("user-7".into()),
+            ..Default::default()
+        }))
+        .await?;
+    tokio::task::block_in_place(|| cluster.run_evals())?;
+    let first = cluster.allocation_of("cart")?;
+    for _ in 0..200 {
+        if cluster.pid(first).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let reply = cluster
+        .resize_instance(
+            "user-7",
+            amounts(Some(1024.0), None, None),
+            ResizeInstanceRequest {
+                reason: "big cart".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(reply.outcome, "applied", "{}", reply.message);
+    let kept = cluster
+        .store()
+        .instance_size("user-7")?
+        .context("the instance carries its size")?;
+    assert_eq!(kept.size.memory, Some(1024.0));
+
+    // Its allocation is replaced: the next one starts at the instance's
+    // size, not the task's.
+    cluster.replace(first)?;
+    let second = cluster.allocation_of("cart")?;
+    assert_ne!(second, first);
+    assert_eq!(cluster.reserved_size(second)?.memory, Some(1024.0));
+    assert_eq!(
+        cluster
+            .store()
+            .allocation_size(second)?
+            .context("row")?
+            .resources_override
+            .context("record")?["reason"],
+        json!("big cart")
+    );
+
+    // `cart` has no suspend block, so it cannot move.
+    let stuck = cluster
+        .resize_instance(
+            "user-7",
+            amounts(Some(2048.0), None, None),
+            ResizeInstanceRequest {
+                move_unit: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("no suspend block");
+    assert_eq!(stuck.code(), Code::FailedPrecondition);
+    assert!(
+        stuck.message().contains("suspend block"),
+        "{}",
+        stuck.message()
+    );
+
+    // Neither can a session whose checkpoints stay on its node.
+    let session = cluster.start_session().await?;
+    let stuck = cluster
+        .resize_instance(
+            &session,
+            amounts(Some(128.0), None, None),
+            ResizeInstanceRequest {
+                move_unit: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a local session");
+    assert_eq!(stuck.code(), Code::FailedPrecondition);
+    assert!(
+        stuck.message().contains("durability"),
+        "{}",
+        stuck.message()
+    );
+    Ok(())
+}
+
+/// A session's keyed resize is answered once per node: the retry gets the
+/// first answer back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sessions_keyed_resize_is_deduplicated_by_its_node_test() -> R<()> {
+    let cluster = Cluster::new().await?;
+    let session = cluster.start_session().await?;
+    let request = || ResizeInstanceRequest {
+        idempotency_key: Some("grow-once".into()),
+        ..Default::default()
+    };
+    let first = cluster
+        .resize_instance(&session, amounts(Some(128.0), None, None), request())
+        .await?;
+    assert_eq!(first.outcome, "applied", "{}", first.message);
+    assert!(!first.deduplicated);
+    let second = cluster
+        .resize_instance(&session, amounts(Some(128.0), None, None), request())
+        .await?;
+    assert!(second.deduplicated);
+    assert_eq!(
+        second.from, first.from,
+        "the first answer, not a second resize"
+    );
     Ok(())
 }

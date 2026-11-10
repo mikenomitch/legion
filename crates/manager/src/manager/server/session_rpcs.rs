@@ -637,6 +637,7 @@ impl ManagerDaemonService {
             cold,
             force_move,
             skip,
+            None,
         )
         .await?
         {
@@ -725,9 +726,16 @@ impl ManagerDaemonService {
                 ..Default::default()
             }));
         }
-        let resumed =
-            sessions::resume_on_node(&self.store, &found.node_id, session_id, cold, None, false)
-                .await;
+        let resumed = sessions::resume_on_node(
+            &self.store,
+            &found.node_id,
+            session_id,
+            cold,
+            None,
+            false,
+            None,
+        )
+        .await;
         if let Err(status) = resumed.as_ref() {
             // Full, or its local copy went meanwhile: a `store` session
             // resumes from its manifest elsewhere. A node full for this

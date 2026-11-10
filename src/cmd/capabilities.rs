@@ -580,13 +580,30 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "instance.resize",
-            cli: "legion instance resize <INSTANCE> [--memory <SIZE>] [--memory-max <SIZE>] [--cpu <MHZ>] [--reason <TEXT>] [--force] [--dry-run]",
+            cli: "legion instance resize <INSTANCE> [--memory <SIZE>] [--memory-max <SIZE>] [--cpu <MHZ>] [--move] [--reason <TEXT>] [--force] [--dry-run]",
             grpc: Some("Manager/ResizeInstance"),
             summary: "Resize a running keyed instance or session in place (memory, memoryMax, \
                  cpu) as an override over the spec: no new job version, no restart. A session's \
-                 resize is node-local and writes nothing to the store. Answers applied, \
-                 deferred, refused (with the free room), needs_restart, or not_supported. \
-                 Needs scale:write. Supports --idempotency-key and --dry-run.",
+                 resize is node-local and writes nothing to the store. An instance keeps its \
+                 size across suspend and resume. Answers applied, deferred, refused (with the \
+                 free room), needs_restart, or not_supported. --move resizes by suspending the \
+                 unit and resuming it at the new size on a node with room (a keyed instance \
+                 with a suspend block, or a store session; also needs job:write). Needs \
+                 scale:write. Supports --idempotency-key and --dry-run.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "job.resize",
+            cli: "legion job resize <JOB> [--task <TASK>] [--group <GROUP>] [--memory <SIZE>] [--memory-max <SIZE>] [--cpu <MHZ>] [--reset] [--replace] [--reason <TEXT>] [--force] [--dry-run]",
+            grpc: Some("Manager/ResizeTask"),
+            summary: "Resize every allocation of a task without a deploy: a task-level size \
+                 override laid over the spec (no new job version, no rollout). Running \
+                 allocations are resized in place where they can be, with one answer each; \
+                 the rest keep their size until replaced, or are replaced now with --replace. \
+                 New allocations start at the overridden size. --reset returns to the spec. A \
+                 submit that changes the task's resources drops the override. Needs \
+                 scale:write. Supports --idempotency-key and --dry-run.",
             mutates: true,
             read_only_safe: false,
         },
