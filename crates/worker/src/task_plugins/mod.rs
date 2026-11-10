@@ -1270,6 +1270,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         .map_err(|e| anyhow!("job name {:?}: {e}", config.name))?;
     validate_object_name("job name", job_name)?;
     let mut registry = TaskPluginRegistry::new();
+    crate::structs::children::validate_children(config).map_err(|err| anyhow!(err))?;
     for task in &config.tasks {
         validate_object_name("task name", &task.name)?;
         validate_object_name(&format!("task {} group", task.name), &task.group)?;

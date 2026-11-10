@@ -2621,6 +2621,10 @@ fn migration_list() -> Vec<M<'static>> {
         // jobspec `run` block as JSON (command, wall, output, allowCommand).
         // NULL for every task without one, which refuses runs.
         M::up("ALTER TABLE task_config ADD COLUMN run TEXT;").down(""),
+        // Child sessions (docs/child-sessions.md): `task_config.children` is
+        // the jobspec `children` block as JSON (tasks, max, suspendWithOwner,
+        // orphanAfter). NULL for every task whose units own nothing.
+        M::up("ALTER TABLE task_config ADD COLUMN children TEXT;").down(""),
     ]
 }
 

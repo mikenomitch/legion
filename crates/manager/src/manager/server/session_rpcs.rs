@@ -269,7 +269,32 @@ impl ManagerDaemonService {
         let derived_id = (!scoped.is_empty()).then(|| {
             crate::structs::session::derived_session_id(&task.name, &config.name, &scoped)
         });
-        let started = sessions::start(&self.store, config, task, derived_id.as_deref()).await?;
+        // A child of a running unit of this job (docs/child-sessions.md):
+        // `job:write` was enforced by the caller, the owner's jobspec
+        // decides the rest.
+        let child = match request.owner.as_ref().filter(|owner| !owner.id.is_empty()) {
+            Some(requested) => {
+                let resolved =
+                    crate::manager::children::resolve_owner(&self.store, config, requested).await?;
+                let block =
+                    crate::manager::children::declaration(config, &resolved.task_name, task)?;
+                Some(sessions::ChildStart {
+                    owner: resolved.owner,
+                    prefer_node: resolved.node_id,
+                    max: block.max,
+                    suspend_with_owner: block.suspend_with_owner,
+                })
+            }
+            None => None,
+        };
+        let started = sessions::start(
+            &self.store,
+            config,
+            task,
+            derived_id.as_deref(),
+            child.as_ref(),
+        )
+        .await?;
         Ok(Response::new(CreateInstanceReply {
             instance_id: started.session_id,
             deduplicated: started.deduplicated,
@@ -278,6 +303,7 @@ impl ManagerDaemonService {
             durable: false,
             node_id: started.node_id,
             state: started.state,
+            owner: started.owner,
         }))
     }
 
@@ -625,6 +651,27 @@ impl ManagerDaemonService {
     }
 
     /// A running session's `InstanceInfo`, its group read from the job.
+    /// List what a unit owns (docs/child-sessions.md), for `GetInstance`.
+    /// Skipped for a job whose spec declares no `children` block, which is
+    /// almost every job.
+    pub(super) async fn attach_children(&self, info: &mut InstanceInfo) {
+        let declares = self
+            .store
+            .get_job_config(&info.job_id)
+            .is_ok_and(|config| crate::manager::children::job_declares_children(&config));
+        if !declares {
+            return;
+        }
+        let kind = if info.mode == InstanceMode::Session.to_string() {
+            crate::structs::children::OWNER_SESSION
+        } else {
+            crate::structs::children::OWNER_INSTANCE
+        };
+        let owner = crate::structs::children::owner_ref(kind, &info.instance_id);
+        info.children =
+            crate::manager::children::children_of(&self.store, &info.job_id, &owner).await;
+    }
+
     pub(super) fn session_info(&self, entry: &IndexedSession) -> InstanceInfo {
         let (job_id, task_name) = entry
             .status

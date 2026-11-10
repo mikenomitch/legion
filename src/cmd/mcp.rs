@@ -1470,6 +1470,8 @@ fn core_tool_defs() -> Vec<ToolDef> {
                     "instance_ids": { "type": "array", "items": { "type": "string" }, "description": "Batch of explicit instance keys, created atomically (all-or-nothing). Mutually exclusive with instance_id." },
                     "count": { "type": "integer", "minimum": 1, "description": "Create this many additional server-minted instances (atomic with instance_ids)." },
                     "from_snapshot": { "type": "string", "description": "Restore the new instance(s) from this snapshot of the job (an id or a name) instead of booting empty. Each gets its own copy of the snapshot's volume and its own identity, on the snapshot's node; at most 64 per call. Needs snapshot:read." },
+                    "owner": { "type": "string", "description": "Start the unnamed session as a child of this running unit of the same job (a session, instance, or allocation id; docs/child-sessions.md). The owner's task must name this task in children.tasks. The child ends when its owner ends, starts on its owner's node when that node has room, and is refused with RESOURCE_EXHAUSTED at children.max. Session tasks only; not with instance_id, instance_ids, count, or from_snapshot." },
+                    "owner_kind": { "type": "string", "enum": ["session", "instance", "allocation"], "description": "What owner names. Default: worked out from the id." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["job_id"],
@@ -2591,6 +2593,17 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let count = args.get("count").and_then(Value::as_u64).unwrap_or(0) as u32;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let from_snapshot = opt_str_arg(&args, "from_snapshot");
+            let owner = opt_str_arg(&args, "owner").map(|id| crate::structs::OwnerRef {
+                kind: opt_str_arg(&args, "owner_kind").unwrap_or_default(),
+                id,
+            });
+            if owner.is_some() && (!instance_ids.is_empty() || count > 0) {
+                return Err(
+                    "owner starts one unnamed session as a child; do not pass instance_ids or \
+                     count with it"
+                        .into(),
+                );
+            }
             let mut client = connect().await?;
             // instance_ids/count select the atomic batch RPC; a lone
             // instance_id keeps the single-create semantics (incl. server
@@ -2621,6 +2634,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     instance_id,
                     idempotency_key,
                     from_snapshot,
+                    owner,
                 }))
                 .await
             }

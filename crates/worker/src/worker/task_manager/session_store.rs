@@ -161,6 +161,9 @@ impl WorkerTaskManager {
     /// manifest stays: it belongs to the winner. Returns whether the node
     /// held the session.
     pub fn end_superseded(&mut self, session_id: &str, via: &str) -> bool {
+        // Its children stay: the session lives on elsewhere, and the
+        // managers say when it ends (docs/child-sessions.md).
+        self.mark_children_remote(session_id);
         let ended = if self.idle_sessions.contains_key(session_id) {
             self.forget_idle_session(session_id, &format!("superseded ({via})"))
         } else {
@@ -751,6 +754,9 @@ pub fn resume_moved(
         &request.origin,
         &request.ticket_jti,
         current.lease_issued_at_unix_ms,
+        // A child that moves is its own unit from then on: the manifest
+        // does not carry its owner (docs/child-sessions.md, "Limitations").
+        None,
     )?;
     let restore = current
         .checkpoint

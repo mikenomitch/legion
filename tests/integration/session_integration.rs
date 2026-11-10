@@ -1479,7 +1479,7 @@ async fn session_start_cost_breakdown_measure() -> R<()> {
     let mut samples = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
         let at = Instant::now();
-        legion::manager::sessions::start(store, &config, &task, None).await?;
+        legion::manager::sessions::start(store, &config, &task, None, None).await?;
         samples.push(at.elapsed());
     }
     report("router start (pick, send, record)", samples);

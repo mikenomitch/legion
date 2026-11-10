@@ -944,6 +944,8 @@ fn map_instance_info(
                 .unwrap_or_default(),
         });
     InstanceInfo {
+        owner: None,
+        children: Vec::new(),
         cold_boot,
         last_stop,
         checkpoint_support,
@@ -7377,6 +7379,21 @@ impl Manager for ManagerDaemonService {
             if requested_id.is_none() {
                 return self.create_session(&identity, &inner, &config, task).await;
             }
+        }
+        // Children are sessions (docs/child-sessions.md): a create with an
+        // id makes a keyed instance, which cannot be owned yet.
+        if inner
+            .owner
+            .as_ref()
+            .is_some_and(|owner| !owner.id.is_empty())
+        {
+            return Err(Status::failed_precondition(format!(
+                "owner is set and the create names instance_id {:?}: a child is an unnamed \
+                 session of a session task; omit instance_id, or omit owner",
+                requested_id.unwrap_or_default()
+            )));
+        }
+        if crate::structs::session::is_session_task(task) {
             if !crate::structs::session::accepts_names(task) {
                 return Err(Status::invalid_argument(format!(
                     "task {} sets stateful.promote.onName = false: its instances are unnamed \
@@ -7474,6 +7491,7 @@ impl Manager for ManagerDaemonService {
             durable: true,
             node_id: String::new(),
             state: String::new(),
+            owner: None,
         }))
     }
 
@@ -8419,8 +8437,10 @@ impl Manager for ManagerDaemonService {
                 .locate_session(&identity, &inner.instance_id, AclAction::Read)
                 .await?
             {
+                let mut info = self.session_info(&session);
+                self.attach_children(&mut info).await;
                 return Ok(Response::new(GetInstanceReply {
-                    instance: Some(self.session_info(&session)),
+                    instance: Some(info),
                     provisional: None,
                     provisional_node_id: String::new(),
                 }));
@@ -8469,11 +8489,14 @@ impl Manager for ManagerDaemonService {
             .instance_history(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?;
 
-        let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
-        let idle_unmeasured = idle_policy_unmeasured_detail(&self.store, &usage, &instance);
-        let egress_unenforced = instance_egress_unenforced_detail(&self.store, &instance);
-        let mut info = map_instance_info(&self.store, &usage, instance, suspend, history);
-        drop(usage);
+        // The usage lock is released before the await below.
+        let (idle_unmeasured, egress_unenforced, mut info) = {
+            let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+            let idle_unmeasured = idle_policy_unmeasured_detail(&self.store, &usage, &instance);
+            let egress_unenforced = instance_egress_unenforced_detail(&self.store, &instance);
+            let info = map_instance_info(&self.store, &usage, instance, suspend, history);
+            (idle_unmeasured, egress_unenforced, info)
+        };
         attach_guest_address(
             &mut info,
             &guest_addresses(&self.net_status.lock().unwrap_or_else(|p| p.into_inner())),
@@ -8482,6 +8505,7 @@ impl Manager for ManagerDaemonService {
         if info.detail.is_none() {
             info.detail = idle_unmeasured.or(egress_unenforced);
         }
+        self.attach_children(&mut info).await;
         Ok(Response::new(GetInstanceReply {
             instance: Some(info),
             provisional,
@@ -9404,6 +9428,10 @@ impl Manager for ManagerDaemonService {
             }
             None => (false, Vec::new()),
         };
+        // What became of the owners of this node's child sessions, for the
+        // owners only the managers can judge (docs/child-sessions.md).
+        // Empty, and free, for a node that reports no child.
+        let owner_notices = crate::manager::children::owner_notices(&self.store, &id);
         // Service-graph samples: fold into per-(caller, service) windows.
         if !req.net_edges.is_empty() {
             let callers: HashMap<i64, (String, String)> = feed_allocations
@@ -9524,6 +9552,7 @@ impl Manager for ManagerDaemonService {
         }
 
         let reply = HeartbeatReply {
+            owner_notices,
             net_policies,
             message: "ack".into(),
             desired_allocations,
@@ -13735,6 +13764,7 @@ fn create_instance_replay(recorded: String) -> CreateInstanceReply {
         .map(|(id, snapshot)| (id.to_string(), snapshot.to_string()))
         .unwrap_or((recorded, String::new()));
     CreateInstanceReply {
+        owner: None,
         instance_id,
         deduplicated: true,
         restoring_from,

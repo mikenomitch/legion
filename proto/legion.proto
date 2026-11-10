@@ -7320,6 +7320,25 @@ message CreateInstanceRequest {
   // job) instead of booting it empty. Needs `snapshot:read` on the job. See
   // `CreateInstances` for the full contract.
   optional string from_snapshot = 6;
+
+  // Start the unnamed session as a child of this unit
+  // (docs/child-sessions.md): it ends when its owner ends, and is listed
+  // under it. Session tasks only, and only without `instance_id`. The
+  // owner must be a running unit of the same job whose task names this
+  // task in `children.tasks`. Needs `job:write` like any create.
+  //
+  // `kind` is `session` (a session id), `instance` (a keyed or slot
+  // instance id), or `allocation` (an allocation id, for owners with no
+  // instance identity); empty asks the manager to work it out from `id`.
+  // The child goes to its owner's node when that node's envelope for this
+  // task has room, and to another node with room otherwise.
+  //
+  // Errors: NotFound when no running unit has the id; FailedPrecondition
+  // when the owner's task does not declare this task, when the owner is
+  // itself a child (depth 1 only), or when the task is keyed;
+  // ResourceExhausted (retryable) when the owner already has
+  // `children.max` children or no envelope has room.
+  optional OwnerRef owner = 7;
 }
 
 // Reply payload for CreateInstance.
@@ -7366,6 +7385,10 @@ message CreateInstanceReply {
   // deduplicated create. Empty for a keyed create (see `GetInstance` for its
   // state).
   string state = 7;
+
+  // The owner the session was started under (`CreateInstanceRequest.owner`),
+  // with its kind resolved. Unset for a create without an owner.
+  optional OwnerRef owner = 8;
 }
 
 // Request payload for CreateInstances (atomic batch create).
@@ -8012,6 +8035,15 @@ message InstanceInfo {
   // and `legion job run <spec> --force-reschedule` lifts every backoff of
   // the job. Replicated, so every manager reports it. Unset otherwise.
   optional RescheduleBackoff reschedule_backoff = 47;
+
+  // The unit that owns this session as its child (docs/child-sessions.md).
+  // Unset for a unit nobody owns. A promoted child is detached and carries
+  // none.
+  optional OwnerRef owner = 48;
+
+  // The sessions this unit owns, as the session index lists them: ids,
+  // tasks, nodes, and states. Filled by `GetInstance`; empty in lists.
+  repeated ChildInfo children = 49;
 }
 
 // A failed allocation's replacement waiting out its task's reschedule
@@ -10018,6 +10050,12 @@ message SessionStatus {
   // periodic (`suspend.checkpointEvery`) or worker-stop checkpoint. Absent
   // for a running session that was never checkpointed.
   SessionCheckpointInfo checkpoint = 12;
+  // The unit that owns this session as its child (docs/child-sessions.md).
+  // Unset for a session nobody owns.
+  // The node reports it on every session report, so the managers know
+  // which sessions to end when an `instance` or `allocation` owner reaches
+  // a terminal state.
+  OwnerRef owner = 13;
 }
 
 // A session's checkpoint, as its node reports it in `SessionStatus`.
@@ -10198,6 +10236,12 @@ message StreamWorkReply {
   // stream and reconnects with no position, which gets a full resync.
   // `digest` is the node's whole desired set after the message, as always.
   string resumed_from = 21;
+
+  // Owner notices for this node's child sessions, pushed as soon as this
+  // manager sees the owner's state change (see
+  // `HeartbeatReply.owner_notices`, which repeats them). Push-only: outside
+  // the sequence and never replayed.
+  repeated OwnerNotice owner_notices = 11;
 }
 
 // One finished (or refused-after-verification) direct exec session.
@@ -10935,6 +10979,13 @@ message HeartbeatReply {
   // Unset by a manager that predates runtime disables; a worker then keeps
   // the set it holds. Set with no `states` when nothing is disabled.
   RuntimeStateSet runtime_states = 26;
+
+  // What happened to the owners of child sessions this node holds
+  // (docs/child-sessions.md): the managers decide when an `instance` or
+  // `allocation` owner ended, and when a `session` owner on another node
+  // did. Sent on every reply until the node's session report no longer
+  // lists a child of the owner, so a lost notice is repeated.
+  repeated OwnerNotice owner_notices = 27;
 }
 
 // Why one allocation is being stopped.
@@ -14383,6 +14434,20 @@ message StartSessionRequest {
   // session that is still running leaves two copies until the old one is
   // fenced (docs/session-mode.md, "No split brain").
   bool force_move = 7;
+
+  // Start the session as a child of this owner (docs/child-sessions.md).
+  // The owner must be running on this node: a session id (`kind =
+  // "session"`), a keyed or slot instance id (`"instance"`), or an
+  // allocation id (`"allocation"`); empty `kind` asks the node to work it
+  // out. The owner's task must name the ticket's task in `children.tasks`
+  // and be a task of the ticket's job. The ticket is still the credential.
+  //
+  // Errors: NotFound when the owner is not running on this node (start it
+  // through a manager to place a child on another node);
+  // FailedPrecondition when the owner's task does not declare the task or
+  // the owner is itself a child; ResourceExhausted (retryable) at
+  // `children.max` or a full envelope.
+  OwnerRef owner = 8;
 }
 
 // Reply payload for Worker.StartSession.
@@ -14418,6 +14483,10 @@ message StartSessionReply {
   // With `resume_id`, the node the session ran on before, when it moved
   // here. Empty otherwise.
   string moved_from = 7;
+
+  // The owner the session was started under, with its kind resolved.
+  // Unset for a session nobody owns.
+  OwnerRef owner = 8;
 }
 
 // The workload channel: what a workload asks its own node's worker, over
@@ -14443,6 +14512,148 @@ service Workload {
   // a `command`, or a task the caller's task may not run, and NotFound when
   // the socket's allocation is no longer running.
   rpc RunSession (RunSessionRequest) returns (RunSessionResponse);
+
+  // Starts a session of a sibling session task as a child of the calling
+  // allocation (docs/child-sessions.md): `legion session start <task>
+  // --owner self` inside a task. The child ends when the caller's unit
+  // ends, is charged to its own task's envelope, and runs under its own
+  // task's resources, network policy, and identity.
+  //
+  // Authorization is the jobspec's: the caller's task must name the task
+  // in `children.tasks`. No credential is read. The owner is the caller,
+  // whatever the request says: its session when it is a session, its
+  // instance when it is a keyed or slot instance, its allocation otherwise.
+  // The child starts on the caller's node; when that node has no room for
+  // it the call is refused, and a start through a manager
+  // (`CreateInstanceRequest.owner`) can place it elsewhere.
+  //
+  // Errors: FailedPrecondition when the caller's task does not declare the
+  // task, the caller is itself a child (depth 1 only), or the node holds
+  // no envelope for the task; ResourceExhausted (retryable) when the
+  // caller already owns `children.max` children or the envelope is full;
+  // Unavailable when the task's runtime is disabled; NotFound when the
+  // socket's allocation is no longer running.
+  rpc StartChildSession (StartChildSessionRequest) returns (StartSessionReply);
+
+  // Lists the children the calling allocation's unit owns on this node:
+  // running and suspended ones, and the ones that ended in the last ten
+  // minutes (`state = "gone"`, with the reason: `stopped`, `evicted`,
+  // `exited`, `owner ended`). This is how an owner learns a child is gone.
+  //
+  // Errors: NotFound when the socket's allocation is no longer running.
+  rpc ListChildren (ListChildrenRequest) returns (ListChildrenReply);
+
+  // Ends one child of the calling allocation's unit. Only the caller's own
+  // children are reachable: any other id answers NotFound, so the existence
+  // of other units cannot be probed.
+  //
+  // Errors: NotFound when the id is not a child of the caller on this node.
+  rpc StopChildSession (StopChildSessionRequest) returns (StopChildSessionReply);
+}
+
+// A typed reference to the unit that owns a child (docs/child-sessions.md).
+// It is stored with the child, wherever the child's own record lives, and
+// whoever holds that record ends the child when the owner's authority says
+// the owner reached a terminal state.
+message OwnerRef {
+  // What `id` names, which also decides who says the owner ended:
+  //
+  // - `session`: a session id. Its node decides: stopped, destroyed, or
+  //   its workload exited. Suspending or moving it is not an end.
+  // - `instance`: a keyed or slot instance id, the logical unit that
+  //   outlives its allocations. The managers decide: stopped or destroyed.
+  //   Suspended, archived, or rescheduling is not an end.
+  // - `allocation`: an allocation id, for an owner with no instance
+  //   identity (a service replica, a batch run). The managers decide:
+  //   complete, failed, stopped, or lost.
+  string kind = 1;
+
+  // The owner's id: a session id, an instance id, or an allocation id in
+  // decimal.
+  string id = 2;
+}
+
+// What happened to the owner of child sessions a node holds.
+message OwnerNotice {
+  // The owner, as the children's references name it.
+  OwnerRef owner = 1;
+
+  // `stopped` or `destroyed`: the owner reached a terminal state, and the
+  // node ends its children (a session child has no difference between the
+  // two). `suspended`: the owner suspended, and the node suspends the
+  // children whose owner task sets `children.suspendWithOwner`.
+  // `promoted`: the owner session became the instance `promoted_to`, and
+  // the node re-keys its children's references to it.
+  string event = 2;
+
+  // For `promoted`: the reference the children carry from now on.
+  OwnerRef promoted_to = 3;
+
+  // A short reason for the log and the child's `gone` record, e.g.
+  // `instance user-42 stopped`.
+  string detail = 4;
+}
+
+// One child of an owner, as `GetInstance`, `Worker.GetSession`, and
+// `Workload.ListChildren` list it.
+message ChildInfo {
+  // The child's session id.
+  string session_id = 1;
+
+  // The child's task.
+  string task_name = 2;
+
+  // The node holding it.
+  string node_id = 3;
+
+  // `starting`, `running`, `suspended`, or `gone` (it ended in the last
+  // ten minutes; only its own node reports this).
+  string state = 4;
+
+  // For `gone`: why, e.g. `stopped`, `exited`, `evicted`, `owner ended`.
+  string reason = 5;
+}
+
+// `Workload.StartChildSession`.
+message StartChildSessionRequest {
+  // The session task to start a child of. It must be a task of the
+  // caller's job that the caller's task names in `children.tasks`.
+  string task_name = 1;
+
+  // Node-local retry key: a repeat on the same node returns the same child
+  // with `deduplicated = true`.
+  string idempotency_key = 2;
+
+  // Whether to answer once the child runs (the default) or as soon as it
+  // is admitted (`false`, state `starting`).
+  optional bool wait = 3;
+}
+
+// `Workload.ListChildren`.
+message ListChildrenRequest {}
+
+message ListChildrenReply {
+  // The reference the caller's children carry: the caller's own unit.
+  OwnerRef owner = 1;
+
+  // The caller's children on this node.
+  repeated ChildInfo children = 2;
+
+  // The most children the caller may own at once (`children.max`); 0 when
+  // the caller's task declares no `children` block.
+  uint32 max = 3;
+}
+
+// `Workload.StopChildSession`.
+message StopChildSessionRequest {
+  // The child's session id, as `StartChildSession` returned it.
+  string session_id = 1;
+}
+
+message StopChildSessionReply {
+  // Whether the child was ended by this call (false when it had already
+  // ended and is remembered as `gone`).
+  bool stopped = 1;
 }
 
 // Request payload for Manager.RunSession and Worker.RunSession: one run in
@@ -14654,6 +14865,11 @@ message GetSessionReply {
 
   // This node's id.
   string node_id = 2;
+
+  // The children this session owns on this node (docs/child-sessions.md):
+  // running and suspended ones, and the ones that ended in the last ten
+  // minutes with `state = "gone"` and why.
+  repeated ChildInfo children = 3;
 }
 
 // Request payload for Worker.StopSessions.
@@ -15591,6 +15807,12 @@ message TaskAllocation {
   // reads `mesh` and `allow` from it to compile the receiving side's
   // `service/allow` check into the allocation's ingress policy.
   string task_service = 35;
+
+  // JSON `ChildrenConfig`: the task's `children` block (`tasks`, `max`,
+  // `suspendWithOwner`, `orphanAfter`; docs/child-sessions.md). Empty when
+  // the task declares none. The node reads it to admit a child started
+  // from inside the allocation, and to count against `max`.
+  string task_children = 36;
 }
 
 // Request payload for PostWork.
@@ -17740,6 +17962,26 @@ message SessionStart {
   // When the router issued the session, unix milliseconds. Breaks a tie
   // between two copies of one session id: the later one is stopped.
   int64 lease_issued_at_unix_ms = 1;
+
+  // The unit that owns the session as its child (docs/child-sessions.md).
+  // The node stores it with the session (`sessions.db`), reports it, ends
+  // the session when a `session` owner on the same node ends, and ends it
+  // on the managers' notice for every other owner.
+  OwnerRef owner = 2;
+
+  // How many children the owner already has on other nodes, as the sending
+  // manager's session index counts them. The node adds the children it
+  // holds itself and refuses the start at the owner task's `children.max`.
+  uint32 owner_children_elsewhere = 3;
+
+  // Set by the node, never read from a caller: the owner is a session
+  // that does not run on this node (the child was placed elsewhere, or the
+  // owner moved away), so the managers say when it ended.
+  bool owner_remote = 4;
+
+  // The owner task's `children.suspendWithOwner`, as whoever resolved the
+  // owner's task read it: the child suspends when its owner does.
+  bool suspend_with_owner = 5;
 }
 
 // One unratified claim a worker is holding, reported on every heartbeat.

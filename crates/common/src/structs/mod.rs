@@ -10,6 +10,7 @@ pub mod archive;
 pub mod artifact;
 pub mod band;
 pub mod checkpoint;
+pub mod children;
 pub mod config;
 pub mod edge_boot;
 pub mod exec_ticket;

@@ -219,7 +219,7 @@ impl WorkerTaskManager {
     }
 
     /// The running, unpromoted session with this id.
-    fn running_session(&self, session_id: &str) -> Option<ClaimRecord> {
+    pub(crate) fn running_session(&self, session_id: &str) -> Option<ClaimRecord> {
         self.claims
             .by_instance(session_id)
             .filter(|claim| claim.is_session() && !claim.is_ratified())
@@ -1032,6 +1032,9 @@ fn suspend_session_inner(
                 .expect("task manager")
                 .suspended_checkpoint(session_id)
                 .unwrap_or(checkpoint);
+            // Children that follow their owner to sleep
+            // (`children.suspendWithOwner`, docs/child-sessions.md).
+            super::children::owner_suspended(manager, session_id);
             Ok(SuspendOutcome::Suspended(checkpoint))
         }
         Err(err) => {

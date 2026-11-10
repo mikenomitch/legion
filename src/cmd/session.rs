@@ -120,8 +120,40 @@ pub fn config() -> Command {
                         "With --resume-id: move the session even when the node its manifest \
                          names did not answer (only once that node is known to be down)",
                     ),
+            )
+            .arg(
+                Arg::new("owner")
+                    .long("owner")
+                    .value_name("ID|self")
+                    .conflicts_with("resume-id")
+                    .help(
+                        "Start the session as a child of this unit (docs/child-sessions.md): \
+                         it ends when its owner ends. An id of a session, instance, or \
+                         allocation running on --node; or `self` inside a task, which asks \
+                         this node's worker over the allocation's API socket with no ticket \
+                         (then JOB is read as the task: `legion session start machine --owner \
+                         self`). The owner's task must name the task in children.tasks",
+                    ),
+            )
+            .arg(
+                Arg::new("owner-kind")
+                    .long("owner-kind")
+                    .value_name("KIND")
+                    .value_parser(["session", "instance", "allocation"])
+                    .requires("owner")
+                    .help("What --owner names. Default: worked out from the id"),
             ),
-    );
+    )
+    // `--owner self` needs neither a node nor a ticket nor --task.
+    .mut_arg("node", |arg| arg.required(false))
+    .mut_arg("ticket", |arg| arg.required(false))
+    .mut_arg("task", |arg| arg.required(false));
+    let children_cmd = Command::new("children")
+        .about(
+            "Inside a task: list the children this workload owns on its node, over the \
+             allocation's API socket (docs/child-sessions.md)",
+        )
+        .arg(json_flag());
     let get_cmd = edge_args(
         Command::new("get")
             .about("Read a session from its node with a session ticket")
@@ -130,8 +162,23 @@ pub fn config() -> Command {
     let stop_cmd = edge_args(
         Command::new("stop")
             .about("End a session on its node with a session ticket")
-            .arg(Arg::new("id").value_name("SESSION").required(true)),
-    );
+            .arg(Arg::new("id").value_name("SESSION").required(true))
+            .arg(
+                Arg::new("local")
+                    .long("local")
+                    .action(clap::ArgAction::SetTrue)
+                    .help(
+                        "Inside a task: end one of this workload's own children over the \
+                         allocation's API socket, with no ticket",
+                    ),
+            ),
+    )
+    .mut_arg("node", |arg| {
+        arg.required(false).required_unless_present("local")
+    })
+    .mut_arg("ticket", |arg| {
+        arg.required(false).required_unless_present("local")
+    });
     let run_cmd = Command::new("run")
         .about("Run once in a fresh, single-use session and return the output")
         .long_about(
@@ -271,6 +318,7 @@ pub fn config() -> Command {
         .subcommand(nodes_cmd)
         .subcommand(run_cmd)
         .subcommand(start_cmd)
+        .subcommand(children_cmd)
         .subcommand(get_cmd)
         .subcommand(stop_cmd)
 }
@@ -281,6 +329,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("nodes", matches)) => nodes(matches).await,
         Some(("run", matches)) => run(matches).await,
         Some(("start", matches)) => start(matches).await,
+        Some(("children", matches)) => children(matches).await,
         Some(("get", matches)) => get(matches).await,
         Some(("stop", matches)) => stop(matches).await,
         _ => {
@@ -754,14 +803,189 @@ fn ticket(matches: &ArgMatches) -> String {
         .unwrap_or_default()
 }
 
+/// A request the CLI refuses before sending anything.
+fn refuse_locally(format: OutputFormat, message: String) -> anyhow::Error {
+    output::fail_local(
+        format,
+        output::CliError::local("invalid_argument", message, None),
+    )
+}
+
+/// The `Workload` service on the allocation's API socket (`LEGION_ADDR =
+/// unix://...` inside a task whose task declares the `legion` identity).
+fn workload_client(
+    format: OutputFormat,
+    flag: &str,
+) -> R<crate::structs::workload_client::WorkloadClient<tonic::transport::Channel>> {
+    let address = crate::cmd::helpers::manager_address();
+    let path = crate::cmd::helpers::unix_socket_path(&address).ok_or_else(|| {
+        refuse_locally(
+            format,
+            format!(
+                "{flag} needs the allocation's API socket: LEGION_ADDR is {address}, not a \
+             unix:// address (the task declares no `legion` identity, or this is not a task)"
+            ),
+        )
+    })?;
+    Ok(crate::structs::workload_client::WorkloadClient::new(
+        crate::cmd::helpers::unix_socket_channel(path, None),
+    ))
+}
+
+fn owner_json(owner: Option<&crate::structs::OwnerRef>) -> Value {
+    match owner {
+        Some(owner) => json!({ "kind": owner.kind, "id": owner.id }),
+        None => Value::Null,
+    }
+}
+
+/// `--owner self`: start a child of the calling workload on its own node.
+async fn start_child_of_self(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
+    // `legion session start machine --owner self`: the positional is the
+    // task, the job is the caller's own.
+    let task_name = matches
+        .get_one::<String>("task")
+        .or_else(|| matches.get_one::<String>("job"))
+        .cloned()
+        .unwrap_or_default();
+    let mut client = workload_client(format, "--owner self")?;
+    let reply = output::resolve(
+        format,
+        "Failed to start the child session",
+        client
+            .start_child_session(crate::structs::StartChildSessionRequest {
+                task_name,
+                idempotency_key: matches
+                    .get_one::<String>("idempotency-key")
+                    .cloned()
+                    .unwrap_or_default(),
+                wait: matches.get_flag("no-wait").then_some(false),
+            })
+            .await
+            .map(tonic::Response::into_inner),
+    )?;
+    print_started(format, &reply);
+    Ok(())
+}
+
+fn print_started(format: OutputFormat, reply: &crate::structs::StartSessionReply) {
+    if format.is_json() {
+        output::print_success(&json!({
+            "sessionId": reply.session_id,
+            "node": reply.node_id,
+            "state": reply.state,
+            "deduplicated": reply.deduplicated,
+            "resumedFrom": reply.resumed_from,
+            "generation": reply.generation,
+            "movedFrom": reply.moved_from,
+            "owner": owner_json(reply.owner.as_ref()),
+        }));
+    } else {
+        let moved = if reply.moved_from.is_empty() {
+            String::new()
+        } else {
+            format!(", moved from {}", reply.moved_from)
+        };
+        let resumed = if reply.resumed_from.is_empty() {
+            String::new()
+        } else {
+            format!(", resumed from {}", reply.resumed_from)
+        };
+        let owned = match reply.owner.as_ref() {
+            Some(owner) => format!(", child of {} {}", owner.kind, owner.id),
+            None => String::new(),
+        };
+        println!(
+            "{} on {} ({}{}{}{}{})",
+            reply.session_id,
+            reply.node_id,
+            reply.state,
+            if reply.deduplicated {
+                ", deduplicated"
+            } else {
+                ""
+            },
+            resumed,
+            moved,
+            owned
+        );
+    }
+}
+
+/// `legion session children`: what the calling workload owns on its node.
+async fn children(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
+    let mut client = workload_client(format, "session children")?;
+    let reply = output::resolve(
+        format,
+        "Failed to list children",
+        client
+            .list_children(crate::structs::ListChildrenRequest {})
+            .await
+            .map(tonic::Response::into_inner),
+    )?;
+    if format.is_json() {
+        output::print_success(&json!({
+            "owner": owner_json(reply.owner.as_ref()),
+            "max": reply.max,
+            "children": reply.children.iter().map(|child| json!({
+                "sessionId": child.session_id,
+                "task": child.task_name,
+                "node": child.node_id,
+                "state": child.state,
+                "reason": child.reason,
+            })).collect::<Vec<_>>(),
+        }));
+    } else if reply.children.is_empty() {
+        println!("no children (max {})", reply.max);
+    } else {
+        for child in &reply.children {
+            let reason = if child.reason.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", child.reason)
+            };
+            println!(
+                "{}  {}  {}{}",
+                child.session_id, child.task_name, child.state, reason
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn start(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
+    let owner = matches.get_one::<String>("owner").cloned();
+    if owner.as_deref() == Some(crate::structs::children::OWNER_SELF) {
+        return start_child_of_self(matches).await;
+    }
+    if matches.get_one::<String>("node").is_none()
+        || matches.get_one::<String>("ticket").is_none()
+        || matches.get_one::<String>("task").is_none()
+    {
+        return Err(refuse_locally(
+            format,
+            "--node, --ticket, and --task are required (only `--owner self`, inside a task, \
+             starts a session without them)"
+                .to_string(),
+        ));
+    }
+    let owner = owner.map(|id| crate::structs::OwnerRef {
+        kind: matches
+            .get_one::<String>("owner-kind")
+            .cloned()
+            .unwrap_or_default(),
+        id,
+    });
     let mut client = edge_client(matches).await?;
     let reply = output::resolve(
         format,
         "Failed to start the session",
         client
             .start_session(StartSessionRequest {
+                owner,
                 ticket: ticket(matches),
                 job_id: matches
                     .get_one::<String>("job")
@@ -786,41 +1010,7 @@ async fn start(matches: &ArgMatches) -> R<()> {
             .await
             .map(tonic::Response::into_inner),
     )?;
-    if format.is_json() {
-        output::print_success(&json!({
-            "sessionId": reply.session_id,
-            "node": reply.node_id,
-            "state": reply.state,
-            "deduplicated": reply.deduplicated,
-            "resumedFrom": reply.resumed_from,
-            "generation": reply.generation,
-            "movedFrom": reply.moved_from,
-        }));
-    } else {
-        let moved = if reply.moved_from.is_empty() {
-            String::new()
-        } else {
-            format!(", moved from {}", reply.moved_from)
-        };
-        let resumed = if reply.resumed_from.is_empty() {
-            String::new()
-        } else {
-            format!(", resumed from {}", reply.resumed_from)
-        };
-        println!(
-            "{} on {} ({}{}{}{})",
-            reply.session_id,
-            reply.node_id,
-            reply.state,
-            if reply.deduplicated {
-                ", deduplicated"
-            } else {
-                ""
-            },
-            resumed,
-            moved
-        );
-    }
+    print_started(format, &reply);
     Ok(())
 }
 
@@ -859,8 +1049,29 @@ async fn get(matches: &ArgMatches) -> R<()> {
 
 async fn stop(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let mut client = edge_client(matches).await?;
     let id = matches.get_one::<String>("id").cloned().unwrap_or_default();
+    if matches.get_flag("local") {
+        let mut client = workload_client(format, "--local")?;
+        let reply = output::resolve(
+            format,
+            "Failed to stop the child session",
+            client
+                .stop_child_session(crate::structs::StopChildSessionRequest {
+                    session_id: id.clone(),
+                })
+                .await
+                .map(tonic::Response::into_inner),
+        )?;
+        if format.is_json() {
+            output::print_success(&json!({ "sessionId": id, "stopped": reply.stopped }));
+        } else if reply.stopped {
+            println!("{id} stopped");
+        } else {
+            println!("{id} had already ended");
+        }
+        return Ok(());
+    }
+    let mut client = edge_client(matches).await?;
     let reply = output::resolve(
         format,
         "Failed to stop the session",

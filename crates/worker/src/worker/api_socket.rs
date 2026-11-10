@@ -161,6 +161,173 @@ impl crate::structs::workload_server::Workload for AllocationWorkload {
         .await
         .map(tonic::Response::new)
     }
+
+    #[instrument(err, skip_all, fields(allocation_id = self.allocation_id, task, session_id))]
+    async fn start_child_session(
+        &self,
+        request: tonic::Request<crate::structs::StartChildSessionRequest>,
+    ) -> Result<tonic::Response<crate::structs::StartSessionReply>, tonic::Status> {
+        use crate::worker::edge;
+        use tonic::Status;
+        // ACL: workload channel. The caller is the socket's allocation, and
+        // the owner of the child whatever the request says; its task's
+        // `children` block decides what it may start.
+        let request = request.into_inner();
+        let task_name = request.task_name.trim().to_string();
+        if task_name.is_empty() {
+            return Err(Status::invalid_argument(
+                "task_name is required: the session task to start a child of",
+            ));
+        }
+        let span = tracing::Span::current();
+        span.record("task", task_name.as_str());
+        let me = self.owner()?;
+        if !me
+            .task
+            .children
+            .as_ref()
+            .is_some_and(|block| block.declares(&task_name))
+        {
+            return Err(Status::failed_precondition(
+                crate::structs::children::not_declared(&me.job_id, &me.task.name, &task_name),
+            ));
+        }
+        let launch_pool = self.channel.launch_pool.get().cloned().ok_or_else(|| {
+            Status::unavailable("the worker is still starting; retry in a moment")
+        })?;
+        let slot = launch_pool
+            .acquire()
+            .await
+            .map_err(|full| Status::resource_exhausted(full.to_string()))?;
+        let task_manager = self.channel.task_manager.clone();
+        let node_id = self.channel.node_id.clone();
+        let key = request.idempotency_key.clone();
+        let (job_id, owner) = (me.job_id.clone(), me.owner.clone());
+        let child_task = task_name.clone();
+        let started = tokio::task::spawn_blocking(move || {
+            edge::start_local_session(
+                &task_manager,
+                &node_id,
+                edge::LocalStart {
+                    job_id: &job_id,
+                    task_name: &child_task,
+                    origin: "workload",
+                    ticket_jti: "",
+                    idempotency_key: &key,
+                    owner: Some(owner),
+                },
+                slot,
+            )
+        })
+        .await
+        .map_err(|err| Status::internal(format!("child start panicked: {err}")))?
+        .map_err(|err| crate::worker::server::admission_status(&err))?;
+        span.record("session_id", started.session_id.as_str());
+        let state = if started.deduplicated || !request.wait.unwrap_or(true) {
+            self.lock()?
+                .session_state(&started.session_id)
+                .unwrap_or_else(|| "starting".to_string())
+        } else {
+            match edge::wait_until_running(
+                &self.channel.task_manager,
+                &started.session_id,
+                crate::worker::server::EDGE_START_WAIT,
+            )
+            .await
+            {
+                Ok(true) => "running".to_string(),
+                Ok(false) => "starting".to_string(),
+                Err(err) => {
+                    return Err(Status::failed_precondition(format!(
+                        "the child failed to start: {err:#}"
+                    )))
+                }
+            }
+        };
+        Ok(tonic::Response::new(crate::structs::StartSessionReply {
+            session_id: started.session_id,
+            node_id: self.channel.node_id.clone(),
+            state,
+            deduplicated: started.deduplicated,
+            resumed_from: String::new(),
+            generation: 1,
+            moved_from: String::new(),
+            owner: Some(me.owner),
+        }))
+    }
+
+    #[instrument(err, skip_all, fields(allocation_id = self.allocation_id))]
+    async fn list_children(
+        &self,
+        _request: tonic::Request<crate::structs::ListChildrenRequest>,
+    ) -> Result<tonic::Response<crate::structs::ListChildrenReply>, tonic::Status> {
+        // ACL: workload channel. A caller lists its own children only.
+        let me = self.owner()?;
+        let children = self.lock()?.child_infos(&me.owner, &self.channel.node_id);
+        Ok(tonic::Response::new(crate::structs::ListChildrenReply {
+            max: me.task.children.as_ref().map_or(0, |block| block.max),
+            owner: Some(me.owner),
+            children,
+        }))
+    }
+
+    #[instrument(err, skip_all, fields(allocation_id = self.allocation_id, session_id))]
+    async fn stop_child_session(
+        &self,
+        request: tonic::Request<crate::structs::StopChildSessionRequest>,
+    ) -> Result<tonic::Response<crate::structs::StopChildSessionReply>, tonic::Status> {
+        use tonic::Status;
+        // ACL: workload channel. Only the caller's own children are
+        // reachable; every other id answers NotFound, whatever it names.
+        let session_id = request.into_inner().session_id;
+        tracing::Span::current().record("session_id", session_id.as_str());
+        let me = self.owner()?;
+        let mut guard = self.lock()?;
+        let not_found = || Status::not_found(format!("no child {session_id} of this workload"));
+        let owned = guard
+            .child_link(&session_id)
+            .is_some_and(|link| link.owner.kind == me.owner.kind && link.owner.id == me.owner.id);
+        if !owned {
+            let gone = guard.gone_child(&session_id).is_some_and(|gone| {
+                gone.owner.kind == me.owner.kind && gone.owner.id == me.owner.id
+            });
+            return if gone {
+                Ok(tonic::Response::new(
+                    crate::structs::StopChildSessionReply { stopped: false },
+                ))
+            } else {
+                Err(not_found())
+            };
+        }
+        let stopped = !guard
+            .stop_sessions(std::slice::from_ref(&session_id), "stopped by its owner")
+            .is_empty();
+        guard.reconcile_children();
+        Ok(tonic::Response::new(
+            crate::structs::StopChildSessionReply { stopped },
+        ))
+    }
+}
+
+impl AllocationWorkload {
+    fn lock(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, crate::worker::task_manager::WorkerTaskManager>,
+        tonic::Status,
+    > {
+        self.channel
+            .task_manager
+            .lock()
+            .map_err(|_| tonic::Status::internal("Task manager lock poisoned"))
+    }
+
+    /// The socket's allocation as an owner of children.
+    fn owner(&self) -> Result<crate::worker::task_manager::children::LocalOwner, tonic::Status> {
+        self.lock()?.self_owner(self.allocation_id).ok_or_else(|| {
+            tonic::Status::not_found("this socket's allocation is no longer running on the node")
+        })
+    }
 }
 
 /// How the socket decides whether a connecting process belongs to its

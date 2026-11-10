@@ -849,6 +849,7 @@ pub fn instance_info(entry: &IndexedSession, group: &str) -> InstanceInfo {
         lease_issued_at: Some(started),
         envelope_alloc_id: (status.envelope_allocation_id > 0)
             .then_some(status.envelope_allocation_id),
+        owner: status.owner,
         ..Default::default()
     }
 }
@@ -1432,6 +1433,21 @@ pub struct StartedSession {
     pub node_id: String,
     pub state: String,
     pub deduplicated: bool,
+    /// The owner it was started under (docs/child-sessions.md).
+    pub owner: Option<crate::structs::OwnerRef>,
+}
+
+/// A session start as a child of an owner the manager resolved and
+/// authorized ([`crate::manager::children`]).
+#[derive(Debug, Clone)]
+pub struct ChildStart {
+    pub owner: crate::structs::OwnerRef,
+    /// The owner's node: the child goes there when its envelope has room.
+    pub prefer_node: Option<String>,
+    /// The owner task's `children.max`.
+    pub max: u32,
+    /// The owner task's `children.suspendWithOwner`.
+    pub suspend_with_owner: bool,
 }
 
 /// Start an unnamed session of a session task: pick a node whose envelope
@@ -1446,15 +1462,21 @@ pub async fn start(
     config: &JobConfig,
     task: &TaskConfig,
     derived_id: Option<&str>,
+    child: Option<&ChildStart>,
 ) -> Result<StartedSession, Status> {
     let metrics = crate::manager::telemetry::metrics();
     let job_id = config.name.as_str();
+    let owner = child.map(|child| child.owner.clone());
     if let Some(session_id) = derived_id {
         if let Some(existing) = find(store, session_id).await {
             metrics.session_starts_total.inc(&["deduplicated"]);
             return Ok(StartedSession {
                 session_id: session_id.to_string(),
                 node_id: existing.node_id.clone(),
+                owner: existing
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.owner.clone()),
                 state: existing
                     .status
                     .map(|status| status.state)
@@ -1463,6 +1485,36 @@ pub async fn start(
             });
         }
     }
+    // The owner's children so far, as this manager's index counts them.
+    // The owner's node counts its own again and is the last word.
+    let siblings: Vec<String> = match child {
+        Some(child) => {
+            let siblings: Vec<String> = store
+                .sessions()
+                .children_of(&child.owner.kind, &child.owner.id)
+                .into_iter()
+                .map(|(node_id, _)| node_id)
+                .collect();
+            if siblings.len() as u32 >= child.max {
+                metrics.session_starts_total.inc(&["refused"]);
+                return Err(Status::resource_exhausted(
+                    crate::structs::children::at_max(&child.owner, child.max),
+                ));
+            }
+            siblings
+        }
+        None => Vec::new(),
+    };
+    let session_start = |node_id: &str, issued_at: i64| SessionStart {
+        lease_issued_at_unix_ms: issued_at,
+        owner: owner.clone(),
+        owner_children_elsewhere: siblings
+            .iter()
+            .filter(|node| node.as_str() != node_id)
+            .count() as u32,
+        owner_remote: false,
+        suspend_with_owner: child.is_some_and(|child| child.suspend_with_owner),
+    };
     // A disabled runtime starts no session (docs/runtime-disable.md). The
     // nodes would refuse it too; refusing here names the reason once
     // instead of once per node tried.
@@ -1513,12 +1565,41 @@ pub async fn start(
         .unwrap_or_default();
     let mut refusals = Vec::new();
     let mut tried: Vec<String> = Vec::new();
+    // A child goes to its owner's node first, so the owner reaches it
+    // without leaving the node; the router picks another node only when
+    // that one refuses (docs/child-sessions.md, "Placement").
+    let mut preferred = child
+        .and_then(|child| child.prefer_node.clone())
+        .filter(|node| first.as_ref().is_some_and(|first| &first.node_id != node))
+        .filter(|node| {
+            envelope_nodes(store, job_id, &task.name)
+                .is_ok_and(|nodes| nodes.iter().any(|candidate| candidate == node))
+        });
     while tried.len() < ROUTER_ATTEMPTS {
-        let reservation = match first.take() {
-            Some(reservation) => reservation,
-            None => match reserve(store, job_id, &task.name, &needs, &tried, placement) {
-                Ok(reservation) => reservation,
-                Err(_) => break,
+        let reservation = match preferred.take() {
+            Some(node_id) => {
+                let skip: Vec<String> = placed_envelopes(store, job_id, &task.name)
+                    .map(|envelopes| {
+                        envelopes
+                            .into_iter()
+                            .map(|envelope| envelope.node_id)
+                            .filter(|candidate| candidate != &node_id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match reserve(store, job_id, &task.name, &needs, &skip, placement) {
+                    Ok(reservation) => reservation,
+                    // The router thinks the owner's node is full; the loop
+                    // below takes whichever node it would have picked.
+                    Err(_) => continue,
+                }
+            }
+            None => match first.take() {
+                Some(reservation) => reservation,
+                None => match reserve(store, job_id, &task.name, &needs, &tried, placement) {
+                    Ok(reservation) => reservation,
+                    Err(_) => break,
+                },
             },
         };
         let node_id = reservation.node_id.clone();
@@ -1540,12 +1621,13 @@ pub async fn start(
             &band,
             &node_id,
             session_id,
-            issued_at,
+            session_start(&node_id, issued_at),
         )
         .await
         {
             Ok(()) => {
                 let status = SessionStatus {
+                    owner: owner.clone(),
                     session_id: session_id.to_string(),
                     job_id: job_id.to_string(),
                     job_config_id: config.id(),
@@ -1567,6 +1649,7 @@ pub async fn start(
                     node_id,
                     state: "starting".into(),
                     deduplicated: false,
+                    owner,
                 });
             }
             Err(status) => {
@@ -1583,8 +1666,21 @@ pub async fn start(
                             node_id: winner,
                             state: "running".into(),
                             deduplicated: true,
+                            owner,
                         });
                     }
+                }
+                // The owner's node refused the child for the owner's own
+                // sake (not declared, at `max`, the owner is a child): no
+                // other node would answer differently.
+                if child.is_some()
+                    && status
+                        .message()
+                        .contains(crate::structs::children::REFUSED_FOR_OWNER)
+                {
+                    reservation.settle(Settle::Released);
+                    metrics.session_starts_total.inc(&["refused"]);
+                    return Err(status);
                 }
                 reservation.settle(
                     if matches!(
@@ -1816,7 +1912,7 @@ async fn send_start(
     band: &str,
     node_id: &str,
     session_id: &str,
-    issued_at: i64,
+    session_start: SessionStart,
 ) -> Result<(), Status> {
     let (mut client, target) = worker_client(store, node_id)?;
     // The session's own identity, for the workload's environment
@@ -1862,9 +1958,7 @@ async fn send_start(
             origin: "manager".into(),
             on_refused: "stop".into(),
             ticket_jti: String::new(),
-            session: Some(SessionStart {
-                lease_issued_at_unix_ms: issued_at,
-            }),
+            session: Some(session_start),
         }),
     )
     .map_err(|err| Status::internal(format!("failed to build the session payload: {err:#}")))?;

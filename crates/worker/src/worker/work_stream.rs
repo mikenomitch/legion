@@ -85,6 +85,10 @@ pub struct Applied {
     /// (docs/runtime-disable.md): the whole set, replacing what the worker
     /// holds. Not part of the mirror.
     pub runtime_states: Option<crate::structs::RuntimeStateSet>,
+    /// Owner notices a push-only message carried (docs/child-sessions.md):
+    /// what happened to the owners of child sessions this node holds. Not
+    /// part of the mirror.
+    pub owner_notices: Vec<crate::structs::OwnerNotice>,
     /// The message was a resume that does not continue from this mirror's
     /// revision: the stream must be reopened with no position.
     pub resume_refused: bool,
@@ -286,6 +290,7 @@ where
             on_applied(Applied {
                 endpoint_feed: message.endpoint_feed,
                 runtime_states: message.runtime_states,
+                owner_notices: message.owner_notices,
                 ..Default::default()
             });
             continue;

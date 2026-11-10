@@ -56,6 +56,9 @@ pub(crate) fn admission_status(err: &anyhow::Error) -> Status {
             return status;
         }
     }
+    if let Some(child) = err.downcast_ref::<crate::worker::task_manager::children::ChildRefusal>() {
+        return child.to_status();
+    }
     match err.downcast_ref::<SessionRefusal>() {
         Some(SessionRefusal::EnvelopeFull { .. }) => Status::resource_exhausted(format!("{err:#}")),
         _ => Status::failed_precondition(format!("{err:#}")),
@@ -940,9 +943,22 @@ impl Worker for WorkerDaemonService {
         if let Some(ticket) = ticket {
             ticket.allows(&session.job_id, &session.task_name)?;
         }
+        // What the session owns on this node (docs/child-sessions.md).
+        let children = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .child_infos(
+                &crate::structs::children::owner_ref(
+                    crate::structs::children::OWNER_SESSION,
+                    &session.session_id,
+                ),
+                &self.node_id,
+            );
         Ok(Response::new(crate::structs::GetSessionReply {
             session: Some(session),
             node_id: self.node_id.clone(),
+            children,
         }))
     }
 
@@ -986,12 +1002,19 @@ impl Worker for WorkerDaemonService {
                 .map(Response::new);
         }
 
+        // A child of a unit running on this node (docs/child-sessions.md):
+        // the ticket is still the credential, the owner's jobspec decides.
+        let owner = request.owner.clone().filter(|owner| !owner.id.is_empty());
+        if let Some(owner) = owner.as_ref() {
+            crate::structs::children::check_owner_request(owner)
+                .map_err(Status::invalid_argument)?;
+        }
         let slot = self.launch_slot().await?;
         let task_manager = self.task_manager.clone();
         let node_id = self.node_id.clone();
         let key = request.idempotency_key.clone();
         let started = tokio::task::spawn_blocking(move || {
-            edge::start_edge_session(&task_manager, &node_id, &claims, &key, slot)
+            edge::start_edge_session(&task_manager, &node_id, &claims, &key, slot, owner)
         })
         .await
         .map_err(|err| Status::internal(format!("session start panicked: {err}")))?
@@ -1021,6 +1044,12 @@ impl Worker for WorkerDaemonService {
             .session_status(&started.session_id)
             .map(|status| status.generation)
             .unwrap_or(1);
+        let owner = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .child_link(&started.session_id)
+            .map(|link| link.owner.clone());
         Ok(Response::new(crate::structs::StartSessionReply {
             session_id: started.session_id,
             node_id: self.node_id.clone(),
@@ -1029,6 +1058,7 @@ impl Worker for WorkerDaemonService {
             resumed_from: String::new(),
             generation,
             moved_from: String::new(),
+            owner,
         }))
     }
 
@@ -1163,7 +1193,7 @@ impl Worker for WorkerDaemonService {
 
 /// How long `StartSession` waits for a session to be running before it
 /// answers `starting`.
-const EDGE_START_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const EDGE_START_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A verified session ticket.
 pub(crate) struct VerifiedSessionTicket(crate::structs::edge_boot::SessionTicketClaims);
@@ -1316,6 +1346,7 @@ impl WorkerDaemonService {
             state,
             deduplicated: moved.from.is_empty(),
             resumed_from: moved.from.to_string(),
+            owner: None,
             generation: moved.generation,
             moved_from: moved.moved_from,
         })
@@ -1455,6 +1486,18 @@ impl WorkerDaemonService {
                  cannot be restored\nHint: start a new session, or set suspend.durability = \
                  \"store\" so idle sessions are kept in the content store",
                 self.node_id, evicted
+            ));
+        }
+        // A child that ended: say why, so its owner can act on it
+        // (docs/child-sessions.md, "When a child is gone").
+        if let Some((owner, reason)) = self.task_manager.lock().ok().and_then(|manager| {
+            manager
+                .gone_child(session_id)
+                .map(|gone| (gone.owner.clone(), gone.reason.clone()))
+        }) {
+            return Status::not_found(format!(
+                "child_gone: session {session_id}, a child of {} {}, ended on {}: {reason}",
+                owner.kind, owner.id, self.node_id
             ));
         }
         let own = crate::structs::node_tag(&self.node_id);

@@ -2258,6 +2258,12 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub run: Option<crate::structs::run::RunConfig>,
+    /// The sibling tasks whose sessions (or keyed instances) a unit of this
+    /// task may start and own (`docs/child-sessions.md`). None = the task's
+    /// units own nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub children: Option<crate::structs::children::ChildrenConfig>,
     /// Task autoscaling (docs/autoscaling.md): `true` for the effective
     /// defaults, or a sparse record overriding some of them. Stored exactly
     /// as written; the defaults it inherits (cluster, namespace policies)
@@ -2973,6 +2979,8 @@ struct TaskConfigInput {
     suspend: Option<crate::structs::suspend::SuspendConfig>,
     #[serde(default)]
     run: Option<crate::structs::run::RunConfig>,
+    #[serde(default)]
+    children: Option<crate::structs::children::ChildrenConfig>,
     // Strict on its own (`deny_unknown_fields` on the record): a typo in an
     // autoscale record is an error even under `allow_unknown_fields`.
     #[serde(default)]
@@ -3021,6 +3029,7 @@ extension_point!(
         "snapshots",
         "suspend",
         "run",
+        "children",
         "autoscale"
     ],
     |this, walk| {
@@ -3061,6 +3070,7 @@ extension_point!(
         walk.opt("snapshots", this.snapshots.as_mut());
         walk.opt("suspend", this.suspend.as_mut());
         walk.opt("run", this.run.as_mut());
+        walk.opt("children", this.children.as_mut());
     }
 );
 
@@ -3213,6 +3223,7 @@ impl TaskConfigInput {
             snapshots: self.snapshots,
             suspend: self.suspend,
             run: self.run,
+            children: self.children,
             // `autoscale = false` is the same as leaving it out; store it so.
             autoscale: self.autoscale.filter(|spec| spec.is_enabled()),
             pending_extensions: self.pending_extensions,
@@ -3473,6 +3484,7 @@ impl TaskConfig {
             snapshots: None,
             suspend: None,
             run: None,
+            children: None,
             autoscale: None,
             name: name.into(),
             count: default_task_count(),
@@ -6689,6 +6701,7 @@ mod unknown_fields_test {
                     cover_opt(suspend.park.as_ref(), "suspend.park", &mut seen);
                 }
                 cover_opt(task.run.as_ref(), "run", &mut seen);
+                cover_opt(task.children.as_ref(), "children", &mut seen);
             }
         }
         // The examples really do exercise the nested blocks.

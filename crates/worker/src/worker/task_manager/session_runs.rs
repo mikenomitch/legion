@@ -360,15 +360,22 @@ impl WorkerTaskManager {
 /// service). The jobspec decides, never the caller: a task runs a sibling
 /// task only when it declares it.
 ///
-/// A task may always run a fresh session of itself. Nothing in the jobspec
-/// declares any other pair yet, so every other pair is refused.
+/// A task may always run a fresh session of itself, and a session of any
+/// task its `children.tasks` names (docs/child-sessions.md): the block that
+/// lets it start a child of the task lets it run one once.
 pub fn workload_may_run(caller: &TaskConfig, target: &TaskConfig) -> Result<(), String> {
-    if caller.name == target.name {
+    if caller.name == target.name
+        || caller
+            .children
+            .as_ref()
+            .is_some_and(|block| block.declares(&target.name))
+    {
         return Ok(());
     }
     Err(format!(
         "task {} may not run task {}: a workload runs a sibling task only when its own task \
-         declares it; send the run through a manager with a token that holds job:write",
+         names it in children.tasks; add it there, or send the run through a manager with a \
+         token that holds job:write",
         caller.name, target.name
     ))
 }
@@ -687,6 +694,7 @@ async fn drive(
                 RUN_ORIGIN,
                 &jti,
                 crate::util::now_unix_ms(),
+                None,
             )?;
             super::session_store::claim_new_store_session(&task_manager, &payload)?;
             crate::worker::edge::admit_and_launch(

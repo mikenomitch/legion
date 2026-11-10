@@ -493,12 +493,14 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "instance.create",
-            cli: "legion instance create <JOB> [--id <KEY>] [--from-snapshot <NAME|ID>]",
+            cli: "legion instance create <JOB> [--id <KEY>] [--from-snapshot <NAME|ID>] [--owner <ID>]",
             grpc: Some("Manager/CreateInstance"),
             summary: "Create a keyed-mode instance (never-recycled id), optionally restored from \
                  a snapshot of the job (needs snapshot:read). On a session task without --id, \
-                 start an unnamed session with no raft write (durable false). Supports \
-                 --idempotency-key.",
+                 start an unnamed session with no raft write (durable false). --owner <ID> \
+                 starts that session as a child of a running session, instance, or allocation \
+                 of the same job whose task names the task in children.tasks: it ends with its \
+                 owner and is listed under it. Supports --idempotency-key.",
             mutates: true,
             read_only_safe: false,
         },
@@ -598,13 +600,26 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "session.start",
-            cli: "legion session start <JOB> --task <TASK> --node <ADDR> --ticket <T>",
+            cli: "legion session start <JOB> --task <TASK> --node <ADDR> --ticket <T> [--owner <ID>] | legion session start <TASK> --owner self",
             grpc: Some("Worker/StartSession"),
             summary: "Start a session on one node with a session ticket, with no manager call \
                  (the edge form, for testing and scripts). Supports --idempotency-key \
-                 (node-local).",
+                 (node-local). --owner <ID> starts it as a child of a unit running on that node \
+                 (it ends with its owner; the owner's task must name the task in \
+                 children.tasks). Inside a task, `--owner self` asks the node's worker over the \
+                 allocation's API socket (Workload/StartChildSession) with no ticket.",
             mutates: true,
             read_only_safe: false,
+        },
+        Capability {
+            name: "session.children",
+            cli: "legion session children",
+            grpc: Some("Workload/ListChildren"),
+            summary: "Inside a task: list the child sessions this workload owns on its node \
+                 (running, suspended, and the ones that ended in the last ten minutes with why), \
+                 over the allocation's API socket with no credential.",
+            mutates: false,
+            read_only_safe: true,
         },
         Capability {
             name: "session.get",
@@ -616,9 +631,11 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "session.stop",
-            cli: "legion session stop <SESSION> --node <ADDR> --ticket <T>",
+            cli: "legion session stop <SESSION> --node <ADDR> --ticket <T> | legion session stop <SESSION> --local",
             grpc: Some("Worker/StopSession"),
-            summary: "End a session on its node with a session ticket. Idempotent.",
+            summary: "End a session on its node with a session ticket. Idempotent. Ending a \
+                 session ends its children first. Inside a task, --local ends one of the \
+                 workload's own children over the API socket (Workload/StopChildSession).",
             mutates: true,
             read_only_safe: false,
         },

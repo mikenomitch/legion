@@ -139,6 +139,8 @@ struct Inner {
     /// share ([`SessionIndex::take_sweep_ids`]).
     sweep_ids: HashSet<String>,
     last_sweep: Option<Instant>,
+    /// How many indexed sessions carry an owner (docs/child-sessions.md).
+    owned: usize,
 }
 
 impl Inner {
@@ -159,7 +161,14 @@ impl Inner {
             }
         }
         if let Some(node) = self.nodes.get_mut(node_id) {
-            node.sessions.insert(status.session_id.clone(), status);
+            let owned = status.owner.is_some();
+            let replaced = node.sessions.insert(status.session_id.clone(), status);
+            let was_owned = replaced.is_some_and(|old| old.owner.is_some());
+            match (was_owned, owned) {
+                (false, true) => self.owned += 1,
+                (true, false) => self.owned = self.owned.saturating_sub(1),
+                _ => {}
+            }
         }
     }
 
@@ -171,6 +180,9 @@ impl Inner {
         else {
             return;
         };
+        if status.owner.is_some() {
+            self.owned = self.owned.saturating_sub(1);
+        }
         if let Some(nodes) = self.by_id.get_mut(session_id) {
             nodes.remove(node_id);
             if nodes.is_empty() {
@@ -559,6 +571,75 @@ impl SessionIndex {
             .ended
             .get(session_id)
             .is_some_and(|at| at.elapsed() < RECENT_END_TTL)
+    }
+
+    /// The child sessions a node reports: the ones that carry an owner
+    /// (docs/child-sessions.md). Empty for almost every node, which is what
+    /// keeps the heartbeat's owner check free.
+    pub fn owned_on(&self, node_id: &str) -> Vec<SessionStatus> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        if inner.owned == 0 {
+            return Vec::new();
+        }
+        inner
+            .nodes
+            .get(node_id)
+            .map(|node| {
+                node.sessions
+                    .values()
+                    .filter(|status| status.owner.is_some())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether any indexed session carries an owner.
+    pub fn any_owned(&self) -> bool {
+        self.inner.read().unwrap_or_else(|p| p.into_inner()).owned > 0
+    }
+
+    /// Whether a node's last report lists a session.
+    pub fn holds(&self, node_id: &str, session_id: &str) -> bool {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .nodes
+            .get(node_id)
+            .is_some_and(|node| node.sessions.contains_key(session_id))
+    }
+
+    /// The sessions this manager indexes (or started within the last
+    /// seconds) as children of `owner`, with their nodes.
+    pub fn children_of(&self, kind: &str, id: &str) -> Vec<(String, SessionStatus)> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let owned = |status: &SessionStatus| {
+            status
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.kind == kind && owner.id == id)
+        };
+        let mut children: Vec<(String, SessionStatus)> = inner
+            .nodes
+            .iter()
+            .flat_map(|(node_id, node)| {
+                node.sessions
+                    .values()
+                    .filter(|status| owned(status))
+                    .map(|status| (node_id.clone(), status.clone()))
+            })
+            .collect();
+        for start in inner.recent.values() {
+            if owned(&start.status)
+                && !children
+                    .iter()
+                    .any(|(_, status)| status.session_id == start.status.session_id)
+            {
+                children.push((start.node_id.clone(), start.status.clone()));
+            }
+        }
+        children.sort_by(|a, b| a.1.session_id.cmp(&b.1.session_id));
+        children
     }
 
     /// The epoch this manager holds for a node, when it has its report.

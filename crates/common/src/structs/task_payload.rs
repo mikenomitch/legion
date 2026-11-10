@@ -156,8 +156,17 @@ pub fn build_task_allocation_with(
         }
         None => String::new(),
     };
+    // The `children` block: the node admits a child started from inside
+    // the allocation against it. Empty when undeclared.
+    let task_children = match task.children.as_ref() {
+        Some(children) => {
+            serde_json::to_string(children).context("Failed to serialize children")?
+        }
+        None => String::new(),
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
+        task_children,
         job_id: allocation.job_id.clone(),
         job_config_id: allocation.job_config_id.clone(),
         node_id: allocation.node_id.clone(),

@@ -114,6 +114,26 @@ pub fn config() -> Command {
                 .help("Task group, when the keyed task is ambiguous"),
         )
         .arg(
+            Arg::new("owner")
+                .long("owner")
+                .value_name("ID")
+                .conflicts_with_all(["id", "count", "from-snapshot"])
+                .help(
+                    "Start the session as a child of this running unit of the same job \
+                     (docs/child-sessions.md): a session, instance, or allocation id whose \
+                     task names this task in children.tasks. The child ends when its owner \
+                     ends and starts on its owner's node when that node has room",
+                ),
+        )
+        .arg(
+            Arg::new("owner-kind")
+                .long("owner-kind")
+                .value_name("KIND")
+                .value_parser(["session", "instance", "allocation"])
+                .requires("owner")
+                .help("What --owner names. Default: worked out from the id"),
+        )
+        .arg(
             Arg::new("task")
                 .long("task")
                 .short('t')
@@ -515,6 +535,15 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
             instance_id: ids.into_iter().next(),
             idempotency_key,
             from_snapshot,
+            owner: arg_matches
+                .get_one::<String>("owner")
+                .map(|id| crate::structs::OwnerRef {
+                    kind: arg_matches
+                        .get_one::<String>("owner-kind")
+                        .cloned()
+                        .unwrap_or_default(),
+                    id: id.clone(),
+                }),
         });
         let reply = output::resolve(
             format,
@@ -532,7 +561,24 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
                 "node": (!reply.node_id.is_empty()).then_some(&reply.node_id),
                 "state": (!reply.state.is_empty()).then_some(&reply.state),
                 "deduplicated": reply.deduplicated,
+                "owner": reply.owner.as_ref().map(|owner| json!({
+                    "kind": owner.kind,
+                    "id": owner.id,
+                })),
             }));
+        } else if let Some(owner) = reply.owner.as_ref().filter(|_| !reply.durable) {
+            println!(
+                "{} session {} on {}, a child of {} {} (it ends when its owner does)",
+                if reply.deduplicated {
+                    "Found"
+                } else {
+                    "Started"
+                },
+                reply.instance_id,
+                reply.node_id,
+                owner.kind,
+                owner.id
+            );
         } else if !reply.durable {
             println!(
                 "{} session {} on {} (not durable; `legion instance promote {}` keeps it)",
@@ -1155,6 +1201,27 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
 }
 
 #[instrument(skip_all)]
+/// What owns this unit and what it owns (docs/child-sessions.md).
+fn ownership_lines(instance: &InstanceInfo) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(owner) = instance.owner.as_ref() {
+        lines.push(format!(
+            "\nowner: {} {} (this session ends when its owner does)",
+            owner.kind, owner.id
+        ));
+    }
+    if !instance.children.is_empty() {
+        lines.push(format!("\nchildren ({}):", instance.children.len()));
+        for child in &instance.children {
+            lines.push(format!(
+                "  {}  {}  {}  {}",
+                child.session_id, child.task_name, child.node_id, child.state
+            ));
+        }
+    }
+    lines
+}
+
 async fn get_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
@@ -1206,6 +1273,9 @@ async fn get_instance(arg_matches: &ArgMatches) -> R<()> {
                     );
                 }
                 for line in suspend_lines(&instance) {
+                    println!("{line}");
+                }
+                for line in ownership_lines(&instance) {
                     println!("{line}");
                 }
             }

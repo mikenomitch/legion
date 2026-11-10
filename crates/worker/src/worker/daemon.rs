@@ -2940,6 +2940,12 @@ pub async fn heartbeat_tick(
         if let Some(states) = reply.runtime_states.as_ref() {
             apply_runtime_states(task_manager, states);
         }
+        // What the managers decided about the owners of this node's child
+        // sessions (docs/child-sessions.md).
+        crate::worker::task_manager::children::apply_owner_notices(
+            task_manager,
+            &reply.owner_notices,
+        );
         // The cluster's manager set, refreshed every beat and persisted when
         // it changes, so failover (and a restart) can reach any manager.
         if let Some(managers) = managers {
@@ -3801,6 +3807,12 @@ fn launch_streamed_work(
     if let Some(states) = applied.runtime_states.as_ref() {
         apply_runtime_states(&launcher.task_manager, states);
     }
+    // Pushed owner notices: children end with their owner now, not at the
+    // next beat.
+    crate::worker::task_manager::children::apply_owner_notices(
+        &launcher.task_manager,
+        &applied.owner_notices,
+    );
     if applied.reconcile {
         HEARTBEAT_WAKE.notify_one();
     }
