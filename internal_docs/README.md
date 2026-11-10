@@ -138,6 +138,7 @@ When one is required and what goes in it:
 | [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) | in execution (phase 1 shipped: one credential path for every streaming store, the platform-identity chain checked at boot, the lease's missing conditional puts; `--restore-from` from the replica and credential introspection deferred) |
 | [persistence-plan.md](plans/persistence-plan.md) | phases 0–1, 3 done |
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | shipped (graceful stop, six priority bands, plan-atomic preemption) |
+| [modular-build-plan.md](plans/modular-build-plan.md) | planned (2026-11-10): the default build stays everything in one binary; Cargo features leave out the manager role (a worker-only build), the `container` and `sandbox` engines, each bundled app, and the heavy seam built-ins; nodes publish what they can run and placement follows; `legion plugin install <url>` and a flat plugin directory put plugins and apps back. Deferred: the first-party engines as installable packages, cluster-wide plugin distribution, signing, an app SDK crate |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
 | [raft-write-path-plan.md](plans/raft-write-path-plan.md) | in execution (2026-11-08, review SCH1/ST1/ST4): group commit, the leader executing each write once under `single` (speculative commit with undo records), one state-DB fsync per log purge instead of per entry, the log tail retained by bytes (`raft.logRetainBytes`), and data migrations as replicated control-lane entries. Deferred: a capture mutex per lane (per-lane DB files), speculation under `lanes`, overlapping capture with the quorum wait, logical commands |
@@ -299,6 +300,7 @@ by project impact. The full template and a worked example:
 - [macos-gated-plan_calls.md](calls/macos-gated-plan_calls.md)
 - [mesh-control-path-plan_calls.md](calls/mesh-control-path-plan_calls.md)
 - [mesh-interfaces-plan_calls.md](calls/mesh-interfaces-plan_calls.md)
+- [modular-build-plan_calls.md](calls/modular-build-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
 - [raft-write-path-plan_calls.md](calls/raft-write-path-plan_calls.md)

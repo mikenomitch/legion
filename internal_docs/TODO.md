@@ -1015,8 +1015,25 @@ docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging
 
 Job templates shipped ([plan](plans/job-templates-plan.md)); the registry is untouched.
 
+- [ ] **Modular builds and installable plugins** (planned, nothing built;
+      [plan](plans/modular-build-plan.md) · [calls](calls/modular-build-plan_calls.md)).
+      Phases, each shippable alone:
+  - [ ] 0: measure the `dist` binary per crate, write the catalog, `legion plugin list`.
+  - [ ] 1: nodes publish `runtime.<name>`; a generated constraint keeps tasks off
+        nodes that cannot run them (today a `container` task lands on a node with no runc).
+  - [ ] 2: the worker-only build (`manager` feature), presets, `scripts/legion-build --without`.
+  - [ ] 3: `runtime-container` / `runtime-sandbox` engines and the heavy seam built-ins as features.
+  - [ ] 4: `app-*` features.
+  - [ ] 5: plugin packages and `legion plugin install|remove|verify|pack`.
+  - [ ] 6: the first-party exec plugins embedded in the binary.
+  - [ ] 7: a release workflow (full and worker variants, packages, `index.json`).
+  - [ ] 8: apps from a directory on disk.
+  - [ ] 9 (gated): the first-party engines as packages; needs the plugin API
+        crate, panic containment for runtime plugins, and no shared statics
+        ([calls 1](calls/modular-build-plan_calls.md#1-the-requests-drivers-are-left-out-at-build-time-installing-the-first-party-ones-later-is-deferred)).
 - [ ] **A job registry**: default + added registries, `@<registry>/<job>`, inspect
-      metadata, a UI to fill in variables; plugins by URL or registry.
+      metadata, a UI to fill in variables; plugins by URL or registry
+      (plugins by URL is Phase 5 of the modular-build plan).
 - [ ] **Build & push images** (`legion build`/`prep`); a buildpack runner.
 - [ ] **Publish the next `legion-rs` to crates.io**; **release binaries and a Homebrew formula.**
       0.1.0 is published as one crate. A release now publishes six in order
@@ -1218,7 +1235,12 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
         the heavy ones.
   - [ ] **Which dependencies own the rest** (candidates: `nickel-lang-core`,
         `wasmi`, `object_store` with `aws`, `oci-client`,
-        `opentelemetry-otlp`, `cel`).
+        `opentelemetry-otlp`, `cel`). A first pass on an unstripped
+        `--release` build (not `dist`, by symbols that name each part) is in
+        the [modular-build plan § 5.4](plans/modular-build-plan.md#54-where-the-bytes-are):
+        Nickel 9.5 MB, the WASM engine 1.8, `object_store` 1.1, `cel` 0.5,
+        OTLP 0.3, `oci-client` 0.3; the manager role is 18.8 and code naming
+        the generated gRPC types 18.2. Still wanted: the same on `dist`.
 - [ ] **Share one target dir across plugin builds** (each rebuilds ~470 crates).
 - [ ] **Decide whether the UI ships inside the binary.**
 - [ ] **Create the `proto-breaking-ok` label** (audit M5).
