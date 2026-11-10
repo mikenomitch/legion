@@ -6,11 +6,11 @@
 //! projection path, which only runs with the raft engine on. A single-node
 //! bootstrap cluster runs that exact path.
 
+use legion::manager::eval::EvalExt;
 use legion::prelude::{Context, R};
 use legion::storage::store::Store;
 use legion::structs::config::{ManagerConfigFull, PersistenceType};
 use legion::structs::job::{JobConfig, TaskConfig, TaskCount};
-use legion::structs::EvalExt;
 use legion::structs::{Node, NodeMsg, Submission};
 use serde_json::json;
 

@@ -77,7 +77,7 @@ impl MeshIdentity {
     /// Whether the worker should ask for a new certificate.
     pub fn needs_refresh(&self) -> bool {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        self.issued.elapsed() >= crate::manager::mesh_ca::NODE_CERT_REFRESH_AFTER
+        self.issued.elapsed() >= crate::mesh_ca::NODE_CERT_REFRESH_AFTER
             || self.expires_at - now < 60 * 60
     }
 
@@ -340,7 +340,7 @@ pub fn server_name(host: &str) -> R<ServerName<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manager::mesh_ca::{generate_ca, issue_node_cert};
+    use crate::mesh_ca::{generate_ca, issue_node_cert};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -371,7 +371,7 @@ mod tests {
         let stream = TcpStream::connect(addr).await?;
         let mut tls = connector
             .connect(
-                server_name(&crate::manager::mesh_ca::node_dns_name("node-b"))?,
+                server_name(&crate::mesh_ca::node_dns_name("node-b"))?,
                 stream,
             )
             .await?;
@@ -404,7 +404,7 @@ mod tests {
         let result = async {
             let mut tls = anonymous
                 .connect(
-                    server_name(&crate::manager::mesh_ca::node_dns_name("node-b"))?,
+                    server_name(&crate::mesh_ca::node_dns_name("node-b"))?,
                     stream,
                 )
                 .await?;

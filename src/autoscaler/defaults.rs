@@ -55,6 +55,8 @@ use super::spec::{
 };
 use super::strategies::{fmt_num, StrategyConfig, TargetValue};
 
+/// The bundled autoscaler app, whose config installs the scaling plugins.
+pub const AUTOSCALER_APP: &str = "autoscaler";
 /// The built-in source every task has.
 pub const LEGION_SOURCE: &str = "legion";
 /// The `legion` source's query behind the `cpu` shorthand.

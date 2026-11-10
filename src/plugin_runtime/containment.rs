@@ -281,7 +281,7 @@ fn quarantine(kind: &str, name: &str, op: &str, message: &str) {
         panic = message,
         "Plugin panicked; quarantining it until this process restarts"
     );
-    crate::manager::telemetry::metrics()
+    crate::telemetry::metrics()
         .plugin_panics_total
         .inc(&[kind, name]);
     if let Ok(mut map) = QUARANTINE.lock() {

@@ -128,7 +128,7 @@ pub fn admit_and_launch(
     launch_payload.allocation_id = admitted.local_key;
 
     if !session {
-        crate::manager::telemetry::worker_metrics()
+        crate::telemetry::worker_metrics()
             .provisional_starts_total
             .inc(&[admitted.origin.as_str(), gate.as_str()]);
     }
@@ -242,7 +242,7 @@ pub fn start_edge_session(
     // (session durability plan §6.7, row 3).
     crate::worker::task_manager::session_store::claim_new_store_session(task_manager, &payload)?;
     admit_and_launch(task_manager, &payload, &provisional, Some(slot), None)?;
-    crate::manager::telemetry::worker_metrics()
+    crate::telemetry::worker_metrics()
         .edge_session_starts_total
         .inc();
     Ok(EdgeSession {
@@ -306,7 +306,7 @@ pub fn session_payload(
             lease_issued_at_unix_ms: issued_at,
         }),
     };
-    let payload = crate::manager::dispatcher::build_task_allocation_with(
+    let payload = crate::structs::task_payload::build_task_allocation_with(
         &spec.task,
         &allocation,
         Some(&identity),
@@ -384,7 +384,7 @@ pub fn apply_verdict(
     detail: &str,
     feedback: Feedback,
 ) {
-    let metrics = crate::manager::telemetry::worker_metrics();
+    let metrics = crate::telemetry::worker_metrics();
     let mut guard = task_manager.lock().expect("task manager");
     // Before the ratify or kill below frees the slot, so the window learns
     // how long this claim waited.
@@ -428,7 +428,7 @@ pub fn apply_verdict(
 /// tick — the backstop that makes the design fail closed regardless of which
 /// delivery path went missing.
 pub fn sweep_leases(task_manager: &Arc<Mutex<WorkerTaskManager>>) {
-    let metrics = crate::manager::telemetry::worker_metrics();
+    let metrics = crate::telemetry::worker_metrics();
     let mut guard = task_manager.lock().expect("task manager");
     let killed = guard.sweep_expired_claims(Instant::now());
     for _ in &killed {

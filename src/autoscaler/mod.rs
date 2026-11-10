@@ -46,6 +46,7 @@
 #![warn(missing_docs)]
 
 pub mod defaults;
+pub mod jobspec;
 pub mod nodes;
 pub mod pipeline;
 pub mod plugins;

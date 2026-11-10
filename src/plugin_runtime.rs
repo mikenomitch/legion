@@ -144,21 +144,7 @@ macro_rules! export_rollout_strategy {
 
         #[no_mangle]
         pub extern "C" fn legion_contained_get(
-        ) -> Box<dyn $crate::manager::rollout_strategy::RolloutStrategyPlugin> {
-            Box::new($crate::plugin_runtime::containment::Contained($value))
-        }
-    };
-}
-
-/// [`export_rollout_strategy!`] for a scheduling policy plugin.
-#[macro_export]
-macro_rules! export_scheduling_policy {
-    ($value:expr) => {
-        $crate::declare_plugin_abi!();
-
-        #[no_mangle]
-        pub extern "C" fn legion_contained_get(
-        ) -> Box<dyn $crate::manager::scheduler::SchedulingPolicy> {
+        ) -> Box<dyn $crate::rollout_strategy::RolloutStrategyPlugin> {
             Box::new($crate::plugin_runtime::containment::Contained($value))
         }
     };

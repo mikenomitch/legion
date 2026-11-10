@@ -34,8 +34,6 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-
 use crate::prelude::*;
 
 /// The node attribute listing the runtime classes a node can run.
@@ -45,32 +43,7 @@ pub const NODE_ATTR: &str = "container.runtimeClasses";
 /// (the same channel as the capability allowlist).
 pub const CLASSES_ENV: &str = "LEGION_CONTAINER_RUNTIME_CLASSES";
 
-/// One runtime class (worker type `container.runtimeClasses.<name>`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RuntimeClassConfig {
-    /// Absolute path to an OCI runtime with runc's command line (`run
-    /// --bundle`, `exec`, `kill`, `delete`, `state`). To pass it flags
-    /// (`runsc --platform=systrap`), point this at a wrapper script.
-    pub path: String,
-    /// The runtime applies an OCI user namespace with idmapped mounts.
-    /// Default `true`.
-    #[serde(default = "default_true")]
-    pub user_namespace: bool,
-    /// The runtime applies the OCI `linux.seccomp` profile. Default `true`.
-    #[serde(default = "default_true")]
-    pub seccomp: bool,
-    /// The runtime keeps container root off host root by itself (a
-    /// user-space kernel, a VM), so a floor part it does not support is
-    /// dropped rather than refused. Default `false`. An operator's trust
-    /// statement: only set it for runtimes that really are sandboxes.
-    #[serde(default)]
-    pub isolates_root: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
+pub use crate::structs::config::RuntimeClassConfig;
 
 /// A class name: letters, digits, `-` and `_`, at most 63 characters.
 pub fn validate_name(name: &str) -> R<()> {

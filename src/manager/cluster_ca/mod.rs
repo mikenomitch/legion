@@ -36,7 +36,7 @@ pub mod exec;
 pub mod file;
 pub mod verify;
 
-use crate::manager::mesh_ca::{generate_csr, CsrSubject, LeafSpec, ManagerCertKind};
+use crate::mesh_ca::{generate_csr, CsrSubject, LeafSpec, ManagerCertKind};
 use crate::prelude::*;
 use crate::storage::netpolicy_store::{CaRotationPhase, ClusterCaRecord};
 use crate::storage::store::Store;

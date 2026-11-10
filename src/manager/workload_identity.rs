@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 
 use crate::prelude::*;
 use crate::storage::store::Store;
+pub use crate::structs::workload_identity::DEFAULT_JWKS_PATH;
 use crate::structs::workload_identity::{
     is_protected_claim_key, NodeIdentityClaims, NodeIdentityConfig, SigningKeyRecord,
     WorkloadIdentity, WorkloadIdentityClaims, CONTROL_PLANE_IDENTITY_NAME,
@@ -43,8 +44,6 @@ use crate::structs::{Allocation, TaskConfig, WorkloadIdentityConfigFull};
 
 /// Standard OIDC discovery route.
 pub const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
-/// Default JWKS route (operator-overridable via config).
-pub const DEFAULT_JWKS_PATH: &str = "/.well-known/jwks.json";
 
 /// Lifecycle state of a signing key. A retiring key stays in the JWKS until the
 /// last token it could have signed has expired — this overlap is what prevents

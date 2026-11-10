@@ -38,3 +38,26 @@ pub mod templates;
 pub mod usage;
 pub mod volumes;
 pub mod work_stream;
+
+#[cfg(test)]
+mod node_attr_test {
+    /// The attributes a worker advertises about its own structure are the
+    /// ones the types crate treats as structural
+    /// (`structs::node::is_structural_node_attr`), which keeps its own list
+    /// because it cannot see the constants defined up here.
+    #[test]
+    fn structural_attrs_match_the_constants_they_mirror_test() {
+        for key in [
+            crate::constraints::NODE_NAMESPACES_ATTR,
+            crate::resources::CAPACITY_ATTR,
+            crate::structs::worker_protocol::WORKER_FLEET_ATTR,
+            crate::worker::netd::kernel_guard::NODE_ATTR,
+            crate::worker::netd::kernel::NODE_ATTR,
+            crate::task_plugins::sandbox_addr::BRIDGES_ATTR,
+            crate::task_plugins::runtime_class::NODE_ATTR,
+            crate::task_plugins::IDMAPPED_MOUNTS_ATTR,
+        ] {
+            assert!(crate::structs::node::is_structural_node_attr(key), "{key}");
+        }
+    }
+}

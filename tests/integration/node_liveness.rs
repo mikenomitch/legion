@@ -15,9 +15,9 @@ use legion::manager::cadence::{
     cadence_report, decide_lost_nodes, freshness_ratio, LossContext, SuppressionReason,
 };
 use legion::manager::daemon::liveness_snapshot;
+use legion::manager::eval::EvalExt;
 use legion::prelude::R;
 use legion::storage::store::Store;
-use legion::structs::EvalExt;
 use legion::structs::{
     HeartbeatConfigFull, LivenessConfigFull, ManagerConfigFull, NodeMsg, PersistenceConfigFull,
 };

@@ -16,6 +16,7 @@
 // Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
 #![allow(clippy::result_large_err)]
 
+use legion::manager::eval::EvalExt;
 use legion::manager::server::{
     idle_sweep, make_room_sweep, settle_stalled_resumes, IdleSweeper, MakeRoomState,
     ManagerDaemonService,
@@ -25,7 +26,6 @@ use legion::storage::events::SchedulerEventFilter;
 use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
 use legion::structs::suspend::{IdleConfig, ParkConfig, SuspendConfig, SuspendReserveConfig};
-use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::StatefulConfig, job::StatefulStorageConfig,
     job::TaskConfig, AllocationUsage, CheckpointRequest, DestroyInstanceRequest,

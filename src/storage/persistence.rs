@@ -1,8 +1,8 @@
-use crate::prelude::*;
-use crate::storage::objects::{
+use crate::objects::{
     self, AwsCredential, AwsKeys, ObjectCredential, OpenOptions, Principal, RegionDefault,
     S3Location, UrlOrPath,
 };
+use crate::prelude::*;
 use crate::storage::raft::driver::MultiRaftDriver;
 use crate::storage::store::Store;
 use crate::structs::{

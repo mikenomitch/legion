@@ -40,7 +40,6 @@
 
 pub mod cdi;
 pub mod plugin;
-pub mod quota;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 

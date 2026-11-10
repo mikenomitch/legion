@@ -7,10 +7,10 @@
 //! `legion volume plugin test`), which runs against built-ins and exec plugins
 //! alike.
 
+use legion::manager::eval::EvalExt;
 use legion::manager::scheduler::{PlanMode, Scheduler};
 use legion::prelude::{json, Context, R};
 use legion::storage::store::{Store, VolumeFilter};
-use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::StatefulConfig, job::StatefulStorageConfig,
     job::TaskConfig, job::TaskCount, job::VolumeSpec, Eval, InstanceMode, Node, NodeMsg,

@@ -31,6 +31,7 @@ use legion::manager::acl::Authenticator;
 use legion::manager::app_forward::AppForwarder;
 use legion::manager::app_page_guard::AppPageGuardLayer;
 use legion::manager::apps::{AppReconciler, ReconcilerSettings};
+use legion::manager::eval::EvalExt;
 use legion::manager::server::ManagerDaemonService;
 use legion::manager::workload_identity::WorkloadIdentityState;
 use legion::storage::store::Store;

@@ -705,7 +705,7 @@ impl ParkService {
             _ => None,
         };
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let metrics = crate::manager::telemetry::worker_metrics();
+        let metrics = crate::telemetry::worker_metrics();
         let (result, armed, parked) = {
             let mut slots = self.slots();
             let Some(slot) = slots.get_mut(&allocation_id) else {
@@ -799,7 +799,7 @@ impl ParkService {
         );
         let service = self.clone();
         self.runtime.spawn_blocking(move || {
-            let metrics = crate::manager::telemetry::worker_metrics();
+            let metrics = crate::telemetry::worker_metrics();
             match service.suspender.suspend(allocation_id, park.checkpoint) {
                 Ok(()) => metrics.parks_total.inc(&["suspended"]),
                 Err(err) => {

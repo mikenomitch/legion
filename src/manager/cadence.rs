@@ -19,6 +19,7 @@
 //! `docs/node-liveness.md`.
 
 use crate::prelude::*;
+pub use crate::structs::worker_protocol::clamp_heartbeat_seconds;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -368,14 +369,6 @@ pub fn freshness_warning(report: &CadenceReport) -> String {
          {false_loss_at:.2}. {remedy} See docs/heartbeat-cadence-and-scale.md",
         percent = ratio * 100.0,
     )
-}
-
-/// A worker type's `heartbeatSeconds`, clamped to the legal range.
-/// `None` means the built-in default.
-pub fn clamp_heartbeat_seconds(configured: Option<u32>) -> u64 {
-    configured
-        .map(|seconds| u64::from(seconds).clamp(1, u64::from(MAX_WORKER_HEARTBEAT_SECONDS)))
-        .unwrap_or(WORKER_HEARTBEAT_DURATION_SEC)
 }
 
 /// A node's lost window from the interval it is actually beating at.

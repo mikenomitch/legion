@@ -11,12 +11,12 @@
 //! with a fake node in `src/worker/pressure.rs`. What a real kernel does is
 //! in `internal_docs/suspend-resume-linux-verification.md`, "Phase 2".
 
+use legion::manager::eval::EvalExt;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;
 use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
-use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::TaskConfig, job::TaskCount, Band, Eval,
     HeartbeatRequest, Node, NodeMsg, PressureAction, StopCause, Submission,

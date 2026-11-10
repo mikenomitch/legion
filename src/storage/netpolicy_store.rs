@@ -174,7 +174,7 @@ impl Store {
 
 /// The built-in cluster CA (`net_mesh_ca`), PEM-encoded. Under the default
 /// `builtin` provider it signs node, fleet, and manager certificates
-/// (`crate::manager::mesh_ca`). Nothing reads it except that provider
+/// (`crate::mesh_ca`). Nothing reads it except that provider
 /// (`crate::manager::cluster_ca::builtin`): every other reader goes through
 /// `Store::cluster_ca`, which knows which provider is active.
 #[derive(Debug, Clone)]
@@ -212,7 +212,7 @@ impl MeshCa {
             return CaRotationPhase::Stable;
         };
         let until = rotated_at
-            + time::Duration::try_from(crate::manager::mesh_ca::CA_ROTATION_OVERLAP)
+            + time::Duration::try_from(crate::mesh_ca::CA_ROTATION_OVERLAP)
                 .unwrap_or(time::Duration::DAY);
         if now < until {
             CaRotationPhase::Overlap { until }
@@ -297,7 +297,7 @@ impl Store {
         if let Some(existing) = self.mesh_ca()? {
             return Ok(existing);
         }
-        let (cert_pem, key_pem) = crate::manager::mesh_ca::generate_ca()?;
+        let (cert_pem, key_pem) = crate::mesh_ca::generate_ca()?;
         let created_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let candidate = MeshCa {
             cert_pem,
@@ -334,13 +334,9 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn rotate_mesh_ca(&self) -> R<MeshCa> {
         let current = self.ensure_mesh_ca()?;
-        let (cert_pem, key_pem) = crate::manager::mesh_ca::generate_ca()?;
-        let cross_cert_pem = crate::manager::mesh_ca::cross_sign(
-            &cert_pem,
-            &key_pem,
-            &current.cert_pem,
-            &current.key_pem,
-        )?;
+        let (cert_pem, key_pem) = crate::mesh_ca::generate_ca()?;
+        let cross_cert_pem =
+            crate::mesh_ca::cross_sign(&cert_pem, &key_pem, &current.cert_pem, &current.key_pem)?;
         let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let next = MeshCa {
             cert_pem,

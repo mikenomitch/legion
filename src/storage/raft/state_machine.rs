@@ -301,7 +301,7 @@ impl StoreStateMachine {
                             self.record_applied_on(conn, log_id, None)
                         })?;
                         ledger.pop_oldest(self.lane);
-                        crate::manager::telemetry::metrics()
+                        crate::telemetry::metrics()
                             .raft_speculation_total
                             .inc(&[self.lane.wire_name(), "matched"]);
                         debug!(
@@ -336,7 +336,7 @@ impl StoreStateMachine {
             speculation::undo_on(conn, Some(self.lane))
         })?;
         ledger.clear(self.lane);
-        crate::manager::telemetry::metrics()
+        crate::telemetry::metrics()
             .raft_speculation_total
             .inc_by(&[self.lane.wire_name(), "undone"], undone.len() as u64);
         warn!(

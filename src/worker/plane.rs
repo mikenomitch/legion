@@ -188,7 +188,7 @@ impl NodeIdentity {
         let key_pem = match std::fs::read_to_string(&key_path) {
             Ok(pem) if rcgen::KeyPair::from_pem(&pem).is_ok() => pem,
             _ => {
-                let (key_pem, _) = crate::manager::mesh_ca::generate_csr(node_id)?;
+                let (key_pem, _) = crate::mesh_ca::generate_csr(node_id)?;
                 write_private(&key_path, &key_pem)?;
                 key_pem
             }
@@ -303,7 +303,7 @@ impl NodeIdentity {
             return Some(RefreshNeed::Now);
         };
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        if issued.issued.elapsed() >= crate::manager::mesh_ca::NODE_CERT_REFRESH_AFTER
+        if issued.issued.elapsed() >= crate::mesh_ca::NODE_CERT_REFRESH_AFTER
             || issued.expires_at - now < 60 * 60
         {
             return Some(RefreshNeed::Now);
@@ -329,7 +329,7 @@ impl NodeIdentity {
         credentials: &crate::worker::daemon::WorkerCredentials,
         manager_addr: &str,
     ) -> R<()> {
-        let csr_pem = crate::manager::mesh_ca::csr_for_key(&self.key_pem, &self.node_id)?;
+        let csr_pem = crate::mesh_ca::csr_for_key(&self.key_pem, &self.node_id)?;
         let request = credentials.attach(tonic::Request::new(
             crate::structs::IssueNodeCertificateRequest {
                 node_id: self.node_id.clone(),
@@ -663,7 +663,7 @@ pub fn rotation_splay(node_id: &str, interval: std::time::Duration) -> std::time
     if millis == 0 {
         return std::time::Duration::ZERO;
     }
-    let hash = crate::storage::endpoint_index::StableHash::default()
+    let hash = crate::structs::worker_protocol::StableHash::default()
         .str(node_id)
         .finish();
     std::time::Duration::from_millis(hash % millis)
@@ -738,7 +738,7 @@ mod plane_test {
     /// reports it, and moving to the bundle moves every manager at once.
     #[test]
     fn a_verifier_recorded_for_one_manager_covers_the_clusters_others_test() -> R<()> {
-        let (ca_pem, _) = crate::manager::mesh_ca::generate_ca()?;
+        let (ca_pem, _) = crate::mesh_ca::generate_ca()?;
         let pin = crate::cluster_tls::ca_pin_pem(&ca_pem)?;
         let seed = "http://192.0.2.11:4747";
         let other = "http://192.0.2.12:4747";
@@ -782,8 +782,8 @@ mod plane_test {
     /// the same process already trusts.
     #[test]
     fn a_cluster_report_keeps_another_clusters_trust_test() -> R<()> {
-        let (ca_a, _) = crate::manager::mesh_ca::generate_ca()?;
-        let (ca_b, _) = crate::manager::mesh_ca::generate_ca()?;
+        let (ca_a, _) = crate::mesh_ca::generate_ca()?;
+        let (ca_b, _) = crate::mesh_ca::generate_ca()?;
         let a = trust_manager(
             "http://203.0.113.31:4747",
             &crate::cluster_tls::ca_pin_pem(&ca_a)?,
@@ -833,15 +833,15 @@ mod plane_test {
 
     #[test]
     fn a_persisted_certificate_is_reloaded_and_its_bundle_checked_test() -> R<()> {
-        let (ca_pem, ca_key) = crate::manager::mesh_ca::generate_ca()?;
+        let (ca_pem, ca_key) = crate::mesh_ca::generate_ca()?;
         let dir = tempfile::tempdir()?;
         let identity = NodeIdentity::load(dir.path(), "node-1", None, None)?;
-        let csr = crate::manager::mesh_ca::csr_for_key(&identity.key_pem, "node-1")?;
-        let (cert_pem, expires) = crate::manager::mesh_ca::sign_csr(
+        let csr = crate::mesh_ca::csr_for_key(&identity.key_pem, "node-1")?;
+        let (cert_pem, expires) = crate::mesh_ca::sign_csr(
             &ca_pem,
             &ca_key,
             &csr,
-            &crate::manager::mesh_ca::CsrSubject::Node("node-1".into()),
+            &crate::mesh_ca::CsrSubject::Node("node-1".into()),
         )?;
         write_private(&dir.path().join("node.pem"), &cert_pem)?;
         write_private(&dir.path().join("ca.pem"), &ca_pem)?;
@@ -854,7 +854,7 @@ mod plane_test {
         assert!(expires > 0);
 
         // A different pin refuses the persisted bundle.
-        let (other, _) = crate::manager::mesh_ca::generate_ca()?;
+        let (other, _) = crate::mesh_ca::generate_ca()?;
         let other_pin = crate::cluster_tls::ca_pin_pem(&other)?;
         let foreign = NodeIdentity::load(dir.path(), "node-1", None, Some(other_pin.clone()))?;
         assert!(!foreign.has_certificate());
@@ -869,18 +869,18 @@ mod plane_test {
     /// or a CA was added or removed, and not when nothing changed.
     #[test]
     fn a_bundle_change_or_a_new_anchor_asks_for_a_refresh_test() -> R<()> {
-        let (ca_a, ca_a_key) = crate::manager::mesh_ca::generate_ca()?;
-        let (ca_b, _) = crate::manager::mesh_ca::generate_ca()?;
+        let (ca_a, ca_a_key) = crate::mesh_ca::generate_ca()?;
+        let (ca_b, _) = crate::mesh_ca::generate_ca()?;
         let pin_a = crate::cluster_tls::ca_pin_pem(&ca_a)?;
         let pin_b = crate::cluster_tls::ca_pin_pem(&ca_b)?;
         let dir = tempfile::tempdir()?;
         let identity = NodeIdentity::load(dir.path(), "node-1", None, None)?;
-        let csr = crate::manager::mesh_ca::csr_for_key(&identity.key_pem, "node-1")?;
-        let (cert_pem, expires) = crate::manager::mesh_ca::sign_csr(
+        let csr = crate::mesh_ca::csr_for_key(&identity.key_pem, "node-1")?;
+        let (cert_pem, expires) = crate::mesh_ca::sign_csr(
             &ca_a,
             &ca_a_key,
             &csr,
-            &crate::manager::mesh_ca::CsrSubject::Node("node-1".into()),
+            &crate::mesh_ca::CsrSubject::Node("node-1".into()),
         )?;
         identity.install(&cert_pem, &ca_a, expires)?;
 

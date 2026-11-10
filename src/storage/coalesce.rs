@@ -117,7 +117,7 @@ impl<Req, Res> Coalescer<Req, Res> {
         // waiting or committing, is not observable from the RPC handler's
         // duration — it was the missing half of a manager-throughput
         // investigation. Cost is a handful of atomics per submit.
-        let telemetry = crate::manager::telemetry::metrics();
+        let telemetry = crate::telemetry::metrics();
         // Taken by whichever branch stops this submitter's wait, so the
         // wait is recorded exactly once even when the loop runs again to
         // lead a second batch.
@@ -243,7 +243,7 @@ impl<Req, Res> Coalescer<Req, Res> {
     /// or `follower` (another submitter's batch handed back its result).
     fn observe_wait(&self, waited: &mut Option<Instant>, role: &'static str) {
         if let Some(started) = waited.take() {
-            crate::manager::telemetry::metrics()
+            crate::telemetry::metrics()
                 .store_coalesce_wait_seconds
                 .observe(&[self.path, role], started.elapsed().as_secs_f64());
         }
@@ -358,7 +358,7 @@ mod tests {
         let coalescer: Coalescer<usize, usize> = Coalescer::new("test_instrumentation", 8);
         coalescer.submit(7, |batch| batch.into_iter().map(Ok).collect())?;
 
-        let rendered = crate::manager::telemetry::render();
+        let rendered = crate::telemetry::render();
         // An uncontended submitter leads a batch of exactly one — the shape
         // that says "batching never engaged".
         assert!(
@@ -519,7 +519,7 @@ mod tests {
     /// the counter never fired and so has no series.
     fn wait_rounds(path: &str) -> u64 {
         let needle = format!("legion_store_coalesce_wait_rounds_total{{path=\"{path}\"}} ");
-        crate::manager::telemetry::render()
+        crate::telemetry::render()
             .lines()
             .find_map(|line| line.strip_prefix(&needle)?.trim().parse().ok())
             .unwrap_or(0)

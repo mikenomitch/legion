@@ -31,6 +31,7 @@
 //! races a commit keeps the entry stale, so the next caller reads again.
 
 use crate::prelude::*;
+pub use crate::structs::worker_protocol::StableHash;
 use crate::structs::{ServiceEndpoint, ServiceEndpointRow};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -635,49 +636,6 @@ pub fn wire_endpoint(row: &ServiceEndpointRow) -> ServiceEndpoint {
             .collect(),
         port_label: row.port_label.clone().unwrap_or_default(),
         mesh_tls: row.mesh_tls,
-    }
-}
-
-/// FNV-1a, 64-bit: stable across processes, builds, and platforms, which
-/// the digests need (a worker reports a digest to whichever manager it
-/// heartbeats next).
-#[derive(Debug, Clone, Copy)]
-pub struct StableHash(u64);
-
-impl Default for StableHash {
-    fn default() -> Self {
-        StableHash(0xcbf2_9ce4_8422_2325)
-    }
-}
-
-impl StableHash {
-    pub fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        self
-    }
-
-    /// A length-prefixed string, so `("ab","c")` and `("a","bc")` differ.
-    pub fn str(&mut self, value: &str) -> &mut Self {
-        self.u64(value.len() as u64).bytes(value.as_bytes())
-    }
-
-    pub fn u64(&mut self, value: u64) -> &mut Self {
-        self.bytes(&value.to_le_bytes())
-    }
-
-    pub fn i64(&mut self, value: i64) -> &mut Self {
-        self.bytes(&value.to_le_bytes())
-    }
-
-    pub fn bool(&mut self, value: bool) -> &mut Self {
-        self.bytes(&[u8::from(value)])
-    }
-
-    pub fn finish(&self) -> u64 {
-        self.0
     }
 }
 

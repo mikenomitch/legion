@@ -1077,6 +1077,36 @@ impl From<LivenessConfigFull> for LivenessConfig {
     }
 }
 
+/// Resolved `liveness` config block (`docs/node-liveness.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivenessSettings {
+    /// Mark nothing lost for this long after becoming responsible.
+    pub failover_grace: std::time::Duration,
+    /// How often a non-leading manager reports what it heard to the leader.
+    pub digest_interval: std::time::Duration,
+    /// How long the leader keeps trusting a silent peer's last digest.
+    pub peer_digest_grace: std::time::Duration,
+    /// How often the leader replicates a display checkpoint. `None` = off.
+    pub checkpoint_interval: Option<std::time::Duration>,
+    /// Accumulation window for the heartbeat group commit. Zero (the default)
+    /// is today's commit-while-you-can batching.
+    pub batch_window: std::time::Duration,
+}
+
+impl Default for LivenessSettings {
+    fn default() -> Self {
+        Self {
+            failover_grace: std::time::Duration::from_secs(DEF_LIVENESS_FAILOVER_GRACE_SEC),
+            digest_interval: std::time::Duration::from_secs(DEF_LIVENESS_DIGEST_INTERVAL_SEC),
+            peer_digest_grace: std::time::Duration::from_secs(DEF_LIVENESS_PEER_DIGEST_GRACE_SEC),
+            checkpoint_interval: Some(std::time::Duration::from_secs(
+                DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC,
+            )),
+            batch_window: std::time::Duration::ZERO,
+        }
+    }
+}
+
 impl LivenessConfigFull {
     pub fn parsed_batch_window(&self) -> Duration {
         parse_humantime_or(&self.batch_window, "0ms")
@@ -1113,8 +1143,8 @@ impl LivenessConfigFull {
     }
 
     /// The runtime view of this block.
-    pub fn settings(&self) -> crate::storage::liveness::LivenessSettings {
-        crate::storage::liveness::LivenessSettings {
+    pub fn settings(&self) -> LivenessSettings {
+        LivenessSettings {
             failover_grace: self.parsed_failover_grace(),
             digest_interval: self.parsed_digest_interval(),
             peer_digest_grace: self.parsed_peer_digest_grace(),
@@ -3043,7 +3073,7 @@ pub struct WorkerConfigAlt {
     /// Where this worker publishes content by digest (docs/artifacts.md,
     /// "Publishing content"). Absent means the node publishes nothing.
     #[serde(default)]
-    pub content_store: Option<crate::content_publish::ContentStoreTarget>,
+    pub content_store: Option<ContentStoreTarget>,
     /// Session settings on this worker (docs/session-mode.md, "No split
     /// brain"). Absent means the defaults.
     #[serde(default)]
@@ -3116,8 +3146,77 @@ pub struct WorkerContainerConfig {
     /// `config.runtimeClass`; the node advertises the ones whose runtime
     /// answers `--version`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub runtime_classes:
-        std::collections::BTreeMap<String, crate::task_plugins::runtime_class::RuntimeClassConfig>,
+    pub runtime_classes: std::collections::BTreeMap<String, RuntimeClassConfig>,
+}
+
+/// Worker config `contentStore.auth`. Absent means the node's ambient
+/// credentials (for S3: the `AWS_*` key variables, web identity, an ECS task
+/// role, then the instance profile), which is how a region's workers usually
+/// reach their own region's bucket.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContentStoreAuth {
+    /// KV path holding an AWS credential object, the same shape artifact
+    /// `auth.kv` reads (docs/artifacts.md, "Credential shapes").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv: Option<String>,
+    /// Accepted so the plan's surface parses, then refused with a hint: an
+    /// S3 upload needs an AWS credential, and exchanging a node identity
+    /// token for one (STS) is not wired yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_identity: Option<serde_json::Value>,
+}
+
+/// Worker config `contentStore` block (docs/artifacts.md, "Publishing
+/// content").
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContentStoreTarget {
+    /// `s3://bucket/optional/prefix` or `file:///shared/dir`.
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ContentStoreAuth>,
+    /// The size published parts are cut into (`"1MiB"` when unset): each
+    /// distinct non-zero chunk is one object, so a repeat checkpoint
+    /// uploads only the chunks that changed (docs/suspend-and-resume.md,
+    /// "How published parts are stored"). 64 KiB to 16 MiB, a multiple of
+    /// 4 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<String>,
+    /// How long chunks are shared between publishes (`"24h"` when unset).
+    /// A chunk is reused only by publishes in the window it was uploaded
+    /// in, so a bucket lifecycle rule that expires `sealed/` objects older
+    /// than the longest-lived checkpoint plus this window never removes a
+    /// chunk a checkpoint still needs. At least 1m.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_window: Option<String>,
+}
+
+/// One runtime class (worker type `container.runtimeClasses.<name>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeClassConfig {
+    /// Absolute path to an OCI runtime with runc's command line (`run
+    /// --bundle`, `exec`, `kill`, `delete`, `state`). To pass it flags
+    /// (`runsc --platform=systrap`), point this at a wrapper script.
+    pub path: String,
+    /// The runtime applies an OCI user namespace with idmapped mounts.
+    /// Default `true`.
+    #[serde(default = "runtime_class_default_true")]
+    pub user_namespace: bool,
+    /// The runtime applies the OCI `linux.seccomp` profile. Default `true`.
+    #[serde(default = "runtime_class_default_true")]
+    pub seccomp: bool,
+    /// The runtime keeps container root off host root by itself (a
+    /// user-space kernel, a VM), so a floor part it does not support is
+    /// dropped rather than refused. Default `false`. An operator's trust
+    /// statement: only set it for runtimes that really are sandboxes.
+    #[serde(default)]
+    pub isolates_root: bool,
+}
+
+fn runtime_class_default_true() -> bool {
+    true
 }
 
 impl WorkerContainerConfig {
@@ -3594,7 +3693,7 @@ pub struct WorkerArtifactsPayload {
     /// The top-level `contentStore` block, riding the same payload for the
     /// same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_store: Option<crate::content_publish::ContentStoreTarget>,
+    pub content_store: Option<ContentStoreTarget>,
     /// The top-level `sessions` block, riding the same payload: its settings
     /// act on the session manifests the `contentStore` holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]

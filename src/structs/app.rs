@@ -1221,7 +1221,7 @@ pub fn validate_app_config(manifest: &AppManifest, config: &Value) -> Result<(),
     // (exactly one way to run, a builtin's own config, a valid checksum):
     // refused here, at `legion app config set`, rather than at the app's
     // start. Bundled names are reserved, so no installed app is named so.
-    if manifest.name == crate::manager::autoscale::AUTOSCALER_APP {
+    if manifest.name == crate::autoscaler::defaults::AUTOSCALER_APP {
         crate::autoscaler::plugins::PluginCatalog::from_app_config(config)?;
     }
     Ok(())

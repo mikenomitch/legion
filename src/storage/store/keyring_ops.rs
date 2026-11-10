@@ -937,7 +937,7 @@ impl Store {
 
     /// Refresh the keyring gauges (`legion_keyring_*`, `legion_kv_rows`).
     pub fn refresh_keyring_gauges(&self) {
-        let telemetry = crate::manager::telemetry::metrics();
+        let telemetry = crate::telemetry::metrics();
         let snapshot = self.keyring.snapshot();
         telemetry
             .keyring_unlocked

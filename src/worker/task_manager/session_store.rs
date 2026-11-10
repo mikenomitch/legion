@@ -173,7 +173,7 @@ impl WorkerTaskManager {
                 session_id,
                 via, "Ended a superseded session copy: a newer generation runs elsewhere"
             );
-            crate::manager::telemetry::worker_metrics()
+            crate::telemetry::worker_metrics()
                 .session_superseded_total
                 .inc(&[via]);
         }
@@ -848,9 +848,7 @@ pub fn resume_moved(
         });
     }
     if current.node != node_id {
-        crate::manager::telemetry::worker_metrics()
-            .session_moves_total
-            .inc();
+        crate::telemetry::worker_metrics().session_moves_total.inc();
     }
     info!(
         session_id,
@@ -978,7 +976,7 @@ pub fn self_fence(
                 );
             }
         }
-        crate::manager::telemetry::worker_metrics()
+        crate::telemetry::worker_metrics()
             .session_self_fenced_total
             .inc();
         fenced.push(session_id);

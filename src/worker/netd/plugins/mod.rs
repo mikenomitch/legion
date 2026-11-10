@@ -548,7 +548,7 @@ impl PluginHost {
     /// Publish every scope's module-defined metrics on the node's metrics
     /// endpoint.
     pub fn export_metrics(&self) {
-        let telemetry = crate::manager::telemetry::worker_metrics();
+        let telemetry = crate::telemetry::worker_metrics();
         for entry in self
             .entries
             .lock()

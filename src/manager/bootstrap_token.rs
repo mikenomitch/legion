@@ -46,7 +46,7 @@ impl BootstrapTokenPaths {
     pub fn for_this_process(local_address: &str) -> Self {
         BootstrapTokenPaths {
             data_dir_file: crate::constants::data_dir().join(BOOTSTRAP_TOKEN_FILE),
-            cli_file: crate::cmd::helpers::cli_token_path(local_address),
+            cli_file: crate::cli_paths::cli_token_path(local_address),
         }
     }
 }

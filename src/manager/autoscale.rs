@@ -24,6 +24,9 @@
 use rusqlite::Connection;
 
 use crate::autoscaler::defaults::{EffectiveDefaults, NamespaceDefaults, ResolvedPolicy};
+pub use crate::autoscaler::jobspec::{
+    is_autoscaled, needs_usage, target_label, validate_static, LEGION_QUERIES, USAGE_RUNTIMES,
+};
 use crate::autoscaler::plugins::{Kind, PluginCatalog};
 use crate::autoscaler::policy::ExternalPolicy;
 use crate::autoscaler::spec::format_duration;
@@ -35,19 +38,14 @@ use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::namespace::job_namespace;
 use crate::structs::namespace_policy::NamespacePolicy;
-use crate::structs::{InstanceMode, JobConfig, TaskConfig, TaskLifecycle};
-
-/// Runtimes whose replicas report measured usage (docs/resource-enforcement.md,
-/// "Measuring usage"). A policy whose signals read the task's own usage needs
-/// one of them.
-pub const USAGE_RUNTIMES: [&str; 3] = ["exec", "container", "sandbox"];
+use crate::structs::{JobConfig, TaskConfig};
 
 /// The built-in metric source: Legion's own measurements. Every other source
 /// is a plugin installed in the autoscaler's app config.
 pub const LEGION_SOURCE: &str = crate::autoscaler::defaults::LEGION_SOURCE;
 
 /// The bundled autoscaler app, whose config installs the scaling plugins.
-pub const AUTOSCALER_APP: &str = "autoscaler";
+pub const AUTOSCALER_APP: &str = crate::autoscaler::defaults::AUTOSCALER_APP;
 
 /// The key one of the autoscaler's objects (an `autoscaler/ScalingPolicy`
 /// or `autoscaler/NodeGroup`) keeps its history, pause, action row, and
@@ -68,22 +66,6 @@ pub fn object_uid_of_target_key(job_id: &str) -> Option<u64> {
     job_id
         .strip_prefix(OBJECT_TARGET_PREFIX)
         .and_then(|uid| uid.parse().ok())
-}
-
-/// The `legion` source's fixed vocabulary (docs/autoscaling.md, "Checks").
-pub const LEGION_QUERIES: [&str; 7] = [
-    "task.cpu.utilization",
-    "task.memory.utilization",
-    "task.unplaced",
-    "service.rps",
-    "service.errors",
-    "service.latency_ms.mean",
-    "service.latency_ms.max",
-];
-
-/// `job/group/task`, the way every autoscaling surface names a target.
-pub fn target_label(job_id: &str, group: &str, task: &str) -> String {
-    format!("{job_id}/{group}/{task}")
 }
 
 /// The inherited levels of every autoscale policy: the cluster's scaling
@@ -389,13 +371,6 @@ pub fn check_plugin_use(
     Ok(())
 }
 
-/// Whether a task has autoscaling on.
-pub fn is_autoscaled(task: &TaskConfig) -> bool {
-    task.autoscale
-        .as_ref()
-        .is_some_and(|spec| spec.is_enabled())
-}
-
 /// The tasks a policy on `task` moves: the task alone, or every task of its
 /// group (plan §6.3, "Multi-task groups"), in spec order.
 pub fn group_members(config: &JobConfig, task: &TaskConfig) -> Vec<String> {
@@ -405,148 +380,6 @@ pub fn group_members(config: &JobConfig, task: &TaskConfig) -> Vec<String> {
         .filter(|other| other.group == task.group)
         .map(|other| other.name.clone())
         .collect()
-}
-
-/// Whether a record's signals read the task's own usage. A record that names
-/// no signal inherits the default signal, which is always a utilization
-/// (defaults may set only `cpu` and `memory`).
-pub fn needs_usage(record: &AutoscaleRecord) -> bool {
-    if !record.names_signal() {
-        return true;
-    }
-    record.cpu.is_some()
-        || record.memory.is_some()
-        || record
-            .checks
-            .iter()
-            .flatten()
-            .any(|check| check.source == LEGION_SOURCE && check.query.ends_with(".utilization"))
-}
-
-/// The `autoscale` rules that need only the jobspec. Run by
-/// `validate_job_config`, so `legion job validate` catches them offline.
-pub fn validate_static(config: &JobConfig) -> R<()> {
-    for task in config.tasks.iter().filter(|task| is_autoscaled(task)) {
-        let spec = task.autoscale.as_ref().expect("filtered on autoscale");
-        let at = target_label(&config.name, &task.group, &task.name);
-        spec.validate().map_err(|err| anyhow!("{at}: {err}"))?;
-        let record = spec.record().unwrap_or_default();
-        if task
-            .stateful
-            .as_ref()
-            .is_some_and(|stateful| stateful.mode == InstanceMode::Keyed)
-        {
-            bail!(
-                "{at}: autoscale cannot be set on a keyed stateful task: its instances come from \
-                 the instance API, not a count. Hint: remove autoscale, or use slot mode"
-            );
-        }
-        if task.count.per.is_some() {
-            bail!(
-                "{at}: autoscale cannot be set on a `count.per` task: its count is per node, set \
-                 by where it runs. Hint: remove autoscale, or use a plain count"
-            );
-        }
-        if task.lifecycle == TaskLifecycle::Batch || task.schedule.is_some() {
-            bail!(
-                "{at}: autoscale applies to long-running tasks; a batch or scheduled task \
-                 finishes by design. Hint: remove autoscale"
-            );
-        }
-        let siblings: Vec<&TaskConfig> = config
-            .tasks
-            .iter()
-            .filter(|other| other.group == task.group && other.name != task.name)
-            .collect();
-        if let Some(other) = siblings.iter().find(|other| is_autoscaled(other)) {
-            bail!(
-                "{at}: tasks {} and {} share group '{}' and both set autoscale; a group scales as \
-                 one unit. Hint: set autoscale on one task of the group",
-                task.name,
-                other.name,
-                task.group
-            );
-        }
-        if let Some(other) = siblings
-            .iter()
-            .find(|other| other.count.num != task.count.num)
-        {
-            bail!(
-                "{at}: autoscale on a task in group '{}' moves every task of the group to one \
-                 count, but task {} has count {} and task {} has count {}. Hint: give the group's \
-                 tasks the same count",
-                task.group,
-                task.name,
-                task.count.num,
-                other.name,
-                other.count.num
-            );
-        }
-        if let Some(other) = siblings.iter().find(|other| {
-            other.count.per.is_some()
-                || other
-                    .stateful
-                    .as_ref()
-                    .is_some_and(|s| s.mode == InstanceMode::Keyed)
-        }) {
-            bail!(
-                "{at}: task {} in the same group is keyed or `count.per`, and a group scales as \
-                 one unit. Hint: move it to its own group",
-                other.name
-            );
-        }
-        if task.count.num == 0 {
-            bail!(
-                "{at}: count = 0 with autoscale; count is the starting size (with min = 0 the \
-                 task sleeps once its activation checks go quiet). Hint: set count >= 1"
-            );
-        }
-        for (index, check) in record.checks.iter().flatten().enumerate() {
-            let label = format!("autoscale.checks[{index}] ({})", check.name);
-            // Other sources are plugins, which only the manager can see
-            // (`legion job plan` and `job run` check them).
-            if check.source != LEGION_SOURCE {
-                continue;
-            }
-            if !check.query.is_empty() && !LEGION_QUERIES.contains(&check.query.as_str()) {
-                bail!(
-                    "{at}: {label}: the `legion` source has no query '{}'. Hint: use one of {}",
-                    check.query,
-                    LEGION_QUERIES.join(", ")
-                );
-            }
-            if check.query.starts_with("service.") && task.service.is_none() {
-                bail!(
-                    "{at}: {label}: '{}' reads the service the task backs, but the task has no \
-                     `service` block. Hint: add one, or use a task.* query",
-                    check.query
-                );
-            }
-        }
-        if needs_usage(&record) {
-            let members: Vec<&TaskConfig> = std::iter::once(task)
-                .chain(siblings.iter().copied())
-                .collect();
-            if let Some(blind) = members
-                .iter()
-                .find(|member| !USAGE_RUNTIMES.contains(&member.runtime.as_str()))
-            {
-                let whose = if blind.name == task.name {
-                    String::new()
-                } else {
-                    format!(" (task {} of its group)", blind.name)
-                };
-                bail!(
-                    "{at}: autoscale needs measured usage, and runtime '{}'{whose} does not \
-                     report it. Hint: only {} report usage; use checks on another `legion` \
-                     query (task.unplaced, service.*), or remove autoscale",
-                    blind.runtime,
-                    USAGE_RUNTIMES.join(", ")
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 /// One autoscaled task's resolution in a plan or a submit.

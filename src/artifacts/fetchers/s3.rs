@@ -3,7 +3,7 @@
 //! credential object or query params
 //! (`s3://bucket/key?endpoint=https://minio.internal:9000&region=auto`),
 //! query params winning. The store is opened through the object-storage
-//! layer ([`crate::storage::objects`]), like every other object store.
+//! layer ([`crate::objects`]), like every other object store.
 
 use std::io::Write;
 
@@ -12,10 +12,10 @@ use object_store::{path::Path as ObjectPath, ObjectStore};
 
 use crate::artifacts::fetcher::{ArtifactFetcher, FetchRequest, FetchedArtifact, FetchedPayload};
 use crate::artifacts::stage::ArtifactSink;
-use crate::prelude::*;
-use crate::storage::objects::{
+use crate::objects::{
     self, ObjectCredential, OpenOptions, RegionDefault, StoreUrl, FALLBACK_REGION,
 };
+use crate::prelude::*;
 
 #[derive(Debug, Default)]
 pub struct S3Fetcher;

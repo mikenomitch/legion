@@ -509,6 +509,27 @@ pub fn load_policy(name: &str) -> R<(Option<Library>, Box<dyn SchedulingPolicy>)
     }
 }
 
+/// Export a scheduling policy plugin: the ABI fingerprint, the panic probe,
+/// and the contained constructor the host loads (`legion_contained_get`).
+/// The scheduling-policy counterpart of `export_rollout_strategy!`; it is
+/// defined here because the trait is the scheduler's.
+///
+/// ```ignore
+/// legion::export_scheduling_policy!(RandomPolicy::new());
+/// ```
+#[macro_export]
+macro_rules! export_scheduling_policy {
+    ($value:expr) => {
+        $crate::declare_plugin_abi!();
+
+        #[no_mangle]
+        pub extern "C" fn legion_contained_get(
+        ) -> Box<dyn $crate::manager::scheduler::SchedulingPolicy> {
+            Box::new($crate::plugin_runtime::containment::Contained($value))
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

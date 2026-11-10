@@ -240,10 +240,10 @@ fn export_request(
             .collect()
     };
 
-    let snapshots = crate::manager::telemetry::snapshot_initialized_families();
+    let snapshots = crate::telemetry::snapshot_initialized_families();
     let mut metrics_out = Vec::with_capacity(snapshots.len());
     for family in snapshots {
-        use crate::manager::telemetry::{SampleValue, SnapshotKind};
+        use crate::telemetry::{SampleValue, SnapshotKind};
         let data = match family.kind {
             SnapshotKind::Counter => metric::Data::Sum(Sum {
                 data_points: family
@@ -414,10 +414,10 @@ mod tests {
     fn export_request_carries_registry_families() {
         use opentelemetry_proto::tonic::metrics::v1::metric;
 
-        crate::manager::telemetry::metrics()
+        crate::telemetry::metrics()
             .plan_apply_total
             .inc(&["applied"]);
-        crate::manager::telemetry::worker_metrics()
+        crate::telemetry::worker_metrics()
             .heartbeat_duration_seconds
             .observe(0.004);
 

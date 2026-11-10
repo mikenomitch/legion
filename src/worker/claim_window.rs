@@ -273,7 +273,7 @@ pub struct ClaimWindow {
 impl ClaimWindow {
     pub fn new(ceiling: usize, threshold: f64, queue_timeout: Duration) -> Self {
         let state = WindowState::new(ceiling, threshold);
-        crate::manager::telemetry::worker_metrics()
+        crate::telemetry::worker_metrics()
             .claim_window
             .set(state.window() as i64);
         ClaimWindow {
@@ -309,7 +309,7 @@ impl ClaimWindow {
         let (held_after, window_after, ceiling) = (state.held, state.window(), state.ceiling);
         drop(state);
         if window_after != window {
-            crate::manager::telemetry::worker_metrics()
+            crate::telemetry::worker_metrics()
                 .claim_window
                 .set(window_after as i64);
             // Lifecycle only: a cut happens at most once per slow patch, and
@@ -353,7 +353,7 @@ impl ClaimWindow {
                         window: Some(self.clone()),
                     });
                 }
-                crate::manager::telemetry::worker_metrics()
+                crate::telemetry::worker_metrics()
                     .claim_overload_refusals_total
                     .inc();
                 return Err(self.lock().overloaded(self.queue_timeout));

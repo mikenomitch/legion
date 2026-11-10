@@ -12,7 +12,7 @@
 //! nothing configured for its credentials. It reports running; frozen, it
 //! reads NOT RUNNING within three intervals.
 
-use legion::structs::EvalExt;
+use legion::manager::eval::EvalExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 

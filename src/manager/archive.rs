@@ -10,16 +10,16 @@
 //! store, and with its own ambient credentials (the AWS environment, web
 //! identity, an ECS task role, or the instance profile) otherwise. Every
 //! store, `s3://` or `file://`, is opened through the object-storage layer
-//! ([`crate::storage::objects`]).
+//! ([`crate::objects`]).
 
 use futures::TryStreamExt;
 use object_store::{path::Path as ObjectPath, ObjectStore};
 use url::Url;
 
 use crate::artifacts::{Credential, CredentialSource};
-use crate::content_publish::{document_url, ContentStoreTarget};
+use crate::content_publish::{document_url, ContentStoreTarget, ContentStoreTargetExt};
+use crate::objects::{self, ObjectCredential, StoreUrl};
 use crate::prelude::*;
-use crate::storage::objects::{self, ObjectCredential, StoreUrl};
 use crate::storage::store::Store;
 use crate::structs::archive::{
     archive_job_prefix, archive_object_name, parse_archive_object_name, ArchiveManifest,

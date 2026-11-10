@@ -55,7 +55,7 @@ pub mod stage {
 
 /// Observe one stage in `legion_task_start_stage_seconds`.
 pub fn observe(runtime: &str, stage: &str, elapsed: Duration) {
-    crate::manager::telemetry::worker_metrics()
+    crate::telemetry::worker_metrics()
         .task_start_stage_seconds
         .observe(&[runtime, stage], elapsed.as_secs_f64());
 }
@@ -171,7 +171,7 @@ mod start_timing_test {
             stage::PREPARE,
             Duration::from_millis(2),
         );
-        let rendered = crate::manager::telemetry::render_worker();
+        let rendered = crate::telemetry::render_worker();
         assert!(rendered.contains(
             "legion_task_start_stage_seconds_count{runtime=\"start-timing-test\",stage=\"prepare\"} 1"
         ));

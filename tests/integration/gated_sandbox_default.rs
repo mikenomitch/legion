@@ -5,9 +5,9 @@
 //! (`legion::structs::network::SANDBOX_GATED_BY_DEFAULT`), so these tests
 //! open it on their own store.
 
+use legion::manager::eval::EvalExt;
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
-use legion::structs::EvalExt;
 use legion::structs::{config::ManagerConfigFull, job::JobConfig, Node, NodeMsg, Submission};
 use serde_json::Value;
 

@@ -6808,7 +6808,7 @@ fn value_token(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::structs::EvalExt;
+    use crate::manager::eval::EvalExt;
     use serde_json::{json, Value};
     use std::collections::{HashMap, HashSet};
     use tempfile::Builder;

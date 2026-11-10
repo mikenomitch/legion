@@ -2,6 +2,7 @@
 //! under `.staging/`, verify checksums, unpack safely, and move atomically
 //! into the task directory. Corrupt bytes never reach a task directory.
 
+use crate::content_publish::ContentStoreTargetExt;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};

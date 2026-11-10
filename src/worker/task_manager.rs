@@ -11556,7 +11556,7 @@ mod tests {
             ..alloc()
         };
 
-        let wire = crate::manager::dispatcher::build_task_allocation(&task, &placed, None, &[])?;
+        let wire = crate::structs::task_payload::build_task_allocation(&task, &placed, None, &[])?;
         let (parsed_alloc, parsed_task) = task_from_allocation(&wire)?;
         assert_eq!(parsed_task.connect, Some(connect));
         let network = parsed_alloc.network.context("network lost on the wire")?;
@@ -11578,7 +11578,8 @@ mod tests {
             config: json!({ "command": ["true"] }),
             ..TaskConfig::new("api", "exec")
         };
-        let wire = crate::manager::dispatcher::build_task_allocation(&plain, &alloc(), None, &[])?;
+        let wire =
+            crate::structs::task_payload::build_task_allocation(&plain, &alloc(), None, &[])?;
         assert_eq!(wire.task_connect, "");
         let (_, parsed_task) = task_from_allocation(&wire)?;
         assert_eq!(parsed_task.connect, None);
@@ -12411,14 +12412,15 @@ mod tests {
             }),
             ..TaskConfig::new("box", "exec")
         };
-        let wire = crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+        let wire = crate::structs::task_payload::build_task_allocation(&task, &alloc(), None, &[])?;
         let (_, parsed) = task_from_allocation(&wire)?;
         assert_eq!(
-            crate::manager::dispatcher::resolved_speculative_start(&parsed)?.mode,
+            crate::structs::task_payload::resolved_speculative_start(&parsed)?.mode,
             Gate::Serve
         );
         let plain = TaskConfig::new("plain", "exec");
-        let wire = crate::manager::dispatcher::build_task_allocation(&plain, &alloc(), None, &[])?;
+        let wire =
+            crate::structs::task_payload::build_task_allocation(&plain, &alloc(), None, &[])?;
         assert_eq!(
             wire.task_speculative_start, "",
             "undeclared stays off the wire"
@@ -12436,7 +12438,8 @@ mod tests {
             lifecycle: crate::structs::TaskLifecycle::Batch,
             ..TaskConfig::new("fetch", "exec")
         };
-        let wire = crate::manager::dispatcher::build_task_allocation(&batch, &alloc(), None, &[])?;
+        let wire =
+            crate::structs::task_payload::build_task_allocation(&batch, &alloc(), None, &[])?;
         assert_eq!(wire.task_lifecycle, "batch");
         // Undeclared stays undeclared: the policy follows the lifecycle.
         assert_eq!(wire.task_restart, "");
@@ -12458,7 +12461,7 @@ mod tests {
             ..batch.clone()
         };
         let wire =
-            crate::manager::dispatcher::build_task_allocation(&declared, &alloc(), None, &[])?;
+            crate::structs::task_payload::build_task_allocation(&declared, &alloc(), None, &[])?;
         let (_, parsed) = task_from_allocation(&wire)?;
         assert_eq!(parsed.restart, declared.restart);
         assert_eq!(
@@ -12477,7 +12480,7 @@ mod tests {
             ..batch
         };
         let wire =
-            crate::manager::dispatcher::build_task_allocation(&delay_only, &alloc(), None, &[])?;
+            crate::structs::task_payload::build_task_allocation(&delay_only, &alloc(), None, &[])?;
         let (_, parsed) = task_from_allocation(&wire)?;
         assert_eq!(
             parsed.restart_policy(),
@@ -12513,7 +12516,7 @@ mod tests {
         // test's wait below.
         task.on_unhealthy.restart_delay = Duration::from_millis(50);
         let payload =
-            crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+            crate::structs::task_payload::build_task_allocation(&task, &alloc(), None, &[])?;
         let launcher = manager.clone();
         tokio::task::spawn_blocking(move || launch_task_allocation(&launcher, &payload)).await??;
 
@@ -12671,7 +12674,7 @@ mod tests {
             ..TaskConfig::new("staged", "exec")
         };
         let payload =
-            crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+            crate::structs::task_payload::build_task_allocation(&task, &alloc(), None, &[])?;
         let launcher = manager.clone();
         // The production call site: a blocking closure on the worker runtime.
         tokio::task::spawn_blocking(move || launch_task_allocation(&launcher, &payload)).await??;
@@ -12916,7 +12919,7 @@ mod tests {
         };
         task.on_unhealthy.restart_count = 0;
         let payload =
-            crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+            crate::structs::task_payload::build_task_allocation(&task, &alloc(), None, &[])?;
         let launcher = manager.clone();
         tokio::task::spawn_blocking(move || launch_task_allocation(&launcher, &payload)).await??;
 
@@ -12980,7 +12983,7 @@ mod tests {
         };
         task.on_unhealthy.restart_count = 0;
         let payload =
-            crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+            crate::structs::task_payload::build_task_allocation(&task, &alloc(), None, &[])?;
         let allocation_id = payload.allocation_id;
         let launcher = manager.clone();
         tokio::task::spawn_blocking(move || launch_task_allocation(&launcher, &payload)).await??;
@@ -13051,7 +13054,7 @@ mod tests {
         };
         task.on_unhealthy.restart_count = 0;
         let payload =
-            crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+            crate::structs::task_payload::build_task_allocation(&task, &alloc(), None, &[])?;
         let launcher = manager.clone();
         tokio::task::spawn_blocking(move || launch_task_allocation(&launcher, &payload)).await??;
 

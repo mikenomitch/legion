@@ -1,6 +1,6 @@
-use crate::manager::rollout_strategy::validate_rollout_strategy_name;
 use crate::plugin_runtime::{plugin_paths, validate_manifest};
 use crate::prelude::*;
+use crate::rollout_strategy::validate_rollout_strategy_name;
 use crate::structs::{
     Allocation, InstanceMode, JobConfig, RolloutReplacement, StopCause, TaskConfig,
     TaskDependencyCondition, TaskLifecycle,
@@ -22,6 +22,7 @@ pub(crate) use exec::host_command_env;
 pub mod exec_isolation;
 mod exec_session;
 pub mod guest_resume;
+pub mod job_schema;
 mod microvm;
 mod oci_bundle;
 mod oci_image;
@@ -1240,7 +1241,7 @@ fn validate_gang_groups(config: &JobConfig) -> R<()> {
             );
         }
         let steps =
-            crate::manager::rollout::step_fractions_for_rollout(&rollout, task.count.num.max(1));
+            crate::structs::job::step_fractions_for_rollout(&rollout, task.count.num.max(1));
         if steps.len() > 1 {
             bail!(
                 "rollout: the step mode for group {} replaces task {} in {} steps, but the task \
@@ -1422,7 +1423,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
     }
     // `autoscale`: the rules that need only the jobspec (the ones that need
     // the cluster's scaling defaults run at submit, docs/autoscaling.md).
-    crate::manager::autoscale::validate_static(config)?;
+    crate::autoscaler::jobspec::validate_static(config)?;
     // Slot instance ids are derived from (job, group, slot), so two slot-mode
     // stateful tasks in one group would collide on instance identity.
     let mut slot_stateful_by_group: HashMap<&str, &str> = HashMap::new();
@@ -4147,5 +4148,29 @@ mod tests {
         let err = validate_job_config(&config).expect_err("sequential slots on a gang");
         assert!(err.to_string().contains("sequential"), "{err}");
         assert!(err.to_string().contains("is a gang"), "{err}");
+    }
+
+    #[test]
+    fn a_jobspec_normalizes_at_parse_and_again_to_itself_test() -> R<()> {
+        let spec = json!({
+            "name": "agents",
+            "task": {
+                "name": "workspace",
+                "runtime": "exec",
+                "config": { "command": ["sleep", "600"] },
+                "resources": { "cpu": 500, "memory": 512 },
+                "stateful": {
+                    "mode": "session",
+                    "envelope": { "resources": { "cpu": 30000, "memory": 61440 } },
+                },
+            },
+        });
+        let config: JobConfig = serde_json::from_value(spec)?;
+        assert_eq!(config.tasks.len(), 2);
+        validate_job_config(&config)?;
+        let mut again = config.clone();
+        crate::structs::session::normalize_session_tasks(&mut again)?;
+        assert_eq!(again, config);
+        Ok(())
     }
 }

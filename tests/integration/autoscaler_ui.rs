@@ -35,6 +35,7 @@ use legion::manager::acl::Authenticator;
 use legion::manager::app_forward::AppForwarder;
 use legion::manager::apps::{AppReconciler, PassOutcome, ReconcilerSettings};
 use legion::manager::auth_method::ControlPlaneIdentityMethod;
+use legion::manager::eval::EvalExt;
 use legion::manager::server::ManagerDaemonService;
 use legion::manager::workload_identity::{claims_for_allocation, WorkloadIdentityState};
 use legion::storage::store::Store;

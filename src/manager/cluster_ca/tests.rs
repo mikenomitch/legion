@@ -2,7 +2,7 @@ use super::test_support::*;
 use super::verify::{assemble_view, verify_issued, Refusal};
 use super::*;
 use crate::cluster_tls::{ca_pin_pem, peer_role, PeerRole, MANAGER_SERVER_NAME};
-use crate::manager::mesh_ca::{generate_csr, CsrSubject, LeafSpec, ManagerCertKind};
+use crate::mesh_ca::{generate_csr, CsrSubject, LeafSpec, ManagerCertKind};
 use crate::structs::config::ClusterCaConfigFull;
 use rcgen::{
     CertificateParams, CertificateSigningRequestParams, DistinguishedName, DnType,
@@ -286,7 +286,7 @@ fn file_provider_refuses_unusable_material_at_start_test() -> R<()> {
 
     // A leaf, not a CA.
     let (leaf, leaf_key, _) =
-        crate::manager::mesh_ca::issue_node_cert(&pki.inter_pem, &pki.inter_key, "node-1")?;
+        crate::mesh_ca::issue_node_cert(&pki.inter_pem, &pki.inter_key, "node-1")?;
     let leaf_path = write(dir.path(), "leaf.pem", &leaf)?;
     let leaf_key_path = write(dir.path(), "leaf.key", &leaf_key)?;
     let err = start(&leaf_path, &leaf_key_path, None);

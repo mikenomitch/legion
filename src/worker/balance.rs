@@ -9,8 +9,9 @@
 //!
 //! # Adding a strategy
 //!
-//! Two steps, because `BALANCERS` is the *only* list of strategy names in the
-//! tree — config validation reads it too, so there is no second place to forget.
+//! Three steps. Jobspec validation lives in the types crate, below this one,
+//! so it keeps its own list of names (`structs::BALANCE_STRATEGIES`); a test
+//! here fails when that list and `BALANCERS` differ.
 //!
 //! 1. Write the impl here:
 //!
@@ -29,8 +30,10 @@
 //! 2. Add one row to `BALANCERS`:
 //!    `("first_healthy", || Arc::new(FirstHealthy))`.
 //!
-//! That is it: `legion job run` accepts `balance: "first_healthy"` immediately,
-//! and the error message for unknown names lists it.
+//! 3. Add the name to `structs::BALANCE_STRATEGIES`, in the same position.
+//!
+//! `legion job run` then accepts `balance: "first_healthy"`, and the error
+//! message for unknown names lists it.
 
 use crate::prelude::*;
 use crate::structs::normalize_balance;
@@ -167,11 +170,11 @@ type BalancerRow = (&'static str, fn() -> Arc<dyn Balancer>);
 
 /// The strategy registry.
 ///
-/// This is the single source of truth. [`balancer`] dispatches through it and
-/// [`balancer_names`] — which config validation
-/// (`crate::structs::is_known_balance`) and its error message read — is derived
-/// from it, so a name and an implementation cannot get out of sync: there is
-/// only one list.
+/// [`balancer`] dispatches through it. Config validation
+/// (`crate::structs::is_known_balance`) reads the same names from
+/// `structs::BALANCE_STRATEGIES`, and
+/// `the_registry_and_the_jobspec_accept_the_same_names_test` keeps the two
+/// lists identical.
 const BALANCERS: &[BalancerRow] = &[
     ("least_latency", default_balancer),
     ("round_robin", || Arc::new(RoundRobin::seeded())),
@@ -190,9 +193,8 @@ pub fn local_node() -> Option<&'static str> {
     LOCAL_NODE.get().map(String::as_str)
 }
 
-/// The strategy names config validation accepts, in canonical form. Read
-/// straight off `BALANCERS`, so it always describes what this build can
-/// actually run.
+/// The strategy names this build can run, in canonical form, read straight
+/// off `BALANCERS`.
 pub fn balancer_names() -> Vec<&'static str> {
     BALANCERS.iter().map(|(name, _)| *name).collect()
 }
@@ -520,6 +522,13 @@ mod tests {
             "widens when nothing is local"
         );
         assert!(balancer_names().contains(&"local_first"));
+    }
+
+    /// Jobspec validation keeps its own list of names (it lives below the
+    /// datapath); the two must be the same list.
+    #[test]
+    fn the_registry_and_the_jobspec_accept_the_same_names_test() {
+        assert_eq!(balancer_names(), crate::structs::BALANCE_STRATEGIES);
     }
 
     fn endpoint(addr: &str) -> Endpoint {

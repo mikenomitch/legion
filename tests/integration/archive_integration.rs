@@ -15,6 +15,7 @@
 #![allow(clippy::result_large_err)]
 
 use legion::content_publish::document_url;
+use legion::manager::eval::EvalExt;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;
@@ -22,7 +23,6 @@ use legion::storage::store::Store;
 use legion::structs::archive::ArchiveManifest;
 use legion::structs::manager_server::Manager;
 use legion::structs::suspend::SuspendConfig;
-use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::StatefulConfig, job::TaskConfig,
     CreateInstanceRequest, DestroyInstanceRequest, GetInstanceRequest, HeartbeatReply,

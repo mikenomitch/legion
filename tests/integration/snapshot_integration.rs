@@ -11,13 +11,13 @@
 // Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
 #![allow(clippy::result_large_err)]
 
+use legion::manager::eval::EvalExt;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;
 use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
 use legion::structs::snapshot::SnapshotsConfig;
-use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::StatefulConfig, job::StatefulStorageConfig,
     job::TaskConfig, CreateSnapshotRequest, DeleteSnapshotRequest, GetInstanceRequest,

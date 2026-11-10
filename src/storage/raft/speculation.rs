@@ -243,7 +243,7 @@ pub(crate) fn undo_outstanding(store: &Store, ledger: &SpeculationLedger, lane: 
         ledger.clear(lane);
         undone
     };
-    crate::manager::telemetry::metrics()
+    crate::telemetry::metrics()
         .raft_speculation_total
         .inc_by(&[lane.wire_name(), "undone"], undone.len() as u64);
     // A cache that loaded a speculative row in the window is corrected.

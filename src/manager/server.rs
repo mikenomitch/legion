@@ -2,6 +2,7 @@
 // large `tonic::Status` error variant cannot be boxed away here.
 #![allow(clippy::result_large_err)]
 
+use crate::content_publish::ContentStoreTargetExt;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
@@ -9062,7 +9063,7 @@ impl Manager for ManagerDaemonService {
         // have registered as part of that fleet, which registration admits
         // only when the node's worker type grants it (`enforce_fleet_claim`).
         let subject = if req.fleet.is_empty() {
-            crate::manager::mesh_ca::CsrSubject::Node(req.node_id.clone())
+            crate::mesh_ca::CsrSubject::Node(req.node_id.clone())
         } else {
             let registered = crate::manager::worker_plane::worker_fleet(&node);
             if registered.as_deref() != Some(req.fleet.as_str()) {
@@ -9073,7 +9074,7 @@ impl Manager for ManagerDaemonService {
                     registered.unwrap_or_default()
                 )));
             }
-            crate::manager::mesh_ca::CsrSubject::Fleet(req.fleet.clone())
+            crate::mesh_ca::CsrSubject::Fleet(req.fleet.clone())
         };
         // Signed through the cluster CA provider (docs/cluster-ca.md): the
         // built-in CA, an operator's CA on disk, or an external signer whose
@@ -15772,9 +15773,9 @@ impl ManagerDaemonService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manager::eval::EvalExt;
     use crate::structs::config::ManagerConfigFull;
     use crate::structs::worker_server::Worker;
-    use crate::structs::EvalExt;
     use crate::structs::{
         AllocationHealth, Eval, GetAllocationLogsRequest, JobConfig, ListRolloutEventsRequest,
         MaterialRef, NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest, RestartWorkerReply,
@@ -17267,12 +17268,12 @@ mod tests {
         // certificate from this cluster's CA, and require manager
         // certificates from the same CA.
         let ca = store.ensure_mesh_ca()?;
-        let (key_pem, csr) = crate::manager::mesh_ca::generate_csr("node-1")?;
-        let (cert_pem, _) = crate::manager::mesh_ca::sign_csr(
+        let (key_pem, csr) = crate::mesh_ca::generate_csr("node-1")?;
+        let (cert_pem, _) = crate::mesh_ca::sign_csr(
             &ca.cert_pem,
             &ca.key_pem,
             &csr,
-            &crate::manager::mesh_ca::CsrSubject::Node("node-1".into()),
+            &crate::mesh_ca::CsrSubject::Node("node-1".into()),
         )?;
         let identity = crate::cluster_tls::SwappableIdentity::new();
         identity.set(crate::cluster_tls::certified_key(&cert_pem, &key_pem)?);
@@ -18723,7 +18724,7 @@ mod tests {
     /// failing the call. A client CA on the same port is its own ref.
     #[tokio::test]
     async fn material_port_cert_derives_the_path_and_skips_unchanged_test() -> R<()> {
-        use crate::manager::mesh_ca::{generate_ca, issue_node_cert};
+        use crate::mesh_ca::{generate_ca, issue_node_cert};
         let store = setup_store()?;
         let manager = ManagerDaemonService::new(store.clone());
         let (ca_pem, ca_key) = generate_ca()?;

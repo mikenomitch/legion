@@ -9,11 +9,11 @@
 //! node that is already nearly full. Scored by requested resources, both
 //! policies see which node is actually full.
 
+use legion::manager::eval::EvalExt;
 use legion::prelude::R;
 use legion::storage::store::Store;
 use legion::structs::config::ManagerConfigFull;
 use legion::structs::job::{JobConfig, TaskConfig, TaskCount};
-use legion::structs::EvalExt;
 use legion::structs::{Node, NodeMsg, Submission};
 use serde_json::{json, Value};
 

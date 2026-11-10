@@ -73,7 +73,7 @@ impl LaunchPool {
             Ok(Ok(slot)) => Ok(slot),
             // The semaphore is never closed; a timeout is the only refusal.
             _ => {
-                crate::manager::telemetry::worker_metrics()
+                crate::telemetry::worker_metrics()
                     .launch_pool_refusals_total
                     .inc();
                 Err(full)

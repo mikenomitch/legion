@@ -15,17 +15,16 @@ pub mod daemon;
 pub mod delegation;
 pub mod dispatcher;
 pub mod edge_boot;
+pub mod eval;
 pub mod exec;
 pub mod exec_ws;
 pub mod governance;
 pub mod job_templates;
 pub mod leader_forward;
-pub mod mesh_ca;
 pub(crate) mod node_group_members;
 pub mod oidc_http;
 pub mod origin;
 pub mod rollout;
-pub mod rollout_strategy;
 pub mod rpc_access;
 pub mod scaling_inputs;
 pub mod scaling_status;
@@ -36,3 +35,8 @@ pub mod telemetry;
 pub mod usage;
 pub mod worker_plane;
 pub mod workload_identity;
+
+// Rollout strategies are a plugin kind with no manager state, so the trait
+// and its loader live beside the other plugin loaders. Re-exported so the
+// path plugins name (`legion::manager::rollout_strategy`) is unchanged.
+pub use crate::rollout_strategy;

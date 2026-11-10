@@ -58,4 +58,32 @@ mod module_test {
         let err = verify_checksum(b"hellO", good).unwrap_err();
         assert!(err.contains("mismatch"), "{err}");
     }
+
+    /// Every plugin object shipped under `configs/netplugins/` evaluates and
+    /// passes the validation `legion net plugin apply` runs, and its checksum
+    /// is the module the tests build.
+    #[test]
+    fn shipped_plugin_objects_validate_test() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut seen = 0;
+        for entry in std::fs::read_dir(root.join("configs/netplugins")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("ncl") {
+                continue;
+            }
+            let raw = crate::config_lang::eval_file(&path).unwrap();
+            let mut object: crate::structs::netplugin::NetPluginObject = serde_json::from_str(&raw)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            object
+                .normalize_and_validate()
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            let module = root.join(format!("tests/netplugins/{}.wasm", object.name));
+            if let Ok(bytes) = std::fs::read(&module) {
+                verify_checksum(&bytes, &object.module.checksum)
+                    .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            }
+            seen += 1;
+        }
+        assert!(seen >= 1);
+    }
 }

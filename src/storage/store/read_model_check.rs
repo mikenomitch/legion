@@ -326,7 +326,7 @@ impl Store {
              rebuilding the cached scheduling state from disk. Writing the state database \
              directly is unsupported (docs/state-store.md)"
         );
-        crate::manager::telemetry::metrics()
+        crate::telemetry::metrics()
             .read_model_external_writes_total
             .inc();
         // An outside write may have touched anything, the keyring included.
@@ -355,7 +355,7 @@ impl Store {
             }
         }
         if repaired > 0 {
-            crate::manager::telemetry::metrics()
+            crate::telemetry::metrics()
                 .read_model_drift_repaired_total
                 .inc_by(&["scrub"], repaired as u64);
         }

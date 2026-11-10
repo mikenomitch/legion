@@ -798,7 +798,7 @@ impl ManagerDaemonService {
             AclAction::Write,
             &AclScope::app(&name),
         )?;
-        if crate::apps::is_bundled(&name) {
+        if crate::bundled_apps::is_bundled(&name) {
             return Err(Status::failed_precondition(format!(
                 "{name} is an app bundled with Legion; it is installed with the cluster, and \
                  upgrades with the binary"
@@ -1754,7 +1754,7 @@ impl ManagerDaemonService {
                     .state
                     .marker_reason
                     .starts_with(crate::structs::app::UPGRADE_HELD)
-                && crate::apps::bundled_manifest(&name).is_some_and(|embedded| {
+                && crate::bundled_apps::bundled_manifest(&name).is_some_and(|embedded| {
                     embedded.digest() != record.manifest_digest
                         && validate_app_config(embedded, &config).is_ok()
                 });

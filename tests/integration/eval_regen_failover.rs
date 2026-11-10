@@ -18,11 +18,11 @@
 //! config-update cleanups, rollout ticks, KV restarts, and — the
 //! over-execution case — no-evict cordons.
 
+use legion::manager::eval::EvalExt;
 use legion::prelude::{Context, R};
 use legion::storage::store::Store;
 use legion::structs::config::ManagerConfigFull;
 use legion::structs::job::{JobConfig, TaskConfig, TaskCount};
-use legion::structs::EvalExt;
 use legion::structs::{Node, NodeMsg, Submission};
 use serde_json::json;
 

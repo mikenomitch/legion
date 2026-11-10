@@ -308,7 +308,7 @@ impl Store {
                 cause,
                 "Capacity appeared while the eval ran; requeueing instead of blocking"
             );
-            crate::manager::telemetry::metrics()
+            crate::telemetry::metrics()
                 .evals_unblocked_total
                 .inc(&["missed"]);
             return EvalCompletion::Released {
@@ -493,7 +493,7 @@ impl Store {
                 s.unblock_evals_apply(wakes)
             })?;
             let now = OffsetDateTime::now_utc();
-            let metrics = crate::manager::telemetry::metrics();
+            let metrics = crate::telemetry::metrics();
             for (eval, node_id, cause) in &woken {
                 metrics.evals_unblocked_total.inc(&[cause]);
                 if let Ok(at) = OffsetDateTime::parse(&eval.blocked_at, &Rfc3339) {
@@ -543,7 +543,7 @@ impl Store {
         self.replicated(Lane::Scheduler, "unblock_evals", move |s| {
             s.unblock_evals_apply(wakes)
         })?;
-        crate::manager::telemetry::metrics()
+        crate::telemetry::metrics()
             .evals_unblocked_total
             .inc_by(&["startup"], blocked.len() as u64);
         Ok(blocked.len())
@@ -565,7 +565,7 @@ impl Store {
             *count -= take;
             remaining -= take;
         }
-        let gauge = &crate::manager::telemetry::metrics().evals_blocked;
+        let gauge = &crate::telemetry::metrics().evals_blocked;
         for (kind, count) in counts {
             gauge.set(&[kind], count);
         }
@@ -574,7 +574,7 @@ impl Store {
             .iter()
             .filter(|eval| !woken.contains(eval.id.as_str()) && eval.gang().is_some())
             .count();
-        crate::manager::telemetry::metrics()
+        crate::telemetry::metrics()
             .gang_blocked_jobs
             .set(gangs as i64);
     }

@@ -17,6 +17,7 @@
 
 #![allow(clippy::result_large_err)]
 
+use legion::manager::eval::EvalExt;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;

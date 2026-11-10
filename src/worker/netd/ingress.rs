@@ -829,7 +829,7 @@ mod tests {
     /// plain client and a caller outside `allow` are refused.
     #[tokio::test]
     async fn mesh_mtls_ingress_attributes_the_peer_workload() {
-        use crate::manager::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
+        use crate::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
         use crate::worker::netd::proxyproto::{self, tlv};
         use crate::worker::netd::tls::MeshIdentity;
 
@@ -954,7 +954,7 @@ mod tests {
     /// serving the last good certificate while reporting the problem.
     #[tokio::test]
     async fn kv_backed_ingress_serves_and_hot_swaps_the_certificate_test() {
-        use crate::manager::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
+        use crate::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
         use crate::structs::source::MATERIAL_PORT_CERT;
         use crate::worker::forwarder::HeldTls;
         use crate::worker::netd::tls::{certs_from_pem, server_name, CertKey};
@@ -1068,7 +1068,7 @@ mod tests {
     /// refused at the handshake.
     #[tokio::test]
     async fn mutual_port_verifies_clients_against_a_kv_ca_test() {
-        use crate::manager::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
+        use crate::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
         use crate::structs::source::{MATERIAL_CLIENT_CA, MATERIAL_PORT_CERT};
         use crate::worker::forwarder::HeldTls;
         use crate::worker::netd::tls::{
@@ -1166,7 +1166,7 @@ mod tests {
 
     #[test]
     fn kv_bundles_are_validated_test() {
-        use crate::manager::mesh_ca::{generate_ca, issue_node_cert};
+        use crate::mesh_ca::{generate_ca, issue_node_cert};
         use crate::worker::netd::tls::validate_bundle;
         let (ca_pem, ca_key) = generate_ca().unwrap();
         let (cert, key, _) = issue_node_cert(&ca_pem, &ca_key, "edge").unwrap();

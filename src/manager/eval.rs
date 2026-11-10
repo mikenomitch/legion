@@ -1,3 +1,7 @@
+//! Eval handlers: what the manager does for each kind of eval it claims
+//! (docs/scheduler-and-eval-loop.md). Plans against the store, applies the
+//! plan, and dispatches the result.
+
 use rand::Rng;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -6,39 +10,39 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
-use crate::manager::dispatcher::dispatch_allocations;
-use crate::manager::scheduler::{PlanMode, PlanOutcome, Scheduler};
+use super::dispatcher::dispatch_allocations;
+use super::scheduler::{PlanMode, PlanOutcome, Scheduler};
 #[cfg(test)]
 use crate::prelude::Context;
 use crate::prelude::{bail, json, R};
 use crate::storage::errors::StorageError;
 use crate::storage::store::Store;
 
-use super::node::Node;
-use super::Eval;
+use crate::structs::node::Node;
+use crate::structs::Eval;
 
 #[cfg(test)]
-use super::config::ManagerConfigFull;
+use crate::structs::config::ManagerConfigFull;
 #[cfg(test)]
-use super::job::{JobConfig, TaskConfig, TaskCount};
+use crate::structs::job::{JobConfig, TaskConfig, TaskCount};
 #[cfg(test)]
-use super::ledger::LedgerEntry;
+use crate::structs::ledger::LedgerEntry;
 #[cfg(test)]
-use super::Submission;
+use crate::structs::Submission;
 
 /// Record one handler phase into `legion_eval_phase_seconds{kind, phase}`
 /// (docs/metrics.md). The phases of a placing eval partition
 /// `legion_eval_handle_seconds`, so the time an eval spends outside its
 /// plan is attributable instead of a derived remainder.
 fn observe_phase(kind: &str, phase: &str, elapsed: Duration) {
-    crate::manager::telemetry::metrics()
+    crate::telemetry::metrics()
         .eval_phase_seconds
         .observe(&[kind, phase], elapsed.as_secs_f64());
 }
 
-/// The eval loop's behavior on an [`Eval`]. `Eval` is a generated wire type
-/// (`legion-proto`), and the orphan rule forbids an inherent impl on another
-/// crate's type, so it reaches the type through this trait.
+/// Handling an [`Eval`]: the eval loop's behavior on the wire type. `Eval`
+/// is generated (`legion-proto`) and the orphan rule forbids an inherent
+/// impl on another crate's type, so the methods are a trait.
 pub trait EvalExt {
     /// Run this eval against `store`: plan, apply, and dispatch whatever it
     /// asks for. Returns a one-line summary for the eval's event.
@@ -842,7 +846,7 @@ impl EvalRun<'_> {
         let tasks = store.shared_task_configs_for_job_config(&self.job_config_id)?;
         let mut min_delay: Option<std::time::Duration> = None;
         for (_, task) in tasks.iter() {
-            if task.lifecycle != super::job::TaskLifecycle::Batch {
+            if task.lifecycle != crate::structs::job::TaskLifecycle::Batch {
                 continue;
             }
             let Some(schedule) = task.schedule.as_ref() else {
@@ -1607,7 +1611,7 @@ mod tests {
     fn phase_count(kind: &str, phase: &str) -> u64 {
         let prefix =
             format!("legion_eval_phase_seconds_count{{kind=\"{kind}\",phase=\"{phase}\"}} ");
-        crate::manager::telemetry::render()
+        crate::telemetry::render()
             .lines()
             .find_map(|line| line.strip_prefix(&prefix))
             .and_then(|value| value.trim().parse().ok())

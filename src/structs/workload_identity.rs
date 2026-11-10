@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
 
+/// Default JWKS route (operator-overridable via config).
+pub const DEFAULT_JWKS_PATH: &str = "/.well-known/jwks.json";
+
 /// The reserved (built-in) identity name that, when present, the manager issues
 /// with `aud` set to the cluster's own issuer so a workload can authenticate
 /// back to Legion itself. Reserved here so the spec/issuance path is

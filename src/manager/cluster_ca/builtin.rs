@@ -8,7 +8,7 @@
 //! [`super::ClusterCa`].
 
 use super::{CaError, CaView, ClusterCaProvider};
-use crate::manager::mesh_ca::LeafSpec;
+use crate::mesh_ca::LeafSpec;
 use crate::storage::netpolicy_store::MeshCa;
 use crate::storage::store::Store;
 use crate::structs::config::CLUSTER_CA_BUILTIN;
@@ -81,9 +81,8 @@ impl ClusterCaProvider for BuiltinCa {
         // One read for the key, the chain, and the view, so a rotation
         // between them cannot pair a leaf with the wrong chain.
         let ca = store.ensure_mesh_ca().map_err(CaError::Internal)?;
-        let (leaf, _) =
-            crate::manager::mesh_ca::sign_leaf(&ca.cert_pem, &ca.key_pem, csr_pem, spec)
-                .map_err(|err| CaError::Internal(err.context("signing with the built-in CA")))?;
+        let (leaf, _) = crate::mesh_ca::sign_leaf(&ca.cert_pem, &ca.key_pem, csr_pem, spec)
+            .map_err(|err| CaError::Internal(err.context("signing with the built-in CA")))?;
         Ok((format!("{leaf}{}", ca.chain_suffix()), view_of(&ca)?))
     }
 

@@ -205,7 +205,7 @@ impl Store {
             })?;
         }
         if woken > 0 {
-            crate::manager::telemetry::metrics()
+            crate::telemetry::metrics()
                 .evals_unblocked_total
                 .inc_by(&["timeout"], woken as u64);
         }
@@ -261,7 +261,7 @@ impl Store {
             allocations.len(),
             &message,
         );
-        crate::manager::telemetry::metrics()
+        crate::telemetry::metrics()
             .gang_outcomes_total
             .inc(&["timeout"]);
         warn!(

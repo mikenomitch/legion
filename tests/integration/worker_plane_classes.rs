@@ -29,7 +29,7 @@ use legion::cluster_tls::{
     certified_key, client_config, server_config, tls_channel, ClusterClientVerifier,
     NamedServerVerifier, SwappableIdentity, SwappableRoots,
 };
-use legion::manager::mesh_ca::{
+use legion::mesh_ca::{
     generate_ca, generate_csr, issue_manager_cert, node_dns_name, sign_csr, CsrSubject,
     ManagerCertKind,
 };

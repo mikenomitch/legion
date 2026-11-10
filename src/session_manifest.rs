@@ -40,6 +40,7 @@
 //! processes on one host and on a shared filesystem with working `flock`;
 //! `s3://` stores send real `If-None-Match` / `If-Match` preconditions.
 
+use crate::content_publish::ContentStoreTargetExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -47,8 +48,8 @@ use std::time::Instant;
 use object_store::{path::Path as ObjectPath, ObjectStore, PutMode, PutOptions, UpdateVersion};
 use serde::{Deserialize, Serialize};
 
+use crate::objects::StoreUrl;
 use crate::prelude::*;
-use crate::storage::objects::StoreUrl;
 use crate::worker::session_log::SessionCheckpoint;
 
 /// The manifest format this build writes and reads.
@@ -375,7 +376,7 @@ impl ManifestBackend for FileManifestBackend {
     }
 
     fn url_for(&self, object: &str) -> String {
-        crate::storage::objects::local_url(&self.path(object))
+        crate::objects::local_url(&self.path(object))
     }
 }
 
@@ -384,7 +385,7 @@ impl ManifestBackend for FileManifestBackend {
 // ---------------------------------------------------------------------------
 
 /// Manifests in an `object_store` store. For S3 the client must be opened
-/// with conditional puts ([`crate::storage::objects::OpenOptions`]), which
+/// with conditional puts ([`crate::objects::OpenOptions`]), which
 /// make `PutMode::Create` send `If-None-Match: *` and `PutMode::Update` send
 /// `If-Match: <etag>`.
 pub struct ObjectStoreManifestBackend {

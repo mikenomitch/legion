@@ -5,6 +5,7 @@ use crate::constants::{
     ALLOCATION_STATUS_COMPLETE, ALLOCATION_STATUS_FAILED, STOP_NOTICE_RETENTION_SECS,
 };
 use crate::constraints::{ConstraintSet, DistinctTracker, PermitSet};
+use crate::manager::eval::EvalExt;
 use crate::prelude::*;
 use crate::resources::{NodeUsage, ResourcePolicy, ResourcePool, ResourceRequest};
 use crate::scheduling_index::{IndexSet, IndexSettings};
@@ -133,7 +134,7 @@ use crate::storage::queries::{
 };
 use crate::structs::spec_fields::{PendingExtensions, UnknownFieldsRecord, PENDING_EXTENSIONS_KEY};
 use crate::structs::{
-    slot_instance_id, Allocation, AllocationHealth, Band, Eval, EvalExt, Instance, InstanceMode,
+    slot_instance_id, Allocation, AllocationHealth, Band, Eval, Instance, InstanceMode,
     InstanceState, Job, JobConfig, JobTemplateProvenance, KvEntry, KvLock, KvValueType,
     LedgerEntry, ManagerConfigFull, ManagerNodeConfig, Node, NodeMsg, ReplaceAfter,
     ResolvedOnLostPolicy, Rollout, RolloutConfig, SigningKeyRecord, StatefulConfig,
@@ -3081,10 +3082,10 @@ impl Store {
         // happened to be holding the stopwatch (`task_fetch`, usually),
         // with no metric anywhere naming the real resource.
         match connection_kind {
-            "write" => crate::manager::telemetry::metrics()
+            "write" => crate::telemetry::metrics()
                 .store_write_lock_wait_seconds
                 .observe(waited.as_secs_f64()),
-            _ => crate::manager::telemetry::metrics()
+            _ => crate::telemetry::metrics()
                 .store_read_lock_wait_seconds
                 .observe(waited.as_secs_f64()),
         }
@@ -3235,13 +3236,11 @@ impl Store {
             return Err(original);
         };
         let forwarded = driver.forward_lane_write(&op);
-        crate::manager::telemetry::metrics()
-            .leader_forwards_total
-            .inc(&[
-                op.lane().wire_name(),
-                op.op_name(),
-                if forwarded.is_ok() { "ok" } else { "failed" },
-            ]);
+        crate::telemetry::metrics().leader_forwards_total.inc(&[
+            op.lane().wire_name(),
+            op.op_name(),
+            if forwarded.is_ok() { "ok" } else { "failed" },
+        ]);
         match forwarded {
             Ok(value) => {
                 debug!(
@@ -3661,7 +3660,7 @@ impl Store {
         for offset in 0..pool.len() {
             let conn = &pool[(start.wrapping_add(offset)) % pool.len()];
             if let Ok(guard) = conn.try_lock() {
-                crate::manager::telemetry::metrics()
+                crate::telemetry::metrics()
                     .store_read_lock_wait_seconds
                     .observe(0.0);
                 return Ok(guard);
@@ -3679,7 +3678,7 @@ impl Store {
     // acquisition records 0 without reading the clock, so the histogram's
     // mean is the real average wait and its count the acquisition rate.
     fn read_model_reader(&self) -> R<std::sync::RwLockReadGuard<'_, SchedulingReadModel>> {
-        let wait = &crate::manager::telemetry::metrics().store_read_model_lock_wait_seconds;
+        let wait = &crate::telemetry::metrics().store_read_model_lock_wait_seconds;
         match self.read_model.try_read() {
             Ok(guard) => {
                 wait.observe(&["read"], 0.0);
@@ -3698,7 +3697,7 @@ impl Store {
     }
 
     fn read_model_writer(&self) -> R<std::sync::RwLockWriteGuard<'_, SchedulingReadModel>> {
-        let wait = &crate::manager::telemetry::metrics().store_read_model_lock_wait_seconds;
+        let wait = &crate::telemetry::metrics().store_read_model_lock_wait_seconds;
         match self.read_model.try_write() {
             Ok(guard) => {
                 wait.observe(&["write"], 0.0);
@@ -3936,7 +3935,7 @@ impl Store {
                 }
             }
         }
-        crate::manager::telemetry::metrics()
+        crate::telemetry::metrics()
             .scheduler_index_maintenance_seconds
             .observe(started.elapsed().as_secs_f64());
     }
@@ -4408,7 +4407,7 @@ impl Store {
         }
 
         if !drifted.is_empty() {
-            crate::manager::telemetry::metrics()
+            crate::telemetry::metrics()
                 .read_model_drift_repaired_total
                 .inc_by(&["delta"], drifted.len() as u64);
             warn!(
@@ -4753,7 +4752,7 @@ impl Store {
             (candidates, guard.nodes_epoch)
         };
         let built = Arc::new(AvailableNodes::new(candidates));
-        crate::manager::telemetry::metrics()
+        crate::telemetry::metrics()
             .scheduler_node_list_rebuilds_total
             .inc();
         Ok(self
@@ -6093,7 +6092,7 @@ impl Store {
                 duration_ms = tx_started.elapsed().as_millis() as u64,
                 "Rejected plan submission: {reason}"
             );
-            crate::manager::telemetry::metrics()
+            crate::telemetry::metrics()
                 .plan_apply_total
                 .inc(&["rejected"]);
             // A race that was LOST. The adaptive-concurrency controller's
@@ -6611,7 +6610,7 @@ impl Store {
             "Applied plan submission transaction"
         );
 
-        let metrics = crate::manager::telemetry::metrics();
+        let metrics = crate::telemetry::metrics();
         for rank in &candidate_ranks {
             metrics.scheduler_plan_candidate_rank.observe(*rank as f64);
         }
@@ -6641,7 +6640,7 @@ impl Store {
             window.record_applied();
         }
         if !preempted.victims.is_empty() {
-            let metrics = crate::manager::telemetry::metrics();
+            let metrics = crate::telemetry::metrics();
             for (pool, band, namespace, count) in preempted.metric_rows {
                 metrics
                     .preemptions_total
@@ -7242,7 +7241,7 @@ impl Store {
         preemptor_band: Band,
         victims: &[crate::manager::scheduler::PlannedPreemption],
     ) {
-        crate::manager::telemetry::metrics()
+        crate::telemetry::metrics()
             .preemption_plans_total
             .inc(&["observe"]);
         if let Some(draft) =
@@ -7542,7 +7541,7 @@ impl Store {
                     Some(StorageError::KeyringLocked { .. }) => "locked",
                     _ => "corrupt",
                 };
-                crate::manager::telemetry::metrics()
+                crate::telemetry::metrics()
                     .kv_decrypt_failures_total
                     .inc(&[reason]);
                 Err(err)
@@ -8771,7 +8770,7 @@ impl Store {
                 node_id = %registered.id,
                 "Node re-registered after being marked lost; it is schedulable again"
             );
-            crate::manager::telemetry::metrics()
+            crate::telemetry::metrics()
                 .nodes_recovered_total
                 .inc(&["reregistration"]);
         }
@@ -9126,7 +9125,7 @@ impl Store {
                         // `marked_lost` minus this is the fleet's net loss;
                         // without it a fleet that dies and comes back reads
                         // as if nothing happened.
-                        crate::manager::telemetry::metrics()
+                        crate::telemetry::metrics()
                             .nodes_recovered_total
                             .inc(&["heartbeat"]);
                     }
@@ -9202,7 +9201,7 @@ impl Store {
                 "Nodes reported active and heartbeating but stored as unavailable; returned \
                  them to the scheduling pool"
             );
-            crate::manager::telemetry::metrics()
+            crate::telemetry::metrics()
                 .nodes_recovered_total
                 .inc_by(&["reconcile"], revive.len() as u64);
         }
@@ -19564,9 +19563,7 @@ impl Store {
 
         let pending = Self::pending_eval_count_tx(&conn)?;
         drop(conn);
-        crate::manager::telemetry::metrics()
-            .eval_queue_depth
-            .set(pending);
+        crate::telemetry::metrics().eval_queue_depth.set(pending);
 
         if updated > 0 && !capture::in_capture() {
             // Recovery moved work from in_flight->pending; wake one worker
@@ -20419,7 +20416,7 @@ impl Store {
         // the claim path resets the gauge from an exact or rate-limited
         // count, so `+1` keeps it moving in between (a racing pair of
         // enqueues can lose one; the next claim corrects it).
-        let depth = &crate::manager::telemetry::metrics().eval_queue_depth;
+        let depth = &crate::telemetry::metrics().eval_queue_depth;
         depth.set(depth.get() + 1);
 
         if delay.is_zero() && !capture::in_capture() {

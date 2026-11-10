@@ -2774,9 +2774,9 @@ where
         let _ = client.shutdown().await;
         return None;
     };
-    let server_name = match crate::worker::netd::tls::server_name(
-        &crate::manager::mesh_ca::node_dns_name(&endpoint.node_id),
-    ) {
+    let server_name = match crate::worker::netd::tls::server_name(&crate::mesh_ca::node_dns_name(
+        &endpoint.node_id,
+    )) {
         Ok(name) => name,
         Err(err) => {
             debug!(error = %err, "Mesh endpoint node name is not a valid server name");

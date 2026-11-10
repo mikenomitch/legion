@@ -4,7 +4,7 @@
 //! report each check. Runs locally; no manager is involved.
 
 use super::{exec, verify, CaError, CaView};
-use crate::manager::mesh_ca::{generate_csr, CsrSubject, LeafSpec, ManagerCertKind};
+use crate::mesh_ca::{generate_csr, CsrSubject, LeafSpec, ManagerCertKind};
 use crate::prelude::*;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -252,9 +252,7 @@ fn hostile_csr() -> R<String> {
     let mut params = CertificateParams::default();
     params.subject_alt_names = vec![
         SanType::DnsName(Ia5String::try_from(MANAGER_SERVER_NAME.to_string())?),
-        SanType::URI(Ia5String::try_from(crate::manager::mesh_ca::manager_uri(
-            "evil",
-        ))?),
+        SanType::URI(Ia5String::try_from(crate::mesh_ca::manager_uri("evil"))?),
     ];
     Ok(params.serialize_request(&key)?.pem()?)
 }

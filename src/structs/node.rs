@@ -259,7 +259,7 @@ const STRUCTURAL_NODE_ATTRS: &[&str] = &[
     "workerAddress",
     "publicAddress",
     "heartbeatSeconds",
-    // crate::manager::worker_plane::WORKER_FLEET_ATTR
+    // crate::structs::worker_protocol::WORKER_FLEET_ATTR
     "workerFleet",
     "hostGuard",
     "netKernel",
@@ -347,22 +347,6 @@ pub fn check_join_attributes<'a>(
 mod node_test {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn structural_attrs_match_the_constants_they_mirror_test() {
-        for key in [
-            crate::constraints::NODE_NAMESPACES_ATTR,
-            crate::resources::CAPACITY_ATTR,
-            crate::manager::worker_plane::WORKER_FLEET_ATTR,
-            crate::worker::netd::kernel_guard::NODE_ATTR,
-            crate::worker::netd::kernel::NODE_ATTR,
-            crate::task_plugins::sandbox_addr::BRIDGES_ATTR,
-            crate::task_plugins::runtime_class::NODE_ATTR,
-            crate::task_plugins::IDMAPPED_MOUNTS_ATTR,
-        ] {
-            assert!(is_structural_node_attr(key), "{key}");
-        }
-    }
 
     #[test]
     fn join_attributes_keep_reserved_keys_for_the_token_test() {

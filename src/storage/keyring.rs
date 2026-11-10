@@ -74,7 +74,7 @@ pub const PROVIDER_EXEC: &str = "exec";
 
 /// Count one root key provider call for `legion_keyring_provider_calls_total`.
 fn count_provider_call(op: &str, ok: bool) {
-    crate::manager::telemetry::metrics()
+    crate::telemetry::metrics()
         .keyring_provider_calls_total
         .inc(&[op, if ok { "ok" } else { "error" }]);
 }

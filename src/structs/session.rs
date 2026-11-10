@@ -778,30 +778,6 @@ mod session_test {
     }
 
     #[test]
-    fn a_jobspec_normalizes_at_parse_and_again_to_itself_test() -> R<()> {
-        let spec = json!({
-            "name": "agents",
-            "task": {
-                "name": "workspace",
-                "runtime": "exec",
-                "config": { "command": ["sleep", "600"] },
-                "resources": { "cpu": 500, "memory": 512 },
-                "stateful": {
-                    "mode": "session",
-                    "envelope": { "resources": { "cpu": 30000, "memory": 61440 } },
-                },
-            },
-        });
-        let config: JobConfig = serde_json::from_value(spec)?;
-        assert_eq!(config.tasks.len(), 2);
-        crate::task_plugins::validate_job_config(&config)?;
-        let mut again = config.clone();
-        normalize_session_tasks(&mut again)?;
-        assert_eq!(again, config);
-        Ok(())
-    }
-
-    #[test]
     fn the_envelope_name_and_runtime_are_reserved_test() {
         let mut config = job(vec![
             session_task(),

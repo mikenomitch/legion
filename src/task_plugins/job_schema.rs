@@ -4,7 +4,7 @@
 //! A manager adds the keys installed apps declare at their extension points
 //! (`crate::structs::extensions::add_keys_to_schema`).
 
-use crate::task_plugins::builtin_task_plugin_schemas;
+use super::builtin_task_plugin_schemas;
 use serde_json::{json, Value};
 
 /// Assemble the jobspec JSON Schema: a documented top-level envelope plus the

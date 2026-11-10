@@ -581,6 +581,24 @@ pub fn status_fields_schema() -> Value {
     })
 }
 
+/// Fill the kinds' `schema` and `status.schema` into the bundled
+/// autoscaler's evaluated manifest (`BundledManifest::generated`), from the
+/// types the parser reads.
+pub fn fill_manifest_kinds(manifest: &mut Value) {
+    let Some(kinds) = manifest.get_mut("kinds").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for kind in kinds {
+        let schema = match kind.get("name").and_then(Value::as_str) {
+            Some(SCALING_POLICY_KIND) => scaling_policy_schema(),
+            Some(NODE_GROUP_KIND) => node_group_schema(),
+            _ => continue,
+        };
+        kind["schema"] = schema;
+        kind["status"] = serde_json::json!({ "schema": status_fields_schema() });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,7 +807,7 @@ mod tests {
             serde_json::from_str(&rendered).expect("JSON")
         };
         let config = file("autoscaler-app-config.ncl");
-        let manifest = crate::apps::bundled_manifest("autoscaler").expect("bundled");
+        let manifest = crate::bundled_apps::bundled_manifest("autoscaler").expect("bundled");
         crate::structs::app::validate_app_config(manifest, &config).expect("valid app config");
         let catalog = PluginCatalog::from_app_config(&config).expect("a catalog");
 

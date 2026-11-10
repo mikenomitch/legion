@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use rusqlite::Connection;
 
-use super::DeviceName;
+use crate::devices::DeviceName;
 use crate::prelude::*;
 use crate::storage::errors::StorageError;
 use crate::storage::namespace_policy_store::{
@@ -57,7 +57,7 @@ impl JobDeviceCharge {
 /// The device counts a task's resources ask for, by request name.
 fn task_devices(resources: &serde_json::Value) -> DeviceCounts {
     let mut counts = DeviceCounts::new();
-    for spec in super::request_specs(resources).unwrap_or_default() {
+    for spec in crate::devices::request_specs(resources).unwrap_or_default() {
         *counts.entry(spec.name).or_default() += f64::from(spec.count);
     }
     counts
@@ -183,7 +183,7 @@ pub fn job_device_charges_on(conn: &Connection) -> R<BTreeMap<String, JobDeviceC
             .live
             .entry(band)
             .or_default();
-        for (_, assignment) in super::assignments(&resources) {
+        for (_, assignment) in crate::devices::assignments(&resources) {
             *held.entry(assignment.device).or_default() += assignment.ids.len() as f64;
         }
     }

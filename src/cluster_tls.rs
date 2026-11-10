@@ -1,6 +1,6 @@
 //! TLS for Legion's own planes, all anchored in the cluster CA.
 //!
-//! One CA per cluster (`net_mesh_ca`, see `crate::manager::mesh_ca`) signs
+//! One CA per cluster (`net_mesh_ca`, see `crate::mesh_ca`) signs
 //! every certificate Legion's processes present to each other. A
 //! certificate's *role* is carried in its subject alternative names and is
 //! checked on every connection, so "signed by our CA" is never enough on its
@@ -1235,12 +1235,12 @@ mod cluster_tls_test {
 
     #[test]
     fn pins_are_sha256_of_the_der_test() -> R<()> {
-        let (ca_pem, _) = crate::manager::mesh_ca::generate_ca()?;
+        let (ca_pem, _) = crate::mesh_ca::generate_ca()?;
         let pin = ca_pin_pem(&ca_pem)?;
         assert!(pin.starts_with("sha256:"));
         assert_eq!(pin.len(), "sha256:".len() + 64);
         assert!(bundle_contains_pin(&ca_pem, &pin)?);
-        let (other, _) = crate::manager::mesh_ca::generate_ca()?;
+        let (other, _) = crate::mesh_ca::generate_ca()?;
         assert!(!bundle_contains_pin(&other, &pin)?);
         assert!(bundle_contains_pin(&format!("{other}{ca_pem}"), &pin)?);
         assert!(short_pin(&pin).ends_with("..."));
@@ -1272,12 +1272,12 @@ mod cluster_tls_test {
     /// A manager's cluster server certificate from a fresh CA, and the CA's
     /// pin.
     fn manager_server_key() -> R<(Arc<CertifiedKey>, String)> {
-        let (ca_pem, ca_key) = crate::manager::mesh_ca::generate_ca()?;
-        let (cert, key, _) = crate::manager::mesh_ca::issue_manager_cert(
+        let (ca_pem, ca_key) = crate::mesh_ca::generate_ca()?;
+        let (cert, key, _) = crate::mesh_ca::issue_manager_cert(
             &ca_pem,
             &ca_key,
             "m1",
-            crate::manager::mesh_ca::ManagerCertKind::Server,
+            crate::mesh_ca::ManagerCertKind::Server,
         )?;
         Ok((
             certified_key(&format!("{cert}{ca_pem}"), &key)?,

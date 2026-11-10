@@ -21,7 +21,7 @@
 //! node content store's index, so a caller can name where each part lives.
 //!
 //! The store is opened through the object-storage layer
-//! ([`crate::storage::objects`]), which parses `contentStore.url`, resolves
+//! ([`crate::objects`]), which parses `contentStore.url`, resolves
 //! the credential, and serves both `s3://` buckets and `file://` directories
 //! behind one `ObjectStore`; every client of a `contentStore` (this
 //! publisher, the session manifests, the manager's archive reads, and a
@@ -54,7 +54,6 @@ use std::sync::Arc;
 use object_store::path::Path as ObjectPath;
 use object_store::prefix::PrefixStore;
 use object_store::ObjectStore;
-use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::artifacts::{AnonymousCredentials, Credential, CredentialSource};
@@ -64,8 +63,8 @@ use crate::checkpoint_chunks::{
 };
 use crate::checkpoint_seal::{ChunkKey, PartKey, OBJECT_PREFIX};
 use crate::content_store::{ContentDigest, ContentStore};
+use crate::objects::{self, ObjectCredential, OpenOptions, StoreUrl};
 use crate::prelude::*;
-use crate::storage::objects::{self, ObjectCredential, OpenOptions, StoreUrl};
 
 /// What one publish did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,48 +120,7 @@ pub trait ContentPublisher: Send + Sync {
     fn put_document(&self, object_name: &str, bytes: &[u8]) -> R<String>;
 }
 
-/// Worker config `contentStore.auth`. Absent means the node's ambient
-/// credentials (for S3: the `AWS_*` key variables, web identity, an ECS task
-/// role, then the instance profile), which is how a region's workers usually
-/// reach their own region's bucket.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ContentStoreAuth {
-    /// KV path holding an AWS credential object, the same shape artifact
-    /// `auth.kv` reads (docs/artifacts.md, "Credential shapes").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kv: Option<String>,
-    /// Accepted so the plan's surface parses, then refused with a hint: an
-    /// S3 upload needs an AWS credential, and exchanging a node identity
-    /// token for one (STS) is not wired yet.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_identity: Option<serde_json::Value>,
-}
-
-/// Worker config `contentStore` block (docs/artifacts.md, "Publishing
-/// content").
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ContentStoreTarget {
-    /// `s3://bucket/optional/prefix` or `file:///shared/dir`.
-    pub url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<ContentStoreAuth>,
-    /// The size published parts are cut into (`"1MiB"` when unset): each
-    /// distinct non-zero chunk is one object, so a repeat checkpoint
-    /// uploads only the chunks that changed (docs/suspend-and-resume.md,
-    /// "How published parts are stored"). 64 KiB to 16 MiB, a multiple of
-    /// 4 KiB.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_size: Option<String>,
-    /// How long chunks are shared between publishes (`"24h"` when unset).
-    /// A chunk is reused only by publishes in the window it was uploaded
-    /// in, so a bucket lifecycle rule that expires `sealed/` objects older
-    /// than the longest-lived checkpoint plus this window never removes a
-    /// chunk a checkpoint still needs. At least 1m.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dedup_window: Option<String>,
-}
+pub use crate::structs::config::{ContentStoreAuth, ContentStoreTarget};
 
 /// The node attribute a worker advertises its `contentStore.url` under (the
 /// URL only, never its `auth`), so the scheduler can send a published
@@ -181,9 +139,67 @@ pub fn node_store_covers(node_store_url: &str, url: &str) -> bool {
     .contains_url(url)
 }
 
-impl ContentStoreTarget {
+/// What a `contentStore` block does: validation, credentials, and opening
+/// the store. The block itself is a config type
+/// ([`crate::structs::config::ContentStoreTarget`]); its behavior needs the
+/// object-store client, so it is a trait here.
+pub trait ContentStoreTargetExt {
     /// `chunkSize` and `dedupWindow`, parsed and checked.
-    pub fn chunk_settings(&self) -> R<ChunkSettings> {
+    fn chunk_settings(&self) -> R<ChunkSettings>;
+
+    /// Admission-time validation, run when the manager loads the worker
+    /// config so a typo fails at startup instead of at the first publish.
+    fn validate(&self) -> R<StoreUrl>;
+
+    /// How every client of a `contentStore` opens it — the publisher, the
+    /// session manifests, and the manager's archive reads: the node's own
+    /// environment supplies the region and the other `AWS_*` settings.
+    /// Session manifests ask for conditional puts.
+    fn open_options(conditional_put: bool) -> OpenOptions;
+
+    /// The KV path `auth.kv` names, if any.
+    fn kv(&self) -> Option<&str>;
+
+    /// The credential a client of this store signs with: the AWS credential
+    /// at `auth.kv` (resolved now, so a rotated credential is picked up on
+    /// the next open), the node's ambient chain when there is no `auth`, and
+    /// none for a `file://` store.
+    fn object_credential(&self, credentials: &dyn CredentialSource) -> R<ObjectCredential>;
+
+    /// Open this store, signing with [`Self::object_credential`].
+    fn open(
+        &self,
+        credentials: &dyn CredentialSource,
+        conditional_put: bool,
+    ) -> R<Arc<dyn ObjectStore>>;
+
+    /// Build the publisher. `credentials` resolves `auth.kv` at publish time.
+    fn publisher(&self, credentials: Arc<dyn CredentialSource>) -> R<Arc<dyn ContentPublisher>>;
+
+    /// Whether `url` names an object in this store: the same scheme, bucket
+    /// (or directory root), and `endpoint`, under the store's prefix. A
+    /// restoring node fetches such a URL with [`Self::read_credential`]
+    /// rather than anonymously. A sibling prefix (`content-old/` beside
+    /// `content/`) or another endpoint serving the same bucket name is not
+    /// this store, so the store's credential is never sent there.
+    fn contains_url(&self, url: &str) -> bool;
+
+    /// The credential an object in this store is read with by the `s3://`
+    /// artifact fetcher: the AWS credential at `auth.kv` (resolved now, so a
+    /// rotated credential is picked up as the publisher picks it up), the
+    /// node's ambient chain when there is no `auth`, and none for a
+    /// `file://` store. A KV credential that names no region is read in the
+    /// node's environment region, the region the publisher signs for: the
+    /// fetcher's own default, a fixed `us-east-1`, is for jobspec artifacts.
+    fn read_credential(
+        &self,
+        credentials: &dyn CredentialSource,
+        redacted_source: &str,
+    ) -> R<Option<Credential>>;
+}
+
+impl ContentStoreTargetExt for ContentStoreTarget {
+    fn chunk_settings(&self) -> R<ChunkSettings> {
         let chunk_size = match self.chunk_size.as_deref() {
             None => DEF_CHUNK_SIZE,
             Some(raw) => {
@@ -218,9 +234,7 @@ impl ContentStoreTarget {
         })
     }
 
-    /// Admission-time validation, run when the manager loads the worker
-    /// config so a typo fails at startup instead of at the first publish.
-    pub fn validate(&self) -> R<StoreUrl> {
+    fn validate(&self) -> R<StoreUrl> {
         let url = StoreUrl::parse(&self.url)
             .with_context(|| format!("invalid contentStore.url {:?}", self.url))?;
         self.chunk_settings()?;
@@ -246,27 +260,18 @@ impl ContentStoreTarget {
         Ok(url)
     }
 
-    /// How every client of a `contentStore` opens it — the publisher, the
-    /// session manifests, and the manager's archive reads: the node's own
-    /// environment supplies the region and the other `AWS_*` settings.
-    /// Session manifests ask for conditional puts.
-    pub fn open_options(conditional_put: bool) -> OpenOptions {
+    fn open_options(conditional_put: bool) -> OpenOptions {
         OpenOptions {
             conditional_put,
             ..OpenOptions::default()
         }
     }
 
-    /// The KV path `auth.kv` names, if any.
-    pub fn kv(&self) -> Option<&str> {
+    fn kv(&self) -> Option<&str> {
         self.auth.as_ref().and_then(|auth| auth.kv.as_deref())
     }
 
-    /// The credential a client of this store signs with: the AWS credential
-    /// at `auth.kv` (resolved now, so a rotated credential is picked up on
-    /// the next open), the node's ambient chain when there is no `auth`, and
-    /// none for a `file://` store.
-    pub fn object_credential(&self, credentials: &dyn CredentialSource) -> R<ObjectCredential> {
+    fn object_credential(&self, credentials: &dyn CredentialSource) -> R<ObjectCredential> {
         let url = self.validate()?;
         if url.local_root().is_some() {
             return Ok(ObjectCredential::Anonymous);
@@ -285,8 +290,7 @@ impl ContentStoreTarget {
         }
     }
 
-    /// Open this store, signing with [`Self::object_credential`].
-    pub fn open(
+    fn open(
         &self,
         credentials: &dyn CredentialSource,
         conditional_put: bool,
@@ -298,11 +302,7 @@ impl ContentStoreTarget {
         )
     }
 
-    /// Build the publisher. `credentials` resolves `auth.kv` at publish time.
-    pub fn publisher(
-        &self,
-        credentials: Arc<dyn CredentialSource>,
-    ) -> R<Arc<dyn ContentPublisher>> {
+    fn publisher(&self, credentials: Arc<dyn CredentialSource>) -> R<Arc<dyn ContentPublisher>> {
         Ok(Arc::new(StorePublisher {
             root: self.validate()?,
             target: self.clone(),
@@ -310,27 +310,14 @@ impl ContentStoreTarget {
         }))
     }
 
-    /// Whether `url` names an object in this store: the same scheme, bucket
-    /// (or directory root), and `endpoint`, under the store's prefix. A
-    /// restoring node fetches such a URL with [`Self::read_credential`]
-    /// rather than anonymously. A sibling prefix (`content-old/` beside
-    /// `content/`) or another endpoint serving the same bucket name is not
-    /// this store, so the store's credential is never sent there.
-    pub fn contains_url(&self, url: &str) -> bool {
+    fn contains_url(&self, url: &str) -> bool {
         match (self.validate(), StoreUrl::parse(url)) {
             (Ok(store), Ok(url)) => store.covers(&url),
             _ => false,
         }
     }
 
-    /// The credential an object in this store is read with by the `s3://`
-    /// artifact fetcher: the AWS credential at `auth.kv` (resolved now, so a
-    /// rotated credential is picked up as the publisher picks it up), the
-    /// node's ambient chain when there is no `auth`, and none for a
-    /// `file://` store. A KV credential that names no region is read in the
-    /// node's environment region, the region the publisher signs for: the
-    /// fetcher's own default, a fixed `us-east-1`, is for jobspec artifacts.
-    pub fn read_credential(
+    fn read_credential(
         &self,
         credentials: &dyn CredentialSource,
         redacted_source: &str,

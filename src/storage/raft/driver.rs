@@ -2151,7 +2151,7 @@ fn execute_batch(
     // Engine metrics label: the raft GROUP the ops commit through
     // (docs/metrics.md, Raft).
     let metric_lane = ctx.group.wire_name();
-    let telemetry = crate::manager::telemetry::metrics();
+    let telemetry = crate::telemetry::metrics();
     let reject_all = |items: Vec<BatchItem>,
                       outcome: &'static str,
                       error: &dyn Fn(&'static str) -> anyhow::Error|
@@ -2477,7 +2477,7 @@ fn check_members_can_apply(raft: &Raft, pool: &ChannelPool, op: &str, changeset:
 /// callers are still served in submission order.
 fn pipeline_loop(ctx: PipelineContext, jobs: std_mpsc::Receiver<PipelineJob>) {
     let group_label = ctx.group.wire_name();
-    let telemetry = crate::manager::telemetry::metrics();
+    let telemetry = crate::telemetry::metrics();
     // The last term in which this node's state machine was confirmed caught
     // up on every earlier term (see `execute_batch`).
     let mut caught_up_term: Option<u64> = None;
@@ -2582,7 +2582,7 @@ const LOG_RETENTION_POLL: Duration = Duration::from_secs(2);
 /// replication of the entries it removes. The scan runs on the blocking pool
 /// on its own read-only connection to the log, so appends never wait on it.
 async fn log_retention_loop(lane: Lane, raft: Raft, log: RaftLogStore, retain_bytes: u64) {
-    let telemetry = crate::manager::telemetry::metrics();
+    let telemetry = crate::telemetry::metrics();
     // The snapshot index this task last purged behind: one scan per new
     // snapshot, not per poll.
     let mut handled_snapshot: Option<u64> = None;
@@ -4178,12 +4178,10 @@ impl PersistenceDriver for MultiRaftDriver {
                 let barrier_store = engine_store.clone();
                 let barrier: crate::storage::raft::log_store::PurgeBarrier = Arc::new(move || {
                     let synced = barrier_store.sync_state_db_to_disk();
-                    crate::manager::telemetry::metrics()
-                        .raft_state_syncs_total
-                        .inc(&[
-                            lane.wire_name(),
-                            if synced.is_ok() { "ok" } else { "error" },
-                        ]);
+                    crate::telemetry::metrics().raft_state_syncs_total.inc(&[
+                        lane.wire_name(),
+                        if synced.is_ok() { "ok" } else { "error" },
+                    ]);
                     synced
                 });
                 let log_store = RaftLogStore::open(&data_dir, lane)?.with_purge_barrier(barrier);
@@ -4536,7 +4534,7 @@ impl PersistenceDriver for MultiRaftDriver {
                 .get(&group)
                 .ok_or_else(|| anyhow!("no raft pipeline for lane {}", group.wire_name()))?;
             let (reply_tx, reply_rx) = std_mpsc::channel();
-            let telemetry = crate::manager::telemetry::metrics();
+            let telemetry = crate::telemetry::metrics();
             telemetry.raft_pipeline_depth.add(&[group.wire_name()], 1);
             sender
                 .send(PipelineJob {

@@ -14,7 +14,7 @@
 
 use super::{CaView, Issued, MAX_LIFETIME_SLACK, MAX_NOT_BEFORE_SKEW, MIN_LEAF_LIFETIME};
 use crate::cluster_tls::{ca_pin, short_pin};
-use crate::manager::mesh_ca::LeafSpec;
+use crate::mesh_ca::LeafSpec;
 use crate::storage::netpolicy_store::CaRotationPhase;
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::BTreeSet;

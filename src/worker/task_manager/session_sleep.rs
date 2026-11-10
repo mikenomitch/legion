@@ -477,7 +477,7 @@ impl WorkerTaskManager {
         if let Some(checkpoint) = row.checkpoint.as_ref() {
             self.release_session_checkpoint(checkpoint);
         }
-        crate::manager::telemetry::worker_metrics()
+        crate::telemetry::worker_metrics()
             .session_evictions_total
             .inc(&[eviction_label(reason)]);
         if row.store && !row.published_url.is_empty() {
@@ -1143,7 +1143,7 @@ pub fn run_checkpoint_round(
         for session_id in &round.skipped {
             guard.reschedule_session_checkpoint(session_id, every[session_id], now_ms);
         }
-        crate::manager::telemetry::worker_metrics()
+        crate::telemetry::worker_metrics()
             .session_checkpoints_skipped_total
             .add(round.skipped.len() as u64);
         warn!(

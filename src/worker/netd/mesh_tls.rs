@@ -391,7 +391,7 @@ impl MeshTls {
 #[cfg(test)]
 mod mesh_tls_test {
     use super::*;
-    use crate::manager::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
+    use crate::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
     use crate::worker::netd::tls::server_name;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};

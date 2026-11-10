@@ -15,7 +15,7 @@
 // Helpers return `tonic::Status` as the RPCs do (see the allow in src/lib.rs).
 #![allow(clippy::result_large_err)]
 
-use legion::structs::EvalExt;
+use legion::manager::eval::EvalExt;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -23,8 +23,8 @@ use legion::cluster_tls::{
     certified_key, server_config, tls_incoming, ClusterClientVerifier, SwappableIdentity,
     SwappableRoots,
 };
-use legion::manager::mesh_ca::{generate_csr, sign_csr, CsrSubject};
 use legion::manager::server::ManagerDaemonService;
+use legion::mesh_ca::{generate_csr, sign_csr, CsrSubject};
 use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;
 use legion::storage::store::Store;

@@ -95,7 +95,7 @@ impl Store {
             }
         }
         self.events().job_gang_member_lost(lost, cause, &loss);
-        crate::manager::telemetry::metrics()
+        crate::telemetry::metrics()
             .gang_outcomes_total
             .inc(&[loss.action.as_str()]);
         info!(

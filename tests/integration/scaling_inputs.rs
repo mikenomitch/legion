@@ -12,7 +12,7 @@
 //! unit-tested in `src/manager/scaling_inputs.rs`.
 
 use crate::support::cluster_gate;
-use legion::structs::EvalExt;
+use legion::manager::eval::EvalExt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

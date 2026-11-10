@@ -18,7 +18,6 @@
 //! heartbeat handler and the liveness tick both hold. Under `single` topology
 //! and on a one-manager cluster the peer/digest half never engages at all.
 
-use crate::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
@@ -45,33 +44,7 @@ struct PeerObservation {
     claimed: HashSet<String>,
 }
 
-/// Resolved `liveness` config block (`docs/node-liveness.md`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LivenessSettings {
-    /// Mark nothing lost for this long after becoming responsible.
-    pub failover_grace: Duration,
-    /// How often a non-leading manager reports what it heard to the leader.
-    pub digest_interval: Duration,
-    /// How long the leader keeps trusting a silent peer's last digest.
-    pub peer_digest_grace: Duration,
-    /// How often the leader replicates a display checkpoint. `None` = off.
-    pub checkpoint_interval: Option<Duration>,
-    /// Accumulation window for the heartbeat group commit. Zero (the default)
-    /// is today's commit-while-you-can batching.
-    pub batch_window: Duration,
-}
-
-impl Default for LivenessSettings {
-    fn default() -> Self {
-        Self {
-            failover_grace: Duration::from_secs(DEF_LIVENESS_FAILOVER_GRACE_SEC),
-            digest_interval: Duration::from_secs(DEF_LIVENESS_DIGEST_INTERVAL_SEC),
-            peer_digest_grace: Duration::from_secs(DEF_LIVENESS_PEER_DIGEST_GRACE_SEC),
-            checkpoint_interval: Some(Duration::from_secs(DEF_LIVENESS_CHECKPOINT_INTERVAL_SEC)),
-            batch_window: Duration::ZERO,
-        }
-    }
-}
+pub use crate::structs::config::LivenessSettings;
 
 #[derive(Debug, Default)]
 struct TableState {

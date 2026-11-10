@@ -26,16 +26,11 @@
 //!   manager restart or failover): ignore it and answer `resync`, and the
 //!   worker sends a full report on its next heartbeat.
 
+pub use crate::structs::worker_protocol::MIN_ADVERTISED_BYTES;
 use crate::structs::{ContentLocation, ContentLocationReport, SnapshotBudget};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
-
-/// Only content at least this large is advertised. Small blobs download in
-/// well under a heartbeat, so steering placement for them buys nothing and
-/// costs index memory. Workers filter before sending, and the manager filters
-/// again so a misbehaving worker cannot flood the index.
-pub const MIN_ADVERTISED_BYTES: u64 = 1024 * 1024;
 
 /// A node silent this long is dropped from the index. Matches the usage
 /// table's staleness window: twelve missed report intervals. A node that

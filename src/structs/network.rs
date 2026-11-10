@@ -645,14 +645,19 @@ pub fn normalize_balance(name: &str) -> String {
 }
 
 /// Canonical load-balancing strategy names accepted by
-/// `connect.upstreams[].balance`.
+/// `connect.upstreams[].balance`, in the order the error message lists them.
 ///
-/// Derived from the worker's balancer registry
-/// (`crate::worker::balance::BALANCERS`) rather than repeated here: validation
-/// must accept exactly the strategies this build can actually run, and a second
-/// list is a second thing to forget when adding one.
+/// The implementations are the worker's balancer registry
+/// (`worker::balance::BALANCERS`), which this crate cannot see: validation
+/// lives below the datapath. A test beside the registry fails when the two
+/// lists differ, so a strategy cannot be accepted without an implementation
+/// or implemented without being accepted.
+pub const BALANCE_STRATEGIES: &[&str] =
+    &["least_latency", "round_robin", "least_conn", "local_first"];
+
+/// [`BALANCE_STRATEGIES`], as a list.
 pub fn balance_strategies() -> Vec<&'static str> {
-    crate::worker::balance::balancer_names()
+    BALANCE_STRATEGIES.to_vec()
 }
 
 /// Whether `name` (already normalized) is a known strategy.
@@ -2553,9 +2558,9 @@ pub fn normalize_task_connect(task_name: &str, connect: &mut Option<ConnectConfi
         if template.source.trim().is_empty() {
             bail!("{what}: source is required");
         }
-        crate::worker::templates::validate_source(&template.source)
+        super::template_syntax::validate_source(&template.source)
             .map_err(|err| anyhow::anyhow!("{what}: {err}"))?;
-        for key in crate::worker::templates::referenced_upstreams(&template.source) {
+        for key in super::template_syntax::referenced_upstreams(&template.source) {
             if !declared.contains(&key) {
                 bail!(
                     "{what}: refers to upstream {key:?}, which this task does not declare in \

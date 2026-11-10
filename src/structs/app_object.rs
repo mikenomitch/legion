@@ -2400,22 +2400,6 @@ mod app_object_tests {
         assert_eq!(reserved_noun("Repo"), None);
     }
 
-    /// Every top-level CLI command is a reserved noun, so a kind never reads
-    /// like a command (calls entry 20).
-    #[test]
-    fn every_top_level_command_is_reserved_test() {
-        for command in crate::cmd::cli().get_subcommands() {
-            let name = command.get_name();
-            if name == "help" {
-                continue;
-            }
-            assert!(
-                reserved_noun(name).is_some(),
-                "`legion {name}` is not in RESERVED_KIND_NOUNS"
-            );
-        }
-    }
-
     #[test]
     fn declarations_are_checked_test() {
         assert!(validate_kind_decls(&[decl("Repo")]).is_ok());

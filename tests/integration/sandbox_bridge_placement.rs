@@ -4,9 +4,9 @@
 //! whose worker config gives that bridge an address pool
 //! (docs/task-runtime-sandbox.md, "Addressing").
 
+use legion::manager::eval::EvalExt;
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
-use legion::structs::EvalExt;
 use legion::structs::{config::ManagerConfigFull, job::JobConfig, Node, NodeMsg, Submission};
 use serde_json::Value;
 

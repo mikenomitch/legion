@@ -47,8 +47,8 @@ use crate::prelude::*;
 use crate::storage::app_store::{AppJobAllocations, AppJobVersion};
 use crate::structs::app::{
     app_name_of_job, decide_build_marker, render_app_job, AppGrant, AppReconcileState, AppRecord,
-    AppSettings, AppSource, BuildMarker, ManagedBy, NodeBuild, Placement, RenderContext,
-    RenderedApp, BOOTSTRAP_PRINCIPAL, BUILD_ID_ATTR, BUILD_VERSION_ATTR,
+    AppSettings, BuildMarker, ManagedBy, NodeBuild, Placement, RenderContext, RenderedApp,
+    BOOTSTRAP_PRINCIPAL, BUILD_ID_ATTR, BUILD_VERSION_ATTR,
 };
 use crate::structs::config::AppSeedConfig;
 use crate::structs::namespace::SYSTEM_NAMESPACE;
@@ -56,6 +56,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+pub use crate::bundled_apps::seed_record;
 
 /// The backstop: a full pass this often, in case an event was missed.
 pub const FULL_PASS_INTERVAL: Duration = Duration::from_secs(60);
@@ -371,89 +373,6 @@ pub fn derive_status(
     }
 }
 
-/// The record a bundled app is seeded with: its manifest's defaults, enabled
-/// as its [`crate::apps::BundledApp::seed_enabled`] says, the manager
-/// config's `apps.<name>` overrides, and its permissions granted by
-/// `legion:bootstrap` (calls entry 17).
-pub fn seed_record(
-    manifest: &crate::structs::app::AppManifest,
-    seed: Option<&AppSeedConfig>,
-) -> AppRecord {
-    let now = now_rfc3339();
-    let mut settings = AppSettings::from_manifest(manifest);
-    let mut config = manifest.default_config();
-    // A bundled app says whether it starts on: the autoscaler does, the
-    // ingress (which takes ports 80 and 443) waits for `legion app enable`.
-    let default_enabled = crate::apps::seeds_enabled(&manifest.name);
-    let mut enabled = default_enabled;
-    if let Some(seed) = seed {
-        enabled = seed.enabled.unwrap_or(default_enabled);
-        if let Some(placement) = &seed.placement {
-            match Placement::parse(placement) {
-                Ok(placement) => settings.placement = placement,
-                Err(err) => {
-                    warn!(app = %manifest.name, "apps.{}.placement: {err}; using the manifest's", manifest.name)
-                }
-            }
-        }
-        if let Some(replicas) = seed.replicas {
-            let candidate = AppSettings {
-                replicas,
-                ..settings.clone()
-            };
-            match candidate.validate() {
-                Ok(()) => settings = candidate,
-                Err(err) => {
-                    warn!(app = %manifest.name, "apps.{}.replicas: {err}; using the manifest's", manifest.name)
-                }
-            }
-        }
-        if let Some(pool) = &seed.pool {
-            let candidate = AppSettings {
-                pool: Some(pool.trim().to_string()),
-                ..settings.clone()
-            };
-            match candidate.validate() {
-                Ok(()) => settings = candidate,
-                Err(err) => {
-                    warn!(app = %manifest.name, "apps.{}.pool: {err}; using the default pool", manifest.name)
-                }
-            }
-        }
-        if let Some(seed_config) = &seed.config {
-            match crate::structs::app::validate_app_config(manifest, seed_config) {
-                Ok(()) => config = seed_config.clone(),
-                Err(err) => warn!(
-                    app = %manifest.name,
-                    "apps.{}.config does not match the app's config schema ({err}); seeding its default config",
-                    manifest.name
-                ),
-            }
-        }
-    }
-    AppRecord {
-        name: manifest.name.clone(),
-        source: AppSource::Bundled,
-        source_ref: String::new(),
-        manifest_digest: manifest.digest(),
-        enabled,
-        settings,
-        config,
-        grant: AppGrant {
-            rules: manifest.permissions.clone(),
-            granted_by: BOOTSTRAP_PRINCIPAL.to_string(),
-            granted_at: now.clone(),
-        },
-        installed_by: BOOTSTRAP_PRINCIPAL.to_string(),
-        installed_at: now.clone(),
-        updated_at: now,
-        state: AppReconcileState::default(),
-        manifest: manifest.clone(),
-        // The store assigns it when the record is inserted.
-        uid: 0,
-    }
-}
-
 /// Seed a record for every bundled app that has none (apps plan §6.3,
 /// "Seeding"). The manager config's `apps` block is read only here: a
 /// bundled app that already has a record keeps it, and the block is logged
@@ -474,9 +393,9 @@ fn seed_bundled_apps_noting(
     build: &BuildMarker,
     note: bool,
 ) -> R<Vec<String>> {
-    let manifests = crate::apps::bundled_manifests()?;
+    let manifests = crate::bundled_apps::bundled_manifests()?;
     for name in seed.keys().filter(|_| note) {
-        if !crate::apps::is_bundled(name) {
+        if !crate::bundled_apps::is_bundled(name) {
             warn!(
                 app = %name,
                 "The manager config's apps.{name} names no app bundled with this build; ignoring it"
@@ -701,7 +620,7 @@ impl AppReconciler {
         if marker.version != self.settings.own_build.version {
             return Ok(Adoption::Kept);
         }
-        let Some(embedded) = crate::apps::bundled_manifest(&record.name) else {
+        let Some(embedded) = crate::bundled_apps::bundled_manifest(&record.name) else {
             return Ok(Adoption::Kept);
         };
         let digest = embedded.digest();
@@ -1233,8 +1152,11 @@ impl Pending {
         // A node joining, leaving, or re-registering on a new build can
         // move a bundled app's marker.
         if kind.starts_with("node.") {
-            self.apps
-                .extend(crate::apps::BUNDLED.iter().map(|app| app.name.to_string()));
+            self.apps.extend(
+                crate::bundled_apps::MANIFESTS
+                    .iter()
+                    .map(|app| app.name.to_string()),
+            );
         }
     }
 }
@@ -1446,7 +1368,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failing_submit_backs_off() -> R<()> {
         let (mut reconciler, store) = reconciler_over_a_store()?;
-        let manifest = crate::apps::bundled_manifest("autoscaler").context("bundled")?;
+        let manifest = crate::bundled_apps::bundled_manifest("autoscaler").context("bundled")?;
         let record = seed_record(manifest, None);
         store.seed_app(record.clone())?;
         let unavailable = tonic::Status::unavailable("the store is busy");
@@ -1510,7 +1432,7 @@ mod tests {
     /// adversarial review, M1 and M2).
     #[test]
     fn status_reflects_the_version_that_runs() {
-        let manifest = crate::apps::bundled_manifest("autoscaler").expect("bundled");
+        let manifest = crate::bundled_apps::bundled_manifest("autoscaler").expect("bundled");
         let record = seed_record(manifest, None);
         let version = |status: &str| AppJobVersion {
             status: status.into(),
@@ -1579,7 +1501,7 @@ mod tests {
     /// healthy (per-node plan §6.3, calls entry 3).
     #[test]
     fn a_per_node_app_wants_what_the_scheduler_placed() {
-        let manifest = crate::apps::bundled_manifest("ingress").expect("bundled");
+        let manifest = crate::bundled_apps::bundled_manifest("ingress").expect("bundled");
         let mut record = seed_record(manifest, None);
         assert_eq!(
             record.settings.replicas,
@@ -1629,7 +1551,7 @@ mod tests {
     #[test]
     fn the_seed_takes_per_node_and_a_pool() {
         use crate::structs::app::{Placement, Replicas};
-        let manifest = crate::apps::bundled_manifest("autoscaler").expect("bundled");
+        let manifest = crate::bundled_apps::bundled_manifest("autoscaler").expect("bundled");
         let seed = AppSeedConfig {
             enabled: Some(true),
             placement: Some("workers".into()),

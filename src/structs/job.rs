@@ -889,6 +889,65 @@ pub struct RolloutConfig {
     pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
+/// The cumulative fraction of a group each step of `config` replaces, ending
+/// at 1.0: `percentEachStep = 25` is `[0.25, 0.5, 0.75, 1.0]`. With no step
+/// mode set the rollout is one step.
+pub fn step_fractions_for_rollout(config: &RolloutConfig, base_count: u32) -> Vec<f64> {
+    if base_count == 0 {
+        return vec![1.0];
+    }
+
+    let mut steps = Vec::new();
+    if let Some(percent_each) = config.percent_each_step {
+        let mut current = percent_each;
+        while current < 100 {
+            steps.push((current as f64) / 100.0);
+            current = current.saturating_add(percent_each);
+        }
+        steps.push(1.0);
+    } else if let Some(count_each) = config.count_each_step {
+        let mut current = count_each;
+        while current < base_count {
+            steps.push((current as f64) / (base_count as f64));
+            current = current.saturating_add(count_each);
+        }
+        steps.push(1.0);
+    } else if let Some(percent_steps) = config.percent_steps.as_ref() {
+        for step in percent_steps {
+            steps.push((*step as f64) / 100.0);
+        }
+    } else if let Some(count_steps) = config.count_steps.as_ref() {
+        let mut cumulative = 0_u32;
+        for step in count_steps {
+            cumulative = cumulative.saturating_add(*step).min(base_count);
+            steps.push((cumulative as f64) / (base_count as f64));
+        }
+        if cumulative < base_count {
+            steps.push(1.0);
+        }
+    } else {
+        steps.push(1.0);
+    }
+
+    let mut deduped = Vec::new();
+    for step in steps {
+        let clamped = step.clamp(0.0, 1.0);
+        if deduped
+            .last()
+            .copied()
+            .is_none_or(|previous: f64| (previous - clamped).abs() > f64::EPSILON)
+        {
+            deduped.push(clamped);
+        }
+    }
+
+    if deduped.last().copied() != Some(1.0) {
+        deduped.push(1.0);
+    }
+
+    deduped
+}
+
 impl RolloutConfig {
     fn step_mode_count(&self) -> usize {
         usize::from(self.percent_each_step.is_some())
@@ -6499,7 +6558,7 @@ mod unknown_fields_test {
                 &rendered,
                 crate::structs::spec_fields::UnknownFieldMode::Reject,
                 crate::structs::spec_fields::ExtensionCheck::Installed(
-                    crate::apps::bundled_extension_registry(),
+                    crate::bundled_apps::bundled_extension_registry(),
                 ),
             )
             .unwrap_or_else(|err| panic!("{} should parse: {err:#}", path.display()));

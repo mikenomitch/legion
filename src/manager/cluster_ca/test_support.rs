@@ -2,7 +2,7 @@
 //! like an organization's PKI, CA files on disk, and an `exec` helper that
 //! signs for real by re-running the test binary (calls entry 15).
 
-use crate::manager::mesh_ca::{CaSigner, LeafRole, LeafSpec};
+use crate::mesh_ca::{CaSigner, LeafRole, LeafSpec};
 use crate::prelude::*;
 use crate::storage::store::Store;
 use rcgen::{

@@ -15,7 +15,7 @@
 //! here: there is no GPU and no runc in CI (docs/devices.md, "What has been
 //! verified").
 
-use legion::structs::EvalExt;
+use legion::manager::eval::EvalExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

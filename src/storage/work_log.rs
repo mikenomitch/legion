@@ -47,6 +47,7 @@
 //! count toward the digest: the heartbeat reply's full set is still the
 //! record, so a lost push costs a heartbeat interval, nothing more.
 
+pub use crate::structs::worker_protocol::WorkDigest;
 use crate::structs::{
     CheckpointRequest, StopNotice, StreamWorkReply, TaskAllocation, WorkStreamState,
 };
@@ -57,48 +58,6 @@ use std::sync::{Arc, Mutex};
 /// resync instead of replaying. A worker acks every message it applies, so
 /// the window only fills while a stream is down or the worker is stuck.
 const MAX_UNACKED: usize = 256;
-
-/// The order-independent digest of a set of allocation ids:
-/// `<count>:<xor of splitmix64(id)>` in lowercase hex. Both sides update it
-/// per id, so neither has to walk the set to compare.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WorkDigest {
-    count: u64,
-    xor: u64,
-}
-
-impl WorkDigest {
-    fn mix(id: i64) -> u64 {
-        // splitmix64: a cheap, well-distributed bijection, so distinct id sets
-        // collide only by accident of the xor.
-        let mut z = (id as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    pub fn insert(&mut self, id: i64) {
-        self.count += 1;
-        self.xor ^= Self::mix(id);
-    }
-
-    pub fn remove(&mut self, id: i64) {
-        self.count = self.count.saturating_sub(1);
-        self.xor ^= Self::mix(id);
-    }
-
-    pub fn of(ids: impl IntoIterator<Item = i64>) -> Self {
-        let mut digest = Self::default();
-        for id in ids {
-            digest.insert(id);
-        }
-        digest
-    }
-
-    pub fn render(&self) -> String {
-        format!("{:x}:{:x}", self.count, self.xor)
-    }
-}
 
 /// What the next message for a node must contain, taken from its log for
 /// the materializer ([`WorkLog::take_pending`]).

@@ -308,7 +308,7 @@ fn config_attrs_for(
     // Every node in this process is served by one listener with one fleet
     // certificate; the manager verifies the fleet's name for all of them.
     attrs.insert(
-        crate::manager::worker_plane::WORKER_FLEET_ATTR.into(),
+        crate::structs::worker_protocol::WORKER_FLEET_ATTR.into(),
         Value::String(fleet.into()),
     );
     // The cadence contract is SHARED with the real worker, not forked: a sim
@@ -664,7 +664,7 @@ impl SimFleet {
             .reported_allocations
             .fetch_add(delta, Ordering::Relaxed)
             + delta;
-        crate::manager::telemetry::worker_metrics()
+        crate::telemetry::worker_metrics()
             .allocations_running
             .set(total);
     }
@@ -685,7 +685,7 @@ impl SimFleet {
             .map(|node| node.reported_acked.load(Ordering::Relaxed) as i64)
             .sum();
         self.reported_allocations.store(reported, Ordering::Relaxed);
-        let metrics = crate::manager::telemetry::worker_metrics();
+        let metrics = crate::telemetry::worker_metrics();
         metrics.allocations_running.set(reported);
         metrics
             .simulated_nodes
@@ -1072,7 +1072,7 @@ pub async fn launch_simulated_fleet(
     // fleet itself (docs/metrics.md § Worker). Started before the
     // registration ramp so a scrape during ramp-up shows the climb.
     start_worker_telemetry();
-    let metrics = crate::manager::telemetry::worker_metrics();
+    let metrics = crate::telemetry::worker_metrics();
     metrics.simulated_nodes_target.set(opts.count as i64);
     metrics.simulated_nodes.set(0);
 
@@ -1218,7 +1218,7 @@ async fn run_sim_node(
             Ok(()) => {
                 node.registered.store(true, Ordering::Relaxed);
                 let registered = fleet.registered.fetch_add(1, Ordering::Relaxed) + 1;
-                crate::manager::telemetry::worker_metrics()
+                crate::telemetry::worker_metrics()
                     .simulated_nodes
                     .set(registered as i64);
                 break;
@@ -1293,7 +1293,7 @@ async fn run_sim_node(
         // `legion_worker_heartbeat*` families whichever fleet produced it.
         let tick_started = Instant::now();
         let tick_result = heartbeat_sim_node(&client, &node, &fleet, ready_after).await;
-        let metrics = crate::manager::telemetry::worker_metrics();
+        let metrics = crate::telemetry::worker_metrics();
         metrics
             .heartbeat_duration_seconds
             .observe(tick_started.elapsed().as_secs_f64());
@@ -1366,7 +1366,7 @@ async fn register_sim_node(
     fleet: &SimFleet,
 ) -> R<()> {
     let outcome = register_sim_node_inner(client, node, fleet).await;
-    crate::manager::telemetry::worker_metrics()
+    crate::telemetry::worker_metrics()
         .simulated_registrations_total
         .inc(&[if outcome.is_ok() { "ok" } else { "error" }]);
     outcome

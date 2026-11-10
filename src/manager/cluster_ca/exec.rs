@@ -22,7 +22,7 @@
 //! on a heartbeat.
 
 use super::{verify, CaError, CaView, ClusterCaProvider};
-use crate::manager::mesh_ca::LeafSpec;
+use crate::mesh_ca::LeafSpec;
 use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::config::CLUSTER_CA_EXEC;

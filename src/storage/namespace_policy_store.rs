@@ -333,7 +333,7 @@ pub(crate) fn enforce_admission_on(
         }
     }
     // Device caps (`quota.<band>.devices`), charged the same way.
-    crate::devices::quota::enforce_on(conn, &governing, config, namespace)?;
+    crate::storage::device_quota::enforce_on(conn, &governing, config, namespace)?;
     Ok(())
 }
 

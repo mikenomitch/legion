@@ -1,7 +1,7 @@
+use legion::manager::eval::EvalExt;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, Value, R};
 use legion::storage::store::Store;
-use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, manager_server::Manager, AdvanceRolloutRequest, AllocationHealth,
     Eval, NodeMsg, RunJobRequest, Submission,

@@ -4,9 +4,9 @@
 //! `127.0.0.53` and an ingress twin for every declared port, inside its
 //! namespace: the port's `to`, or the advertised number itself.
 
+use legion::manager::eval::EvalExt;
 use legion::prelude::{json, Context, R};
 use legion::storage::store::Store;
-use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, AllocNetwork, Node, NodeMsg, Submission,
 };

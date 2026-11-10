@@ -649,7 +649,7 @@ impl ManagerDaemonService {
     ) -> Result<Response<GetJobSchemaReply>, Status> {
         self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let registry = self.extension_registry()?;
-        let mut schema = crate::structs::job_schema::core_jobspec_schema();
+        let mut schema = crate::task_plugins::job_schema::core_jobspec_schema();
         crate::structs::extensions::add_keys_to_schema(&mut schema, &registry);
         schema["$comment"] = json!(format!(
             "This cluster's jobspec schema: the core fields, and {} key(s) installed apps add.",

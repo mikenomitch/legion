@@ -1,5 +1,7 @@
+use crate::content_publish::ContentStoreTargetExt;
 use crate::manager::blocked::PlacementBlocked;
 use crate::manager::concurrency::{is_planning_kind, PlannerPermit};
+use crate::manager::eval::EvalExt;
 use crate::manager::oidc_http::OidcHttpLayer;
 use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
@@ -7,7 +9,7 @@ use crate::prelude::*;
 use crate::storage::events::drafts;
 use crate::storage::store::{ClaimScope, EvalBatchLimits, EvalCompletion, Store};
 use crate::structs::{
-    manager_server::ManagerServer, Eval, EvalExt, JobConfig, KvValueType, ManagerConfig, NodeMsg,
+    manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, NodeMsg,
     Submission, TaskConfig, TlsConfigFull, WorkerConfig as WorkerConfigMsg, WorkerConfigAlt,
     MANAGER_ROLE_ATTR, MANAGER_ROLE_VALUE, SYSTEM_WORKER_TYPE,
 };

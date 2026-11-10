@@ -18,7 +18,7 @@
 //! keeps the last good CA signing and reports the problem.
 
 use super::{verify, CaError, CaView, ClusterCaProvider};
-use crate::manager::mesh_ca::{generate_csr, CaSigner, CsrSubject, LeafSpec};
+use crate::mesh_ca::{generate_csr, CaSigner, CsrSubject, LeafSpec};
 use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::config::CLUSTER_CA_FILE;

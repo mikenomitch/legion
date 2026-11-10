@@ -29,7 +29,7 @@
 //! is dropped and reopened with no position, which gets a full resync.
 
 use crate::prelude::*;
-use crate::storage::work_log::WorkDigest;
+use crate::structs::worker_protocol::WorkDigest;
 use crate::structs::{
     manager_client::ManagerClient, stream_work_request, CheckpointRequest, StopNotice,
     StreamWorkAck, StreamWorkOpen, StreamWorkReply, StreamWorkRequest, TaskAllocation,

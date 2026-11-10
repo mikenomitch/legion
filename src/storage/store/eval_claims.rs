@@ -200,7 +200,7 @@ impl Store {
         if unclaimed == 0 {
             drop(claims);
             if exact {
-                crate::manager::telemetry::metrics().eval_queue_depth.set(0);
+                crate::telemetry::metrics().eval_queue_depth.set(0);
             }
             return Ok((Vec::new(), epoch));
         }
@@ -255,7 +255,7 @@ impl Store {
         // The gauge: exact when the capped count was, otherwise a full count
         // at most once per interval, outside the claims mutex.
         if exact {
-            crate::manager::telemetry::metrics()
+            crate::telemetry::metrics()
                 .eval_queue_depth
                 .set((pending - held_after as i64).max(0));
         } else {
@@ -295,7 +295,7 @@ impl Store {
         }
         QUEUE_DEPTH_REFRESHED_AT_MS.store(now_ms, Ordering::Relaxed);
         let pending = Self::pending_eval_count_tx(conn)?;
-        crate::manager::telemetry::metrics()
+        crate::telemetry::metrics()
             .eval_queue_depth
             .set((pending - held as i64).max(0));
         Ok(())

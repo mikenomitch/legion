@@ -30,12 +30,11 @@ use crate::cluster_tls::{
     SwappableRoots,
 };
 use crate::manager::cluster_ca::CaView;
-use crate::manager::mesh_ca::{
-    fleet_dns_name, node_dns_name, ManagerCertKind, NODE_CERT_REFRESH_AFTER,
-};
+use crate::mesh_ca::{fleet_dns_name, node_dns_name, ManagerCertKind, NODE_CERT_REFRESH_AFTER};
 use crate::prelude::*;
 use crate::storage::store::Store;
 use crate::structs::worker_client::WorkerClient;
+pub use crate::structs::worker_protocol::{ERROR_CODE_METADATA, OVERLOADED, WORKER_FLEET_ATTR};
 use crate::structs::Node;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
@@ -53,10 +52,6 @@ const CURRENT_CA_TTL: Duration = Duration::from_secs(1);
 /// The worker protocol version that serves the mTLS worker plane and
 /// advertises a reachable `https://` address. Managers dial nothing older.
 pub const MIN_WORKER_PLANE_PROTOCOL: u64 = 3;
-
-/// The node config attribute the simulator sets so the manager verifies its
-/// shared fleet certificate instead of a per-node one.
-pub const WORKER_FLEET_ATTR: &str = "workerFleet";
 
 /// Where and how to reach one node's worker plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,17 +438,8 @@ impl WorkerPlane {
     }
 }
 
-/// The metadata key a status carries its stable error code in. The CLI and
-/// MCP error envelopes use it as `error.code` instead of the gRPC code name.
-pub const ERROR_CODE_METADATA: &str = "legion-error-code";
-
 /// The error code for "a manager could not reach this worker".
 pub const WORKER_UNREACHABLE: &str = "WORKER_UNREACHABLE";
-
-/// The error code for "this node is shedding edge starts": its window of
-/// unratified edge claims stayed full (docs/edge-boot.md, "Overload").
-/// Carried on a retryable `RESOURCE_EXHAUSTED`.
-pub const OVERLOADED: &str = "OVERLOADED";
 
 /// The node attribute (in its dynamic attributes) a probe's outcome lands
 /// in.

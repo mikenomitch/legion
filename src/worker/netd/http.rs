@@ -1832,9 +1832,9 @@ async fn open(
             .context
             .mesh_connector()
             .ok_or_else(|| AttemptError::Connect("no mesh certificate yet".into()))?;
-        let server_name = crate::worker::netd::tls::server_name(
-            &crate::manager::mesh_ca::node_dns_name(&endpoint.node_id),
-        )
+        let server_name = crate::worker::netd::tls::server_name(&crate::mesh_ca::node_dns_name(
+            &endpoint.node_id,
+        ))
         .map_err(|err| AttemptError::Connect(err.to_string()))?;
         let mut tls = connector
             .connect(server_name, stream)
@@ -2856,7 +2856,7 @@ mod integration {
     /// this node is used in plaintext.
     #[tokio::test]
     async fn proxy_hand_offs_cross_nodes_only_over_the_mesh_test() {
-        use crate::manager::mesh_ca::{generate_ca, issue_node_cert};
+        use crate::mesh_ca::{generate_ca, issue_node_cert};
         use crate::worker::balance::Endpoint;
         use crate::worker::forwarder::PortTermination;
         use crate::worker::netd::ingress::{IngressListeners, IngressSpec, TaskDial};

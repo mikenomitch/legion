@@ -6,12 +6,12 @@
 //! RPC surface (ACLs disabled).
 
 use anyhow::anyhow;
+use legion::manager::eval::EvalExt;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::events::SchedulerEventFilter;
 use legion::storage::store::Store;
 use legion::structs::manager_server::Manager;
-use legion::structs::EvalExt;
 use legion::structs::{
     config::ManagerConfigFull, job::JobConfig, job::TaskConfig, job::TaskCount, Eval, Node,
     NodeMsg, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, Submission,
