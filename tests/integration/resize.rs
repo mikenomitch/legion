@@ -791,14 +791,24 @@ async fn a_running_allocation_converges_to_its_committed_size_test() -> R<()> {
     assert_eq!(committed.outcome, "applied", "{}", committed.message);
     assert_eq!(cluster.running_size(web).cpu, Some(1000.0));
 
-    // The node's next heartbeat reconciles against the desired set.
-    let desired = legion::manager::server::desired_allocations_for_test(cluster.store(), NODE)?;
-    let pending = cluster
-        .task_manager
-        .lock()
-        .expect("task manager")
-        .reconcile_allocations(&desired);
-    assert!(pending.is_empty(), "nothing is relaunched: {pending:?}");
+    // The node's next heartbeats reconcile against the desired set, which
+    // carries the committed size once the read model has it.
+    for _ in 0..100 {
+        let desired = legion::manager::server::desired_allocations_for_test(cluster.store(), NODE)?;
+        let pending = cluster
+            .task_manager
+            .lock()
+            .expect("task manager")
+            .reconcile_allocations(&desired);
+        assert!(
+            pending.iter().all(|payload| payload.allocation_id != web),
+            "a resized allocation is never relaunched"
+        );
+        if cluster.running_size(web).cpu == Some(3000.0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(cluster.running_size(web).cpu, Some(3000.0));
     assert_eq!(cluster.pid(web), pid_before);
     Ok(())
