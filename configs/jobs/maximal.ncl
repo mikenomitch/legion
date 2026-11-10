@@ -1123,6 +1123,27 @@
                 # here). Session tasks only.
                 # checkpointEvery = "10m",
             },
+            # One-shot runs (docs/session-runs.md): `legion session run
+            # maximal-demo --task scratch --file main.sh --input '{"n": 3}'`
+            # starts a fresh, single-use session of this task, stages the
+            # caller's files under /legion/run/ (on exec: the session's own
+            # run directory, also in LEGION_RUN_DIR), executes `command`
+            # once, returns stdout, stderr, the exit status, and
+            # /legion/run/result.json as `result`, and ends the session.
+            # Session tasks on the exec, container, or sandbox runtime only.
+            run = {
+                # The argv a run executes.
+                command = ["sh", "/legion/run/main.sh"],
+                # Deadline of one run (required; at most "24h"). A run past
+                # it is stopped and answered with stopped.reason = "wall".
+                wall = "30s",
+                # Most stdout plus stderr returned (default and maximum
+                # "1MiB"); the reply says `truncated` beyond it.
+                output = "256KiB",
+                # Whether a caller may replace `command` (--command); the
+                # caller also needs exec:write on the job. Default false.
+                allowCommand = false,
+            },
             # One session's size, in the envelope's units.
             resources = {
                 cpu = 250,

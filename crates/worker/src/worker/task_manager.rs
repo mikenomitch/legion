@@ -26,6 +26,7 @@ use std::path::PathBuf;
 
 /// Sessions sleeping on their node: suspend, resume, eviction, periodic and
 /// worker-stop checkpoints (session durability plan §6.6).
+pub mod session_runs;
 pub mod session_sleep;
 pub mod session_store;
 
@@ -962,6 +963,9 @@ pub struct WorkerTaskManager {
     /// without surviving a worker restart, and a warning says so).
     session_log: Option<crate::worker::session_log::SessionLog>,
     session_log_unavailable: bool,
+    /// Session runs in flight and the replies of finished ones
+    /// (docs/session-runs.md).
+    run_registry: Arc<session_runs::RunRegistry>,
     /// Sessions on this node that run nothing: suspended to a local
     /// checkpoint, or evicted and remembered for `suspend.keepFor`. Keyed by
     /// session id; mirrored in the session log.
@@ -1057,6 +1061,7 @@ impl WorkerTaskManager {
         let runtime_gate = Arc::new(crate::worker::runtime_state::RuntimeGate::beside(
             state_store.path(),
         ));
+        let run_registry = session_runs::RunRegistry::new(state_store.sessions_db_path());
         Self {
             devices: Arc::new(crate::devices::plugin::DeviceManager::default()),
             registry: TaskPluginRegistry::new(),
@@ -1122,6 +1127,7 @@ impl WorkerTaskManager {
             stage_waiters: HashMap::new(),
             session_log: None,
             session_log_unavailable: false,
+            run_registry,
             idle_sessions: HashMap::new(),
             session_specs: HashMap::new(),
             session_payloads: HashMap::new(),

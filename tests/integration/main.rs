@@ -112,6 +112,7 @@ mod scheduler_integration;
 mod scheduler_scale_benchmark;
 mod scheduling_index;
 mod session_integration;
+mod session_runs;
 mod snapshot_integration;
 mod spread_under_raft;
 mod suspend_integration;

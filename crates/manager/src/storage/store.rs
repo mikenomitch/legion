@@ -3749,7 +3749,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions, autoscale
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions, autoscale, run
             FROM task_config;
             "#,
         )?;
@@ -3770,6 +3770,7 @@ impl Store {
                 speculative_start: parse_json_column(29, row.get(29)?)?,
                 snapshots: parse_json_column(30, row.get(30)?)?,
                 suspend: parse_json_column(31, row.get(31)?)?,
+                run: parse_json_column(35, row.get(35)?)?,
                 gang: parse_json_column(32, row.get(32)?)?,
                 name: row.get(1)?,
                 runtime: row.get(2)?,
@@ -7881,6 +7882,7 @@ impl Store {
             gang: parse_json_column(33, row.get(33)?)?,
             pending_extensions: parse_json_column(34, row.get(34)?)?.unwrap_or_default(),
             autoscale: parse_json_column(35, row.get(35)?)?,
+            run: parse_json_column(36, row.get(36)?)?,
         };
 
         Ok(task_config)
@@ -11716,6 +11718,7 @@ impl Store {
                 .transpose()?;
             let suspend = t.suspend.as_ref().map(serde_json::to_string).transpose()?;
             let gang = t.gang.as_ref().map(serde_json::to_string).transpose()?;
+            let run = t.run.as_ref().map(serde_json::to_string).transpose()?;
             let pending_extensions = if t.pending_extensions.is_empty() {
                 None
             } else {
@@ -11763,6 +11766,7 @@ impl Store {
                 ":gang": gang,
                 ":pending_extensions": pending_extensions,
                 ":autoscale": autoscale,
+                ":run": run,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;

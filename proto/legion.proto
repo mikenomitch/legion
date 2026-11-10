@@ -1289,6 +1289,54 @@ service Manager {
   //   the job has more than one session task and `task_name` is empty.
   rpc ListSessionNodes (ListSessionNodesRequest) returns (ListSessionNodesReply);
 
+  // Runs once in a fresh, single-use session of a session task and returns
+  // the outcome (docs/session-runs.md): the session router picks a node
+  // with envelope room exactly as it does for an unnamed session start,
+  // and that node starts the session, stages the caller's `files` and
+  // `input` under the run directory, executes the task's `run.command`
+  // once under `run.wall`, collects stdout, stderr, the exit status,
+  // `result.json`, and the files named in `get`, ends the session, and
+  // answers. Nothing is written to the replicated store, and the session
+  // is ended on every path, including a failure in any step.
+  //
+  // A command that ran is a successful call, whatever it exited with: the
+  // reply carries `exit`. A run stopped by a limit is also a successful
+  // call, with `stopped` set and no `exit`. Only a run that could not start
+  // or could not finish is an error.
+  //
+  // Idempotency is per node. With `idempotency_key`, the node derives the
+  // run's id from the key and keeps the reply for 10 minutes, so a retry
+  // that reaches the same node is answered from it (`deduplicated`) without
+  // running again, and a retry that arrives while the first is still
+  // running waits for it. A manager remembers which node it sent a key to
+  // for the same 10 minutes, and `node_id` pins a retry sent through
+  // another manager. A retry that lands on another node runs again.
+  //
+  // ACL: `job:write` on the job runs the task's own `run.command`. A
+  // request that sets `command` also needs `exec:write` on the job, the
+  // permission `ExecAllocation` needs, and `run.allowCommand = true` on the
+  // task.
+  //
+  // Errors:
+  // - InvalidArgument: no `job_id`; a file or `get` path outside the run
+  //   directory; `input` that is not JSON; more than 3 MiB staged.
+  // - NotFound: no such job, or `node_id` names no node.
+  // - PermissionDenied: `command` without `exec:write` ("--command needs
+  //   exec:write on job <job> (running the task's own run.command needs
+  //   only job:write)").
+  // - FailedPrecondition: `task_name` names no session task of the job (or
+  //   is empty and the job has several); the task has no `run` block; the
+  //   task does not allow `command`; no node holds an envelope for the
+  //   task; the pinned node holds none.
+  // - ResourceExhausted: every envelope is full. Retryable.
+  // - Unavailable: the task's runtime is disabled (`runtime_disabled`), the
+  //   node could not be reached, or the session was lost mid-run.
+  //   Retryable; with an idempotency key, a retry to the same node does
+  //   not run the command twice unless the first attempt never finished.
+  // - DeadlineExceeded: the session did not reach `running` within
+  //   `wait_timeout_seconds`. It is ended; nothing ran.
+  rpc RunSession (RunSessionRequest) returns (RunSessionResponse);
+
   // === SNAPSHOTS (see docs/suspend-and-resume.md) ===
 
   // Captures a point-in-time snapshot of an instance's running allocation.
@@ -14269,6 +14317,25 @@ service Worker {
   // Caller class: `manager`; anything else is refused with
   // `Unauthenticated`.
   rpc ResumeSession (ResumeSessionRequest) returns (ResumeSessionReply);
+
+  // Runs once in a fresh, single-use session of a session task on this
+  // node and returns the outcome: the edge form of `Manager.RunSession`,
+  // with no manager on the path and nothing written to raft (see that RPC
+  // for the steps, the reply, and idempotency; docs/session-runs.md).
+  //
+  // Caller classes: `ticket` (a session ticket for the job and task, in
+  // `ticket`) and `manager` (a manager's certificate, which routed a
+  // `Manager.RunSession` here after enforcing its ACL).
+  //
+  // A ticket runs the task's own `run.command`. `command` is refused for
+  // the ticket class with PermissionDenied: replacing the command needs
+  // `exec:write`, which only a manager can check.
+  //
+  // Errors: as `Manager.RunSession`, plus Unauthenticated for a missing or
+  // unverifiable ticket, and PermissionDenied when the ticket does not
+  // cover the job and task. ResourceExhausted (`envelope_full`,
+  // `no_envelope`, `overloaded`) is retryable on another node.
+  rpc RunSession (RunSessionRequest) returns (RunSessionResponse);
 }
 
 // Request payload for Worker.StartSession.
@@ -14351,6 +14418,181 @@ message StartSessionReply {
   // With `resume_id`, the node the session ran on before, when it moved
   // here. Empty otherwise.
   string moved_from = 7;
+}
+
+// Request payload for Manager.RunSession and Worker.RunSession: one run in
+// a fresh, single-use session (docs/session-runs.md).
+message RunSessionRequest {
+  // The job. Required for `Manager.RunSession`; for `Worker.RunSession`
+  // with a ticket it defaults to the ticket's job and must match it when
+  // set.
+  string job_id = 1;
+
+  // The session task to run in. May be empty when the job has exactly one
+  // session task with a `run` block (a ticket's task, for the ticket
+  // class).
+  string task_name = 2;
+
+  // Files staged in the run directory before the command runs. Together
+  // with `input`, at most 3 MiB.
+  repeated RunFile files = 3;
+
+  // A JSON document staged as `input.json` in the run directory; its path
+  // is in the command's `LEGION_RUN_INPUT`. Must parse as JSON.
+  optional string input = 4;
+
+  // Files to return after the command exits, named relative to the run
+  // directory (or absolute under `/legion/run/`). A file the command did
+  // not write is answered with `missing = true`. Together they return at
+  // most `run.output` bytes; a file that does not fit is `truncated`.
+  repeated string get = 5;
+
+  // Replaces the task's `run.command` for this run. Needs
+  // `run.allowCommand = true` on the task and `exec:write` on the job;
+  // refused for the ticket class.
+  repeated string command = 6;
+
+  // Optional idempotency key, per node (see `Manager.RunSession`). The
+  // reply is kept for 10 minutes.
+  optional string idempotency_key = 7;
+
+  // How long to wait for the session to reach `running` before giving up
+  // (default 60, at most 600). The command's own deadline is `run.wall`.
+  optional uint32 wait_timeout_seconds = 8;
+
+  // Answer which node would take the run and whether its envelope has
+  // room, without starting anything (`RunSessionResponse.dry_run`).
+  bool dry_run = 9;
+
+  // `Worker.RunSession`, ticket class: the session ticket.
+  string ticket = 10;
+
+  // `Manager.RunSession` only: run on this node rather than the one the
+  // router would pick. A retry of a call that named a node in its reply or
+  // error sets it, so an idempotency key finds the first attempt.
+  string node_id = 11;
+}
+
+// One file staged for a run.
+message RunFile {
+  // Where it goes, relative to the run directory (`main.py`,
+  // `data/in.csv`) or absolute under `/legion/run/`. No `..`.
+  string path = 1;
+
+  // Its bytes.
+  bytes content = 2;
+
+  // Make it executable (mode 0755 rather than 0644).
+  bool executable = 3;
+}
+
+// One file returned from a run (`RunSessionRequest.get`).
+message RunOutputFile {
+  // The path as the request named it.
+  string path = 1;
+
+  // Its bytes, cut at the remaining `run.output` budget.
+  bytes content = 2;
+
+  // True when the file was larger than the budget left.
+  bool truncated = 3;
+
+  // True when the command left no readable file at the path.
+  bool missing = 4;
+}
+
+// Why a run was stopped before its command exited by itself. A stopped run
+// is a successful call: the caller's code hit a limit, Legion did not fail.
+message RunStop {
+  // `wall` (the command outlived `run.wall`) or `session_ended` (the
+  // session was ended under the run: stopped by an operator, killed for
+  // memory, or its runtime exited).
+  string reason = 1;
+
+  // The limit that stopped it, as the jobspec wrote it (`"30s"`). Empty
+  // for `session_ended`.
+  string limit = 2;
+
+  // What happened, in a sentence.
+  string detail = 3;
+
+  // What to change.
+  string hint = 4;
+}
+
+// What a dry run answers (`RunSessionRequest.dry_run`).
+message RunDryRun {
+  // The node that would take the run.
+  string node_id = 1;
+
+  // Whether that node's envelope has room for one more session of the
+  // task right now.
+  bool has_room = 2;
+
+  // Why not, when `has_room` is false.
+  string reason = 3;
+
+  // The command the run would execute.
+  repeated string command = 4;
+
+  // `run.wall` and `run.output` as they would apply.
+  string wall = 5;
+  uint64 output_bytes = 6;
+}
+
+// Reply payload for Manager.RunSession and Worker.RunSession.
+message RunSessionResponse {
+  // The node the run happened on. Keep retries there.
+  string node_id = 1;
+
+  // The id of the run's session. It has ended by the time this arrives;
+  // the id is for correlating events and logs.
+  string session_id = 2;
+
+  // The task that ran.
+  string task_name = 3;
+
+  // The command's exit status. Unset when the run was stopped.
+  optional int32 exit = 4;
+
+  // The command's stdout and stderr, together at most `run.output` bytes.
+  bytes stdout = 5;
+  bytes stderr = 6;
+
+  // True when stdout or stderr was cut at `run.output`.
+  bool truncated = 7;
+
+  // The contents of `result.json` in the run directory, when the command
+  // wrote one that parses as JSON and fits `run.output`. Empty otherwise.
+  string result = 8;
+
+  // The files named in `get`, in request order.
+  repeated RunOutputFile files = 9;
+
+  // Wall-clock time the command ran, in milliseconds.
+  uint64 wall_ms = 10;
+
+  // CPU time the run's session used, in milliseconds, where the node
+  // meters it (resource enforcement on); 0 otherwise.
+  uint64 cpu_ms = 11;
+
+  // Set when the run was stopped by a limit rather than exiting.
+  RunStop stopped = 12;
+
+  // True when this reply was kept from an earlier call with the same
+  // idempotency key and nothing ran now.
+  //
+  // Also true for the loser of two concurrent requests carrying the
+  // same key (see "Idempotency keys" in docs/agent-readiness.md for
+  // what each operation hands the loser).
+  bool deduplicated = 13;
+
+  // Set for a dry run; every other field but `node_id` and `task_name` is
+  // then empty.
+  RunDryRun dry_run = 14;
+
+  // The run's id: derived from the idempotency key, or minted.
+  string run_id = 15;
 }
 
 // Request payload for Worker.StopSession.

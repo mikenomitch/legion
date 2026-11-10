@@ -1226,6 +1226,15 @@ async fn start_session_maintenance(
     let mut last_fence_list = std::time::Instant::now();
     loop {
         tokio::time::sleep(SESSION_MAINTENANCE_INTERVAL).await;
+        // A run's session outlives its driver only across a worker restart
+        // (docs/session-runs.md): end what the session log brought back.
+        {
+            let manager = task_manager.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::worker::task_manager::session_runs::end_orphaned_runs(&manager)
+            })
+            .await;
+        }
         let manifests = task_manager
             .lock()
             .expect("task manager")

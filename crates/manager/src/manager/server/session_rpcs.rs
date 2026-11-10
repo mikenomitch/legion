@@ -103,6 +103,142 @@ impl ManagerDaemonService {
         }))
     }
 
+    /// RunSession: one run in a fresh, single-use session
+    /// (docs/session-runs.md).
+    pub(super) async fn run_session_rpc(
+        &self,
+        request: Request<crate::structs::RunSessionRequest>,
+    ) -> Result<Response<crate::structs::RunSessionResponse>, Status> {
+        let ident = self.authenticate_acl(&request)?;
+        let mut request = request.into_inner();
+        if request.job_id.trim().is_empty() {
+            return Err(Status::invalid_argument("job_id is required"));
+        }
+        let scope = AclScope::job(&request.job_id);
+        acl::enforce(&ident, AclResource::Job, AclAction::Write, &scope)?;
+        if !request.command.is_empty() {
+            // An arbitrary command is an exec, and needs what exec needs.
+            acl::enforce(&ident, AclResource::Exec, AclAction::Write, &scope).map_err(
+                |status| {
+                    if status.code() == tonic::Code::PermissionDenied {
+                        Status::permission_denied(format!(
+                            "--command needs exec:write on job {} (running the task's own \
+                         run.command needs only job:write)",
+                            request.job_id
+                        ))
+                    } else {
+                        status
+                    }
+                },
+            )?;
+        }
+        let config = self
+            .store
+            .get_job_config(&request.job_id)
+            .map_err(|_| Status::not_found(format!("job {} not found", request.job_id)))?;
+        let session_tasks: Vec<&TaskConfig> = config
+            .tasks
+            .iter()
+            .filter(|task| crate::structs::session::is_session_task(task))
+            .collect();
+        let task = match request.task_name.as_str() {
+            "" => {
+                let runnable: Vec<&TaskConfig> = session_tasks
+                    .iter()
+                    .copied()
+                    .filter(|task| task.run.is_some())
+                    .collect();
+                match (runnable.as_slice(), session_tasks.as_slice()) {
+                    ([only], _) => *only,
+                    ([], [only]) => *only,
+                    ([], _) => {
+                        return Err(Status::failed_precondition(format!(
+                            "job {} has no session task with a run block; add one \
+                             (run = {{ command = [...], wall = \"30s\" }})",
+                            request.job_id
+                        )))
+                    }
+                    (several, _) => {
+                        return Err(Status::failed_precondition(format!(
+                            "job {} has {} session tasks that take runs; name one with --task \
+                             (task_name in the API)",
+                            request.job_id,
+                            several.len()
+                        )))
+                    }
+                }
+            }
+            name => session_tasks
+                .iter()
+                .find(|task| task.name == name)
+                .copied()
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "job {} has no session task {name}",
+                        request.job_id
+                    ))
+                })?,
+        };
+        let run = task
+            .run
+            .as_ref()
+            .ok_or_else(|| {
+                Status::failed_precondition(crate::structs::run::no_run_block(
+                    &request.job_id,
+                    &task.name,
+                ))
+            })?
+            .resolve()
+            .map_err(|err| Status::failed_precondition(format!("task {}: {err}", task.name)))?;
+        if !request.command.is_empty() {
+            if !run.allow_command {
+                return Err(Status::failed_precondition(
+                    crate::structs::run::command_not_allowed(&task.name),
+                ));
+            }
+            info!(
+                target: "exec_audit",
+                principal = %ident.principal,
+                accessor_id = ident.accessor_id.as_deref().unwrap_or("-"),
+                job_id = %request.job_id,
+                task = %task.name,
+                command = ?request.command,
+                dry_run = request.dry_run,
+                "session run with a caller's command"
+            );
+        }
+        // The key a node sees is scoped to the caller and the request, as
+        // every recorded idempotency key is: another caller's same key, or
+        // the same key on a different request, is a different run.
+        request.ticket.clear();
+        let scoped = scoped_idempotency_key(
+            &ident,
+            "run_session",
+            request.idempotency_key.as_deref(),
+            &(
+                &request.job_id,
+                &task.name,
+                &request.command,
+                &request.input,
+                &request.get,
+                request
+                    .files
+                    .iter()
+                    .map(|file| {
+                        use sha2::{Digest, Sha256};
+                        (&file.path, format!("{:x}", Sha256::digest(&file.content)))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        request.idempotency_key = (!scoped.is_empty()).then_some(scoped);
+        request.task_name = task.name.clone();
+        request.job_id = config.name.clone();
+        sessions::run(&self.store, &config, task, run.wall, request)
+            .await
+            .map(Response::new)
+    }
+
     /// CreateInstance without an id on a session task: start an unnamed
     /// session through the router. Writes nothing to the replicated store;
     /// an idempotency key derives the id instead of recording it.

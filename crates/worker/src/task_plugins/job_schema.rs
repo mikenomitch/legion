@@ -156,6 +156,32 @@ fn jobspec_schema_envelope() -> Value {
                             }
                         }
                     },
+                    "run": {
+                        "type": "object",
+                        "description": "Opts a session task (stateful.mode = \"session\") on the exec, container or sandbox runtime into one-shot runs: `legion session run` starts a fresh single-use session, stages the caller's files under /legion/run/, executes `command` once, returns its output, and ends the session. See docs/session-runs.md.",
+                        "required": ["command", "wall"],
+                        "properties": {
+                            "command": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "The argv a run executes. Name staged files under /legion/run/ (rewritten to the session's own run directory on exec)."
+                            },
+                            "wall": {
+                                "type": "string",
+                                "description": "Deadline of one run's command, e.g. \"30s\" or \"5m\". Required; at most 24h. A run past it is stopped and answered with stopped.reason = \"wall\"."
+                            },
+                            "output": {
+                                "type": "string",
+                                "default": "1MiB",
+                                "description": "Most stdout plus stderr returned, e.g. \"256KiB\". Maximum 1MiB; output beyond it is dropped and the reply says truncated."
+                            },
+                            "allowCommand": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Whether a caller may replace command (--command). The caller also needs exec:write on the job."
+                            }
+                        }
+                    },
                     "disruption": {
                         "type": "object",
                         "description": "Floor on how many of this task's allocations VOLUNTARY disruption (preemption) may leave running. Does not bind drain, node loss or job stop. See docs/preemption-and-eviction.md.",

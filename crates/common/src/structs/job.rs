@@ -2252,6 +2252,12 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub suspend: Option<crate::structs::suspend::SuspendConfig>,
+    /// Opts a session task into one-shot runs (`legion session run`, see
+    /// `docs/session-runs.md`): the command a run executes and its limits.
+    /// None = the task refuses runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[tabled(skip)]
+    pub run: Option<crate::structs::run::RunConfig>,
     /// Task autoscaling (docs/autoscaling.md): `true` for the effective
     /// defaults, or a sparse record overriding some of them. Stored exactly
     /// as written; the defaults it inherits (cluster, namespace policies)
@@ -2965,6 +2971,8 @@ struct TaskConfigInput {
     snapshots: Option<crate::structs::snapshot::SnapshotsConfig>,
     #[serde(default)]
     suspend: Option<crate::structs::suspend::SuspendConfig>,
+    #[serde(default)]
+    run: Option<crate::structs::run::RunConfig>,
     // Strict on its own (`deny_unknown_fields` on the record): a typo in an
     // autoscale record is an error even under `allow_unknown_fields`.
     #[serde(default)]
@@ -3012,6 +3020,7 @@ extension_point!(
         "speculativeStart",
         "snapshots",
         "suspend",
+        "run",
         "autoscale"
     ],
     |this, walk| {
@@ -3051,6 +3060,7 @@ extension_point!(
         walk.opt("speculativeStart", this.speculative_start.as_mut());
         walk.opt("snapshots", this.snapshots.as_mut());
         walk.opt("suspend", this.suspend.as_mut());
+        walk.opt("run", this.run.as_mut());
     }
 );
 
@@ -3202,6 +3212,7 @@ impl TaskConfigInput {
             speculative_start: self.speculative_start,
             snapshots: self.snapshots,
             suspend: self.suspend,
+            run: self.run,
             // `autoscale = false` is the same as leaving it out; store it so.
             autoscale: self.autoscale.filter(|spec| spec.is_enabled()),
             pending_extensions: self.pending_extensions,
@@ -3461,6 +3472,7 @@ impl TaskConfig {
             speculative_start: None,
             snapshots: None,
             suspend: None,
+            run: None,
             autoscale: None,
             name: name.into(),
             count: default_task_count(),
@@ -6676,6 +6688,7 @@ mod unknown_fields_test {
                     cover_opt(suspend.wake.as_ref(), "suspend.wake", &mut seen);
                     cover_opt(suspend.park.as_ref(), "suspend.park", &mut seen);
                 }
+                cover_opt(task.run.as_ref(), "run", &mut seen);
             }
         }
         // The examples really do exercise the nested blocks.

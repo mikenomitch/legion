@@ -167,6 +167,7 @@ pub const RPC_ACCESS: &[(&str, Access)] = &[
     ("GetInstance", Access::Protected("job", "read")),
     ("PromoteInstance", Access::Protected("job", "write")),
     ("ListSessionNodes", Access::Protected("job", "read")),
+    ("RunSession", Access::Protected("job", "write")),
     ("CreateSnapshot", Access::Protected("snapshot", "write")),
     ("ListSnapshots", Access::Protected("snapshot", "read")),
     ("GetSnapshot", Access::Protected("snapshot", "read")),

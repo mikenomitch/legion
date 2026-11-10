@@ -18,7 +18,7 @@
 //!
 //! By default only read-only / introspection tools are exposed. Mutating tools
 //! (`legion_job_run`, `legion_job_stop`, `legion_job_scale`, `legion_scaling_pause`,
-//! `legion_job_destroy`, `legion_instance_create`, `legion_instance_stop`,
+//! `legion_job_destroy`, `legion_instance_create`, `legion_session_run`, `legion_instance_stop`,
 //! `legion_instance_start`, `legion_instance_promote`,
 //! `legion_instance_destroy`) are gated behind `--allow-write`, mirroring the
 //! `read_only_safe` flag in the capabilities catalog. Even with
@@ -1492,6 +1492,43 @@ fn core_tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_session_run",
+            description: "Run code once in a fresh, single-use session of a session task that declares a `run` block (exec, container or sandbox runtime), in one call: the node starts the session, stages `files` and `input` under /legion/run/ (input as input.json, its path in LEGION_RUN_INPUT), executes the task's run.command once, and ends the session whatever happens. Returns stdout, stderr, exit, `result` (the JSON the command wrote to /legion/run/result.json, else null), the `get` files, wallMs and cpuMs. Read the reply's structure: `exit` set means your code ran (non-zero is your code failing); `stopped` set (reason wall|memory|session_ended, with a hint) means a limit stopped it and exit is null; an error envelope means Legion could not run it (RESOURCE_EXHAUSTED and UNAVAILABLE are retryable). Pass idempotency_key so a retry does not run the code twice, and keep retries on the node a reply or error named (node_id): idempotency is per node, with the reply kept 10 minutes. dry_run answers which node would take it and whether it has room. `command` replaces run.command and needs run.allowCommand plus exec:write. Mutating; needs job:write.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "The job." },
+                    "namespace": { "type": "string", "description": "Namespace of an unqualified job_id (default: default)." },
+                    "task": { "type": "string", "description": "The session task. Optional when the job has one that takes runs." },
+                    "files": {
+                        "type": "array",
+                        "description": "Files staged in the run directory before the command runs (with input, at most 3 MiB).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Relative to the run directory (main.py, data/in.csv), or absolute under /legion/run/." },
+                                "content": { "type": "string", "description": "The file's text." },
+                                "content_base64": { "type": "string", "description": "The file's bytes, base64, instead of content." },
+                                "executable": { "type": "boolean", "description": "Mode 0755 instead of 0644." }
+                            },
+                            "required": ["path"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "input": { "description": "Any JSON value, staged as input.json." },
+                    "get": { "type": "array", "items": { "type": "string" }, "description": "Files of the run directory to return after the command exits (together at most run.output bytes)." },
+                    "command": { "type": "array", "items": { "type": "string" }, "description": "Replace the task's run.command (needs run.allowCommand = true and exec:write)." },
+                    "idempotency_key": { "type": "string", "description": "Per-node retry key; the reply is kept 10 minutes." },
+                    "node_id": { "type": "string", "description": "Run on this node (a retry names the node the first attempt reported)." },
+                    "wait_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 600, "description": "How long to wait for the session to start (default 60)." },
+                    "dry_run": { "type": "boolean", "description": "Answer the node and its room; run nothing." }
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
             name: "legion_instance_promote",
             description: "Promote a running session (mode=session, durable=false) to a keyed instance in place: one raft entry writes its row and an allocation the node adopts it as, so nothing restarts. From then on it is listed exactly, rescheduled on node loss, and can be suspended or forked. new_id names it (refused when the task sets stateful.promote.onName = false); omit it to keep the session id. A repeat reports the same instance with deduplicated=true. Mutating.",
             input_schema: || json!({
@@ -2586,6 +2623,87 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     from_snapshot,
                 }))
                 .await
+            }
+        }
+        "legion_session_run" => {
+            use base64::Engine;
+            let job_id = job_arg(&args, "job_id")?;
+            let mut files = Vec::new();
+            for file in args
+                .get("files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let path = str_arg(file, "path")?;
+                let content = match (
+                    file.get("content").and_then(Value::as_str),
+                    file.get("content_base64").and_then(Value::as_str),
+                ) {
+                    (Some(_), Some(_)) => {
+                        return Err(format!(
+                            "file {path}: pass content or content_base64, not both"
+                        ))
+                    }
+                    (Some(text), None) => text.as_bytes().to_vec(),
+                    (None, Some(encoded)) => base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .map_err(|err| {
+                            format!("file {path}: content_base64 is not base64: {err}")
+                        })?,
+                    (None, None) => Vec::new(),
+                };
+                files.push(crate::structs::RunFile {
+                    path,
+                    content,
+                    executable: file
+                        .get("executable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                });
+            }
+            let strings = |key: &str| -> Vec<String> {
+                args.get(key)
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let request = crate::structs::RunSessionRequest {
+                job_id,
+                task_name: opt_str_arg(&args, "task").unwrap_or_default(),
+                files,
+                input: args
+                    .get("input")
+                    .filter(|value| !value.is_null())
+                    .map(Value::to_string),
+                get: strings("get"),
+                command: strings("command"),
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                wait_timeout_seconds: args
+                    .get("wait_timeout_seconds")
+                    .and_then(Value::as_u64)
+                    .map(|seconds| seconds as u32),
+                dry_run: args
+                    .get("dry_run")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                ticket: String::new(),
+                node_id: opt_str_arg(&args, "node_id").unwrap_or_default(),
+            };
+            let mut client = connect().await?;
+            match client.run_session(request).await {
+                Ok(reply) => Ok(crate::cmd::session::run_reply_json(&reply.into_inner())),
+                Err(status) => {
+                    let err = CliError::from_status("run failed", &status);
+                    Err(serde_json::to_string(&err)
+                        .unwrap_or_else(|_| status.message().to_string()))
+                }
             }
         }
         "legion_session_nodes" => {

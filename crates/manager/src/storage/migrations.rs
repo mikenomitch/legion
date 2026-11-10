@@ -2617,6 +2617,10 @@ fn migration_list() -> Vec<M<'static>> {
         );",
         )
         .down("DROP TABLE IF EXISTS runtime_state;"),
+        // Session runs (docs/session-runs.md): `task_config.run` is the
+        // jobspec `run` block as JSON (command, wall, output, allowCommand).
+        // NULL for every task without one, which refuses runs.
+        M::up("ALTER TABLE task_config ADD COLUMN run TEXT;").down(""),
     ]
 }
 

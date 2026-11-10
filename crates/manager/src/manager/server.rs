@@ -8505,6 +8505,16 @@ impl Manager for ManagerDaemonService {
         self.list_session_nodes_rpc(request).await
     }
 
+    #[instrument(err, skip_all, fields(job_id = %request.get_ref().job_id))]
+    async fn run_session(
+        &self,
+        request: Request<crate::structs::RunSessionRequest>,
+    ) -> Result<Response<crate::structs::RunSessionResponse>, Status> {
+        // ACL: `job:write` on the job, and `exec:write` when the request
+        // replaces the command; enforced in `run_session_rpc`.
+        self.run_session_rpc(request).await
+    }
+
     // === SNAPSHOTS (docs/suspend-and-resume.md) ===
     // The handlers live in `snapshot_rpcs`; each enforces `snapshot` ACLs
     // itself (coarse `AclScope::any()` first, the job scope after lookup).
@@ -17224,6 +17234,13 @@ mod tests {
             &self,
             _request: Request<crate::structs::StopSessionRequest>,
         ) -> Result<Response<crate::structs::StopSessionReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn run_session(
+            &self,
+            _request: Request<crate::structs::RunSessionRequest>,
+        ) -> Result<Response<crate::structs::RunSessionResponse>, Status> {
             Err(Status::unimplemented("not used in test"))
         }
 

@@ -2427,6 +2427,7 @@ dependencies = [
  "object_store",
  "oci-client",
  "portable-pty",
+ "prost",
  "rand 0.8.5",
  "rcgen",
  "regex",

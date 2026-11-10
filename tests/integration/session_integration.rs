@@ -340,6 +340,13 @@ impl Worker for FakeNode {
         Err(Status::unimplemented("fake node"))
     }
 
+    async fn run_session(
+        &self,
+        _request: Request<legion::structs::RunSessionRequest>,
+    ) -> Result<Response<legion::structs::RunSessionResponse>, Status> {
+        Err(Status::unimplemented("fake node"))
+    }
+
     async fn probe(&self, _request: Request<ProbeRequest>) -> Result<Response<ProbeReply>, Status> {
         Ok(Response::new(ProbeReply::default()))
     }

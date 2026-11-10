@@ -839,6 +839,11 @@ pub struct Metrics {
     /// `legion_session_starts_total{outcome}` (docs/metrics.md, "Sessions";
     /// sandbox-scaling Phase 6)
     pub session_starts_total: Arc<CounterVec>,
+    /// `legion_session_runs_total{outcome}` — session runs this manager
+    /// routed (docs/session-runs.md): `ran`, `deduplicated`, `refused` (no
+    /// node took it), `failed` (the node it ran on failed it), and
+    /// `runtime_disabled`.
+    pub session_runs_total: Arc<CounterVec>,
     /// `legion_session_stops_total{reason}` (docs/metrics.md, "Sessions")
     pub session_stops_total: Arc<CounterVec>,
     /// `legion_session_promotions_total` (docs/metrics.md, "Sessions")
@@ -1364,6 +1369,14 @@ impl Metrics {
                 name: "legion_instance_archived_total",
                 help: "Suspended instances archived as their checkpoint was published (suspend.archive), by mode (slim|manifestOnly). An archived instance keeps no snapshot row in the store; manifestOnly keeps no row at all.",
                 labels: &["mode"],
+            },
+            series: Series::new(),
+        });
+        let session_runs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_session_runs_total",
+                help: "Session runs this manager routed, by outcome (ran|deduplicated|refused|failed|runtime_disabled).",
+                labels: &["outcome"],
             },
             series: Series::new(),
         });
@@ -2036,6 +2049,7 @@ impl Metrics {
             Arc::clone(&checkpoint_publish_total) as Arc<dyn RenderMetric>,
             Arc::clone(&instance_archived_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_runs_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_stops_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_promotions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
@@ -2156,6 +2170,7 @@ impl Metrics {
             checkpoint_publish_total,
             instance_archived_total,
             session_starts_total,
+            session_runs_total,
             envelope_resizes_total,
             session_stops_total,
             session_promotions_total,
@@ -2339,6 +2354,10 @@ pub struct WorkerMetrics {
     /// `legion_worker_edge_session_starts_total` — sessions started on this
     /// node from a session ticket (`Worker.StartSession`).
     pub edge_session_starts_total: Arc<Counter>,
+    /// `legion_worker_session_runs_total{outcome}` — session runs this node
+    /// drove (docs/session-runs.md): `ran` (the command exited), `stopped`
+    /// (a limit stopped it), `failed` (it could not start or finish).
+    pub session_runs_total: Arc<CounterVec>,
     /// `legion_session_checkpoints_skipped_total` — periodic session
     /// checkpoints (`suspend.checkpointEvery`) a node skipped because its
     /// backlog would not let it capture them within one interval.
@@ -2473,6 +2492,14 @@ impl WorkerMetrics {
                 labels: &[],
             },
             cell: GaugeCell::default(),
+        });
+        let session_runs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_worker_session_runs_total",
+                help: "Session runs this node drove, by outcome (ran|stopped|failed).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
         });
         let provisional_starts_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -2732,6 +2759,7 @@ impl WorkerMetrics {
             Arc::clone(&claim_overload_refusals_total) as Arc<dyn RenderMetric>,
             Arc::clone(&claim_window) as Arc<dyn RenderMetric>,
             Arc::clone(&edge_session_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_runs_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_checkpoints_skipped_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_evictions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_superseded_total) as Arc<dyn RenderMetric>,
@@ -2776,6 +2804,7 @@ impl WorkerMetrics {
             claim_overload_refusals_total,
             claim_window,
             edge_session_starts_total,
+            session_runs_total,
             session_checkpoints_skipped_total,
             session_evictions_total,
             session_superseded_total,

@@ -45,7 +45,7 @@ pub trait ClaimRatifier: Send + Sync {
 /// The status a refused provisional start answers with. A session refused
 /// for room is RESOURCE_EXHAUSTED, which the manager's session router reads as
 /// "try the next node"; everything else is FAILED_PRECONDITION, as before.
-fn admission_status(err: &anyhow::Error) -> Status {
+pub(crate) fn admission_status(err: &anyhow::Error) -> Status {
     use crate::worker::task_manager::session_sleep::SessionSleepError;
     use crate::worker::task_manager::SessionRefusal;
     if let Some(status) = runtime_disabled_status(err) {
@@ -116,7 +116,7 @@ fn store_status(
 /// manager round trip), and FAILED_PRECONDITION otherwise, because a start
 /// failure is this node or this task config being unable to run the task,
 /// not a bug in the worker. INTERNAL stays for panics and poisoned locks.
-fn task_start_status(context: &str, err: &anyhow::Error) -> Status {
+pub(crate) fn task_start_status(context: &str, err: &anyhow::Error) -> Status {
     let message = format!("{context}: {err:#}");
     let code = if err
         .chain()
@@ -1030,6 +1030,76 @@ impl Worker for WorkerDaemonService {
             generation,
             moved_from: String::new(),
         }))
+    }
+
+    /// Run once in a fresh, single-use session on this node
+    /// (docs/session-runs.md).
+    #[instrument(err, skip_all, fields(job, task))]
+    async fn run_session(
+        &self,
+        request: Request<crate::structs::RunSessionRequest>,
+    ) -> Result<Response<crate::structs::RunSessionResponse>, Status> {
+        // ACL: worker-plane. Caller classes: a manager's certificate (the
+        // manager enforced `job:write`, and `exec:write` for a replaced
+        // command, before routing the run here), or a session ticket for
+        // the job and task, which runs the task's own command only.
+        let caller = crate::worker::plane::caller_of(&request, "RunSession")?;
+        let mut request = request.into_inner();
+        let (job, task, ticket_jti) = match caller {
+            crate::worker::plane::Caller::Manager(_) => {
+                if request.job_id.trim().is_empty() || request.task_name.trim().is_empty() {
+                    return Err(Status::invalid_argument(
+                        "RunSession from a manager names the job and the task",
+                    ));
+                }
+                (
+                    request.job_id.clone(),
+                    request.task_name.clone(),
+                    String::new(),
+                )
+            }
+            crate::worker::plane::Caller::Ticket => {
+                let ticket = self.verify_session_ticket(&request.ticket, "RunSession")?;
+                let claims = ticket.0.clone();
+                let job = if request.job_id.is_empty() {
+                    claims.job.clone()
+                } else {
+                    request.job_id.clone()
+                };
+                let task = if request.task_name.is_empty() {
+                    claims.task.clone()
+                } else {
+                    request.task_name.clone()
+                };
+                ticket.allows(&job, &task)?;
+                if !request.command.is_empty() {
+                    return Err(Status::permission_denied(format!(
+                        "--command needs exec:write on job {job}, which a session ticket does \
+                         not carry; send the run through a manager (running the task's own \
+                         run.command needs only the ticket)"
+                    )));
+                }
+                (job, task, claims.jti.clone())
+            }
+        };
+        let span = tracing::Span::current();
+        span.record("job", job.as_str());
+        span.record("task", task.as_str());
+        // The ticket is a credential: it goes no further than this check.
+        request.ticket.clear();
+        crate::worker::task_manager::session_runs::run_session(
+            self.task_manager.clone(),
+            self.launch_pool.clone(),
+            self.node_id.clone(),
+            crate::worker::task_manager::session_runs::RunCall {
+                job_id: job,
+                task_name: task,
+                request,
+                ticket_jti,
+            },
+        )
+        .await
+        .map(Response::new)
     }
 
     /// End one session from a session ticket.

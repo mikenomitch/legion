@@ -878,6 +878,16 @@ impl Worker for SimWorkerService {
             "a simulated node does not accept edge starts",
         ))
     }
+
+    async fn run_session(
+        &self,
+        _request: Request<crate::structs::RunSessionRequest>,
+    ) -> Result<Response<crate::structs::RunSessionResponse>, Status> {
+        // ACL: worker-plane; a simulated node runs nothing.
+        Err(Status::failed_precondition(
+            "a simulated node runs no sessions",
+        ))
+    }
 }
 
 /// A launched fleet: observability for tests and drivers, plus the point

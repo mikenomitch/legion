@@ -583,6 +583,20 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "session.run",
+            cli: "legion session run <JOB> [--task <TASK>] [--file <[NAME=]PATH>]... [--input <JSON>] [--get <PATH>]... [--idempotency-key <K>] [--dry-run] [--on-node <NODE>] [--node <ADDR> --ticket <T>] [--command <ARG>...]",
+            grpc: Some("Manager/RunSession"),
+            summary: "Run once in a fresh, single-use session of a session task with a `run` \
+                 block and return stdout, stderr, the exit status, result.json as `result`, and \
+                 the --get files; the session is always ended. A stopped run (run.wall, memory) \
+                 is ok:true with `stopped`. Needs job:write; --command also needs exec:write \
+                 and run.allowCommand. --idempotency-key is per node (reply kept 10 minutes); \
+                 --dry-run runs nothing. With --node and --ticket it is Worker/RunSession, with \
+                 no manager on the path.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "session.start",
             cli: "legion session start <JOB> --task <TASK> --node <ADDR> --ticket <T>",
             grpc: Some("Worker/StartSession"),

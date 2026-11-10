@@ -1295,6 +1295,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
                 .map_err(|err| anyhow!("task {}: {err}", task.name))?;
         }
         crate::structs::suspend::validate_suspend(task).map_err(|err| anyhow!(err))?;
+        crate::structs::run::validate_run(task).map_err(|err| anyhow!(err))?;
         crate::structs::network::validate_gated_sandbox(
             task,
             crate::structs::network::sandbox_gated_by_default(),
