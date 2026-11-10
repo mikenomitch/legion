@@ -13,7 +13,7 @@ that would improve config parity.
   (`object_store` 0.11, `rusqlite` 0.32, `reqwest` 0.12, `tokio` 1), so the
   shared `object_store::ObjectStore` trait unifies to a single crate version —
   this is what lets Legion hand an `Arc<dyn ObjectStore>` to `S3Leaser::new`.
-- **WAL shipping** (`src/storage/persistence.rs`): the old `litestream replicate`
+- **WAL shipping** (`crates/manager/src/storage/persistence.rs`): the old `litestream replicate`
   subprocess (`std::process::Command`) is replaced by an in-process loop:
   - `rustyriver::Db::open(db_path)` takes over checkpointing (WAL mode,
     auto-checkpoint off, long-running read lock).
@@ -34,7 +34,7 @@ that would improve config parity.
   docs. Removal is backward-compatible: the structs do not set
   `deny_unknown_fields`, so old configs that still carry `litestreamBinary`
   deserialize fine (the field is ignored).
-- **Tests** (`src/storage/persistence.rs`): added an end-to-end replicate →
+- **Tests** (`crates/manager/src/storage/persistence.rs`): added an end-to-end replicate →
   simulate-host-loss → `rustyriver::restore` → verify test over a
   `FileReplicaClient`, a lease acquire/renew/fence test using `S3Leaser` over an
   in-memory object store, and unit tests for the URL/interval/key helpers.

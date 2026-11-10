@@ -20,11 +20,11 @@ does not. Both halves of the checkpoint channel still ride the heartbeat:
 
 - **Requests.** A `capturing`, `deleting`, or unpublished `store` snapshot
   row is work for its node, and the node learns about it only from
-  `HeartbeatReply.checkpoint_requests` (`src/manager/server.rs`, the
+  `HeartbeatReply.checkpoint_requests` (`crates/manager/src/manager/server.rs`, the
   heartbeat handler, via `snapshot_rpcs::build_checkpoint_requests`). On
   the default 2 s cadence that is a uniform wait of 0 to 2 s.
 - **Reports.** The worker queues each `SnapshotReport` in its outbox
-  (`src/worker/checkpoints.rs`) and sends it on its next scheduled beat,
+  (`crates/worker/src/worker/checkpoints.rs`) and sends it on its next scheduled beat,
   another wait of up to a full interval.
 
 Measured with `legion-loadgen --mode instances` (sandbox-scaling plan
@@ -126,27 +126,27 @@ sandboxes through the API)
 
 ## 5. Background: what exists today
 
-- `src/storage/work_log.rs`: the per-node delivery log behind `StreamWork`.
+- `crates/manager/src/storage/work_log.rs`: the per-node delivery log behind `StreamWork`.
   The store's changeset projection marks changed allocations
-  (`note_work_changes` in `src/storage/store.rs`), the stream task builds a
+  (`note_work_changes` in `crates/manager/src/storage/store.rs`), the stream task builds a
   message from the store when it sends (`next_work_message` in
-  `src/manager/server/work_stream.rs`), and every message is sequenced,
+  `crates/manager/src/manager/server/work_stream.rs`), and every message is sequenced,
   kept for replay until acked, and folded into a digest the heartbeat
   checks.
-- `src/manager/server/snapshot_rpcs.rs`: `build_checkpoint_requests` reads
+- `crates/manager/src/manager/server/snapshot_rpcs.rs`: `build_checkpoint_requests` reads
   a node's outstanding checkpoint work (one indexed lookup on
   `snapshot (node_id, state)`, plus the leader-local warm queue) and builds
   each request, part keys included. The heartbeat handler applies
   `snapshot_reports` first, in one scheduler-lane group commit, then builds
   the reply.
-- `src/worker/checkpoints.rs`: `CheckpointState::accept` sorts a reply's
+- `crates/worker/src/worker/checkpoints.rs`: `CheckpointState::accept` sorts a reply's
   requests into new work and re-sends, and forgets finished work the reply
   no longer lists. That forgetting is correct only because requests arrive
   on the heartbeat alone (§6.3).
-- `src/worker/daemon.rs`: the heartbeat loop already wakes early
+- `crates/worker/src/worker/daemon.rs`: the heartbeat loop already wakes early
   (`HEARTBEAT_WAKE`) for a stream message that stops or changes an
   allocation.
-- `src/worker/simulate.rs`: the simulated fleet answers checkpoint
+- `crates/worker/src/worker/simulate.rs`: the simulated fleet answers checkpoint
   requests from the heartbeat reply and queues reports for the next beat.
 
 ## 6. Design

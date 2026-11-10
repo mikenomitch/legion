@@ -673,7 +673,7 @@ Known limits:
 `WhoAmI` returns the caller's effective rules (`rulesJson`).
 `utils/acl.ts` mirrors the manager's evaluation behind
 `allows(resource, action, scope)`. The rule engine underneath,
-`utils/aclEngine.ts`, follows `src/structs/acl.rs` rule for rule: the same
+`utils/aclEngine.ts`, follows `crates/common/src/structs/acl.rs` rule for rule: the same
 resources (`boot`, `object`, `audit` and `approval` included), globbing,
 default-deny, the same rule that a selector never matches a request without
 that attribute, the `bands`, `kinds` and `host` selectors (`host` on `exec`

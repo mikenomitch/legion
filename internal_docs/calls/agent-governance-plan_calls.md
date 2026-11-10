@@ -5,7 +5,7 @@ Entries are ranked by project impact, highest first; the number is the rank.
 
 ## 1. Journaling and gating hook the existing ACL check through a request layer, not each handler
 
-**Call.** A tower layer (`src/manager/governance/layer.rs`), innermost in the
+**Call.** A tower layer (`crates/manager/src/manager/governance/layer.rs`), innermost in the
 manager's gRPC stack and inside leader forwarding, installs a per-request
 context in a tokio task-local. `acl::enforce` (which every handler already
 calls), `authenticate_acl`, and `scoped_idempotency_key` report into it; the
@@ -141,7 +141,7 @@ replicated journal.
 
 **Why (performance).** (a) adds a raft round trip or capture work to every
 write in the cluster for an observability feature. (c) needs a change in
-`src/storage/raft/`, outside this change's remit; recorded as a TODO.
+`crates/manager/src/storage/raft/`, outside this change's remit; recorded as a TODO.
 Writes themselves always end on a leader and are journaled there, so the gap
 is denials on followers, which still reach a log.
 
@@ -258,7 +258,7 @@ hash-only invariant for tokens is worth more than retry-safety here.
 ## 12. The caller-aware catalog is a server RPC over a source-side access table
 
 **Call.** `GetCallerCapabilities` evaluates the caller against
-`src/manager/rpc_access.rs` (a restatement of the ACL endpoint table, held
+`crates/manager/src/manager/rpc_access.rs` (a restatement of the ACL endpoint table, held
 equal by `rpc_access_table_matches_the_endpoint_table`) and the CLI/MCP merge
 it into the catalog by `grpc` method.
 

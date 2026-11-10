@@ -85,7 +85,7 @@ trainer   blocked (gang)   since 14:02:11 (9 attempts)
 ```
 
 **Alternatives.** (a) Keep today's contract — placement failure marks the
-eval `failed` terminally (`src/manager/daemon.rs:1590`) and the user
+eval `failed` terminally (`crates/manager/src/manager/daemon.rs:1590`) and the user
 resubmits; gang would then only change *what* fails, not *whether*. (b)
 Block on capacity but fail fast on constraint infeasibility, so a typo'd
 constraint errors immediately.
@@ -195,7 +195,7 @@ succeed or don't as a unit, and keeping that invariant is what makes call
 1 cheap.
 
 **Why (simplicity).** Legion deliberately has no group *container* —
-`group` is a co-location label (`src/manager/scheduler.rs:1035-1163`), and
+`group` is a co-location label (`crates/manager/src/manager/scheduler.rs:1035-1163`), and
 reusing it for gangs would collide with its one-node meaning. A task's
 `count` is already the replica-set concept users know; gang annotates it
 rather than introducing a fourth grouping notion (task, group, job, gang).
@@ -387,7 +387,7 @@ do not count as retries"): a gang should not fail because nodes did.
 ## 12. Updating a gang restarts it — `job_update` keeps remove-then-plan, blue-green is a documented pattern, not the default
 
 **Call.** For gang jobs, the update path keeps its existing
-remove-allocations-then-plan order (`src/structs/eval.rs:170-171`); what
+remove-allocations-then-plan order (`crates/manager/src/manager/eval.rs:170-171`); what
 changes is the failure mode — a deferred replan leaves the job **blocked at
 zero and retrying** (`blocked (gang): updating — 0/8 placed`) instead of
 today's stranded-at-zero with a dead eval. Zero-downtime updates are the
@@ -422,7 +422,7 @@ gang: { min: 6, placementTimeout: '30m', recovery: 'gang' },  // long form
 ```
 
 using the same untagged number/bool-or-object serde pattern as `count`
-(`TaskCountInput`, `src/structs/job.rs:208`).
+(`TaskCountInput`, `crates/common/src/structs/job.rs:208`).
 
 **Alternatives.** Fold it into `count` — `count: { num: 8, min: 6, atomic:
 true }` — one placement-cardinality object, which the code recon even
@@ -536,7 +536,7 @@ dry runs succeed too would change an existing contract for no gang reason.
 
 **Call.** Gang tasks join `count.per`, `distinct`, volume-pinned, and
 multi-task-group tasks on the no-truncation list
-(`src/manager/scheduler.rs:1558-1564`); their candidates come from the full
+(`crates/manager/src/manager/scheduler.rs:1558-1564`); their candidates come from the full
 scan path.
 
 **Alternatives.** Keep index-served truncated candidates plus the existing
@@ -721,7 +721,7 @@ holds for "blocked" and "placed", which stay `eval.*` events.
 
 
 **Call.** v1 wakes blocked gangs on `node_join` (one new clause in
-`reschedule_allocations_for_new_node`, `src/storage/store.rs:7950`) and
+`reschedule_allocations_for_new_node`, `crates/manager/src/storage/store.rs:7950`) and
 otherwise retries on jittered exponential backoff capped at 2 minutes.
 Capacity freed by allocation removal is picked up by the next backoff tick,
 so worst-case start latency after capacity frees is 2 minutes in v1.

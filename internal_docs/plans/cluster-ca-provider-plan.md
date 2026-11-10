@@ -23,7 +23,7 @@ CA certificate and key the operator puts on each manager (`file`), and an
 external signer Legion talks to over JSON on stdin/stdout (`exec`, with a
 reference helper for Vault PKI). The seam is modelled on the KV keyring's
 root-key providers ([kv-encryption plan](kv-encryption-plan.md) §6.3,
-`src/storage/keyring.rs:234`), so an operator who has configured one knows
+`crates/manager/src/storage/keyring.rs:234`), so an operator who has configured one knows
 the other.
 
 ---
@@ -35,10 +35,10 @@ certificates (the worker plane listener and the mesh), the managers' own
 client and server certificates, the pin every join token carries, and
 `certFrom = "legion"` ingress. Today that CA is hard-wired:
 
-- `src/manager/mesh_ca.rs` is plain `rcgen` code: `generate_ca`, `sign_csr`,
+- `crates/common/src/mesh_ca.rs` is plain `rcgen` code: `generate_ca`, `sign_csr`,
   `issue_manager_cert`, `cross_sign`.
 - The CA certificate **and its private key** live as plaintext PEM in one
-  replicated row, `net_mesh_ca` (`src/storage/netpolicy_store.rs:175-400`).
+  replicated row, `net_mesh_ca` (`crates/manager/src/storage/netpolicy_store.rs:175-400`).
   So the key is in every raft log entry that touched it, every snapshot,
   every `legion state backup`, and every streamed replica. `QueryStateStore`
   redacts the column, but a copy of `store.sqlite` does not.
@@ -47,11 +47,11 @@ client and server certificates, the pin every join token carries, and
   point Legion at Vault PKI, step-ca, or AWS Private CA. What it does today
   is run Legion's CA as an unaudited island, or not run Legion.
 
-Verification is already issuer-agnostic. `src/cluster_tls.rs` trusts a PEM
+Verification is already issuer-agnostic. `crates/common/src/cluster_tls.rs` trusts a PEM
 bundle (`SwappableRoots`), finds a peer's role in its URI SANs
 (`legion://node/`, `legion://manager/`, `legion://fleet/`), and the worker's
 pinned first contact finds the pinned CA among the certificates the manager
-sends (`PinnedManagerVerifier`, `src/cluster_tls.rs:473-550`). Only the
+sends (`PinnedManagerVerifier`, `crates/common/src/cluster_tls.rs:473-550`). Only the
 *issuing* side and the places that read the store row directly need to
 change.
 
@@ -220,19 +220,19 @@ plan removes. Kept as an open question (§11).
 
 | Where | What it does with the CA |
 | --- | --- |
-| `src/manager/mesh_ca.rs` | `generate_ca`, `sign_csr(ca_cert, ca_key, csr, subject)`, `issue_manager_cert(ca_cert, ca_key, id, kind)` (generates the manager's key and signs it directly), `cross_sign`, `generate_csr`, `csr_for_key`, `issue_node_cert` (tests). |
-| `src/storage/netpolicy_store.rs:175-400` | `MeshCa` (cert, key, previous, cross, rotated_at), `phase`, `bundle_pem`, `chain_suffix`, `server_chain_suffix`, `pin`; `Store::{mesh_ca, ensure_mesh_ca, rotate_mesh_ca}`. |
-| `src/manager/worker_plane.rs:214-322` | `materials_with_pin` reads the row, keys material by the signing pin, mints the manager's client and server certificates from the CA key, re-mints after 8h. |
-| `src/manager/acl.rs:529` | `mint_join_token` pins `ensure_mesh_ca().pin()`. |
-| `src/manager/daemon.rs:449` | the `--run-worker` worker's pin. |
-| `src/manager/daemon.rs:1350-1420` | `keep_manager_server_cert` and `manager_incoming` serve the minted server certificate for `manager.legion`. |
-| `src/manager/exec.rs:339` | direct exec tickets carry the trust bundle. |
-| `src/manager/server.rs:1856` | `cluster_ca_pin()` for `HeartbeatReply.cluster_ca_pin`, cached 5s. |
-| `src/manager/server.rs:7269-7420` | `GetMeshCa`, `RotateMeshCa`, `IssueNodeCertificate` (signs with the row's key). |
-| `src/worker/plane.rs:290` | `needs_refresh`: re-issue after 8h, under 1h left, or when the heartbeat's pin is not in the held bundle. |
-| `src/cluster_tls.rs` | verification only: bundles, pins, URI-SAN roles, pinned first contact. Unchanged. |
+| `crates/common/src/mesh_ca.rs` | `generate_ca`, `sign_csr(ca_cert, ca_key, csr, subject)`, `issue_manager_cert(ca_cert, ca_key, id, kind)` (generates the manager's key and signs it directly), `cross_sign`, `generate_csr`, `csr_for_key`, `issue_node_cert` (tests). |
+| `crates/manager/src/storage/netpolicy_store.rs:175-400` | `MeshCa` (cert, key, previous, cross, rotated_at), `phase`, `bundle_pem`, `chain_suffix`, `server_chain_suffix`, `pin`; `Store::{mesh_ca, ensure_mesh_ca, rotate_mesh_ca}`. |
+| `crates/manager/src/manager/worker_plane.rs:214-322` | `materials_with_pin` reads the row, keys material by the signing pin, mints the manager's client and server certificates from the CA key, re-mints after 8h. |
+| `crates/manager/src/manager/acl.rs:529` | `mint_join_token` pins `ensure_mesh_ca().pin()`. |
+| `crates/manager/src/manager/daemon.rs:449` | the `--run-worker` worker's pin. |
+| `crates/manager/src/manager/daemon.rs:1350-1420` | `keep_manager_server_cert` and `manager_incoming` serve the minted server certificate for `manager.legion`. |
+| `crates/manager/src/manager/exec.rs:339` | direct exec tickets carry the trust bundle. |
+| `crates/manager/src/manager/server.rs:1856` | `cluster_ca_pin()` for `HeartbeatReply.cluster_ca_pin`, cached 5s. |
+| `crates/manager/src/manager/server.rs:7269-7420` | `GetMeshCa`, `RotateMeshCa`, `IssueNodeCertificate` (signs with the row's key). |
+| `crates/worker/src/worker/plane.rs:290` | `needs_refresh`: re-issue after 8h, under 1h left, or when the heartbeat's pin is not in the held bundle. |
+| `crates/common/src/cluster_tls.rs` | verification only: bundles, pins, URI-SAN roles, pinned first contact. Unchanged. |
 
-The keyring seam this mirrors: `RootKeyProvider` (`src/storage/keyring.rs:234`),
+The keyring seam this mirrors: `RootKeyProvider` (`crates/manager/src/storage/keyring.rs:234`),
 `provider_from_config` (`:633`), `ExecRootKey` with
 `run_provider_command` (`:475`), `test_exec_provider` (`:1387`),
 `legion keyring provider test` (`src/cmd/keyring.rs:524`), helpers in

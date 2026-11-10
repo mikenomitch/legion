@@ -1099,7 +1099,7 @@ plugins/artifacts/<scheme>/
 ```
 
 The plugin implements the blocking `ArtifactFetcher` trait
-(`src/artifacts/fetcher.rs`) and exports it with `legion::export_artifact_fetcher!`:
+(`crates/worker/src/artifacts/fetcher.rs`) and exports it with `legion::export_artifact_fetcher!`:
 
 ```rust
 use legion::artifacts::fetcher::{ArtifactFetcher, FetchRequest, FetchedArtifact, FetchedPayload};

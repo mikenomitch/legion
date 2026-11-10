@@ -125,9 +125,9 @@ Five evaluation sites, each constructing its own `JsonnetVm`:
 | --- | --- |
 | `src/cmd/job.rs:1038` | jobspec evaluation, with an import callback recording every imported file as a `Submission` |
 | `src/cmd/start.rs:181` | manager config |
-| `src/manager/daemon.rs:1823` | worker configs |
+| `crates/manager/src/manager/daemon.rs:1823` | worker configs |
 | `src/cmd/acl.rs:310` | ACL policy files ending in `.jsonnet` |
-| `src/manager/job_templates.rs:85` | job templates, with imports rejected via the VM import callback |
+| `crates/manager/src/manager/job_templates.rs:85` | job templates, with imports rejected via the VM import callback |
 
 Plus `tests/integration/config_jobs.rs`, which built a sixth VM to evaluate every shipped
 example.
@@ -138,7 +138,7 @@ a SQLite column (`job_template_version`), and a UI field (`sourceJsonnet` in
 
 ## Proposed design
 
-### 1. One module: `src/config_lang.rs`
+### 1. One module: `crates/common/src/config_lang.rs`
 
 Three entry points, so every surface gets the same behavior:
 
@@ -198,9 +198,9 @@ migration is edited in place — no data migration, per the compatibility waiver
 - `proto/legion.proto`: `JobTemplate.source_jsonnet` → `source_nickel` (field 5),
   `UpsertJobTemplateRequest.source_jsonnet` → `source_nickel` (field 2), plus
   the surrounding comments describing the document shape.
-- `src/storage/migrations.rs`: the `job_template_version` create-table
+- `crates/manager/src/storage/migrations.rs`: the `job_template_version` create-table
   statement names `source_nickel`.
-- `src/storage/store.rs`: `JobTemplateVersionRecord.source_nickel` and the
+- `crates/manager/src/storage/store.rs`: `JobTemplateVersionRecord.source_nickel` and the
   three statements that read/write it.
 - `Cargo.toml`: `jsonnet-rs` (git fork) out, `nickel-lang-core` (default
   features off) in.
@@ -212,7 +212,7 @@ migration is edited in place — no data migration, per the compatibility waiver
 
 ## Implementation phases
 
-1. **Evaluator.** `src/config_lang.rs` with unit tests; dependency swap.
+1. **Evaluator.** `crates/common/src/config_lang.rs` with unit tests; dependency swap.
 2. **Call sites.** manager config, worker configs, ACL policies, jobspecs
    (including submission tracking), job templates.
 3. **CLI surface.** The `--var` family; `ConfigVars`; KV-backed variables
@@ -229,7 +229,7 @@ each stand alone.
 
 ## Testing plan
 
-- `src/config_lang.rs` unit tests: record → JSON, `vars` binding and its empty
+- `crates/common/src/config_lang.rs` unit tests: record → JSON, `vars` binding and its empty
   default, `not_exported` dropped on export, import rejection (and the
   string/comment non-false-positive), contract errors carrying source context,
   `--var-code` expression evaluation, and import tracking.

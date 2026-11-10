@@ -10,7 +10,7 @@ Entries are ranked by project impact; the number is the rank.
 node" awareness, and no cadence shortcuts: a sim node registers,
 heartbeats, and reports health with the same messages, intervals, retry
 backoffs, and re-register-on-`Unauthenticated` behavior as
-`src/worker/daemon.rs`. The only manager-visible difference is
+`crates/worker/src/worker/daemon.rs`. The only manager-visible difference is
 `"simulated": true` in `config_attrs`.
 
 **Alternatives.** (a) A bulk `RegisterSimulatedNodes(N)` RPC — far
@@ -51,7 +51,7 @@ migration to the verb we declined.
 easier to explain than two; the token flow, config resolution, and docs
 are shared rather than duplicated; and the capability catalog keeps one
 entry. The rejected verb is cheap to add later if fault injection ever
-becomes real — the engine is a module (`src/worker/simulate.rs`), not
+becomes real — the engine is a module (`crates/worker/src/worker/simulate.rs`), not
 CLI-shaped.
 
 ## 3. One shared stub `Worker` server per sim process, so push dispatch stays measured
@@ -74,7 +74,7 @@ nodesim and KWOK make the same trade.
 
 **Why (performance, honestly measured).** Without an address the
 dispatcher *skips* push dispatch entirely
-(`src/manager/dispatcher.rs:43-49`, "worker address missing") — with a
+(`crates/manager/src/manager/dispatcher.rs:43-49`, "worker address missing") — with a
 skip log per placement, at campaign volume a log flood — and the
 benchmark would silently exempt Legion's managers from a real
 per-placement cost that every production cluster pays. Reversed from

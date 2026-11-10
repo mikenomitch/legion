@@ -44,7 +44,7 @@ this is latent — but TEXT affinity removes the class.
   table rebuild ([lang_altertable.html §"Making Other Kinds Of Table
   Schema Changes"](https://www.sqlite.org/lang_altertable.html)).
 - This repo: the C-0/C-1/C-2 lane-ownership migrations
-  (`src/storage/migrations.rs`) established the rebuild pattern —
+  (`crates/manager/src/storage/migrations.rs`) established the rebuild pattern —
   create twin, copy, drop, rename, re-create indexes — including the
   rule that rebuild order must account for `foreign_keys = ON` (a
   `DROP TABLE` performs an implicit `DELETE FROM`, firing CASCADEs).
@@ -88,7 +88,7 @@ this is latent — but TEXT affinity removes the class.
 
 ## What exists today
 
-- 17 tables with 46 `JSONB` columns (`src/storage/migrations.rs`), the
+- 17 tables with 46 `JSONB` columns (`crates/manager/src/storage/migrations.rs`), the
   hot ones being `allocation` (resources, network), `plan_submission`
   (placements, expected_version_vector, evictions), `node_alloc_usage`
   (usage_json), `task_config` (21 columns), `node`/`node_health`
@@ -97,7 +97,7 @@ this is latent — but TEXT affinity removes the class.
   the eval loop's own tables are unaffected.
 - Migrations run via `rusqlite_migration` inside a transaction with
   `foreign_keys = ON` (`Store::configure_connection`,
-  `src/storage/store.rs:1767`), so `PRAGMA foreign_keys = OFF` is not
+  `crates/manager/src/storage/store.rs:1767`), so `PRAGMA foreign_keys = OFF` is not
   available to a migration and CASCADE hazards must be handled by
   ordering.
 - `job_config` is the one rebuilt table that is a CASCADE *parent*
@@ -106,7 +106,7 @@ this is latent — but TEXT affinity removes the class.
   `ON DELETE CASCADE` via the implicit `DELETE FROM`.
 - Raft replication captures per-table changesets via the SQLite session
   extension, which identifies columns **by position**, and lane
-  snapshots install rows **by name** (`src/storage/raft/state_machine.rs`).
+  snapshots install rows **by name** (`crates/manager/src/storage/raft/state_machine.rs`).
 
 ## Proposed design
 
@@ -140,7 +140,7 @@ declared type names, which changesets never see.
 
 ## Persistence changes
 
-- One appended migration in `src/storage/migrations.rs` (schema version
+- One appended migration in `crates/manager/src/storage/migrations.rs` (schema version
   +1). No wire change, no config surface, no struct change.
 - Rowids are preserved (explicit-id copies), so `node_alloc_usage`
   fingerprints (alloc epoch + count + id sum) remain valid — per the

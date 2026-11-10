@@ -323,7 +323,7 @@ def parse_legion_event(line):
 
     The envelope is {"ok":true,"data":{...event...}};
     `allocation.placed` is emitted once per plan apply with the number of
-    allocations in metadata.count (src/storage/events.rs)."""
+    allocations in metadata.count (crates/manager/src/storage/events.rs)."""
     line = line.strip()
     if not line:
         return None

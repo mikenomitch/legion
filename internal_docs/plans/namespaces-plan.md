@@ -167,20 +167,20 @@ What breaks:
   anchor does not exist yet.
 - **Several global name spaces leak between tenants once tenants exist:**
   - *The service catalog pools endpoints by name across jobs.* A service's
-    name is `COALESCE($.name, task name)` (`src/structs/network.rs:583`).
+    name is `COALESCE($.name, task name)` (`crates/common/src/structs/network.rs:583`).
     `service_endpoints` returns every job's endpoints for it
-    (`src/storage/store.rs:15066`). So a second team that also advertises
+    (`crates/manager/src/storage/store.rs:15066`). So a second team that also advertises
     `web` adds its instances to the first team's load-balancing pool.
   - *Every service read is visible to every reader.* `ListServices`,
     `ResolveService` and `ListServiceEdges` gate on `job:read` with
-    `AclScope::any()` and filter nothing (`src/manager/server.rs:10197-10415`).
+    `AclScope::any()` and filter nothing (`crates/manager/src/manager/server.rs:10197-10415`).
     Any `job:read` grant sees every endpoint address in the cluster.
   - *Instance ids are caller-chosen and unique cluster-wide*
-    (`src/storage/migrations.rs:458`, `src/storage/store.rs:16977`). The
+    (`crates/manager/src/storage/migrations.rs:458`, `crates/manager/src/storage/store.rs:16977`). The
     second team to pick `user-42` gets `AlreadyExists`, which tells it that
     some other team has a `user-42`.
   - *Checkpoint seal keys and chunk dedup derive from the bare job id*
-    (`src/checkpoint_seal.rs:320-345`, `:481`). That is harmless
+    (`crates/common/src/checkpoint_seal.rs:320-345`, `:481`). That is harmless
     while names are unique, and a shared key the day they stop being unique.
 
 Two more are sharper:
@@ -194,7 +194,7 @@ Two more are sharper:
   (`docs/auth-and-acls.md:186-191`), but this footgun gets discovered at 3am.
 - **A `net` rule with `namespaces` matches nothing at all.** Net-policy
   upsert, get, list and delete build their scope from the policy's node pools
-  only (`src/manager/server.rs:13518-13530`). Footnote 1 of the first version
+  only (`crates/manager/src/manager/server.rs:13518-13530`). Footnote 1 of the first version
   of this plan said the opposite.
 
 ---
@@ -293,7 +293,7 @@ Enterprise. The flag is `-namespace`, the env var is `NOMAD_NAMESPACE`, and
 | N6 | **The event stream's wildcard bypassed namespace ACLs** (CVE-2025-0937, 1.0.0 through 1.9.5). Earlier, allocation reads leaked across namespaces (CVE-2019-16742). | [HCSEC-2025-02](https://discuss.hashicorp.com/t/hcsec-2025-02-nomad-vulnerable-to-event-stream-namespace-acl-policy-bypass-through-wildcard-namespace/73191); changelog. **Strong.** | `*` is never a separate authorization path. It widens the candidate set, and every item still passes the per-item filter. There is a test with a one-namespace token (§ 8.9, § 13). |
 | N7 | **The UI kept losing the namespace:** 404 on reload, exec windows (fixed three times), dispatch "Not Found". The all-namespaces default made the UI slow. | [#12022](https://github.com/hashicorp/nomad/issues/12022); [#11970](https://github.com/hashicorp/nomad/issues/11970) ("an unintended side-effect"); [Discuss 29028](https://discuss.hashicorp.com/t/when-executing-parameterized-job-with-namespace-applied-in-ui-not-found/29028); changelog. **Strong** (many issues, few reactions each). | The namespace is a path segment in every detail route, so navigation can't drop it. The All view paginates (§ 10). |
 | N8 | **One-namespace tokens break UI flows:** greyed-out buttons, an empty topology page. | [#23905](https://github.com/hashicorp/nomad/issues/23905); [#24334](https://github.com/hashicorp/nomad/issues/24334). **Strong.** | A one-namespace identity is a first-class UI test fixture (§ 13). |
-| N9 | **ACL glob precedence is "most specific wins", and the docs had it wrong.** Malformed blocks were silently accepted (CVE-2023-3072: an unlabeled block applied to a namespace literally named `policy`). | [ACL policy spec](https://developer.hashicorp.com/nomad/docs/other-specifications/acl-policy); [#20118](https://github.com/hashicorp/nomad/issues/20118); [#17908](https://github.com/hashicorp/nomad/issues/17908). **Strong.** | No precedence: the union of allows, with any matching deny winning (`src/structs/acl.rs:445-470`). Rules already `deny_unknown_fields` (`:119`). A rule that omits or misplaces `namespaces` is rejected (§ 8.5). |
+| N9 | **ACL glob precedence is "most specific wins", and the docs had it wrong.** Malformed blocks were silently accepted (CVE-2023-3072: an unlabeled block applied to a namespace literally named `policy`). | [ACL policy spec](https://developer.hashicorp.com/nomad/docs/other-specifications/acl-policy); [#20118](https://github.com/hashicorp/nomad/issues/20118); [#17908](https://github.com/hashicorp/nomad/issues/17908). **Strong.** | No precedence: the union of allows, with any matching deny winning (`crates/common/src/structs/acl.rs:445-470`). Rules already `deny_unknown_fields` (`:119`). A rule that omits or misplaces `namespaces` is rejected (§ 8.5). |
 | N10 | **Only a management token can create namespaces.** | [#14003](https://github.com/hashicorp/nomad/issues/14003) (open, 5 👍); item 2 of [#18803](https://github.com/hashicorp/nomad/issues/18803). **Strong.** | A `namespace` ACL resource, delegable by glob (§ 8.5, call 12). |
 | N11 | **Workload-identity policies could only attach per job until 1.10.2.** The implicit policy lets any workload read every service registration ("seeing other teams' jobs can be a security issue"). | [#17181](https://github.com/hashicorp/nomad/issues/17181); [#19803](https://github.com/hashicorp/nomad/issues/19803). **Strong.** | Workload binding rules can match the namespace claim from Phase 1 (§ 8.8). |
 | N12 | **Delete safety was added piecemeal and kept breaking.** Deletion was allowed with CSI volumes present. A delete with variables returned 200 and failed in the FSM. Quota↔namespace cycles broke Terraform teardown. | [#19414](https://github.com/hashicorp/nomad/issues/19414); [#23672](https://github.com/hashicorp/nomad/issues/23672); changelog GH-13880, GH-23499. **Strong.** | One emptiness check over a single list of namespaced kinds, run in the same store write as the delete. Namespace policies select namespaces by glob, so there is no cycle (§ 8.11). |
@@ -481,51 +481,51 @@ federation later. § 8.6 says which, and the public page says it first.
 
 | Piece | Location | State |
 | --- | --- | --- |
-| `namespaces` rule selector | `src/structs/acl.rs:129-131` | Real, glob-matched, unit-tested (`:732-747`). The doc comment says "jobs live in `default` today". |
-| `AclScope.namespace` | `src/structs/acl.rs:211` | Real field |
-| `DEFAULT_NAMESPACE = "default"` | `src/structs/acl.rs:235`, and a **second** copy at `src/structs/netpolicy.rs:116` | The only value ever produced |
+| `namespaces` rule selector | `crates/common/src/structs/acl.rs:129-131` | Real, glob-matched, unit-tested (`:732-747`). The doc comment says "jobs live in `default` today". |
+| `AclScope.namespace` | `crates/common/src/structs/acl.rs:211` | Real field |
+| `DEFAULT_NAMESPACE = "default"` | `crates/common/src/structs/acl.rs:235`, and a **second** copy at `crates/common/src/structs/netpolicy.rs:116` | The only value ever produced |
 | Constructors that stamp it | `AclScope::job` `:252`, `::exec` `:277`, `::action` `:287`, `::job_via_template` `:305` | All hardcoded. `pool`, `path`, `template`, `none` and `any` carry no namespace. |
-| Namespace matching | `rule_matches`, `src/structs/acl.rs:430` | Real |
+| Namespace matching | `rule_matches`, `crates/common/src/structs/acl.rs:430` | Real |
 | UI mirror | `ui/src/utils/acl.ts:61` (`DEFAULT_NAMESPACE`), `jobScope` `:64-68` (16 call sites) | Same hardcode. The mirror has also **drifted** from Rust: no `boot` resource, no `bands`, and the `host` check covers only `exec`. |
-| Audit log `namespace` | `src/manager/acl.rs:780` | Always `default` or `-` |
-| `NetSelector.namespaces` | `src/structs/netpolicy.rs:132-135`, matched at `:167-195` | Real glob list. All 7 builders of `NetSelectorFacts` pass `namespace: String::new()`, which is read as `default` (`store.rs:13233, :13277, :13423`; `server.rs:2497, :12960, :13055, :13328`). |
-| `net` ACL scope | `enforce_net_policy_scope`, `src/manager/server.rs:13518-13530` | Pools only. A `net` rule with `namespaces` matches nothing. |
-| Workload identity subject | `DEFAULT_SUB_TEMPLATE = "{region}:{job}:{group}:{task}"`, `src/structs/workload_identity.rs:90` | Documented as "Nomad's composed subject minus the namespace segment Legion lacks" (`:87-89`). There is no namespace claim (`:636-655`). |
+| Audit log `namespace` | `crates/manager/src/manager/acl.rs:780` | Always `default` or `-` |
+| `NetSelector.namespaces` | `crates/common/src/structs/netpolicy.rs:132-135`, matched at `:167-195` | Real glob list. All 7 builders of `NetSelectorFacts` pass `namespace: String::new()`, which is read as `default` (`store.rs:13233, :13277, :13423`; `server.rs:2497, :12960, :13055, :13328`). |
+| `net` ACL scope | `enforce_net_policy_scope`, `crates/manager/src/manager/server.rs:13518-13530` | Pools only. A `net` rule with `namespaces` matches nothing. |
+| Workload identity subject | `DEFAULT_SUB_TEMPLATE = "{region}:{job}:{group}:{task}"`, `crates/common/src/structs/workload_identity.rs:90` | Documented as "Nomad's composed subject minus the namespace segment Legion lacks" (`:87-89`). There is no namespace claim (`:636-655`). |
 | Jobspec `namespace` field, `Namespace` object, RPC, CLI | — | Do not exist |
 
 ### 6.2 The code the design has to fit
 
 - **A job's id *is* its name.** Submit inserts `":id": config.name,
-  ":name": config.name` (`src/storage/store.rs:10545-10547`), and the
+  ":name": config.name` (`crates/manager/src/storage/store.rs:10545-10547`), and the
   scheduler says so outright: "(job id == job name)"
-  (`src/manager/scheduler.rs:1665`). Uniqueness comes from the primary key on
-  `job.id` (`src/storage/migrations.rs:101-109`). **So every `job_id` column
+  (`crates/manager/src/manager/scheduler.rs:1665`). Uniqueness comes from the primary key on
+  `job.id` (`crates/manager/src/storage/migrations.rs:101-109`). **So every `job_id` column
   in the schema stores the bare name.** The first version of this plan said
   the foreign-key graph would not need to change. It does: either every
   job-keyed column changes, or what goes into `job.id` changes. § 8.2 picks
   the second.
 - **What is derived from the bare job id:**
-  - `JobConfig::id()` is `"{name}-{version}"` (`src/structs/job.rs:2457`).
-  - A slot instance id is `"{job}-{group}-{slot}"` (`src/structs/instance.rs:272`).
+  - `JobConfig::id()` is `"{name}-{version}"` (`crates/common/src/structs/job.rs:2457`).
+  - A slot instance id is `"{job}-{group}-{slot}"` (`crates/common/src/structs/instance.rs:272`).
   - Volume claim ids are a hash of `job\x01group\x01task\x01name`
-    (`src/storage/store.rs:20982`).
+    (`crates/manager/src/storage/store.rs:20982`).
   - Snapshot aliases are keyed `(job_id, name)`.
   - Checkpoint seal keys and chunk keys are HKDF'd over the job id
-    (`src/checkpoint_seal.rs:320-345, :481`).
+    (`crates/common/src/checkpoint_seal.rs:320-345, :481`).
   - Archive manifests live at `manifests/{job_id}/…`
-    (`src/structs/archive.rs:30-41`), and session manifests at
-    `sessions/{job_id}/…` (`src/session_manifest.rs:58`).
+    (`crates/common/src/structs/archive.rs:30-41`), and session manifests at
+    `sessions/{job_id}/…` (`crates/worker/src/session_manifest.rs:58`).
   - Boot, exec and session tickets carry a `job` claim.
   - `job_kv_reference` is keyed `(job_id, kv_key)`.
   - Scale rows are keyed `(job_id, task_group, task_name)`.
 - **Job names are already strictly validated.** `validate_object_name`
-  (`src/structs/job.rs:1498-1513`) allows `[A-Za-z0-9._-]`, 1–128
+  (`crates/common/src/structs/job.rs:1498-1513`) allows `[A-Za-z0-9._-]`, 1–128
   characters, with no leading dot. **`/` and `:` are already illegal**, so
   `namespace/name` is unambiguous with no new validation and no
   grandfathering.
 - **ACL enforcement is centralized and scope-shaped.** There are 109
   `check_acl` call sites across 136 Manager RPCs. 46 `AclScope::job(` sites
-  in `src/manager` build a job scope, along with 3 `exec`, 3 `action` and 2
+  in `crates/manager/src/manager` build a job scope, along with 3 `exec`, 3 `action` and 2
   `job_via_template` sites, plus `job_read_scope` (`server.rs:1998`, 9
   callers) and `volume_write_scope` (`:11780`). Changing the constructor
   signatures turns every missed site into a compile error.
@@ -552,8 +552,8 @@ federation later. § 8.6 says which, and the public page says it first.
   `task_config.service` JSON. `ListServices` collapses duplicate names into
   one summary through a `BTreeMap` keyed by service name
   (`server.rs:10337-10373`). Mesh DNS is `<key>.svc.legion`
-  (`src/structs/network.rs:22`). The node resolver **rejects multi-label
-  names** (`src/worker/netd/dns.rs:406-426`, test at `:628`), so a
+  (`crates/common/src/structs/network.rs:22`). The node resolver **rejects multi-label
+  names** (`crates/worker/src/worker/netd/dns.rs:406-426`, test at `:628`), so a
   `<svc>.<ns>.svc.legion` form needs a resolver change. `allow` intentions
   are bare job ids and "not cryptographic identity" (`network.rs:574-579`).
 - **Instance ids are global.** `instance.instance_id` is the primary key
@@ -568,7 +568,7 @@ federation later. § 8.6 says which, and the public page says it first.
 - **Node caches serve images without checking registry credentials.** A
   digest the node already holds is served "with no registry request", and a
   tag whose registry lookup fails, auth failures included, falls back to the
-  node's last-resolved digest (`src/artifacts/fetchers/oci.rs:611-621, :701`).
+  node's last-resolved digest (`crates/worker/src/artifacts/fetchers/oci.rs:611-621, :701`).
   So a job with no credentials for a private image can run it if another job
   pulled it to the same node. This predates namespaces. Namespaces turn it
   into a tenant-to-tenant leak: it is the problem Kubernetes' `AlwaysPullImages`
@@ -586,7 +586,7 @@ federation later. § 8.6 says which, and the public page says it first.
   `/volumes/:id` (`:1158`).
 - **Workload-identity subjects already have a uniqueness floor.**
   `validate_sub_template` hard-rejects any template missing `{job}`,
-  `{group}` or `{task}` (`src/structs/workload_identity.rs:543-551`). The
+  `{group}` or `{task}` (`crates/common/src/structs/workload_identity.rs:543-551`). The
   namespace joins that floor (§ 8.8).
 
 ---
@@ -938,11 +938,11 @@ without probing.
 **Enforcement mechanics.** `AclScope::job(name)` becomes
 `AclScope::job(namespace, name)`. The same goes for `exec`, `action` and
 `job_via_template`. That is a signature change, so all 54 construction
-sites in `src/manager` become compile errors until each supplies a
+sites in `crates/manager/src/manager` become compile errors until each supplies a
 namespace from a stored column. The coarse-then-precise pattern is
 unchanged. `list_jobs`'s per-item `retain` filters by namespace with no
 code beyond the new argument. The audit log's `namespace` field
-(`src/manager/acl.rs:780`) gets a real value.
+(`crates/manager/src/manager/acl.rs:780`) gets a real value.
 
 **Things that go live for free.** The `bands` selector composes with
 `namespaces`, so "only payments may claim `high`" becomes real in Phase 1.
@@ -1041,7 +1041,7 @@ written for one would accept the other's tokens.
   template" escape hatch (call 8). The floor already hard-rejects a dropped
   `{job}`, and dropping `{namespace}` is the same forgery.
 - Tokens carry a `legion.io/namespace` claim. Control-plane binding rules
-  (`AclBindingRule`, `src/structs/config.rs:1503`) can match on it, so a
+  (`AclBindingRule`, `crates/common/src/structs/config.rs:1503`) can match on it, so a
   platform can give every workload in `payments-*` one policy without
   attaching it job by job (N11).
 
@@ -1076,7 +1076,7 @@ written for one would accept the other's tokens.
 | Idempotency records | per caller and operation, fingerprinted | unchanged; the namespace is part of the fingerprinted request, so reusing a key across namespaces is `InvalidInput` | — |
 | Job templates | cluster objects | **stay cluster objects** (call 20). `RunJobTemplate` takes a target namespace, and the collision guard becomes namespace-local, which confines today's oracle to namespaces the caller can submit into | 1 |
 | Standalone volumes (no owning job) | cluster-wide; deleting needs cluster-wide `job:write` (`docs/volumes.md:373`) | carry a namespace | 2 |
-| Exec keys | `jobs` glob over bare names, which crosses tenants (`src/manager/exec.rs:424`) | patterns match qualified ids (`payments-*/web`) | 2 |
+| Exec keys | `jobs` glob over bare names, which crosses tenants (`crates/manager/src/manager/exec.rs:424`) | patterns match qualified ids (`payments-*/web`) | 2 |
 | Host volumes | any `job:write` holder can claim any name declared on a node | an allowlist per namespace policy (`hostVolumes`) | 4 |
 | Net policies | cluster objects; `namespaces` selector matched against `default` | cluster objects; selector facts are real | 1 |
 | KV, saved queries, the state explorer, the ledger | cluster-scoped | **stay** cluster-scoped and documented as such: operator tools | — |
@@ -1339,7 +1339,7 @@ rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceReply); // c
 - **Addressing a job:** every request that names a job gains
   `string namespace` (empty means `default`). Its existing name field
   accepts either `web` or `payments-prod/web`, through one shared parser in
-  `src/structs/namespace.rs`. A qualified name that disagrees with
+  `crates/common/src/structs/namespace.rs`. A qualified name that disagrees with
   `namespace` is `InvalidArgument`. The parser is shared because Legion's
   goal is that you can paste back what you were shown.
 - **Lists:** `repeated string namespaces` (names or globs; empty means
@@ -1354,24 +1354,24 @@ rpc DeleteNamespace(DeleteNamespaceRequest) returns (DeleteNamespaceReply); // c
 
 ### Structs
 
-- `src/structs/namespace.rs` (new) holds:
+- `crates/common/src/structs/namespace.rs` (new) holds:
   - `Namespace` and `validate_namespace_name`.
   - The single `DEFAULT_NAMESPACE`. The copies in `acl.rs` and
     `netpolicy.rs` are removed, not re-exported.
   - `JobRef { namespace, name }` with `parse_job_ref` and `qualified_id`,
     used by the CLI, MCP and server alike.
-- `src/structs/job.rs`: `namespace: Option<String>` on the jobspec.
-- `src/structs/acl.rs`:
+- `crates/common/src/structs/job.rs`: `namespace: Option<String>` on the jobspec.
+- `crates/common/src/structs/acl.rs`:
   - `AclResource::Namespace`.
   - `AclResource::is_namespaced()`.
   - The scope constructors take a namespace.
   - `AclScope::namespace(name)`.
   - The two `parse_rules` checks (§ 8.5).
-- `src/structs/netpolicy.rs`: the facts take a real namespace.
-- `src/structs/workload_identity.rs`: the placeholder, the floor, the new
+- `crates/common/src/structs/netpolicy.rs`: the facts take a real namespace.
+- `crates/common/src/structs/workload_identity.rs`: the placeholder, the floor, the new
   default, and the claim.
 
-### Persistence (`src/storage/migrations.rs`)
+### Persistence (`crates/manager/src/storage/migrations.rs`)
 
 ```sql
 CREATE TABLE IF NOT EXISTS namespace (

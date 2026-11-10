@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Split N simulated nodes across a scenario's node_profiles by their
 count weights — the same largest-remainder rule as Legion's
-`--simulate` (src/worker/simulate.rs::distribute), so every system's
+`--simulate` (crates/worker/src/worker/simulate.rs::distribute), so every system's
 fake fleet has the same class mix at every scale step.
 
 Emits one line per profile:  name cpus memory_gb count [key=value...]

@@ -191,11 +191,11 @@ would take a claimed host is refused, and the public doc says so.
 ## 5. Background: what exists today
 
 - **The app framework** (`src/apps/mod.rs`). A bundled app is one `BUNDLED`
-  entry: a Nickel manifest (`src/apps/bundled/*.ncl`) and a body,
+  entry: a Nickel manifest (`crates/common/src/bundled_apps/*.ncl`) and a body,
   `fn(AppContext) -> AppFuture`. The first Control leader seeds a record
-  for each, enabled (`seed_record`, `src/manager/apps.rs:363`). The manager
+  for each, enabled (`seed_record`, `crates/manager/src/manager/apps.rs:363`). The manager
   config's `apps.<name>.enabled` overrides that at seed time only. The
-  reconciler renders the job (`render_app_job`, `src/structs/app.rs:1389`)
+  reconciler renders the job (`render_app_job`, `crates/common/src/structs/app.rs:1389`)
   with the app's uid, its config file, and its `legion` identity.
 - **Jobspec extensions** (`docs/apps.md`, "Jobspec extensions"). An app
   declares a key at the `service` point with a JSON Schema. The manager
@@ -206,7 +206,7 @@ would take a claimed host is refused, and the public doc says so.
   or unreachable app passes values with a warning. No bundled app declares
   extensions yet, and there is no Rust client helper for the watch.
 - **The catalog** (`docs/service-discovery.md`). It is derived, not
-  registered. `ResolveService` (`src/manager/server.rs:11452`) returns
+  registered. `ResolveService` (`crates/manager/src/manager/server.rs:11452`) returns
   healthy endpoints filtered by `job:read`. There is no watch stream, so a
   consumer outside the worker polls.
 - **The gateway** (`src/gateway.rs`). It reads one HTTP/1 head per
@@ -215,21 +215,21 @@ would take a claimed host is refused, and the public doc says so.
   routing, where a browser reuses a connection across `/` and `/api`, so
   the ingress needs a per-request proxy. The gateway's envelope and
   host-parsing helpers are worth sharing.
-- **The datapath's HTTP mode** (`src/worker/netd/http.rs`). It is a hyper 1
+- **The datapath's HTTP mode** (`crates/worker/src/worker/netd/http.rs`). It is a hyper 1
   proxy with a private connection pool for a task's own upstreams. It is
   tied to the datapath's listener context, so the ingress reuses its
   approach, not its code.
-- **TLS helpers** (`src/worker/netd/tls.rs`): `certs_from_pem` and
+- **TLS helpers** (`crates/worker/src/worker/netd/tls.rs`): `certs_from_pem` and
   `key_from_pem`, with rustls 0.23 on `ring`. `rcgen` 0.13 (CSRs),
   `x509-parser` 0.16, `ring` (ES256), and async `reqwest` (rustls) are
   already in the tree, so an ACME client needs no new crate.
-- **Exec hardening** (`src/task_plugins/exec_isolation.rs`). It can only
+- **Exec hardening** (`crates/worker/src/task_plugins/exec_isolation.rs`). It can only
   *drop* bounding-set capabilities. The pre-exec sequence
-  (`configure_linux_process_options`, `src/task_plugins/exec.rs:729`)
+  (`configure_linux_process_options`, `crates/worker/src/task_plugins/exec.rs:729`)
   already owns the user switch when hardening needs privilege, which is
   where an ambient capability has to be raised.
 - **Static ports** are scheduler-reserved, one holder per node
-  (`task_static_ports`, `src/manager/scheduler.rs:1051`). So `replicas = N`
+  (`task_static_ports`, `crates/manager/src/manager/scheduler.rs:1051`). So `replicas = N`
   with static 80/443 spreads one replica per node without new placement
   code.
 
@@ -510,7 +510,7 @@ which the views showed as a cluster address only. Now:
   Linux. It goes in `configs/jobs/maximal.ncl`, `docs/task-runtime-exec.md`,
   and `docs/task-supervision.md`.
 - **Apps:** `BundledApp.seed_enabled`, and a new bundled manifest
-  `src/apps/bundled/ingress.ncl` with the `ingress` key at the `service`
+  `crates/common/src/bundled_apps/ingress.ncl` with the `ingress` key at the `service`
   point.
 - **Jobspec:** `service.ingress` (an app key, registered on every cluster by
   seeding). It goes in `configs/jobs/maximal.ncl` if the offline validator

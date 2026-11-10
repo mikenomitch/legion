@@ -9,14 +9,14 @@ Entries are ranked by project impact, highest first; the number is the rank.
 ---
 
 The object-storage entries came from that layer's own record and are ranked
-in with the rest. The layer is `src/storage/objects/` (`mod.rs`: schemes,
+in with the rest. The layer is `crates/worker/src/objects/` (`mod.rs`: schemes,
 `StoreUrl`, `ObjectCredential`, `OpenOptions`, `open`/`open_s3`; `aws.rs`:
 principal resolution and the one `AmazonS3` builder). Its consumers are the
-`contentStore` publisher (`src/content_publish.rs`), session manifests
-(`src/session_manifest.rs`), the `s3://` artifact fetcher
-(`src/artifacts/fetchers/s3.rs`), the manager's archive reads
-(`src/manager/archive.rs`), and streaming persistence's replica, restore and
-lease (`src/storage/persistence.rs`). Putting the three old S3 builders side
+`contentStore` publisher (`crates/worker/src/content_publish.rs`), session manifests
+(`crates/worker/src/session_manifest.rs`), the `s3://` artifact fetcher
+(`crates/worker/src/artifacts/fetchers/s3.rs`), the manager's archive reads
+(`crates/manager/src/manager/archive.rs`), and streaming persistence's replica, restore and
+lease (`crates/manager/src/storage/persistence.rs`). Putting the three old S3 builders side
 by side found three more bugs than the two that motivated it (entries
 7, 8, 12).
 

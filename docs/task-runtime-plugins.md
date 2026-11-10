@@ -39,7 +39,7 @@ schema. `legion job schema` emits the live per-runtime schemas under
 
 ## Plugin Contract
 
-Task runtimes implement `TaskPlugin` (`src/task_plugins/mod.rs`).
+Task runtimes implement `TaskPlugin` (`crates/worker/src/task_plugins/mod.rs`).
 
 Lifecycle hooks:
 

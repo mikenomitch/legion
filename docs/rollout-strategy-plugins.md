@@ -2,7 +2,7 @@
 
 A rollout strategy decides how a job's instances are replaced during a rollout,
 for example how many go at each step. You can swap in your own strategy as a
-plugin. The plugin contract is defined in `src/manager/rollout_strategy.rs`.
+plugin. The plugin contract is defined in `crates/worker/src/rollout_strategy.rs`.
 
 ## Contract
 

@@ -2,7 +2,7 @@
 //! `certs/Certificate` (docs/cert-manager.md), as the app parses them.
 //!
 //! The manager checks each object against the JSON Schema in the bundled
-//! manifest (`src/apps/bundled/certs.ncl`) and its CEL rules before the app
+//! manifest (`crates/common/src/bundled_apps/certs.ncl`) and its CEL rules before the app
 //! ever sees it, so these types only have to agree with that schema (a unit
 //! test parses every manifest example). What a schema cannot say (a DNS
 //! name's shape, a duration, `renewBefore` shorter than `duration`) is

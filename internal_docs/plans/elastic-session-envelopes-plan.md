@@ -19,9 +19,9 @@ tunable headroom (calls entry 4), and a resize that preempts to grow
 
 A session task reserves capacity per node as an **envelope**: a generated
 `<task>-envelope` allocation on every eligible node, sized by
-`stateful.envelope.resources` (`src/structs/session.rs:270`). Sessions are
+`stateful.envelope.resources` (`crates/common/src/structs/session.rs:270`). Sessions are
 admitted against the envelope's room, never against the node's free
-capacity (`src/worker/task_manager.rs:3531`). The scheduler counts the
+capacity (`crates/worker/src/worker/task_manager.rs:3531`). The scheduler counts the
 envelope like any allocation, so capacity accounting stays honest.
 
 The envelope holds its full size whether sessions fill it or not, and an
@@ -36,7 +36,7 @@ operator has to pick one number that is wrong at both ends of the day:
 - **Sized for the average, it refuses the peak.** A smaller envelope
   answers `RESOURCE_EXHAUSTED "every envelope ... is full"` once sessions
   fill it, even when the node has free room nobody is using
-  (`src/manager/sessions.rs:1176`). `docs/session-mode.md` tells the
+  (`crates/manager/src/manager/sessions.rs:1176`). `docs/session-mode.md` tells the
   operator to "size envelopes for the peak you want to absorb", which is
   the first bullet.
 
@@ -140,33 +140,33 @@ Resizes happen without an API call, and the existing
 
 - **The envelope task** is generated at parse time with `resources =
   envelope.resources` and `count = { num = 1, per = "id" }`
-  (`src/structs/session.rs:270`). The scheduler places it like any
+  (`crates/common/src/structs/session.rs:270`). The scheduler places it like any
   allocation and stores its size on the allocation row
-  (`allocation.resources`, `src/structs/ledger.rs:13`).
+  (`allocation.resources`, `crates/common/src/structs/ledger.rs:13`).
 - **The router reads the row**, not the task config, for each envelope's
-  room (`src/manager/sessions.rs:880`), and so does `legion session
+  room (`crates/manager/src/manager/sessions.rs:880`), and so does `legion session
   nodes`. Both pick up a resized row with no change.
 - **The node admits against the task config's `resources`**
-  (`src/worker/task_manager.rs:3546`), which the payload carries as
-  `TaskAllocation.task_resources` (`src/manager/dispatcher.rs:592`). It
+  (`crates/worker/src/worker/task_manager.rs:3546`), which the payload carries as
+  `TaskAllocation.task_resources` (`crates/manager/src/manager/dispatcher.rs:592`). It
   never sees the row.
 - **No in-place allocation resize exists.** Sandbox-scaling calls entry 11
   avoided one for promotion. But an in-place `UPDATE` of an allocation row
   already flows through every derived structure: the changeset projection
-  treats it as an upsert (`src/storage/store.rs:11444`), the read model
+  treats it as an upsert (`crates/manager/src/storage/store.rs:11444`), the read model
   splices it and adjusts the node's usage memo (`cache_apply_allocation_delta`),
   the work log marks it dirty so a streaming worker gets the new payload
-  (`src/storage/work_log.rs:217`), and the persisted `node_alloc_usage`
+  (`crates/manager/src/storage/work_log.rs:217`), and the persisted `node_alloc_usage`
   cache is invalidated by a node epoch bump (`node_alloc_fingerprint_tx`).
 - **Worker reports ride the heartbeat**, and scheduler-lane writes from a
   heartbeat on a follower are forwarded to the lane leader
-  (`src/storage/raft/forward.rs`), the same way snapshot reports are.
+  (`crates/manager/src/storage/raft/forward.rs`), the same way snapshot reports are.
 - **Blocked evals wake on capacity events**, which the projection derives
   from node changes and allocation deletes only
-  (`src/storage/store.rs:11717`). An in-place shrink frees room without a
+  (`crates/manager/src/storage/store.rs:11717`). An in-place shrink frees room without a
   delete, so it would not wake anything.
 - **Heartbeats run every 2 s** on fleets up to 2,500 nodes
-  (`src/constants.rs:141`), which bounds how fast a node can ask to grow.
+  (`crates/common/src/constants.rs:141`), which bounds how fast a node can ask to grow.
 
 ## 6. Proposed design
 
@@ -210,7 +210,7 @@ end up over a smaller envelope, on room the scheduler has already handed
 to someone else.
 
 Per envelope, at each heartbeat, the node's controller
-(`src/worker/envelope_elastic.rs`) reads the active sessions' usage `u`,
+(`crates/worker/src/worker/envelope_elastic.rs`) reads the active sessions' usage `u`,
 the committed size `s`, the floor, the ceiling, and one session's shape.
 Fill is `u / s`, the highest over the envelope's keys.
 
@@ -304,7 +304,7 @@ so retry in a few seconds, or raise stateful.envelope.max
 - `HeartbeatRequest.envelope_resizes` (repeated `EnvelopeResize`) and
   `HeartbeatReply.envelope_resizes` (repeated `EnvelopeResizeResult`).
 - `SessionEnvelopeConfig.max` and `.shrink_after`
-  (`src/structs/session.rs`), in `configs/jobs/maximal.ncl`.
+  (`crates/common/src/structs/session.rs`), in `configs/jobs/maximal.ncl`.
 - `ForwardableLaneWrite::ResizeEnvelope` on the manager plane (serde, same
   `PROTOCOL_VERSION` rules as the other variants).
 - Metric `legion_envelope_resizes_total{direction, outcome}`.
@@ -333,15 +333,15 @@ per-manager coalescer that folds every queued resize into one entry.
 
 ## 9. Testing plan
 
-- **Unit, controller** (`src/worker/envelope_elastic.rs`): grow at 0.9,
+- **Unit, controller** (`crates/worker/src/worker/envelope_elastic.rs`): grow at 0.9,
   grow when one session does not fit, target at 0.75 clamped to floor and
   ceiling, shrink only after `shrinkAfter` of sustained low use, never past
   usage, one request in flight, backoff after `refused`, cap lifted on
   every terminal answer.
-- **Unit, worker** (`src/worker/task_manager.rs`): admission uses the
+- **Unit, worker** (`crates/worker/src/worker/task_manager.rs`): admission uses the
   committed size and the shrink cap, a grow answer raises the room, a
   stale payload inside the trust window is ignored.
-- **Unit, spec** (`src/structs/session.rs`): every refusal in §6.1.
+- **Unit, spec** (`crates/common/src/structs/session.rs`): every refusal in §6.1.
 - **Integration** (`tests/integration/session_integration.rs`, fake nodes, single-voter
   raft): a heartbeat grow writes one entry and the router sees the new
   room, a grow on a node full of other work is `refused` with no entry, a

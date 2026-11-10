@@ -390,7 +390,7 @@ Proto (`proto/legion.proto`, documented per repo convention):
 
 Structs and config:
 
-- `src/artifacts/store.rs` (the CAS + index), `PinOwner`, GC loop wiring in
+- `crates/worker/src/artifacts/store.rs` (the CAS + index), `PinOwner`, GC loop wiring in
   the worker daemon.
 - `ArtifactSpec` += `ttl`.
 - Worker config += `artifacts.cache`; manager config += `artifacts.warm`;

@@ -142,7 +142,7 @@ sandboxes.
   [dependency graph](docs/jobs-tasks-and-scheduling.md), gated on another
   task starting, completing, or succeeding. Dependencies can span groups
   placed on different nodes, so you don't need a separate workflow engine.
-- **One file to install.** The shipping binary is ~91 MB on linux/amd64
+- **One file to install.** The shipping binary is ~97 MB on linux/amd64
   (stripped, fat LTO), against ~82 MB for k3s and ~150 MB for Nomad. It runs
   on macOS and Linux.
 

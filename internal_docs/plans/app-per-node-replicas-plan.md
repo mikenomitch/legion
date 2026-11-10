@@ -90,8 +90,8 @@ Non-goals:
 ## 5. What exists today
 
 - `AppManifest.replicas: u32` and `AppSettings.replicas: u32`, validated
-  1-32 (`src/structs/app.rs`), rendered as `count` in `render_app_job`.
-- `AppJobState::healthy` and `derive_status` (`src/manager/apps.rs`)
+  1-32 (`crates/common/src/structs/app.rs`), rendered as `count` in `render_app_job`.
+- `AppJobState::healthy` and `derive_status` (`crates/manager/src/manager/apps.rs`)
   compare `allocations.running` with `replicas × tasks`.
 - `UpdateAppSettings` takes `optional uint32 replicas`; `AppSettingsInfo`
   reports `uint32 replicas`.

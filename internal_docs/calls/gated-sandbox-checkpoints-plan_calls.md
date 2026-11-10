@@ -43,7 +43,7 @@ impose. The resolution already happens at placement, which has the node.
 
 **Call.** Phase 2 ships everything but the flip itself. `auto` resolving to
 `gated` for sandboxes on microVM nodes is implemented and tested, and held
-behind `SANDBOX_GATED_BY_DEFAULT = false` in `src/structs/network.rs` until
+behind `SANDBOX_GATED_BY_DEFAULT = false` in `crates/common/src/structs/network.rs` until
 G0.1 and G2.1 pass on a KVM host (Phase 0, the plan's gate). A store opens it
 per instance for tests (`Store::set_sandbox_gated_default`), and a manager
 started with `LEGION_SANDBOX_GATED_DEFAULT=1` opens it for verification runs.

@@ -336,7 +336,7 @@ treat every kind the same, the lesson of Kubernetes' kstatus.
 and `--wait` succeeds on it, rather than `Pending` forever. Precedence is
 `Orphaned`, `Deleting`, `Invalid`, `Stale`, `Pending`, `Rejected`,
 `NotReady`, `Ready`, `Accepted` (`summarize` in
-`src/structs/app_object.rs`; docs/app-objects.md, "Status").
+`crates/common/src/structs/app_object.rs`; docs/app-objects.md, "Status").
 
 ## 12. Object events reach only callers who may read the kind there, and carry no values
 
@@ -1244,7 +1244,7 @@ the object deployed; an orphaned kind has no app reconciling it.
 
 ## 53. Kinds validate across fields with CEL `rules`, evaluated in the manager and failing closed
 
-*Implementation, Phase O4 (`src/structs/object_rules.rs`).* **Call.** A
+*Implementation, Phase O4 (`crates/common/src/structs/object_rules.rs`).* **Call.** A
 kind declares `rules`: CEL expressions over `self` (the effective spec,
 defaults filled) and `oldSelf` (the stored spec, on update), each with a
 fixed `message` and an optional `path`. The manager compiles them at
@@ -1422,7 +1422,7 @@ resolved spec is authorized.
 
 ## 57. The autoscaler declares its parser's cross-field checks as rules; `immutable` and the validate call stay
 
-*Implementation, Phase O4 (`src/apps/bundled/autoscaler.ncl`).* **Call.**
+*Implementation, Phase O4 (`crates/common/src/bundled_apps/autoscaler.ncl`).* **Call.**
 ScalingPolicy declares 11 rules: `min <= max`, `max >= 1`, unique check
 names, no `query` on the `legion` source, `activation >= 0`, `tolerance`
 in [0, 1), a schedule window sets a bound and orders its bounds when both

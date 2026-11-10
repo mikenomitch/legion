@@ -1,9 +1,10 @@
 # Metrics & Health Probes
 
 The manager exposes Prometheus metrics and Kubernetes-style health probes on
-a dedicated HTTP listener (implemented in `src/manager/telemetry.rs`). Use them
-to alert on and graph cluster health. The registry is hand-rolled on atomics
-(no prometheus crate) and renders the standard text exposition format, so any
+a dedicated HTTP listener (`crates/manager/src/manager/telemetry.rs`). Use them
+to alert on and graph cluster health. The registry
+(`crates/common/src/telemetry.rs`, shared with the worker) is hand-rolled on
+atomics (no prometheus crate) and renders the standard text exposition format, so any
 Prometheus-compatible scraper works unchanged.
 
 ## Endpoints

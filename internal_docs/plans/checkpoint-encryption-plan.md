@@ -34,7 +34,7 @@ Three paths upload checkpoint parts to a remote store:
 - `legion instance fork --spread` publishes the fork checkpoint so the forks
   can land on other nodes.
 
-Each one runs [`ContentPublishing::publish`](../../src/content_publish.rs),
+Each one runs [`ContentPublishing::publish`](../../crates/worker/src/content_publish.rs),
 which copies the part from the node content store to
 `<contentStore.url>/sha256/<hex>` byte for byte. The public doc says so
 plainly: "A published snapshot is in your bucket, unencrypted"
@@ -155,20 +155,20 @@ the same structured errors on the existing snapshot and instance calls.
 
 ## 5. Background: what exists today
 
-- **Publisher.** `src/content_publish.rs`. `ContentPublishing::publish`
+- **Publisher.** `crates/worker/src/content_publish.rs`. `ContentPublishing::publish`
   rehashes the local blob (`ContentStore::verify`), then a
   `ContentPublisher` writes it: `FileContentPublisher` copies and rehashes,
   `S3ContentPublisher` streams a 16 MiB multipart upload. The URL is
   `<url>/sha256/<hex>`, recorded per digest in the node content store index
   (`record_published`).
-- **Publish op.** `src/worker/checkpoints.rs` `publish()` walks the
+- **Publish op.** `crates/worker/src/worker/checkpoints.rs` `publish()` walks the
   manifest's memory parts and fills each part's `url`. Every publish is a
   manager `CheckpointRequest { op = "publish" }`, built in
-  `build_checkpoint_requests` (`src/manager/server/snapshot_rpcs.rs`) for a
+  `build_checkpoint_requests` (`crates/manager/src/manager/server/snapshot_rpcs.rs`) for a
   snapshot in state `local`.
-- **Fetch.** `fetch_published_parts` (`src/worker/checkpoints.rs`) runs on
+- **Fetch.** `fetch_published_parts` (`crates/worker/src/worker/checkpoints.rs`) runs on
   the staging thread for a restore and on a blocking thread for `warm`. It
-  calls `ArtifactStager::fetch_into_store` (`src/artifacts/stage.rs`), which
+  calls `ArtifactStager::fetch_into_store` (`crates/worker/src/artifacts/stage.rs`), which
   downloads through the `s3://` or `file://` fetcher, checks the bytes
   against the plaintext digest, and imports them into the node store.
 - **Restore payload.** `snapshot_restore_payload` builds a `SnapshotRestore`
@@ -176,8 +176,8 @@ the same structured errors on the existing snapshot and instance calls.
   (including `--spread`), and `instance create --from-snapshot`. A worker
   holds it in memory only (`CheckpointState::restores`). It is not written to
   the worker's state file.
-- **Keyring.** `src/storage/keyring.rs` and
-  `src/storage/store/keyring_ops.rs`. The `keyring_key` table holds wrapped
+- **Keyring.** `crates/manager/src/storage/keyring.rs` and
+  `crates/manager/src/storage/store/keyring_ops.rs`. The `keyring_key` table holds wrapped
   32-byte keys with a free-text `state` column (`active`, `retired`). Rows
   replicate, every manager unwraps them at load, and `legion keyring root-key
   rewrap` rewraps every row. Initialization and the daemon's keyring loop run
@@ -327,7 +327,7 @@ Fetching adds one AES pass to the download. Measured numbers are in §9.
 One phase. Sealing without the key delivery, or delivery without sealing, is
 worth nothing on its own, and the change is a few hundred lines.
 
-1. Sealed object format and key derivation (`src/checkpoint_seal.rs`).
+1. Sealed object format and key derivation (`crates/common/src/checkpoint_seal.rs`).
 2. Checkpoint key in the keyring, minted with initialization and by the
    daemon loop on clusters that already have a keyring.
 3. Proto fields, manager-side key attachment, worker-side publish and fetch.

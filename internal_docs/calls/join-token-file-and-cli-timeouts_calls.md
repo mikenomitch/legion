@@ -31,7 +31,7 @@ and Kubernetes secrets mount as files, and systemd's `LoadCredential=` hands
 the unit a file, so the common platforms are covered.
 
 **Why.** Exec tasks inherit the worker's whole environment
-(`src/task_plugins/exec.rs` adds to it and never clears it). A token in the
+(`crates/worker/src/task_plugins/exec.rs` adds to it and never clears it). A token in the
 worker's environment reaches every host-mode exec task through `env`, which
 is worse than argv, where a task had to go looking with `ps`. A root-only
 `0600` file is readable only by root. This is a security boundary, so the

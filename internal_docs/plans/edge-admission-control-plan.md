@@ -107,7 +107,7 @@ Non-goals:
 ### 5.1 The claim window
 
 Each node keeps a window over its unratified **edge** claims
-(`src/worker/claim_window.rs`):
+(`crates/worker/src/worker/claim_window.rs`):
 
 - It starts at, and never exceeds, `edgeBoot.maxProvisionalPerNode`.
 - A verdict that arrives within `overloadThreshold` of the claim's lease is

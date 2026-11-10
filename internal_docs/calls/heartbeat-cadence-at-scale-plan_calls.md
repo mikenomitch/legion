@@ -259,7 +259,7 @@ registration payload it already sends, and the manager derives that node's
 lost window from it:
 
 ```rust
-// src/worker/daemon.rs, building the registration config_attrs
+// crates/worker/src/worker/daemon.rs, building the registration config_attrs
 config_attrs.insert("heartbeatSeconds".into(), json!(heartbeat_interval.as_secs()));
 ```
 

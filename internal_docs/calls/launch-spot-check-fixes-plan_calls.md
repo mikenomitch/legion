@@ -126,7 +126,7 @@ was annotated with a dated update rather than rewritten.
 Any unary Manager RPC that a follower rejects with the typed not-the-leader
 error is replayed, verbatim (headers, bearer token, idempotency key, deadline,
 body), to the leader named in the rejection, and the leader's reply is
-returned. A tower layer (`src/manager/leader_forward.rs`) buffers the request,
+returned. A tower layer (`crates/manager/src/manager/leader_forward.rs`) buffers the request,
 runs it locally, and forwards only when the reply is `FAILED_PRECONDITION`
 carrying the `x-legion-raft-leader` metadata that `map_store_error` now
 attaches. One hop (`x-legion-forwarded-by`), never `ExecAllocation` (the one
@@ -204,7 +204,7 @@ $ legion job logs web -j | jq '.data[0].removalCause'
 
 *Workstream: Scheduler.*
 
-`dependency_satisfied` (src/manager/scheduler.rs) no longer counts a batch
+`dependency_satisfied` (crates/manager/src/manager/scheduler.rs) no longer counts a batch
 dependency that is merely *planned in the same pass* as `complete`/`success`.
 Under the new `DependencyGate::Live` gate only a status a worker reported
 (`task_status`, written by `Store::complete_allocation`) satisfies them. A
@@ -965,7 +965,7 @@ it; both are now tested.
   by a UUID/ULID (unbounded ripple through every `i64` allocation id in the
   proto, worker state, and paths).
 - **Trade-off.** Relies on SQLite's AUTOINCREMENT bookkeeping, and edits a
-  file owned by the ha track (`src/storage/raft/state_machine.rs`, two small
+  file owned by the ha track (`crates/manager/src/storage/raft/state_machine.rs`, two small
   hunks plus tests).
 - **Why.** Smallest correct change on the path that was actually wrong;
   zero cost on the placement path (performance).
@@ -1026,7 +1026,7 @@ A capacity-blocked group re-ticks after `clamp(blocked_for / 2, 2s, 30s)`
 - **Trade-off:** a blocked rollout still produces some eval events (about two
   every 30s after the first minute), and capacity that appears is noticed up
   to 30s late.
-- **Why:** event emission is generic eval-loop code (src/manager/daemon.rs,
+- **Why:** event emission is generic eval-loop code (crates/manager/src/manager/daemon.rs,
   another track's file) and a per-kind exception there is a special case
   every reader of the stream would have to know. The rollout's own event log
   was already change-gated.
@@ -1369,7 +1369,7 @@ artifact staging failed: ... credentials from kv secrets/ecr-pull: connect to ma
 artifact credential: no cluster CA pin for the manager at http://172.31.80.241:4747; ...
 ```
 
-The registry in `src/worker/plane.rs` stays keyed by address, but every
+The registry in `crates/worker/src/worker/plane.rs` stays keyed by address, but every
 address of a cluster now maps to the *same* `PinnedManagerVerifier`.
 `trust_cluster_managers(seed, addrs)` adds the addresses a manager reported
 (and the persisted `managers.json` set) under the token's verifier, from

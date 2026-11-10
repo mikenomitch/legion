@@ -5,7 +5,7 @@
 //! and routed through `Store::replicated()`, with its body renamed to a
 //! private `<name>_apply` fn (or delegating into another replicated method's
 //! body). These tests make that classification *total*: they parse
-//! `src/storage/store.rs` + `src/storage/acl_store.rs` and assert that the
+//! `crates/manager/src/storage/store.rs` + `crates/manager/src/storage/acl_store.rs` and assert that the
 //! set of `fn <name>_apply` bodies and the set of `replicated(Lane::…, "…")`
 //! call sites exactly match the hardcoded classification below. Adding a
 //! mutating method without classifying it here fails these tests.
@@ -407,7 +407,10 @@ fn lane_for(method: &str) -> Lane {
 fn store_sources() -> String {
     let root = env!("CARGO_MANIFEST_DIR");
     let mut combined = String::new();
-    for path in ["src/storage/store.rs", "src/storage/acl_store.rs"] {
+    for path in [
+        "crates/manager/src/storage/store.rs",
+        "crates/manager/src/storage/acl_store.rs",
+    ] {
         combined.push_str(
             &std::fs::read_to_string(format!("{root}/{path}"))
                 .unwrap_or_else(|e| panic!("failed reading {path}: {e}")),

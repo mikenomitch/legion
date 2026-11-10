@@ -164,7 +164,7 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: 0
           CARGO_PROFILE_TEST_DEBUG: 0
         run: |
-          cargo test --lib --locked --no-run
+          cargo test -p legion-worker --lib --locked --no-run
           clang-18 -O2 -o "$RUNNER_TEMP/uring_connect" bpf/tests/uring_connect.c
 
       - name: Run the root-only kernel tests
@@ -173,7 +173,7 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: 0
         run: |
           sudo -E env "PATH=$PATH" LEGION_URING_PROBE="$RUNNER_TEMP/uring_connect" \
-            cargo test --lib --locked -- --ignored --test-threads=1 kernel:: capture_kernel
+            cargo test -p legion-worker --lib --locked -- --ignored --test-threads=1 kernel:: capture_kernel
 
   # For an intentional break, bump PROTOCOL_VERSION and label the PR
   # `proto-breaking-ok` to skip the check.
@@ -294,9 +294,9 @@ jobs:
         with:
           filters: |
             scheduler:
-              - 'src/manager/scheduler.rs'
-              - 'src/storage/store.rs'
-              - 'src/manager/daemon.rs'
+              - 'crates/manager/src/manager/scheduler.rs'
+              - 'crates/manager/src/storage/store.rs'
+              - 'crates/manager/src/manager/daemon.rs'
               - 'benchmarks/scheduler/**'
               - 'tests/integration/scheduler_benchmark_slo.rs'
               - 'tests/integration/benchmark_support/**'

@@ -20,7 +20,7 @@ plan:
 
 1. `available_nodes()` → `Store::cached_nodes()` **deep-clones every
    `Node`**, including its four `serde_json::Value` attribute bags
-   (`src/manager/scheduler.rs:963`, `src/storage/store.rs`).
+   (`crates/manager/src/manager/scheduler.rs:963`, `crates/manager/src/storage/store.rs`).
 2. `ResourceLedger::new` **re-parses every node's capacity from JSON**
    (`ResourcePool::from_node`: fingerprint memory/cpu parsing, custom
    `config_attrs.resources`, reservations) and re-normalizes every
@@ -83,7 +83,7 @@ and was pulled into scope during execution — see the status note.)
    capacity read" rule, unchanged). Pools and allocations can therefore
    never disagree with each other, and any later mutation bumps an epoch
    the apply-time compare-and-set checks.
-5. **Resource types move to `src/resources.rs`.** `ResourcePool`,
+5. **Resource types move to `crates/common/src/resources.rs`.** `ResourcePool`,
    `ResourceRequest`, `ResourceValue`, and the fingerprint/parse helpers
    become crate-internal (`pub(crate)`) residents of the resources module —
    they now have three consumers (scheduler, store, scheduling index) and

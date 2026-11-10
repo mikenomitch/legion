@@ -355,7 +355,7 @@ index is invisible to `legion state query`.
 
 **Why (performance and scale).** At snapshot scale a node's content set
 churns on every suspend. Dynamic attributes are replicated and every change
-enqueues evals for the node's jobs (`src/manager/server.rs:6209-6217`).
+enqueues evals for the node's jobs (`crates/manager/src/manager/server.rs:6209-6217`).
 A table puts that churn on raft. Losing locality briefly costs placement
 quality, never correctness, which is the same argument that took liveness
 off raft.

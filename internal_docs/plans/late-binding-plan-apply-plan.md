@@ -17,30 +17,30 @@ terminally — blocked-eval waits belong to the gang-scheduling plan.
 Legion applies placement plans with Omega-style optimistic concurrency:
 the planner works against a snapshot, submits exactly one node per
 placement together with a version vector (the job-config epoch plus a
-per-node epoch for each placed-on node, `src/manager/scheduler.rs:810`),
+per-node epoch for each placed-on node, `crates/manager/src/manager/scheduler.rs:810`),
 and the apply path rejects the whole plan if any epoch moved
-(`src/storage/store.rs:2187`). Conflicts are already scoped as tightly as
+(`crates/manager/src/storage/store.rs:2187`). Conflicts are already scoped as tightly as
 optimistic concurrency allows — two plans conflict only when they touch
 the same node.
 
 The problem is that concurrent planners *reliably* touch the same node:
 
 - Eval workers default to one per CPU core
-  (`default_eval_threads`, `src/structs/config.rs:1355`), so a burst of
+  (`default_eval_threads`, `crates/common/src/structs/config.rs:1355`), so a burst of
   independent job submits genuinely plans in parallel.
 - In Fresh mode (the submit path), `bin_pack`/`spread` pick the
   argmax-scoring node, with random tie-breaking only among *exact* score
-  ties (within `1e-9`, `src/manager/scheduler.rs:2294`). The 1% score
+  ties (within `1e-9`, `crates/manager/src/manager/scheduler.rs:2294`). The 1% score
   jitter band exists but arms only in Reschedule mode
-  (`src/manager/scheduler.rs:1016`). Concurrent planners read the same
+  (`crates/manager/src/manager/scheduler.rs:1016`). Concurrent planners read the same
   snapshot, compute the same scores, and pick the same node.
 - One wins; the rest hit the CAS, sleep 25–500 ms, and replan — and
   converge on the same node again. A burst of N single-allocation jobs
   degenerates to ~N serial apply rounds with O(N²) wasted planning.
 - The retry budget defaults to **3**
-  (`plan_conflict_max_retries`, `src/structs/eval.rs:355`), and an eval
+  (`plan_conflict_max_retries`, `crates/manager/src/manager/eval.rs:355`), and an eval
   that exhausts it is marked failed — and **failed evals are never
-  retried** (`src/storage/store.rs:9525`, the comment on
+  retried** (`crates/manager/src/storage/store.rs:9525`, the comment on
   `release_eval_for_retry`). The job silently never places.
 
 What a user has to do today: raise `plan_conflict_max_retries` toward its
@@ -179,41 +179,41 @@ rank instead of a retry.**
 ## Background — What Exists Today
 
 - **Plan submission.** `create_plan_submission`
-  (`src/storage/store.rs:2095`) persists
+  (`crates/manager/src/storage/store.rs:2095`) persists
   `placements: Vec<(node_id, task_id)>` as JSON plus
   `expected_version_vector`. The scheduler samples epochs for **every
   candidate node** before planning
   (`allocation_version_vector_for_candidates`,
-  `src/storage/store.rs:1933`, called at
-  `src/manager/scheduler.rs:715`) and narrows to the placed-on subset at
-  submit (`expected_versions_for`, `src/manager/scheduler.rs:878`). The
+  `crates/manager/src/storage/store.rs:1933`, called at
+  `crates/manager/src/manager/scheduler.rs:715`) and narrows to the placed-on subset at
+  submit (`expected_versions_for`, `crates/manager/src/manager/scheduler.rs:878`). The
   epochs come from an in-memory mirror kept coherent with the allocation
   cache (the 2026-07-28 plan-fence fix).
-- **Apply.** `apply_plan_submission_apply` (`src/storage/store.rs:2176`)
+- **Apply.** `apply_plan_submission_apply` (`crates/manager/src/storage/store.rs:2176`)
   is a replicated scheduler-lane op: compare the full vector (`:2187`,
   all-or-nothing), re-validate availability/constraints/permit on the
   fresh node row per placement (`:2282`), assign networks — static port
   collisions fail placement with a node-scoped error
-  (`src/storage/store.rs:6512`) — insert allocations, bump the touched
+  (`crates/manager/src/storage/store.rs:6512`) — insert allocations, bump the touched
   node and job-config epochs (`:2352`).
 - **Conflict retry.** `Eval::plan_with_conflict_retries`
-  (`src/structs/eval.rs:293`): full replan per attempt, adaptive backoff
+  (`crates/manager/src/manager/eval.rs:293`): full replan per attempt, adaptive backoff
   (base 25 ms, cap 500 ms, jitter), default 3 attempts, then the eval is
-  failed terminally (`complete_eval_impl`, `src/storage/store.rs:9558`).
-  `release_eval_for_retry` (`src/storage/store.rs:9540`) already exists
+  failed terminally (`complete_eval_impl`, `crates/manager/src/storage/store.rs:9558`).
+  `release_eval_for_retry` (`crates/manager/src/storage/store.rs:9540`) already exists
   — built for foreign-lane `NotRaftLeader` rejections — and requeues a
   claimed eval as `pending` with a delay.
-- **Selection.** `select_cached_node` (`src/manager/scheduler.rs:2279`)
+- **Selection.** `select_cached_node` (`crates/manager/src/manager/scheduler.rs:2279`)
   scores eligible nodes and returns the argmax with exact-tie shuffle;
   the jitter variant (`:2308`, band
   `RESCHEDULE_SCORE_JITTER_THRESHOLD = 0.01`, `:28`) is Reschedule-only.
   The scored list the selector already computes is exactly the ranking a
   candidate list needs — today all but the winner is discarded.
 - **Coupling machinery that already exists:** `DistinctTracker`
-  (`src/constraints.rs`) threads distinct-constraint state across
+  (`crates/common/src/constraints.rs`) threads distinct-constraint state across
   placements in one plan; group co-placement builds combined candidate
   sets in `build_plan`; colocation affinities
-  (`task_colocation_preferences`, `src/manager/scheduler.rs:2729`) softly
+  (`task_colocation_preferences`, `crates/manager/src/manager/scheduler.rs:2729`) softly
   couple tasks; Reschedule mode already knows how to "place only what is
   missing" with excluded nodes — the refill shape Phase 4's partial
   commit would reuse.

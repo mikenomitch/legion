@@ -138,20 +138,20 @@ usage — usage integrates reservations.
 ## 5. What exists today
 
 - ACL checks: `ManagerDaemonService::check_acl`/`authenticate_acl`
-  (`src/manager/server.rs:2364`) and `acl::enforce` (`src/manager/acl.rs:857`),
+  (`crates/manager/src/manager/server.rs:2364`) and `acl::enforce` (`crates/manager/src/manager/acl.rs:857`),
   which logs denials to `acl_audit` and nothing else.
 - Delegation: `with_delegation` resolves `legion-on-behalf-of` /
   `legion-for-object` into `AclSource::Delegated` / `ForObject` identities
-  (`src/manager/server/delegation.rs`).
+  (`crates/manager/src/manager/server/delegation.rs`).
 - Idempotency: `scoped_idempotency_key` (`server.rs:13207`) sees every
   idempotency key a handler honours.
-- The gRPC stack in `src/manager/daemon.rs:760`: OIDC, origin guard, CORS,
+- The gRPC stack in `crates/manager/src/manager/daemon.rs:760`: OIDC, origin guard, CORS,
   gRPC-Web, metrics, app-page guard, leader forwarding (innermost).
 - Commutative raft tables (`scheduler_event`, `idempotency_record`): insert
-  from any lane, pruned locally (`src/storage/raft/ownership.rs`).
+  from any lane, pruned locally (`crates/manager/src/storage/raft/ownership.rs`).
 - Tokens: `acl_token` rows, `CreateAclToken` needs `acl:write`
   (`server.rs:12128`), `acl.tokenMaxTtl` unbounded by default
-  (`src/structs/config.rs:1602`).
+  (`crates/common/src/structs/config.rs:1602`).
 - MCP: `src/cmd/mcp.rs`, stdio, `2024-11-05`, 107 tools.
 - Namespace charged usage: `namespace_charges` (current only).
 
@@ -159,7 +159,7 @@ usage — usage integrates reservations.
 
 ### 6.1 The governance layer (AI2, AI3 gates)
 
-A tower layer, `GovernanceLayer` (`src/manager/governance/`), sits innermost
+A tower layer, `GovernanceLayer` (`crates/manager/src/manager/governance/`), sits innermost
 in the manager's gRPC stack, inside leader forwarding, so only the manager
 that actually executes a request journals it. For each `/legion.Manager/*`
 request it:
@@ -282,7 +282,7 @@ other tokens are named in `overrides` by accessor. Limits are per manager
 ### 6.6 Caller-aware catalog
 
 `GetCallerCapabilities` evaluates the caller against every Manager RPC's
-required permission (a table in `src/manager/rpc_access.rs`, kept equal to
+required permission (a table in `crates/manager/src/manager/rpc_access.rs`, kept equal to
 the ACL endpoint table by a test) and answers `allowed` / `partial` (some
 namespaces) / `denied` / `open`. `legion capabilities --mine` and the MCP
 `legion_capabilities` tool merge it into the catalog.

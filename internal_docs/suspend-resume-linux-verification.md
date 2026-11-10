@@ -785,7 +785,7 @@ cargo run -q -- job logs workspaces | tail -3
 - **Fail, `permission denied` opening the memory or state file:** restore
   hardlinks parts out of the content store, whose blobs are mode `0444`. If a
   VMM opens them for writing, `materialize_parts` in
-  `src/worker/checkpoints.rs` must copy instead of hardlink (or the store
+  `crates/worker/src/worker/checkpoints.rs` must copy instead of hardlink (or the store
   must hand out a writable clone). Record which VMM and version.
 - Record the restore time (`snapshot.restored` has no duration yet, so time
   `restore --wait` and note it). Repeat with `hypervisor =
@@ -2001,7 +2001,7 @@ the gated default, and TAP addressing ran against fakes, fixture trees, Unix
 sockets standing in for vsock, and (for the guest's netlink re-addressing) a
 veth pair in a throwaway network namespace. No guest booted. Phase 0 is the
 gate: until G0.1 passes on both VMMs, `SANDBOX_GATED_BY_DEFAULT` in
-`src/structs/network.rs` stays `false`, and nothing here is claimed as
+`crates/common/src/structs/network.rs` stays `false`, and nothing here is claimed as
 boot-tested.
 
 Status: **pending** (no KVM host has run any item below). Record each run

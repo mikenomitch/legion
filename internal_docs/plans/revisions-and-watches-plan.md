@@ -26,23 +26,23 @@ tool today: poll.
   app objects, but it polls a fingerprint about once a second and resends a
   full snapshot on every reconnect.
 - **Event ids can go backwards after a failover.** They are wall clock plus a
-  per-process sequence (`src/storage/store.rs`, `next_scheduler_event_id`), so
+  per-process sequence (`crates/manager/src/storage/store.rs`, `next_scheduler_event_id`), so
   a new leader whose clock is behind mints ids below a poller's cursor
   (`docs/event-stream.md`, "ID ordering is per manager process").
 - **Read-after-write through a follower is not guaranteed.** A follower that
-  forwards a write to the leader (`src/manager/leader_forward.rs`) returns
+  forwards a write to the leader (`crates/manager/src/manager/leader_forward.rs`) returns
   the leader's reply at once; the client's next read on the same follower can
   run before the follower applied its own write.
 - **There is no linearizable read.** `ensure_linearizable` exists in the raft
   driver but only guards a new leader's first capture.
 - **A manager restart or failover resyncs every worker it served.**
   `StreamWork` positions hang off a random per-process epoch
-  (`src/storage/work_log.rs`), so a worker that reconnects anywhere else is
+  (`crates/manager/src/storage/work_log.rs`), so a worker that reconnects anywhere else is
   sent its whole desired set, rebuilt from store reads. Losing a manager at
   10k–50k nodes means thousands of full-set builds at once (ST3).
 - **The heartbeat handler parks a runtime thread on raft writes.**
   `handle_failed_allocations`, `handle_terminated_allocations`, and
-  `update_allocation_health_snapshots` run inline (`src/manager/server.rs`,
+  `update_allocation_health_snapshots` run inline (`crates/manager/src/manager/server.rs`,
   `heartbeat`), and each can make a blocking replicated write (ST5).
 - **Jobs are less declarative than objects.** `RunJobRequest` has no
   `expected_version`, so two agents silently overwrite each other's jobs;
@@ -150,27 +150,27 @@ Non-goals:
 
 - **The applied index commits with the data.** The raft state machine writes
   each lane's applied log id to `raft_applied` inside the same savepoint as
-  the entry's rows (`src/storage/raft/state_machine.rs`, `apply`). In
+  the entry's rows (`crates/manager/src/storage/raft/state_machine.rs`, `apply`). In
   `single` topology one group (`control`) carries every lane; under `lanes`
   there is one group, and one row, per lane (`physical_group`,
-  `src/storage/raft/mod.rs`).
+  `crates/manager/src/storage/raft/mod.rs`).
 - **Every replica projects every committed changeset.**
-  `Store::project_changeset_side_effects` (`src/storage/store.rs`) runs after
+  `Store::project_changeset_side_effects` (`crates/manager/src/storage/store.rs`) runs after
   each apply on every replica, and already feeds the read model, the event
   broadcast, and the `StreamWork` log. In `local_disk` mode,
   `capture::local_projected_mutation` projects a session changeset filtered
   to `READ_MODEL_TABLES`.
 - **Single-writer table ownership.** `job`, `job_config`, `task_config`, and
   `kv_entry` are Control-lane tables; `allocation`, `instance`, `volume` are
-  Scheduler; `task_status` is Status (`src/storage/raft/ownership.rs`).
+  Scheduler; `task_status` is Status (`crates/manager/src/storage/raft/ownership.rs`).
 - **The derived job status spans all three lanes**
-  (`src/storage/store/job_status_ops.rs`): the job row, its latest version's
+  (`crates/manager/src/storage/store/job_status_ops.rs`): the job row, its latest version's
   tasks, live allocations, task outcomes, and keyed instances.
-- **`StreamWork`** (`src/storage/work_log.rs`, `src/manager/server/work_stream.rs`,
-  `src/worker/work_stream.rs`): per-node `dirty`/`held`/`unacked` state on the
+- **`StreamWork`** (`crates/manager/src/storage/work_log.rs`, `crates/manager/src/manager/server/work_stream.rs`,
+  `crates/worker/src/worker/work_stream.rs`): per-node `dirty`/`held`/`unacked` state on the
   serving manager, an order-independent digest checked on each heartbeat, and
   a random epoch per manager process.
-- **Leader forwarding** (`src/manager/leader_forward.rs`): a follower runs a
+- **Leader forwarding** (`crates/manager/src/manager/leader_forward.rs`): a follower runs a
   request locally and replays it verbatim to the leader only when the reply
   is the typed not-the-leader rejection.
 - **CAS elsewhere:** `ApplyObjectRequest.expected_version` (`ABORTED` on
@@ -373,7 +373,7 @@ the heartbeat update.
 
 ## Implementation phases
 
-1. **Revisions + journal** (`src/storage/revisions.rs`, projection hook):
+1. **Revisions + journal** (`crates/manager/src/storage/revisions.rs`, projection hook):
    revisions on replies. Valuable alone: a client can tell how new a reply is.
 2. **Blocking reads.** Valuable alone: polling loops become one call.
 3. **`Watch`** + CLI `job watch`/`kv watch`/`alloc watch` + MCP `legion_watch`.
@@ -387,9 +387,9 @@ Each phase stands alone; phases 2, 3, and 6 need phase 1.
 
 ## Testing plan
 
-- Unit (`src/storage/revisions.rs`): revision parse/format/cover; journal
+- Unit (`crates/manager/src/storage/revisions.rs`): revision parse/format/cover; journal
   window, horizons, per-node changes, resets; changes-since filtering.
-- Unit (`src/storage/work_log.rs`): a resume attaches without a resync and
+- Unit (`crates/manager/src/storage/work_log.rs`): a resume attaches without a resync and
   carries the changed allocations; a too-old revision resyncs.
 - Unit (server): the heartbeat handler does not block the runtime while its
   writes wait; RunJob CAS success, conflict, must-not-exist; plan diff paths.

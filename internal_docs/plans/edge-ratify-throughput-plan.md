@@ -18,7 +18,7 @@ The public doc is [`docs/edge-boot.md`](../../docs/edge-boot.md)
 Every edge start boots without a manager, but it still needs one durable
 ratification: `RatifyClaim` → `edge_boot::ratify` → a one-placement plan
 apply inside one scheduler-lane group-commit entry
-(`src/manager/edge_boot.rs`, `src/storage/store/group_commit.rs`). That
+(`crates/manager/src/manager/edge_boot.rs`, `crates/manager/src/storage/store/group_commit.rs`). That
 write caps sustained edge starts per second, and nothing about it had been
 measured.
 
@@ -32,7 +32,7 @@ and the other 63 failed the job-config check with `plan epoch for job config
 one node after the first, on the node epoch.
 
 A refusal is not a retry. The worker applies every refused verdict as a kill
-(`src/worker/server.rs::drive_claim` → `edge::apply_verdict`), whatever the
+(`crates/worker/src/worker/server.rs::drive_claim` → `edge::apply_verdict`), whatever the
 public doc's refusal table says about `internal`. So under any real burst,
 most sandboxes a node had already booted were killed, and the platform saw
 random `refused` starts with an `internal` reason that pointed nowhere.
@@ -124,10 +124,10 @@ that runs in parallel on the manager's cores, not the serialized commit
 
 ## 5. Background: what exists today
 
-- `RatifyClaim` (`src/manager/server.rs::ratify_claim`) authenticates the
+- `RatifyClaim` (`crates/manager/src/manager/server.rs::ratify_claim`) authenticates the
   node, re-verifies the ticket, and calls `edge_boot::ratify` directly on
   the async runtime.
-- `edge_boot::ratify` (`src/manager/edge_boot.rs`) samples
+- `edge_boot::ratify` (`crates/manager/src/manager/edge_boot.rs`) samples
   `allocation_version_vector_for_candidates(job_config_id, [node])` from
   the epoch mirror, decides whether this start is the create, and submits
   one closure to `Store::scheduler_group_commit`: spend the ticket, create
@@ -137,7 +137,7 @@ that runs in parallel on the manager's cores, not the serialized commit
   ratifications never touch the plan coalescer or
   `schedulerSettings.plan_apply_batch_max`. The TODO's "capped by
   `plan_apply_batch_max` (default 16)" was stale.
-- `apply_plan_submission_on` (`src/storage/store.rs`) checks the
+- `apply_plan_submission_on` (`crates/manager/src/storage/store.rs`) checks the
   job-config epoch first, all or nothing, then walks candidates. For a
   plan with `target_instance` the node epoch was a hard gate and the
   revalidation pass never ran. The comment's reason was that "a moved

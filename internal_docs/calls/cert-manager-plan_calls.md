@@ -9,7 +9,7 @@ its rank.
 ## 1. The cert manager is a bundled app with object kinds, not a core subsystem
 
 The request was "a cert manager as a built in app". It is a bundled
-app (`src/apps/certs/`, manifest `src/apps/bundled/certs.ncl`), with two
+app (`src/apps/certs/`, manifest `crates/common/src/bundled_apps/certs.ncl`), with two
 object kinds, `certs/Issuer` and `certs/Certificate`, reconciled through the
 apps framework.
 

@@ -2,7 +2,7 @@
 //! and a shallow fetch of that one commit (docs/gitops.md, "How a sync
 //! works").
 //!
-//! Like the artifact fetcher (`src/artifacts/fetchers/git.rs`), it runs the
+//! Like the artifact fetcher (`crates/worker/src/artifacts/fetchers/git.rs`), it runs the
 //! `git` binary and hands it a token through `GIT_CONFIG_*` environment
 //! variables, so a secret never appears in a process's arguments or in a
 //! log. Each command may speak only its URL's own transport

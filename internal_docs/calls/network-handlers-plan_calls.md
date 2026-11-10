@@ -362,7 +362,7 @@ chain or not; a service can gain an ingress chain without touching its image.
 **Trade-off.** Two cert-source paths; for one phase, mTLS exists but
 `service.allow` is still control-plane.
 
-**Why.** There is no workload CA today (`src/certs.rs` is a dev fixture); 6b
+**Why.** There is no workload CA today (`crates/common/src/certs.rs` is a dev fixture); 6b
 is issuance, rotation, revocation, and a new root of trust. Every operator
 with an internal CA can be served without any of it.
 

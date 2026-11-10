@@ -84,36 +84,36 @@ Concretely, today:
 
 - **Every sandbox start is a cold boot.** The `sandbox` runtime builds a root
   disk, boots a kernel, runs `/legion/init`, and runs the command
-  (`src/task_plugins/sandbox.rs:598-691`, `src/task_plugins/microvm.rs:482-561`).
+  (`crates/worker/src/task_plugins/sandbox.rs:598-691`, `crates/worker/src/task_plugins/microvm.rs:482-561`).
   There is no pause, snapshot, or restore anywhere in the runtime or the
-  `TaskPlugin` trait (`src/task_plugins/mod.rs:442-738`). An agent workspace
+  `TaskPlugin` trait (`crates/worker/src/task_plugins/mod.rs:442-738`). An agent workspace
   that stops loses its warm language server, its REPL, and its loaded model.
 - **An idle sandbox costs as much as a busy one.** A keyed instance is either
   `active` (holding its full reservation) or `stopped` (holding nothing, and
-  cold-booting on `start`) (`src/structs/instance.rs:67-86`,
-  `src/storage/store.rs:14599-14738`). Nothing detects idleness. The only
+  cold-booting on `start`) (`crates/common/src/structs/instance.rs:67-86`,
+  `crates/manager/src/storage/store.rs:14599-14738`). Nothing detects idleness. The only
   way to reclaim memory from a sandbox that is waiting on a human is to stop
   it and pay a cold start later.
 - **Reservations are the only memory model.** Resources are a single number
   per dimension with no request/limit split. The fit check is
-  `available >= amount` over declared values (`src/resources.rs:678-689`),
+  `available >= amount` over declared values (`crates/common/src/resources.rs:678-689`),
   and the public docs say it plainly: "No oversubscription and no
   node-pressure eviction" (`docs/preemption-and-eviction.md:351-353`). A
   service that idles at 300 MiB and spikes to 2 GiB must reserve 2 GiB
   forever.
 - **Nobody measures actual usage.** The worker fingerprints memory once at
-  startup (`src/worker/daemon.rs:268`), and the heartbeat carries no usage
+  startup (`crates/worker/src/worker/daemon.rs:268`), and the heartbeat carries no usage
   fields (`proto/legion.proto:2861-2930`). The scheduler cannot tell a node
   at 95% real memory from one at 5%.
 - **Sandboxes are not governed at all.** `sandbox` returns
-  `ResourceEnforcement::Unsupported` (`src/task_plugins/mod.rs:581`,
+  `ResourceEnforcement::Unsupported` (`crates/worker/src/task_plugins/mod.rs:581`,
   `docs/task-runtime-sandbox.md:307`), so a guest's memory is whatever the
   VMM allocates, outside any cgroup.
 - **Nothing moves bytes to where work lands.** There is no node cache, no
   advertisement of what a node holds, and no locality scoring
   (`internal_docs/TODO.md:1304-1316`). Every allocation re-fetches its
   artifacts into a per-allocation staging dir
-  (`src/artifacts/stage.rs:443-447`). A multi-GiB memory snapshot needs
+  (`crates/worker/src/artifacts/stage.rs:443-447`). A multi-GiB memory snapshot needs
   this badly.
 - **Forking is impossible.** There is no way to say "give me five copies of
   this sandbox as it is right now."
@@ -199,7 +199,7 @@ call that out (InfoQ, above), and it is the opening for Legion.
   kubelet evicts under node pressure in roughly that order.
   **Take:** request vs limit is the right model, and node-pressure eviction
   needs an order. **Reject:** named QoS classes as a concept. Legion already
-  has priority bands (`src/structs/band.rs:60-160`), and "is this allocation
+  has priority bands (`crates/common/src/structs/band.rs:60-160`), and "is this allocation
   above its reservation right now" is a measured fact, not a class.
 
 ### 2.5 Nomad: `memory_max`
@@ -235,7 +235,7 @@ placement is a later plan, once we have numbers from real fleets.
   for reseeding the guest RNG on clone. Restoring the same memory file with
   `MAP_PRIVATE` in several VMs gives copy-on-write sharing for free.
 - cloud-hypervisor exposes `pause`/`snapshot`/`restore` on the API socket
-  Legion already creates (`src/task_plugins/microvm.rs:357`) and supports a
+  Legion already creates (`crates/worker/src/task_plugins/microvm.rs:357`) and supports a
   balloon with free page reporting.
 - CodeSandbox's [VM cloning writeup](https://codesandbox.io/blog/how-we-clone-a-running-vm-in-2-seconds)
   shows live fork in production: pause, snapshot, copy-on-write memory and
@@ -383,7 +383,7 @@ starts sandboxes that skip boot and imports entirely.
 - **GPU sandboxes.** VMM snapshot support for passthrough devices does not
   exist in either VMM.
 - **CPU pressure handling.** CPU is already work-conserving under
-  `cpu.weight` (`src/worker/resources.rs:125-142`). The ladder is for memory,
+  `cpu.weight` (`crates/worker/src/worker/resources.rs:125-142`). The ladder is for memory,
   the resource whose exhaustion kills things.
 
 ---
@@ -392,25 +392,25 @@ starts sandboxes that skip boot and imports entirely.
 
 **Instances.** Keyed and slot instances have a stable id, a storage handle,
 and at most one live allocation
-(`src/storage/migrations.rs:415-429`, `src/structs/instance.rs:23-147`).
+(`crates/manager/src/storage/migrations.rs:415-429`, `crates/common/src/structs/instance.rs:23-147`).
 `InstanceState` is `pending | active | rescheduling | stopped | terminated`.
 `stop` deletes the allocation and keeps the row and handle in one
-transaction (`src/storage/store.rs:14599-14668`). `start` moves
+transaction (`crates/manager/src/storage/store.rs:14599-14668`). `start` moves
 `stopped → pending` (`:14683-14738`). A keyed task's desired count is its
 instances not in `stopped` or `terminated` (`:14745-14756`). Instance RPCs
-gate on `job:write` (`src/manager/server.rs:4539-4571`). There are no
+gate on `job:write` (`crates/manager/src/manager/server.rs:4539-4571`). There are no
 `instance.*` events.
 
-**Allocations** have a free-string status (`src/constants.rs:34-50`). A stop
+**Allocations** have a free-string status (`crates/common/src/constants.rs:34-50`). A stop
 deletes the row, the worker sees it missing from
 `HeartbeatReply.desired_allocations`, and `StopCause` records why
-(`src/structs/stop.rs:27-78`).
+(`crates/common/src/structs/stop.rs:27-78`).
 
 **Sandbox runtime.** Backends are cloud-hypervisor, Firecracker, Apple
-`container`, and an OCI dev mode (`src/task_plugins/microvm.rs:79-146`).
+`container`, and an OCI dev mode (`crates/worker/src/task_plugins/microvm.rs:79-146`).
 cloud-hypervisor launches with `--api-socket` that nothing connects to
 (`:357`). Firecracker launches `--no-api --config-file` with no control
-channel (`src/task_plugins/sandbox.rs:733-740`). Guest memory is fixed at boot
+channel (`crates/worker/src/task_plugins/sandbox.rs:733-740`). Guest memory is fixed at boot
 from `config.memory_mib` (default 512), separate from `resources.memory`
 (`sandbox.rs:52-85`, `microvm.rs:351,404`). There is no balloon, hotplug, or
 free page reporting. A guest agent exists, `legion guest-agent`, but it only
@@ -421,47 +421,47 @@ do not work on sandboxes yet.
 
 **Task runtime trait.** `prepare/start/stop/destroy`, `stop_with`,
 `signal`, `exec`, `supported_volume_modes`, `resource_enforcement`, network
-gate hooks (`src/task_plugins/mod.rs:442-738`). No checkpoint hook.
+gate hooks (`crates/worker/src/task_plugins/mod.rs:442-738`). No checkpoint hook.
 
 **Volumes.** `VolumeOp` reserves `Snapshot`, `Restore`, `Clone`, `Expand`,
 but the `VolumeDriver` trait dispatches only
-`capabilities/mount/unmount/destroy` (`src/volumes/mod.rs:61-80,554-572`).
-`local-dir` block mode is a sparse ext4 image (`src/volumes/builtins.rs:61-160`).
+`capabilities/mount/unmount/destroy` (`crates/common/src/volumes/mod.rs:61-80,554-572`).
+`local-dir` block mode is a sparse ext4 image (`crates/common/src/volumes/builtins.rs:61-160`).
 
 **Resources and fit.** `cpus`/`cpu` (MHz), `cores`, `memory` (MiB), custom
-counters (`src/resources.rs:43-90,1081-1083`). Node capacity comes from the
+counters (`crates/common/src/resources.rs:43-90,1081-1083`). Node capacity comes from the
 registration fingerprint minus `reservedResources`
-(`src/resources.rs:552-600`). Fit is `ResourcePool::can_fit`
+(`crates/common/src/resources.rs:552-600`). Fit is `ResourcePool::can_fit`
 (`:678-689`), re-checked in the apply transaction
-(`src/storage/store.rs:5065-5074`).
+(`crates/manager/src/storage/store.rs:5065-5074`).
 
 **Enforcement.** Opt-in per worker (`resourceEnforcement.enabled`). Cgroup
 v2, with `memory.max = memory`, `memory.swap.max = 0`, `cpu.weight` from MHz,
-`cpuset.cpus` for `cores` (`src/worker/resources.rs:525-549`). `container`
+`cpuset.cpus` for `cores` (`crates/worker/src/worker/resources.rs:525-549`). `container`
 is runtime-applied, `exec` uses a worker cgroup, `sandbox` is unsupported.
 OOM kills are annotated from `memory.events`
-(`src/worker/resources.rs:583-593`). Nothing reads `memory.current` or
+(`crates/worker/src/worker/resources.rs:583-593`). Nothing reads `memory.current` or
 `cpu.stat`.
 
 **Preemption.** Bands `critical..background`, victims strictly lower band,
 older than `victimExemptAge`, never node-pinned storage
-(`src/manager/scheduler/preemption.rs:272-385`). No node-pressure eviction.
+(`crates/manager/src/manager/scheduler/preemption.rs:272-385`). No node-pressure eviction.
 
 **Scoring.** A fixed weighted sum of `affinity`, `spread`, `bin_pack`,
-`automatic_anti_affinity` (`src/manager/scheduler/policy.rs:19-49`),
+`automatic_anti_affinity` (`crates/manager/src/manager/scheduler/policy.rs:19-49`),
 computed in `score_node_for_context` (`policy.rs:277-301`) and in the
-cached-batch path (`src/manager/scheduler.rs:4414-4449`). Weights are set
+cached-batch path (`crates/manager/src/manager/scheduler.rs:4414-4449`). Weights are set
 under `schedulerSettings.weights` (`scheduler.rs:3903-3950`).
 
 **Artifacts.** Fetch-only (`ArtifactFetcher` has no put,
-`src/artifacts/fetcher.rs:202-221`). No node cache, no advertisement, no
+`crates/worker/src/artifacts/fetcher.rs:202-221`). No node cache, no advertisement, no
 pre-warm (`internal_docs/TODO.md:1304-1316`). `ArtifactSink` is documented as
 the seam where a content-addressed store writer goes
-(`src/artifacts/stage.rs:101-124`).
+(`crates/worker/src/artifacts/stage.rs:101-124`).
 
 **Heartbeat.** Allocation ids, failures, health, volume reports, terminated,
 provisional claims, net stats (`proto/legion.proto:2861-2930`). The worker
-already counts per-allocation network bytes (`src/worker/netd/mod.rs:54`).
+already counts per-allocation network bytes (`crates/worker/src/worker/netd/mod.rs:54`).
 
 **Workload identity.** ES256 JWT, default TTL 15m, bound to the allocation
 id, refreshed at half TTL, delivered to sandboxes by env only
@@ -590,7 +590,7 @@ resourceEnforcement = {
 The ratio rides registration into `ResourcePool::from_node`, so `can_fit`
 and the apply-transaction recheck need no change in shape, only a multiplied
 capacity. The policy fingerprint that keys the cached `NodeUsage`
-(`src/resources.rs:101-129`) gains the ratio, so a ratio change invalidates
+(`crates/common/src/resources.rs:101-129`) gains the ratio, so a ratio change invalidates
 cached free pools instead of silently overcommitting further.
 
 **The honest guarantee.** With `memoryMax` alone and ratio 1.0, the sum of
@@ -955,7 +955,7 @@ plan proposed advertising cache contents as a `legion.artifact_cache`
 dynamic attribute (`artifact-cache-and-prewarm-plan.md:310-345`). That puts
 a node's content list into a replicated, attribute-matched column and
 re-evaluates jobs on every change (`UpdateNodeDynamic` enqueues evals,
-`src/manager/server.rs:6209-6217`). At snapshot scale (thousands of digests
+`crates/manager/src/manager/server.rs:6209-6217`). At snapshot scale (thousands of digests
 per node, churning on every suspend) that is the wrong store. Instead:
 
 - Workers send **deltas** (`content_added`, `content_removed`) in the
@@ -1450,14 +1450,14 @@ Phase 5](../suspend-resume-linux-verification.md#phase-5))
   does, and a pressured node suspends opted-in idle instances before
   evicting anything.
 
-Phase 5 shipped with these as `src/worker/idle.rs` (one test per signal, the
+Phase 5 shipped with these as `crates/worker/src/worker/idle.rs` (one test per signal, the
 quiet-connection pair, the `cpuBelow` scaling, the idle-since tracker),
 `idle_since_follows_the_policys_signals` in the usage sampler,
 `an_idle_instance_suspends_after_its_window_and_a_busy_one_never_does` and
 the local-suspension tests in `tests/integration/suspend_integration.rs` (manager side,
 fake usage and simulated reports),
 `opted_in_instances_are_suspended_most_idle_first_before_evict_bursting` in
-`src/worker/pressure.rs` (a fake node), a pressure suspend of a real `exec`
+`crates/worker/src/worker/pressure.rs` (a fake node), a pressure suspend of a real `exec`
 task in the worker, and the balloon against fake Firecracker and
 cloud-hypervisor API servers. The idle "sandbox" is an `exec` task with fake
 usage: a real idle suspend needs cgroups, so it is in the verification plan.
@@ -1493,8 +1493,8 @@ RNG.
 - Benchmarks before/after with content sets present and absent.
 
 Phase 7a shipped with the location index, publisher, and score tests above
-(`src/storage/content_index.rs`, `src/worker/content_report.rs`,
-`src/content_publish.rs`, `tests/integration/content_locality.rs`, and
+(`crates/manager/src/storage/content_index.rs`, `crates/worker/src/worker/content_report.rs`,
+`crates/worker/src/content_publish.rs`, `tests/integration/content_locality.rs`, and
 `placement_prefers_the_node_holding_the_content` in the scheduler). The
 published-resume test is 7b. The `scheduler_bench` `locality` group measures
 content present and absent. One `plan_only` of 100 placements (4 tasks x 25), bin_pack, half the fleet
@@ -1522,7 +1522,7 @@ the node holding the parts; `compat` filters every candidate; warm), the
 worker transport for real with the `file` publisher
 (`a_published_snapshot_restores_on_a_node_that_never_held_it`,
 `warm_fetches_published_parts_into_the_store_once` in
-`src/worker/task_manager.rs`), and `tests/integration/restore_placement_indexed.rs` for
+`crates/worker/src/worker/task_manager.rs`), and `tests/integration/restore_placement_indexed.rs` for
 the truncation fix (calls entry 88). It added a `restore` group to
 `scheduler_bench`: 25 keyed instances restoring from their own `local`
 snapshots (`local_pinned`) or `published` ones (`published_floating`, compat

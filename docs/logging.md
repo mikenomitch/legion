@@ -66,7 +66,7 @@ worker opens the capture file descriptors before spawning the task.
 Capture runs through the task plugin runtime. The worker sets a log directory
 on `TaskInstance`, and the built-in `exec` and `container` task runtimes
 redirect their child process to those files
-([`configure_task_log_capture`](../src/task_plugins/mod.rs)). The task writes
+([`configure_task_log_capture`](../crates/worker/src/task_plugins/mod.rs)). The task writes
 to a file descriptor instead of a pipe to the worker. So logging keeps working,
 and tasks keep running, across worker restarts.
 
@@ -82,7 +82,7 @@ and tasks keep running, across worker restarts.
 
 Legion doesn't run a separate logging process per task (Nomad's `logmon`
 model). Log handling is an in-process, pluggable **`LogSink`**
-([`src/worker/log_sink.rs`](../src/worker/log_sink.rs)):
+([`crates/worker/src/worker/log_sink.rs`](../crates/worker/src/worker/log_sink.rs)):
 
 ```rust
 pub trait LogSink: Send + Sync {
@@ -176,9 +176,9 @@ LEGION_LOG_RETENTION_DAYS=2 \
 legion start worker
 ```
 
-Defaults live in [`src/constants.rs`](../src/constants.rs)
+Defaults live in [`crates/common/src/constants.rs`](../crates/common/src/constants.rs)
 (`DEF_TASK_LOG_*`). The rotation code is in
-[`src/worker/logs.rs`](../src/worker/logs.rs).
+[`crates/worker/src/worker/logs.rs`](../crates/worker/src/worker/logs.rs).
 
 ---
 
@@ -517,5 +517,5 @@ Notes:
 - Local trace files (`legion start … --o11y` → `./traces`) still work as
   before. OTLP export runs alongside them.
 
-Implementation: [`src/otel.rs`](../src/otel.rs), wired in
-[`src/tracing_util.rs`](../src/tracing_util.rs).
+Implementation: [`crates/common/src/otel.rs`](../crates/common/src/otel.rs), wired in
+[`crates/common/src/tracing_util.rs`](../crates/common/src/tracing_util.rs).

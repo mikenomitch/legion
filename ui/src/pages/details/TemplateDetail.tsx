@@ -170,7 +170,7 @@ const formatValue = (value: unknown): string => {
 const truncate = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max - 1)}…` : text)
 
 // ---------------------------------------------------------------------------
-// What a template run records (RunJobTemplate in src/manager/server.rs)
+// What a template run records (RunJobTemplate in crates/manager/src/manager/server.rs)
 // ---------------------------------------------------------------------------
 
 /** The resolved variable values (defaults merged in) of a template run. */

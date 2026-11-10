@@ -171,7 +171,7 @@ Non-goals:
 ## Background: what exists today
 
 - **Apps** (`src/apps/mod.rs`): `BUNDLED` lists the bundled apps (today the
-  autoscaler); a bundled app is a Nickel manifest in `src/apps/bundled/`
+  autoscaler); a bundled app is a Nickel manifest in `crates/common/src/bundled_apps/`
   plus a body `fn(AppContext) -> AppFuture`, run by `legion:self app run
   <name>` on the managers' system workers, seeded by the first Control
   leader with its permissions granted by `legion:bootstrap`.
@@ -186,14 +186,14 @@ Non-goals:
   status-on-change.
 - **KV** (`PutKv` with `expected_version = 0` creates only if absent).
   `GetKv` returns the value and version.
-- **Delivery**: `validate_bundle` in `src/worker/netd/tls.rs` is the check
+- **Delivery**: `validate_bundle` in `crates/worker/src/worker/netd/tls.rs` is the check
   the manager runs before handing a KV bundle to the datapath: a chain, a
   private key, and a key matching the leaf.
 - **Crypto**: `rcgen` 0.13 (with `x509-parser`), `ring` 0.17,
   `x509-parser` 0.16, `rustls`, `reqwest` (rustls, webpki roots), `base64`,
   `sha2` are already dependencies. Nothing new is needed for RFC 8555.
 - **`legion:self`** resolves to the worker's own binary for any exec task
-  (`src/task_plugins/exec.rs:979`).
+  (`crates/worker/src/task_plugins/exec.rs:979`).
 
 ## Proposed design
 
@@ -343,7 +343,7 @@ filtered by the viewer's `object:read` namespaces.
 
 - No proto, storage, or jobspec changes. Everything is an app: a manifest,
   a body, two kinds, a CLI group.
-- `src/apps/bundled/certs.ncl`; `BUNDLED` gains `certs`.
+- `crates/common/src/bundled_apps/certs.ncl`; `BUNDLED` gains `certs`.
 - `legion cert` (`renew`, `http01`); `cert` joins `RESERVED_KIND_NOUNS`.
 - The app's config is empty (`{}`): everything a user sets lives on the
   objects, so the config schema accepts no fields.

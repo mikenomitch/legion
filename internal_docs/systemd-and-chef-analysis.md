@@ -32,7 +32,7 @@ them almost exactly and none of the others.
 | systemd role | Legion today |
 | --- | --- |
 | PID 1: initrd handoff, early mounts, reaping orphans, ordered shutdown | **Nothing.** Not attempted anywhere in the tree. |
-| Service supervision (`Type=simple/exec`, `Restart=`, `ExecStart`) | **Partial.** `exec` runtime (`src/task_plugins/exec.rs`) spawns and tracks a host process; restarts come from health checks, not exit codes. |
+| Service supervision (`Type=simple/exec`, `Restart=`, `ExecStart`) | **Partial.** `exec` runtime (`crates/worker/src/task_plugins/exec.rs`) spawns and tracks a host process; restarts come from health checks, not exit codes. |
 | Dependency ordering (`After=`, `Requires=`, `BindsTo=`) | **Yes, richer.** `dependsOn` with `start`/`complete`/`success` conditions, topologically sorted, cycles rejected (`docs/jobs-tasks-and-scheduling.md`). |
 | Timers (`OnCalendar=`, `OnUnitActiveSec=`) | **Yes.** `lifecycle: "batch"` + `schedule: "every 15m"` or a cron expression. |
 | Resource control (`MemoryMax=`, `CPUQuota=`, delegation) | **No, for `exec`.** `resources` is scheduling arithmetic only; `config.cgroup` *joins* an existing cgroup v2 path (`exec.rs:472-481`), it never creates one or writes a limit. Real enforcement exists only in the `container` and `sandbox` runtimes. |
@@ -56,7 +56,7 @@ A "systemd-shaped" workload — a long-lived host binary, not a container — is
 first-class citizen:
 
 - `runtime: "exec"` spawns with `setsid` so tasks survive worker restarts and
-  are signal-isolated from the agent (`src/task_plugins/mod.rs:33`).
+  are signal-isolated from the agent (`crates/worker/src/task_plugins/mod.rs:33`).
 - `user`, `cwd`, `env`, `oom_adj`, `cgroup`, `landlock` cover the common
   hardening fields.
 - `config.files[]` writes host files with modes before start (`exec.rs:349`) —
@@ -86,7 +86,7 @@ enough that a health check is a good proxy for "is it alive".**
 
 There is no reaper. Nothing in the worker calls `try_wait`/`waitpid` on a task
 process while it runs; the only `try_wait` in the tree is for interactive exec
-sessions (`src/worker/exec.rs:211`). Consequences, all verifiable in the code:
+sessions (`crates/worker/src/worker/exec.rs:211`). Consequences, all verifiable in the code:
 
 - **A task with no checks is reported healthy forever.** `spawn_health_monitor`
   short-circuits: `set_allocation_health(.., true, "healthy (no checks
@@ -270,7 +270,7 @@ More than you would guess, because config *delivery* is well built out:
 | `file` / `template` resources | `exec` `config.files[]` (host path + mode + content) and KV `files[]` rendered server-side from templates |
 | attributes / data bags | KV store with typed values, versions, optimistic concurrency, locks, JSON patch; `$`-references in jobspecs |
 | cookbooks + attribute precedence | Jsonnet (imports, libsonnet, vars) — genuinely a decent recipe language — plus **job templates**: cluster-stored specs with typed variables and delegated submission (`docs/job-templates.md`) |
-| ohai | node fingerprint attrs + `config_attrs` + dynamic attrs, with fingerprinter plugins (`src/worker/node_check.rs`) |
+| ohai | node fingerprint attrs + `config_attrs` + dynamic attrs, with fingerprinter plugins (`crates/worker/src/worker/node_check.rs`) |
 | roles / environments | node pools, `constraints`, `permit`, `affinities` |
 | chef-client interval | `lifecycle: "batch"` + `schedule: "every 30m"` / cron |
 | `--why-run` | `legion job plan` / `job validate` (read-only, agent-friendly) |

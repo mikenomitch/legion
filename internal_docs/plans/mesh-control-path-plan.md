@@ -160,38 +160,38 @@ Non-goals:
 
 ## 5. Background — what exists today
 
-- Endpoint feed: `build_upstream_endpoints` (`src/manager/server.rs`, called
+- Endpoint feed: `build_upstream_endpoints` (`crates/manager/src/manager/server.rs`, called
   from the heartbeat handler) and `build_handler_endpoints` for `proxy`
   handler targets; catalog rows from `Store::service_endpoints`
-  (`src/storage/store.rs`), intentions applied per consumer with
+  (`crates/manager/src/storage/store.rs`), intentions applied per consumer with
   `allow_permits`. Wire: `HeartbeatReply.upstream_endpoints`, one
   `UpstreamEndpoints` per (allocation, upstream). Worker: `Netd::apply_desired`
-  (`src/worker/netd/datapath.rs`) calls `set_endpoints` for every entry;
-  `apply_templates` (`src/worker/daemon.rs`) renders from the same list.
+  (`crates/worker/src/worker/netd/datapath.rs`) calls `set_endpoints` for every entry;
+  `apply_templates` (`crates/worker/src/worker/daemon.rs`) renders from the same list.
 - The read model and the work log follow committed changesets on every
   replica (`Store::project_changeset`), which is how followers stay coherent;
   `local_disk` mode projects only `READ_MODEL_TABLES` (no `allocation_health`).
-- `StreamWork` (`src/manager/server/work_stream.rs`,
-  `src/storage/work_log.rs`) already pushes checkpoint work as a hint outside
+- `StreamWork` (`crates/manager/src/manager/server/work_stream.rs`,
+  `crates/manager/src/storage/work_log.rs`) already pushes checkpoint work as a hint outside
   the sequenced set, with the heartbeat as the record.
 - Policy: `build_net_policies` with a TTL-cached generation
   (`net_policy_generation_cached`), merged bodies cached by hash
   (`remember_net_policy`).
-- TLS: `MeshIdentity::client_config`/`server_config` (`src/worker/netd/tls.rs`),
+- TLS: `MeshIdentity::client_config`/`server_config` (`crates/worker/src/worker/netd/tls.rs`),
   `ForwarderContext::set_mesh_identity` and `ingress_server_config`
-  (`src/worker/forwarder.rs`).
-- HTTP mode: `src/worker/netd/http.rs` (`body.collect()` in the request path,
+  (`crates/worker/src/worker/forwarder.rs`).
+- HTTP mode: `crates/worker/src/worker/netd/http.rs` (`body.collect()` in the request path,
   `attempt_request` replays a buffered body).
-- Kernel guard: `src/worker/netd/kernel_guard.rs` (`render`, `read_counters`).
-- Identity refresh: `refresh_node_identity` (`src/worker/daemon.rs`),
-  `NodeIdentity::needs_refresh` (`src/worker/plane.rs`).
+- Kernel guard: `crates/worker/src/worker/netd/kernel_guard.rs` (`render`, `read_counters`).
+- Identity refresh: `refresh_node_identity` (`crates/worker/src/worker/daemon.rs`),
+  `NodeIdentity::needs_refresh` (`crates/worker/src/worker/plane.rs`).
 
 ## 6. Proposed design
 
 ### 6.1 Versioned endpoint sets per service (NET1)
 
 **Manager.** An `EndpointIndex` per manager process
-(`src/storage/endpoint_index.rs`) holds, per canonical service reference
+(`crates/manager/src/storage/endpoint_index.rs`) holds, per canonical service reference
 (`web`, `payments-prod/web`), the service's catalog rows sorted by allocation,
 a content digest, and a version from a process-wide monotonic counter. Per
 consuming identity it memoizes the intention-filtered, healthy-only wire list
@@ -225,7 +225,7 @@ stream sends a push-only message carrying the changed sets
 is never replayed, and the heartbeat stays the record: a lost push costs one
 heartbeat interval.
 
-**Worker.** `EndpointFeedState` (`src/worker/netd/endpoint_feed.rs`) holds the
+**Worker.** `EndpointFeedState` (`crates/worker/src/worker/netd/endpoint_feed.rs`) holds the
 sets and bindings, applies a set only when it is newer (same manager epoch
 and higher version, or another epoch), and hands each listener a shared list
 that is swapped only when its set changed. Failure keeps the last known good
@@ -241,7 +241,7 @@ message StreamWorkReply  { ... EndpointFeed endpoint_feed = 8; bool push_only = 
 
 ### 6.2 Memoized policy assignments (NET2)
 
-`NetPolicyMemo` (`src/manager/net_policy_memo.rs`) keeps the stored policy
+`NetPolicyMemo` (`crates/manager/src/manager/net_policy_memo.rs`) keeps the stored policy
 list per generation and the effective result per (generation, node pool when
 a policy selects on pools, runtime, job, task network, task service, placed
 network). A beat costs one hash per allocation; listing, parsing, and merging

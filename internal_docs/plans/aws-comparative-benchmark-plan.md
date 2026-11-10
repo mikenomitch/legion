@@ -117,7 +117,7 @@ bought.
 
 ## Prerequisite: Legion worker simulation (gap)
 
-Legion has no fake-worker mode today (checked: nothing in `src/worker/`).
+Legion has no fake-worker mode today (checked: nothing in `crates/worker/src/worker/`).
 Packing real workers works (the worker is one binary + noop runtime) but
 each process costs a tokio runtime + gRPC channel + fingerprint loop;
 hundreds per instance is realistic, thousands per instance is not, and

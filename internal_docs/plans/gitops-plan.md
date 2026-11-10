@@ -84,7 +84,7 @@ job updates automatically" as open.
   windows, and `legion object apply|get|list|delete --wait`. The app
   framework gives views and actions. The artifact `git` fetcher shows how
   Legion shells out to `git` with env-injected credentials
-  (`src/artifacts/fetchers/git.rs`). This plan composes them.
+  (`crates/worker/src/artifacts/fetchers/git.rs`). This plan composes them.
 
 ## 3. Jobs to be done
 
@@ -188,17 +188,17 @@ or disabling the app: GitOps is a bundled app and needs no setup.
 ## 5. Background — what exists today
 
 - **Bundled apps** are one entry in `BUNDLED` (`src/apps/mod.rs:73`): a
-  Nickel manifest under `src/apps/bundled/`, a body `fn(AppContext) ->
+  Nickel manifest under `crates/common/src/bundled_apps/`, a body `fn(AppContext) ->
   AppFuture`, and an optional manifest filler. The first Control leader
-  seeds a record for each (`src/manager/apps.rs:434`), with its permissions
+  seeds a record for each (`crates/manager/src/manager/apps.rs:434`), with its permissions
   granted by `legion:bootstrap`, and the job runs `legion:self app run
   <name>`. Installing an app whose name is bundled is refused
-  (`src/manager/server/app_rpcs.rs:801`).
+  (`crates/manager/src/manager/server/app_rpcs.rs:801`).
 - **Object kinds** (`docs/app-objects.md`): schema, CEL `rules`,
   `requires` resolved from spec pointers (`resolve_requirements`,
-  `src/structs/app_object.rs:1632`: one permission per value of a list
+  `crates/common/src/structs/app_object.rs:1632`: one permission per value of a list
   pointer, at most 64 per object, a single `band`), recorded as authority;
-  `authority_rule` (`src/manager/delegation.rs:196`) turns each into an
+  `authority_rule` (`crates/manager/src/manager/delegation.rs:196`) turns each into an
   exact rule (no globs in a name or KV path), intersected with the app's
   grant including `via = "objects"` rules.
 - **The reconcile loop** (`src/apps/objects.rs:853`): level-triggered,
@@ -208,7 +208,7 @@ or disabling the app: GitOps is a bundled app and needs no setup.
   `spec_version`, `generation`, `state`, or `deleting`
   (`object_moved`, `src/apps/objects.rs:112`), so a label write wakes it.
   Nothing outside the loop can wake one object.
-- **RunJob** (`src/manager/server.rs:2770`): an identical spec is
+- **RunJob** (`crates/manager/src/manager/server.rs:2770`): an identical spec is
   `Unchanged` and adds no version, but restarts a job that is stopped,
   failed, or idle. So resubmitting every interval would rerun finished
   batch jobs and undo a responder's `job stop`: the app must submit only
@@ -226,7 +226,7 @@ or disabling the app: GitOps is a bundled app and needs no setup.
   The lexer (`nickel_lang_parser::lexer`) yields `import` followed by a
   static string (or a package identifier), so imports can be checked before
   evaluation.
-- **git**: `src/artifacts/fetchers/git.rs` runs the `git` binary with
+- **git**: `crates/worker/src/artifacts/fetchers/git.rs` runs the `git` binary with
   `GIT_ALLOW_PROTOCOL` and credentials in `GIT_CONFIG_*` env, never argv.
 
 ## 6. Proposed design
@@ -395,7 +395,7 @@ on the job), which wakes the Repo's reconcile at once.
   `ListRollouts`, and `GetKv`.
 - **No new job-config fields**, so `configs/jobs/maximal.ncl` is
   unchanged.
-- New: `src/apps/bundled/gitops.ncl`, `src/apps/gitops/` (engine, git,
+- New: `crates/common/src/bundled_apps/gitops.ncl`, `src/apps/gitops/` (engine, git,
   render, UI), `src/cmd/gitops.rs`; `config_lang::eval_file_confined`;
   `Reconciler::wake` in the object framework.
 - **Persistence**: none new. The inventory lives in the Repo's status

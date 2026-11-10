@@ -1,5 +1,5 @@
 // The conformance module behind Legion's plugin host tests
-// (src/worker/netd/handlers/plugin.rs, `plugin_host_test`). One module,
+// (crates/worker/src/worker/netd/handlers/plugin.rs, `plugin_host_test`). One module,
 // many behaviors: the plugin configuration's `mode` picks one, so each test
 // is a reference with a different config.
 //

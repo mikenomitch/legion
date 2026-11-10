@@ -5,9 +5,9 @@
 //!
 //! The heartbeat stands in for the worker, as in `snapshot_integration.rs`.
 //! The worker half (pause, capture, stop; cold boot on the retained volume)
-//! runs against a real `exec` task in `src/worker/task_manager.rs`
+//! runs against a real `exec` task in `crates/worker/src/worker/task_manager.rs`
 //! (`an_exec_disk_suspend_cold_boots_on_its_retained_volume`), and the
-//! guest's identity refresh in `src/task_plugins/guest_resume.rs`.
+//! guest's identity refresh in `crates/worker/src/task_plugins/guest_resume.rs`.
 //!
 //! Automatic suspend (Phase 5) is here too: the idle sweep over usage
 //! reports the heartbeat carries, and the local suspensions a node's

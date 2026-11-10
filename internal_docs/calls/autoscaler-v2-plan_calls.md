@@ -220,7 +220,7 @@ the same traits in-process.
   against Prometheus.
 - **(b)** gRPC needs codegen in the plugin's language for no benefit at
   these call rates.
-- **(c)** Legion now embeds WASM (`wasmi`, `src/wasm`, for network plugins),
+- **(c)** Legion now embeds WASM (`wasmi`, `crates/worker/src/wasm`, for network plugins),
   but that layer deliberately offers no sockets. It can't do the network
   I/O that sources and targets exist for, so it could only ever cover
   strategies. One protocol for all three kinds beats two half-measures. WASM
@@ -472,7 +472,7 @@ one hour in memory, and serves `GetScalingInputs`.
 **Why (performance).**
 - **(a)** It turns a deliberately off-raft, 10-second, per-allocation
   signal into replicated writes. That is exactly what usage was designed to
-  avoid (`src/manager/usage.rs` header: "worthless after a restart … never
+  avoid (`crates/manager/src/manager/usage.rs` header: "worthless after a restart … never
   touches the state store").
 - **(b)** It leaks manager topology into a client and multiplies reads by
   the manager count.
@@ -679,7 +679,7 @@ expect the percent default to survive, and it doesn't.
 
 ## 20. Signals are all or nothing at every defaults level, not only the task's
 
-*Implementation, engine core (`src/autoscaler/defaults.rs`).*
+*Implementation, engine core (`crates/common/src/autoscaler/defaults.rs`).*
 
 **Call.** If a level sets any signal (`cpu`, `memory`), its signals
 replace, rather than add to, the signals inherited from the levels below it.
@@ -741,7 +741,7 @@ make that impossible.
 
 ## 23. Schedules use 5-field crontab with Legion's own time-zone and DST handling
 
-*Implementation, engine core (`src/autoscaler/schedule.rs`).*
+*Implementation, engine core (`crates/common/src/autoscaler/schedule.rs`).*
 
 **Call.** `schedule[].cron` is standard 5-field crontab (`0 8 * * 1-5` means
 Monday to Friday). The engine translates it for the `cron` crate, which is
@@ -764,7 +764,7 @@ surprise.
 
 ## 24. Warmup counts not-ready replicas at 0% for scale-out and at the target for scale-in
 
-*Implementation, engine core (`src/autoscaler/strategies.rs`).*
+*Implementation, engine core (`crates/common/src/autoscaler/strategies.rs`).*
 
 **Call.** Not-ready replicas (`current − ready`) count as 0% busy when the
 strategy is deciding to scale out, and as exactly at target when it is
@@ -780,7 +780,7 @@ warming replica as an overload signal.
 
 ## 25. The step budget is a percent of the count at the window's start, with no refunds
 
-*Implementation, engine core (`src/autoscaler/pipeline.rs`).*
+*Implementation, engine core (`crates/common/src/autoscaler/pipeline.rs`).*
 
 **Call.** The step limit's percent half is taken of the count at the start
 of the rolling `every` window, rounded up for scale-out and down for
@@ -850,7 +850,7 @@ metrics source had a blip.
 
 ## 29. Rollups ride their own `ReportNodeLiveness` call every 10 seconds, not the 1-second digest
 
-*Implementation, Phase 1 (`src/manager/scaling_inputs.rs`).*
+*Implementation, Phase 1 (`crates/manager/src/manager/scaling_inputs.rs`).*
 
 **Call.** Each non-leader manager sends its rollups to the status-lane leader
 every 10 seconds on a separate `ReportNodeLiveness` call that carries no node
@@ -1176,7 +1176,7 @@ intents (§6.9) is the natural home for an action that is not a count write.
 
 ## 44. The autoscaler's grant is exactly what Phase 2 calls: `scale:read` and `scale:write`
 
-*Implementation, Phase 2 (`src/apps/bundled/autoscaler.ncl`; defers calls
+*Implementation, Phase 2 (`crates/common/src/bundled_apps/autoscaler.ncl`; defers calls
 entry 18 until node groups ship).*
 
 **Call.** The bundled manifest asks for `scale` read and write in every
@@ -1692,7 +1692,7 @@ plugin needs it.
 
 ## 68. A plugin's code fields are what it runs: `source`, `command`, `url`, and an `exec` target's `config.command`
 
-*Implementation, Phase 4 (`src/apps/bundled/autoscaler.ncl` `codeFields`;
+*Implementation, Phase 4 (`crates/common/src/bundled_apps/autoscaler.ncl` `codeFields`;
 extends the apps plan's `source` and `url`, §6.3).*
 
 **Call.** Changing a plugin's `source` (an artifact), `command`, `url`, or
@@ -2283,7 +2283,7 @@ operator grants.
 
 ## 94. The app's grant gains `node:write` and `job:read`
 
-*Implementation, Phase 5b (`src/apps/bundled/autoscaler.ncl`; carries out
+*Implementation, Phase 5b (`crates/common/src/bundled_apps/autoscaler.ncl`; carries out
 calls entry 18 as entry 44 deferred it).*
 
 **Call.** The manifest's permissions are now `scale` read and write in

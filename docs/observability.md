@@ -6,7 +6,7 @@ depth.
 
 ## Logging and Tracing Setup
 
-`init_tracing()` / `init_tracing_with_options()` (`src/tracing_util.rs`)
+`init_tracing()` / `init_tracing_with_options()` (`crates/common/src/tracing_util.rs`)
 configure the `tracing_subscriber` stack:
 
 - Pretty console logs. Servers (every `legion start` subcommand, and
@@ -47,8 +47,8 @@ directly.
 
 Legion can export its own control-plane spans over **OTLP/HTTP** to any
 OpenTelemetry backend (Tempo, Jaeger, Honeycomb, an OTel Collector, and so on).
-The exporter lives in `src/otel.rs` and is wired into the subscriber stack in
-`src/tracing_util.rs`.
+The exporter lives in `crates/common/src/otel.rs` and is wired into the subscriber stack in
+`crates/common/src/tracing_util.rs`.
 
 Export is opt-in. Turn it on with the standard OpenTelemetry env vars:
 
@@ -66,7 +66,7 @@ itself" section of [docs/logging.md](logging.md).
 ## Metrics and Health Probes
 
 The manager serves a separate telemetry HTTP listener
-(`src/manager/telemetry.rs`, default port `server.port + 2`):
+(`crates/manager/src/manager/telemetry.rs`, default port `server.port + 2`):
 
 - `GET /metrics`: Prometheus text exposition (`legion_*` families such as gRPC
   request counts and latency, evals, plan applies, heartbeats, nodes, and

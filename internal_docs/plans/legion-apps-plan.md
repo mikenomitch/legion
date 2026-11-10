@@ -116,16 +116,16 @@ them hits the same six walls:
    - `legion start manager --run-worker` exists (`src/cmd/start.rs:18-23`),
      but it turns the manager into an ordinary `default`-type worker in the
      `default` pool (worker type hard-coded at
-     `src/manager/daemon.rs:783-802`). Nothing marks the node as a manager,
+     `crates/manager/src/manager/daemon.rs:783-802`). Nothing marks the node as a manager,
      and tenant work lands on it freely.
 2. **No isolation for that place.**
-   - Pools act as taints (`src/constraints.rs:114-175`), but the toleration
+   - Pools act as taints (`crates/common/src/constraints.rs:114-175`), but the toleration
      is the job's own `permit`, so any job author can opt in.
    - Namespace policies are allowlists that only intersect
-     (`src/structs/namespace_policy.rs:342-380`), so "only `legion-system`
+     (`crates/common/src/structs/namespace_policy.rs:342-380`), so "only `legion-system`
      may use pool X" means restricting every other namespace glob.
    - The `legion-` namespace prefix is reserved
-     (`src/structs/namespace.rs:34-36`), but nothing ever creates a
+     (`crates/common/src/structs/namespace.rs:34-36`), but nothing ever creates a
      `legion-*` namespace.
 3. **Talking to Legion takes two-sided wiring.**
    - The worked example, `configs/jobs/cert-renewer.ncl`, needs four
@@ -160,7 +160,7 @@ them hits the same six walls:
      lives, but its schema belongs to core, so there is nowhere to put an
      app's settings except a field core already knows.
    - Worse, the parsers ignore keys they don't know. `TaskConfigInput`
-     (`src/structs/job.rs:2404-2406`) has no `deny_unknown_fields`. So a
+     (`crates/common/src/structs/job.rs:2404-2406`) has no `deny_unknown_fields`. So a
      typo like `autoscael = true`, or `autoscale = true` sent to a manager
      that predates it, is accepted and silently dropped.
 
@@ -225,7 +225,7 @@ them hits the same six walls:
   declares, and core enforces.
 - **Legion itself.** Task runtimes publish a JSON Schema for their `config`
   block. Submit validates it with the `jsonschema` crate
-  (`src/task_plugins/mod.rs:2134`), and `legion job schema` prints the
+  (`crates/worker/src/task_plugins/mod.rs:2134`), and `legion job schema` prints the
   merged schema so agents author against it (`docs/agent-readiness.md` §4).
   *Take:* the same shape for apps.
 
@@ -394,12 +394,12 @@ named and the facts were re-checked after merging `main` on 2026-10-28.
 
 - **Manager as worker**: `--run-worker` mints a 15-minute join token and runs
   `run_worker_local` with `worker_type: "default"` and `in_process: true`
-  (`src/manager/daemon.rs:496-530,783-802`). `in_process` only changes
+  (`crates/manager/src/manager/daemon.rs:496-530,783-802`). `in_process` only changes
   shutdown behavior. No attribute marks the node as a manager.
 - **Pools and permits.** `PermitSet::new` adds an implicit `pool=default`
-  (`src/constraints.rs:114-121`). `is_permitted` requires every node
+  (`crates/common/src/constraints.rs:114-121`). `is_permitted` requires every node
   restriction to match some permit rule (`:123-175`). This is applied in
-  `scan_base_eligible` (`src/manager/scheduler.rs:3165-3182`). Blocked evals
+  `scan_base_eligible` (`crates/manager/src/manager/scheduler.rs:3165-3182`). Blocked evals
   are keyed by pool, and their wake pass re-runs the permit checks
   (`docs/scheduler-and-eval-loop.md` § Keys).
 - **Namespaces** (shipped 2026-10-19).
@@ -410,17 +410,17 @@ named and the facts were re-checked after merging `main` on 2026-10-28.
     allowed (`docs/namespaces.md:196-245`).
   - Tokens carry `legion.io/namespace`.
 - **Bands.** `critical` is "for control-plane jobs" and is never preempted
-  (`src/structs/band.rs:41-61`, `docs/preemption-and-eviction.md`).
+  (`crates/common/src/structs/band.rs:41-61`, `docs/preemption-and-eviction.md`).
 - **Workload identity.** The reserved `legion` identity mints a JWT with
-  the cluster issuer as `aud` (`src/structs/workload_identity.rs:28,238`).
+  the cluster issuer as `aud` (`crates/common/src/structs/workload_identity.rs:28,238`).
   - The manager's built-in `legion` auth method maps it to principal
     `legion:<sub>` and resolves policies from `controlPlaneBindings` with
-    `bound_policies` (`src/manager/auth_method.rs:555-660,820-846`).
+    `bound_policies` (`crates/manager/src/manager/auth_method.rs:555-660,820-846`).
   - The default TTL is 15m, refreshed at about half life
-    (`src/worker/identity.rs:715`).
+    (`crates/worker/src/worker/identity.rs:715`).
   - Env injected into tasks: `LEGION_ALLOC_ID`, `LEGION_JOB_ID`,
     `LEGION_JOB_NAME`, `LEGION_NAMESPACE`, `LEGION_TASK_NAME`, ports and
-    upstreams (`src/task_plugins/mod.rs:127-151`). Not injected:
+    upstreams (`crates/worker/src/task_plugins/mod.rs:127-151`). Not injected:
     `LEGION_ADDR`, CA, or token.
   - The CLI reads `LEGION_TOKEN`, then `LEGION_TOKEN_FILE`, then
     `~/.legion/tokens/…`, and the address from `LEGION_ADDR`
@@ -429,7 +429,7 @@ named and the facts were re-checked after merging `main` on 2026-10-28.
   metadata service, Legion's own ports when the manager shares the node,
   `127.42.0.0/16`, and other allocations' listeners. `hostGuard.allow` is
   the operator's escape hatch (`docs/network-handlers.md` § host guard).
-- **ACL.** There are 14 resources (`src/structs/acl.rs:21-78`). Policies
+- **ACL.** There are 14 resources (`crates/common/src/structs/acl.rs:21-78`). Policies
   are applied with `legion acl policy apply`. No built-in policy documents
   ship, and management tokens bypass rules.
 - **Job templates** are stored, versioned, and rendered server-side
@@ -442,7 +442,7 @@ named and the facts were re-checked after merging `main` on 2026-10-28.
   - There is no extension mechanism of any kind.
 - **Jobspec parsing.**
   - The job input and `TaskConfigInput` deserialize without
-    `deny_unknown_fields` (`src/structs/job.rs:2404-2406`), so unknown keys
+    `deny_unknown_fields` (`crates/common/src/structs/job.rs:2404-2406`), so unknown keys
     there are dropped silently. The exception is `kind`, which has a
     hand-written error (`:2507-2521`).
   - Several nested blocks already refuse unknown keys: `VolumeSpec`
@@ -453,16 +453,16 @@ named and the facts were re-checked after merging `main` on 2026-10-28.
     untagged-enum message.
   - Task-runtime `config` blocks are validated against the runtime's JSON
     Schema with the `jsonschema` crate, version 0.17.1, which recompiles the
-    schema on every call (`src/task_plugins/mod.rs:2132-2134`).
+    schema on every call (`crates/worker/src/task_plugins/mod.rs:2132-2134`).
   - `legion job validate` and `legion job schema` run in the CLI, from
     schemas compiled into the binary (`src/cmd/job.rs:550,666`). There is
     no manager RPC for either.
 - **In-place version moves exist only for KV re-renders.** `run_job`'s
   `Updated` branch always creates a rollout (`create_rollout_for_update`,
-  `src/manager/server.rs:2451-2462`). The KV re-render path is the one place
+  `crates/manager/src/manager/server.rs:2451-2462`). The KV re-render path is the one place
   that moves running allocations onto a new version without a rollout. It
   checks `job_configs_schedule_equivalent` (built on
-  `task_schedule_equivalent`, `src/storage/store.rs:21251`), then calls
+  `task_schedule_equivalent`, `crates/manager/src/storage/store.rs:21251`), then calls
   `migrate_allocations_to_job_config`, which is a separate Scheduler-lane
   write (`server.rs:4150-4180`).
 - **Worker-plane tunnel.** It is planned, not built:
@@ -686,7 +686,7 @@ and handles one app at a time, with at most one submit in flight per app.
     a disable) starts from a different state, so it gets a new key.
   - The starting state has to be in the key because idempotency keys are
     global and kept for 24 hours (`IDEMPOTENCY_KEY_TTL`,
-    `src/manager/daemon.rs:60`). A digest-only key would make the next
+    `crates/manager/src/manager/daemon.rs:60`). A digest-only key would make the next
     revert of an identical edit a no-op.
   - Stopping a disabled app's job uses `app:<name>:stop:<from>`.
 - **Triggers.** It is event-driven, with a backstop timer:
@@ -738,7 +738,7 @@ reconciler restarts it only when there is one new build to move to:
 - **The build.** Workers report `buildVersion` at registration
   (`server.rs:8679-8686`). This plan adds `buildId`, a hash of the worker's
   own executable computed at startup, because `buildVersion` is
-  `CARGO_PKG_VERSION` (`src/worker/daemon.rs:3598`, `0.1.0` today), which
+  `CARGO_PKG_VERSION` (`crates/worker/src/worker/daemon.rs:3598`, `0.1.0` today), which
   doesn't change on a rebuild without a version bump.
 - **The build marker** is the (`buildVersion`, `buildId`) pair, defined
   only when every ready node the app's placement allows reports the same
@@ -784,7 +784,7 @@ Limits, stated in the public doc:
   scheduler places them again, possibly on a manager that hasn't upgraded
   yet.
 - **Pre-releases.** `version_matches` uses semver requirements
-  (`src/constraints.rs`), under which a pre-release of a newer version
+  (`crates/common/src/constraints.rs`), under which a pre-release of a newer version
   (`0.16.0-rc.1`) doesn't satisfy `>=0.15.0`. During a mixed window, such
   nodes can't host the app. Once every eligible node is on the pre-release,
   the marker moves to it and the constraint matches again.
@@ -928,7 +928,7 @@ binary (calls entry 17).
   leaf (`legion/{share,reserve}/legion-<alloc>`). A process in another
   allocation is refused even if it can open the path. Attribution is
   therefore exact (compare the datapath's caveat in
-  `src/worker/netd/dns.rs:4-10`).
+  `crates/worker/src/worker/netd/dns.rs:4-10`).
 - The token file is still written (`$LEGION_SECRETS_DIR/legion.token`) for
   clients that can't use a socket, and its path is in
   `LEGION_IDENTITY_TOKEN_FILE`. It is deliberately **not**
@@ -1258,7 +1258,7 @@ warning: orders-db: task postgres: volume data: backup was not checked by the ba
 **Changing only extension values restarts nothing.** A resubmit whose only
 differences are extension values still creates a job version. A new check
 in `run_job`'s `Updated` branch, which today always creates a rollout
-(`src/manager/server.rs:2451-2462`), sees that only extension values
+(`crates/manager/src/manager/server.rs:2451-2462`), sees that only extension values
 changed. It then moves the running allocations onto the new version
 synchronously, the way KV re-renders do (`server.rs:4150-4180`), instead of
 creating a rollout. The app sees the new value through its watch.
@@ -1477,7 +1477,7 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
   RPC above goes in `tests/integration/acl_endpoints.rs`. Glob matching
   gains the reserved-prefix rule for `legion-*` namespaces and `legion/` KV
   paths, in rule evaluation and in grant coverage, unit-tested in
-  `src/structs/acl.rs`. The grant check runs on `RunJob`, `RunJobTemplate`,
+  `crates/common/src/structs/acl.rs`. The grant check runs on `RunJob`, `RunJobTemplate`,
   and every other path that stores a job config.
 - **Store**, on the Control lane:
   - an `app` table;
@@ -1522,7 +1522,7 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
     `orphaned`).
   - The job version records what the flag dropped or left pending.
   - A new predicate in `run_job`'s `Updated` branch
-    (`src/manager/server.rs:2451`), checked before
+    (`crates/manager/src/manager/server.rs:2451`), checked before
     `create_rollout_for_update`. If every difference from the previous
     version is in extension values, it moves the allocations synchronously
     with `migrate_allocations_to_job_config`, as the KV path does, instead

@@ -39,7 +39,7 @@ pub static DYNAMIC_PORT_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const
 /// made, so it keeps the directory, and nothing ever removed it: every run
 /// left hundreds of megabytes of SQLite stores in the system temp dir. The
 /// root is removed when the test process exits (the library's unit tests do
-/// the same in `src/test_scratch.rs`). A run killed before exit leaves its
+/// the same in `crates/common/src/test_scratch.rs`). A run killed before exit leaves its
 /// one `legion-tests-*` root behind.
 pub fn scratch_root() -> &'static Path {
     SCRATCH_ROOT.get_or_init(|| {

@@ -8,7 +8,7 @@
 //! admits sessions as the real one does (no ledger hold, refusing when told
 //! its envelope is full) and reports them on a heartbeat the test sends. The
 //! worker side of admission, adoption, and the orphan sweep is covered by
-//! the unit tests in `src/worker/task_manager.rs`. Fake nodes serve the real
+//! the unit tests in `crates/worker/src/worker/task_manager.rs`. Fake nodes serve the real
 //! worker-plane listener with a node certificate from the store's mesh CA, so
 //! the manager reaches them the way it reaches real workers (mTLS).
 
@@ -69,7 +69,7 @@ struct NodeState {
 
 /// A stand-in for the session manifests in a shared content store: each
 /// `store` session's holder, generation, and state. The real conditional
-/// writes are covered by the unit tests in `src/session_manifest.rs`; here
+/// writes are covered by the unit tests in `crates/worker/src/session_manifest.rs`; here
 /// one lock makes every claim atomic.
 type Bucket = Arc<Mutex<BTreeMap<String, Manifest>>>;
 

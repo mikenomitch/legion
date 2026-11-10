@@ -123,29 +123,29 @@ lower write latency under load.
 
 ## 5. Background — what exists today
 
-- `src/storage/raft/driver.rs`: `pipeline_loop` (one OS thread per group)
+- `crates/manager/src/storage/raft/driver.rs`: `pipeline_loop` (one OS thread per group)
   receives one `PipelineJob` and calls `execute_replicated`, which checks
   leadership, runs `ensure_linearizable` once per term (R1), calls
   `capture::capture_mutation`, runs the ownership guard
   (`ownership::verify_changeset_ownership`) and the mixed-version guard
   (`check_members_can_apply`, R2), then `block_on(raft.client_write(..))`.
-- `src/storage/raft/capture.rs`: `CAPTURE_MUTEX` serializes every capture
+- `crates/manager/src/storage/raft/capture.rs`: `CAPTURE_MUTEX` serializes every capture
   and every apply on the one write connection; `capture_mutation` always
   rolls back; `apply_changeset_with` applies under the mutex with
   `foreign_keys = OFF` and projects side effects after commit.
-- `src/storage/raft/state_machine.rs`: `apply` writes the changeset and the
+- `crates/manager/src/storage/raft/state_machine.rs`: `apply` writes the changeset and the
   `raft_applied` marker in one savepoint; snapshot build is lock-free on its
   own read-only connection (`VACUUM INTO` for `single`, a lane-table dump
   for `lanes`); install holds the capture mutex.
-- `src/storage/raft/log_store.rs`: one `log.sqlite` per group at
+- `crates/manager/src/storage/raft/log_store.rs`: one `log.sqlite` per group at
   `synchronous = FULL`; `purge` records the marker then deletes.
-- `src/storage/store.rs` `configure_connection`: the state DB runs `FULL`
+- `crates/manager/src/storage/store.rs` `configure_connection`: the state DB runs `FULL`
   in raft mode (`durable_sync`). openraft 0.9's `get_initial_state` re-applies
   `(last_applied, committed]` from the log, which fails permanently if the
   applied marker regressed below `last_purged_log_id`.
 - `driver.rs` `start_engine`: `max_in_snapshot_log_to_keep =
   (snapshotEntries / 2).clamp(1, 1000)`.
-- `src/storage/migrations.rs`: one `Vec<M>` of schema steps and data steps,
+- `crates/manager/src/storage/migrations.rs`: one `Vec<M>` of schema steps and data steps,
   run with `rusqlite_migration` on every node at `Store::start_storage`.
 
 ## 6. Proposed design
@@ -318,7 +318,7 @@ constant seed rows. They run locally on every node at startup, as now. A
 test (`schema_migrations_carry_no_data_steps`) fails the build if an `up`
 step contains `UPDATE … SET` or `DELETE FROM`.
 
-**Data steps** live in `src/storage/data_migrations.rs`:
+**Data steps** live in `crates/manager/src/storage/data_migrations.rs`:
 
 ```rust
 pub(crate) const DATA_MIGRATIONS: &[DataMigration] = &[
@@ -374,7 +374,7 @@ still catch up by replay.
 ## 7. Proto, struct, config, and persistence changes
 
 - **Config:** `raft.logRetainBytes` (u64, default 268435456). Documented in
-  `src/structs/config.rs` and `docs/raft-operations.md`.
+  `crates/common/src/structs/config.rs` and `docs/raft-operations.md`.
 - **Log format (breaking):** `StoreCommand { lane, ops: Vec<String>,
   changeset, proposal: Option<Proposal>, schema_version }`; the log table
   gains `appended_ms`.

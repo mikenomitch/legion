@@ -102,18 +102,18 @@ The costs are on the manager side, in what every heartbeat recomputes.
 ### NET1. The endpoint feed is rebuilt from scratch on every heartbeat (high)
 
 - **Today:** every heartbeat with connect allocations calls
-  `build_upstream_endpoints` (`src/manager/server.rs:8963` → `:15281`).
+  `build_upstream_endpoints` (`crates/manager/src/manager/server.rs:8963` → `:15281`).
   - It re-parses each allocation's `task_connect` JSON.
   - It runs one `service_endpoints` query per (service, consumer job)
     (`:15325`), and parses three JSON values per catalog row
-    (`src/storage/store.rs:15929`, `:15935`, `worker_address_host`).
+    (`crates/manager/src/storage/store.rs:15929`, `:15935`, `worker_address_host`).
   - It memoizes only within the call, then clones the result into each
     allocation's list (`:15371`).
   - One node with 100 consumers of a 1,000-endpoint service ships about 100k
     endpoints per beat. The worker replaces every list wholesale
-    (`src/worker/netd/datapath.rs:448`).
+    (`crates/worker/src/worker/netd/datapath.rs:448`).
 - **Convergence follows heartbeat cadence.** The cadence is `ceil(N/1250)` s
-  (`src/constants.rs:150`): about 8 s at 10k nodes and 16 s at 20k. So
+  (`crates/common/src/constants.rs:150`): about 8 s at 10k nodes and 16 s at 20k. So
   backend up/down convergence slows as the fleet grows.
 - **Best in class:** Envoy delta xDS, Kubernetes EndpointSlices, and Consul
   blocking queries push only changed, per-service, versioned sets, in under
@@ -147,7 +147,7 @@ The costs are on the manager side, in what every heartbeat recomputes.
 - **Today:** a mesh connection takes three TCP connections and two userspace
   proxies: the client goes to the loopback forwarder, then over a new mTLS
   connection to the remote node's ingress, which dials the task.
-  - TLS streams take the copy path, not splice (`src/worker/netd/splice.rs:12`).
+  - TLS streams take the copy path, not splice (`crates/worker/src/worker/netd/splice.rs:12`).
   - The eBPF classifier passes upstream VIP traffic up to netd
     (`bpf/legion_net.bpf.c:299`), so the kernel fast path never covers mesh
     traffic.
@@ -164,7 +164,7 @@ The costs are on the manager side, in what every heartbeat recomputes.
 
 ### NET4. HTTP mode buffers request bodies with no cap (medium)
 
-- **Today:** when no body-reading hop applies, `src/worker/netd/http.rs:962`
+- **Today:** when no body-reading hop applies, `crates/worker/src/worker/netd/http.rs:962`
   runs `body.collect()` with no `Limited`. Only the body-hop branch is capped
   (`:981`).
 - **Risk:** a large upload from any caller can exhaust the worker's memory,
@@ -180,9 +180,9 @@ The costs are on the manager side, in what every heartbeat recomputes.
 
 - **Today:**
   - Endpoints are formatted `"{}:{}"` with no brackets
-    (`src/worker/netd/specs.rs:234`).
+    (`crates/worker/src/worker/netd/specs.rs:234`).
   - `worker_address_host` splits on the last `:` (`store.rs:339`).
-  - Ingress binds `0.0.0.0` by default (`src/worker/netd/ingress.rs:306`).
+  - Ingress binds `0.0.0.0` by default (`crates/worker/src/worker/netd/ingress.rs:306`).
 - **Effect:** an IPv6-only node most likely cannot take part in the mesh.
 - **Direction:** use `SocketAddr` end to end, and bind dual-stack.
 - **Tracked:** no.
@@ -193,7 +193,7 @@ The costs are on the manager side, in what every heartbeat recomputes.
   has no `ct state established` short-circuit. So every egress packet walks
   one rule per allocation.
   - Counters are read by forking `nft -j list table` every heartbeat
-    (`src/worker/netd/kernel_guard.rs:413`, called from `forwarder.rs:561`).
+    (`crates/worker/src/worker/netd/kernel_guard.rs:413`, called from `forwarder.rs:561`).
 - **Direction:**
   - Accept established flows first.
   - Read counters over netlink, less often.
@@ -203,7 +203,7 @@ The costs are on the manager side, in what every heartbeat recomputes.
 
 ### NET7. CA rotation re-issues every node's certificate at once (low)
 
-- **Today:** `refresh_node_identity` (`src/worker/daemon.rs:3320`) re-issues
+- **Today:** `refresh_node_identity` (`crates/worker/src/worker/daemon.rs:3320`) re-issues
   as soon as the bundle changes. The only spread is the heartbeat's ±10%
   jitter.
 - **Effect:** about 10k CSRs land within one beat interval, which is a real
@@ -216,7 +216,7 @@ The costs are on the manager side, in what every heartbeat recomputes.
 
 - **Today:**
   - `EdgeLedger` is one node-wide `Mutex<HashMap>`
-    (`src/worker/netd/graph.rs:42`).
+    (`crates/worker/src/worker/netd/graph.rs:42`).
   - The forwarder's in-flight map allocates a `String` key per connection
     (`forwarder.rs:165`, `:2745`).
   - Each copy direction gets a 16 KiB heap buffer (`splice.rs:253`).
@@ -227,7 +227,7 @@ The costs are on the manager side, in what every heartbeat recomputes.
 ### NET9. A node caps at 255 allocations with upstreams (low today, matters for dense sandbox nodes)
 
 - **Today:** VIP blocks come from `127.42.b` with `VIP_BLOCK_MAX = 255`
-  (`src/structs/network.rs:32`).
+  (`crates/common/src/structs/network.rs:32`).
   - Upstream loopback ports and ingress twin ports share the 20000–32000
     range with task ports.
   - A dense sandbox node (the 96-vCPU numbers in
@@ -237,7 +237,7 @@ The costs are on the manager side, in what every heartbeat recomputes.
 ### Noted, not filed
 
 - **NET10.** External upstreams resolve DNS on every connection with no
-  cache (`src/worker/netd/handlers.rs:972`, `guard.rs:39`). This is
+  cache (`crates/worker/src/worker/netd/handlers.rs:972`, `guard.rs:39`). This is
   deliberate, against DNS rebinding, and relies on the host's caching
   resolver.
 - **NET11.** Mesh mTLS is off by default (`service.mesh = true` turns it on),
@@ -271,14 +271,14 @@ What is good:
 ### SCH1. The commit pipeline is stop-and-wait, under one cross-lane mutex, and runs each write twice (critical at scale)
 
 - **Today:** each lane has one `pipeline_loop` thread
-  (`src/storage/raft/driver.rs:2179`). For each entry it runs these steps
+  (`crates/manager/src/storage/raft/driver.rs:2179`). For each entry it runs these steps
   strictly in sequence:
   1. capture the mutation;
   2. `block_on(client_write)` for the quorum commit and local apply (`:2094`);
   3. reply.
 - **Shared across lanes:**
   - Every lane's capture and apply share one process-wide `CAPTURE_MUTEX`
-    (`src/storage/raft/capture.rs:163`) and one SQLite write connection.
+    (`crates/manager/src/storage/raft/capture.rs:163`) and one SQLite write connection.
   - Snapshot install holds that mutex (`state_machine.rs:79`).
 - **The leader runs every write twice:** it executes, extracts the changeset,
   rolls back, then applies the changeset on commit.
@@ -291,7 +291,7 @@ What is good:
 - **Effect:** the `lanes` topology overlaps only the quorum waits. Local CPU
   and IO stay serialized across every lane.
 - **Park adds pressure.** Every keyed park is a suspend and every wake a
-  resume, and both are scheduler-lane entries (`src/storage/store/suspend_ops.rs`).
+  resume, and both are scheduler-lane entries (`crates/manager/src/storage/store/suspend_ops.rs`).
   They now compete with plans on the bottleneck lane.
 - **Tracked:**
   - Pipelining, one fsync per entry, and fewer round trips per eval are
@@ -306,7 +306,7 @@ What is good:
 
 - **Today:** nothing in `src/` deletes or prunes `plan_submission`.
   - Each row carries every placement's 8 ranked candidates as JSON
-    (`DEFAULT_COUNT = 8`, `src/manager/scheduler.rs:316`).
+    (`DEFAULT_COUNT = 8`, `crates/manager/src/manager/scheduler.rs:316`).
   - Every row goes through the raft log and into every snapshot.
 - **Effect:** at 1k plans/s, that is about 86M rows a day. It inflates
   snapshot size, install time, and the memory that T4 holds.
@@ -340,7 +340,7 @@ What is good:
 ### SCH4. `bin_pack` and `spread` score allocation counts, not resources (medium-high)
 
 - **Today:** the score is the node's `assigned_count`, min-max normalized
-  against the other candidates (`src/manager/scheduler.rs:6195`;
+  against the other candidates (`crates/manager/src/manager/scheduler.rs:6195`;
   `policy.rs:121`, `:256`). That candidate list may be truncated.
   - A 32-CPU allocation weighs the same as a 0.1-CPU one.
   - The docs call this "fullness", which overstates it.
@@ -371,14 +371,14 @@ What is good:
 ### SCH6. The scheduling plugin seam can only pick a node (medium; blocks whole workload classes)
 
 - **Today:**
-  - The trait is one method, `select_node` (`src/manager/scheduler/policy.rs:214`),
+  - The trait is one method, `select_node` (`crates/manager/src/manager/scheduler/policy.rs:214`),
     run over already-eligible nodes.
   - One policy applies cluster-wide (`scheduler.rs:1590`).
   - The plugin's context has no free resources.
   - The candidate fast path and ranking are hard-coded to
     `"bin_pack" | "spread"` (`scheduler.rs:4477`, `:5347`, `:5688`, `:5735`),
     so a plugin pays O(eligible) per placement.
-  - The dylib is re-opened on every eval: `src/structs/eval.rs:446` →
+  - The dylib is re-opened on every eval: `crates/manager/src/manager/eval.rs:446` →
     `load_policy` → `policy.rs:411`.
 - **Best in class:** the Kubernetes scheduler framework (PreFilter, Filter,
   Score, Reserve, Permit, Bind) with per-workload profiles (`schedulerName`).
@@ -396,7 +396,7 @@ What is good:
     `maxSkew`; Nomad has `spread`. Here `distinct` and `count.per` are hard
     rules only.
   - **A feasibility cache by computed node class.** Class keys exist only for
-    blocked evals (`src/manager/blocked.rs:16`).
+    blocked evals (`crates/manager/src/manager/blocked.rs:16`).
   - **Usage-aware placement and a descheduler.** Both appear only as
     limitations in the public docs
     ([resource-enforcement.md](../docs/resource-enforcement.md),
@@ -412,7 +412,7 @@ What is good:
   - "Starting scheduler plan_and_apply" (`scheduler.rs:2006`);
   - the applied line (`:2391`);
   - "Claimed evals" (`eval_claims.rs:169`);
-  - one more per submit (`src/structs/eval.rs:186`).
+  - one more per submit (`crates/manager/src/manager/eval.rs:186`).
 - **Why it matters:** AGENTS.md says high-frequency events log at `debug`.
 - **Tracked:** no.
 
@@ -458,7 +458,7 @@ What is good:
     backwards after a failover ([event-stream.md](../docs/event-stream.md)).
   - The event journal keeps 10,000 rows (`store.rs:1966`).
   - A write forwarded by a follower returns without waiting for the
-    follower's own apply (`src/manager/leader_forward.rs`), so
+    follower's own apply (`crates/manager/src/manager/leader_forward.rs`), so
     read-after-write through a follower can be stale.
 - **New watches exist only for apps and the autoscaler:** `WatchObjects`,
   `WatchScalingPolicies`, and `WatchAppExtensions`. `WatchObjects` polls a
@@ -482,7 +482,7 @@ What is good:
 ### ST3. A manager restart or failover forces a full resync of every worker's desired set (medium at scale)
 
 - **Today:** StreamWork positions are tied to a random epoch per manager
-  process (`src/storage/work_log.rs:25`, `:179`). A worker on any other
+  process (`crates/manager/src/storage/work_log.rs:25`, `:179`). A worker on any other
   epoch gets its whole desired set rebuilt from store reads.
 - **Effect (inferred):** losing the leader at 10k–50k nodes means 10k+
   full-set builds at once, on top of the liveness grace rebuild.
@@ -493,7 +493,7 @@ What is good:
 ### ST4. Snapshots are held in memory, and the log tail is capped at 1,000 entries (medium)
 
 - **Today:** snapshots are `Cursor<Vec<u8>>`
-  (`src/storage/raft/state_machine.rs:788`), so a manager needs about twice
+  (`crates/manager/src/storage/raft/state_machine.rs:788`), so a manager needs about twice
   the DB's size in memory. The retained log tail is `.clamp(1, 1000)`
   (`driver.rs:3717`).
 - **Effect:** at 10× the write rate the tail lasts seconds, so any follower
@@ -529,7 +529,7 @@ Legion has two plugin models, and they differ sharply in quality.
 | --- | --- | --- |
 | Rust `cdylib`, `Box<dyn Trait>` over `libloading` | tasks, scheduling, rollouts, node checks, artifacts | In process. Rust only. Tied to one exact build by an FNV fingerprint. No panic containment |
 | exec or HTTP with JSON (`legion-scaling/1` for the autoscaler) | volumes, keyring, cluster CA, autoscaler sources, strategies, and targets | Isolated. Any language. Idempotent operations, a versioned manifest, timeouts, conformance harnesses |
-| WASM (proxy-wasm ABI, `src/wasm/`) | network plugins | Sandboxed, with a fuel limit, any language that targets WASM. Only network plugins use it |
+| WASM (proxy-wasm ABI, `crates/worker/src/wasm/`) | network plugins | Sandboxed, with a fuel limit, any language that targets WASM. Only network plugins use it |
 
 The exec and WASM rows are the right models. The dylib row carries the
 high-rate seams and the risk.
@@ -537,10 +537,10 @@ high-rate seams and the risk.
 ### PLG1. Dylib plugins: no stable ABI and no panic containment (high)
 
 - **Today:**
-  - Five load sites: `src/worker/node_check.rs:112`,
-    `src/manager/rollout_strategy.rs:97`, `src/manager/scheduler/policy.rs:422`,
-    `src/task_plugins/mod.rs:2257`, `src/artifacts/fetcher.rs:410`.
-  - The guard is an FNV hash (`src/plugin_runtime.rs:30`), which the code
+  - Five load sites: `crates/worker/src/worker/node_check.rs:112`,
+    `crates/worker/src/rollout_strategy.rs:97`, `crates/manager/src/manager/scheduler/policy.rs:422`,
+    `crates/worker/src/task_plugins/mod.rs:2257`, `crates/worker/src/artifacts/fetcher.rs:410`.
+  - The guard is an FNV hash (`crates/worker/src/plugin_runtime.rs:30`), which the code
     itself calls "a guard, not a stable ABI".
   - No plugin call is wrapped in `catch_unwind`.
   - Scheduling and rollout plugins run inside the manager, so a plugin bug
@@ -563,17 +563,17 @@ high-rate seams and the risk.
 
 - **Today:**
   - Custom resources come only from static node config
-    (`src/resources.rs:982`). A node-check plugin cannot advertise devices
+    (`crates/common/src/resources.rs:982`). A node-check plugin cannot advertise devices
     it discovers.
   - Device-ID sets are scheduled, but nothing hands the assigned IDs to the
     task. There is no `CUDA_VISIBLE_DEVICES`, CDI, or `nvidia` anywhere in
     `src/`.
-  - Containers deny every device (`src/task_plugins/oci_bundle.rs:1688`).
+  - Containers deny every device (`crates/worker/src/task_plugins/oci_bundle.rs:1688`).
   - The microVM has no VFIO path.
   - There is no device health, NUMA, NVLink, or PCIe topology, and no
     MIG/MPS sharing.
   - Namespace quota covers cpu, memory, and cores only
-    (`src/structs/namespace_policy.rs:79`).
+    (`crates/common/src/structs/namespace_policy.rs:79`).
   - So a GPU job can run only under raw `exec`.
 - **Best in class:** Kubernetes device plugins (`Allocate` returns env,
   mounts, and device nodes) and DRA, the NVIDIA GPU Operator, Nomad's nvidia
@@ -594,11 +594,11 @@ high-rate seams and the risk.
 
 - **Today:**
   - `exec`, `container`, `sandbox`, and `envelope` are hard-coded
-    (`src/task_plugins/mod.rs:2244`). Only `noop` is a dylib.
+    (`crates/worker/src/task_plugins/mod.rs:2244`). Only `noop` is a dylib.
   - The `TaskPlugin` trait has about 42 methods, all of which a plugin would
     have to carry across the fragile ABI.
   - The OCI runtime allowlist is `["runc", "crun"]`
-    (`src/task_plugins/container.rs:263`), so gVisor (`runsc`) and Kata are
+    (`crates/worker/src/task_plugins/container.rs:263`), so gVisor (`runsc`) and Kata are
     refused.
   - There is no Windows support (no `cfg(windows)`).
 - **Best in class:** CRI with `RuntimeClass` (shim v2), and Nomad's task
@@ -613,7 +613,7 @@ high-rate seams and the risk.
 ### PLG4. No admission or mutation policy on jobs, and no secrets provider (medium)
 
 - **Today:** app object kinds have CEL `rules`
-  (`src/structs/object_rules.rs`), but a jobspec passes through no
+  (`crates/common/src/structs/object_rules.rs`), but a jobspec passes through no
   operator-defined policy. There is no OPA, CEL, or webhook admission on
   `RunJob`. Namespace policies cover quota, pools, runtimes, and counts, not
   arbitrary rules ("no `latest` tags", "every service has an owner label").
@@ -630,15 +630,15 @@ high-rate seams and the risk.
 ### PLG5. Shallow seams: rollouts, node checks, volumes (low-medium)
 
 - **Rollouts:** the trait is `name` and `resolve` only
-  (`src/manager/rollout_strategy.rs:8`). There are no step, analysis, or
+  (`crates/worker/src/rollout_strategy.rs:8`). There are no step, analysis, or
   abort hooks, which Argo Rollouts and Flagger have.
 - **Node checks:**
-  - They return an untyped `Map` (`src/worker/node_check.rs:57`).
+  - They return an untyped `Map` (`crates/worker/src/worker/node_check.rs:57`).
   - They dlopen on every pass (`:105`).
   - They have no pressure or taint semantics; pluggable node statuses are
     tracked.
 - **Volumes:** node side only. `create`, `attach`, `detach`, and `expand`
-  are reserved (`src/volumes/mod.rs:82`), so EBS-style block volumes that
+  are reserved (`crates/common/src/volumes/mod.rs:82`), so EBS-style block volumes that
   follow an allocation cannot work. The CSI bridge is tracked.
 - **Tracked:** rollout hooks and the per-pass dlopen are not.
 
@@ -663,10 +663,10 @@ See PLG2. This is the largest gap for AI workloads.
 
 - **Today:**
   - Only denials are logged, to the `acl_audit` tracing target
-    (`src/manager/acl.rs`, `src/manager/server/delegation.rs:460`).
+    (`crates/manager/src/manager/acl.rs`, `crates/manager/src/manager/server/delegation.rs:460`).
   - `SchedulerEvent` has no actor field.
   - A few events now carry `by` (`scale.pinned`, app install;
-    `src/storage/events.rs:1217`, `:1659`), and app objects record their
+    `crates/manager/src/storage/events.rs:1217`, `:1659`), and app objects record their
     writer's `authority`.
   - Sessions have no audit log ([session-mode.md](../docs/session-mode.md)).
 - **Effect:** "which agent, acting for whom, did this?" has no answer.
@@ -686,13 +686,13 @@ See PLG2. This is the largest gap for AI workloads.
 ### AI3. Credentials and guardrails for agent operators (high)
 
 - **Exists now:**
-  - On-behalf-of delegation for apps (`src/manager/delegation.rs`).
+  - On-behalf-of delegation for apps (`crates/manager/src/manager/delegation.rs`).
   - Acting for an object.
-  - Job grants under "grant what you hold" (`src/structs/grant.rs`).
+  - Job grants under "grant what you hold" (`crates/common/src/structs/grant.rs`).
   - App install and upgrade show a permission diff and need approval.
 - **Still missing:**
   - **Token expiry.** ACL tokens never expire by default; `acl.tokenMaxTtl`
-    is unbounded unless set (`src/structs/config.rs:1602`).
+    is unbounded unless set (`crates/common/src/structs/config.rs:1602`).
   - **Token attenuation.** Minting any token needs `acl:write`
     (`server.rs:12132`), so an agent cannot hand a sub-agent a narrower
     token. Biscuit or macaroon-style attenuation, or a "create a child token
@@ -743,7 +743,7 @@ See PLG2. This is the largest gap for AI workloads.
 
 - **Today:**
   - The node cache class is clamped to 1–20 GiB by default
-    (`src/structs/config.rs:3360`), smaller than one 70B checkpoint.
+    (`crates/common/src/structs/config.rs:3360`), smaller than one 70B checkpoint.
   - ORAS layers are not cached.
   - There is no peer-to-peer distribution and no lazy loading.
 - **Best in class:** Dragonfly, Spegel, SOCI/Nydus, Modal's lazy filesystem.
@@ -772,7 +772,7 @@ See PLG2. This is the largest gap for AI workloads.
 - **One stale TODO entry:** it said the `sandbox` runtime "cannot exec,
   signal, or deliver identity files". Exec works through the guest agent, and
   identity files are projected through the identity disk
-  (`src/task_plugins/sandbox.rs:181`). Only on-demand signals are still
+  (`crates/worker/src/task_plugins/sandbox.rs:181`). Only on-demand signals are still
   missing. This change corrects that entry.
 
 ### AI9. No usage or cost accounting over time per namespace (medium for multi-tenant and agent budgets)

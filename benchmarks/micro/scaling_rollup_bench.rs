@@ -1,5 +1,5 @@
 //! Scaling-input rollups (docs/autoscaling.md, "Scaling inputs";
-//! `src/manager/scaling_inputs.rs`): what each step costs at fleet sizes the
+//! `crates/manager/src/manager/scaling_inputs.rs`): what each step costs at fleet sizes the
 //! autoscaler plan sizes for (§6.7: 10,000 tasks on about 3 nodes each).
 //!
 //! Groups:

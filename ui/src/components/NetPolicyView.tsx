@@ -2,7 +2,7 @@ import { For, Show } from 'solid-js'
 import { Badge, DefList, MonoBadge, cx } from './ui'
 
 // The merged policy the manager returns from ShowNetPolicy (`effective_json`),
-// mirroring `EffectivePolicy` in src/structs/netpolicy.rs. Every rule and
+// mirroring `EffectivePolicy` in crates/common/src/structs/netpolicy.rs. Every rule and
 // handler carries `source` — `policy/<name>#<index>` or `task#<index>` — so
 // the view can say where each line came from.
 export type RuleMatch = {
@@ -24,7 +24,7 @@ export type EffectiveRule = {
 }
 
 // A handler is written as its kind (`{ authz = { url } }`), plus the settings
-// every hop shares. Mirrors `HopConfig` in src/structs/hops.rs.
+// every hop shares. Mirrors `HopConfig` in crates/common/src/structs/hops.rs.
 export type HandlerSettings = {
   url?: string
   cache?: string

@@ -285,22 +285,26 @@ Two consequences to know about:
 
 #### Adding a strategy
 
-A strategy is a trait plus a registry entry. Adding one takes two steps, both
-in one file:
+A strategy is a trait, a registry entry, and a name the jobspec accepts.
+Adding one takes three steps:
 
-1. Implement `Balancer` in [`src/worker/balance.rs`](../src/worker/balance.rs)
+1. Implement `Balancer` in [`crates/worker/src/worker/balance.rs`](../crates/worker/src/worker/balance.rs)
    (`name()` plus `pick(&[Endpoint], &HashMap<String, usize>) -> Option<usize>`,
    where the map is in-flight connections per endpoint address). A strategy
    that learns from outcomes also implements `observe(addr, Outcome)`, which
    the datapath calls with every latency sample and failure it sees.
 2. Add one row to the `BALANCERS` table in the same file:
    `("first_healthy", || Arc::new(FirstHealthy))`.
+3. Add the name, in the same position, to `BALANCE_STRATEGIES` in
+   [`crates/common/src/structs/network.rs`](../crates/common/src/structs/network.rs),
+   which is what config validation reads (`is_known_balance`, and the
+   "valid strategies are …" error message).
 
-`BALANCERS` is the only list of strategy names in the tree. Config validation
-reads it too (`is_known_balance`, and the "valid strategies are …" error
-message), so you can't ship a name the worker cannot build. Nothing else
-changes. The wire carries the strategy name as a string, so a new strategy
-needs no proto change and no migration.
+Validation lives in a crate below the datapath, so it keeps its own list of
+names. A unit test beside `BALANCERS` fails when the two lists differ, so
+you can't ship a name the worker cannot build, or a strategy nobody can
+select. Nothing else changes. The wire carries the strategy name as a
+string, so a new strategy needs no proto change and no migration.
 
 ### How it works
 

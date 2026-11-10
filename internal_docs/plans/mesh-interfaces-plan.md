@@ -140,7 +140,7 @@ pluggability on the egress path. Problems 6 to 11 are about the surface.
 
 1. **Custom logic is expensive or impossible.** The built-in handler set is
    a closed table (`HANDLERS`,
-   [src/structs/netpolicy.rs:67](../../src/structs/netpolicy.rs)): `authz`,
+   [crates/common/src/structs/netpolicy.rs:67](../../crates/common/src/structs/netpolicy.rs)): `authz`,
    `proxy`, `log`, `dlp`. Anything else has two routes:
    - **A webhook** (`authz`). One HTTP POST per new (identity, destination,
      method, path), cached, and verdict-only: it cannot rewrite a header,
@@ -161,7 +161,7 @@ pluggability on the egress path. Problems 6 to 11 are about the surface.
    trip latency are paid by every flow, for a decision made once at connect.
 3. **Host-mode egress policy is cooperative.** A `host`-mode `exec` task that
    dials a raw address bypasses its own chain. The kernel guard
-   ([kernel_guard.rs](../../src/worker/netd/kernel_guard.rs)) is a fixed
+   ([kernel_guard.rs](../../crates/worker/src/worker/netd/kernel_guard.rs)) is a fixed
    floor (metadata, control ports, other allocations' listeners), not the
    task's policy.
 4. **Gated capture depends on the client's cooperation.** A gated task
@@ -174,29 +174,29 @@ pluggability on the egress path. Problems 6 to 11 are about the surface.
    restarts").
 6. **A handler's kind is a string matched in four places, and two of them
    already disagree.** `HandlerConfig`
-   ([netpolicy.rs:404](../../src/structs/netpolicy.rs)) is one flat
+   ([netpolicy.rs:404](../../crates/common/src/structs/netpolicy.rs)) is one flat
    struct. `url` and `cache` mean something only for `authz`. `service`,
    `port`, `node`, and `proxyProtocol` mean something only for `proxy`,
    where a count at validation enforces that exactly one target is set.
    `dlp`'s settings are untyped JSON in `config`, read once by the validator
-   (`normalize_handler`, [netpolicy.rs:702](../../src/structs/netpolicy.rs))
+   (`normalize_handler`, [netpolicy.rs:702](../../crates/common/src/structs/netpolicy.rs))
    and again by HTTP mode, which drops a pattern that fails to compile with
-   `filter_map` ([netd/http.rs:270](../../src/worker/netd/http.rs)). The
+   `filter_map` ([netd/http.rs:270](../../crates/worker/src/worker/netd/http.rs)). The
    kind string is matched by:
    - the validator;
-   - `handlers::run` ([netd/handlers.rs:150](../../src/worker/netd/handlers.rs)),
+   - `handlers::run` ([netd/handlers.rs:150](../../crates/worker/src/worker/netd/handlers.rs)),
      which serves `authz` and `proxy` and skips the rest;
-   - `HttpSettings::new` ([netd/http.rs:235](../../src/worker/netd/http.rs)),
+   - `HttpSettings::new` ([netd/http.rs:235](../../crates/worker/src/worker/netd/http.rs)),
      which serves `dlp` and `log` and skips the rest;
    - the manager's `build_handler_endpoints`
-     ([manager/server.rs:12822](../../src/manager/server.rs)), which reaches
+     ([manager/server.rs:12822](../../crates/manager/src/manager/server.rs)), which reaches
      into `proxy`'s fields to build the endpoint feed, once for chains and
      once for upstreams.
 
    **The gap this leaves.** `HttpSettings` is only ever built from the
    upstream's own handlers (`&self.handlers`,
-   [forwarder.rs:1119](../../src/worker/forwarder.rs)) or from none
-   (`for_ingress`, [netd/http.rs:359](../../src/worker/netd/http.rs)).
+   [forwarder.rs:1119](../../crates/worker/src/worker/forwarder.rs)) or from none
+   (`for_ingress`, [netd/http.rs:359](../../crates/worker/src/worker/netd/http.rs)).
    Nothing else compiles a chain's `dlp` or `log`. So a `dlp` or `log` on a
    chain, inline or on a policy object, passes validation and never runs. A
    `require` policy that tells every sandbox to block request bodies holding
@@ -204,29 +204,29 @@ pluggability on the egress path. Problems 6 to 11 are about the surface.
    confirms it with a test before fixing it.
 7. **A chain's `onError` is shown, not enforced.** The chain-level `onError`
    is validated, merged
-   ([netpolicy.rs:1134](../../src/structs/netpolicy.rs)), and printed by
+   ([netpolicy.rs:1134](../../crates/common/src/structs/netpolicy.rs)), and printed by
    `net policy show` as the default for any hop without its own
    ([cmd/net.rs:1084](../../src/cmd/net.rs)). The datapath reads only the
    hop's own value, and treats an absent one as `deny`
-   ([netd/handlers.rs:144](../../src/worker/netd/handlers.rs),
-   [netd/http.rs:292](../../src/worker/netd/http.rs)). A chain that says
+   ([netd/handlers.rs:144](../../crates/worker/src/worker/netd/handlers.rs),
+   [netd/http.rs:292](../../crates/worker/src/worker/netd/http.rs)). A chain that says
    `onError = "allow"` is shown failing open and fails closed.
 8. **An upstream is two shapes in one struct, and its protocol is decided in
    four places.** `UpstreamConfig`
-   ([network.rs:688](../../src/structs/network.rs)) uses `service` for a
+   ([network.rs:688](../../crates/common/src/structs/network.rs)) uses `service` for a
    catalog service and `name` + `to` for an external destination, held
    apart by a validation matrix
-   ([network.rs:1812](../../src/structs/network.rs)). The resolved
+   ([network.rs:1812](../../crates/common/src/structs/network.rs)). The resolved
    `AllocUpstream.service`
-   ([network.rs:1097](../../src/structs/network.rs)) holds the upstream's
+   ([network.rs:1097](../../crates/common/src/structs/network.rs)) holds the upstream's
    key, which for an external upstream is not a service. HTTP parsing is
    turned on by any of:
-   - `UpstreamConfig::is_http` ([network.rs:944](../../src/structs/network.rs)):
+   - `UpstreamConfig::is_http` ([network.rs:944](../../crates/common/src/structs/network.rs)):
      an `http` block or an `http(s)://` scheme;
-   - `declares_http` ([forwarder.rs:1094](../../src/worker/forwarder.rs)):
+   - `declares_http` ([forwarder.rs:1094](../../crates/worker/src/worker/forwarder.rs)):
      the same, plus credentials, plus any `dlp` handler;
    - the task chain's `protocol`;
-   - the **effective egress policy** ([forwarder.rs:1107](../../src/worker/forwarder.rs)).
+   - the **effective egress policy** ([forwarder.rs:1107](../../crates/worker/src/worker/forwarder.rs)).
 
    The last one means a pool-wide `protocol = "http"` policy, written for
    path rules, also parses a `{ service = "db" }` Postgres stream as HTTP and
@@ -237,14 +237,14 @@ pluggability on the egress path. Problems 6 to 11 are about the surface.
 
    | What the task reads | Value |
    | --- | --- |
-   | `LEGION_UPSTREAM_DB` | `127.0.0.1:20003`, always the loopback port ([network.rs:1236](../../src/structs/network.rs)) |
+   | `LEGION_UPSTREAM_DB` | `127.0.0.1:20003`, always the loopback port ([network.rs:1236](../../crates/common/src/structs/network.rs)) |
    | `LEGION_UPSTREAM_PORT_DB` | `20003` |
    | `LEGION_UPSTREAM_HOST_DB` | `db.svc.legion` |
    | `LEGION_UPSTREAM_VIP_DB` | `127.42.7.2:5432` |
    | `{{ service "db" }}` in a connect template | `127.42.7.2:5432` |
 
    The template helper's comment
-   ([templates.rs:186](../../src/worker/templates.rs)) says it returns what
+   ([templates.rs:186](../../crates/worker/src/worker/templates.rs)) says it returns what
    `LEGION_UPSTREAM_<KEY>` carries. On Linux it does not. Every upstream
    also takes a port from the per-node 20000–32000 range, even where the VIP
    serves it.
@@ -253,34 +253,34 @@ pluggability on the egress path. Problems 6 to 11 are about the surface.
     `ingress.tls = { mode = "mutual", certFrom = "legion", clientCa = "legion" }`,
     three fields that must agree. The catalog marks an endpoint `mesh_tls`
     only when the effective ingress chain resolves to the mesh at placement
-    ([store.rs:13237](../../src/storage/store.rs),
-    [store.rs:15142](../../src/storage/store.rs)). The values `tls.mode`
+    ([store.rs:13237](../../crates/manager/src/storage/store.rs),
+    [store.rs:15142](../../crates/manager/src/storage/store.rs)). The values `tls.mode`
     accepts depend on direction
-    ([netpolicy.rs:107](../../src/structs/netpolicy.rs)), and egress
+    ([netpolicy.rs:107](../../crates/common/src/structs/netpolicy.rs)), and egress
     `originate` restates what `https://` on an upstream already says.
     Callers are restricted three ways:
     - `service.allow`: job ids, filtered in the endpoint feed
-      (`allow_permits`, [network.rs:620](../../src/structs/network.rs),
-      [server.rs:12896](../../src/manager/server.rs)). Not cryptographic, and
+      (`allow_permits`, [network.rs:620](../../crates/common/src/structs/network.rs),
+      [server.rs:12896](../../crates/manager/src/manager/server.rs)). Not cryptographic, and
       never checked at the receiving node.
     - `tls.requireIdentity`: workload globs over
       `<region>:<job>:<group>:<task>`
-      ([forwarder.rs:765](../../src/worker/forwarder.rs)), checked after the
-      handshake ([netd/ingress.rs:463](../../src/worker/netd/ingress.rs)).
+      ([forwarder.rs:765](../../crates/worker/src/worker/forwarder.rs)), checked after the
+      handshake ([netd/ingress.rs:463](../../crates/worker/src/worker/netd/ingress.rs)).
     - `ingress.rules[].when.identity`, plus `authz`.
 
     The public doc needs a paragraph ("Intentions … Scope") to explain how
     they differ.
 11. **Every new source of material is a new RPC.** The same idea is spelled
-    five ways: `certFrom = { kv }` ([netpolicy.rs:464](../../src/structs/netpolicy.rs)),
+    five ways: `certFrom = { kv }` ([netpolicy.rs:464](../../crates/common/src/structs/netpolicy.rs)),
     `credentials[].from = { kv | identity }`
-    ([network.rs:737](../../src/structs/network.rs)), `certPath`/`keyPath`,
+    ([network.rs:737](../../crates/common/src/structs/network.rs)), `certPath`/`keyPath`,
     `clientCa = "legion" | <path>`, and `caPath`. The worker fetches policy
     bodies, KV certificates, and credentials through three worker-plane RPCs
     (`FetchNetPolicy`, `GetIngressCertificates`, `GetUpstreamCredentials`;
     [legion.proto:1855, 1137, 1185](../../proto/legion.proto)). Each has its
     own `NetdWants` field and `NetdInput` variant
-    ([netd/datapath.rs:64, 96](../../src/worker/netd/datapath.rs)). A Vault or
+    ([netd/datapath.rs:64, 96](../../crates/worker/src/worker/netd/datapath.rs)). A Vault or
     cloud secret-manager source would need a new RPC, a new wants field, a new
     input variant, a new caller class, and a new `tests/acl_endpoints.rs` row.
     `clientCa = { kv }` is still an open TODO item for the same reason.
@@ -526,25 +526,25 @@ covers them.
 
 | What | Where | Why it matters here |
 | --- | --- | --- |
-| The L4 forwarder and `ForwarderContext` (policy lookup, denials, credentials, handler state) | [forwarder.rs:226](../../src/worker/forwarder.rs) | The redirect target for A, and the host for B |
-| `splice(2)` for bulk L4, with a copy fallback | [netd/splice.rs:93](../../src/worker/netd/splice.rs) | Redirected flows keep it |
-| Connect-time and request-time evaluators | `evaluate_connect` / `evaluate_request`, [netpolicy.rs:1309](../../src/structs/netpolicy.rs). `Verdict::Defer` when a connect-time decision needs the request head ([netpolicy.rs:1221](../../src/structs/netpolicy.rs)) | The single source of truth that the kernel maps must agree with (§9), and what S2's fail-closed rule reads |
-| `HandlerConfig`, a flat bag: `url` only means something for `authz`, `service` only for `proxy` | [netpolicy.rs:404](../../src/structs/netpolicy.rs), validated by `normalize_handler` at [:702](../../src/structs/netpolicy.rs) | What S1 replaces |
-| Hop dispatch, in four places | `handlers::run` ([netd/handlers.rs:150](../../src/worker/netd/handlers.rs)), `HttpSettings::new` ([netd/http.rs:235](../../src/worker/netd/http.rs)), `build_handler_endpoints` ([server.rs:12822](../../src/manager/server.rs)), the validator | The four places S1 replaces with one registry and one compiled pipeline |
-| The `Balancer` trait and the `BALANCERS` table, read by validation too | [balance.rs](../../src/worker/balance.rs) | The pattern S1 copies for handlers |
-| `UpstreamConfig`, its validation matrix, `AllocUpstream` | [network.rs:688](../../src/structs/network.rs), [:1812](../../src/structs/network.rs), [:1097](../../src/structs/network.rs) | What S2 replaces |
-| HTTP-mode triggers | [network.rs:944](../../src/structs/network.rs), [forwarder.rs:1094](../../src/worker/forwarder.rs), [:1107](../../src/worker/forwarder.rs) | The four triggers S2 reduces to one |
-| Upstream env vars and the template address | `env_pairs`, [network.rs:1218](../../src/structs/network.rs); `service_address`, [templates.rs:186](../../src/worker/templates.rs) | S2's one-address rule |
-| Mesh opt-in | `TlsConfig` and `cert_from_mesh`, [netpolicy.rs:437](../../src/structs/netpolicy.rs), [:481](../../src/structs/netpolicy.rs); `ingress_tls_at_placement`, [store.rs:13237](../../src/storage/store.rs); the catalog's `mesh_tls`, [store.rs:15142](../../src/storage/store.rs) | What S3 collapses to `service.mesh` |
-| Callers | `allow_permits` in the endpoint feed, [network.rs:620](../../src/structs/network.rs), [server.rs:12896](../../src/manager/server.rs); `requireIdentity`, [netd/ingress.rs:463](../../src/worker/netd/ingress.rs); the identity string, [forwarder.rs:765](../../src/worker/forwarder.rs) | What S4 unifies |
-| Material sources and fetches | `CertFrom`, [netpolicy.rs:464](../../src/structs/netpolicy.rs); `CredentialFrom`, [network.rs:737](../../src/structs/network.rs); `NetdInput`/`NetdWants`, [netd/datapath.rs:64](../../src/worker/netd/datapath.rs), [:96](../../src/worker/netd/datapath.rs); the three RPCs, [legion.proto:1137, 1185, 1855](../../proto/legion.proto) | What S5 replaces |
-| HTTP mode: rules, hops, credentials, built-in `dlp`/`log` | [netd/http.rs:731](../../src/worker/netd/http.rs) (`handle`), `:270` | The request, body, and response stages B hooks |
-| The gated egress proxy (`CONNECT`, absolute URI, SOCKS5) | [netd/proxy.rs](../../src/worker/netd/proxy.rs) | Keeps working; transparent capture sits beside it |
-| The per-allocation resolver, which already judges names against policy | [netd/dns.rs:431](../../src/worker/netd/dns.rs) | The source of kernel FQDN policy (§6.A.4) |
-| The kernel guard: one `nftables` table matching sockets by cgroup leaf | [netd/kernel_guard.rs](../../src/worker/netd/kernel_guard.rs) | Proves the per-allocation cgroup attach point. Phase A1 re-implements it in eBPF |
-| Every task gets a cgroup leaf `legion/{share,reserve}/legion-<alloc>`, even with resource enforcement off | [oci_bundle.rs:1679](../../src/task_plugins/oci_bundle.rs), [resources.rs](../../src/worker/resources.rs) | The attach point for every hook in A |
-| Gated namespaces: loopback plus listeners | [netd/netns.rs:58](../../src/worker/netd/netns.rs) | Stay the boundary. A adds transparency, not a replacement |
-| Restart replay from `netd_state.json` | [netd/state.rs](../../src/worker/netd/state.rs) | Pinned eBPF links extend this to the kernel tier |
+| The L4 forwarder and `ForwarderContext` (policy lookup, denials, credentials, handler state) | [forwarder.rs:226](../../crates/worker/src/worker/forwarder.rs) | The redirect target for A, and the host for B |
+| `splice(2)` for bulk L4, with a copy fallback | [netd/splice.rs:93](../../crates/worker/src/worker/netd/splice.rs) | Redirected flows keep it |
+| Connect-time and request-time evaluators | `evaluate_connect` / `evaluate_request`, [netpolicy.rs:1309](../../crates/common/src/structs/netpolicy.rs). `Verdict::Defer` when a connect-time decision needs the request head ([netpolicy.rs:1221](../../crates/common/src/structs/netpolicy.rs)) | The single source of truth that the kernel maps must agree with (§9), and what S2's fail-closed rule reads |
+| `HandlerConfig`, a flat bag: `url` only means something for `authz`, `service` only for `proxy` | [netpolicy.rs:404](../../crates/common/src/structs/netpolicy.rs), validated by `normalize_handler` at [:702](../../crates/common/src/structs/netpolicy.rs) | What S1 replaces |
+| Hop dispatch, in four places | `handlers::run` ([netd/handlers.rs:150](../../crates/worker/src/worker/netd/handlers.rs)), `HttpSettings::new` ([netd/http.rs:235](../../crates/worker/src/worker/netd/http.rs)), `build_handler_endpoints` ([server.rs:12822](../../crates/manager/src/manager/server.rs)), the validator | The four places S1 replaces with one registry and one compiled pipeline |
+| The `Balancer` trait and the `BALANCERS` table, read by validation too | [balance.rs](../../crates/worker/src/worker/balance.rs) | The pattern S1 copies for handlers |
+| `UpstreamConfig`, its validation matrix, `AllocUpstream` | [network.rs:688](../../crates/common/src/structs/network.rs), [:1812](../../crates/common/src/structs/network.rs), [:1097](../../crates/common/src/structs/network.rs) | What S2 replaces |
+| HTTP-mode triggers | [network.rs:944](../../crates/common/src/structs/network.rs), [forwarder.rs:1094](../../crates/worker/src/worker/forwarder.rs), [:1107](../../crates/worker/src/worker/forwarder.rs) | The four triggers S2 reduces to one |
+| Upstream env vars and the template address | `env_pairs`, [network.rs:1218](../../crates/common/src/structs/network.rs); `service_address`, [templates.rs:186](../../crates/worker/src/worker/templates.rs) | S2's one-address rule |
+| Mesh opt-in | `TlsConfig` and `cert_from_mesh`, [netpolicy.rs:437](../../crates/common/src/structs/netpolicy.rs), [:481](../../crates/common/src/structs/netpolicy.rs); `ingress_tls_at_placement`, [store.rs:13237](../../crates/manager/src/storage/store.rs); the catalog's `mesh_tls`, [store.rs:15142](../../crates/manager/src/storage/store.rs) | What S3 collapses to `service.mesh` |
+| Callers | `allow_permits` in the endpoint feed, [network.rs:620](../../crates/common/src/structs/network.rs), [server.rs:12896](../../crates/manager/src/manager/server.rs); `requireIdentity`, [netd/ingress.rs:463](../../crates/worker/src/worker/netd/ingress.rs); the identity string, [forwarder.rs:765](../../crates/worker/src/worker/forwarder.rs) | What S4 unifies |
+| Material sources and fetches | `CertFrom`, [netpolicy.rs:464](../../crates/common/src/structs/netpolicy.rs); `CredentialFrom`, [network.rs:737](../../crates/common/src/structs/network.rs); `NetdInput`/`NetdWants`, [netd/datapath.rs:64](../../crates/worker/src/worker/netd/datapath.rs), [:96](../../crates/worker/src/worker/netd/datapath.rs); the three RPCs, [legion.proto:1137, 1185, 1855](../../proto/legion.proto) | What S5 replaces |
+| HTTP mode: rules, hops, credentials, built-in `dlp`/`log` | [netd/http.rs:731](../../crates/worker/src/worker/netd/http.rs) (`handle`), `:270` | The request, body, and response stages B hooks |
+| The gated egress proxy (`CONNECT`, absolute URI, SOCKS5) | [netd/proxy.rs](../../crates/worker/src/worker/netd/proxy.rs) | Keeps working; transparent capture sits beside it |
+| The per-allocation resolver, which already judges names against policy | [netd/dns.rs:431](../../crates/worker/src/worker/netd/dns.rs) | The source of kernel FQDN policy (§6.A.4) |
+| The kernel guard: one `nftables` table matching sockets by cgroup leaf | [netd/kernel_guard.rs](../../crates/worker/src/worker/netd/kernel_guard.rs) | Proves the per-allocation cgroup attach point. Phase A1 re-implements it in eBPF |
+| Every task gets a cgroup leaf `legion/{share,reserve}/legion-<alloc>`, even with resource enforcement off | [oci_bundle.rs:1679](../../crates/worker/src/task_plugins/oci_bundle.rs), [resources.rs](../../crates/worker/src/worker/resources.rs) | The attach point for every hook in A |
+| Gated namespaces: loopback plus listeners | [netd/netns.rs:58](../../crates/worker/src/worker/netd/netns.rs) | Stay the boundary. A adds transparency, not a replacement |
+| Restart replay from `netd_state.json` | [netd/state.rs](../../crates/worker/src/worker/netd/state.rs) | Pinned eBPF links extend this to the kernel tier |
 
 ---
 
@@ -563,16 +563,16 @@ already rewrites the code it lives in (calls entry 17).
 
 | Removed | Why | Instead | Track |
 | --- | --- | --- | --- |
-| `log` handler | Does exactly what `accessLog = true` does (`access_log` checks `chain.access_log \|\| settings.log_handler`, [netd/http.rs:1703](../../src/worker/netd/http.rs)) | `accessLog = true` on the chain | S1 |
+| `log` handler | Does exactly what `accessLog = true` does (`access_log` checks `chain.access_log \|\| settings.log_handler`, [netd/http.rs:1703](../../crates/worker/src/worker/netd/http.rs)) | `accessLog = true` on the chain | S1 |
 | Chain-level `onError` | Shown by `show`, never read by the datapath (problem 7) | `onError` on the hop, default `deny` | S1 |
 | `handler = "…"` string and `config = {…}` | Replaced by keyed variants | `{ authz = {…} }`, `{ dlp = {…} }` | S1 |
 | `proxy` target `node = "x"` | It is "`service = "x"`, node-local endpoints only" under another name | `{ proxy = { service = "x", local = true } }` | S1 |
 | `service`, `localPort` on upstreams | One `to`; `port` pins | `{ to = "db" }`, `{ to = "cache", port = 6379 }` | S2 |
 | `LEGION_UPSTREAM_VIP_<K>` | It names the same listener as `LEGION_UPSTREAM_<K>` | `LEGION_UPSTREAM_<K>` | S2 |
 | `http.outlier` | `least_latency` already counts a 5xx as a 1-second answer and sheds the endpoint. Ejection becomes fixed behavior in HTTP mode for every balancer: 5 consecutive 5xx, 30 s out, today's defaults | nothing to write | S2 |
-| `random` balancer | It exists so that many clients don't send their first connections to the same endpoint. That happens with `round_robin` because every new listener's cursor starts at 0 ([balance.rs](../../src/worker/balance.rs)). Starting each listener's cursor at a random offset fixes `round_robin` itself, and then `random` adds nothing (calls entry 17) | `round_robin` | S2 |
+| `random` balancer | It exists so that many clients don't send their first connections to the same endpoint. That happens with `round_robin` because every new listener's cursor starts at 0 ([balance.rs](../../crates/worker/src/worker/balance.rs)). Starting each listener's cursor at a random offset fixes `round_robin` itself, and then `random` adds nothing (calls entry 17) | `round_robin` | S2 |
 | `tls.mode` on chains (`off`/`server`/`mutual`/`passthrough`/`originate`), `certFrom`, `certPath`/`keyPath`, `clientCa`, `caPath`, `requireIdentity` | The mesh is one switch, and TLS moves onto ports and upstreams (S3). Callers move to `service.allow` (S4) | `service.mesh`, `ports[].tls`, upstream `ca`, `service.allow` | S3, S4 |
-| Reserved `network.mode` values `bridge` and `cni/<name>` | Reserving a name for a plugin that does not exist is surface without a feature ([netpolicy.rs:903](../../src/structs/netpolicy.rs)) | The unknown-mode error lists the valid modes | S3 |
+| Reserved `network.mode` values `bridge` and `cni/<name>` | Reserving a name for a plugin that does not exist is surface without a feature ([netpolicy.rs:903](../../crates/common/src/structs/netpolicy.rs)) | The unknown-mode error lists the valid modes | S3 |
 | `FetchNetPolicy`, `GetIngressCertificates`, `GetUpstreamCredentials` | One fetch, keyed by kind (S5) | `FetchDatapathMaterial` | S5 |
 
 The registries keep re-adding cheap. A balancer that comes back is one row
@@ -659,7 +659,7 @@ pub trait Handler: Send + Sync {
 pub const HANDLERS: &[HandlerEntry] = &[ /* authz, proxy, dlp, plugin */ ];
 ```
 
-This is the pattern `BALANCERS` in [balance.rs](../../src/worker/balance.rs)
+This is the pattern `BALANCERS` in [balance.rs](../../crates/worker/src/worker/balance.rs)
 already proved: one table, read by validation too, so there is no second
 place to forget.
 
@@ -694,7 +694,7 @@ label each one `kernel`, `netd`, `netd (wasm)`, or `external`, from
 reviewer can read the cost straight off the policy. Placement keeps that
 property by being printed, not implied.
 
-**Adding a kind** is one file under `src/worker/netd/handlers/`, one
+**Adding a kind** is one file under `crates/worker/src/worker/netd/handlers/`, one
 `HANDLERS` row, one Nickel contract, one entry in `configs/jobs/maximal.ncl`,
 and one row in the public handler table. A parity test fails the build if any
 of the last four is missing (§9).
@@ -1031,7 +1031,7 @@ directly, which is the better source of attribution.
 
 The kernel sees addresses, and Legion's rules name hosts. The bridge is the
 resolver Legion already runs per allocation, which already judges every
-name ([dns.rs:431](../../src/worker/netd/dns.rs)):
+name ([dns.rs:431](../../crates/worker/src/worker/netd/dns.rs)):
 
 1. **All DNS is captured.** `sendmsg4/6` and `connect4/6` rewrite port-53
    traffic from governed tasks to the allocation's resolver, whatever
@@ -1339,7 +1339,7 @@ surface or a moving part:
 - `HandlerConfig` becomes `HopConfig { kind: HandlerKind, timeout, on_error }`,
   with `HandlerKind` = `Authz`, `Proxy`, `Dlp`, and (B1) `Plugin`. `Log` is
   removed, and so is `ChainConfig.on_error`. The policy hash format changes.
-- `src/worker/netd/handlers.rs` becomes a module directory: one file per
+- `crates/worker/src/worker/netd/handlers.rs` becomes a module directory: one file per
   kind, the `Handler` trait, `HANDLERS`, and `Pipeline`.
 - `NetHandlerStatus.handler` carries the registry name. Its shape is
   otherwise unchanged.
@@ -1350,7 +1350,7 @@ surface or a moving part:
 - `AllocUpstream.service` becomes `key`, and `local_port` becomes optional:
   it is set on macOS, when the node has no VIP block, or when `port` is
   pinned. The rename rides a store migration
-  ([storage/migrations.rs](../../src/storage/migrations.rs)).
+  ([storage/migrations.rs](../../crates/manager/src/storage/migrations.rs)).
 - `UpstreamHttpConfig` loses `outlier`. `RetryConfig` is unchanged.
 - `BALANCERS` loses `random`. `RoundRobin` and `LeastConn` seed their cursor
   at a random offset.

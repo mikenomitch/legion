@@ -2,387 +2,452 @@
 
 > **Judgement calls:** [workspace-crate-split-plan_calls.md](../calls/workspace-crate-split-plan_calls.md)
 
-**Status: IN EXECUTION** — phase 1 (`legion-proto`) shipped 2026-11-08: the
-main crate's peak build memory fell from 11.1 GB to 10.0 GB (§ 5.3). Phases
-2–7 are planned. Deliberately deferred: publishing the new crates to
-crates.io (§ 10), and moving the example plugins off the `legion` crate
-(§ 11).
+**Status: SHIPPED** (2026-11-10) as five crates in a chain: `legion-proto` →
+`legion-common` → `legion-worker` → `legion-manager` → the `legion` binary.
+Building Legion went from 9.0 GB to 5.0 GB at the peak, and the test build,
+which a 16 GB machine could not finish, now fits (§ 5.4). It cost 5.8 MB of
+shipping binary (91.5 → 97.3 MB). **Deliberately deferred**, each with what it would take in § 8: splitting the store and the
+scheduler out of `legion-manager`, a datapath crate, a plugin API crate so
+plugins stop depending on all of Legion, and publishing the crates.
+
+The public description of the layout is
+[docs/codebase-conventions.md, "Crates"](../../docs/codebase-conventions.md#crates).
 
 ## 1. Problem
 
-Legion is one library crate of 465,000 lines (`src/`, excluding generated
-code) plus the protobuf code `tonic-build` generates from a 19,000-line
-`legion.proto`: 640 messages and enums, each deriving `serde`, `prost`, and
-`Clone`/`PartialEq`, and the `Manager` client and server stubs. rustc compiles
-a crate in one process, and most of the front end — macro expansion, type
-checking, borrow checking — is single-threaded within it. So:
+Legion was one library crate of 470,000 lines, plus the code `tonic-build`
+generates from a 19,000-line `legion.proto`. rustc compiles a crate in one
+process, and what that process holds grows with the crate:
 
-- **Memory.** The whole crate's HIR, type tables, and MIR are live in one
-  rustc at once. The measured peak is in § 5. On a laptop or a 16 GB CI
-  runner that is the build's ceiling, and on the `dist` profile the fat-LTO
-  step stacks the whole dependency tree's IR on top of it.
-- **Time.** Every edit to any file re-runs the front end over the whole crate
-  (incremental helps the back end far more than the front). The ~490
-  dependencies build in parallel; Legion itself is one long serial tail at the
-  end of every build.
-- **Every test binary links all of it.** Already mitigated by the single
-  `tests/integration/` binary ([test-build-footprint
-  calls](../calls/test-build-footprint_calls.md)), but a unit test in the
-  scheduler still waits for the worker's datapath to type-check.
-- **Plugins link all of it.** Every plugin under `plugins/` depends on the
-  whole `legion` crate for a handful of types, so a `LEGION_BUILD_PLUGINS=1`
-  build compiles Legion once per plugin (TODO.md, "Share one target dir across
-  plugin builds").
+- **Memory.** Building the library took 9.0 GB. `cargo test` compiles the
+  library and the library-with-its-tests at the same time, and on a 16 GB
+  machine that was killed at 13.5 GB: the unit tests alone need 10.9 GB.
+  Contributors were passing `-j 1` to get a test binary at all.
+- **Time.** Any edit rechecked all of it: 30 seconds and 3.9 GB for
+  `cargo check` after touching one file, whichever file. The ~490
+  dependencies build in parallel; Legion itself was one serial tail at the end
+  of every build.
+- **Every test binary links all of it**, and every plugin under `plugins/`
+  compiles all of it for a handful of types.
 
-The crate is also a single namespace in which anything can call anything, and
-it does: the module graph in § 5.2 has cycles through `structs`, `storage`,
-`manager`, and `worker`. That is the actual obstacle — a cycle cannot cross a
-crate boundary — and most of this plan is about breaking those edges in an
-order where each step is shippable.
+The crate was also one namespace in which anything could call anything, and
+it did: the module graph had cycles through `structs`, `storage`, `manager`,
+and `worker`. A cycle cannot cross a crate boundary, so most of this work was
+cutting those references in an order where each step still compiled.
 
 ## 2. Prior art
 
 - **Nomad** is one Go module, but Go compiles per package (directory), so its
   ~200 packages already build in parallel with a per-package memory peak. Its
-  `api/` package is a separate module precisely so clients don't pull the
-  server: the same shape as `legion-proto` below.
+  `api/` package is a separate module so clients do not pull the server: the
+  same shape as `legion-proto`.
 - **Kubernetes** splits the wire types out as `k8s.io/api` and
-  `k8s.io/apimachinery` (staged repos), with `client-go` on top, and the
-  components (`kube-scheduler`, `kubelet`, `kube-apiserver`) in their own
-  packages and binaries. The scheduler depends on the API types and a
+  `k8s.io/apimachinery`, with `client-go` on top and the components in their
+  own packages. The scheduler depends on the API types and a
   `framework.Handle` interface, never on the apiserver's storage.
-- **Consul** keeps `api/` and `sdk/` as separate Go modules for the same reason
-  as Nomad.
-- **Rust projects at this size** — rustc itself (~50 `rustc_*` crates),
-  `wasmtime` (`cranelift-*`, `wasmtime-*`), `deno` (`deno_core`, `deno_runtime`,
-  ext crates), `databend`, `materialize`, `nushell` — all split into workspace
-  crates for exactly the compile-time and memory reasons in § 1. The common
-  shape: a `*-types` / `*-proto` leaf, domain crates in the middle, a thin
-  binary crate on top, with traits at the seams where a lower crate needs to
-  call up.
+- **Rust projects at this size** (rustc itself, `wasmtime`, `deno`,
+  `materialize`, `nushell`) all split into workspace crates for the reasons in
+  § 1: a types leaf, domain crates in the middle, a thin binary on top.
 
-**Take:** the leaf wire-types crate (k8s `api`, Nomad `api`), traits at the
-seams instead of upward calls (k8s scheduler `framework.Handle`), and the thin
-binary on top. **Reject:** splitting into separate repositories or separately
-versioned modules (k8s staging) — Legion ships one binary at one version, and a
-single workspace with path dependencies is all the build needs.
+**Take:** the leaf wire-types crate and the thin binary on top. **Reject:**
+separate repositories or separately versioned modules; Legion ships one
+binary at one version. **Did not take, yet:** k8s's scheduler-behind-an-
+interface, which is what separating the store from the scheduler needs
+(§ 8).
 
 ## 3. Jobs to be done
 
 **Contributor**
 - When I change one file in the scheduler, I want the rebuild to touch the
-  scheduler and the binary, so I can stay in an edit–test loop measured in
-  seconds, not minutes.
-- When I build Legion on a 16 GB laptop or a CI runner, I want the build to
-  fit in memory with headroom, so it does not swap, get OOM-killed, or force
-  me onto `-j1`.
-- When I run one crate's unit tests, I want to build only that crate and what
-  it depends on, so testing the store does not wait on the datapath.
+  manager and the binary, so I stay in an edit–test loop measured in seconds.
+- When I build Legion on a 16 GB laptop or a CI runner, I want the build and
+  the tests to fit in memory, so nothing swaps, is OOM-killed, or needs `-j1`.
+- When I run one part's unit tests, I want to build only that part and what
+  it depends on, so testing the worker does not wait on the store.
 
 **Release engineer**
-- When I cut a release, I want the shipping build to run on a stock runner,
-  so the release does not depend on one oversized machine.
-- When I quote the binary's size, I want the number to be what we actually
-  ship on the platform people run, so the README is not off by a platform.
+- When I cut a release, I want the shipping build to run on a stock runner.
+- When I quote the binary's size, I want the number to be what we ship on the
+  platform people run.
 
 **Plugin author**
 - When I write a plugin, I want to depend on the types and the plugin
-  interface, not on all of Legion, so my plugin builds in seconds and is not
-  rebuilt every time Legion's internals change.
+  interface, not on all of Legion. *Not served yet:* § 8, "A plugin API
+  crate".
 
 **Operator / job author / agent:** *not in scope.* Nothing they can observe
-changes: one binary, same CLI, same wire format, same on-disk formats.
+changed: one binary, same CLI, same wire format, same on-disk formats.
 
 ### Scenarios
 
-1. A contributor edits `src/manager/scheduler.rs` and runs
-   `cargo test -p legion-scheduler`. Today that recompiles all of Legion and
-   links a 200 MB test binary; at the end of phase 4 it compiles the
-   scheduler crate and its tests, against `legion-types` that is already
-   built.
-2. CI builds `--profile dist` on a 16 GB runner, and it finishes.
-3. A plugin author depends on `legion-proto` and `legion-plugin-api`, and
-   their `cargo build` never compiles `rusqlite`, `openraft`, or the
-   datapath.
+1. A contributor edits `crates/worker/src/worker/daemon.rs` and runs
+   `cargo test -p legion-worker daemon`. It builds the worker crate's tests
+   against a `legion-common` that is already built; the manager, the store, and
+   the CLI are not compiled.
+2. A contributor runs `cargo test --all` on a 16 GB machine with no flags,
+   and it builds.
+3. An agent session edits the scheduler and runs `cargo check`: 11 seconds
+   and 1.4 GB, where it was 29 seconds and 3.9 GB.
 
 ## 4. Goals and non-goals
 
 **Goals**
-- Lower the peak memory of building Legion (every profile), and keep the
-  `dist` build inside a 16 GB machine with headroom.
-- Shorten the serial tail of a clean build and the front-end time of an
-  incremental one, by letting independent crates compile in parallel.
-- Make the subsystem boundaries real: a crate's dependencies are its allowed
-  calls.
+- Lower the peak memory of building and testing Legion, far enough that a
+  16 GB machine does both without flags.
+- Shorten the rebuild after an edit by not recompiling what did not change.
+- Make the layers real: a crate's dependencies are its allowed calls.
 - Correct the shipped-size numbers, measured on linux/amd64.
 
 **Non-goals**
-- **More binaries.** Still one `legion` binary: manager, worker, CLI, MCP
-  server. `legion-guest` stays the only second artifact.
-- **A stable Rust API.** The crates are an internal build structure, versioned
-  in lockstep at `0.1.0`, with no compatibility promise between them.
+- **More binaries.** Still one `legion` binary; `legion-guest` stays the only
+  second artifact.
+- **A stable Rust API.** The crates are an internal build structure,
+  versioned in lockstep, with no compatibility promise between them.
 - **Publishing** the crates to crates.io (§ 10).
-- **Behavior changes.** Every phase is a refactor with no change on the wire,
-  on disk, or at the CLI.
-- **Cargo features to trim the binary** (a worker-only build). Possible once the
-  crates exist, but a separate decision about the product, not the build.
+- **Behavior changes.** Nothing on the wire, on disk, or at the CLI.
+- **Cargo features to trim the binary** (a worker-only build). Possible now
+  that the crates exist, but a product decision, not a build one.
 
-## 5. Background — what exists today
+## 5. Background
 
-### 5.1 The shape of the build
+### 5.1 The shape before
 
-The workspace today (`Cargo.toml`, `[workspace]`) is the root `legion-rs`
-package plus `guest/` (`legion-guest`, the static in-guest agent) and the
-scaling-plugin SDK. `src/` is one library crate (`[lib] name = "legion"`) and
-`src/main.rs` the binary.
-
-Sizes of `src/` by top-level module (lines, including tests):
+`src/` by top-level module, as it stood on `main` (lines, tests included):
 
 | Module | Lines | What it is |
 | --- | ---: | --- |
-| `manager/` | 104,078 | server (44k across `server.rs` + `server/`), scheduler (14.5k), daemon, rollout, telemetry, CA, ACLs |
-| `storage/` | 87,154 | `store.rs` (33.5k) + `store/` (14k), raft (15k), migrations, events |
-| `worker/` | 78,368 | `netd/` datapath (25.7k), task manager (15k), daemon, forwarder |
-| `structs/` | 50,477 | hand-written domain types around the generated proto types |
-| `cmd/` | 38,475 | the CLI and MCP server |
-| `task_plugins/` | 32,034 | exec, container, sandbox, microVM runtimes |
-| `apps/` | 28,436 | autoscaler, certs, ingress, gitops apps |
-| `autoscaler/` | 12,346 | |
-| `artifacts/`, `volumes/`, `devices/`, … | 34,000 | |
+| `manager/` | 105,000 | server (44k), scheduler (14.5k), daemon, rollout, telemetry, CA, ACLs |
+| `storage/` | 88,000 | `store.rs` (33.5k) + `store/` (14k), raft (15k), migrations, events |
+| `worker/` | 80,000 | `netd/` datapath (25.7k), task manager (15k), daemon, forwarder |
+| `structs/` | 51,000 | hand-written domain types around the generated proto types |
+| `cmd/` | 38,500 | the CLI and MCP server |
+| `task_plugins/` | 32,500 | exec, container, sandbox, microVM runtimes, jobspec validation |
+| `apps/` | 28,500 | autoscaler, certs, ingress, gitops apps |
+| `autoscaler/` | 12,400 | |
+| everything else | 34,000 | artifacts, volumes, devices, config language, TLS, … |
 
-Plus the generated `legion.rs`: 40,909 lines / 2.0 MB before the derives
-expand.
+About 27% of it is unit tests.
 
-### 5.2 The module graph has cycles
+### 5.2 What crossed the boundaries
 
-Counting `crate::<module>` references between top-level modules (a grep
-over `src/`), the edges that block a split are the back-edges into the low
-layers:
+References from one top-level module to another were counted from `use`
+trees and inline `crate::`/`super::` paths, separating code from tests. For
+the layering common → worker → manager → binary, the references that pointed
+the wrong way, before any change:
 
-| From → to | Refs | What crosses |
-| --- | ---: | --- |
-| `storage` → `manager` | 96 | `manager::telemetry::metrics` (44 — the metrics registry), `scheduler::{Scheduler, PlannedPreemption, PlanMode, GangReport}`, `cluster_ca`, `mesh_ca`, `autoscale`, `scaling_inputs`, `blocked` |
-| `structs` → `storage` | 20 | `Store` (eval handling in `structs/eval.rs`), `NotRaftLeader`, `arm_eval_settle`, move-policy types |
-| `structs` → `manager`, `worker`, `task_plugins`, `autoscaler` | 45 | node-attribute name constants, validation hooks (`validate_job_config`, `validate_source`, balancer names), rollout handlers |
-| `worker` → `manager` | 105 | `telemetry` (35), `mesh_ca` (31), `dispatcher` (17), `workload_identity` |
-| `manager` → `worker` | 14 | `netd`, `daemon`, `pressure` |
-| `apps` → `cmd` | 24 | `cmd::helpers`, `cmd::scaling` |
-| `storage` → `cluster_tls` → `manager` | 11 + 7 | raft transport TLS |
+| From → to | Code | Tests | What they were |
+| --- | ---: | ---: | --- |
+| common modules → manager/storage | 42 | 15 | the eval handler living in `structs` (it runs evals against the `Store`), the object-store client under `storage/`, liveness settings, device quota |
+| common modules → worker/task_plugins | 11 | 6 | config types defined beside their runtime, balancer names, template syntax, the jobspec schema |
+| worker/task_plugins → manager/storage | 55 | 76 | the metrics registry (33), mesh CA helpers, payload building in the dispatcher, constants |
+| manager/storage → cmd/apps | 8 | 4 | the bundled apps' manifests, the CLI's token path |
+| worker → cmd/apps | 0 | 3 | |
+| **manager/storage → worker/task_plugins** | **40** | **4** | **kept: the manager depends on the worker crate** |
 
-Every one of these is a call from a lower layer up into a higher one. None is
-deep: most are a constant, a metrics handle, or a type that belongs lower down
-than where it was first written.
+The last row is why the manager is above the worker rather than beside it
+([calls 1](../calls/workspace-crate-split-plan_calls.md)): the manager
+validates jobs against the task runtimes and can run a worker in its own
+process. Those are real dependencies.
+
+No inherent `impl` was in a different module tree from its type, so the
+orphan rule cost nothing beyond the four impls on generated types.
+
+Not cut, and what is left for a later split: `storage` → `manager`, 28
+references (§ 8).
 
 ### 5.3 Where the memory goes
 
-Measured 2026-11-08 on linux/amd64 (4 vCPU, 16 GB, no swap), clean build,
-`cargo 1.97.0`, peak RSS sampled once a second:
+`-Z time-passes` on the library as one crate (dev profile, tests excluded),
+resident memory at the end of each compiler pass:
 
-| | Before (`9a97d54`) | After phase 1 |
+| Pass | RSS after | Added |
 | --- | ---: | ---: |
-| Peak RSS, whole build | 11.4 GB | 10.1 GB |
-| Peak RSS, the `legion` lib rustc | **11.1 GB** | **10.0 GB** |
-| Peak RSS, fat-LTO link of the binary | 7.0 GB | 6.7 GB |
-| `legion` lib compile (front end + codegen, one process) | ~15 min | ~15 min |
-| Fat-LTO link | ~16 min | ~16 min |
-| Clean `cargo build --profile dist`, wall | 35m 06s | 34m 44s |
-| `target/dist/legion`, stripped | 91,206,208 B | 91,207,040 B |
+| macro expansion | 1.5 GB | 1.4 GB |
+| name resolution, AST lowering | 2.2 GB | 0.7 GB |
+| type checking (coherence included) | 3.5 GB | 1.3 GB |
+| borrow checking | 5.0 GB | 1.5 GB |
+| MIR for metadata, monomorphization collection | 6.9 GB | 1.9 GB |
+| code generation | 7.3 GB | 0.3 GB |
 
-What that says:
+There is no single hot pass and nothing pathological: every stage adds
+memory roughly in proportion to how much code it sees, and nothing is freed
+until the crate is done. (Sampled from outside, with LLVM's threads counted,
+the same build peaks at 9.0 GB.) So `cargo check` alone needed 5–6 GB, the
+LTO link was never the peak, and no profile setting would have helped. The
+only lever is how much code one rustc process holds.
 
-- **The peak is the `legion` crate's front end, not the link.** RSS climbs
-  to 11 GB in the first four minutes of compiling the library (parsing,
-  expansion, type and borrow checking, MIR for 465k lines), then falls to
-  5–7 GB for LLVM. The fat-LTO link of the binary tops out at 7 GB. So
-  changing the `dist` LTO settings would not lower the peak (calls 1); making
-  the crate smaller would, and that is this plan.
-- **`cargo test` doubles it.** A test build compiles the library and the
-  library-with-unit-tests as two separate rustc processes, in parallel. A
-  clean `cargo test --all --all-features` on this 16 GB box was OOM-killed
-  (13.6 GB summed, the dev-profile `legion` lib at 9.0 GB) — after phase 1.
-  Building `--lib` tests first and the rest second works; it is a workaround
-  in `internal_docs/development.md`, not a fix.
-- **The rest of the build is not the problem.** The ~490 dependency crates
-  build in parallel and never sum past ~5 GB on four cores.
-- **Phase 1 moved ~10% of the peak.** The generated code is 40,909 lines
-  before its derives expand; out of the main crate, it compiles in its own
-  rustc (under 4.7 GB for everything running alongside it) and pipelines
-  with the start of `legion`. Size is unchanged, as a pure move should be.
-- **Time is dominated by single-threaded work** — the front end of one crate,
-  LLVM with `codegen-units = 1`, the fat-LTO link — with three of four cores
-  idle for ~30 of the 35 minutes. Parallel crates shorten the front-end
-  share; the fat-LTO link stays serial unless the shipping profile changes.
+### 5.4 Measured, before and after
 
-The binary is **91 MB on linux/amd64**, not the 26 MB the docs quoted. That
-figure was macOS arm64, from an older and smaller tree. The ELF breakdown: `.text` 67.8
-MB of machine code, `.rodata` 5.8 MB, unwind tables (`.eh_frame` +
-`.gcc_except_table`) 7.6 MB, relocations 2.8 MB. Mach-O's compact unwind
-info and an arm64 encoding account for some of the gap, not 3.5×; what grew
-is filed in TODO.md (Cross-cutting, "Find what makes the linux/amd64 binary
-91 MB").
+linux/amd64, 4 vCPU, 16 GB, no swap, cargo 1.97.0. "Before" is `main` at
+`d1077f2`. Peak is resident memory sampled twice a second, summed over every
+compiler and linker running at that moment.
 
-## 6. Proposed design
+| | Before | After |
+| --- | ---: | ---: |
+| `cargo build`, clean: wall | 5m 16s | 4m 19s |
+| `cargo build`, clean: peak | 9.0 GB | **5.0 GB** |
+| Largest single compile | 9.0 GB (`legion`) | **3.8 GB** (`legion-manager`) |
+| Legion's own crates only: wall | 3m 44s | 2m 52s |
+| `cargo check`, clean: wall / peak | 3m 00s / 6.2 GB | 2m 19s / 3.6 GB |
+| `cargo check` after editing the scheduler | 29 s / 3.9 GB | 11 s / 1.4 GB |
+| … after editing the worker daemon | 31 s / 3.9 GB | 15 s / 1.4 GB |
+| … after editing `structs/job.rs` | 30 s / 4.0 GB | 19 s / 1.4 GB |
+| … after editing a CLI command | 30 s / 3.9 GB | 3 s / 0.7 GB |
+| `cargo build` after editing the scheduler | 50 s / 6.3 GB | 27 s / 3.7 GB |
+| Release build (`cargo bench --no-run`): wall | 12m 18s | 11m 12s |
+| Release build: peak / largest single compile | 10.0 GB / 10.0 GB | 8.6 GB / 4.5 GB |
+| `cargo build --profile dist`: wall | 35m 05s | 23m 46s |
+| `--profile dist`: peak / largest single process | 11.1 GB / 11.1 GB | 9.8 GB / 7.8 GB (the LTO link) |
+| `target/dist/legion`, stripped | 91.5 MB | **97.3 MB** |
+| `cargo test --all --no-run`: result | OOM-killed at 13.5 GB | builds in 3m 47s |
+| `cargo test --all --no-run`: peak | (13.5 GB when killed) | **9.6 GB** |
+| Largest unit-test compile | 10.9 GB (`legion`) | **4.5 GB** (`legion-manager`) |
 
-### 6.1 Target crate graph
+Each crate's own compile, dev build: `legion-manager` 3.8 GB,
+`legion-worker` 2.2 GB, the binary crate 2.2 GB, `legion-common` 1.7 GB,
+`legion-proto` 1.6 GB.
+
+**The shipping binary grew by 5.8 MB (6.4%).** `.text` went from 71.3 MB
+to 76.3 MB. The likeliest cause, not yet confirmed symbol by symbol: an
+optimized build does not share monomorphized generics between crates, so a
+generic instantiated in several of Legion's crates (a `serde` deserializer
+for `JobConfig`, say, used by the store, the worker, and the CLI) is
+compiled once per crate where it used to be compiled once, and fat LTO does
+not fold the copies back together. It is the price of the split, taken
+knowingly ([calls 3](../calls/workspace-crate-split-plan_calls.md)), and
+what to try is in TODO.md ("Find what makes the linux/amd64 binary 97 MB").
+
+The shipping build's peak moved less than the dev build's because its
+crates overlap: with one codegen unit each, four of them are in LLVM at
+once (9.8 GB at the worst moment), and the fat-LTO link is 7.8 GB whatever
+the crate layout. The dist wall time fell by a third because those crates
+now compile in parallel. (The "before" wall time is from `9a97d54`, two days
+earlier; memory and size are from `d1077f2`.)
+
+### 5.5 Scheduler benchmarks
+
+`resources`, `constraints`, `scheduling_index`, and the domain types are in
+`legion-common` now, a crate away from the scheduler that calls them per
+candidate, and the release profile has no cross-crate LTO. `scheduler_bench`
+on `main` and on this branch, same machine, release profile, median:
+
+| Benchmark | `main` | Branch |
+| --- | ---: | ---: |
+| `candidate_construction/indexes_off/nodes_1000` | 2.75 ms | 3.17 ms |
+| `candidate_construction/indexes_on/nodes_1000` | 2.68 ms | 2.35 ms |
+| `candidate_construction/indexes_off/nodes_5000` | 13.90 ms | 14.86 ms |
+| `candidate_construction/indexes_on/nodes_5000` | 6.81 ms | 6.57 ms |
+| `candidate_construction/indexes_off/nodes_10000` | 30.06 ms | 27.32 ms |
+| `candidate_construction/indexes_on/nodes_10000` | 9.31 ms | 9.57 ms |
+| `plan_under_fill/plan_only/fill_0` | 224 µs | 208 µs |
+| `plan_under_fill/plan_and_apply/fill_0` | 2.21 ms | 2.14 ms |
+| `plan_under_fill/plan_only/fill_40` | 270 µs | 257 µs |
+| `plan_under_fill/plan_and_apply/fill_40` | 2.60 ms | 2.55 ms |
+| `scheduler_speed/bin_pack/nodes_100_allocs_1000` | 77.1 ms | 76.4 ms |
+| `scheduler_speed/bin_pack/nodes_100_allocs_10000` | 437.6 ms | 439.2 ms |
+
+No difference outside the run-to-run spread (the `nodes_1000` rows'
+confidence intervals overlap, and the two directions cancel). The 4-vCPU
+machine is noisy; nothing here says the boundary costs anything.
+
+## 6. Design, as built
+
+### 6.1 The crates
 
 ```text
-                         legion (bin: src/main.rs)            ← cmd, MCP, wiring
-                ┌──────────────┼──────────────────┐
-         legion-manager   legion-worker      legion-apps
-           │      │          │      │             │
-           │  legion-scheduler  legion-datapath   │
-           │      │          │                    │
-           └── legion-store ─┘                    │
-                  │                               │
-             legion-types  ←──────────────────────┘   (domain structs, config_lang,
-                  │                                    resources, constraints, devices,
-             legion-core                               metrics registry, util, constants)
-                  │
-             legion-proto        legion-guest (exists)
+legion-rs        src/             the binary: cmd/ (CLI, MCP), apps/, gateway
+   │
+legion-manager   crates/manager/  manager/ (server, eval loop, scheduler, rollouts)
+   │                              storage/ (store, raft, migrations)
+legion-worker    crates/worker/   worker/ (agent, netd datapath), task_plugins/,
+   │                              artifacts/, objects/, content_publish, wasm/,
+   │                              plugin_runtime, rollout_strategy
+legion-common    crates/common/   structs/, autoscaler/, bundled_apps, config_lang,
+   │                              volumes/, devices/, cluster_tls, mesh_ca, telemetry
+legion-proto     proto/           generated from legion.proto
 ```
 
-| Crate | Takes from `src/` | Depends on |
+| Crate | Lines | Depends on |
+| --- | ---: | --- |
+| `legion-rs` | 68,000 | all below |
+| `legion-manager` | 189,000 | worker, common |
+| `legion-worker` | 126,000 | common |
+| `legion-common` | 85,000 | proto, `legion-guest` |
+| `legion-proto` | generated | prost, tonic, serde |
+
+It differs from the first sketch of this plan, which had nine crates
+(`-core`, `-types`, `-store`, `-scheduler`, `-datapath`, `-worker`,
+`-manager`, `-apps`, binary) with the worker and manager as siblings. What
+changed and why is [calls 1 and 2](../calls/workspace-crate-split-plan_calls.md).
+
+### 6.2 Paths did not change
+
+Each crate re-exports the modules of the crates below it at its root:
+
+```rust
+// crates/worker/src/lib.rs
+pub use legion_common::{autoscaler, constants, prelude, structs, telemetry, util, /* … */};
+pub mod worker;
+pub mod task_plugins;
+```
+
+So `crate::structs::Job` resolves in every crate, and `legion::manager::…`
+in the integration tests, benchmarks, and plugins. The `#[macro_export]`
+plugin macros live with their traits (`export_scheduling_policy!` in the
+manager, the rest in the worker) and are re-exported by the binary crate, so
+a plugin still writes `legion::export_rollout_strategy!(…)`.
+
+### 6.3 How each wrong-way reference was cut
+
+All of them are moves; none changed behavior.
+
+**Moved down**, to the lowest crate that needs it:
+
+| What | From | To |
 | --- | --- | --- |
-| `legion-proto` (`proto/`) | the generated code | prost, tonic, serde |
-| `legion-core` | `constants`, `util`, `prelude`, `signals`, `tracing_util`, `otel`, `manager::telemetry::metrics` (the registry, not the endpoint) | proto |
-| `legion-types` | `structs/` (hand-written), `config_lang`, `constraints`, `resources`, `devices`, `scheduling_index`, `cluster_tls` | core, proto, nickel |
-| `legion-store` | `storage/` incl. `raft/`, `migrations`, `events`, `keyring` | types, rusqlite, openraft |
-| `legion-scheduler` | `manager/scheduler*`, `rollout*`, `dispatcher`, `blocked`, `concurrency`, `gang` | types; reads the cluster through a trait the store implements |
-| `legion-datapath` | `worker/netd/`, `worker/forwarder`, `gateway` | types, core |
-| `legion-worker` | `worker/` (rest), `task_plugins/`, `volumes/`, `artifacts/`, content store, checkpoints | types, datapath |
-| `legion-manager` | `manager/` (rest): server, daemon, ACLs, CAs, identity, telemetry endpoint | store, scheduler, types |
-| `legion-apps` | `apps/`, `autoscaler/` | types, a client trait |
-| `legion` | `cmd/`, `main.rs` | everything |
+| The metrics registry (cells, `Metrics`, `WorkerMetrics`, rendering, the worker's listener) | `manager/telemetry.rs` | `common/telemetry.rs`; the manager keeps its `/readyz` endpoint and re-exports the rest |
+| Mesh CA helpers | `manager/mesh_ca.rs` | `common/mesh_ca.rs` |
+| Payload building (`build_task_allocation`, `effective_gate`, …) | `manager/dispatcher.rs` | `common/structs/task_payload.rs` |
+| What both sides must compute alike (`WorkDigest`, `StableHash`, heartbeat clamp, error-code constants) | `storage/*`, `manager/*` | `common/structs/worker_protocol.rs` |
+| Jobspec-only autoscale validation | `manager/autoscale.rs` | `common/autoscaler/jobspec.rs` |
+| Template syntax checks | `worker/templates.rs` | `common/structs/template_syntax.rs` |
+| `RuntimeClassConfig`, `ContentStoreTarget`, `LivenessSettings` | beside their runtime | `common/structs/config.rs` |
+| Bundled apps' manifests and `seed_record` | `apps/`, `manager/apps.rs` | `common/bundled_apps.rs` |
+| The CLI token path | `cmd/helpers.rs` | `common/cli_paths.rs` |
+| The object-store client | `storage/objects/` | `worker/objects/` |
+| The rollout-strategy plugin loader | `manager/rollout_strategy.rs` | `worker/rollout_strategy.rs` |
 
-Store and scheduler: the scheduler is a planner over a read model
-(`scheduling_index`, capacity snapshots) and returns a plan; applying it is
-the store's job. Today `storage` constructs the `Scheduler` and names its
-result types. After phase 4 the plan types (`PlannedPreemption`, `PlanMode`,
-`GangReport`) live in `legion-types`, the store applies a plan it is handed,
-and the code that runs the scheduler against the store lives in
-`legion-manager`. The scheduler crate never sees SQLite.
+**Moved up**, to where its dependencies are:
 
-### 6.2 How a back-edge is broken
+| What | From | To |
+| --- | --- | --- |
+| The eval handler (`Eval::handle`, as `EvalExt`) | `structs/eval.rs` | `manager/eval.rs` |
+| Device quota enforcement | `devices/quota.rs` | `storage/device_quota.rs` |
+| The jobspec JSON Schema builder | `structs/job_schema.rs` | `worker/task_plugins/job_schema.rs` |
+| `export_scheduling_policy!` | `plugin_runtime.rs` | `manager/scheduler/policy.rs` |
 
-Three moves cover every edge in § 5.2:
+**A list on each side, and a test that they match**
+([calls 9](../calls/workspace-crate-split-plan_calls.md)): load-balancing
+strategy names; bundled apps (manifests in common, bodies in the binary).
 
-1. **Move it down.** A constant, a metrics handle, or a plain type that lives
-   too high moves to the lowest crate that uses it (`WORKER_FLEET_ATTR`,
-   `netd::kernel::NODE_ATTR`, `PlannedPreemption`, the metrics registry).
-2. **Turn the upward call into a trait** the lower crate declares and the
-   higher one implements, registered at startup in `legion` (`main.rs`) —
-   `structs` validating a job's task config against the task plugins,
-   `storage` asking the CA for a certificate.
-3. **Move behavior off a type onto the subsystem that owns it.** `Eval::handle`
-   (`src/structs/eval.rs`) runs evals against the `Store`; it is eval-loop
-   code that sits in `structs` because `Eval` is a proto type. It moves to the
-   manager as `fn handle_eval(eval: &Eval, store: &Store)`.
+**Extension traits**, where a type is defined below the code its methods
+need: `EvalExt`, `SubmissionExt`, `LedgerNodeExt`, `LedgerAllocationExt` on
+generated types; `ContentStoreTargetExt` on the `contentStore` config block.
 
-### 6.3 What the user sees
+**Tests.** Sixty-odd worker unit tests that ran against a real manager moved
+to `tests/integration/` as six `worker_*` modules
+([calls 5](../calls/workspace-crate-split-plan_calls.md)). Four tests in
+`structs` that asserted something about an upper layer moved up beside it.
 
-Nothing at runtime. Contributors see:
+### 6.4 What the contributor sees
 
 ```bash
-cargo build                          # unchanged: builds the binary
-cargo test --all --locked            # unchanged: tests every crate
-cargo test -p legion-scheduler       # new: just the scheduler and its deps
-cargo bench --bench scheduler_bench  # unchanged (bench targets move with the crate)
+cargo build                          # unchanged
+cargo test --all --locked            # unchanged; now fits in 16 GB
+cargo test --lib <filter>            # unchanged: covers every crate (default-members)
+cargo test -p legion-worker <filter> # new: only the worker crate and legion-common
+cargo test -p legion-manager scheduler
+cargo check                          # 3–19 s after an edit, was 30 s
 ```
-
-`tests/integration/` stays one binary on the `legion` package.
 
 ## 7. Proto, struct, config, and persistence changes
 
-None on the wire, on disk, or in job config. `proto/legion.proto` stays at the
-same path (the `proto/` directory becomes the `legion-proto` package around
-it), so the UI's generator, the `proto-breaking` CI job, and the RPC
-classification tests that parse it are unaffected.
+None on the wire, on disk, or in job config. `proto/legion.proto` is at the
+same path. The plugin ABI fingerprint's build-info string now names
+`legion-worker` (the crate the loader is in) where it named `legion-rs`;
+plugins are rebuilt against their host in any case.
 
 ## 8. Implementation phases
 
-Each phase leaves `cargo test --all --locked` green and is one PR.
+**Phase 1: `legion-proto` (SHIPPED 2026-11-08).** The generated code as its
+own crate; `legion::structs` re-exports it.
 
-**Phase 1 — `legion-proto` (SHIPPED 2026-11-08).**
-The generated code moves to `proto/` as its own crate; `legion::structs`
-re-exports it, so no call site changes. The handful of inherent impls on
-generated types become extension traits in `legion` (the orphan rule forbids
-inherent impls on another crate's types) and the redacting `Debug` impls move
-with the types. `include_str!("../../proto/legion.proto")` becomes
-`legion_proto::PROTO_SOURCE`. Measured result in § 5.3: −1.1 GB peak, no
-size change. The `dist` profile is unchanged (calls 1).
+**Phase 2: the layered split (SHIPPED 2026-11-10).** `legion-common`,
+`legion-worker`, `legion-manager`, and the binary crate, as in § 6.
 
-**Phase 2 — `legion-core`.** Move the metrics registry out of
-`manager::telemetry`, plus `constants`, `util`, `signals`, tracing. Removes the
-largest single back-edge (44 refs `storage` → `manager::telemetry::metrics`, 35
-from `worker`). Small and mechanical.
+**Not started.** Each is independent of the others.
 
-**Phase 3 — `legion-types`.** Hand-written `structs/` plus the pure domain
-modules. Break `structs` → {storage, manager, worker, task_plugins,
-autoscaler}: move the node-attribute constants down, move `Eval::handle` to
-the manager, put job-config validation behind a `TaskConfigValidator` trait.
-This is the phase that makes every later one possible.
-
-**Phase 4 — `legion-store` and `legion-scheduler`.** Move plan types to
-`legion-types`; the store stops constructing the scheduler. The two crates
-build in parallel. Scheduler PRs carry `scheduler_bench` numbers before and
-after (AGENTS.md); this phase must show no regression, since moving code
-across a crate boundary can cost inlining (§ 11).
-
-**Phase 5 — `legion-datapath`.** `worker/netd`, forwarder, gateway. Its
-upward edges are `mesh_ca` and `telemetry`, both lower by now.
-
-**Phase 6 — `legion-worker` and `legion-manager`.** What remains of each;
-`manager` ↔ `worker` edges (`worker_plane`, `dispatcher`) settle into
-`legion-types`.
-
-**Phase 7 — `legion-apps`, and the `legion` binary crate.** `apps` stops
-reaching into `cmd::helpers` (the shared client helpers move to a small
-module in `legion-types` or a `legion-client`); `cmd/` and `main.rs` become
-the top crate. The root `src/` is then just the binary.
+- **The store out of the manager's crate.** `legion-manager` is 189k lines
+  and the largest compile. `storage` has 28 references into `manager`, and
+  they are not misplaced items: `Store` holds `ScalingRollups`,
+  `ScalingStatusBoard`, and `ClusterCa` as fields; `store.rs` calls
+  `Scheduler::new` to replan inside a write; the store's transactions call
+  `autoscale::{is_autoscaled, AutoscaleLayers::load_tx}`,
+  `blocked::{PlacementBlocked, node_could_help}`, and
+  `concurrency::conflict_window`. Separating them means deciding who owns
+  the autoscaler's in-memory state and the CA, and putting plan application
+  behind an interface the store is handed (k8s's `framework.Handle` shape).
+  That is a design change to the write path and needs its own plan, with
+  `scheduler_bench` before and after. Expected gain: the largest compile at
+  about 2.5 GB, and a scheduler edit that no longer rebuilds the store.
+- **A datapath crate.** `worker/netd/` is 25.7k lines with few references
+  out. It would take the worker crate from 126k to about 100k: worth doing
+  only if the worker's 2.2 GB becomes the constraint.
+- **A plugin API crate.** Every plugin depends on `legion-rs` and so
+  compiles all five crates. The plugin traits and the types that cross the
+  dylib boundary could be one small crate; the ABI fingerprint's layout hash
+  has to move with them. Also fixes "Share one target dir across plugin
+  builds" (TODO.md) from the other side.
+- **`legion-loadgen` as a workspace member**, off the `loadgen` feature
+  (TODO.md, "Test hygiene").
 
 ## 9. Testing plan
 
-- Every phase: `cargo test --all --locked`, `cargo clippy --all -- -D
-  warnings`, `cargo fmt --all --check` — a refactor with no behavior change has
-  the existing suite as its test.
-- Every phase records the build footprint against the previous phase on the
-  same machine: clean `cargo build` peak RSS and wall time, an incremental
-  rebuild after touching one file in a leaf crate and one in a top crate, and
-  the `dist` binary size. The script used for § 5.3 samples the summed RSS of
-  the build's rustc processes once a second.
-- Phase 4 adds `scheduler_bench` before/after.
-- A test that guards the graph: once a crate exists, a `cargo metadata` check
-  in CI fails if a lower crate gains a dependency on a higher one (cargo
-  already rejects cycles; this catches a *new* upward edge that happens to be
-  acyclic but violates the layering).
+- Each step: `cargo test --all --all-features --locked`,
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+  `cargo fmt --all --check`. A refactor with no behavior change has the
+  existing suite as its test.
+- The cuts were made first, inside the single crate, each one compiling, so
+  that the split itself was only moving directories and widening visibility.
+  A script recounted wrong-way references after every cut until there were
+  none.
+- New tests: the balancer registry and the jobspec's strategy list agree;
+  every bundled manifest has a body and the reverse; key-carrying messages
+  never print or serialize their keys (`legion-proto`).
+- The footprint numbers in § 5.4 are from a sampler that records, per
+  compiler process, the crate it is building; rerun it when the layout
+  changes.
 
 ## 10. Rollout and backward compatibility
 
-Nothing to roll out: same binary, same formats. Contributors with a checkout
-rebuild once. The crates are not published: `legion-rs` declares path +
-version dependencies on them (as it does on `legion-guest`), so publishing
-`legion-rs` would require publishing each first, in dependency order. That is
-deferred until there is a reason to publish at all.
+Nothing to roll out at runtime: same binary, same formats. A checkout
+rebuilds once. Open branches rebase across the directory moves (git follows
+the renames).
+
+**Publishing changes.** `legion-rs` and `legion-guest` are on crates.io at
+0.1.0, published as one crate plus the guest. `legion-rs` now has
+path-and-version dependencies on `legion-proto`, `legion-common`,
+`legion-worker`, and `legion-manager`, so the next release publishes those
+first, in that order. None is published yet, and `legion-worker` cannot pass
+`cargo publish`'s verification until `bpf/legion_net.bpf.o` is inside its
+package (TODO.md, "Publish"). The shared crate is `legion-common` rather
+than `legion-core` because that name is taken
+([calls 7](../calls/workspace-crate-split-plan_calls.md)).
 
 ## 11. Open questions
 
 - **Cross-crate inlining on the hot path.** Generic and `#[inline]` code
-  inlines across crates; plain functions do not without LTO. `release` uses
-  thin-local LTO only. Lean: measure in phase 4 with `scheduler_bench`, and
-  if the scheduler regresses, set `lto = "thin"` on `release` rather than
-  sprinkle `#[inline]`.
-- **Where plugins attach.** Plugins should depend on `legion-proto` plus a
-  small `legion-plugin-api`, not on `legion`. Lean: do it after phase 3, when
-  the plugin traits can move to `legion-types` without dragging the store.
-- **`cluster_tls`** sits between `storage` (raft transport) and `manager`
-  (CA). Lean: it goes to `legion-types` with its CA dependency behind a trait.
+  inlines across crates; plain functions do not without LTO. The shipping
+  profile is fat LTO, so the shipped binary is unaffected. Benchmarks run
+  the release profile, where the scheduler now calls `resources`,
+  `constraints`, and `scheduling_index` across a crate boundary; § 5.5
+  measured no change. The store and the scheduler are still one crate.
+  Measure again if they are separated.
+- **Does the binary crate need `apps/` and `cmd/` apart?** At 68k lines and
+  2.2 GB it is not the constraint. Lean: no.
 
 ## 12. Acceptance criteria
 
-- **Phase 1:** `cargo test --all --locked` green; `legion-proto` builds
-  alone (`cargo build -p legion-proto`); the main crate's peak rustc RSS is
-  lower than before, measured as in § 5.3; `cargo build --profile dist`
-  completes on a 16 GB / 4 vCPU machine; README, AGENTS.md, Cargo.toml and
-  `internal_docs/development.md` carry the linux/amd64 sizes.
-- **Phases 2–7:** each one green, each with its footprint numbers in the PR,
-  and at the end `src/` contains only the binary crate.
+- `cargo test --all --all-features --locked` builds and passes on a 16 GB,
+  4-vCPU machine with no `-j` flag. *Met: 3,902 passed, 0 failed.*
+- No single compile over 4 GB in a dev build, or 5 GB with unit tests. *Met:
+  3.8 GB and 4.5 GB.*
+- `cargo test -p legion-worker` builds without compiling `legion-manager`.
+  *Met.*
+- No scheduler benchmark regression. *Met (§ 5.5).*
+- `cargo build --profile dist` completes on the same machine, and the README,
+  AGENTS.md, `Cargo.toml`, and `internal_docs/development.md` carry the
+  linux/amd64 sizes. *Met.*
+- All five dylib plugin kinds build against the new layout with no source
+  change. *Met.*
+- The shipping binary does not grow. *Not met: +5.8 MB (§ 5.4).*

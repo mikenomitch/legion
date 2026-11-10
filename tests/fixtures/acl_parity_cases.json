@@ -1,5 +1,5 @@
 {
-  "about": "ACL evaluation cases run against BOTH engines: the manager's (`parity_fixture` in src/structs/acl.rs) and the UI's mirror (ui/tests/unit/acl-parity.mjs, against ui/src/utils/aclEngine.ts). A case states the rules, the request, and the answer the manager gives; a change to either engine that changes an answer fails one of the two tests. Rules are evaluated as stored (not through parse_rules), so legacy shapes can be covered. Scope keys: any, namespace, name, pool, path, actionName, template, band, host, kind.",
+  "about": "ACL evaluation cases run against BOTH engines: the manager's (`parity_fixture` in crates/common/src/structs/acl.rs) and the UI's mirror (ui/tests/unit/acl-parity.mjs, against ui/src/utils/aclEngine.ts). A case states the rules, the request, and the answer the manager gives; a change to either engine that changes an answer fails one of the two tests. Rules are evaluated as stored (not through parse_rules), so legacy shapes can be covered. Scope keys: any, namespace, name, pool, path, actionName, template, band, host, kind.",
   "cases": [
     {
       "name": "default deny: no rules",

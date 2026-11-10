@@ -3,7 +3,7 @@
 //! These exercise the manager's half — the volume table, node pinning, and the
 //! reclaim state machine — against a real store, since that is where the
 //! invariants live. The driver half is covered by the conformance harness
-//! (`src/volumes/conformance.rs`, also reachable as
+//! (`crates/common/src/volumes/conformance.rs`, also reachable as
 //! `legion volume plugin test`), which runs against built-ins and exec plugins
 //! alike.
 

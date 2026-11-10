@@ -12,7 +12,7 @@ runtime) are planned. Real-KVM boot of a cloned disk is not yet verified.
 Every microVM sandbox boots from a root disk the worker builds at start:
 resolve the image, extract every layer into a tree, write Legion's guest
 files and the sandbox's init and env into it, then `mkfs.ext4 -d` the tree
-into a raw image (`src/task_plugins/sandbox.rs`, `start_microvm`). The only
+into a raw image (`crates/worker/src/task_plugins/sandbox.rs`, `start_microvm`). The only
 reuse is an in-place restart of the *same* allocation, through the
 `rootfs.stamp` fingerprint.
 
@@ -109,16 +109,16 @@ Non-goals:
 
 ## What exists today
 
-- `src/task_plugins/sandbox.rs` `start_microvm`: resolves the layout
+- `crates/worker/src/task_plugins/sandbox.rs` `start_microvm`: resolves the layout
   (`oci_image::resolve_layout`), builds `GuestPayload`, fingerprints it
   (`build_stamp`), and on a miss extracts, installs artifacts, writes the
   payload into the tree (`microvm::install_guest_payload`), and runs
   `mkfs.ext4 -d`.
-- `src/task_plugins/oci_image.rs` `pull_layout` already goes through the node
+- `crates/worker/src/task_plugins/oci_image.rs` `pull_layout` already goes through the node
   content store: layers are hard-linked from it and a tag costs one `HEAD`.
   Concurrent pulls of one reference queue on `ImagePullClaim`, and each sends
   its own `HEAD` when its turn comes.
-- `src/volumes/copy.rs` has reflink and sparse-copy helpers, used by
+- `crates/common/src/volumes/copy.rs` has reflink and sparse-copy helpers, used by
   checkpoints.
 - Checkpoints copy `<scratch>/rootfs.img` with `clone_file` and restore by
   cloning the part back. Neither cares how the disk was made.

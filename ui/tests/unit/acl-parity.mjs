@@ -1,6 +1,6 @@
 // The UI's ACL mirror against the manager's engine, on the cases both are
 // checked with (tests/fixtures/acl_parity_cases.json; the Rust side is
-// `parity_fixture` in src/structs/acl.rs).
+// `parity_fixture` in crates/common/src/structs/acl.rs).
 //
 //   npm run test:unit
 //

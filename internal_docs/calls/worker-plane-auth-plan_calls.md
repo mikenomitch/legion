@@ -312,7 +312,7 @@ worker extracts layers itself, shifting ownership costs nothing extra.
 The worker generates its key and sends a CSR. The manager no longer returns
 private keys to anyone.
 
-**Alternative.** Keep the current design (`src/manager/mesh_ca.rs:72-75`):
+**Alternative.** Keep the current design (`crates/common/src/mesh_ca.rs:72-75`):
 the manager generates both halves, which its own comment justifies as "a CSR
 flow is more ceremony than a 24-hour credential warrants."
 
@@ -1166,7 +1166,7 @@ won.**
 `main` shipped a first cut of Phase 1 in
 [#17](https://github.com/mikenomitch/legion/pull/17) while this branch built
 all nine phases from the same plan. The two touched the same files
-(`src/manager/worker_plane.rs`, `src/worker/plane.rs`, `mesh_ca.rs`, the
+(`crates/manager/src/manager/worker_plane.rs`, `crates/worker/src/worker/plane.rs`, `mesh_ca.rs`, the
 simulator) with different APIs. The merge keeps this branch's modules and
 ports #17's other work onto them.
 
@@ -1207,7 +1207,7 @@ porting nine phases onto #17's API is more code, and more risk, than porting
 
 ## 48. Worker failover dials through one TLS connector, not a balanced channel
 
-`main`'s manager failover (`src/worker/managers.rs`) kept a balanced tonic
+`main`'s manager failover (`crates/worker/src/worker/managers.rs`) kept a balanced tonic
 channel and swapped its endpoints on failover, all plaintext. Phase 4 needs
 every worker-to-manager connection to be TLS naming `manager.legion`,
 verified against the token's pin or the cluster bundle. The merge keeps

@@ -18,7 +18,7 @@ allocation count, so completeness is asserted, never assumed.
 Resource units: scenario `cpu` is MHz and `memory` MiB (Legion pool
 units). Nomad uses the same units natively. K8s requests are converted
 at the fleet's fingerprinted 3000 MHz/core (see fingerprint_for in
-src/worker/simulate.rs): cpu_millicores = MHz / 3. That keeps the
+crates/worker/src/worker/simulate.rs): cpu_millicores = MHz / 3. That keeps the
 *bin-packing pressure* — task share of a node — identical across
 systems, which is the property that matters for a scheduler benchmark.
 

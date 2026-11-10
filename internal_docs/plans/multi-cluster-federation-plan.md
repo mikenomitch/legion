@@ -323,68 +323,68 @@ Code recon, current as of this branch:
 
 - **One address knob in the whole product.** The CLI resolves
   `LEGION_ADDR` or falls back to `http://127.0.0.1:4747`
-  (`src/cmd/helpers.rs:106`, `src/constants.rs:22`); one flat token file
+  (`src/cmd/helpers.rs:106`, `crates/common/src/constants.rs:22`); one flat token file
   `~/.legion/token` (`src/cmd/helpers.rs:51`); no contexts or profiles.
   The UI bakes one endpoint at build time
   (`ui/src/grpcClient.ts:5`) with one localStorage token, one singleton
   gRPC-web client. The MCP server inherits the CLI's connection
   (`src/cmd/mcp.rs`). Workers get their manager address from the join
-  token (`src/structs/token.rs:30`) and never re-resolve it
-  (`src/worker/daemon.rs:161`).
+  token (`crates/common/src/structs/token.rs:30`) and never re-resolve it
+  (`crates/worker/src/worker/daemon.rs:161`).
 - **No manager-to-manager RPC path exists.** `ManagerClient` is never used
-  inside `src/manager/`. The only inter-manager wire is the raft transport
+  inside `crates/manager/src/manager/`. The only inter-manager wire is the raft transport
   (`proto/legion.proto:4296`), which is single-cluster by construction
-  (cluster stamp + shared secret, `src/storage/raft/driver.rs:30`).
+  (cluster stamp + shared secret, `crates/manager/src/storage/raft/driver.rs:30`).
 - **The Manager service is 85 RPCs on one listener**
-  (`proto/legion.proto:18`, mounted at `src/manager/daemon.rs:380` beneath
+  (`proto/legion.proto:18`, mounted at `crates/manager/src/manager/daemon.rs:380` beneath
   OIDC/CORS/gRPC-web/metrics layers). Manager→worker proxying exists
-  (exec splice at `src/manager/exec.rs:229`, log fetch at
-  `src/manager/server.rs:5799`), so "manager as trust-boundary proxy" is
+  (exec splice at `crates/manager/src/manager/exec.rs:229`, log fetch at
+  `crates/manager/src/manager/server.rs:5799`), so "manager as trust-boundary proxy" is
   an established pattern.
 - **Non-leader writes are rejected with a typed leader hint, never
-  forwarded** (`src/storage/raft/driver.rs:576`,
-  `src/manager/server.rs:88`, documented stance in
+  forwarded** (`crates/manager/src/storage/raft/driver.rs:576`,
+  `crates/manager/src/manager/server.rs:88`, documented stance in
   [docs/multi-raft.md](../../docs/multi-raft.md) §"Non-leader write
   redirects"). Reads are served locally by every manager and are not
   leader-gated anywhere.
 - **Learners exist as a join transition, not a role.** `add-learner` is an
-  operator command (`src/storage/raft/driver.rs:3019`), join adds learners
+  operator command (`crates/manager/src/storage/raft/driver.rs:3019`), join adds learners
   on every lane and promotes when caught up
-  (`src/storage/raft/driver.rs:2228`), but nothing supports a permanent
+  (`crates/manager/src/storage/raft/driver.rs:2228`), but nothing supports a permanent
   learner: no standby config, no staleness reporting, and
   `PersistenceRole` is only `Primary | Standby | Candidate`
-  (`src/storage/persistence.rs:21`).
+  (`crates/manager/src/storage/persistence.rs:21`).
 - **Snapshot + changeset machinery is reusable for DR.** Snapshots are
   whole-DB or per-lane logical dumps with atomic install
-  (`src/storage/raft/state_machine.rs:913`, `:273`); every mutation is a
+  (`crates/manager/src/storage/raft/state_machine.rs:913`, `:273`); every mutation is a
   captured SQLite changeset applied identically on every replica. A DR
   feed can be "snapshot install, then changeset stream" without new apply
   machinery.
 - **Streaming persistence already ships an async-DR primitive.** rustyriver
   WAL shipping to object storage with an S3-lease failover loop
-  (`src/storage/persistence.rs:192`, `:515`) — but its role flag is
+  (`crates/manager/src/storage/persistence.rs:192`, `:515`) — but its role flag is
   advisory: nothing in the RPC layer rejects writes on a lease standby.
 - **Each manager is already an OIDC issuer.** Workload identity serves
   discovery + JWKS over plain HTTP on the main listener
-  (`src/manager/oidc_http.rs`), and `JwtAuthMethod`
-  (`src/manager/auth_method.rs:261`) already validates externally issued
+  (`crates/manager/src/manager/oidc_http.rs`), and `JwtAuthMethod`
+  (`crates/manager/src/manager/auth_method.rs:261`) already validates externally issued
   JWTs against a JWKS with binding rules mapping claims to policies. A
-  `ControlPlaneIdentityMethod` exists (`src/manager/auth_method.rs:515`).
+  `ControlPlaneIdentityMethod` exists (`crates/manager/src/manager/auth_method.rs:515`).
   Cluster-to-cluster authn can reuse all of this.
 - **The event stream is federation-ready.** `StreamEvents` subscribes
   before replay, dedupes by id, and backfills on lag
-  (`src/manager/server.rs:2369`), so a peer can consume a resumable,
+  (`crates/manager/src/manager/server.rs:2369`), so a peer can consume a resumable,
   gap-free feed today. Event ids are lane-strided and per-cluster, so a
   merged feed needs a `(cluster, event_id)` cursor.
 - **Placement vocabulary that already exists:** node pools
-  (`src/structs/node.rs:16`), free-form node attributes + constraints, and
+  (`crates/common/src/structs/node.rs:16`), free-form node attributes + constraints, and
   `count: { num: N, per: "<attr>" }` spread
-  (`src/structs/job.rs:190`, `src/manager/scheduler.rs:1064`). Namespaces
+  (`crates/common/src/structs/job.rs:190`, `crates/manager/src/manager/scheduler.rs:1064`). Namespaces
   are vocabulary-complete but value-empty: the ACL matcher handles
   namespace globs but everything is `"default"`
-  (`src/structs/acl.rs:150`). There is no `region`/`cluster` field on the
+  (`crates/common/src/structs/acl.rs:150`). There is no `region`/`cluster` field on the
   jobspec; the only region string in the product is the constant `"auto"`
-  stamped into workload-identity claims (`src/constants.rs:37`).
+  stamped into workload-identity claims (`crates/common/src/constants.rs:37`).
 - **Prior intent on record:** `internal_docs/TODO.md` lists "Cluster
   federation" as open, and the service-discovery plan scopes services
   cluster-local, deferring a `ServiceExport`-style federation to a later
@@ -505,7 +505,7 @@ Any manager can serve requests *about* a peer by forwarding them:
   tooling) is recorded as a judgement call.
 - Streaming RPCs (`StreamEvents`, exec) forward as spliced streams, the
   same pattern as the existing manager→worker exec splice
-  (`src/manager/exec.rs`).
+  (`crates/manager/src/manager/exec.rs`).
 
 Merged reads (`--all-clusters`) stay client-driven: the client fans out one
 request per cluster (directly or via one manager with N headers) and
@@ -652,7 +652,7 @@ persistence: {
 - Promotion remains one command away: `legion raft command add-voter
   --target mgr-d` — now guaranteed safe because openraft only promotes a
   caught-up learner, and our join flow already enforces catch-up-then-
-  promote per lane (`src/storage/raft/driver.rs:2228`).
+  promote per lane (`crates/manager/src/storage/raft/driver.rs:2228`).
 
 ### 8.2 Stale reads become observable instead of implicit
 
@@ -887,12 +887,12 @@ peering surface will need to change for it.
 - No per-message `cluster` field: routing is the `x-legion-cluster`
   header (§6.3).
 
-**Config (`src/structs/config.rs`)**: `cluster: { name }` (defaults to the
+**Config (`crates/common/src/structs/config.rs`)**: `cluster: { name }` (defaults to the
 raft node's derived id; required for peering), `acl.federation`
 (bindingRules, trustManagement), `raft.standby`, `raft.zone`,
 `raft.zoneFailoverAfter`, `raft.drStandbyOf`.
 
-**Job config (`src/structs/job.rs`)**: the `clusters` block
+**Job config (`crates/common/src/structs/job.rs`)**: the `clusters` block
 (`placements[]`, `strategy`), validated at submit (unknown cluster names,
 duplicate entries, `maxParallel` bounds). Added to
 `configs/jobs/maximal.jsonnet` when Phase 3 ships.

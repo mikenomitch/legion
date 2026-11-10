@@ -24,9 +24,15 @@ include = [
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-# The workspace is this crate plus `guest/`, the in-guest agent that ships as
-# its own static binary (docs/task-runtime-sandbox.md, "The guest agent"),
-# `proto/`, the generated wire types (`legion-proto`),
+# The workspace is this crate (the `legion` binary: CLI, MCP server, and the
+# bundled apps) on top of the three library crates it is split into, lowest
+# first (docs/codebase-conventions.md, "Crates"):
+#   crates/common   legion-common   domain types, config language, policy
+#   crates/worker   legion-worker   the worker, task runtimes, the datapath
+#   crates/manager  legion-manager  the manager, scheduler, and state store
+# plus `proto/`, the generated wire types (`legion-proto`), `guest/`, the
+# in-guest agent that ships as its own static binary
+# (docs/task-runtime-sandbox.md, "The guest agent"),
 # and the scaling-plugin SDK (`legion-scaling-plugin`,
 # docs/autoscaling-plugins.md), so `cargo test --all` builds and tests it.
 # The example plugins under `plugins/` are separate crates built by build.rs
@@ -35,16 +41,33 @@ include = [
 # Not ".": the root package is a member of its own workspace anyway, and
 # listing it makes every path under the root an explicit member, which
 # overrides `exclude` and breaks every plugin build.
-members = ["guest", "proto", "examples/scaling-plugins/rust"]
+members = [
+    "guest",
+    "proto",
+    "crates/common",
+    "crates/worker",
+    "crates/manager",
+    "examples/scaling-plugins/rust",
+]
+# What a bare `cargo build` / `cargo test` / `cargo test --lib <filter>`
+# covers: the binary crate and the library crates under it, which is what
+# those commands covered when Legion was one crate. Without this they would
+# stop at the root package and skip most of the unit tests. `legion-guest`
+# and the plugin SDK are reached with `-p` or `--all`.
+default-members = [".", "proto", "crates/common", "crates/worker", "crates/manager"]
 exclude = ["plugins"]
 
-[dependencies]
-# The guest agent, resume handler, and identity disk format, shared with the
-# static `legion-guest` binary built from the same crate.
+# One version of every dependency for the whole workspace: each crate
+# lists the ones it uses as `name.workspace = true`.
+[workspace.dependencies]
+# Legion's own crates, lowest layer first
+# (internal_docs/plans/workspace-crate-split-plan.md). `legion-guest` is the
+# in-guest agent, also shipped as its own static binary.
 legion-guest = { path = "guest", version = "0.1.0" }
-# The generated protobuf types and gRPC stubs, re-exported from
-# `legion::structs` (internal_docs/plans/workspace-crate-split-plan.md).
 legion-proto = { path = "proto", version = "0.1.0" }
+legion-common = { path = "crates/common", version = "0.1.0" }
+legion-worker = { path = "crates/worker", version = "0.1.0" }
+legion-manager = { path = "crates/manager", version = "0.1.0" }
 clap = { version = "4.5.48", features = ["cargo", "derive"] }
 futures = "0.3"
 # Persistent (HAMT) maps for the scheduler's read model: a plan's capacity
@@ -106,7 +129,6 @@ bytes = "1"
 json-patch = "3.0.1"
 rusqlite_migration = "1.0.2"
 humantime = "2.1.0"
-serde_rusqlite = "0.36.0"
 jsonschema = "0.17.1"
 # CEL validation `rules` on app object kinds (src/structs/object_rules.rs,
 # docs/app-objects.md "Validation rules"). No default features: no regex,
@@ -120,7 +142,6 @@ argon2 = "0.5.3"
 base64 = "0.22"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["json", "env-filter"] }
-tracing-futures = "0.2.5"
 tracing-appender = "0.2.3"
 # OpenTelemetry trace export for Legion's own spans (OTLP/HTTP, opt-in via env).
 # HTTP exporter avoids a second tonic/prost version in the dependency tree.
@@ -128,7 +149,6 @@ opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
 opentelemetry-proto = { version = "0.27", default-features = false, features = ["gen-tonic-messages", "metrics"] }
-opentelemetry-semantic-conventions = "0.27"
 tracing-opentelemetry = "0.28"
 sha2 = "0.10.8"
 # KV encryption at rest (docs/kv-encryption.md): AES-256-GCM for values and
@@ -187,16 +207,69 @@ hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1", "http2", "server-auto", "server-graceful"] }
 # CLI interactive terminal: raw mode + window size for `legion exec -it`.
 crossterm = "0.28"
-
-[target.'cfg(target_os = "linux")'.dependencies]
+# Linux only.
 landlock = "0.4.1"
-# The kernel classifier's loader (src/worker/netd/kernel): pure Rust over
+# The kernel classifier's loader (the worker's netd/kernel): pure Rust over
 # the bpf syscall, no libbpf. The programs themselves are a checked-in
 # object (bpf/legion_net.bpf.o).
 aya = "0.14.0"
+criterion = "0.5.1"
+
+[dependencies]
+# The layers under the CLI, re-exported from `src/lib.rs` so `legion::manager`,
+# `legion::worker`, `legion::structs` and the rest are the paths they always
+# were.
+legion-common.workspace = true
+legion-worker.workspace = true
+legion-manager.workspace = true
+# `legion guest-agent` runs the in-guest agent from this binary too.
+legion-guest.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+humantime.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+jsonschema.workspace = true
+jsonwebtoken.workspace = true
+libc.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tabled.workspace = true
+tempfile.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tracing.workspace = true
+url.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
-criterion = "0.5.1"
+criterion.workspace = true
+flate2.workspace = true
+prost.workspace = true
+rusqlite.workspace = true
+sysinfo.workspace = true
+tar.workspace = true
+tracing-subscriber.workspace = true
 
 # Benchmarks all live under `benchmarks/` — the Criterion targets below in
 # `benchmarks/micro/`, alongside the scenario-driven scheduler harness
@@ -287,22 +360,24 @@ opt-level = 3
 #
 # Legion is distributed as one binary that is manager, worker, CLI, and MCP
 # server, so binary size is a feature. The stock `--release` profile leaves
-# ~66 MB on the table (linux/amd64, ~490 crates, 2026-11-08):
+# ~74 MB on the table (linux/amd64, ~490 crates, 2026-11-10):
 #
-#   --release           157.4 MB
-#   --profile dist       91.2 MB   (-42%)
+#   --release           171.2 MB
+#   --profile dist       97.3 MB   (-43%)
 #
-# About two thirds of that is `strip` dropping the symbol tables (42 MB); the
-# rest is fat LTO with one codegen unit collapsing dead code and cross-crate
-# duplication (loaded sections 115.1 MB -> 87.0 MB, `.text` 84.4 -> 67.8 MB).
+# A little over half of that is `strip` dropping the symbol tables (41 MB);
+# the rest is fat LTO with one codegen unit collapsing dead code and
+# cross-crate duplication (loaded sections 129.7 MB -> 97.3 MB, `.text`
+# 95.4 -> 76.3 MB).
 #
-# The cost is build time. A clean `dist` build takes ~35 minutes on 4 vCPU
-# against ~15 for `--release`: one codegen unit cannot parallelize LLVM, and
-# the fat-LTO link alone is ~16 minutes. That is why this is a separate
-# profile: `--release` stays fast for local work, and only release artifacts
-# pay for the smaller binary. Debug builds are unaffected. Peak memory is
-# ~10 GB either way, and it is compiling the `legion` crate, not the link
-# (internal_docs/plans/workspace-crate-split-plan.md, § 5.3).
+# The cost is build time. A clean `dist` build takes ~24 minutes on 4 vCPU
+# against ~11 for `--release`: one codegen unit cannot parallelize LLVM
+# within a crate, and the fat-LTO link alone is ~16 minutes. That is why
+# this is a separate profile: `--release` stays fast for local work, and
+# only release artifacts pay for the smaller binary. Debug builds are
+# unaffected. It needs ~10 GB at its peak (Legion's crates in LLVM at once),
+# and the link itself 7.8 GB (internal_docs/plans/workspace-crate-split-plan.md,
+# § 5.4).
 [profile.dist]
 inherits = "release"
 # Collapse dead code and duplicated generics across every crate in the tree.

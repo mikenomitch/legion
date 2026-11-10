@@ -277,16 +277,16 @@ time**. Legion today has no way to say that, and its failure behavior for
 
 - **Placement failure is terminal.** When any single allocation of a job
   cannot be placed, `place_task_allocations` bails
-  (`src/manager/scheduler.rs:1743`: *"Failed to place task …: no available
+  (`crates/manager/src/manager/scheduler.rs:1743`: *"Failed to place task …: no available
   nodes matching constraints, permit, or resources"*), the error aborts the
   whole plan, and the eval worker marks the eval **`failed` — never retried**
-  (`src/manager/daemon.rs:1590`, comment: *"failed evals are never
+  (`crates/manager/src/manager/daemon.rs:1590`, comment: *"failed evals are never
   retried"*). A job submitted 30 seconds before capacity frees up fails
   exactly like a job that could never fit. The user's only remedy is to
   resubmit and hope.
 - **Nothing wakes a job when capacity arrives.** The only new-capacity
   reconciliation, `reschedule_allocations_for_new_node`
-  (`src/storage/store.rs:7950`), re-plans `count.per` jobs and incomplete
+  (`crates/manager/src/storage/store.rs:7950`), re-plans `count.per` jobs and incomplete
   rollouts — an under-placed plain job is not on its list. There is no
   blocked-eval queue, no backoff retry, nothing between "placed" and "failed".
 - **Partial gangs arise over a job's lifetime and then wedge.** A node loss
@@ -296,7 +296,7 @@ time**. Legion today has no way to say that, and its failure behavior for
   waiting on rank 7), and nothing will ever retry. This is the classic gang
   deadlock, reached through the side door.
 - **A config update can strand a job at zero.** `handle_job_update` removes
-  the job's allocations *before* planning (`src/structs/eval.rs:170-171`);
+  the job's allocations *before* planning (`crates/manager/src/manager/eval.rs:170-171`);
   if the new plan cannot place, the job is left with no allocations and a
   terminally-failed eval.
 
@@ -308,9 +308,9 @@ scheduler.
 
 One structural fact makes this plan small rather than large: **Legion's plan
 commit is already all-or-nothing.** The scheduler computes every placement
-for a job config in one pass (`build_plan`, `src/manager/scheduler.rs:987`)
+for a job config in one pass (`build_plan`, `crates/manager/src/manager/scheduler.rs:987`)
 and applies them in one transaction under one epoch CAS
-(`apply_plan_submission_apply`, `src/storage/store.rs:2176`). There is no
+(`apply_plan_submission_apply`, `crates/manager/src/storage/store.rs:2176`). There is no
 pod-at-a-time incremental placement to retrofit atomicity onto — the missing
 pieces are the *contract* (a jobspec way to say "all of this task or
 nothing"), the *waiting state* (blocked, retried, woken by capacity), and
@@ -546,14 +546,14 @@ a coin flip.
 Code recon (verified against `main` at the time of writing):
 
 - **Plans are computed whole and committed whole.** `build_plan`
-  (`src/manager/scheduler.rs:987`) plans every task of a job config in one
+  (`crates/manager/src/manager/scheduler.rs:987`) plans every task of a job config in one
   pass into a local `placements` vec (`:1008`); `apply_plan_submission_apply`
-  (`src/storage/store.rs:2176`) inserts all of them in one transaction,
+  (`crates/manager/src/storage/store.rs:2176`) inserts all of them in one transaction,
   fenced by the epoch CAS sampled before the capacity read
-  (`src/manager/scheduler.rs:697-723`). Concurrent plans for overlapping
+  (`crates/manager/src/manager/scheduler.rs:697-723`). Concurrent plans for overlapping
   capacity conflict and retry (`plan_with_conflict_retries`,
-  `src/structs/eval.rs:293`; test `concurrent_plans_cannot_oversubscribe_a_node`,
-  `src/manager/scheduler.rs:5143`). **The all-or-nothing write exists; this
+  `crates/manager/src/manager/eval.rs:293`; test `concurrent_plans_cannot_oversubscribe_a_node`,
+  `crates/manager/src/manager/scheduler.rs:5143`). **The all-or-nothing write exists; this
   plan adds no new commit machinery.**
 - **Placement failure is a hard error, and errors are terminal.** The bail
   sites: no eligible node (`scheduler.rs:1743`), disk fit (`:1774`),
@@ -562,18 +562,18 @@ Code recon (verified against `main` at the time of writing):
   (`:1224`, `:1273`), empty fleet (`:497`, `:586`, `:693`). Every one
   propagates as an `anyhow` error; `plan_with_conflict_retries` retries only
   `StorageError::Conflict` (`eval.rs:350`); `handle_claimed_eval` marks
-  everything else `failed` terminally (`src/manager/daemon.rs:1590`). There
+  everything else `failed` terminally (`crates/manager/src/manager/daemon.rs:1590`). There
   is no partial commit — but also no distinction between "unsatisfiable"
   and "full right now".
 - **The requeue primitive already exists, used once.** `release_eval_for_retry`
-  (`src/storage/store.rs:9540`) flips an eval back to `pending` with a
+  (`crates/manager/src/storage/store.rs:9540`) flips an eval back to `pending` with a
   future `ready_at`; today only the `NotRaftLeader` path uses it
   (`daemon.rs:1600`). Its doc comment (`store.rs:9525-9538`) is practically
   a design note for this plan: failed evals are dropped forever, so work
   that must survive gets re-released instead. The `eval` table has
   `priority` and `ready_at` but no attempt counter and no blocked metadata.
 - **New capacity wakes almost nobody.** `reschedule_allocations_for_new_node`
-  (`src/storage/store.rs:7950`) reconciles only `count.per` jobs and
+  (`crates/manager/src/storage/store.rs:7950`) reconciles only `count.per` jobs and
   incomplete rollouts on `node_join`. `regenerate_scheduling_evals`
   (`store.rs:9250`) is a failover/startup sweep, not a steady-state one.
 - **Desired counts and top-ups.** `required_counts_for_mode`
@@ -584,15 +584,15 @@ Code recon (verified against `main` at the time of writing):
   are pinned to one node per replica token (`build_plan` group candidates,
   `scheduler.rs:1035-1163`; pin enforcement `:1806-1824`). The natural gang
   unit is therefore **a task's `count.num` replicas** (`TaskCount`,
-  `src/structs/job.rs:190`), which spread across nodes via automatic
+  `crates/common/src/structs/job.rs:190`), which spread across nodes via automatic
   anti-affinity (`policy.rs:300`). Reusing `group` for gangs would collide
   with its meaning.
 - **The update path can strand a job.** `handle_job_update` removes
-  allocations then plans fresh (`src/structs/eval.rs:170-171`); a plan
+  allocations then plans fresh (`crates/manager/src/manager/eval.rs:170-171`); a plan
   failure leaves zero allocations. `handle_job_submit` plans first
   (`:139`) — the asymmetry matters once a gang plan can *defer*.
 - **Rollouts own the only "blocked on capacity" model.**
-  `try_place_for_group` (`src/manager/rollout.rs:866`) treats a zero-placement
+  `try_place_for_group` (`crates/manager/src/manager/rollout.rs:866`) treats a zero-placement
   `Ok` and a hard `Err` identically as `GroupAction::Wait` with
   `blocked_since` stamping (`:1002`, `:1017-1026`) and a
   `capacityBlockTimeout` / `onCapacityTimeout` escape hatch (`:1028-1046`).
@@ -604,7 +604,7 @@ Code recon (verified against `main` at the time of writing):
   and already disables truncation for `count.per`, `distinct`,
   volume-pinned, and multi-task groups (`:1558-1564`). "Does the whole gang
   fit" needs the same exclusion — a truncated list cannot prove a negative.
-- **Keyed stateful tasks have no static count** (`src/structs/job.rs:1866-1877`
+- **Keyed stateful tasks have no static count** (`crates/common/src/structs/job.rs:1866-1877`
   rejects `count` on keyed tasks; cardinality is live instances). A gang
   needs a knowable membership, so keyed tasks are out in v1.
 - **Preemption plan adjacency.** Its design extends `PlanOutcome` and
@@ -649,7 +649,7 @@ Code recon (verified against `main` at the time of writing):
 
 `gang: true` is sugar for `gang: { min: count.num }` — deserialized with the
 same untagged number-or-object pattern `count` already uses
-(`TaskCountInput`, `src/structs/job.rs:208`). Serialization round-trips the
+(`TaskCountInput`, `crates/common/src/structs/job.rs:208`). Serialization round-trips the
 short form, like `TaskCount` does.
 
 Validation at submit (and `job validate` / `job plan`):
@@ -710,7 +710,7 @@ When the plan defers, the eval does not complete and does not fail — it
 
 - The eval handler calls a new `Store::block_eval_for_capacity(id, delay,
   shortfall)`: built on `release_eval_for_retry`
-  (`src/storage/store.rs:9540`), plus two new `eval` columns —
+  (`crates/manager/src/storage/store.rs:9540`), plus two new `eval` columns —
   `attempts` (incremented per blocked retry) and `blocked_reason` (the
   serialized shortfall, for status surfaces). The eval returns to `pending`
   with `ready_at = now + backoff(attempts)`.
@@ -891,7 +891,7 @@ comments per repo rule:
 
 Structs and store:
 
-- `src/structs/job.rs`: `TaskConfig.gang: Option<GangConfig>`;
+- `crates/common/src/structs/job.rs`: `TaskConfig.gang: Option<GangConfig>`;
   `GangConfig { min, placement_timeout, recovery }` with the untagged
   bool-or-object deserializer; validation per §1.
 - `eval` table migration: `attempts INTEGER NOT NULL DEFAULT 0`,
@@ -904,7 +904,7 @@ Structs and store:
   `reschedule_allocations_for_new_node` gains the blocked-eval wake clause;
   eval handler maps `Deferred` → block instead of complete/fail.
 - Events: `job.gang_blocked` / `job.gang_placed` / `job.gang_timeout`
-  draft functions in `src/storage/events.rs`, staged in-transaction;
+  draft functions in `crates/manager/src/storage/events.rs`, staged in-transaction;
   `docs/event-stream.md` kind table updated.
 - CLI/MCP: `job plan` and `job status` render §4; JSON envelopes carry §7
   verbatim; no new commands → `catalog()` in `src/cmd/capabilities.rs`
@@ -1001,7 +1001,7 @@ Concurrency / property tests (extending the existing suite):
 
 - Two gangs contending for capacity that fits one: exactly one places
   (extends `concurrent_plans_cannot_oversubscribe_a_node`,
-  `src/manager/scheduler.rs:5143`); the loser is blocked, not failed, and
+  `crates/manager/src/manager/scheduler.rs:5143`); the loser is blocked, not failed, and
   holds zero resources (assert no allocation rows, no reservation state).
 - A blocked gang plus a stream of small jobs: small jobs keep placing
   (nothing is held), and the gang places on the first retry after capacity
@@ -1050,7 +1050,7 @@ Regression:
   manager-side (planner + eval loop + store); workers are untouched, so
   mixed-version fleets are unaffected. The one sharp edge is *older
   managers*: `TaskConfig` does not reject unknown fields
-  (`src/structs/job.rs:1308-1310` — no `deny_unknown_fields`), so a jobspec
+  (`crates/common/src/structs/job.rs:1308-1310` — no `deny_unknown_fields`), so a jobspec
   with `gang` submitted to a pre-gang manager is **silently accepted and
   scheduled without gang semantics**. The public doc states this, and the
   CLI's `job validate` on a new client warns when the target manager

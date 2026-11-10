@@ -20,13 +20,13 @@ Concretely, today:
   item set), nothing tells the task which devices it got (no
   `CUDA_VISIBLE_DEVICES`, no CDI, no `nvidia` anywhere in `src/`), the
   container runtime denies every device (`linux.resources.devices = [{ allow =
-  false }]`, `src/task_plugins/oci_bundle.rs:1688`), the device list is static
+  false }]`, `crates/worker/src/task_plugins/oci_bundle.rs:1688`), the device list is static
   config with no health, and quota caps cpu, memory, and cores only. A GPU job
   today means `exec` plus a hand-written `CUDA_VISIBLE_DEVICES` and a promise
   that nobody else uses the same card.
 - **Model weights (AI6).** The artifacts class of the node content store
   defaults to 10% of the disk clamped to 1–20 GiB
-  (`src/content_store.rs:88`), smaller than one 70B checkpoint, and ORAS
+  (`crates/common/src/content_store.rs:88`), smaller than one 70B checkpoint, and ORAS
   layers (the shape model weights ship in) are never cached.
 - **Plugins (PLG1, PLG5).** Five dylib load sites call `Box<dyn Trait>`
   methods with no `catch_unwind`; a scheduling or rollout plugin that panics
@@ -158,32 +158,32 @@ API, Windows. Each has an entry in §12.
 ## 5. Background — what exists today
 
 - Custom resources: `ResourcePool::from_node` reads
-  `config_attrs.resources` (`src/resources.rs:982`); `ResourceValue::Items`
+  `config_attrs.resources` (`crates/common/src/resources.rs:982`); `ResourceValue::Items`
   is a set of item tokens; `can_fit` needs `request ⊆ free` for items.
 - The single allocation-insert choke point is
-  `Store::insert_allocation_with_data` (`src/storage/store.rs`), called by
+  `Store::insert_allocation_with_data` (`crates/manager/src/storage/store.rs`), called by
   the plan-apply walk and every other placement path.
 - The plan-apply walk rebuilds each candidate's free pool in-transaction and
-  re-checks `can_fit` (`src/storage/store.rs`, `apply_plan_submission_on`).
+  re-checks `can_fit` (`crates/manager/src/storage/store.rs`, `apply_plan_submission_on`).
 - The worker sends `HealthCheck` every 30 s (`start_node_checks`,
-  `src/worker/daemon.rs`); the store compares before writing
+  `crates/worker/src/worker/daemon.rs`); the store compares before writing
   (`update_node_health_checks`), the write is status-lane and forwardable to
   the lane leader, and `cache_node` re-projects the node's free pool.
 - Worker-type top-level blocks that need no proto field ride the
-  `artifacts` payload (`WorkerArtifactsPayload`, `src/structs/config.rs`).
+  `artifacts` payload (`WorkerArtifactsPayload`, `crates/common/src/structs/config.rs`).
 - `TaskAllocation.task_resources` is the task's declared resources
-  (`src/manager/dispatcher.rs`).
+  (`crates/manager/src/manager/dispatcher.rs`).
 - Exec+JSON plugin conventions: `crate::util::run_json_command` (one JSON
   request on stdin, one reply on stdout, timeout), used by the cluster CA and
   keyring `exec` providers; the volume exec ABI adds a manifest and a
   conformance harness.
-- CEL: `src/structs/object_rules.rs` compiles and bounds rules for object
+- CEL: `crates/common/src/structs/object_rules.rs` compiles and bounds rules for object
   kinds.
 - Content store budgets: `BudgetSpec::Share { percent, min, max }`
-  (`src/content_store.rs`).
-- Dylib loads: `src/worker/node_check.rs`, `src/manager/rollout_strategy.rs`,
-  `src/manager/scheduler/policy.rs`, `src/task_plugins/mod.rs`,
-  `src/artifacts/fetcher.rs`, all through
+  (`crates/common/src/content_store.rs`).
+- Dylib loads: `crates/worker/src/worker/node_check.rs`, `crates/worker/src/rollout_strategy.rs`,
+  `crates/manager/src/manager/scheduler/policy.rs`, `crates/worker/src/task_plugins/mod.rs`,
+  `crates/worker/src/artifacts/fetcher.rs`, all through
   `plugin_runtime::open_plugin_library`.
 
 ## 6. Proposed design

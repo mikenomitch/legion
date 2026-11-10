@@ -44,10 +44,10 @@ This plan is modeled on Diptanu Gon Choudhury's multi-raft scheduling write-up
 
 Legion's Raft backend today is a **control-plane simulation**, not a replicated store:
 
-1. **No real consensus.** [`RaftPersistenceDriver`](../../src/storage/persistence.rs) tracks `role`/`term`/`commit_index`/`applied_index` in an in-process `Mutex<RaftState>` and mutates them when an operator issues a command. `openraft` is a dependency but only `OpenRaftConfig::default()` is constructed and stored in an unused field (`_raft_config`). No log, no network, no quorum, no apply loop.
-2. **Writes are not replicated.** Every mutation goes through `Store::write_connection()` → local SQLite ([`src/storage/store.rs`](../../src/storage/store.rs)). The persistence driver is consulted only for `status()` / `raft_status()` / operator commands — it is **not on the write path**. So `persistence.type = raft` gives leader-election *theater* with single-node durability underneath (as [`docs/state-store.md`](../../docs/state-store.md) and [`docs/raft-operations.md`](../../docs/raft-operations.md) both admit: “manager data is still local SQLite per node”).
+1. **No real consensus.** [`RaftPersistenceDriver`](../../crates/manager/src/storage/persistence.rs) tracks `role`/`term`/`commit_index`/`applied_index` in an in-process `Mutex<RaftState>` and mutates them when an operator issues a command. `openraft` is a dependency but only `OpenRaftConfig::default()` is constructed and stored in an unused field (`_raft_config`). No log, no network, no quorum, no apply loop.
+2. **Writes are not replicated.** Every mutation goes through `Store::write_connection()` → local SQLite ([`crates/manager/src/storage/store.rs`](../../crates/manager/src/storage/store.rs)). The persistence driver is consulted only for `status()` / `raft_status()` / operator commands — it is **not on the write path**. So `persistence.type = raft` gives leader-election *theater* with single-node durability underneath (as [`docs/state-store.md`](../../docs/state-store.md) and [`docs/raft-operations.md`](../../docs/raft-operations.md) both admit: “manager data is still local SQLite per node”).
 3. **Even once real, a single Raft group is a throughput ceiling.** This is the exact bottleneck the source tweet calls out: one log serializes *all* writes, so user-request bursts and status floods contend with — and stall — the scheduler.
-4. **Test coverage is near zero.** [`src/storage/persistence.rs`](../../src/storage/persistence.rs) has 3 unit tests (local-disk status, streaming standby, raft *bootstrap-status*). There are **no** apply/replay tests, **no** multi-node tests, **no** snapshot/restore tests, **no** partition/fault-injection tests, and **no** Raft entries in [`tests/`](../../tests). The user explicitly asked that missing Raft tests and functionality be added.
+4. **Test coverage is near zero.** [`crates/manager/src/storage/persistence.rs`](../../crates/manager/src/storage/persistence.rs) has 3 unit tests (local-disk status, streaming standby, raft *bootstrap-status*). There are **no** apply/replay tests, **no** multi-node tests, **no** snapshot/restore tests, **no** partition/fault-injection tests, and **no** Raft entries in [`tests/`](../../tests). The user explicitly asked that missing Raft tests and functionality be added.
 
 We want Legion to be **faster and more scalable than Nomad/K8s** (per [`README.md`](../../README.md)) — and Nomad's single-Raft control plane is a known scaling limit. Multi-raft is how we beat it while keeping the single-binary, token-join ergonomics Legion is built around.
 
@@ -77,19 +77,19 @@ We want Legion to be **faster and more scalable than Nomad/K8s** (per [`README.m
 
 | Concern | Where | Notes |
 | --- | --- | --- |
-| Persistence trait + drivers | [`src/storage/persistence.rs`](../../src/storage/persistence.rs) | `PersistenceDriver` trait; `LocalDisk`, `Streaming`, `Raft` impls. `RaftPersistenceDriver` is a `Mutex<RaftState>` simulation (lines ~362–690). |
-| Unused real engine | [`src/storage/persistence.rs:421`](../../src/storage/persistence.rs) | `_raft_config: OpenRaftConfig::default()` — openraft is imported but never drives anything. |
-| Driver build/select | [`src/storage/persistence.rs:692`](../../src/storage/persistence.rs) | `build_persistence_driver()` matches `PersistenceType`. |
-| Store write path | [`src/storage/store.rs:361`](../../src/storage/store.rs) | `write_connection()` → single `Mutex<Connection>`; multi-statement writes use `conn.transaction()`. **This is the single integration seam for propose→apply.** |
-| Persistence wiring | [`src/storage/store.rs:215`](../../src/storage/store.rs) | `build_persistence_driver(...)` + `persistence_driver.start()` at `start_storage`; `persistence_status()`, `raft_status()`, `raft_history()`, `issue_raft_command()`, `issue_raft_join_token()` delegate to the driver. |
-| Raft gRPC surface | [`src/manager/server.rs:1797`](../../src/manager/server.rs) | `get_raft_status`, `list_raft_history`, `issue_raft_command`, `get_raft_join_token`; `map_raft_status`/`map_raft_event` adapters. |
+| Persistence trait + drivers | [`crates/manager/src/storage/persistence.rs`](../../crates/manager/src/storage/persistence.rs) | `PersistenceDriver` trait; `LocalDisk`, `Streaming`, `Raft` impls. `RaftPersistenceDriver` is a `Mutex<RaftState>` simulation (lines ~362–690). |
+| Unused real engine | [`crates/manager/src/storage/persistence.rs:421`](../../crates/manager/src/storage/persistence.rs) | `_raft_config: OpenRaftConfig::default()` — openraft is imported but never drives anything. |
+| Driver build/select | [`crates/manager/src/storage/persistence.rs:692`](../../crates/manager/src/storage/persistence.rs) | `build_persistence_driver()` matches `PersistenceType`. |
+| Store write path | [`crates/manager/src/storage/store.rs:361`](../../crates/manager/src/storage/store.rs) | `write_connection()` → single `Mutex<Connection>`; multi-statement writes use `conn.transaction()`. **This is the single integration seam for propose→apply.** |
+| Persistence wiring | [`crates/manager/src/storage/store.rs:215`](../../crates/manager/src/storage/store.rs) | `build_persistence_driver(...)` + `persistence_driver.start()` at `start_storage`; `persistence_status()`, `raft_status()`, `raft_history()`, `issue_raft_command()`, `issue_raft_join_token()` delegate to the driver. |
+| Raft gRPC surface | [`crates/manager/src/manager/server.rs:1797`](../../crates/manager/src/manager/server.rs) | `get_raft_status`, `list_raft_history`, `issue_raft_command`, `get_raft_join_token`; `map_raft_status`/`map_raft_event` adapters. |
 | Raft CLI | [`src/cmd/raft.rs`](../../src/cmd/raft.rs) | `raft status|history|command|join-token`. |
-| Config | [`src/structs/config.rs:146`](../../src/structs/config.rs) | `PersistenceType::{LocalDisk,Streaming,Raft}`; `RaftPersistenceConfig{node_id,bootstrap,peers,join_token_ttl_seconds}` (+ `*Full` variants). Default backend = `LocalDisk`. |
-| Tables (state machine) | [`src/storage/migrations.rs`](../../src/storage/migrations.rs) | 23 tables incl. `node`, `worker_type`, `job`, `job_config`, `task_config`, `task_status`, `allocation`, `allocation_epoch`, `allocation_epoch_partition`, `plan_submission`, `eval`, `kv_*`, `rollout*`, `idempotency_record`. |
+| Config | [`crates/common/src/structs/config.rs:146`](../../crates/common/src/structs/config.rs) | `PersistenceType::{LocalDisk,Streaming,Raft}`; `RaftPersistenceConfig{node_id,bootstrap,peers,join_token_ttl_seconds}` (+ `*Full` variants). Default backend = `LocalDisk`. |
+| Tables (state machine) | [`crates/manager/src/storage/migrations.rs`](../../crates/manager/src/storage/migrations.rs) | 23 tables incl. `node`, `worker_type`, `job`, `job_config`, `task_config`, `task_status`, `allocation`, `allocation_epoch`, `allocation_epoch_partition`, `plan_submission`, `eval`, `kv_*`, `rollout*`, `idempotency_record`. |
 | Epoch CAS | [`docs/state-store.md`](../../docs/state-store.md) | `allocation_epoch` compare-and-swap already guards placement against stale cluster state — the basis for tolerating cross-lane read lag. |
 | Idempotency | AGENTS.md / `Store::idempotency_*` | Mutating RPCs carry `idempotency_key`; commands must dedupe on apply (replay-safety). |
-| Read model cache | [`src/storage/store.rs:105`](../../src/storage/store.rs) | In-memory `SchedulingReadModel` already decouples scheduler reads from the write DB — the natural projection point for a multi-lane read view. |
-| Raft tests | [`src/storage/persistence.rs:714`](../../src/storage/persistence.rs) | 3 unit tests; **no** integration/multi-node/fault/perf tests anywhere. |
+| Read model cache | [`crates/manager/src/storage/store.rs:105`](../../crates/manager/src/storage/store.rs) | In-memory `SchedulingReadModel` already decouples scheduler reads from the write DB — the natural projection point for a multi-lane read view. |
+| Raft tests | [`crates/manager/src/storage/persistence.rs:714`](../../crates/manager/src/storage/persistence.rs) | 3 unit tests; **no** integration/multi-node/fault/perf tests anywhere. |
 | Perf harness | [`tests/integration/scheduler_benchmark_slo.rs`](../../tests/integration/scheduler_benchmark_slo.rs), [`benchmarks/micro/`](../../benchmarks/micro) | SLO test reads `min_evals_per_sec`, `max_p99_latency_ms`, `max_conflict_rejection_rate`, `min_correctness_ratio`; `scheduler_bench` + `eval_critical_path_bench` exist. Reuse these as the multi-raft perf gate. |
 
 **Bottom line:** the operator-facing Raft surface (RPC/CLI/UI/history/config/join-token) already exists and is good. What's missing is the *engine* underneath it and the *partitioning* on top of it.
@@ -433,18 +433,18 @@ An optional control loop that closes the observe→diagnose→act loop, modeled 
 
 ## Proto, Struct, Persistence, and Config Changes
 
-1. **`src/structs/config.rs`** — extend `RaftPersistenceConfig`/`*Full` with `data_dir`, `topology` (`lanes|single`, default `lanes`), `snapshot_entries`, **the tiered `tuning` (with `profile`) + per-lane `lanes` overrides + cluster-shape knobs (`voters`, `leaderBalancing`, `autopilot`)**, and a `TuningKnob` doc-metadata layer (single source for docs/explain/UI). Defaults keep `type=local_disk` as the global default and `profile=balanced`.
-2. **New `src/storage/raft/` module** —
+1. **`crates/common/src/structs/config.rs`** — extend `RaftPersistenceConfig`/`*Full` with `data_dir`, `topology` (`lanes|single`, default `lanes`), `snapshot_entries`, **the tiered `tuning` (with `profile`) + per-lane `lanes` overrides + cluster-shape knobs (`voters`, `leaderBalancing`, `autopilot`)**, and a `TuningKnob` doc-metadata layer (single source for docs/explain/UI). Defaults keep `type=local_disk` as the global default and `profile=balanced`.
+2. **New `crates/manager/src/storage/raft/` module** —
    - `mod.rs` (types: `Lane`, `StoreCommand`, `StoreOp`, `StoreResponse`, `RaftTypeConfig`),
    - `lane.rs` (`lane_for()` classifier + exhaustiveness test),
    - `network.rs` (`RaftNetwork`/`RaftNetworkFactory` over gRPC),
    - `log_store.rs` + `state_machine.rs` (openraft storage over SQLite/`raft/<lane>/`),
    - `driver.rs` (`MultiRaftDriver: PersistenceDriver` owning `HashMap<Lane, Raft<C>>`),
    - **`diagnostics.rs` (per-lane metrics sampler → typed `RaftLaneDiagnosis`; the L1/L2 verdict engine), `tuning.rs` (profiles → openraft `Config`; `TuningKnob` registry + `explain`), `autopilot.rs` (advisory/auto control loop).**
-3. **`src/storage/store.rs`** — split each mutating method into `propose_*` (build+route command) and `apply_*` (existing SQL body), invoked by the lane state machine. Read paths unchanged except the read model now fans in from all lanes **and exposes a `raft_lane_metrics` view for the saved query.**
+3. **`crates/manager/src/storage/store.rs`** — split each mutating method into `propose_*` (build+route command) and `apply_*` (existing SQL body), invoked by the lane state machine. Read paths unchanged except the read model now fans in from all lanes **and exposes a `raft_lane_metrics` view for the saved query.**
 4. **`proto/legion.proto`** — add the internal `RaftService` (append/vote/snapshot, group-keyed) used *between managers*; extend `RaftStatus` with `repeated RaftLaneStatus lanes`; **add `GetRaftDiagnostics` → `RaftDiagnostics`, `GetRaftTuning` → effective per-lane config, and the `RaftLaneDiagnosis`/`TuningKnob`/`Recommendation` messages.** Document every field with public-facing comments (per AGENTS.md, proto is source of truth). Regenerate via `build.rs`.
-5. **`src/storage/migrations.rs`** — add `node_health` table (status lane); no destructive changes to existing tables.
-6. **`src/manager/server.rs` / `src/cmd/raft.rs`** — surface per-lane status/history; add `--lane` flags; **add `raft diagnose`, `raft tuning`, `raft explain`**; keep aggregate defaults. **Add the read-only `legion_raft_diagnose` MCP tool and seed `agent:raft-bottlenecks`.** Update `catalog()` in `src/cmd/capabilities.rs` and MCP tools in `src/cmd/mcp.rs` for any new/renamed surfaces (AGENTS.md requirement).
+5. **`crates/manager/src/storage/migrations.rs`** — add `node_health` table (status lane); no destructive changes to existing tables.
+6. **`crates/manager/src/manager/server.rs` / `src/cmd/raft.rs`** — surface per-lane status/history; add `--lane` flags; **add `raft diagnose`, `raft tuning`, `raft explain`**; keep aggregate defaults. **Add the read-only `legion_raft_diagnose` MCP tool and seed `agent:raft-bottlenecks`.** Update `catalog()` in `src/cmd/capabilities.rs` and MCP tools in `src/cmd/mcp.rs` for any new/renamed surfaces (AGENTS.md requirement).
 7. **`ui/src/pages/Raft.tsx` / `Observability.tsx`** — disclosure-layered Raft health UI (verdict banner, leadership map, per-lane cards with explain-tooltips, effective-config panel, recommendations, Learn affordance).
 8. **Docs** — update `docs/raft-operations.md`, `docs/state-store.md`, `internal_docs/plans/persistence-plan.md` (mark store-replication items done); add `docs/multi-raft.md` (operator guide) **and `docs/multi-raft-tuning.md` (generated knob reference + symptom→fix matrix + plain-language "how it works" explainer + glossary)**; cross-link from `README.md`.
 
@@ -495,7 +495,7 @@ Each work item below is expressed so a workflow can consume it directly:
   "id": "P2.upsert_allocation",
   "phase": "P2",
   "depends_on": ["P0.apply_seam", "P1.driver"],
-  "files": ["src/storage/store.rs", "src/storage/raft/lane.rs"],
+  "files": ["crates/manager/src/storage/store.rs", "crates/manager/src/storage/raft/lane.rs"],
   "intent": "Split upsert_allocation into propose_* (route to scheduler lane) + apply_* (existing SQL).",
   "exit_rubric": [                     // machine-checkable; the skeptic agent tests these
     "upsert_allocation routes to Lane::Scheduler (unit test asserts lane_for)",
@@ -539,7 +539,7 @@ Plus the phase's **targeted** suite (named per phase below) and, for P7, the **p
 
 Make `raft` actually replicate, with a single group, before partitioning. This de-risks consensus correctness independently of multi-raft.
 
-- [ ] `StoreCommand`/`StoreOp`/`StoreResponse` + `RaftTypeConfig` (`src/storage/raft/mod.rs`).
+- [ ] `StoreCommand`/`StoreOp`/`StoreResponse` + `RaftTypeConfig` (`crates/manager/src/storage/raft/mod.rs`).
 - [ ] openraft `RaftLogStorage` + `RaftStateMachine` over SQLite (`raft/` dir) (`log_store.rs`, `state_machine.rs`).
 - [ ] gRPC `RaftService` + `RaftNetwork`/`RaftNetworkFactory` (`network.rs`, `proto/legion.proto`).
 - [ ] Refactor a *first slice* of `Store` mutations into `propose_*`/`apply_*`; route through one `Raft`.

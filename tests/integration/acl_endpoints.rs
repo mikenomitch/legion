@@ -5961,8 +5961,9 @@ async fn namespace_errors_say_where_to_look_without_leaking() -> R<()> {
 fn rpc_access_table_matches_the_endpoint_table() {
     use legion::manager::rpc_access::{access_of, Access};
     for (method, plane) in endpoint_table() {
-        let access = access_of(method)
-            .unwrap_or_else(|| panic!("{method} has no row in src/manager/rpc_access.rs"));
+        let access = access_of(method).unwrap_or_else(|| {
+            panic!("{method} has no row in crates/manager/src/manager/rpc_access.rs")
+        });
         match (plane, access) {
             (Plane::Protected(gate), Access::Protected(resource, action)) => assert!(
                 gate.starts_with(&format!("{resource}:{action}")),

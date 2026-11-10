@@ -117,7 +117,7 @@ other callers without changing the node.
 
 **Call.** When a claim ratifies, the worker records it. Until a desired set
 lists it, or for 30 seconds (`RATIFIED_SETTLE` in
-`src/worker/task_manager.rs`), whichever comes first, the claim is
+`crates/worker/src/worker/task_manager.rs`), whichever comes first, the claim is
 protected from the sweep that stops work a desired set leaves out. After
 that, an absence means stop again.
 

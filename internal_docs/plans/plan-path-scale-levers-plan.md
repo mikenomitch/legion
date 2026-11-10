@@ -23,19 +23,19 @@ matrix (`benchmarks/scheduler/README.md`):
 
 1. **The optimistic-concurrency sample is O(fleet)**
    (`allocation_version_vector_for_candidates`,
-   `src/storage/store.rs:1940`): every plan builds a
+   `crates/manager/src/storage/store.rs:1940`): every plan builds a
    `BTreeMap<String, i64>` with a formatted `node:<id>` key for *every
    candidate node in the fleet*, because the affected node set is only
    known after planning. Measured ~1.2 ms/plan at 1k nodes; the curve
    projects to ~12 ms at 10k — larger than `build_plan` itself.
 2. **Every plan commits alone** (`Store::submit_and_apply_plan`,
-   `src/storage/store.rs:2130`): one write transaction, and on raft one
+   `crates/manager/src/storage/store.rs:2130`): one write transaction, and on raft one
    propose→quorum-commit→apply, per eval. Apply is the largest phase in
    every measured cell — 646 µs on local_disk, 4.4-7.9 ms on raft3.
    Concurrent eval workers serialize on this cost one at a time.
 3. **Every plan rebuilds the world snapshot**
    (`Scheduler::available_nodes` + `capacity_snapshot`,
-   `src/manager/scheduler.rs:1058`, `:600`): an O(fleet) sort + clone of
+   `crates/manager/src/manager/scheduler.rs:1058`, `:600`): an O(fleet) sort + clone of
    the node list, and a deep clone of every node's `ResourcePool` —
    ~1 ms/plan at 1k nodes, linear, rebuilt even when nothing changed.
 
@@ -93,11 +93,11 @@ matrix (`benchmarks/scheduler/README.md`):
 
 - The fence: `plan_and_apply_internal` samples the epoch mirror for every
   candidate node **before** the capacity snapshot
-  (`src/manager/scheduler.rs:748-776` — the invariant comment), then
+  (`crates/manager/src/manager/scheduler.rs:748-776` — the invariant comment), then
   narrows to job scope + affected nodes at submit
   (`expected_versions_for`, `:946`). Apply re-reads epochs in-transaction
-  and rejects on mismatch (`src/storage/store.rs:2248`).
-- The read model (`SchedulingReadModel`, `src/storage/store.rs:116`)
+  and rejects on mismatch (`crates/manager/src/storage/store.rs:2248`).
+- The read model (`SchedulingReadModel`, `crates/manager/src/storage/store.rs:116`)
   keeps `nodes`, `allocations_by_node`, `node_pools`, `indexes`, and the
   `scope_epochs` mirror coherent under one `RwLock`; every allocation
   mutation funnels through `cache_refresh_allocation_scopes`
@@ -303,7 +303,7 @@ No proto, wire, or on-disk changes. No migration.
   per phase; a new concurrent driver mode
   (`LEGION_BENCH_CONCURRENCY=N`) so group commit is actually exercised;
   SLO gate stays green.
-- Phase 4 adds, in `src/storage/store.rs`:
+- Phase 4 adds, in `crates/manager/src/storage/store.rs`:
   - `local_plan_batch_commits_once_and_projects_statuses_once` — a
     SQLite **commit hook** counts the transactions that actually reach
     the disk. Three plans applied singly cost 6 commits (one each, plus

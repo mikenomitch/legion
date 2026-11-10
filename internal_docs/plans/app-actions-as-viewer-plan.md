@@ -150,25 +150,25 @@ as it, through the app (§6.7).
 
 ## 5. Background: what exists today
 
-- `InvokeAppAction` (`src/manager/server/app_ui_rpcs.rs`) checks `app:read`,
+- `InvokeAppAction` (`crates/manager/src/manager/server/app_ui_rpcs.rs`) checks `app:read`,
   then `enforce_ui_permission` checks the declared permission on the scope
   `ui_permission_scope` derives from the slot: the job (namespace, name,
   template provenance) for `job`/`task`, the node's pool for a node-slot
   `node` permission, `unowned` for a namespaced one there.
-- It signs a `ViewerAssertion` (`src/structs/app_ui.rs`) as the
+- It signs a `ViewerAssertion` (`crates/common/src/structs/app_ui.rs`) as the
   `legion.io/viewer` claim of an ES256 JWT, `aud = app:<name>`, 60 seconds,
   with the workload-identity key (`WorkloadIdentityState::issue_viewer_assertion`).
 - The framework (`src/apps/ui.rs`) verifies it and runs the handler with an
   `ActionRequest` (context, inputs, viewer). The token itself is dropped.
 - Apps reach Legion through `LEGION_ADDR`, the allocation's API socket
-  (`src/worker/api_socket.rs`), which forwards each request as is and
+  (`crates/worker/src/worker/api_socket.rs`), which forwards each request as is and
   attaches the app's `legion` identity token when the request carries no
   `authorization`. That token's policies hold `grant:alloc/<id>`, which
   resolves to the app's recorded grant.
-- `ManagerDaemonService::authenticate_acl` (`src/manager/server.rs`) is the
+- `ManagerDaemonService::authenticate_acl` (`crates/manager/src/manager/server.rs`) is the
   one funnel every handler authenticates through; `is_autoscaler_identity`
-  (`src/manager/server/autoscale_rpcs.rs`) and `calling_app`
-  (`src/manager/server/extension_rpcs.rs`) each map a credential to an app.
+  (`crates/manager/src/manager/server/autoscale_rpcs.rs`) and `calling_app`
+  (`crates/manager/src/manager/server/extension_rpcs.rs`) each map a credential to an app.
 - The autoscaler's actions (`src/apps/autoscaler_ui.rs`) call `PauseScaling`
   and `ScaleTask` with the app's client, putting `by <viewer>` in the reason.
 
@@ -220,7 +220,7 @@ legion-on-behalf-of: <the action's viewer assertion>
 ```
 
 The header name is one constant, `ON_BEHALF_OF_HEADER` in
-`src/structs/app_ui.rs`, shared by the manager and the framework.
+`crates/common/src/structs/app_ui.rs`, shared by the manager and the framework.
 
 ### 6.3 Honor: the manager builds a delegated identity
 
@@ -323,7 +323,7 @@ All three ship together in one change; each is independently testable.
 
 ## 9. Testing plan
 
-- **Unit** (`src/manager/delegation.rs`, `src/structs/app_ui.rs`): the
+- **Unit** (`crates/manager/src/manager/delegation.rs`, `crates/common/src/structs/app_ui.rs`): the
   synthesized rule allows exactly the scope and actions; the intersection
   drops what the app lacks; deny rules carry over; a `*` in a scope value is
   refused; the claim round-trips and view assertions refuse one.

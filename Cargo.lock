@@ -2282,6 +2282,68 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "legion-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "cel",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "cron",
+ "http 1.4.0",
+ "http-body-util",
+ "humantime",
+ "hyper 1.9.0",
+ "hyper-util",
+ "jsonschema",
+ "jsonwebtoken",
+ "lazy_static",
+ "legion-guest",
+ "legion-proto",
+ "libc",
+ "nickel-lang-core",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "rand 0.8.5",
+ "rcgen",
+ "regex",
+ "reqwest 0.12.28",
+ "ring",
+ "rusqlite",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "schemars 0.8.22",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "strsim",
+ "sysinfo",
+ "tabled",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tower 0.4.13",
+ "tracing",
+ "tracing-appender",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
 name = "legion-guest"
 version = "0.1.0"
 dependencies = [
@@ -2290,6 +2352,63 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "legion-manager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "fallible-streaming-iterator",
+ "futures",
+ "http 1.4.0",
+ "http-body-util",
+ "humantime",
+ "hyper 1.9.0",
+ "hyper-tungstenite",
+ "hyper-util",
+ "imbl",
+ "json-patch",
+ "jsonwebtoken",
+ "lazy_static",
+ "legion-common",
+ "legion-worker",
+ "libloading",
+ "object_store",
+ "openraft",
+ "prost",
+ "rand 0.8.5",
+ "rcgen",
+ "reqwest 0.12.28",
+ "ring",
+ "rusqlite",
+ "rusqlite_migration",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "rustyriver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tonic",
+ "tonic-web",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -2309,48 +2428,27 @@ name = "legion-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "argon2",
  "async-trait",
- "aya",
  "base64 0.22.1",
  "bytes",
- "cel",
  "chrono",
- "chrono-tz",
  "clap",
  "criterion",
- "cron",
  "crossterm",
- "fallible-streaming-iterator",
  "flate2",
  "futures",
- "hickory-proto",
  "http 1.4.0",
  "http-body-util",
  "humantime",
  "hyper 1.9.0",
- "hyper-tungstenite",
  "hyper-util",
- "imbl",
- "json-patch",
  "jsonschema",
  "jsonwebtoken",
- "landlock",
- "lazy_static",
+ "legion-common",
  "legion-guest",
- "legion-proto",
+ "legion-manager",
+ "legion-worker",
  "libc",
- "libloading",
- "nickel-lang-core",
- "object_store",
- "oci-client",
- "openraft",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry-proto",
- "opentelemetry-semantic-conventions",
- "opentelemetry_sdk",
- "portable-pty",
  "prost",
  "rand 0.8.5",
  "rcgen",
@@ -2358,18 +2456,11 @@ dependencies = [
  "reqwest 0.12.28",
  "ring",
  "rusqlite",
- "rusqlite_migration",
  "rustls",
- "rustls-pemfile",
  "rustls-pki-types",
- "rustyriver",
- "schemars 0.8.22",
- "semver",
  "serde",
  "serde_json",
- "serde_rusqlite",
  "sha2",
- "strsim",
  "sysinfo",
  "tabled",
  "tar",
@@ -2378,22 +2469,12 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
- "tokio-tungstenite",
  "tonic",
- "tonic-web",
  "tower 0.4.13",
- "tower-http 0.5.2",
  "tracing",
- "tracing-appender",
- "tracing-futures",
- "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
- "wasmi",
- "wasmi_core",
- "webpki-roots",
  "x509-parser",
- "zeroize",
 ]
 
 [[package]]
@@ -2402,6 +2483,66 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "legion-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aya",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "flate2",
+ "futures",
+ "hickory-proto",
+ "http 1.4.0",
+ "http-body-util",
+ "humantime",
+ "hyper 1.9.0",
+ "hyper-util",
+ "jsonschema",
+ "jsonwebtoken",
+ "landlock",
+ "legion-common",
+ "legion-guest",
+ "libc",
+ "libloading",
+ "object_store",
+ "oci-client",
+ "portable-pty",
+ "rand 0.8.5",
+ "rcgen",
+ "regex",
+ "reqwest 0.12.28",
+ "ring",
+ "rusqlite",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "rustyriver",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sysinfo",
+ "tar",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tower 0.4.13",
+ "tracing",
+ "url",
+ "wasmi",
+ "wasmi_core",
+ "webpki-roots",
+ "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
@@ -3122,12 +3263,6 @@ dependencies = [
  "prost",
  "tonic",
 ]
-
-[[package]]
-name = "opentelemetry-semantic-conventions"
-version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc1b6902ff63b32ef6c489e8048c5e253e2e4a803ea3ea7e783914536eb15c52"
 
 [[package]]
 name = "opentelemetry_sdk"
@@ -4299,16 +4434,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "serde_rusqlite"
-version = "0.36.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b741cc5ef185cd96157e762c3bba743c4e94c8dc6af0edb053c48d2b3c27e691"
-dependencies = [
- "rusqlite",
- "serde",
 ]
 
 [[package]]

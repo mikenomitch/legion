@@ -83,15 +83,15 @@ them, which is the point.
 
 ## What exists today
 
-- `src/worker/task_manager.rs`: `UnlockedLaunch::run` (mount, consume,
+- `crates/worker/src/worker/task_manager.rs`: `UnlockedLaunch::run` (mount, consume,
   `prepare`, `start`, off the lock), `finish_unlocked_launch` (register, state
   file), `prepare_registered_allocation` / `start_registered_allocation` (the
   locked path: provisional starts, restores, gated starts), the staging threads.
-- `src/task_plugins/sandbox.rs`: `start_microvm` builds the TAP and lease, the
+- `crates/worker/src/task_plugins/sandbox.rs`: `start_microvm` builds the TAP and lease, the
   layout, the root disk, and the VMM command. `start` spawns it.
-- `src/worker/task_health.rs`: one tokio task per check on
+- `crates/worker/src/worker/task_health.rs`: one tokio task per check on
   `tokio::time::interval(every)`, results to one monitor loop.
-- `src/worker/daemon.rs`: `heartbeat_tick` binds the datapath
+- `crates/worker/src/worker/daemon.rs`: `heartbeat_tick` binds the datapath
   (`apply_upstreams`), then later creates gated namespaces
   (`apply_net_capture`).
 

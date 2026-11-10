@@ -9,7 +9,7 @@
 //!   node that moves to another manager is counted once.
 //!
 //! The merge rules themselves (stale managers, resyncs, size bounds) are
-//! unit-tested in `src/manager/scaling_inputs.rs`.
+//! unit-tested in `crates/manager/src/manager/scaling_inputs.rs`.
 
 use crate::support::cluster_gate;
 use legion::manager::eval::EvalExt;

@@ -66,7 +66,7 @@ Their remaining real-hardware runs are under Verify.
       `docs/installation.md` were never checked upstream. Confirm before launch.
 - [ ] **No way to reach a microVM sandbox over HTTP** without a hand-built TAP,
       guest IP config, and host DNAT. Gated mode has no host-to-guest ingress
-      relay (gated sandboxes never get a netns, `src/worker/daemon.rs`).
+      relay (gated sandboxes never get a netns, `crates/worker/src/worker/daemon.rs`).
 
 ### Spot-check-fix follow-ups
 
@@ -196,7 +196,7 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
       admission changes coalescer batching or crowds heartbeats before tuning.
 - [ ] **`legion_runtime_spawn_delay_seconds` can't see the starvation it exists
       for**: the probe lands in the spawner's LIFO slot. Measure from the
-      tick's deadline instead (`start_runtime_probe`, `src/manager/telemetry.rs`).
+      tick's deadline instead (`start_runtime_probe`, `crates/common/src/telemetry.rs`).
 - [ ] **`legion_eval_queue_depth` lags up to a second on a deep queue** (above
       `evalThreads × 16` pending; [calls #6](calls/placement-and-commit-cost-plan_calls.md)).
       A `kind` label would want the same treatment.
@@ -233,7 +233,7 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
       [calls 25](calls/legion-apps-plan_calls.md)). Precompute "accepts every
       namespace" per node, or fold it into `permits_restrictions`, and re-measure.
 - [ ] **In-place rollout ticks build an O(fleet) exclusion set**
-      (`src/manager/rollout.rs`, `available_node_ids`), forcing the plan's node-set
+      (`crates/manager/src/manager/rollout.rs`, `available_node_ids`), forcing the plan's node-set
       copy. Express it as an allow-list ([plan §13](plans/plan-path-fleet-scaling-plan.md)).
 - [ ] **Truncation-ineligible tasks still scan the fleet** (`count.per`,
       `distinct`, volumes, multi-task groups); a non-goal of the fleet-scaling plan.
@@ -257,10 +257,10 @@ Plans: [plan-path-fleet-scaling](plans/plan-path-fleet-scaling-plan.md) ·
 
 ### Placement features
 
-- [ ] **Soft taints.** Pools act as hard taints (`src/constraints.rs`) and the
+- [ ] **Soft taints.** Pools act as hard taints (`crates/common/src/constraints.rs`) and the
       worker type's `namespaces` list restricts nodes; there is no prefer-not form.
 - [ ] **Schedule onto the same node as an existing job.** `same_node_as` works
-      only within one job spec (`src/manager/scheduler/policy.rs`).
+      only within one job spec (`crates/manager/src/manager/scheduler/policy.rs`).
 - [ ] **Worker-fingerprinted `disk` as a built-in schedulable resource**; today
       only operator-declared `config_attrs.resources.disk` feeds the `fit` index.
 - [ ] **Let a node override its builtin capacity** (`cpu`, `memory`, `cores`).
@@ -482,7 +482,7 @@ rig runs for everything below live in the verify list.
 - [ ] Possible, not planned: `sd_notify` readiness, watchdog pings, and
       socket activation for `exec` ([plan §8 phase 4](plans/host-process-supervision-plan.md)).
 - [ ] **A WASM runtime** (WASI `wasm32-wasip1` command modules). The
-      embedding layer is ready in [`src/wasm/`](../src/wasm/mod.rs); needs a
+      embedding layer is ready in [`crates/worker/src/wasm/`](../crates/worker/src/wasm/mod.rs); needs a
       plan for the task surface, a whole-run CPU budget, preopened dirs,
       networking, and wasmi vs wasmtime.
 - [ ] **A `converge` runtime** — idempotent host resources with per-resource
@@ -506,7 +506,7 @@ rig runs for everything below live in the verify list.
       1.5.1.** `stop_lets_a_trapping_container_drain` and
       `stop_force_kills_at_the_deadline` look stale (they call the hard
       `stop()`); fix them. Three others are unexplained pending a cgroup v2
-      rerun (`src/task_plugins/container.rs`).
+      rerun (`crates/worker/src/task_plugins/container.rs`).
 - [ ] **Two workers on one host can still collide on cgroup leaves and gated
       netns names.** OCI ids are node-scoped (2026-11-08), but the cgroup leaf
       stays `legion-<alloc>` and netns names carry no node id. The orphan-netns
@@ -546,7 +546,7 @@ rig runs for everything below live in the verify list.
       [calls](calls/gated-sandbox-checkpoints-plan_calls.md)); Phases 1–5
       built without KVM:
   - [ ] Flip the default once G0.1 and G2.1 pass: `SANDBOX_GATED_BY_DEFAULT`
-        in `src/structs/network.rs`, the docs that say `auto` means `host`,
+        in `crates/common/src/structs/network.rs`, the docs that say `auto` means `host`,
         and drop `LEGION_SANDBOX_GATED_DEFAULT` (calls 2).
   - [ ] Decide the Firecracker 1.17 floor for ingress (RX stick after pause,
         #6100) from the G5.1 measurement (calls 20).
@@ -561,7 +561,7 @@ rig runs for everything below live in the verify list.
   - [ ] Gated `container`/`exec` tasks without upstreams get no resolver
         (worker-plane-auth Phase 3).
   - [ ] The egress proxy records service-graph bytes only when a splice
-        ends (`src/worker/netd/proxy.rs`).
+        ends (`crates/worker/src/worker/netd/proxy.rs`).
   - [ ] A gated resolver forwards queries while policy is pending
         (calls 22).
   - [ ] TAP guests are IPv4 only; a kernel without `CONFIG_IP_PNP` boots
@@ -599,7 +599,7 @@ rig runs for everything below live in the verify list.
         ([calls](calls/multi-eval-plans-plan_calls.md) #5).
   - [ ] Rollout ticks and node-scoped passes do not block (calls 41).
   - [ ] `tests/integration/raft_seam.rs` does not read
-        `src/storage/store/*.rs` submodules (calls 48).
+        `crates/manager/src/storage/store/*.rs` submodules (calls 48).
   - [ ] Idle sessions: suspend an unpromoted session to a bucket manifest
         (plan §6.5, calls 18, 50).
   - [ ] Workload identity for sessions (plan §6.3, §6.8; calls 18, 33, 34).
@@ -643,7 +643,7 @@ rig runs for everything below live in the verify list.
   - [ ] Park for `container` tasks on macOS needs a vsock-style relay.
   - [ ] `legion instance suspend` of an edge-started keyed instance likely
         fails: `run_capture` looks it up by the manager's id, not its
-        `local_key` (`src/worker/checkpoints.rs`).
+        `local_key` (`crates/worker/src/worker/checkpoints.rs`).
 
 ### Suspend, resume, fork, and oversubscription
 
@@ -816,7 +816,7 @@ Plan: [network-handlers-plan.md](plans/network-handlers-plan.md) · calls: [netw
 - [ ] **Phase 7: UDP (SOCKS5 `UDP ASSOCIATE`) and transparent capture** (TUN +
       userspace stack) for tools that ignore `HTTP_PROXY`.
 - [ ] **Publish `pool` and `nodeId` into worker `config_attrs`**
-      ([daemon.rs](../src/worker/daemon.rs)) for one-per-node `count.per` jobs.
+      ([daemon.rs](../crates/worker/src/worker/daemon.rs)) for one-per-node `count.per` jobs.
 - [ ] **Leftovers from the shipped mesh phases:**
   - [ ] Guest agent: no VM-fork/microVM `exec` channel; no musl-static build.
   - [ ] Ingress: PROXY v2 to the task; drain/grace sets lost on worker restart; no
@@ -943,7 +943,7 @@ Plans: [multi-raft](plans/multi-raft-persistence-plan.md), [durability-and-ops](
 - [ ] **An older-schema manager can be sent a newer snapshot (audit R2)** and won't start.
 - [ ] **Streaming fencing is time-based (audit R4)**; a paused primary can ship once more.
 - [ ] **No raft leadership transfer on shutdown (audit M3)**; openraft 0.9 lacks it.
-- [ ] **Native GCS and Azure object storage** (`src/storage/objects/`).
+- [ ] **Native GCS and Azure object storage** (`crates/worker/src/objects/`).
 - [ ] **Worker object-store principal resolves on first use, not boot**; decide if
       `contentStore` refuses ambiguous AWS envs ([calls #3](calls/swappable-seams-plan_calls.md)).
 - [ ] **Measure `file://` publish throughput** vs the old direct write (calls #17).
@@ -1017,7 +1017,13 @@ Job templates shipped ([plan](plans/job-templates-plan.md)); the registry is unt
 - [ ] **A job registry**: default + added registries, `@<registry>/<job>`, inspect
       metadata, a UI to fill in variables; plugins by URL or registry.
 - [ ] **Build & push images** (`legion build`/`prep`); a buildpack runner.
-- [ ] **Publish `legion-rs` to crates.io**; **release binaries and a Homebrew formula.**
+- [ ] **Publish the next `legion-rs` to crates.io**; **release binaries and a Homebrew formula.**
+      0.1.0 is published as one crate. A release now publishes six in order
+      (`legion-proto`, `legion-guest`, `legion-common`, `legion-worker`,
+      `legion-manager`, `legion-rs`), and `legion-worker` embeds
+      `bpf/legion_net.bpf.o` from outside its package, which `cargo publish`
+      will refuse ([development.md](development.md#the-guest-binary-legion-guest),
+      [plan § 10](plans/workspace-crate-split-plan.md#10-rollout-and-backward-compatibility)).
 
 ## Ecosystem apps (the omakase experience)
 
@@ -1104,7 +1110,7 @@ docs: [plugin-system.md](../docs/plugin-system.md)
 - [ ] **A stable plugin ABI (audit M6)** ([calls #8](calls/architecture-audit-2026-10-09_calls.md)).
 - [ ] **Plugin lockfiles are stale** — likely closed by [#41](https://github.com/mikenomitch/legion/pull/41).
 - [ ] **Panic containment for task runtime dylibs** ([review PLG1](architecture-review-2026-11-07.md)).
-- [ ] **In-manager plugin hooks on the WASM layer** (`src/wasm/`); needs a plan.
+- [ ] **In-manager plugin hooks on the WASM layer** (`crates/worker/src/wasm/`); needs a plan.
 - [ ] **Lift a plugin quarantine without a restart**; a `legion plugin status`.
 - [ ] **Devices follow-ups** ([docs](../docs/devices.md)): sandbox VFIO; MIG/MPS/DRA;
       an `exec` device cgroup; preemption and node groups ignore devices; NVLink
@@ -1186,9 +1192,32 @@ docs: [ui-architecture.md](../docs/ui-architecture.md)
       `raft_write_path::every_log_purge_fsyncs_the_state_db_first`,
       `proxy_hand_offs_cross_nodes_only_over_the_mesh_test`,
       `plugins_rewrite_requests_and_responses_on_an_http_upstream_test` (WASM
-      10 ms deadline), and `typical_rules_are_cheap_test` (10 ms budget). The
-      lib-test build also needs `-j 1` or `-j 2` on a 15 GB host, or it is
-      OOM-killed.
+      10 ms deadline), and `typical_rules_are_cheap_test` (10 ms budget).
+- [ ] **Crate split follow-ups** ([plan § 8](plans/workspace-crate-split-plan.md#8-implementation-phases)):
+  - [ ] **The store out of `legion-manager`.** It is the largest compile
+        (3.8 GB, 4.5 GB with tests). `storage` has 28 references into
+        `manager` that are design, not placement: `Store` owns the scaling
+        rollups, the status board and the cluster CA, and calls
+        `Scheduler::new` inside a write. Needs its own plan and
+        `scheduler_bench` numbers.
+  - [ ] **A plugin API crate**, so a plugin stops compiling all five crates
+        for a trait and a few types. The ABI fingerprint moves with it.
+  - [ ] **A datapath crate** (`worker/netd`, 25.7k lines), if the worker's
+        2.2 GB becomes the constraint.
+- [ ] **Find what makes the linux/amd64 binary 97 MB.** `.text` alone is
+      76 MB; the 26 MB the docs used to quote was a macOS arm64 build of a
+      smaller tree. Two questions for `cargo bloat --profile dist --crates`
+      on an unstripped build:
+  - [ ] **The crate split added 5.8 MB** (91.5 → 97.3 MB,
+        [plan § 5.4](plans/workspace-crate-split-plan.md#54-measured-before-and-after),
+        [calls 3](calls/workspace-crate-split-plan_calls.md)). Likely generics
+        instantiated once per crate (serde for `JobConfig` and friends,
+        parsed in four crates). Confirm with a symbol-level diff against a
+        `main` build, then put non-generic wrappers at the crate boundary for
+        the heavy ones.
+  - [ ] **Which dependencies own the rest** (candidates: `nickel-lang-core`,
+        `wasmi`, `object_store` with `aws`, `oci-client`,
+        `opentelemetry-otlp`, `cel`).
 - [ ] **Share one target dir across plugin builds** (each rebuilds ~470 crates).
 - [ ] **Decide whether the UI ships inside the binary.**
 - [ ] **Create the `proto-breaking-ok` label** (audit M5).
@@ -1275,7 +1304,7 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 ### Networking, persistence, apps and the rest
 
 - [ ] Measure the manager-routed session start path across three managers with loadgen session mode, on the AWS rig (`benchmarks/aws/README.md`, [plan §8](plans/session-durability-and-routing-plan.md)).
-- [ ] Run Phase 5b `store` sessions against real S3 or MinIO (`src/session_manifest.rs` is tested only on `object_store`'s in-memory store).
+- [ ] Run Phase 5b `store` sessions against real S3 or MinIO (`crates/worker/src/session_manifest.rs` is tested only on `object_store`'s in-memory store).
 - [ ] Run Phase 5b with the `sandbox` runtime on KVM: publish and restore a session's sealed memory parts on another node ([plan](plans/session-durability-and-routing-plan.md)).
 - [ ] Boot a gated `sandbox` over vsock end to end on a real VMM (KVM), then let `auto` resolve to `gated` for sandboxes ([network-handlers-plan.md](plans/network-handlers-plan.md) M9).
 - [ ] Measure splice pipe-page limits on a node with tens of thousands of concurrent bulk flows ([calls #6](calls/datapath-performance-plan_calls.md)).
@@ -1292,7 +1321,6 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 - [ ] Browser check of the sessions UI against a live session cluster: Promote, End, paging, envelope and edge-nodes cards ([plan](plans/session-ui-plan.md)).
 - [ ] Re-verify on the rig: microVM clean stop (volume writes survive `instance stop`), image pulls after leader failover, two local managers with separate `~/.legion/tokens/` files, and `rig_install_cli_token` on a 3-manager rig ([findings](launch-spot-check-findings.md#re-run-2026-10-12)).
 - [ ] Bake the operator AMI against real AWS: console output survives the stop, bake finishes inside 90 minutes ([calls #29](calls/aws-comparative-benchmark-plan_calls.md)).
-- [ ] Re-measure the shipping binary size on linux/amd64 (26 MB is macOS arm64).
 
 - [ ] Rerun `scheduler_bench` `snapshot_budget` / `candidate_construction` on a quiet host (the content-store budget numbers were taken on a loaded one).
 
@@ -1302,7 +1330,7 @@ Runs that need real hardware, a KVM or macOS host, root on cgroup v2, or the AWS
 
 ## Configuration language
 
-- **Nickel replaces Jsonnet** — every config surface is `.ncl` through `src/config_lang.rs`; `vars` + `--var`/`--var-code`/`--kv-var`/`--kv-var-code`; no `.jsonnet` compatibility ([plan](plans/nickel-config-language-plan.md) · [calls](calls/nickel-config-language-plan_calls.md) · [docs](../docs/configuration-language.md))
+- **Nickel replaces Jsonnet** — every config surface is `.ncl` through `crates/common/src/config_lang.rs`; `vars` + `--var`/`--var-code`/`--kv-var`/`--kv-var-code`; no `.jsonnet` compatibility ([plan](plans/nickel-config-language-plan.md) · [calls](calls/nickel-config-language-plan_calls.md) · [docs](../docs/configuration-language.md))
 - **`.json` on four of five config surfaces** — extension-dispatched, for machine-emitted config; templates stay Nickel-only ([calls](calls/nickel-config-language-plan_calls.md) · [docs](../docs/configuration-language.md#json-for-machine-emitted-config))
 - **Local jobspecs evaluated in place** — relative imports work from `job run/plan/validate`
 
@@ -1449,7 +1477,7 @@ Plans: [mesh control path](plans/mesh-control-path-plan.md) ([calls](calls/mesh-
 - **WASM network plugins (Track B)** — proxy-wasm ABI on wasmi, `legion net plugin` CLI/RPCs/MCP, request/body/response/done stages, `legion_sign`, `dispatch_http_call`; also closes handlers-plan Phase 8 ([docs](../docs/network-plugins.md))
 - **macOS gated networking, phases 1–3** — per-allocation egress proxy, Seatbelt for `exec`, Apple `container` VMs under a `pf` anchor ([plan](plans/macos-gated-plan.md) · [docs](../docs/network-handlers.md#gated-mode-on-macos))
 - **Datapath simplification** — one egress judge (`netd::egress`), SOCKS5 dropped, dead code and `MaterialProvider` removed
-- **Shared WASM embedding layer** — `src/wasm/` engine, memory cap, WASI preview1 shim, module fetching
+- **Shared WASM embedding layer** — `crates/worker/src/wasm/` engine, memory cap, WASI preview1 shim, module fetching
 - **M1 policy + datapath core** — `netpolicy` merge with provenance, `net_policy` RPCs and `legion net policy`, connect-time rules, external upstreams, fail-static policy delivery, `net.*` events and metrics ([plan](plans/network-handlers-plan.md) · [docs](../docs/network-handlers.md))
 - **M2 HTTP/1.1 mode** — request-time rules, structured 403s, `dlp`, NDJSON access log, timeouts/retries/split/outlier ejection ([plan](plans/network-handlers-plan.md))
 - **M3 name-is-config** — per-allocation loopback /24, `<key>.svc.legion` resolver with VIPs, egress policy at resolution ([plan](plans/network-handlers-plan.md))
@@ -1551,7 +1579,7 @@ Plans: [legion apps](plans/legion-apps-plan.md) ([calls](calls/legion-apps-plan_
 - **App actions run as the viewer** — `<viewer> via app <app>` ([plan](plans/app-actions-as-viewer-plan.md))
 - **Autoscaler Phase 0: `legion job scale`** — `task_scale` overrides, `job_scale` eval, `scale` ACL, ScaleTask/GetJobScaleStatus ([docs](../docs/autoscaling.md))
 - **Autoscaler Phase 1: scaling inputs** — per-(node, task) usage rollups, `GetScalingInputs` ([docs](../docs/autoscaling.md#scaling-inputs))
-- **Autoscaler engine core** — `src/autoscaler/` spec, strategies, schedules, safeguards, simulator ([calls](calls/autoscaler-v2-plan_calls.md))
+- **Autoscaler engine core** — `crates/common/src/autoscaler/` spec, strategies, schedules, safeguards, simulator ([calls](calls/autoscaler-v2-plan_calls.md))
 - **Autoscaler Phases 2–4** — bundled task-autoscaling app, full policies (`prometheus`, `http`, `min = 0`, `scaling simulate`), external plugins and standalone policies ([plan](plans/autoscaler-v2-plan.md))
 - **Autoscaler Phase 5a: node-autoscaling substrate** — join-token `max_uses`/`attributes`, `ForgetNode` / `legion node forget`, `GetCapacityDemand` ([docs](../docs/autoscaling.md#capacity-demand))
 - **Autoscaler Phases 5b, 6, 7** — node groups run by the app, the UI as app views, sharded replicas with a 10,000-policy load test ([plan](plans/autoscaler-v2-plan.md))
@@ -1658,7 +1686,7 @@ Fixes for the open bug and security items; judgement calls in
 - **AWS spot-check re-run fixes (2026-10-12)** — exponential reschedule backoff as a replicated `reschedule_hold` with events and `--force-reschedule`; slot instances return to their volume's node uncharged; per-address `~/.legion/tokens/`; SIGPIPE exit 141; `state query` errors as `InvalidArgument`; errors name CLI flags; MCP node attrs as objects; `job plan` previews age-gated preemption; instance `nodeId`; macOS `--run-worker` stops its containers on shutdown ([calls](calls/launch-spot-check-fixes-plan_calls.md))
 - **Architecture audit (2026-10-09)** — worker W1–W6 (W3 partial), raft/store R1–R5 (R5 partial), scheduler SC1–SC6 (SC4 partial), manager lifecycle M1–M6 (M6 partial) ([audit](architecture-audit-2026-10-09.md) · [calls](calls/architecture-audit-2026-10-09_calls.md))
 - **Sandbox spot check (2026-10-12)** — `node.pressure` events from a lane-less follower are forwarded and journaled ([calls](calls/durability-and-ops-execution-plan_calls.md) · [docs](../docs/event-stream.md))
-- **Swappable seams (2026-10-14)** — one datapath `Attachment`, one listener/dialer (`netd::listen`), typed `netd::Netd` boundary, DNS on `hickory-proto`, egress proxy HTTP on hyper (pipelined requests judged), mesh upstreams honour `mesh_tls`, one object-storage layer (`src/storage/objects/`), VIP blocks follow the node's OS ([plan](plans/swappable-seams-plan.md) · [calls](calls/swappable-seams-plan_calls.md) · [docs](../docs/codebase-conventions.md#datapath-conventions))
+- **Swappable seams (2026-10-14)** — one datapath `Attachment`, one listener/dialer (`netd::listen`), typed `netd::Netd` boundary, DNS on `hickory-proto`, egress proxy HTTP on hyper (pipelined requests judged), mesh upstreams honour `mesh_tls`, one object-storage layer (`crates/worker/src/objects/`), VIP blocks follow the node's OS ([plan](plans/swappable-seams-plan.md) · [calls](calls/swappable-seams-plan_calls.md) · [docs](../docs/codebase-conventions.md#datapath-conventions))
 - **Pluggable cluster CA providers** — `clusterCa.provider = builtin | file | exec` with a Vault PKI helper and `legion net ca provider test` ([plan](plans/cluster-ca-provider-plan.md) · [calls](calls/cluster-ca-provider-plan_calls.md) · [docs](../docs/cluster-ca.md))
 - **Security gap closure (2026-10-17)** — naming a KV key needs `kv:read`; root worker confined to the allocation (name charset, `unpack_in`, no link following); host-level covers exec checks, `file://`, `auth.nodeIdentity`; unforgeable identities (sub templates, audiences, bound boot tickets); allowlisted exec env; reused idempotency keys with a different request fail; fleet certs need a worker-type grant; `templateKv` re-renders can't read new keys ([plan](plans/security-gap-closure-plan.md) · [calls](calls/security-gap-closure-plan_calls.md) · [docs](../docs/auth-and-acls.md))
 - **Launch blockers and security gaps (2026-11-08)** — node caches serve private images only to credentialed jobs (`image_source`); lanes dependency stall, rollout DAG freeze, missing sidecar, fractional-step deadlock; record-by-record worker state; host-guarded git/OCI/S3 fetches; `legion exec` joins gated namespaces; old runc kept off user-namespaced placements ([plan](plans/launch-blockers-and-security-gaps-plan.md) · [calls](calls/launch-blockers-and-security-gaps-plan_calls.md) · [docs](../docs/artifacts.md#who-a-cached-image-is-served-to))
@@ -1700,6 +1728,8 @@ Fixes for the open bug and security items; judgement calls in
 
 ## Developer workflow & CI
 
+- **Legion is five crates in a chain** — `legion-proto` → `legion-common` → `legion-worker` → `legion-manager` → the binary; a clean build peaks at 5.0 GB where it took 9.0, `cargo test --all` builds on a 16 GB machine (it was OOM-killed at 13.5 GB), and `cargo check` after an edit takes 3–19 s where it took 30 ([plan](plans/workspace-crate-split-plan.md) · [calls](calls/workspace-crate-split-plan_calls.md) · [docs](../docs/codebase-conventions.md#crates))
+- **Shipping binary measured on linux/amd64** — 97 MB with `--profile dist` (91.5 MB before the crate split); README, AGENTS.md, `Cargo.toml` and development.md corrected from the 26 MB macOS figure ([development.md](development.md#building-a-shipping-binary---profile-dist))
 - **Smaller, faster test builds** — one integration binary (12.9 GB → 1.1 GB), scratch-root temp dirs, line-table debuginfo, faster migrations ([calls](calls/test-build-footprint_calls.md) · [docs](../docs/testing-and-benchmarks.md#test-layout) · [dev notes](development.md#keeping-builds-and-test-runs-small))
 - **Raft-entry-count tests read the applied marker** — `Store::raft_applied_entries` instead of lagging openraft metrics
 - **CI cache, cancellation, pinned protoc** — `rust-cache` saved from `main`, superseded runs cancelled, pinned checksummed protoc

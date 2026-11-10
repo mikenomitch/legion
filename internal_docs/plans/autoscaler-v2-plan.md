@@ -12,7 +12,7 @@
 
 **Status: SHIPPED** (every phase, 2026-10-28; the deferred items below
 stay open in `internal_docs/TODO.md`). Phase 1 (cluster-wide scaling inputs), the
-engine core (`src/autoscaler/`: spec, layered defaults, strategies,
+engine core (`crates/common/src/autoscaler/`: spec, layered defaults, strategies,
 schedules, pipeline, simulator), and Phase 2 (task autoscaling as the
 bundled app: `autoscale`, live layered defaults, in-place resubmits, pins,
 pauses, history, `legion scaling`, workload identity on by default) shipped
@@ -85,12 +85,12 @@ machines underneath it.
    somewhere. If a scale-out cannot place, the job reports `blocked` and
    waits (`docs/scheduler-and-eval-loop.md` § Blocked evals). Nothing
    provisions a node. Idle nodes also run forever: there is no node-removal
-   RPC (`Store::remove_node`, `src/storage/store.rs:7940`, has no caller
+   RPC (`Store::remove_node`, `crates/manager/src/storage/store.rs:7940`, has no caller
    outside tests), and lost nodes are never garbage-collected.
 3. **The inputs exist, but only in pieces.** Per-allocation CPU and memory
    usage now reaches the manager on every heartbeat (`UsageReport`,
    `proto/legion.proto:6611`). It stays in memory on *whichever manager
-   received the heartbeat* (`src/manager/usage.rs:1-25`; "another manager
+   received the heartbeat* (`crates/manager/src/manager/usage.rs:1-25`; "another manager
    answers with `usage_reported: false`", `docs/resource-enforcement.md`
    § What usage does not do). Per-service request counts exist too
    (`NetEdgeSample`, folded into 15 minutes of per-minute buckets, served by
@@ -343,7 +343,7 @@ config, and reference it from policies by name.
   `task_scale` already lives (old calls entry 5).
 - **WASM strategies, for now.** Legion now embeds `wasmi` for network
   plugins, through a layer meant to be shared by other embedders
-  (`src/wasm`, `docs/network-plugins.md`). That layer provides fuel and
+  (`crates/worker/src/wasm`, `docs/network-plugins.md`). That layer provides fuel and
   memory caps, modules fetched by URL and `sha256:`, and WASI with no
   sockets or filesystem.
   - A strategy is a pure function, so it could run there later. That is
@@ -363,7 +363,7 @@ merging `main` on 2026-10-28.
 
 **Phase 0 (shipped).**
 - RPCs: `ScaleTask` and `GetJobScaleStatus` (`proto/legion.proto:92-107`,
-  handlers `src/manager/server.rs:6021,6216`). `ScaleTaskRequest` carries
+  handlers `crates/manager/src/manager/server.rs:6021,6216`). `ScaleTaskRequest` carries
   `name`, optional `task_group`/`task_name`, `count`, `reset`, `reason`, and
   `idempotency_key`. Scale-out runs namespace quota admission
   (`server.rs:6111-6122`).
@@ -375,9 +375,9 @@ merging `main` on 2026-10-28.
   called by the scheduler overlay, rollouts, surplus retirement, gangs, slot
   retirement, the capacity pass, and quota.
 - `job_scale` eval: retire surplus, then `Reschedule` the shortfall
-  (`src/structs/eval.rs:410-438`).
+  (`crates/manager/src/manager/eval.rs:410-438`).
 - Events: `scale.applied`, `scale.deferred`, and `scale.reset`
-  (`src/storage/events.rs:1105-1177`).
+  (`crates/manager/src/storage/events.rs:1105-1177`).
 - **Hardening found during recon:** `GetJobScaleStatus` computes
   `override_count.unwrap_or(spec)` without the `base_count` filter that
   `effective_task_count` applies (`server.rs:6250`). Today this can't be
@@ -387,7 +387,7 @@ merging `main` on 2026-10-28.
   routes status through `effective_task_count` as well.
 
 **Jobspec shape.** A job is a flat list of tasks, and each task has a
-`group` string (default `"default"`, `src/structs/job.rs:122`). There are no
+`group` string (default `"default"`, `crates/common/src/structs/job.rs:122`). There are no
 group objects. Tasks that share a group are co-placed and all-or-nothing,
 but each task keeps its own `count` (`docs/scheduler-and-eval-loop.md`
 § Partial placement). The scaling unit has therefore been the task. For a
@@ -396,13 +396,13 @@ multi-task group, this plan scales the group's tasks together (§6.3).
 **Usage.**
 - Workers sample cgroup v2 (`memory.current`, `memory.peak`, anon memory,
   `cpu.stat usage_usec`, PSI) every 10 seconds, at a fixed interval
-  (`src/worker/usage.rs:24,264-271`). Sampling runs only when
+  (`crates/worker/src/worker/usage.rs:24,264-271`). Sampling runs only when
   `resourceEnforcement.enabled`, which is the default.
 - Only governed runtimes are sampled: exec, container, and sandbox. `noop`
   and third-party runtimes report nothing.
 - The manager holds the latest report per node in memory, stale after 120s.
   It is never written to the store, and it is per receiving manager
-  (`src/manager/usage.rs`). CPU arrives as `cpu_millicores` and is converted
+  (`crates/manager/src/manager/usage.rs`). CPU arrives as `cpu_millicores` and is converted
   with the node's `mhz_per_core` (`usage.rs:317-321`).
 
 **Requests.**
@@ -421,9 +421,9 @@ Phase 1 uses to roll usage up.
 
 **Pending work.**
 - The planner reports unplaced replicas in memory
-  (`PlanOutcome.unplaced`, `src/manager/scheduler.rs:369`).
+  (`PlanOutcome.unplaced`, `crates/manager/src/manager/scheduler.rs:369`).
 - Blocked evals exist only when *nothing* placed. They store one key and one
-  per-placement shortfall (`src/manager/blocked.rs:43-84`), with keys
+  per-placement shortfall (`crates/manager/src/manager/blocked.rs:43-84`), with keys
   `class:pool=…`, `node:<id>`, and `escaped`.
 - No RPC lists unplaced demand. The capacity pass finds jobs short of their
   count with SQL (`job_configs_waiting_on_capacity`, `store.rs:16368`). That
@@ -432,11 +432,11 @@ Phase 1 uses to roll usage up.
 **Placement rules a simulation must reuse.**
 - Pools act as taints, and permits act as tolerations: `PermitSet` adds an
   implicit `pool=default`, and `is_permitted` requires every node
-  restriction to be matched (`src/constraints.rs:114-175`).
+  restriction to be matched (`crates/common/src/constraints.rs:114-175`).
 - The rest: constraints, `distinct`, static ports, oversubscription ratios
-  (`src/resources.rs:1421`), gang quorum (`GangReport`, `proto:3330`), and
+  (`crates/common/src/resources.rs:1421`), gang quorum (`GangReport`, `proto:3330`), and
   session envelopes that sit one per node via `per(1, "id")`
-  (`src/structs/session.rs:410`).
+  (`crates/common/src/structs/session.rs:410`).
 
 **Nodes.**
 - Drain: `SetNodeAvailability` (`proto:1511`) evicts stateless allocations
@@ -449,14 +449,14 @@ Phase 1 uses to roll usage up.
   (`src/cmd/join.rs`).
 - No removal RPC, and no GC for lost nodes.
 
-**Background loops.** `start_node_status_checker` (`src/manager/daemon.rs:1558`)
+**Background loops.** `start_node_status_checker` (`crates/manager/src/manager/daemon.rs:1558`)
 and the lane gate `Store::is_raft_leader` (`store.rs:2247`) are the pattern
 the old plan copied for an in-core loop. This plan does not use it (calls
 entry 1).
 
 **Auth.**
 - The `legion` reserved workload identity authenticates a task as
-  `legion:<sub>` (`src/manager/auth_method.rs:555-660`). Policies attach
+  `legion:<sub>` (`crates/manager/src/manager/auth_method.rs:555-660`). Policies attach
   only through `workloadIdentity.controlPlaneBindings` in manager config,
   which are cloned at startup (`daemon.rs:344`).
 - `LEGION_ADDR` is not injected into tasks: `configs/jobs/cert-renewer.ncl`
@@ -467,10 +467,10 @@ entry 1).
   (architecture audit M6, still open).
 - Three exec-JSON seams exist: volumes, the keyring root-key provider, and
   the cluster-CA provider. The latter two go through
-  `util::run_json_command` (`src/util.rs:465`).
+  `util::run_json_command` (`crates/common/src/util.rs:465`).
 - There is no gRPC plugin ABI. WASM exists for one kind: network plugins on
   the proxy-wasm ABI, run by `wasmi` through a shared embedding layer
-  (`src/wasm`, `docs/network-plugins.md`), which a future `wasm` task
+  (`crates/worker/src/wasm`, `docs/network-plugins.md`), which a future `wasm` task
   runtime is meant to reuse.
 - Legion already speaks JSON-RPC 2.0 over stdio for `legion mcp serve`.
 
@@ -738,7 +738,7 @@ version, and these steps follow:
    the override together (the arbitration above).
 2. A new check in `run_job`'s `Updated` branch sees that only those fields
    changed. Today that branch always creates a rollout
-   (`src/manager/server.rs:2451-2462`).
+   (`crates/manager/src/manager/server.rs:2451-2462`).
 3. Instead of a rollout, it moves the running allocations onto the new
    version synchronously with `migrate_allocations_to_job_config`, a
    Scheduler-lane write, the way KV re-renders do (`server.rs:4150-4180`).

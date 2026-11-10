@@ -27,12 +27,12 @@ Stateful sandboxes checkpoint often, and with `durability = "store"` every
 checkpoint is published: an idle suspend, every `suspend.checkpointEvery`
 tick, a checkpoint at worker stop, `snapshot create --publish`, and a
 `--spread` fork. A sandbox checkpoint has four parts
-(`src/task_plugins/sandbox_checkpoint.rs:655`): guest memory (the full guest
+(`crates/worker/src/task_plugins/sandbox_checkpoint.rs:655`): guest memory (the full guest
 RAM size), device state, the VMM config, and the guest's root disk (the
 image plus `rootfs_headroom_mib` of free space, 256 MiB by default).
 
 Today each part is published as one sealed object named by a key derived
-from the whole part's digest (`src/content_publish.rs`, `publish_sealed`).
+from the whole part's digest (`crates/worker/src/content_publish.rs`, `publish_sealed`).
 So:
 
 - **A repeat checkpoint re-uploads everything.** One dirtied page changes
@@ -166,22 +166,22 @@ publish report's byte count simply gets smaller.
 
 - **Capture** writes memory, device state, the VMM config, and a reflink of
   the root disk into a checkpoint dir, hashes each whole file
-  (`CheckpointDir::seal`, `src/task_plugins/checkpoint.rs:163`), and imports
+  (`CheckpointDir::seal`, `crates/worker/src/task_plugins/checkpoint.rs:163`), and imports
   them into the node content store pinned to the snapshot
-  (`ingest_memory_parts`, `src/worker/checkpoints.rs:561`).
+  (`ingest_memory_parts`, `crates/worker/src/worker/checkpoints.rs:561`).
 - **Publish** walks the manifest's memory parts and calls
   `ContentPublishing::publish(part key)` for each
-  (`src/worker/checkpoints.rs:832` for snapshots,
-  `publish_checkpoint_parts` in `src/worker/task_manager/session_store.rs`
+  (`crates/worker/src/worker/checkpoints.rs:832` for snapshots,
+  `publish_checkpoint_parts` in `crates/worker/src/worker/task_manager/session_store.rs`
   for `store` sessions). The publisher seals the whole file with the STREAM
   construction and uploads it as one object at
   `sealed/<hkdf(part key, "object-name")>` (S3 multipart, 16 MiB parts,
   4 in flight).
 - **Keys.** The manager derives a part key per whole-part digest from the
   cluster checkpoint key and sends it with the publish, warm, or restore
-  (`checkpoint_part_keys`, `src/manager/server/snapshot_rpcs.rs`). A `store`
+  (`checkpoint_part_keys`, `crates/manager/src/manager/server/snapshot_rpcs.rs`). A `store`
   session's node derives part keys from the job's session sealing key
-  (`SessionSealKeys`, `src/checkpoint_seal.rs`). So whole parts dedupe
+  (`SessionSealKeys`, `crates/common/src/checkpoint_seal.rs`). So whole parts dedupe
   cluster-wide for snapshots and job-wide for sessions, but only when the
   whole part is identical, which almost never happens for memory or disk.
 - **Fetch** downloads the object through the artifact fetcher, opens it in
@@ -331,7 +331,7 @@ chunks downloaded.
   schema version bump: nothing published by an older build is readable
   anyway, and Legion has no installed base.
 - No job-config field, so `configs/jobs/maximal.ncl` is unchanged.
-- New module `src/checkpoint_chunks.rs`. `ContentPublisher::publish_sealed`
+- New module `crates/worker/src/checkpoint_chunks.rs`. `ContentPublisher::publish_sealed`
   is replaced by `sealed_objects()`. `open_file_in_place` is removed.
 
 ## 8. Implementation phases

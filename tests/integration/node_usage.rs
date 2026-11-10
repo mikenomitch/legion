@@ -3,8 +3,8 @@
 //! (docs/resource-enforcement.md, "Measuring usage").
 //!
 //! The worker half (cgroup readers and the sampler) is unit-tested in
-//! `src/worker/usage.rs` against fixture files; the reply arithmetic in
-//! `src/manager/usage.rs`.
+//! `crates/worker/src/worker/usage.rs` against fixture files; the reply arithmetic in
+//! `crates/manager/src/manager/usage.rs`.
 
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{Context, R};
