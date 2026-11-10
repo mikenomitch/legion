@@ -544,6 +544,10 @@ We keep the cost and add the stopping point.
 
 ## 14. The served interval is not checked against the stateful self-fence
 
+> **Superseded 2026-11-10.** Alternative (a) was taken: the default
+> `maxInterval` is 55s, and a ceiling at or past the 90s fence warns at
+> startup ([todo-closeout calls #1](todo-closeout-2026-11-10_calls.md)).
+
 **Call.** *(Phase 5, accepted limitation.)* The startup check that rejects a
 worker-type `missedBeatsBeforeLost x heartbeatSeconds` at or past
 `selfTerminateAfter` (entry 18) is not applied to the served interval. At the

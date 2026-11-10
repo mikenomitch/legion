@@ -1251,7 +1251,7 @@ async fn a_local_suspension_applies_the_suspend_with_reason_pressure() -> R<()> 
     assert_eq!(pressure.len(), 1);
     assert_eq!(pressure[0]["step"], "suspend");
     assert_eq!(pressure[0]["cause"], "suspended");
-    assert_eq!(pressure[0]["snapshot_id"], "snap-local");
+    assert_eq!(pressure[0]["snapshotId"], "snap-local");
     let suspended = cluster.events("instance.suspended")?;
     assert_eq!(suspended.len(), 1);
     assert_eq!(suspended[0]["reason"], "pressure");
@@ -1439,7 +1439,7 @@ async fn an_instance_records_its_last_stop_and_its_checkpoint_support() -> R<()>
     );
     let pressure = cluster.events("node.pressure")?;
     assert_eq!(pressure.len(), 1);
-    assert_eq!(pressure[0]["instance_id"], ID);
+    assert_eq!(pressure[0]["instanceId"], ID);
 
     // ListInstances carries the same record.
     let listed = cluster

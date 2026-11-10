@@ -147,6 +147,6 @@ let email = "ops@example.com" in
         echo "stored a new certificate for $DOMAIN in kv $KV_KEY"
       "%],
     },
-    resources = { cpus = 0.1, memory = 64 },
+    resources = { cpu = 100, memory = 64 },
   },
 }

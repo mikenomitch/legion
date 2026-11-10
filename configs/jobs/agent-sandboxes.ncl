@@ -63,8 +63,7 @@
     resources = {
       # MHz. The scheduler packs on it, and it becomes a CPU weight that only
       # matters when the node's CPUs are contended. Kept low so CPU doesn't
-      # fill the node before memory does. (`cpus` is an alias for this same
-      # MHz number, not a core count.)
+      # fill the node before memory does. It is MHz, not a core count.
       cpu = 250,
       # Reserved: what the scheduler packs on, and the cgroup's memory.low.
       memory = 512,

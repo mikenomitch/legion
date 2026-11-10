@@ -75,7 +75,6 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
-use sha2::{Digest as _, Sha256};
 
 use crate::prelude::*;
 
@@ -218,7 +217,14 @@ impl ContentDigest {
     }
 
     fn from_hasher(hasher: Sha256) -> Self {
-        ContentDigest(format!("sha256:{:x}", hasher.finalize()))
+        let digest = hasher.0.finish();
+        let mut out = String::with_capacity(7 + 64);
+        out.push_str("sha256:");
+        for byte in digest.as_ref() {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+        }
+        ContentDigest(out)
     }
 
     /// The full `sha256:<hex>` form.
@@ -1530,6 +1536,27 @@ impl Drop for ContentWriter<'_> {
     }
 }
 
+/// SHA-256 through `ring`, which uses the CPU's SHA extensions on x86-64
+/// and on aarch64. The `sha2` crate does so on aarch64 only with its `asm`
+/// feature, and every checkpoint part and artifact is hashed here.
+struct Sha256(ring::digest::Context);
+
+impl Sha256 {
+    fn new() -> Self {
+        Sha256(ring::digest::Context::new(&ring::digest::SHA256))
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+}
+
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct HashWriter<'a>(&'a mut Sha256);
 
 impl Write for HashWriter<'_> {
@@ -1656,6 +1683,16 @@ fn set_writable(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digests_are_standard_sha256_test() {
+        // The FIPS 180-2 "abc" vector: a digest written by one hasher must be
+        // readable by any other, in a bucket or on another node.
+        assert_eq!(
+            ContentDigest::of_bytes(b"abc").as_str(),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     fn config(artifacts: u64, snapshots: u64) -> ContentStoreConfig {
         ContentStoreConfig {

@@ -668,6 +668,13 @@ reason.
   resident set size, read from `/proc/self/status` at each scrape. It keeps
   the conventional Prometheus name (no `legion_` prefix) so stock process
   dashboards pick it up. Linux only: it reads 0 on macOS.
+- **`legion_log_dropped_lines_total{sink}`** (counter): log lines this
+  manager process dropped because a sink's buffer was full. `sink` is
+  `console` (stdout), `file` (`./logs/events.log`), or `traces`
+  (`./traces/spans.json`). A server's log writers never block the thread
+  that logs, so a reader that falls behind (journald, a container runtime, a
+  slow disk) costs lines instead of stalling heartbeats. Anything above zero
+  means the log is incomplete for that period. Read at scrape time.
 - **`legion_runtime_worker_threads`** (gauge): worker threads in the
   runtime. Set once at startup. This is the ceiling on concurrent blocking
   handlers and the denominator for `legion_grpc_in_flight`.
@@ -954,6 +961,10 @@ and `/healthz`. A worker has no store or quorum to probe, so there is no
 `/readyz`. The manager's node health and heartbeat state is the cluster's view
 of worker readiness. Default: disabled.
 
+- **`legion_worker_log_dropped_lines_total{sink}`** (counter): the worker
+  process's own dropped log lines, by sink. See
+  `legion_log_dropped_lines_total` under [Async runtime](#async-runtime);
+  this is the same count for a worker.
 - **`legion_worker_heartbeats_total{outcome}`** (counter): heartbeat
   round-trips attempted, by outcome (`ok` | `error` | `unauthenticated`).
   A rising `error` rate is the worker-side view of manager unreachability.

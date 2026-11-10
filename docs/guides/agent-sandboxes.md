@@ -267,9 +267,9 @@ packs on it, and the cgroup turns it into a CPU weight that only matters when
 the node's CPUs are contended. Keep it low for idle-heavy sandboxes, or CPU
 fills the node before memory does: a 64,000 MHz node fits 64 sandboxes at
 1000 MHz, and 256 at 250. An active sandbox still bursts to whatever CPU is
-free. `cpus` is an alias for this same MHz number, not a core count, so
-`cpus = 1` asks for 1 MHz, and `job run` warns about any `cpu` or `cpus` under
-10. Use `cpu` and avoid the confusion.
+free. It is MHz, not a core count, so `cpu = 1` asks for 1 MHz, and `job
+run` warns about any `cpu` under 10. (`cpus` is refused at submit: it is
+not a resource.)
 
 **`config.vcpus = 2`** is the guest's shape: how many vCPUs its kernel sees.
 It is not a reservation. The host weights the VMM's threads by

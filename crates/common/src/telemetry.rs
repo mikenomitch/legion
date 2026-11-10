@@ -740,6 +740,8 @@ pub struct Metrics {
     pub evals_processed_total: Arc<CounterVec>,
     /// `legion_eval_queue_depth`
     pub eval_queue_depth: Arc<Gauge>,
+    /// `legion_log_dropped_lines_total{sink}`
+    pub log_dropped_lines_total: Arc<CounterVec>,
     /// `legion_plan_apply_total{outcome}`
     pub plan_apply_total: Arc<CounterVec>,
     /// `legion_eval_claim_total{outcome}`
@@ -1045,6 +1047,14 @@ impl Metrics {
                 labels: &[],
             },
             cell: GaugeCell::default(),
+        });
+        let log_dropped_lines_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_log_dropped_lines_total",
+                help: "Log lines this manager process dropped because a sink's buffer was full, by sink (console|file|traces). A server's log writers never block the thread that logs; a reader that falls behind (journald, a container runtime, a slow disk) costs lines instead.",
+                labels: &["sink"],
+            },
+            series: Series::new(),
         });
         let plan_apply_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -2083,6 +2093,7 @@ impl Metrics {
             Arc::clone(&object_status_writes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
             Arc::clone(&blocked_wait_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&log_dropped_lines_total) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_claim_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_handle_seconds) as Arc<dyn RenderMetric>,
@@ -2149,6 +2160,7 @@ impl Metrics {
             grpc_in_flight,
             evals_processed_total,
             eval_queue_depth,
+            log_dropped_lines_total,
             plan_apply_total,
             eval_claim_total,
             eval_handle_seconds,
@@ -2281,6 +2293,7 @@ pub fn metrics() -> &'static Metrics {
 /// Renders every registered family in the Prometheus text exposition format.
 pub fn render() -> String {
     let mut out = String::with_capacity(4096);
+    sync_dropped_log_lines(&metrics().log_dropped_lines_total);
     if let Some(bytes) = resident_memory_bytes() {
         metrics().process_resident_memory_bytes.set(bytes as i64);
     }
@@ -2288,6 +2301,19 @@ pub fn render() -> String {
         family.render_into(&mut out);
     }
     out
+}
+
+/// Bring a registry's dropped-log-lines counter up to the log writers' own
+/// counts. The writers count drops themselves (they cannot call back into a
+/// registry from the logging path), so the counter is advanced at scrape
+/// time by whatever it is behind.
+fn sync_dropped_log_lines(counter: &CounterVec) {
+    for (sink, dropped) in crate::tracing_util::dropped_log_lines() {
+        let seen = counter.get(&[sink]);
+        if dropped > seen {
+            counter.inc_by(&[sink], dropped - seen);
+        }
+    }
 }
 
 /// This process's resident set size in bytes, or `None` where it cannot be
@@ -2337,6 +2363,8 @@ pub fn snapshot_initialized_families() -> Vec<FamilySnapshot> {
 /// series are deliberately not exported; at 1,250 nodes per host that is a
 /// cardinality bomb, and the manager already holds the per-node view.
 pub struct WorkerMetrics {
+    /// `legion_worker_log_dropped_lines_total{sink}`
+    pub log_dropped_lines_total: Arc<CounterVec>,
     /// `legion_worker_heartbeats_total{outcome}`
     pub heartbeats_total: Arc<CounterVec>,
     /// `legion_worker_heartbeat_duration_seconds`
@@ -2462,6 +2490,14 @@ pub struct WorkerMetrics {
 
 impl WorkerMetrics {
     fn new() -> Self {
+        let log_dropped_lines_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_worker_log_dropped_lines_total",
+                help: "Log lines this worker process dropped because a sink's buffer was full, by sink (console|file|traces). A worker's log writers never block the thread that logs, so a console reader that falls behind costs lines, not heartbeats.",
+                labels: &["sink"],
+            },
+            series: Series::new(),
+        });
         let heartbeats_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_worker_heartbeats_total",
@@ -2806,6 +2842,7 @@ impl WorkerMetrics {
             Arc::clone(&net_plugin_callback_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&net_plugin_metric) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&log_dropped_lines_total) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&launch_pool_refusals_total) as Arc<dyn RenderMetric>,
             Arc::clone(&claim_overload_refusals_total) as Arc<dyn RenderMetric>,
@@ -2837,6 +2874,7 @@ impl WorkerMetrics {
         ];
 
         WorkerMetrics {
+            log_dropped_lines_total,
             heartbeats_total,
             heartbeat_duration_seconds,
             allocations_running,
@@ -2891,6 +2929,7 @@ pub fn worker_metrics() -> &'static WorkerMetrics {
 /// Renders the worker registry in the Prometheus text exposition format.
 pub fn render_worker() -> String {
     let mut out = String::with_capacity(1024);
+    sync_dropped_log_lines(&worker_metrics().log_dropped_lines_total);
     for family in &worker_metrics().families {
         family.render_into(&mut out);
     }

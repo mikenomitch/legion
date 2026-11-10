@@ -3592,11 +3592,12 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Deletes a stored plugin object. Refused while a stored policy object
-     * references it (the error names them). A job that references it keeps
-     * running; its plugin hops fail with "plugin not found" and follow their
-     * `onError` from the next heartbeat. ACL: `net:write`, as for
-     * UpsertNetPlugin.
+     * Deletes a stored plugin object. Refused with `FAILED_PRECONDITION`
+     * while a stored policy object references it, or while a job that is not
+     * stopped references it in its latest config. The error names the
+     * policies, and the jobs the caller may read; the rest are counted ("2
+     * job(s) you cannot read"). A stopped job does not block the delete; its
+     * next run is refused at submit. ACL: `net:write`, as for UpsertNetPlugin.
      *
      * @generated from rpc legion.Manager.DeleteNetPlugin
      */
@@ -5039,10 +5040,12 @@ export const Manager = {
      * allocation), `refused` carries a machine-readable reason the worker kills
      * the work with.
      *
-     * Only the raft leader ratifies. A follower answers `FAILED_PRECONDITION`
-     * ("this manager is not the raft leader…") instead of a verdict. It wrote
-     * nothing and the ticket is unspent, so the caller sends the same request
-     * to the leader.
+     * Only the raft leader ratifies. A follower that knows the leader replays
+     * the request there and returns the leader's verdict. One that does not
+     * (an election is under way) answers `FAILED_PRECONDITION` ("this manager
+     * is not the raft leader…") instead of a verdict. It wrote nothing and the
+     * ticket is unspent, so the caller sends the same request to another
+     * manager.
      *
      * @generated from rpc legion.Manager.RatifyClaim
      */

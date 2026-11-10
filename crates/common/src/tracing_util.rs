@@ -8,6 +8,37 @@ use tracing_appender::rolling;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{prelude::*, EnvFilter, Registry};
 
+/// The drop counters of this process's lossy log writers, by sink
+/// (`console`, `file`, `traces`). A non-blocking writer drops a line when
+/// its buffer is full instead of stalling the thread that logged.
+static DROPPED_LINES: OnceLock<
+    Mutex<Vec<(&'static str, tracing_appender::non_blocking::ErrorCounter)>>,
+> = OnceLock::new();
+
+fn track_dropped_lines(sink: &'static str, writer: &tracing_appender::non_blocking::NonBlocking) {
+    DROPPED_LINES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("dropped-lines lock")
+        .push((sink, writer.error_counter()));
+}
+
+/// Log lines each lossy sink has dropped since this process started. Empty
+/// for a one-shot command, whose logging blocks instead of dropping.
+pub fn dropped_log_lines() -> Vec<(&'static str, u64)> {
+    DROPPED_LINES
+        .get()
+        .map(|sinks| {
+            sinks
+                .lock()
+                .expect("dropped-lines lock")
+                .iter()
+                .map(|(sink, counter)| (*sink, counter.dropped_lines() as u64))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 const LOG_RETENTION_DAYS: i64 = 7;
 const TRACE_RETENTION_DAYS: i64 = 3;
 
@@ -59,6 +90,7 @@ pub fn init_tracing_with_options(
         // up: a worker bursting 1,200 sandbox starts went a minute without a
         // heartbeat and was marked lost. A full buffer drops lines instead.
         let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+        track_dropped_lines("console", &writer);
         console_guard = Some(guard);
         tracing_subscriber::fmt::layer()
             .pretty()
@@ -78,6 +110,7 @@ pub fn init_tracing_with_options(
 
         let file_appender = rolling::daily("./logs", "events.log");
         let (file_appender, guard) = tracing_appender::non_blocking(file_appender);
+        track_dropped_lines("file", &file_appender);
         log_guard = Some(guard);
         Some(
             tracing_subscriber::fmt::layer()
@@ -92,6 +125,7 @@ pub fn init_tracing_with_options(
     let trace_layer = if enable_o11y && server_mode {
         let trace_appender = rolling::daily("./traces", "spans.json");
         let (trace_appender, trace_guard) = tracing_appender::non_blocking(trace_appender);
+        track_dropped_lines("traces", &trace_appender);
         trace_guard_opt = Some(trace_guard);
         Some(
             tracing_subscriber::fmt::layer()

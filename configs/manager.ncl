@@ -378,8 +378,10 @@
 
     # Floor and ceiling on a served interval. Past the ceiling the manager
     # stops backing off and warns instead: the answer is more control plane.
+    # The ceiling stays under the stateful self-fence (selfTerminateAfter,
+    # 90s by default); a ceiling at or past 90s starts with a warning.
     minInterval = "2s",
-    maxInterval = "120s",
+    maxInterval = "55s",
 
     # Headroom in the sizing formula `heartbeatSeconds >= H x N / R`.
     # 2 runs the control plane at half its measured ceiling.

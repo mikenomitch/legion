@@ -1117,6 +1117,14 @@ mod tests {
             StorageError::from_anyhow(&err),
             Some(StorageError::KeyringLocked { .. })
         ));
+        // A listing with values marks what it cannot decrypt and goes on;
+        // a key the caller may not read is not even tried.
+        assert!(store.list_kv("a/").is_err());
+        let listed = store.list_kv_marking_locked("a/", |key| key != "a/other")?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "a/secret");
+        assert!(listed[0].locked);
+        assert_eq!(listed[0].value, "");
         // Deleting never needs the value.
         store.delete_kv("a/other", None, None)?;
         assert!(store.kv_stored_form("a/other")?.is_none());

@@ -1343,6 +1343,10 @@ impl WorkerTaskManager {
         use crate::task_plugins::{
             AfterCheckpoint, CheckpointDir, CheckpointQuery, CheckpointSupport,
         };
+        // A manager's request names the allocation by the manager's id; the
+        // maps below are keyed by the local key, which differs for a
+        // ratified edge start.
+        let allocation_id = self.local_key(allocation_id);
         let allocation = self
             .allocations
             .get(&allocation_id)
@@ -1429,6 +1433,7 @@ impl WorkerTaskManager {
     /// Runs under the task-manager lock, so the exit poller never sees the
     /// stop as a crash.
     pub(crate) fn checkpoint_finish_suspend(&mut self, allocation_id: i64, paused: bool) -> R<()> {
+        let allocation_id = self.local_key(allocation_id);
         if paused {
             if let (Some(task), Some(instance)) = (
                 self.task_configs.get(&allocation_id),
@@ -1448,6 +1453,7 @@ impl WorkerTaskManager {
 
     /// Resume a task [`Self::checkpoint_begin`] left paused.
     pub(crate) fn checkpoint_resume(&mut self, allocation_id: i64) -> R<()> {
+        let allocation_id = self.local_key(allocation_id);
         let allocation = self
             .allocations
             .get(&allocation_id)
@@ -8922,6 +8928,32 @@ mod tests {
 
         // No longer desired: the protection window is over, so it stops.
         manager.reconcile_allocations(&[]);
+        assert!(!manager.is_allocation_active(admitted.local_key));
+        Ok(())
+    }
+
+    #[test]
+    fn a_checkpoint_finds_a_ratified_claim_by_the_managers_id() -> R<()> {
+        // The manager names an edge-started allocation by the id it
+        // committed; the worker's maps keep it under the local key.
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+
+        let context = manager.checkpoint_begin(
+            8123,
+            "snap-1",
+            crate::structs::checkpoint::SnapshotKind::Disk,
+            crate::task_plugins::AfterCheckpoint::Resume,
+        )?;
+        assert!(!context.paused);
+        manager.checkpoint_resume(8123)?;
+        manager.checkpoint_finish_suspend(8123, false)?;
         assert!(!manager.is_allocation_active(admitted.local_key));
         Ok(())
     }

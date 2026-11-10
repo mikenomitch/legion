@@ -972,6 +972,26 @@ impl HeartbeatConfigFull {
         }
         Ok(())
     }
+
+    /// A warning for a `maxInterval` at or past the default stateful
+    /// self-fence: a worker served an interval that long can go the whole
+    /// fence window between two healthy beats and kill its stateful tasks.
+    /// Accepted, not refused, because a cluster with no stateful jobs (or
+    /// with `selfTerminateAfter` raised) can want it.
+    pub fn self_fence_warning(&self) -> Option<String> {
+        let max = self.parsed_max_interval();
+        let fence = crate::structs::job::DEFAULT_SELF_TERMINATE_AFTER;
+        (self.adaptive_enabled() && max >= fence).then(|| {
+            format!(
+                "heartbeat.maxInterval ({}) reaches the default stateful self-fence \
+                 (stateful.onLost.selfTerminateAfter, {}s): at that interval a healthy \
+                 worker can fence its stateful tasks between beats. Keep maxInterval \
+                 below it or raise selfTerminateAfter on stateful jobs",
+                self.max_interval,
+                fence.as_secs()
+            )
+        })
+    }
 }
 
 /// Node liveness: where heartbeat state lives and how it survives an election
@@ -4147,6 +4167,28 @@ mod tests {
             serde_json::from_value(serde_json::json!({})).expect("an empty manager config parses");
         assert_eq!(empty.with_defaults().heartbeat, full);
         assert!(full.validate().is_ok());
+    }
+
+    #[test]
+    fn the_default_heartbeat_ceiling_stays_under_the_stateful_self_fence_test() {
+        let full = ManagerConfigFull::default().heartbeat;
+        assert!(full.parsed_max_interval() < crate::structs::job::DEFAULT_SELF_TERMINATE_AFTER);
+        assert_eq!(full.self_fence_warning(), None);
+
+        let raised = HeartbeatConfigFull {
+            max_interval: "120s".into(),
+            ..full.clone()
+        };
+        assert!(raised.validate().is_ok(), "accepted, with a warning");
+        let warning = raised.self_fence_warning().expect("warns");
+        assert!(warning.contains("selfTerminateAfter"), "{warning}");
+
+        // Fixed cadence never serves maxInterval, so there is nothing to warn about.
+        let fixed = HeartbeatConfigFull {
+            adaptive: false,
+            ..raised
+        };
+        assert_eq!(fixed.validate().ok().and(fixed.self_fence_warning()), None);
     }
 
     #[test]

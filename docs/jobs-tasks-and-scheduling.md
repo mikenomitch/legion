@@ -486,6 +486,12 @@ When `count.per` is set:
 
 If the attribute is missing on all candidates, placement fails.
 
+Two keys need no operator attribute. `per = "id"` groups by node id, which
+gives one-per-node placement (`count = { num = 1, per = "id" }`). `per =
+"pool"` groups by node pool: every worker publishes its pool as the `pool`
+attribute, unless its worker type already declares an attribute of that
+name.
+
 ## Group Co-Placement Behavior
 
 When a job group contains multiple tasks:

@@ -2641,11 +2641,12 @@ service Manager {
   // Lists stored plugin objects by name. ACL: `net:read`.
   rpc ListNetPlugins (ListNetPluginsRequest) returns (ListNetPluginsReply);
 
-  // Deletes a stored plugin object. Refused while a stored policy object
-  // references it (the error names them). A job that references it keeps
-  // running; its plugin hops fail with "plugin not found" and follow their
-  // `onError` from the next heartbeat. ACL: `net:write`, as for
-  // UpsertNetPlugin.
+  // Deletes a stored plugin object. Refused with `FAILED_PRECONDITION`
+  // while a stored policy object references it, or while a job that is not
+  // stopped references it in its latest config. The error names the
+  // policies, and the jobs the caller may read; the rest are counted ("2
+  // job(s) you cannot read"). A stopped job does not block the delete; its
+  // next run is refused at submit. ACL: `net:write`, as for UpsertNetPlugin.
   rpc DeleteNetPlugin (DeleteNetPluginRequest) returns (DeleteNetPluginReply);
 
   // Where a plugin runs and how it is doing, as each node last reported it
@@ -3692,10 +3693,12 @@ service Manager {
   // allocation), `refused` carries a machine-readable reason the worker kills
   // the work with.
   //
-  // Only the raft leader ratifies. A follower answers `FAILED_PRECONDITION`
-  // ("this manager is not the raft leader…") instead of a verdict. It wrote
-  // nothing and the ticket is unspent, so the caller sends the same request
-  // to the leader.
+  // Only the raft leader ratifies. A follower that knows the leader replays
+  // the request there and returns the leader's verdict. One that does not
+  // (an election is under way) answers `FAILED_PRECONDITION` ("this manager
+  // is not the raft leader…") instead of a verdict. It wrote nothing and the
+  // ticket is unspent, so the caller sends the same request to another
+  // manager.
   rpc RatifyClaim (RatifyClaimRequest) returns (RatifyClaimReply);
 
   // === Agent governance (internal_docs/plans/agent-governance-plan.md) ===
@@ -13173,6 +13176,12 @@ message KvEntry {
   // was enabled (or with `encryption.enabled = false`) that no rewrap has
   // converted yet — `legion keyring status` counts them.
   bool encrypted = 7;
+
+  // Set only by ListKv with `include_values`: this manager cannot decrypt
+  // the value right now (its data key is not unwrapped here, see
+  // docs/kv-encryption.md), so `value` is empty. The rest of the list is
+  // unaffected. GetKv fails with the keyring error instead.
+  bool locked = 8;
 }
 
 // KV lock record.
@@ -19233,6 +19242,13 @@ message NetPlugin {
   // Stored policy objects whose chains reference this plugin. Filled by
   // GetNetPlugin and GetNetPluginStatus; empty in list replies.
   repeated string referenced_by = 9;
+
+  // Ids of the jobs that reference this plugin in a chain or in an
+  // upstream's handlers: every job that is not stopped, judged by its latest
+  // config, sorted. Jobs the caller may not read (`job:read`) are left out,
+  // so the list can be shorter than what blocks a delete. Filled by
+  // GetNetPlugin and GetNetPluginStatus; empty in list replies.
+  repeated string referenced_by_jobs = 10;
 }
 
 // Request payload for UpsertNetPlugin.

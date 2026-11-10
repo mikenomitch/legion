@@ -1734,20 +1734,18 @@ pub fn normalize_runtime_task(task: &mut TaskConfig) {
     }
 }
 
-/// A `cpu` (or its alias `cpus`) under 10 MHz is almost always a CPU count
-/// written in the wrong unit: `cpus = 1` reads as one CPU but reserves 1 MHz.
-/// Accepted, since it is valid, but called out with the likely intent.
+/// A `cpu` under 10 MHz is almost always a CPU count written in the wrong
+/// unit: `cpu = 1` reads as one CPU but reserves 1 MHz. Accepted, since it
+/// is valid, but called out with the likely intent.
 fn tiny_cpu_warning(task: &TaskConfig) -> Option<String> {
-    let (key, value) = ["cpus", "cpu"].into_iter().find_map(|key| {
-        task.resources
-            .get(key)
-            .and_then(serde_json::Value::as_f64)
-            .map(|value| (key, value))
-    })?;
+    let value = task
+        .resources
+        .get("cpu")
+        .and_then(serde_json::Value::as_f64)?;
     (value > 0.0 && value < 10.0).then(|| {
         format!(
-            "task {} sets resources.{key} = {value}, which is {value} MHz, not {value} CPU(s): \
-             `cpu` and its alias `cpus` are in MHz. Did you mean cpu = {}? (For whole \
+            "task {} sets resources.cpu = {value}, which is {value} MHz, not {value} CPU(s): \
+             `cpu` is in MHz. Did you mean cpu = {}? (For whole \
              exclusive CPUs use `cores`; a sandbox's guest CPU count is `config.vcpus`.)",
             task.name,
             (value * 1000.0).round() as u64
@@ -3602,7 +3600,7 @@ mod tests {
         );
     }
 
-    /// `cpus = 1` reads as one CPU but means 1 MHz: submit warns, naming the
+    /// `cpu = 1` reads as one CPU but means 1 MHz: submit warns, naming the
     /// likely intent. Ordinary MHz values and `cores` are left alone.
     #[test]
     fn a_tiny_cpu_value_warns_that_cpu_is_mhz() {
@@ -3613,11 +3611,11 @@ mod tests {
                 ..TaskConfig::new("api", "exec")
             })
         };
-        let warnings = resource_submit_warnings(&config(json!({ "cpus": 1 })));
+        let warnings = resource_submit_warnings(&config(json!({ "cpu": 1 })));
         assert!(
             warnings
                 .iter()
-                .any(|line| line.contains("resources.cpus = 1") && line.contains("cpu = 1000")),
+                .any(|line| line.contains("resources.cpu = 1") && line.contains("cpu = 1000")),
             "{warnings:?}"
         );
         let warnings = resource_submit_warnings(&config(json!({ "cpu": 0.5 })));

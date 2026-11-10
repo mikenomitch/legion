@@ -391,6 +391,7 @@ impl Store {
                 allocation_id: report.allocation_id,
                 ok: true,
                 error: String::new(),
+                duration_ms: report.duration_ms,
             }
         } else {
             let policy =

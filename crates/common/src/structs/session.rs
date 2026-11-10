@@ -450,7 +450,7 @@ pub fn resource_amounts(resources: &Value) -> BTreeMap<String, f64> {
             map.iter()
                 .filter(|(key, _)| key.as_str() != crate::resources::MEMORY_MAX_KEY)
                 .filter_map(|(key, value)| {
-                    let key = if key == "cpus" { "cpu" } else { key.as_str() };
+                    let key = key.as_str();
                     value.as_f64().map(|amount| (key.to_string(), amount))
                 })
                 .collect()
@@ -562,7 +562,7 @@ pub fn validate_session_task(task: &TaskConfig) -> R<()> {
                      remove resources.{key}, or use stateful.mode = \"keyed\""
                 );
             };
-            let key = if key == "cpus" { "cpu" } else { key.as_str() };
+            let key = key.as_str();
             match room.get(key) {
                 Some(room) if *room >= amount => {}
                 Some(room) => bail!(
@@ -656,7 +656,7 @@ fn validate_elastic_envelope(
     };
     let floor_keys = floor.keys().cloned().collect::<Vec<_>>().join(", ");
     for (key, value) in max {
-        let key = if key == "cpus" { "cpu" } else { key.as_str() };
+        let key = key.as_str();
         if value.as_f64().is_none() {
             bail!(
                 "task {name}: stateful.envelope.max.{key} = {value} is not an amount. An \

@@ -550,11 +550,13 @@ Under `persistence.type = "raft"`, only the raft leader commits a
 ratification. A node sends its ratifications to one manager at a time, and
 that manager may be a follower.
 
-- **A follower answers "not the leader".** It does not forward the call
-  and does not judge the claim. It answers `FailedPrecondition` with `this
-  manager is not the raft leader…`, writes nothing, and leaves the ticket
-  unspent.
-- **The node asks the leader.** On that answer, or when the call never
+- **A follower forwards the call to the leader.** It does not judge the
+  claim, writes nothing, and leaves the ticket unspent. When it knows the
+  leader, it replays the request there and returns the leader's verdict, as
+  it does for any other write. When it does not (an election is under way),
+  it answers `FailedPrecondition` with `this manager is not the raft
+  leader…`.
+- **The node asks the other managers.** On that answer, or when the call never
   reached the manager (`Unavailable`), the node tries the other managers it
   knows, in order, and keeps sending ratifications to the first one that
   ratifies. It drops that one when it answers not-leader or stops

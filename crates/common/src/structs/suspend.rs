@@ -1070,7 +1070,7 @@ fn validate_reserve_amount(
     };
     for (field, held, names, unit) in [
         ("memory", memory_mib, &["memory"][..], "MiB"),
-        ("cpu", cpu_mhz, &["cpu", "cpus"][..], "MHz"),
+        ("cpu", cpu_mhz, &["cpu"][..], "MHz"),
     ] {
         if held <= 0.0 {
             continue;

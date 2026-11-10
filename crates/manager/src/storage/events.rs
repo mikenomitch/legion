@@ -1668,13 +1668,13 @@ pub mod drafts {
         }
         let mut meta = json!({
             "step": action.step,
-            "freed_bytes": action.freed_bytes,
-            "used_bytes": action.used_bytes,
-            "reserved_bytes": action.reserved_bytes,
-            "available_bytes": action.available_bytes,
-            "min_free_bytes": action.min_free_bytes,
-            "stall_percent": action.stall_percent,
-            "max_stall_percent": action.max_stall_percent,
+            "freedBytes": action.freed_bytes,
+            "usedBytes": action.used_bytes,
+            "reservedBytes": action.reserved_bytes,
+            "availableBytes": action.available_bytes,
+            "minFreeBytes": action.min_free_bytes,
+            "stallPercent": action.stall_percent,
+            "maxStallPercent": action.max_stall_percent,
             "detail": action.detail,
         });
         match action.step.as_str() {
@@ -1683,7 +1683,7 @@ pub mod drafts {
             // resumes, so the allocation's cause is `suspended`.
             "suspend" => {
                 meta["cause"] = json!(StopCause::Suspended.as_str());
-                meta["snapshot_id"] = json!(action.snapshot_id);
+                meta["snapshotId"] = json!(action.snapshot_id);
             }
             _ => meta["cause"] = json!(StopCause::NodePressure.as_str()),
         }
@@ -1693,7 +1693,7 @@ pub mod drafts {
         // The stateful instance acted on, so a reader can tie the event to an
         // instance row after its allocation row is gone.
         if let Some(instance_id) = instance_id {
-            meta["instance_id"] = json!(instance_id);
+            meta["instanceId"] = json!(instance_id);
         }
         draft.meta(meta)
     }
@@ -2292,7 +2292,9 @@ pub mod drafts {
     /// `snapshot.restored` / `snapshot.restore_failed` — an allocation
     /// started from a snapshot (RestoreInstance), or failed to. A failed
     /// restore fails the allocation, and the error names the cause (for
-    /// example `restore needs TAP device tap7: ...`).
+    /// example `restore needs TAP device tap7: ...`). `duration_ms` is the
+    /// node's own measure of the restore.
+    #[allow(clippy::too_many_arguments)]
     pub fn snapshot_restore(
         snapshot_id: &str,
         job_id: &str,
@@ -2301,6 +2303,7 @@ pub mod drafts {
         allocation_id: i64,
         ok: bool,
         error: &str,
+        duration_ms: u64,
     ) -> EventDraft {
         let draft = if ok {
             EventDraft::info(
@@ -2326,6 +2329,7 @@ pub mod drafts {
             .meta(json!({
                 "snapshotId": snapshot_id,
                 "instanceId": instance_id,
+                "durationMs": duration_ms,
                 "error": if ok { Value::Null } else { json!(error) },
             }))
     }
@@ -3580,6 +3584,7 @@ impl EventRecorder<'_> {
         allocation_id: i64,
         ok: bool,
         error: &str,
+        duration_ms: u64,
     ) {
         self.emit(drafts::snapshot_restore(
             snapshot_id,
@@ -3589,6 +3594,7 @@ impl EventRecorder<'_> {
             allocation_id,
             ok,
             error,
+            duration_ms,
         ));
     }
 }
@@ -3612,10 +3618,8 @@ pub struct SchedulerEventFilter {
     pub allocation_id: Option<i64>,
 }
 
-/// Metadata keys that name the instance an event is about. `instance_id` is
-/// the `node.pressure` spelling (that event's metadata is snake_case
-/// throughout); everything else uses `instanceId`.
-const INSTANCE_ID_META_KEYS: [&str; 2] = ["instanceId", "instance_id"];
+/// The metadata key that names the instance an event is about.
+const INSTANCE_ID_META_KEYS: [&str; 1] = ["instanceId"];
 /// Metadata arrays whose members are instances the event is also about: the
 /// forks of `instance.forked` / `instance.fork_failed`, and the instances an
 /// `instance.make_room` suspended.

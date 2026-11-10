@@ -381,8 +381,10 @@ Logs name key ids and the root key's location, never its contents.
 - The 2³¹-encryptions-per-key guard that backs time-based rotation is
   counted in memory per process, so a restart resets it. With the default
   30-day rotation, you will not reach the bound in practice.
-- `legion kv list` fails entirely when any listed value is under a data key
-  this manager cannot unwrap. `legion keyring status` names the key.
+- `legion kv list --values` returns a value under a data key this manager
+  cannot unwrap as an empty value with `locked: true` (`(locked)` in the
+  table), and lists the rest normally. `legion kv get` of that key still
+  fails with the keyring error, and `legion keyring status` names the key.
 - An `exec` provider's `wrap`/`unwrap` runs during rotation and root-key
   rewrap on the manager handling the request, with its configured timeout.
   A provider that is down delays those operations and nothing else.

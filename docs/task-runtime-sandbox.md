@@ -690,7 +690,7 @@ the worker's `sandbox.vmmOverheadMiB` (default 64). See
 [resource-enforcement.md](resource-enforcement.md#sandbox-tasks).
 
 The guest's vCPU count is `config.vcpus` (default 1), independent of
-`resources.cpus`, `cpu`, and `cores`, which only govern the VMM's threads on
+`resources.cpu` and `cores`, which only govern the VMM's threads on
 the host.
 
 **Upgrading from `memory_mib`.** Before this rule, `config.memory_mib` sized
@@ -844,7 +844,8 @@ subnet 10.88.0.0/16`).
   another guest holds it. A fork never asks for its origin's.
 - **The address is visible**: `LEGION_GUEST_ADDR` in the guest's env (and in
   `/legion/resume.env` after a restore), and an `address:` line in `legion
-  instance get` (`InstanceInfo.guest_address` and `guest_bridge` in JSON):
+  instance get` (`InstanceInfo.guest_address` and `guest_bridge` in JSON).
+  The UI shows it under the instance's id in instance tables:
 
   ```text
   address: 10.88.128.7 (br0)

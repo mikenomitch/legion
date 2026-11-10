@@ -26,6 +26,6 @@
     checks = [
       { type = "health", kind = "http", path = "/", port = "http", every = "5s", timeout = "2s" },
     ],
-    resources = { cpus = 0.25, memory = 128 },
+    resources = { cpu = 250, memory = 128 },
   },
 }

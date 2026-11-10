@@ -204,6 +204,10 @@ no longer 10% of margin from mass false loss — not the destination.
 
 ## 4. `liveness.batchWindow` ships inert, because the measurement it is contingent on has not been run
 
+> **Superseded 2026-11-10.** The inert field was deleted
+> ([todo-closeout calls #4](todo-closeout-2026-11-10_calls.md)); the reasoning
+> below is why it was never wired, and still holds if the window comes back.
+
 **Call.** *(Implementation.)* `liveness.batchWindow` exists in the config, is
 parsed and validated, and defaults to `"0ms"` — reproducing today's
 commit-while-you-can batching exactly — but **nothing consumes it**, and the

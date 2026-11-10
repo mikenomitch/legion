@@ -817,6 +817,12 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     for (key, value) in config.attributes {
         config_attrs.insert(key, Value::String(value));
     }
+    // The node's pool as an attribute, so `count = { num = 1, per = "pool" }`
+    // and attribute constraints can name it. An operator attribute called
+    // `pool` wins.
+    config_attrs
+        .entry("pool".to_string())
+        .or_insert_with(|| Value::String(config.pool.clone()));
     // The namespaces this node accepts: the scheduler refuses every other
     // namespace's jobs here, whatever their permit says.
     if !config.namespaces.is_empty() {

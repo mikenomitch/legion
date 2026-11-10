@@ -2621,6 +2621,10 @@ mod integration {
                 "name": "c",
                 "module": { "source": "file:///unused", "checksum": format!("sha256:{}", "0".repeat(64)) },
                 "stages": ["request", "response"],
+                // A debug build on a loaded test runner can take longer than
+                // the default 10ms for one callback; this test is about the
+                // rewrite, not the deadline.
+                "limits": { "deadline": "1s" },
             }))
             .unwrap();
         plugin.normalize_and_validate().unwrap();

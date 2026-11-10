@@ -10,8 +10,10 @@ this plan stays as history.
 
 - **Phase 1's attribution of the residual 16%** (`heartbeat-commit-probe.sh`
   on gp3 and NVMe at 1000 and 4000 nodes) and every re-measurement in §10.1.
-  They need the AWS rig. `liveness.batchWindow` therefore ships parsed,
-  validated, and **inert** — see the judgement-calls doc.
+  They need the AWS rig. `liveness.batchWindow` therefore shipped parsed,
+  validated, and **inert** — see the judgement-calls doc. *Removed
+  2026-11-10:* the field is gone until a measurement asks for it
+  ([todo-closeout calls #4](../calls/todo-closeout-2026-11-10_calls.md)).
 - **The `lost -> active` recovery does the composite itself rather than
   calling `mark_node_ready`.** That method writes `status = "ready"`, which
   every liveness query filters out, and flips `availability` unconditionally

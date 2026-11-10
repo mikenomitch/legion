@@ -577,9 +577,9 @@
                 },
             ],
             resources = {
-                # MHz. `cpus` is an older alias for `cpu`, also in MHz (not
-                # a CPU count): `cpus = 1` reserves 1 MHz, and submit warns
-                # about any value under 10. Use `cores` for whole CPUs.
+                # MHz, not a CPU count: `cpu = 1` reserves 1 MHz, and submit
+                # warns about any value under 10. Use `cores` for whole
+                # CPUs. (`cpus` is refused: it is not a resource.)
                 cpu = 1500,
                 memory = 512,
                 disk = 1024,
@@ -1211,7 +1211,7 @@
                 },
                 # Guest working directory (defaults to the image's).
                 cwd = "/workspace",
-                # Guest vCPUs (default 1), independent of resources.cpus.
+                # Guest vCPUs (default 1), independent of resources.cpu.
                 # Guest RAM is not set here: it follows `resources` below
                 # (memoryMax, else memory). An explicit `memory_mib` still
                 # wins this release, with a submit warning when it disagrees.

@@ -406,11 +406,25 @@ fn lane_for(method: &str) -> Lane {
 
 fn store_sources() -> String {
     let root = env!("CARGO_MANIFEST_DIR");
+    let mut paths = vec![
+        "crates/manager/src/storage/store.rs".to_string(),
+        "crates/manager/src/storage/acl_store.rs".to_string(),
+    ];
+    // `store.rs`'s submodules hold `impl Store` blocks too.
+    let submodules = "crates/manager/src/storage/store";
+    let mut entries: Vec<String> = std::fs::read_dir(format!("{root}/{submodules}"))
+        .unwrap_or_else(|e| panic!("failed listing {submodules}: {e}"))
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".rs"))
+        .collect();
+    entries.sort();
+    paths.extend(
+        entries
+            .into_iter()
+            .map(|name| format!("{submodules}/{name}")),
+    );
     let mut combined = String::new();
-    for path in [
-        "crates/manager/src/storage/store.rs",
-        "crates/manager/src/storage/acl_store.rs",
-    ] {
+    for path in paths {
         combined.push_str(
             &std::fs::read_to_string(format!("{root}/{path}"))
                 .unwrap_or_else(|e| panic!("failed reading {path}: {e}")),
