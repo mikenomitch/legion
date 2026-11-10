@@ -113,10 +113,12 @@ impl Worker for FakeNode {
             .allocation
             .ok_or_else(|| Status::invalid_argument("no allocation"))?;
         let mut state = self.lock();
-        let session = allocation
-            .provisional
-            .as_ref()
-            .and_then(|provisional| provisional.session.map(|session| (provisional, session)));
+        let session = allocation.provisional.as_ref().and_then(|provisional| {
+            provisional
+                .session
+                .clone()
+                .map(|session| (provisional, session))
+        });
         if let Some((provisional, session)) = session {
             if state.full {
                 return Err(Status::resource_exhausted("the envelope is full"));
@@ -321,6 +323,7 @@ impl Worker for FakeNode {
             Some(status) => Ok(Response::new(GetSessionReply {
                 session: Some(status.clone()),
                 node_id: String::new(),
+                children: Vec::new(),
             })),
             None => Err(Status::not_found(format!("not_found: no session {id}"))),
         }
@@ -1438,6 +1441,7 @@ async fn session_start_cost_breakdown_measure() -> R<()> {
                 on_refused: "stop".into(),
                 session: Some(legion::structs::SessionStart {
                     lease_issued_at_unix_ms: 1,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),

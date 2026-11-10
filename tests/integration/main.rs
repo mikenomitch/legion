@@ -47,6 +47,7 @@ mod blocked_evals;
 mod capacity_demand;
 mod capacity_retry;
 mod certs;
+mod child_sessions;
 mod cli_closed_pipe;
 mod config_jobs;
 mod content_locality;

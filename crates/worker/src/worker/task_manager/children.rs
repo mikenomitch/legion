@@ -537,11 +537,22 @@ impl WorkerTaskManager {
     /// themselves, so no child outlives the report of its owner's stop. A
     /// stop that keeps the owner's manifest (it moved, or lost to a newer
     /// copy) is not an end: its children stay, as a remote owner's.
-    pub(crate) fn cascade_before_stop(&mut self, session_ids: &[String], keeps_manifest: bool) {
+    pub(crate) fn cascade_before_stop(
+        &mut self,
+        session_ids: &[String],
+        keeps_manifest: bool,
+        reason: &str,
+    ) {
         if self.session_owners.is_empty() {
             return;
         }
         for session_id in session_ids {
+            // A child being stopped itself: remember why, for its owner.
+            if self.session_owners.contains_key(session_id) {
+                self.child_end_reasons
+                    .entry(session_id.clone())
+                    .or_insert_with(|| reason.to_string());
+            }
             if keeps_manifest {
                 self.mark_children_remote(session_id);
                 continue;

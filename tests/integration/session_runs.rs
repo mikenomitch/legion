@@ -660,6 +660,7 @@ async fn a_run_session_without_its_driver_is_swept_test() -> R<()> {
         RUN_ORIGIN,
         "",
         legion::util::now_unix_ms(),
+        None,
     )?;
     let manager = cluster.task_manager.clone();
     tokio::task::spawn_blocking(move || {

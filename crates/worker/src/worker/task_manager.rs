@@ -4773,7 +4773,7 @@ impl WorkerTaskManager {
             .get(&claim_id)
             .is_some_and(|claim| claim.is_session() && !claim.is_ratified());
         if running {
-            self.cascade_before_stop(&[session_id.to_string()], false);
+            self.cascade_before_stop(&[session_id.to_string()], false, reason);
         }
         running && self.kill_claim(&claim_id, reason).is_some()
     }
@@ -4785,7 +4785,7 @@ impl WorkerTaskManager {
         let mut stopped = Vec::new();
         let keep = session_store::reason_keeps_manifest(reason);
         // Children first, so none outlives the report of its owner's stop.
-        self.cascade_before_stop(session_ids, keep);
+        self.cascade_before_stop(session_ids, keep, reason);
         for session_id in session_ids {
             // A suspended (or evicted) session runs nothing: ending it drops
             // its checkpoint and its row.
