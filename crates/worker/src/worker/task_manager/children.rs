@@ -207,6 +207,82 @@ impl WorkerTaskManager {
         })
     }
 
+    /// The id the managers know an allocation by, given the id its API
+    /// socket was opened under.
+    pub fn external_allocation_id(&self, allocation_id: i64) -> Option<i64> {
+        self.external_id(self.local_key(allocation_id))
+    }
+
+    /// How to dial port `label` of `child`, a session child of the unit
+    /// behind `allocation_id`'s API socket, for a connection handoff
+    /// (docs/child-sessions.md). NotFound for anything that is not the
+    /// caller's own running child on this node, whatever the id names.
+    pub fn child_port_target(
+        &self,
+        allocation_id: i64,
+        child: &str,
+        label: &str,
+    ) -> Result<crate::worker::netd::ingress::TaskTarget, tonic::Status> {
+        use tonic::Status;
+        let me = self.self_owner(allocation_id).ok_or_else(|| {
+            Status::not_found("this socket's allocation is no longer running on the node")
+        })?;
+        let not_found = || Status::not_found(format!("no child {child} of this workload"));
+        if !self
+            .child_link(child)
+            .is_some_and(|link| same_owner(&link.owner, &me.owner))
+        {
+            return Err(not_found());
+        }
+        let key = self
+            .claims
+            .by_instance(child)
+            .filter(|claim| claim.is_session())
+            .map(|claim| claim.local_key)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "child {child} is not running (a suspended child takes no handoff; resume it                      first)"
+                ))
+            })?;
+        let (Some(allocation), Some(task)) =
+            (self.allocations.get(&key), self.task_configs.get(&key))
+        else {
+            return Err(Status::failed_precondition(format!(
+                "child {child} is not running yet"
+            )));
+        };
+        if !self.instances.contains_key(&key) || self.terminated.contains_key(&key) {
+            return Err(Status::failed_precondition(format!(
+                "child {child} is not running"
+            )));
+        }
+        let network = allocation.network.clone().unwrap_or_default();
+        let Some(port) = network.ports.iter().find(|port| port.name == label) else {
+            let declared: Vec<&str> = network.ports.iter().map(|port| port.name.as_str()).collect();
+            return Err(Status::failed_precondition(format!(
+                "child {child} declares no port {label:?} (its ports: {})",
+                if declared.is_empty() {
+                    "none".to_string()
+                } else {
+                    declared.join(", ")
+                }
+            )));
+        };
+        let payload = TaskAllocation {
+            allocation_id: key,
+            task_runtime: task.runtime.clone(),
+            task_config: task.config.to_string(),
+            ..Default::default()
+        };
+        let attachment =
+            crate::worker::netd::attach::Attachment::of(&payload, &network, &self.alloc_root);
+        Ok(crate::worker::netd::ingress::TaskTarget {
+            dial: attachment.task_dial(),
+            label: label.to_string(),
+            port: port.bind_port(),
+        })
+    }
+
     /// Find the owner a start names among the units of `job_id` this node
     /// runs. An empty `kind` tries a session, then an instance, then an
     /// allocation id.
@@ -303,6 +379,7 @@ impl WorkerTaskManager {
             .iter()
             .filter(|(_, link)| same_owner(&link.owner, owner))
             .map(|(id, link)| ChildInfo {
+                kind: crate::structs::children::CHILD_SESSION.into(),
                 session_id: id.clone(),
                 task_name: link.task_name.clone(),
                 node_id: node_id.to_string(),
@@ -315,6 +392,7 @@ impl WorkerTaskManager {
                 .iter()
                 .filter(|(_, gone)| same_owner(&gone.owner, owner))
                 .map(|(id, gone)| ChildInfo {
+                kind: crate::structs::children::CHILD_SESSION.into(),
                     session_id: id.clone(),
                     task_name: gone.task_name.clone(),
                     node_id: node_id.to_string(),

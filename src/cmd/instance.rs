@@ -117,12 +117,15 @@ pub fn config() -> Command {
             Arg::new("owner")
                 .long("owner")
                 .value_name("ID")
-                .conflicts_with_all(["id", "count", "from-snapshot"])
+                .conflicts_with_all(["count", "from-snapshot"])
                 .help(
-                    "Start the session as a child of this running unit of the same job \
+                    "Create the unit as a child of this running unit of the same job \
                      (docs/child-sessions.md): a session, instance, or allocation id whose \
-                     task names this task in children.tasks. The child ends when its owner \
-                     ends and starts on its owner's node when that node has room",
+                     task names this task in children.tasks. A session task without --id \
+                     starts a session child; a keyed task (or --id) creates a keyed child, \
+                     which an instance or allocation may own and a session may not. The child \
+                     ends when its owner ends. Inside a task, `self` names the calling \
+                     workload and needs no token: `legion instance create <TASK> --owner self`",
                 ),
         )
         .arg(
@@ -504,6 +507,70 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     }
 }
 
+/// Print one created instance or started session.
+fn print_created(format: OutputFormat, reply: &crate::structs::CreateInstanceReply) {
+    if format.is_json() {
+        output::print_success(&json!({
+            "instanceIds": [reply.instance_id],
+            "restoringFrom": (!reply.restoring_from.is_empty()).then_some(&reply.restoring_from),
+            "mode": reply.mode,
+            "durable": reply.durable,
+            "node": (!reply.node_id.is_empty()).then_some(&reply.node_id),
+            "state": (!reply.state.is_empty()).then_some(&reply.state),
+            "deduplicated": reply.deduplicated,
+            "owner": reply.owner.as_ref().map(|owner| json!({
+                "kind": owner.kind,
+                "id": owner.id,
+            })),
+        }));
+    } else if let Some(owner) = reply.owner.as_ref().filter(|_| reply.durable) {
+        println!(
+            "{} instance {}, a child of {} {} (stopped when its owner is stopped, destroyed \
+             when it is destroyed)",
+            if reply.deduplicated {
+                "Found"
+            } else {
+                "Created"
+            },
+            reply.instance_id,
+            owner.kind,
+            owner.id
+        );
+    } else if let Some(owner) = reply.owner.as_ref().filter(|_| !reply.durable) {
+        println!(
+            "{} session {} on {}, a child of {} {} (it ends when its owner does)",
+            if reply.deduplicated {
+                "Found"
+            } else {
+                "Started"
+            },
+            reply.instance_id,
+            reply.node_id,
+            owner.kind,
+            owner.id
+        );
+    } else if !reply.durable {
+        println!(
+            "{} session {} on {} (not durable; `legion instance promote {}` keeps it)",
+            if reply.deduplicated {
+                "Found"
+            } else {
+                "Started"
+            },
+            reply.instance_id,
+            reply.node_id,
+            reply.instance_id
+        );
+    } else if reply.restoring_from.is_empty() {
+        println!("Created instance {}", reply.instance_id);
+    } else {
+        println!(
+            "Created instance {}, restoring from {}",
+            reply.instance_id, reply.restoring_from
+        );
+    }
+}
+
 #[instrument(skip_all)]
 async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
@@ -521,6 +588,33 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
         .unwrap_or_default();
     let count = arg_matches.get_one::<u32>("count").copied().unwrap_or(0);
     let from_snapshot = arg_matches.get_one::<String>("from-snapshot").cloned();
+
+    // `--owner self`, inside a task: the node's worker vouches for the
+    // caller over the allocation's API socket; no token is read.
+    if arg_matches.get_one::<String>("owner").map(String::as_str)
+        == Some(crate::structs::children::OWNER_SELF)
+    {
+        // `legion instance create workspace --owner self`: the positional
+        // is the task, the job is the caller's own.
+        let task_name = task
+            .or_else(|| arg_matches.get_one::<String>("job").cloned())
+            .unwrap_or_default();
+        let mut workload = crate::cmd::session::workload_client(format, "--owner self")?;
+        let reply = output::resolve(
+            format,
+            "failed to create the child instance",
+            workload
+                .create_child_instance(crate::structs::WorkloadCreateChildInstanceRequest {
+                    task_name,
+                    instance_id: ids.into_iter().next().unwrap_or_default(),
+                    idempotency_key: idempotency_key.unwrap_or_default(),
+                })
+                .await,
+        )?
+        .into_inner();
+        print_created(format, &reply);
+        return Ok(());
+    }
 
     let mut client = connect_manager_client().await?;
 
@@ -552,53 +646,7 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
         )?
         .into_inner();
 
-        if format.is_json() {
-            output::print_success(&json!({
-                "instanceIds": [reply.instance_id],
-                "restoringFrom": (!reply.restoring_from.is_empty()).then_some(&reply.restoring_from),
-                "mode": reply.mode,
-                "durable": reply.durable,
-                "node": (!reply.node_id.is_empty()).then_some(&reply.node_id),
-                "state": (!reply.state.is_empty()).then_some(&reply.state),
-                "deduplicated": reply.deduplicated,
-                "owner": reply.owner.as_ref().map(|owner| json!({
-                    "kind": owner.kind,
-                    "id": owner.id,
-                })),
-            }));
-        } else if let Some(owner) = reply.owner.as_ref().filter(|_| !reply.durable) {
-            println!(
-                "{} session {} on {}, a child of {} {} (it ends when its owner does)",
-                if reply.deduplicated {
-                    "Found"
-                } else {
-                    "Started"
-                },
-                reply.instance_id,
-                reply.node_id,
-                owner.kind,
-                owner.id
-            );
-        } else if !reply.durable {
-            println!(
-                "{} session {} on {} (not durable; `legion instance promote {}` keeps it)",
-                if reply.deduplicated {
-                    "Found"
-                } else {
-                    "Started"
-                },
-                reply.instance_id,
-                reply.node_id,
-                reply.instance_id
-            );
-        } else if reply.restoring_from.is_empty() {
-            println!("Created instance {}", reply.instance_id);
-        } else {
-            println!(
-                "Created instance {}, restoring from {}",
-                reply.instance_id, reply.restoring_from
-            );
-        }
+        print_created(format, &reply);
         return Ok(());
     }
 

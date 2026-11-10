@@ -598,6 +598,7 @@ impl Worker for WorkerDaemonService {
             identity_epoch: 0,
             named: true,
             promoted_from: None,
+            owner: None,
         };
         let payload = crate::structs::task_payload::build_task_allocation_with(
             &task,

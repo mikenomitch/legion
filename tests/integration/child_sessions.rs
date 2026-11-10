@@ -55,6 +55,10 @@ const AGENT: &str = "agent";
 const TASK: &str = "machine";
 /// A service task whose allocation may own `machine` sessions.
 const CI: &str = "ci";
+/// A keyed task whose instances own session and keyed children.
+const KEEPER: &str = "keeper";
+/// A keyed task whose instances can be keyed children.
+const WORKSPACE: &str = "workspace";
 const NODE: &str = "w-17";
 const ISSUER: &str = "https://manager.example.com:4747";
 
@@ -231,7 +235,22 @@ impl Cluster {
                     "runtime": "exec",
                     "config": { "command": ["sleep", "600"] },
                     "resources": { "cpu": 100, "memory": 64 },
-                    "children": { "tasks": [TASK], "max": 8 },
+                    "children": { "tasks": [TASK, WORKSPACE], "max": 8 },
+                },
+                {
+                    "name": KEEPER,
+                    "runtime": "exec",
+                    "config": { "command": ["sleep", "600"] },
+                    "resources": { "cpu": 100, "memory": 64 },
+                    "stateful": { "mode": "keyed" },
+                    "children": { "tasks": [TASK, WORKSPACE], "max": 2, "suspendWithOwner": true },
+                },
+                {
+                    "name": WORKSPACE,
+                    "runtime": "exec",
+                    "config": { "command": ["sleep", "600"] },
+                    "resources": { "cpu": 100, "memory": 64 },
+                    "stateful": { "mode": "keyed" },
                 },
             ],
         }))?;
@@ -304,6 +323,40 @@ impl Cluster {
             }))
             .await
             .map(|reply| reply.into_inner())
+    }
+
+    /// Create a keyed instance (a child when `owner` is set).
+    async fn create_keyed(
+        &self,
+        task: &str,
+        id: &str,
+        owner: Option<OwnerRef>,
+    ) -> Result<CreateInstanceReply, Status> {
+        self.svc
+            .create_instance(Request::new(CreateInstanceRequest {
+                job_id: JOB.into(),
+                task: Some(task.into()),
+                instance_id: Some(id.into()),
+                owner,
+                ..Default::default()
+            }))
+            .await
+            .map(|reply| reply.into_inner())
+    }
+
+    /// Run the scheduler until its queue is empty.
+    fn run_evals(&self) -> R<()> {
+        tokio::task::block_in_place(|| -> R<()> {
+            while let Some(eval) = self.store().claim_eval()? {
+                eval.handle(self.store())?;
+                self.store().complete_eval(&eval.id, true)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn instance(&self, id: &str) -> R<legion::structs::Instance> {
+        self.store().get_instance(id)?.context("the instance row")
     }
 
     /// Start a session and wait until the worker runs it.
@@ -401,6 +454,7 @@ impl Cluster {
         Ok(AllocationWorkload::new(
             self.ci_allocation().context("the ci allocation")?,
             WorkloadChannel {
+                manager: None,
                 task_manager: self.task_manager.clone(),
                 launch_pool,
                 node_id: NODE.into(),
@@ -799,5 +853,296 @@ async fn a_remote_session_owners_end_reaches_its_children_test() -> R<()> {
     assert_eq!(notices[0].event, "stopped");
     cluster.apply(&notices);
     cluster.wait_gone(&child.instance_id).await?;
+    Ok(())
+}
+
+/// Phase 3: a keyed instance owns keyed children. The child's row carries
+/// the reference, `max` bounds session and keyed children together, a
+/// session cannot own one, the child's identity names its owner, and the
+/// owner's stop and destroy end it in the owner's own entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keyed_owner_owns_keyed_children_test() -> R<()> {
+    let cluster = Cluster::new().await?;
+    cluster.create_keyed(KEEPER, "user-1", None).await?;
+    cluster.run_evals()?;
+    let keeper = owner_ref(OWNER_INSTANCE, "user-1");
+
+    let child = cluster
+        .create_keyed(WORKSPACE, "ws-1", Some(owner_ref("", "user-1")))
+        .await?;
+    assert_eq!(child.instance_id, "ws-1");
+    assert_eq!(child.owner, Some(keeper.clone()), "the kind was worked out");
+    assert!(child.durable);
+    assert_eq!(
+        cluster.instance("ws-1")?.owner.as_deref(),
+        Some("instance:user-1"),
+        "the reference lives in the child's row"
+    );
+
+    // Placed beside its owner, and its identity names the tree it is in.
+    cluster.run_evals()?;
+    let row = cluster.instance("ws-1")?;
+    let allocation = cluster
+        .store()
+        .get_allocation_by_id(row.current_alloc_id.context("placed")?)?
+        .context("the child's allocation")?;
+    assert_eq!(allocation.node_id, NODE);
+    let task = cluster
+        .store()
+        .get_job_config(JOB)?
+        .tasks
+        .iter()
+        .find(|task| task.name == WORKSPACE)
+        .cloned()
+        .context("workspace task")?;
+    let claims = legion::manager::workload_identity::claims_for_allocation(
+        cluster.store(),
+        &allocation,
+        &task,
+        "global",
+    )?;
+    assert_eq!(claims.owner.as_deref(), Some("instance:user-1"));
+
+    // Listed under the owner, by kind.
+    let owner = cluster.get("user-1").await?;
+    assert_eq!(owner.children.len(), 1, "{owner:?}");
+    assert_eq!(owner.children[0].session_id, "ws-1");
+    assert_eq!(owner.children[0].kind, "instance");
+    assert_eq!(cluster.get("ws-1").await?.owner, Some(keeper.clone()));
+
+    // A child cannot own (depth 1), and a session cannot own a keyed child.
+    let nested = cluster
+        .create_keyed(WORKSPACE, "ws-nested", Some(owner_ref(OWNER_INSTANCE, "ws-1")))
+        .await
+        .expect_err("a child owns nothing");
+    assert_eq!(nested.code(), Code::FailedPrecondition, "{nested}");
+    let agent = cluster.start(AGENT, None).await?;
+    let durable_of_session = cluster
+        .create_keyed(WORKSPACE, "ws-of-session", Some(session(&agent.instance_id)))
+        .await
+        .expect_err("a session cannot own a durable child");
+    assert_eq!(
+        durable_of_session.code(),
+        Code::FailedPrecondition,
+        "{durable_of_session}"
+    );
+
+    // `max = 2` counts the keyed child and a session child together.
+    let machine = cluster.start(TASK, Some(keeper.clone())).await?;
+    cluster.heartbeat().await?;
+    let over = cluster
+        .create_keyed(WORKSPACE, "ws-2", Some(keeper.clone()))
+        .await
+        .expect_err("at max");
+    assert_eq!(over.code(), Code::ResourceExhausted, "{over}");
+    let over = cluster
+        .create(TASK, Some(keeper.clone()))
+        .await
+        .expect_err("at max");
+    assert_eq!(over.code(), Code::ResourceExhausted, "{over}");
+
+    // Stopping the owner stops the keyed child in the same entry; the
+    // session child hears from the managers at the next beat.
+    cluster
+        .svc
+        .stop_instance(Request::new(StopInstanceRequest {
+            instance_id: "user-1".into(),
+            idempotency_key: None,
+        }))
+        .await?;
+    assert_eq!(
+        cluster.instance("ws-1")?.state,
+        legion::structs::InstanceState::Stopped
+    );
+    let notices = cluster.heartbeat().await?;
+    cluster.apply(&notices);
+    cluster.wait_gone(&machine.instance_id).await?;
+
+    // Destroying it destroys the child.
+    cluster
+        .svc
+        .destroy_instance(Request::new(legion::structs::DestroyInstanceRequest {
+            instance_id: "user-1".into(),
+            ..Default::default()
+        }))
+        .await?;
+    assert_eq!(
+        cluster.instance("ws-1")?.state,
+        legion::structs::InstanceState::Terminated
+    );
+    Ok(())
+}
+
+/// Phase 3, from inside a task: the worker vouches for one of its
+/// allocations and a manager creates the keyed child
+/// (`Manager.CreateChildInstance`). When that allocation ends, the leader's
+/// sweep stops the child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_creates_a_keyed_child_for_its_allocation_test() -> R<()> {
+    let cluster = Cluster::new().await?;
+    let ci = cluster.ci_allocation().context("ci allocation")?;
+    let request = |node: &str, task: &str, key: &str| {
+        Request::new(legion::structs::CreateChildInstanceRequest {
+            node_id: node.into(),
+            allocation_id: ci,
+            task_name: task.into(),
+            instance_id: "ws-ci".into(),
+            idempotency_key: key.into(),
+        })
+    };
+    let created = cluster
+        .svc
+        .create_child_instance(request(NODE, WORKSPACE, "k1"))
+        .await?
+        .into_inner();
+    let me = owner_ref(OWNER_ALLOCATION, &ci.to_string());
+    assert_eq!(created.instance_id, "ws-ci");
+    assert_eq!(created.owner, Some(me.clone()));
+    let retried = cluster
+        .svc
+        .create_child_instance(request(NODE, WORKSPACE, "k1"))
+        .await?
+        .into_inner();
+    assert!(retried.deduplicated);
+    assert_eq!(retried.instance_id, "ws-ci");
+
+    // Another node may not speak for this allocation, and a session task
+    // is not a keyed child.
+    let elsewhere = cluster
+        .svc
+        .create_child_instance(request("w-99", WORKSPACE, "k2"))
+        .await
+        .expect_err("not that node's allocation");
+    assert_eq!(elsewhere.code(), Code::NotFound, "{elsewhere}");
+    let not_keyed = cluster
+        .svc
+        .create_child_instance(request(NODE, TASK, "k3"))
+        .await
+        .expect_err("a session task");
+    assert_eq!(not_keyed.code(), Code::FailedPrecondition, "{not_keyed}");
+
+    // The socket refuses what the jobspec does not grant before it asks a
+    // manager, and says so when it has no manager to ask.
+    let socket = cluster.socket()?;
+    let undeclared = socket
+        .create_child_instance(Request::new(
+            legion::structs::WorkloadCreateChildInstanceRequest {
+                task_name: AGENT.into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect_err("not declared");
+    assert_eq!(undeclared.code(), Code::FailedPrecondition, "{undeclared}");
+    let no_link = socket
+        .create_child_instance(Request::new(
+            legion::structs::WorkloadCreateChildInstanceRequest {
+                task_name: WORKSPACE.into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect_err("no manager link in this fixture");
+    assert_eq!(no_link.code(), Code::Unavailable, "{no_link}");
+
+    // The allocation ends: nothing cascades in its own entry, so the
+    // leader's sweep stops the child.
+    cluster.run_evals()?;
+    assert_eq!(legion::manager::children::sweep_keyed_children(cluster.store())?, 0);
+    tokio::task::block_in_place(|| cluster.store().remove_allocation_by_id(ci))?;
+    assert_eq!(legion::manager::children::sweep_keyed_children(cluster.store())?, 1);
+    assert_eq!(
+        cluster.instance("ws-ci")?.state,
+        legion::structs::InstanceState::Stopped
+    );
+    Ok(())
+}
+
+/// Phase 3: promoting a session child whose owner the managers judge keeps
+/// the reference, written into the new row by the promotion itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_promoted_child_of_an_allocation_stays_its_child_test() -> R<()> {
+    let cluster = Cluster::new().await?;
+    let ci = cluster.ci_allocation().context("ci allocation")?;
+    let me = owner_ref(OWNER_ALLOCATION, &ci.to_string());
+    let child = cluster.start(TASK, Some(me.clone())).await?;
+    cluster.heartbeat().await?;
+    cluster
+        .svc
+        .promote_instance(Request::new(PromoteInstanceRequest {
+            instance_id: child.instance_id.clone(),
+            new_id: "kept".into(),
+            idempotency_key: None,
+        }))
+        .await?;
+    let row = cluster.instance("kept")?;
+    assert_eq!(row.owner, Some(format!("allocation:{ci}")));
+    let info = cluster.get("kept").await?;
+    assert_eq!(info.owner, Some(me));
+    assert_eq!(info.mode, "keyed");
+
+    // It ends with its owner still: here through the sweep, since an
+    // allocation's end is not an instance stop.
+    tokio::task::block_in_place(|| cluster.store().remove_allocation_by_id(ci))?;
+    assert_eq!(legion::manager::children::sweep_keyed_children(cluster.store())?, 1);
+    assert_eq!(
+        cluster.instance("kept")?.state,
+        legion::structs::InstanceState::Stopped
+    );
+    Ok(())
+}
+
+/// `children.suspendWithOwner`, and Phase 4's lookup: a suspended owner's
+/// node is told which children follow it, and a handoff reaches only the
+/// caller's own running children and only ports they declare.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn suspend_with_owner_and_handoff_reach_only_the_owners_children_test() -> R<()> {
+    let cluster = Cluster::new().await?;
+    cluster.create_keyed(KEEPER, "user-1", None).await?;
+    cluster.run_evals()?;
+    let keeper = owner_ref(OWNER_INSTANCE, "user-1");
+    let follows = cluster.start(TASK, Some(keeper.clone())).await?;
+    let ci = cluster.ci_allocation().context("ci allocation")?;
+    let stays = cluster
+        .start(TASK, Some(owner_ref(OWNER_ALLOCATION, &ci.to_string())))
+        .await?;
+
+    {
+        let mut guard = cluster.task_manager.lock().expect("task manager");
+        // `keeper` sets suspendWithOwner; `ci` does not.
+        assert_eq!(
+            guard.children_to_suspend_with(&keeper),
+            vec![follows.instance_id.clone()]
+        );
+        assert!(guard
+            .children_to_suspend_with(&owner_ref(OWNER_ALLOCATION, &ci.to_string()))
+            .is_empty());
+        // A `suspended` notice names the same children, and ends nothing.
+        let to_suspend = guard.apply_owner_notice(&OwnerNotice {
+            owner: Some(keeper.clone()),
+            event: "suspended".into(),
+            promoted_to: None,
+            detail: String::new(),
+        });
+        assert_eq!(to_suspend, vec![follows.instance_id.clone()]);
+
+        // Handoff: `ci` reaches its own child, not `keeper`'s, and only a
+        // port the child declares.
+        let own = guard
+            .child_port_target(ci, &stays.instance_id, "http")
+            .expect_err("the child declares no port");
+        assert_eq!(own.code(), Code::FailedPrecondition, "{own}");
+        assert!(own.message().contains("declares no port"), "{own}");
+        let other = guard
+            .child_port_target(ci, &follows.instance_id, "http")
+            .expect_err("another owner's child");
+        assert_eq!(other.code(), Code::NotFound, "{other}");
+        let missing = guard
+            .child_port_target(ci, "machine-nope.01", "http")
+            .expect_err("no such child");
+        assert_eq!(missing.code(), Code::NotFound, "{missing}");
+    }
+    assert!(cluster.holds(&follows.instance_id));
+    assert!(cluster.holds(&stays.instance_id));
     Ok(())
 }

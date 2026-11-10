@@ -156,7 +156,7 @@ instance_id, job_id, group_name, task_name, mode, state, slot_index, current_all
 /// `promoted_from` only when a keyed row is inserted, so an upsert of an
 /// instance (a re-bind, a reschedule) can never drop any of them.
 pub const INSTANCE_SELECT_ATTRS: &str = r#"
-instance_id, job_id, group_name, task_name, mode, state, slot_index, current_alloc_id, storage_handle, created_at, updated_at, restore_from, identity_epoch, named, promoted_from
+instance_id, job_id, group_name, task_name, mode, state, slot_index, current_alloc_id, storage_handle, created_at, updated_at, restore_from, identity_epoch, named, promoted_from, owner
 "#;
 
 pub const INSTANCE_ATTRS_VALS: &str = r#"

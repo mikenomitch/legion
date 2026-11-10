@@ -944,7 +944,7 @@ fn map_instance_info(
                 .unwrap_or_default(),
         });
     InstanceInfo {
-        owner: None,
+        owner: instance.owner_ref(),
         children: Vec::new(),
         cold_boot,
         last_stop,
@@ -7378,19 +7378,6 @@ impl Manager for ManagerDaemonService {
         if crate::structs::session::is_session_task(task) && requested_id.is_none() {
             return self.create_session(&identity, &inner, &config, task).await;
         }
-        // Children are sessions (docs/child-sessions.md): a create with an
-        // id makes a keyed instance, which cannot be owned yet.
-        if inner
-            .owner
-            .as_ref()
-            .is_some_and(|owner| !owner.id.is_empty())
-        {
-            return Err(Status::failed_precondition(format!(
-                "owner is set and the create names instance_id {:?}: a child is an unnamed \
-                 session of a session task; omit instance_id, or omit owner",
-                requested_id.unwrap_or_default()
-            )));
-        }
         if crate::structs::session::is_session_task(task)
             && !crate::structs::session::accepts_names(task)
         {
@@ -7399,6 +7386,32 @@ impl Manager for ManagerDaemonService {
                  sessions; omit instance_id",
                 task.name
             )));
+        }
+
+        // A keyed child of a running unit of this job
+        // (docs/child-sessions.md): the row carries the owner reference,
+        // and the owner's stop or destroy ends it in the owner's own entry.
+        if let Some(requested) = inner.owner.as_ref().filter(|owner| !owner.id.is_empty()) {
+            if inner
+                .from_snapshot
+                .as_deref()
+                .is_some_and(|from| !from.trim().is_empty())
+            {
+                return Err(Status::invalid_argument(
+                    "from_snapshot cannot be combined with owner: a child boots empty",
+                ));
+            }
+            let resolved =
+                crate::manager::children::resolve_owner(&self.store, &config, requested).await?;
+            return self
+                .create_keyed_child(
+                    &config,
+                    task,
+                    resolved,
+                    requested_id.map(str::to_string),
+                    idempotency_key,
+                )
+                .await;
         }
 
         // Phase 6: restore from a snapshot instead of booting empty.
@@ -7491,6 +7504,95 @@ impl Manager for ManagerDaemonService {
             state: String::new(),
             owner: None,
         }))
+    }
+
+    /// Create a keyed child for a workload on the calling node. See the
+    /// proto comments on `CreateChildInstance`.
+    #[instrument(skip_all, fields(node_id, allocation_id))]
+    async fn create_child_instance(
+        &self,
+        request: Request<crate::structs::CreateChildInstanceRequest>,
+    ) -> Result<Response<CreateInstanceReply>, Status> {
+        // ACL: worker-plane endpoint. The worker attributed the call to one
+        // of its allocations on that allocation's API socket; node
+        // ownership of the allocation is enforced against the authenticated
+        // principal below, and the jobspec's `children` block is the
+        // authorization.
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let inner = request.into_inner();
+        tracing::Span::current().record("node_id", inner.node_id.as_str());
+        tracing::Span::current().record("allocation_id", inner.allocation_id);
+        if !identity.is_management && identity.principal != format!("node:{}", inner.node_id) {
+            return Err(Status::permission_denied(format!(
+                "worker {:?} may not create children for node {:?}",
+                identity.principal, inner.node_id
+            )));
+        }
+        let not_here = || {
+            Status::not_found(format!(
+                "allocation {} does not run on node {:?}",
+                inner.allocation_id, inner.node_id
+            ))
+        };
+        let allocation = self
+            .store
+            .get_allocation_by_id(inner.allocation_id)
+            .map_err(|e| map_store_error("Error loading allocation", e))?
+            .filter(|allocation| allocation.node_id == inner.node_id)
+            .ok_or_else(not_here)?;
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "create_child_instance",
+            Some(inner.idempotency_key.as_str()),
+            &inner,
+        );
+        if let Some(recorded) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(create_instance_replay(recorded)));
+        }
+        let config = keyed_job_config(&self.store, &allocation.job_id)?;
+        let resolved = crate::manager::children::resolve_owner(
+            &self.store,
+            &config,
+            &crate::structs::children::owner_ref(
+                crate::structs::children::OWNER_ALLOCATION,
+                &inner.allocation_id.to_string(),
+            ),
+        )
+        .await?;
+        let task_name = inner.task_name.trim();
+        let task = config
+            .tasks
+            .iter()
+            .find(|task| task.name == task_name)
+            .ok_or_else(|| {
+                Status::failed_precondition(crate::structs::children::not_declared(
+                    &config.name,
+                    &resolved.task_name,
+                    task_name,
+                ))
+            })?;
+        if crate::structs::children::child_kind(task) != Some("keyed") {
+            return Err(Status::failed_precondition(format!(
+                "task {task_name} is not a keyed task: CreateChildInstance creates keyed                  children; start a session child with `legion session start {task_name} --owner                  self`"
+            )));
+        }
+        let requested_id = Some(inner.instance_id.trim()).filter(|id| !id.is_empty());
+        if let Some(id) = requested_id {
+            validate_keyed_instance_id(id).map_err(Status::invalid_argument)?;
+        }
+        self.create_keyed_child(
+            &config,
+            task,
+            resolved,
+            requested_id.map(str::to_string),
+            idempotency_key,
+        )
+        .await
     }
 
     /// Create a batch of keyed-mode instances atomically (explicit ids plus

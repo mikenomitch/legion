@@ -288,6 +288,7 @@ mod tests {
             instance: None,
             slot: None,
             epoch: None,
+            owner: None,
         };
         let identity = WorkloadIdentity {
             name: "aws".into(),

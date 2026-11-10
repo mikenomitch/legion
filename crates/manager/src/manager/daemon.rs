@@ -569,6 +569,28 @@ pub async fn run_manager_with(
         }
     });
 
+    // Keyed children whose owner ended some way other than an instance
+    // stop or destroy, which cascade in their own entry
+    // (docs/child-sessions.md, "When an owner ends").
+    let child_store = store.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(crate::manager::children::KEYED_CHILD_SWEEP_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let store = child_store.clone();
+            let swept = tokio::task::spawn_blocking(move || {
+                crate::manager::children::sweep_keyed_children(&store)
+            })
+            .await;
+            match swept {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => debug!(error = ?err, "Keyed child sweep failed; retrying next tick"),
+                Err(join_error) => warn!("Keyed child sweep task failed: {join_error:?}"),
+            }
+        }
+    });
+
     // Read-model maintenance on every manager (each holds its own cache):
     // rebuild after an outside commit to the state database, and reload a
     // rotating slice of nodes so drift from any source heals within one

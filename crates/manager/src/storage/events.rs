@@ -2455,6 +2455,21 @@ pub mod drafts {
         }))
     }
 
+    /// `instance.child_ended` — a keyed child was stopped or destroyed
+    /// because its owner was (docs/child-sessions.md).
+    pub fn child_ended(job_id: &str, instance_id: &str, owner: &str, end: &str) -> EventDraft {
+        EventDraft::info(
+            "instance.child_ended",
+            format!("Instance {instance_id} {end} with its owner {owner}"),
+        )
+        .job(job_id)
+        .meta(json!({
+            "instanceId": instance_id,
+            "owner": owner,
+            "end": end,
+        }))
+    }
+
     /// `instance.resumed` — a suspended instance restored from its
     /// checkpoint as a new allocation.
     pub fn instance_resumed(
@@ -3454,6 +3469,10 @@ impl EventRecorder<'_> {
             node_id,
             allocation_id,
         ));
+    }
+
+    pub fn child_ended(self, job_id: &str, instance_id: &str, owner: &str, end: &str) {
+        self.emit(drafts::child_ended(job_id, instance_id, owner, end));
     }
 
     pub fn instance_resumed(

@@ -29,6 +29,8 @@ mod keyring_ops;
 mod read_model_check;
 // Phase 6: fork, create-from-snapshot, and snapshot names.
 mod blocked_evals;
+mod child_ops;
+pub use child_ops::{EndedChild, KeyedChildOutcome, OwnerEnd};
 pub use blocked_evals::{BlockedEval, CAPACITY_REPLAY_WINDOW};
 mod eval_claims;
 // What `plan_submission` keeps: rejections and staged plans, id-windowed.
@@ -2218,7 +2220,7 @@ const KEYED_BIND_SQL: &str = "SELECT instance.instance_id, instance.job_id, inst
                  instance.task_name, instance.mode, instance.state, instance.slot_index, \
                  instance.current_alloc_id, instance.storage_handle, instance.created_at, \
                  instance.updated_at, instance.restore_from, instance.identity_epoch, \
-                 instance.named, instance.promoted_from \
+                 instance.named, instance.promoted_from, instance.owner \
                  FROM instance \
                  LEFT JOIN volume ON volume.instance_id = instance.instance_id \
                  AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
@@ -7932,6 +7934,7 @@ impl Store {
             identity_epoch: row.get::<_, i64>(12)?.max(0) as u64,
             named: row.get::<_, i64>(13)? != 0,
             promoted_from: row.get(14)?,
+            owner: row.get(15)?,
         };
 
         Ok(instance)
@@ -18857,6 +18860,12 @@ impl Store {
         if instance.state == InstanceState::Terminated {
             return Ok(DestroyInstanceOutcome::AlreadyTerminated);
         }
+        // Its keyed children are destroyed in this entry, before it is
+        // (docs/child-sessions.md).
+        self.cascade_keyed_children_apply(
+            &format!("{}:{instance_id}", crate::structs::children::OWNER_INSTANCE),
+            OwnerEnd::Destroyed,
+        )?;
 
         let now = Self::now_rfc3339()?;
         let mut conn = self.write_connection()?;
@@ -18972,6 +18981,12 @@ impl Store {
             | InstanceState::Rescheduling
             | InstanceState::Suspended => {}
         }
+        // Its keyed children are stopped in this entry, before it is
+        // (docs/child-sessions.md).
+        self.cascade_keyed_children_apply(
+            &format!("{}:{instance_id}", crate::structs::children::OWNER_INSTANCE),
+            OwnerEnd::Stopped,
+        )?;
 
         let now = Self::now_rfc3339()?;
         let mut conn = self.write_connection()?;
@@ -31242,6 +31257,219 @@ mod tests {
             StorageError::from_anyhow(&err),
             Some(StorageError::NotFound { .. })
         ));
+        Ok(())
+    }
+
+    /// A job with a keyed owner task and a keyed child task, the owner
+    /// `agent-a` placed on `node-a`.
+    fn keyed_owner_and_child_job(store: &Store, job_id: &str) -> R<Allocation> {
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        store.insert_node(make_node_msg("node-b", "active"))?;
+        submit_job(
+            store,
+            job_id,
+            vec![
+                stateful_keyed_task("agent", false),
+                stateful_keyed_task("workspace", false),
+            ],
+        )?;
+        store.create_keyed_instance(job_id, "default", "agent", Some("agent-a"))?;
+        let agent_task = task_id_for(store, "agent", job_id)?;
+        store.place_alloc("node-a", agent_task)
+    }
+
+    fn keyed_child(store: &Store, job_id: &str, id: &str, owner: &str, max: u32) -> R<Instance> {
+        match store.create_keyed_child_instance(
+            job_id,
+            "default",
+            "workspace",
+            Some(id),
+            owner,
+            max,
+            0,
+        )? {
+            KeyedChildOutcome::Created(instance) => Ok(*instance),
+            other => bail!("expected a created child, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_keyed_child_stores_its_owner_and_max_bounds_it_test() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-children";
+        keyed_owner_and_child_job(&store, job_id)?;
+
+        let child = keyed_child(&store, job_id, "ws-1", "instance:agent-a", 2)?;
+        assert_eq!(child.owner.as_deref(), Some("instance:agent-a"));
+        let owner = child.owner_ref().context("typed owner")?;
+        assert_eq!((owner.kind.as_str(), owner.id.as_str()), ("instance", "agent-a"));
+        assert_eq!(
+            store
+                .keyed_children_of("instance:agent-a")?
+                .iter()
+                .map(|child| child.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ws-1"]
+        );
+
+        // `max` counts keyed children and the session children the caller
+        // counted, together.
+        let refused = store.create_keyed_child_instance(
+            job_id,
+            "default",
+            "workspace",
+            Some("ws-2"),
+            "instance:agent-a",
+            2,
+            1,
+        )?;
+        assert_eq!(refused, KeyedChildOutcome::AtMax { children: 2 });
+        assert!(store.get_instance("ws-2")?.is_none(), "nothing was written");
+        keyed_child(&store, job_id, "ws-2", "instance:agent-a", 2)?;
+        assert_eq!(
+            store.create_keyed_child_instance(
+                job_id,
+                "default",
+                "workspace",
+                Some("ws-3"),
+                "instance:agent-a",
+                2,
+                0,
+            )?,
+            KeyedChildOutcome::AtMax { children: 2 }
+        );
+
+        // An owner that has ended owns nothing: the create is NotFound.
+        let err = store
+            .create_keyed_child_instance(
+                job_id,
+                "default",
+                "workspace",
+                Some("ws-9"),
+                "allocation:987654",
+                2,
+                0,
+            )
+            .expect_err("a missing allocation owns nothing");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::NotFound { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_a_keyed_owner_stops_its_keyed_children_in_the_same_write_test() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-cascade-stop";
+        keyed_owner_and_child_job(&store, job_id)?;
+        keyed_child(&store, job_id, "ws-1", "instance:agent-a", 2)?;
+        let workspace_task = task_id_for(&store, "workspace", job_id)?;
+        let child_alloc = store.place_alloc("node-a", workspace_task)?;
+        assert_eq!(child_alloc.instance_id.as_deref(), Some("ws-1"));
+
+        // Suspending the owner is not an end: nothing cascades, and the
+        // sweep finds nothing either.
+        store.set_instance_state("agent-a", InstanceState::Suspended)?;
+        assert!(store.orphaned_keyed_children()?.is_empty());
+        assert_eq!(
+            store.get_instance("ws-1")?.context("child")?.state,
+            InstanceState::Active
+        );
+        store.set_instance_state("agent-a", InstanceState::Active)?;
+
+        store.stop_keyed_instance("agent-a")?;
+        let child = store.get_instance("ws-1")?.context("child row is kept")?;
+        assert_eq!(child.state, InstanceState::Stopped, "the owner's verb");
+        assert!(
+            store.get_allocation_by_id(child_alloc.id)?.is_none(),
+            "the child's allocation went with it"
+        );
+        assert_eq!(
+            child.owner.as_deref(),
+            Some("instance:agent-a"),
+            "a stopped child stays its owner's"
+        );
+        assert!(
+            store.orphaned_keyed_children()?.is_empty(),
+            "the cascade left nothing for the sweep"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn destroying_a_keyed_owner_destroys_its_keyed_children_test() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-cascade-destroy";
+        keyed_owner_and_child_job(&store, job_id)?;
+        keyed_child(&store, job_id, "ws-1", "instance:agent-a", 2)?;
+        // A child stopped earlier is destroyed too.
+        keyed_child(&store, job_id, "ws-2", "instance:agent-a", 2)?;
+        store.stop_keyed_instance("ws-2")?;
+
+        store.destroy_keyed_instance("agent-a")?;
+        for id in ["ws-1", "ws-2"] {
+            assert_eq!(
+                store.get_instance(id)?.context("named tombstone")?.state,
+                InstanceState::Terminated,
+                "{id}"
+            );
+        }
+        assert!(store.keyed_children_of("instance:agent-a")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn the_sweep_ends_keyed_children_of_an_allocation_that_ended_test() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-sweep";
+        let owner_alloc = keyed_owner_and_child_job(&store, job_id)?;
+        let owner = format!("allocation:{}", owner_alloc.id);
+        keyed_child(&store, job_id, "ws-1", &owner, 1)?;
+        assert!(store.orphaned_keyed_children()?.is_empty());
+        assert!(store.end_orphaned_keyed_children()?.is_empty());
+
+        store.remove_allocation_by_id(owner_alloc.id)?;
+        assert_eq!(
+            store.orphaned_keyed_children()?,
+            vec![("ws-1".to_string(), owner.clone())]
+        );
+        let ended = store.end_orphaned_keyed_children()?;
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].instance_id, "ws-1");
+        assert_eq!(ended[0].end, OwnerEnd::Stopped);
+        assert_eq!(
+            store.get_instance("ws-1")?.context("child")?.state,
+            InstanceState::Stopped
+        );
+        assert!(
+            store.orphaned_keyed_children()?.is_empty(),
+            "a stopped child of a stopped owner is settled"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_pending_keyed_child_prefers_its_owners_node_test() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-affinity";
+        keyed_owner_and_child_job(&store, job_id)?;
+        let workspace_task = task_id_for(&store, "workspace", job_id)?;
+        assert!(store
+            .owner_node_preferences_for_task(workspace_task)?
+            .is_empty());
+        // An unowned pending instance of the task has no preference.
+        store.create_keyed_instance(job_id, "default", "workspace", Some("ws-free"))?;
+        keyed_child(&store, job_id, "ws-1", "instance:agent-a", 2)?;
+        let expected = vec![("ws-1".to_string(), "node-a".to_string())];
+        assert_eq!(
+            store.owner_node_preferences_for_task(workspace_task)?,
+            expected
+        );
+        assert_eq!(
+            store.owner_node_preferences_for_task_named(job_id, "default", "workspace")?,
+            expected
+        );
         Ok(())
     }
 

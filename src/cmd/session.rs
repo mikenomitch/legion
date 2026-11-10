@@ -154,6 +154,44 @@ pub fn config() -> Command {
              allocation's API socket (docs/child-sessions.md)",
         )
         .arg(json_flag());
+    let handoff_cmd = Command::new("handoff")
+        .about(
+            "Inside a task: hand an inbound connection this workload accepted to a port of one \
+             of its children, so the worker moves the bytes and the workload leaves the path \
+             (docs/child-sessions.md, \"Connection handoff\")",
+        )
+        .after_help(
+            "The connection is an open file descriptor this command inherits, e.g. from a \
+             shell or a parent process that accepted it:\n\n  \
+             legion session handoff machine-q4n7c2rd.01jc0 --port http --fd 5\n\n\
+             The command returns once the worker has taken the connection; with --wait it \
+             returns when the connection has closed, and reports the bytes moved.",
+        )
+        .arg(Arg::new("id").value_name("CHILD").required(true).help(
+            "The child's session id, as `legion session start <task> --owner self` printed it",
+        ))
+        .arg(
+            Arg::new("port")
+                .long("port")
+                .value_name("LABEL")
+                .required(true)
+                .help("The child's port label (network.ports[].name)"),
+        )
+        .arg(
+            Arg::new("fd")
+                .long("fd")
+                .value_name("N")
+                .required(true)
+                .value_parser(clap::value_parser!(i32).range(0..))
+                .help("The file descriptor of the accepted connection (a TCP or Unix stream)"),
+        )
+        .arg(
+            Arg::new("wait")
+                .long("wait")
+                .action(clap::ArgAction::SetTrue)
+                .help("Return when the handed-off connection has closed"),
+        )
+        .arg(json_flag());
     let get_cmd = edge_args(
         Command::new("get")
             .about("Read a session from its node with a session ticket")
@@ -319,6 +357,7 @@ pub fn config() -> Command {
         .subcommand(run_cmd)
         .subcommand(start_cmd)
         .subcommand(children_cmd)
+        .subcommand(handoff_cmd)
         .subcommand(get_cmd)
         .subcommand(stop_cmd)
 }
@@ -330,10 +369,11 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         Some(("run", matches)) => run(matches).await,
         Some(("start", matches)) => start(matches).await,
         Some(("children", matches)) => children(matches).await,
+        Some(("handoff", matches)) => handoff(matches).await,
         Some(("get", matches)) => get(matches).await,
         Some(("stop", matches)) => stop(matches).await,
         _ => {
-            println!("Usage: legion session nodes|run|start|get|stop");
+            println!("Usage: legion session nodes|run|start|children|handoff|get|stop");
             Ok(())
         }
     }
@@ -804,7 +844,7 @@ fn ticket(matches: &ArgMatches) -> String {
 }
 
 /// A request the CLI refuses before sending anything.
-fn refuse_locally(format: OutputFormat, message: String) -> anyhow::Error {
+pub(crate) fn refuse_locally(format: OutputFormat, message: String) -> anyhow::Error {
     output::fail_local(
         format,
         output::CliError::local("invalid_argument", message, None),
@@ -813,7 +853,7 @@ fn refuse_locally(format: OutputFormat, message: String) -> anyhow::Error {
 
 /// The `Workload` service on the allocation's API socket (`LEGION_ADDR =
 /// unix://...` inside a task whose task declares the `legion` identity).
-fn workload_client(
+pub(crate) fn workload_client(
     format: OutputFormat,
     flag: &str,
 ) -> R<crate::structs::workload_client::WorkloadClient<tonic::transport::Channel>> {
@@ -837,6 +877,81 @@ fn owner_json(owner: Option<&crate::structs::OwnerRef>) -> Value {
         Some(owner) => json!({ "kind": owner.kind, "id": owner.id }),
         None => Value::Null,
     }
+}
+
+/// `legion session handoff`: pass an accepted connection to a child's port
+/// over the allocation's handoff socket.
+async fn handoff(matches: &ArgMatches) -> R<()> {
+    use crate::worker::handoff;
+    let format = OutputFormat::from_matches(matches);
+    let address = crate::cmd::helpers::manager_address();
+    let api_socket = crate::cmd::helpers::unix_socket_path(&address).ok_or_else(|| {
+        refuse_locally(
+            format,
+            format!(
+                "handoff needs the allocation's API socket: LEGION_ADDR is {address}, not a \
+                 unix:// address (the task declares no `legion` identity, or this is not a task)"
+            ),
+        )
+    })?;
+    let socket = std::path::Path::new(&api_socket).with_file_name(handoff::HANDOFF_SOCKET_NAME);
+    let request = handoff::HandoffRequest {
+        child: matches.get_one::<String>("id").cloned().unwrap_or_default(),
+        port: matches.get_one::<String>("port").cloned().unwrap_or_default(),
+    };
+    let fd = matches.get_one::<i32>("fd").copied().unwrap_or(-1);
+    let wait = matches.get_flag("wait");
+    let outcome = tokio::task::spawn_blocking(move || -> R<Option<handoff::HandoffClosed>> {
+        let control = handoff::hand_off(&socket, &request, fd)?;
+        // The worker holds its own copy now; ours would keep the
+        // connection open after the child is done with it.
+        // SAFETY: `fd` is a descriptor this process inherited for this
+        // call and uses nowhere else.
+        unsafe {
+            libc::close(fd);
+        }
+        if wait {
+            handoff::wait_closed(control).map(Some)
+        } else {
+            Ok(None)
+        }
+    })
+    .await
+    .context("handoff task panicked")?;
+    let closed = match outcome {
+        Ok(closed) => closed,
+        Err(err) => {
+            return Err(output::fail_local(
+                format,
+                output::CliError::local("handoff_refused", format!("{err:#}"), None),
+            ))
+        }
+    };
+    if format.is_json() {
+        output::print_success(&json!({
+            "handedOff": true,
+            "closed": closed.as_ref().map(|closed| json!({
+                "sent": closed.sent,
+                "received": closed.received,
+                "error": (!closed.error.is_empty()).then_some(&closed.error),
+            })),
+        }));
+    } else {
+        match closed {
+            None => println!("Handed the connection to the child"),
+            Some(closed) => println!(
+                "The handed-off connection closed: {} bytes to the child, {} back{}",
+                closed.sent,
+                closed.received,
+                if closed.error.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", closed.error)
+                }
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// `--owner self`: start a child of the calling workload on its own node.

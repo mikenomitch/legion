@@ -644,6 +644,10 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         // The workload channel: node-local calls the worker answers itself
         // (docs/workload-identity.md, "The API socket").
         workload: Some(crate::worker::api_socket::WorkloadChannel {
+            manager: Some(crate::worker::api_socket::ManagerLink {
+                channel: managers.channel(),
+                credentials: credentials.clone(),
+            }),
             task_manager: task_manager.clone(),
             launch_pool: workload_launch_pool.clone(),
             node_id: name.clone(),

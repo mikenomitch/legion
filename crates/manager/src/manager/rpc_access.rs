@@ -184,6 +184,7 @@ pub const RPC_ACCESS: &[(&str, Access)] = &[
     ("DeleteVolume", Access::Protected("job", "write")),
     ("ListVolumeDrivers", Access::Protected("node", "read")),
     ("IssueWorkloadIdentityToken", Access::Worker),
+    ("CreateChildInstance", Access::Worker),
     ("IssueNodeIdentityToken", Access::Worker),
     ("IssueNodeCertificate", Access::Worker),
     ("GetAllocationLogs", Access::Protected("job", "read")),

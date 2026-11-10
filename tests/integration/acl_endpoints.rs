@@ -237,6 +237,8 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("DeleteVolume", Plane::Protected("job:write")),
         ("ListVolumeDrivers", Plane::Protected("node:read")),
         ("IssueWorkloadIdentityToken", Plane::Worker),
+        // A worker vouching for one of its allocations (docs/child-sessions.md).
+        ("CreateChildInstance", Plane::Worker),
         ("IssueNodeIdentityToken", Plane::Worker),
         ("IssueNodeCertificate", Plane::Worker),
         ("GetAllocationLogs", Plane::Protected("job:read")),
@@ -1561,6 +1563,19 @@ async fn call_endpoint(
             .map(|_| ()),
         "ListVolumeDrivers" => svc
             .list_volume_drivers(req(ListVolumeDriversRequest {}, token))
+            .await
+            .map(|_| ()),
+        "CreateChildInstance" => svc
+            .create_child_instance(req(
+                legion::structs::CreateChildInstanceRequest {
+                    node_id: NODE_ID.into(),
+                    allocation_id: 1,
+                    task_name: "workspace".into(),
+                    instance_id: String::new(),
+                    idempotency_key: String::new(),
+                },
+                token,
+            ))
             .await
             .map(|_| ()),
         "IssueWorkloadIdentityToken" => svc

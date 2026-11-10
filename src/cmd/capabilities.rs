@@ -493,14 +493,18 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "instance.create",
-            cli: "legion instance create <JOB> [--id <KEY>] [--from-snapshot <NAME|ID>] [--owner <ID>]",
+            cli: "legion instance create <JOB> [--id <KEY>] [--from-snapshot <NAME|ID>] [--owner <ID>] | legion instance create <TASK> [--id <KEY>] --owner self",
             grpc: Some("Manager/CreateInstance"),
             summary: "Create a keyed-mode instance (never-recycled id), optionally restored from \
                  a snapshot of the job (needs snapshot:read). On a session task without --id, \
                  start an unnamed session with no raft write (durable false). --owner <ID> \
-                 starts that session as a child of a running session, instance, or allocation \
-                 of the same job whose task names the task in children.tasks: it ends with its \
-                 owner and is listed under it. Supports --idempotency-key.",
+                 makes the unit a child of a running session, instance, or allocation of the \
+                 same job whose task names the task in children.tasks: a session child of a \
+                 session task, or a keyed child of a keyed task (an instance or allocation \
+                 owner only), which is stopped when its owner is stopped and destroyed when \
+                 it is destroyed, in the owner's own entry. Inside a task, `--owner self` asks \
+                 the node's worker over the allocation's API socket \
+                 (Workload/CreateChildInstance) with no token. Supports --idempotency-key.",
             mutates: true,
             read_only_safe: false,
         },
@@ -608,6 +612,19 @@ pub fn catalog() -> Vec<Capability> {
                  (it ends with its owner; the owner's task must name the task in \
                  children.tasks). Inside a task, `--owner self` asks the node's worker over the \
                  allocation's API socket (Workload/StartChildSession) with no ticket.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "session.handoff",
+            cli: "legion session handoff <CHILD> --port <LABEL> --fd <N> [--wait]",
+            grpc: None,
+            summary: "Inside a task: hand an inbound connection the workload accepted (an \
+                 inherited file descriptor) to a port of one of its own session children on \
+                 the same node, over the allocation's handoff socket with no credential. The \
+                 worker moves the bytes with the datapath's splice path and the workload \
+                 leaves the byte path; --wait returns when the connection closed, with the \
+                 bytes moved.",
             mutates: true,
             read_only_safe: false,
         },

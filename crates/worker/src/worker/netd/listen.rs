@@ -226,6 +226,7 @@ where
 
 /// One accepted or dialed connection: TCP, or a Unix stream to or from a
 /// sandbox guest's VMM.
+#[derive(Debug)]
 pub enum Stream {
     Tcp(TcpStream),
     Unix(UnixStream),

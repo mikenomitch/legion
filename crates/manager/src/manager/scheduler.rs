@@ -4046,6 +4046,31 @@ impl<'a> Scheduler<'a> {
         } else {
             Vec::new()
         };
+        // Keyed children awaiting their first placement prefer their
+        // owner's node (docs/child-sessions.md). A preference, not a pin:
+        // when that node is not eligible the child goes wherever the task
+        // fits. Keyed tasks only, and empty unless a child is pending.
+        let mut owner_preferences: std::collections::VecDeque<(String, String)> = if task_config
+            .stateful
+            .as_ref()
+            .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed)
+        {
+            match plan.positional_job_id.as_deref() {
+                None => self.store.owner_node_preferences_for_task(task_id),
+                Some(job_id) => self.store.owner_node_preferences_for_task_named(
+                    job_id,
+                    &task_config.group,
+                    &task_config.name,
+                ),
+            }
+            .unwrap_or_else(|err| {
+                warn!(task_id, error = ?err, "Failed loading owner preferences; placing without");
+                Vec::new()
+            })
+            .into()
+        } else {
+            std::collections::VecDeque::new()
+        };
         // Score locality after the restore lookup, so a restoring instance's
         // manifest parts count toward the content set.
         let locality = self.locality_scores(task_config, &restores, weights);
@@ -4420,11 +4445,24 @@ impl<'a> Scheduler<'a> {
             };
             // A restore's node was chosen for that instance (its pin, or its
             // `compat` and spread), so the apply must bind that instance.
-            let bind_instance = floating.clone().or_else(|| {
-                pin.as_ref()
-                    .filter(|(instance_id, _)| restore_manifests.contains_key(instance_id))
-                    .map(|(instance_id, _)| instance_id.clone())
-            });
+            // A fresh placement of a keyed child: its owner's node first.
+            let owner_preference = if pin.is_none() && floating.is_none() {
+                owner_preferences.pop_front()
+            } else {
+                None
+            };
+            let bind_instance = floating
+                .clone()
+                .or_else(|| {
+                    pin.as_ref()
+                        .filter(|(instance_id, _)| restore_manifests.contains_key(instance_id))
+                        .map(|(instance_id, _)| instance_id.clone())
+                })
+                .or_else(|| {
+                    owner_preference
+                        .as_ref()
+                        .map(|(instance_id, _)| instance_id.clone())
+                });
             if let Some((instance_id, node_id)) = pin.as_ref() {
                 if let Some(restore) = restore_manifests.get(instance_id) {
                     // A memory checkpoint resumes a running guest, so the
@@ -4442,6 +4480,21 @@ impl<'a> Scheduler<'a> {
                     restore,
                     filter_restore_compat(task_config, restore, eligible)?,
                 ),
+                None => eligible,
+            };
+            let eligible = match owner_preference.as_ref() {
+                Some((_, owner_node)) => {
+                    let beside: Vec<&Node> = eligible
+                        .iter()
+                        .copied()
+                        .filter(|node| node.id == *owner_node)
+                        .collect();
+                    if beside.is_empty() {
+                        eligible
+                    } else {
+                        beside
+                    }
+                }
                 None => eligible,
             };
             // A spread fork never shares a node with a sibling. A hard rule,

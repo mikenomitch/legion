@@ -1235,6 +1235,7 @@ pub fn claims_for_allocation(
         instance: instance.as_ref().map(|i| i.instance_id.clone()),
         slot: instance.as_ref().and_then(|i| i.slot_index),
         epoch: instance.as_ref().map(|i| i.identity_epoch),
+        owner: instance.as_ref().and_then(|i| i.owner.clone()),
     })
 }
 
@@ -1346,6 +1347,7 @@ mod tests {
             instance: None,
             slot: None,
             epoch: None,
+            owner: None,
         }
     }
 

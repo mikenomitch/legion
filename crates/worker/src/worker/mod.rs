@@ -13,6 +13,7 @@ pub mod edge;
 pub mod envelope_elastic;
 pub mod exec;
 pub mod forwarder;
+pub mod handoff;
 pub mod identity;
 pub mod idle;
 pub mod launch_pool;

@@ -625,6 +625,7 @@ mod tests {
             identity_epoch: 0,
             named: true,
             promoted_from: None,
+            owner: None,
         }
     }
 

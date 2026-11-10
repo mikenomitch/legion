@@ -278,10 +278,26 @@ impl ManagerDaemonService {
                     crate::manager::children::resolve_owner(&self.store, config, requested).await?;
                 let block =
                     crate::manager::children::declaration(config, &resolved.task_name, task)?;
+                // `max` bounds session and keyed children together: the
+                // node counts the sessions, so it is told what is left.
+                let keyed = if crate::structs::children::raft_owned(&resolved.owner) {
+                    self.store
+                        .keyed_children_of(&crate::structs::children::owner_label(&resolved.owner))
+                        .map_err(|e| map_store_error("Error reading the owner's children", e))?
+                        .len() as u32
+                } else {
+                    0
+                };
+                if keyed >= block.max {
+                    return Err(Status::resource_exhausted(crate::structs::children::at_max(
+                        &resolved.owner,
+                        block.max,
+                    )));
+                }
                 Some(sessions::ChildStart {
                     owner: resolved.owner,
                     prefer_node: resolved.node_id,
-                    max: block.max,
+                    max: block.max - keyed,
                     suspend_with_owner: block.suspend_with_owner,
                 })
             }
@@ -305,6 +321,120 @@ impl ManagerDaemonService {
             state: started.state,
             owner: started.owner,
         }))
+    }
+
+    /// Create a keyed instance as a child of `resolved` (docs/child-sessions.md).
+    /// The caller has authorized the create (`job:write`, or a worker
+    /// vouching for one of its allocations); the jobspec decides the rest.
+    /// One scheduler-lane entry: the row with its owner reference, the
+    /// placement eval, and the idempotency record.
+    pub(super) async fn create_keyed_child(
+        &self,
+        config: &JobConfig,
+        task: &TaskConfig,
+        resolved: crate::manager::children::ResolvedOwner,
+        requested_id: Option<String>,
+        idempotency_key: String,
+    ) -> Result<Response<CreateInstanceReply>, Status> {
+        use crate::storage::store::KeyedChildOutcome;
+        use crate::structs::children;
+        let block = crate::manager::children::declaration(config, &resolved.task_name, task)?;
+        // `declaration` refuses a session task owning a keyed child; an
+        // owner that is a session by kind (a promoted task's leftover) is
+        // refused the same way.
+        if !children::raft_owned(&resolved.owner) {
+            return Err(Status::failed_precondition(children::keyed_child_of_session(
+                &resolved.task_name,
+                &task.name,
+            )));
+        }
+        self.store
+            .check_namespace_quota_growth(&config.name, config.priority, &task.resources, 1)
+            .map_err(|e| map_store_error("Namespace policy refused the instance", e))?;
+        // `max` bounds session and keyed children together. The session
+        // count is the index's (soft state); the keyed count is read in the
+        // write.
+        let session_children = crate::manager::children::session_children_of(
+            &self.store,
+            &config.name,
+            &resolved.owner,
+        )
+        .await
+        .len() as u32;
+        let max = block.max;
+        let owner = resolved.owner.clone();
+        let label = children::owner_label(&owner);
+        let job_id = config.name.clone();
+        let group = task.group.clone();
+        let task_name = task.name.clone();
+        let config_id = config.id();
+        let priority = self.store.default_eval_priority;
+        let key = idempotency_key.clone();
+        let outcome = self
+            .store
+            .scheduler_group_commit("create_child_instance", move |s| {
+                claimed_body(s, |s| {
+                    let outcome = s.create_keyed_child_instance(
+                        &job_id,
+                        &group,
+                        &task_name,
+                        requested_id.as_deref(),
+                        &label,
+                        max,
+                        session_children,
+                    )?;
+                    if let KeyedChildOutcome::Created(instance) = &outcome {
+                        s.enqueue_eval(
+                            "job_reschedule",
+                            Some(&job_id),
+                            Some(&config_id),
+                            None,
+                            Some(priority),
+                        )?;
+                        claim_idempotency_key(s, &key, "create_instance", &instance.instance_id)?;
+                    }
+                    Ok(outcome)
+                })
+            });
+        let outcome =
+            match self.claimed_write(&idempotency_key, "Error creating child instance", outcome)? {
+                Ok(outcome) => outcome,
+                Err(recorded) => {
+                    return Ok(Response::new(CreateInstanceReply {
+                        instance_id: recorded,
+                        deduplicated: true,
+                        restoring_from: String::new(),
+                        mode: InstanceMode::Keyed.to_string(),
+                        durable: true,
+                        node_id: String::new(),
+                        state: String::new(),
+                        owner: Some(owner),
+                    }))
+                }
+            };
+        match outcome {
+            KeyedChildOutcome::AtMax { .. } => {
+                Err(Status::resource_exhausted(children::at_max(&owner, max)))
+            }
+            KeyedChildOutcome::Created(instance) => {
+                info!(
+                    instance_id = %instance.instance_id,
+                    job_id = %instance.job_id,
+                    owner = %children::owner_label(&owner),
+                    "Created keyed child instance"
+                );
+                Ok(Response::new(CreateInstanceReply {
+                    instance_id: instance.instance_id,
+                    deduplicated: false,
+                    restoring_from: String::new(),
+                    mode: InstanceMode::Keyed.to_string(),
+                    durable: true,
+                    node_id: String::new(),
+                    state: String::new(),
+                    owner: Some(owner),
+                }))
+            }
+        }
     }
 
     /// The running session with this id, once `action` on its job is
@@ -979,6 +1109,15 @@ impl ManagerDaemonService {
             task_name: task.name.clone(),
             node_id: found.node_id.clone(),
             new_id: (!new_id.is_empty()).then(|| new_id.to_string()),
+            // A child of an instance or an allocation stays its child: the
+            // reference moves into the row, in this entry. A child of a
+            // session is detached (a durable child of an ephemeral owner is
+            // not allowed).
+            owner: status
+                .owner
+                .as_ref()
+                .filter(|owner| crate::structs::children::raft_owned(owner))
+                .map(crate::structs::children::owner_label),
         };
         let key = idempotency_key.clone();
         // One scheduler-lane entry: the instance row, its allocation, the

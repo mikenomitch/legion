@@ -2625,6 +2625,14 @@ fn migration_list() -> Vec<M<'static>> {
         // the jobspec `children` block as JSON (tasks, max, suspendWithOwner,
         // orphanAfter). NULL for every task whose units own nothing.
         M::up("ALTER TABLE task_config ADD COLUMN children TEXT;").down(""),
+        // The unit that owns an instance as its child, as `kind:id`
+        // (docs/child-sessions.md). Indexed: an owner's stop and destroy
+        // look its children up in their own transaction.
+        M::up(
+            "ALTER TABLE instance ADD COLUMN owner TEXT;
+             CREATE INDEX IF NOT EXISTS instance_owner ON instance (owner) WHERE owner IS NOT NULL;",
+        )
+        .down(""),
     ]
 }
 

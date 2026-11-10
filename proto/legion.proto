@@ -804,7 +804,40 @@ service Manager {
   // - ResourceExhausted: no node's envelope for the task has room. Retryable
   //   once sessions end or envelopes are added.
   // - FailedPrecondition: no node holds an envelope for the task yet.
+  //
+  // With `owner` the new unit is a child (docs/child-sessions.md): a
+  // session child of a session task, or a keyed child of a keyed task,
+  // whose row carries the owner reference and which the owner's stop or
+  // destroy ends in the same replicated entry. See
+  // `CreateInstanceRequest.owner`.
   rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceReply);
+
+  // Creates a keyed instance as a child of a unit running on the calling
+  // node: what `Workload.CreateChildInstance` on an allocation's API socket
+  // becomes once the worker has attributed the caller (`legion instance
+  // create <task> --owner self` inside a task; docs/child-sessions.md).
+  //
+  // The node vouches for which of its allocations asked; the manager
+  // checks that the allocation runs on that node, works out the owner (the
+  // allocation's instance when it has one, the allocation otherwise), and
+  // applies the jobspec's rules exactly as `CreateInstance` with `owner`
+  // does: the owner's task must name the child task in `children.tasks`,
+  // the child task must be keyed, and the owner must have fewer than
+  // `children.max` children. The row, its owner reference, and the
+  // placement eval are one scheduler-lane entry.
+  //
+  // ACL: worker-plane. The caller is a registered worker (its node
+  // certificate or join credentials), and `node_id` must be the node the
+  // owning allocation is placed on. No operator token is involved: the
+  // authority is the jobspec's `children` block.
+  //
+  // Errors: NotFound when the allocation does not run on the calling node;
+  // FailedPrecondition when its task does not declare the child task, the
+  // child task is not keyed, or the owner is itself a child (depth 1
+  // only); ResourceExhausted (retryable) at `children.max`; AlreadyExists
+  // when `instance_id` names an existing instance; InvalidArgument for a
+  // malformed `instance_id`.
+  rpc CreateChildInstance (CreateChildInstanceRequest) returns (CreateInstanceReply);
 
   // Creates several keyed-mode stateful instances in one atomic call and
   // enqueues a single placement evaluation for the batch.
@@ -7321,24 +7354,56 @@ message CreateInstanceRequest {
   // `CreateInstances` for the full contract.
   optional string from_snapshot = 6;
 
-  // Start the unnamed session as a child of this unit
-  // (docs/child-sessions.md): it ends when its owner ends, and is listed
-  // under it. Session tasks only, and only without `instance_id`. The
-  // owner must be a running unit of the same job whose task names this
-  // task in `children.tasks`. Needs `job:write` like any create.
+  // Create the unit as a child of this unit (docs/child-sessions.md): it
+  // ends when its owner ends, and is listed under it. The owner must be a
+  // running unit of the same job whose task names this task in
+  // `children.tasks`. Needs `job:write` like any create.
+  //
+  // - On a session task without `instance_id`, the child is an unnamed
+  //   session. It goes to its owner's node when that node's envelope for
+  //   this task has room, and to another node with room otherwise.
+  // - On a keyed task (or a session task with `instance_id`, which makes a
+  //   keyed instance), the child is a keyed instance whose row stores the
+  //   reference. The owner must be an `instance` or an `allocation`: a
+  //   session cannot own a durable child. Stopping the owner stops the
+  //   child and destroying it destroys the child, in the owner's own
+  //   replicated entry; suspending, archiving, or rescheduling the owner
+  //   does neither. The scheduler prefers the owner's node for the child's
+  //   first placement. `from_snapshot` is refused with `owner`.
   //
   // `kind` is `session` (a session id), `instance` (a keyed or slot
   // instance id), or `allocation` (an allocation id, for owners with no
   // instance identity); empty asks the manager to work it out from `id`.
-  // The child goes to its owner's node when that node's envelope for this
-  // task has room, and to another node with room otherwise.
   //
   // Errors: NotFound when no running unit has the id; FailedPrecondition
   // when the owner's task does not declare this task, when the owner is
-  // itself a child (depth 1 only), or when the task is keyed;
-  // ResourceExhausted (retryable) when the owner already has
-  // `children.max` children or no envelope has room.
+  // itself a child (depth 1 only), or when a session would own a keyed
+  // child; ResourceExhausted (retryable) when the owner already has
+  // `children.max` children (session and keyed children counted together)
+  // or, for a session child, no envelope has room.
   optional OwnerRef owner = 7;
+}
+
+// Request payload for Manager.CreateChildInstance (worker-plane).
+message CreateChildInstanceRequest {
+  // The calling node: the one the owning allocation runs on.
+  string node_id = 1;
+
+  // The allocation whose workload asked, as the node attributed the
+  // connection on its API socket.
+  int64 allocation_id = 2;
+
+  // The keyed task to create a child of. It must be a task of the
+  // allocation's job that the allocation's task names in `children.tasks`.
+  string task_name = 3;
+
+  // Optional key for the child, as `CreateInstanceRequest.instance_id`.
+  // Empty mints an unnamed id.
+  string instance_id = 4;
+
+  // Optional retry key, scoped to the owning allocation: a repeat returns
+  // the instance the first call created with `deduplicated = true`.
+  string idempotency_key = 5;
 }
 
 // Reply payload for CreateInstance.
@@ -14497,6 +14562,10 @@ message StartSessionReply {
 // attributes every connection to the socket's allocation (by cgroup where
 // every task has a leaf, by the directory's modes otherwise), so a caller
 // acts for its own allocation and no other.
+//
+// One workload-channel call is not gRPC, because it passes a file
+// descriptor: connection handoff, on `legion-handoff.sock` beside this
+// socket (docs/child-sessions.md, "Connection handoff").
 service Workload {
   // Runs once in a fresh, single-use session of a session task of the
   // caller's own job, on the caller's node (see `Manager.RunSession` for
@@ -14549,6 +14618,37 @@ service Workload {
   //
   // Errors: NotFound when the id is not a child of the caller on this node.
   rpc StopChildSession (StopChildSessionRequest) returns (StopChildSessionReply);
+
+  // Creates a keyed instance of a sibling keyed task as a child of the
+  // calling allocation's unit: `legion instance create <task> --owner self`
+  // inside a task (docs/child-sessions.md). The worker attributes the call
+  // to the socket's allocation and asks a manager
+  // (`Manager.CreateChildInstance`), since a keyed instance is a replicated
+  // row; no credential is read from the caller.
+  //
+  // The owner is the caller's instance when it is a keyed or slot
+  // instance and its allocation otherwise. A session cannot own a keyed
+  // child, so a caller that is a session is refused.
+  //
+  // Errors: as `Manager.CreateChildInstance`, plus FailedPrecondition when
+  // the caller is a session, Unavailable when no manager can be reached,
+  // and NotFound when the socket's allocation is no longer running.
+  rpc CreateChildInstance (WorkloadCreateChildInstanceRequest) returns (CreateInstanceReply);
+}
+
+// `Workload.CreateChildInstance`.
+message WorkloadCreateChildInstanceRequest {
+  // The keyed task to create a child of. It must be a task of the caller's
+  // job that the caller's task names in `children.tasks`.
+  string task_name = 1;
+
+  // Optional key for the child (`[A-Za-z0-9._-]{1,128}`). Empty mints an
+  // unnamed id.
+  string instance_id = 2;
+
+  // Optional retry key: a repeat returns the same instance with
+  // `deduplicated = true`.
+  string idempotency_key = 3;
 }
 
 // A typed reference to the unit that owns a child (docs/child-sessions.md).
@@ -14597,7 +14697,8 @@ message OwnerNotice {
 // One child of an owner, as `GetInstance`, `Worker.GetSession`, and
 // `Workload.ListChildren` list it.
 message ChildInfo {
-  // The child's session id.
+  // The child's id: a session id for a session child, an instance id for a
+  // keyed child (`kind` says which).
   string session_id = 1;
 
   // The child's task.
@@ -14612,6 +14713,13 @@ message ChildInfo {
 
   // For `gone`: why, e.g. `stopped`, `exited`, `evicted`, `owner ended`.
   string reason = 5;
+
+  // `session` for a session child, whose record is its node's, or
+  // `instance` for a keyed child, whose record is a replicated row
+  // (`state` is then the instance state: `pending`, `active`, `suspended`,
+  // `rescheduling`, or `stopped`). Only `GetInstance` lists keyed children:
+  // a node knows the sessions it holds, not the rows.
+  string kind = 6;
 }
 
 // `Workload.StartChildSession`.

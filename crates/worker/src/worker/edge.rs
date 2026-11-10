@@ -358,6 +358,7 @@ pub fn session_payload(
         identity_epoch: 0,
         named: false,
         promoted_from: None,
+        owner: None,
     };
     let allocation = crate::structs::Allocation {
         id: 0,

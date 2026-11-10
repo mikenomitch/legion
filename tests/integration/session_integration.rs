@@ -1416,6 +1416,7 @@ async fn session_start_cost_breakdown_measure() -> R<()> {
             identity_epoch: 0,
             named: false,
             promoted_from: None,
+            owner: None,
         };
         let allocation = legion::structs::Allocation {
             id: 0,

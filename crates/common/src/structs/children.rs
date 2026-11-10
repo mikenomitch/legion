@@ -23,6 +23,11 @@ pub const OWNER_ALLOCATION: &str = "allocation";
 /// `--owner self`: the calling allocation's own unit, on the API socket.
 pub const OWNER_SELF: &str = "self";
 
+/// `ChildInfo.kind`: a session child, whose record is its node's.
+pub const CHILD_SESSION: &str = "session";
+/// `ChildInfo.kind`: a keyed child, whose record is a replicated row.
+pub const CHILD_INSTANCE: &str = "instance";
+
 /// `OwnerNotice.event` values.
 pub const EVENT_STOPPED: &str = "stopped";
 pub const EVENT_DESTROYED: &str = "destroyed";

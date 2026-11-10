@@ -1933,6 +1933,7 @@ async fn send_start(
         identity_epoch: 0,
         named: false,
         promoted_from: None,
+        owner: None,
     };
     let allocation = Allocation {
         id: 0,

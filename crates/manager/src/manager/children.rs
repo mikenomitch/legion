@@ -83,6 +83,11 @@ pub async fn resolve_owner(
             if instance.job_id != job_id || instance_ended(instance.state).is_some() {
                 return Err(not_found());
             }
+            if instance.owner.is_some() {
+                return Err(Status::failed_precondition(children::owner_is_child(
+                    &children::owner_ref(OWNER_INSTANCE, id),
+                )));
+            }
             let node_id = instance
                 .current_alloc_id
                 .and_then(|alloc| store.get_allocation_by_id(alloc).ok().flatten())
@@ -113,6 +118,15 @@ pub async fn resolve_owner(
                 // it, so the reference outlives a reschedule.
                 let owner = match allocation.instance_id.as_deref() {
                     Some(instance_id) if !instance_id.is_empty() => {
+                        let owned = store
+                            .get_instance(instance_id)
+                            .map_err(read)?
+                            .is_some_and(|instance| instance.owner.is_some());
+                        if owned {
+                            return Err(Status::failed_precondition(children::owner_is_child(
+                                &children::owner_ref(OWNER_INSTANCE, instance_id),
+                            )));
+                        }
                         children::owner_ref(OWNER_INSTANCE, instance_id)
                     }
                     _ => children::owner_ref(OWNER_ALLOCATION, &allocation_id.to_string()),
@@ -162,9 +176,40 @@ pub fn declaration<'a>(
     Ok(block)
 }
 
-/// An owner's children across the cluster, as every manager's session
-/// index lists them.
+/// An owner's children of both kinds: its session children across the
+/// cluster, then its keyed children from the store.
 pub async fn children_of(store: &Store, job_id: &str, owner: &OwnerRef) -> Vec<ChildInfo> {
+    let mut children = session_children_of(store, job_id, owner).await;
+    if children::raft_owned(owner) {
+        let keyed = store
+            .keyed_children_of(&children::owner_label(owner))
+            .unwrap_or_default();
+        children.extend(keyed.into_iter().map(|instance| {
+            let node_id = instance
+                .current_alloc_id
+                .and_then(|alloc| store.get_allocation_by_id(alloc).ok().flatten())
+                .map(|alloc| alloc.node_id)
+                .unwrap_or_default();
+            ChildInfo {
+                session_id: instance.instance_id,
+                task_name: instance.task_name,
+                node_id,
+                state: instance.state.to_string(),
+                reason: String::new(),
+                kind: children::CHILD_INSTANCE.into(),
+            }
+        }));
+    }
+    children
+}
+
+/// An owner's session children across the cluster, as every manager's
+/// session index lists them.
+pub async fn session_children_of(
+    store: &Store,
+    job_id: &str,
+    owner: &OwnerRef,
+) -> Vec<ChildInfo> {
     let mut found: HashMap<String, ChildInfo> = store
         .sessions()
         .children_of(&owner.kind, &owner.id)
@@ -207,6 +252,7 @@ fn child_info(node_id: &str, status: &SessionStatus) -> ChildInfo {
         node_id: node_id.to_string(),
         state: status.state.clone(),
         reason: String::new(),
+        kind: children::CHILD_SESSION.into(),
     }
 }
 
@@ -351,6 +397,47 @@ fn orphan_after(store: &Store, job_id: &str, child_task: &str) -> Duration {
         .unwrap_or(children::DEFAULT_ORPHAN_AFTER)
 }
 
+/// Record what one probe learned about a `session` owner that is not on its
+/// child's node, and decide whether the owner has ended:
+///
+/// - found: alive, and the clocks restart;
+/// - evicted by its node: ended, on the node's own word;
+/// - in no index: ended once that has held for `grace` (a session that just
+///   moved is briefly in no index);
+/// - its node does not answer: ended only once it has been unseen for
+///   `orphan_after`, the child task's `children.orphanAfter`.
+fn settle_probe(
+    entry: &mut RemoteOwner,
+    owner_id: &str,
+    located: &sessions::Located,
+    orphan_after: Duration,
+    grace: Duration,
+) {
+    match located {
+        sessions::Located::Found(_) => {
+            entry.seen = Instant::now();
+            entry.missing_since = None;
+        }
+        sessions::Located::Evicted(_) => {
+            entry.ended = Some(format!("session {owner_id} was evicted"));
+        }
+        sessions::Located::NotFound => {
+            let since = *entry.missing_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= grace {
+                entry.ended = Some(format!("session {owner_id} ended"));
+            }
+        }
+        sessions::Located::Unreachable(_) => {
+            if entry.seen.elapsed() >= orphan_after {
+                entry.ended = Some(format!(
+                    "session {owner_id} has not been reachable for {}",
+                    humantime::format_duration(Duration::from_secs(orphan_after.as_secs()))
+                ));
+            }
+        }
+    }
+}
+
 /// Ask where a `session` owner is, off the heartbeat path, and record the
 /// answer for the next beat.
 fn probe_remote_owner(store: &Store, owner_id: String, job_id: String, child_task: String) {
@@ -368,33 +455,7 @@ fn probe_remote_owner(store: &Store, owner_id: String, job_id: String, child_tas
             return;
         };
         entry.asking = false;
-        match located {
-            sessions::Located::Found(_) => {
-                entry.seen = Instant::now();
-                entry.missing_since = None;
-            }
-            // Evicted by its node: an end, on the node's own word.
-            sessions::Located::Evicted(_) => {
-                entry.ended = Some(format!("session {owner_id} was evicted"));
-            }
-            // No node and no manager has it. An end once that has held for
-            // the grace: a session that just moved is briefly in no index.
-            sessions::Located::NotFound => {
-                let since = *entry.missing_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= not_found_grace() {
-                    entry.ended = Some(format!("session {owner_id} ended"));
-                }
-            }
-            // Its node does not answer: an end only after `orphanAfter`.
-            sessions::Located::Unreachable(_) => {
-                if entry.seen.elapsed() >= after {
-                    entry.ended = Some(format!(
-                        "session {owner_id} has not been reachable for {}",
-                        humantime::format_duration(Duration::from_secs(after.as_secs()))
-                    ));
-                }
-            }
-        }
+        settle_probe(entry, &owner_id, &located, after, not_found_grace());
     };
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
@@ -550,6 +611,33 @@ pub fn owner_notices(store: &Store, node_id: &str) -> Vec<OwnerNotice> {
     notices
 }
 
+/// How often the scheduler lane's leader looks for keyed children whose
+/// owner ended without a cascade: an `allocation` owner that completed,
+/// failed, or was lost, or an instance owner ended by its job's stop or a
+/// scale-down. An instance owner's own stop and destroy never wait for
+/// this; they end its keyed children in the same entry.
+pub const KEYED_CHILD_SWEEP_EVERY: Duration = Duration::from_secs(5);
+
+/// One pass of the keyed-child sweep. Reads only, unless a child's owner
+/// has ended; then one scheduler-lane entry ends them all. Returns how many
+/// children it ended. A manager that does not lead the scheduler lane does
+/// nothing.
+pub fn sweep_keyed_children(store: &Store) -> anyhow::Result<usize> {
+    if !store.is_raft_leader(crate::storage::Lane::Scheduler) {
+        return Ok(0);
+    }
+    if store.orphaned_keyed_children()?.is_empty() {
+        return Ok(0);
+    }
+    let ended = store.end_orphaned_keyed_children()?;
+    for child in &ended {
+        crate::manager::telemetry::metrics()
+            .keyed_children_ended_total
+            .inc(&[child.end.as_str()]);
+    }
+    Ok(ended.len())
+}
+
 /// Whether a node's stream has anything to push: only nodes that report a
 /// child are ever looked at.
 pub fn node_has_children(store: &Store, node_id: &str) -> bool {
@@ -575,5 +663,77 @@ mod children_test {
         ] {
             assert_eq!(instance_ended(alive), None, "{alive:?} is not an end");
         }
+    }
+
+    fn watched(seen_ago: Duration) -> RemoteOwner {
+        let now = Instant::now();
+        RemoteOwner {
+            missing_since: None,
+            asked: now,
+            asking: true,
+            seen: now.checked_sub(seen_ago).expect("a recent instant"),
+            ended: None,
+        }
+    }
+
+    /// `children.orphanAfter`: an owner whose node does not answer has not
+    /// ended until it has been unseen that long, and an answer restarts
+    /// the clock.
+    #[test]
+    fn an_unreachable_owner_ends_only_after_orphan_after_test() {
+        let orphan_after = Duration::from_secs(600);
+        let grace = Duration::from_secs(20);
+        let unreachable = sessions::Located::Unreachable(Status::unavailable("no route"));
+
+        let mut entry = watched(Duration::from_secs(599));
+        settle_probe(&mut entry, "agent-1", &unreachable, orphan_after, grace);
+        assert_eq!(entry.ended, None, "a minute of silence is not an end");
+
+        let mut entry = watched(Duration::from_secs(601));
+        settle_probe(&mut entry, "agent-1", &unreachable, orphan_after, grace);
+        assert_eq!(
+            entry.ended.as_deref(),
+            Some("session agent-1 has not been reachable for 10m")
+        );
+
+        // A shorter orphanAfter on the task ends it sooner.
+        let mut entry = watched(Duration::from_secs(61));
+        settle_probe(&mut entry, "agent-1", &unreachable, Duration::from_secs(60), grace);
+        assert!(entry.ended.is_some());
+    }
+
+    #[test]
+    fn a_missing_owner_ends_after_the_grace_and_an_evicted_one_at_once_test() {
+        let orphan_after = Duration::from_secs(600);
+        let mut entry = watched(Duration::ZERO);
+        settle_probe(
+            &mut entry,
+            "agent-1",
+            &sessions::Located::NotFound,
+            orphan_after,
+            Duration::from_secs(20),
+        );
+        assert_eq!(entry.ended, None, "one miss is not an end");
+        assert!(entry.missing_since.is_some());
+        // Still missing once the grace has passed.
+        entry.missing_since = Instant::now().checked_sub(Duration::from_secs(21));
+        settle_probe(
+            &mut entry,
+            "agent-1",
+            &sessions::Located::NotFound,
+            orphan_after,
+            Duration::from_secs(20),
+        );
+        assert_eq!(entry.ended.as_deref(), Some("session agent-1 ended"));
+
+        let mut entry = watched(Duration::ZERO);
+        settle_probe(
+            &mut entry,
+            "agent-1",
+            &sessions::Located::Evicted("evicted".into()),
+            orphan_after,
+            Duration::from_secs(20),
+        );
+        assert_eq!(entry.ended.as_deref(), Some("session agent-1 was evicted"));
     }
 }

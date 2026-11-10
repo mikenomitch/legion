@@ -848,6 +848,8 @@ pub struct Metrics {
     pub session_stops_total: Arc<CounterVec>,
     /// `legion_session_promotions_total` (docs/metrics.md, "Sessions")
     pub session_promotions_total: Arc<Counter>,
+    /// `legion_keyed_children_ended_total{end}` (docs/metrics.md, "Sessions")
+    pub keyed_children_ended_total: Arc<CounterVec>,
     /// `legion_envelope_resizes_total{direction, outcome}` (docs/metrics.md,
     /// "Sessions"; elastic-session-envelopes plan §6.3)
     pub envelope_resizes_total: Arc<CounterVec>,
@@ -1411,6 +1413,14 @@ impl Metrics {
                 labels: &[],
             },
             cell: CounterCell::default(),
+        });
+        let keyed_children_ended_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_keyed_children_ended_total",
+                help: "Keyed children ended by the maintenance sweep because their owner ended some way other than an instance stop or destroy, by what was applied (stopped, destroyed).",
+                labels: &["end"],
+            },
+            series: Series::new(),
         });
         let node_cpu_used_millicores = Arc::new(GaugeVec {
             meta: FamilyMeta {
@@ -2052,6 +2062,7 @@ impl Metrics {
             Arc::clone(&session_runs_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_stops_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_promotions_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&keyed_children_ended_total) as Arc<dyn RenderMetric>,
             Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
@@ -2174,6 +2185,7 @@ impl Metrics {
             envelope_resizes_total,
             session_stops_total,
             session_promotions_total,
+            keyed_children_ended_total,
             allocations,
             namespace_jobs,
             namespace_allocations,
@@ -2328,6 +2340,9 @@ pub struct WorkerMetrics {
     /// `legion_derived_hits_total{kind}` — uses served by an entry already
     /// on the node.
     pub derived_hits_total: Arc<CounterVec>,
+    /// `legion_child_handoffs_total` — inbound connections an owner handed
+    /// to one of its children's ports (docs/child-sessions.md).
+    pub child_handoffs_total: Arc<Counter>,
     /// `legion_derived_bytes` — disk the derived class holds.
     pub derived_bytes: Arc<Gauge>,
     /// `legion_provisional_refused_total{reason}` — ratifications refused.
@@ -2475,6 +2490,14 @@ impl WorkerMetrics {
             },
             bounds: CHECKPOINT_DURATION_BUCKETS,
             series: Series::new(),
+        });
+        let child_handoffs_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_child_handoffs_total",
+                help: "Inbound connections an owner handed to one of its children's ports (docs/child-sessions.md).",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
         });
         let derived_hits_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -2774,6 +2797,7 @@ impl WorkerMetrics {
             Arc::clone(&derived_builds_total) as Arc<dyn RenderMetric>,
             Arc::clone(&derived_build_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&derived_hits_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&child_handoffs_total) as Arc<dyn RenderMetric>,
             Arc::clone(&derived_bytes) as Arc<dyn RenderMetric>,
             Arc::clone(&pressure_actions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&parks_total) as Arc<dyn RenderMetric>,
@@ -2795,6 +2819,7 @@ impl WorkerMetrics {
             derived_builds_total,
             derived_build_seconds,
             derived_hits_total,
+            child_handoffs_total,
             derived_bytes,
             provisional_refused_total,
             provisional_killed_total,

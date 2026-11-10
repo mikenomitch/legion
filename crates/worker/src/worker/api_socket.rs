@@ -74,6 +74,17 @@ pub struct WorkloadChannel {
     /// call that arrives before then is answered `Unavailable`.
     pub launch_pool: Arc<std::sync::OnceLock<Arc<crate::worker::launch_pool::LaunchPool>>>,
     pub node_id: String,
+    /// How the worker asks a manager for what only a manager can write (a
+    /// keyed child is a replicated row). `None` refuses those calls
+    /// `Unavailable`.
+    pub manager: Option<ManagerLink>,
+}
+
+/// The worker's own manager channel and the credential it attaches.
+#[derive(Clone)]
+pub struct ManagerLink {
+    pub channel: Channel,
+    pub credentials: Arc<crate::worker::daemon::WorkerCredentials>,
 }
 
 /// The `Workload` service as one allocation's socket serves it: every call
@@ -307,6 +318,60 @@ impl crate::structs::workload_server::Workload for AllocationWorkload {
             crate::structs::StopChildSessionReply { stopped },
         ))
     }
+
+    #[instrument(err, skip_all, fields(allocation_id = self.allocation_id, task))]
+    async fn create_child_instance(
+        &self,
+        request: tonic::Request<crate::structs::WorkloadCreateChildInstanceRequest>,
+    ) -> Result<tonic::Response<crate::structs::CreateInstanceReply>, tonic::Status> {
+        use tonic::Status;
+        // ACL: workload channel. The caller is the socket's allocation; the
+        // worker vouches for that to a manager, which applies the jobspec's
+        // `children` block. No credential of the caller's is read.
+        let request = request.into_inner();
+        let task_name = request.task_name.trim().to_string();
+        if task_name.is_empty() {
+            return Err(Status::invalid_argument(
+                "task_name is required: the keyed task to create a child of",
+            ));
+        }
+        tracing::Span::current().record("task", task_name.as_str());
+        let me = self.owner()?;
+        if me.owner.kind == crate::structs::children::OWNER_SESSION {
+            return Err(Status::failed_precondition(
+                crate::structs::children::keyed_child_of_session(&me.task.name, &task_name),
+            ));
+        }
+        if !me
+            .task
+            .children
+            .as_ref()
+            .is_some_and(|block| block.declares(&task_name))
+        {
+            return Err(Status::failed_precondition(
+                crate::structs::children::not_declared(&me.job_id, &me.task.name, &task_name),
+            ));
+        }
+        let link = self.channel.manager.clone().ok_or_else(|| {
+            Status::unavailable("this worker has no manager link for keyed children")
+        })?;
+        // The manager knows the allocation by its own id.
+        let allocation_id = self
+            .lock()?
+            .external_allocation_id(self.allocation_id)
+            .unwrap_or(self.allocation_id);
+        let mut client = crate::structs::manager_client::ManagerClient::new(link.channel);
+        let request = link.credentials.attach(tonic::Request::new(
+            crate::structs::CreateChildInstanceRequest {
+                node_id: self.channel.node_id.clone(),
+                allocation_id,
+                task_name,
+                instance_id: request.instance_id,
+                idempotency_key: request.idempotency_key,
+            },
+        ));
+        client.create_child_instance(request).await
+    }
 }
 
 impl AllocationWorkload {
@@ -368,6 +433,9 @@ pub struct AllocationSocket {
     path: PathBuf,
     token: Arc<StdRwLock<Option<String>>>,
     task: JoinHandle<()>,
+    /// The handoff socket and its listener, when the node serves the
+    /// workload channel.
+    handoff: Option<(PathBuf, JoinHandle<()>)>,
 }
 
 impl AllocationSocket {
@@ -392,6 +460,12 @@ impl AllocationSocket {
 impl Drop for AllocationSocket {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some((path, task)) = self.handoff.take() {
+            // Handoffs already spliced keep running until their
+            // connections close; only new ones stop.
+            task.abort();
+            let _ = std::fs::remove_file(path);
+        }
         if let Ok(mut current) = self.token.write() {
             *current = None;
         }
@@ -429,13 +503,43 @@ pub fn serve(
         token: token.clone(),
         workload,
     });
+    // Connection handoff has its own socket beside this one, because it
+    // passes a descriptor (see `worker::handoff`). Same directory, same
+    // admission.
+    let handoff = match proxy.context.workload.clone() {
+        Some(channel) => {
+            let listener = bind_beneath(
+                host_task_dir,
+                secrets,
+                crate::worker::handoff::HANDOFF_SOCKET_NAME,
+            )?;
+            let peer_check = proxy.context.peer_check.clone();
+            Some((
+                host_task_dir
+                    .join(secrets)
+                    .join(crate::worker::handoff::HANDOFF_SOCKET_NAME),
+                tokio::spawn(handoff_loop(
+                    listener,
+                    allocation_id,
+                    peer_check,
+                    channel.task_manager,
+                )),
+            ))
+        }
+        None => None,
+    };
     let task = tokio::spawn(accept_loop(listener, proxy));
     info!(
         allocation_id,
         path = %path.display(),
         "Serving the allocation's API socket"
     );
-    Ok(AllocationSocket { path, token, task })
+    Ok(AllocationSocket {
+        path,
+        token,
+        task,
+        handoff,
+    })
 }
 
 /// Bind a unix socket named `name` in `root/relative`, making the
@@ -532,6 +636,34 @@ async fn accept_loop(listener: UnixListener, proxy: Arc<Proxy>) {
                 debug!(error = %err, "API socket connection ended");
             }
         });
+    }
+}
+
+/// Accept connection handoffs for `allocation_id` (see `worker::handoff`).
+async fn handoff_loop(
+    listener: UnixListener,
+    allocation_id: i64,
+    peer_check: PeerCheck,
+    task_manager: Arc<Mutex<crate::worker::task_manager::WorkerTaskManager>>,
+) {
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                warn!(allocation_id, error = %err, "Handoff socket accept failed");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        if let Err(reason) = admit(&stream, allocation_id, &peer_check) {
+            warn!(allocation_id, "Refused a handoff connection: {reason}");
+            continue;
+        }
+        tokio::spawn(crate::worker::handoff::serve_connection(
+            stream,
+            allocation_id,
+            task_manager.clone(),
+        ));
     }
 }
 
@@ -720,6 +852,7 @@ mod api_socket_test {
             managers: None,
             peer_check: PeerCheck::FileMode,
             workload: workload.then(|| WorkloadChannel {
+                manager: None,
                 task_manager: task_manager.clone(),
                 launch_pool: launch_pool.clone(),
                 node_id: "node-1".into(),
