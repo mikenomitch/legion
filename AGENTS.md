@@ -18,7 +18,7 @@
 ## Build, Test, and Development Commands
 - Build crate and plugins: `cargo build` (requires `protoc`).
 - Release build: `cargo build --release`.
-- Shipping build: `cargo build --profile dist` — adds fat LTO and strips symbols, cutting the linux/amd64 binary from ~171 MB to ~97 MB at the cost of a slower build (~24 min against ~11 on 4 cores). Output is `target/dist/legion`. See "Building a shipping binary" in `internal_docs/development.md`.
+- Shipping build: `cargo build --profile dist` — adds fat LTO and strips symbols, cutting the linux/amd64 binary from ~160 MB to ~89 MB at the cost of a slower build (~24 min against ~11 on 4 cores). Output is `target/dist/legion`. See "Building a shipping binary" in `internal_docs/development.md`.
 - Run tests: `cargo test --all --locked`. While iterating, test one crate: `cargo test -p legion-worker <filter>` builds and runs the worker's unit tests without building the manager (`-p legion-common`, `-p legion-manager`, `-p legion-rs` likewise). A bare `cargo test --lib <filter>` still works and covers every crate.
 - Run manager: `cargo run -- start manager -c configs/manager.ncl`.
 - Run worker: `cargo run -- join <TOKEN>` or `cargo run -- start worker <TOKEN>`.

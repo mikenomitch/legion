@@ -92,8 +92,8 @@ const RELR_MIN_GLIBC: (u32, u32) = (2, 36);
 ///
 /// A position-independent executable carries one 24-byte relocation for every
 /// pointer in its data (vtables, string tables, statics), and the shipping
-/// build has ~120,000 of them. `-z pack-relative-relocs` stores them as a
-/// bitmap instead: 2.8 MB down to under 50 KB, with no change to the code.
+/// build has ~125,000 of them. `-z pack-relative-relocs` stores them as a
+/// bitmap instead: 3.0 MB down to 50 KB, with no change to the code.
 ///
 /// The catch is the loader. glibc reads the packed form from 2.36, and the
 /// linker marks the binary as needing it (`GLIBC_ABI_DT_RELR`), so on an

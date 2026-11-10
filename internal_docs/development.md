@@ -184,27 +184,31 @@ The binary lands in `target/dist/legion` rather than `target/release/legion`.
 
 Legion ships as one binary that is manager, worker, CLI, and MCP server, so
 size counts. The `dist` profile adds fat LTO, a single codegen unit, and
-symbol stripping on top of `release`, which is worth about 74 MB (measured
-2026-11-10 on linux/amd64, ~490 crates in the build, 4 vCPU / 16 GB):
+symbol stripping on top of `release`, which is worth about 70 MB (measured
+2026-11-10 on linux/amd64, ~470 crates in the build, 4 vCPU / 16 GB):
 
 | Build | Size | Clean build | Peak RSS | Largest single process |
 | --- | --- | --- | --- | --- |
-| `cargo build --release` | 171.2 MB | 11m 00s | 7.4 GB | 4.5 GB |
-| `cargo build --profile dist` | **97.3 MB** | 23m 46s | 9.8 GB | 7.8 GB (the LTO link) |
+| `cargo build --release` | 159.6 MB | 11m 00s | 7.4 GB | 4.5 GB |
+| `cargo build --profile dist` | **89.1 MB** | 23m 46s | 9.8 GB | 7.8 GB (the LTO link) |
 
 A little over half of the saving is `strip` removing the symbol tables
 (41 MB) and the rest is LTO collapsing dead code and duplicated generics
-(loaded sections 129.7 MB → 97.3 MB). Of the 97 MB, `.text` is 76.3 MB and
-unwind tables 8.6 MB.
+(loaded sections 118.7 MB → 89.1 MB). Of the 89 MB, `.text` is 71.6 MB and
+unwind tables 8.8 MB. The sizes are from after the size work described
+[below](#what-else-keeps-the-binary-small); the build times and memory are
+from just before it.
 
 As one crate, before the split into five
 ([the plan](plans/workspace-crate-split-plan.md#54-measured-before-and-after)),
-the `dist` binary was 91.5 MB: the split costs 5.8 MB, most likely generic
-code now instantiated once per crate. Its build took 35 minutes and 11.1 GB.
+the `dist` binary was 91.5 MB, and 97.3 MB after it: the split costs 5.8 MB,
+most likely generic code now instantiated once per crate. Its build took
+35 minutes and 11.1 GB.
 
 An earlier version of this page quoted 43.7 MB and 26.0 MB. Those were macOS
 arm64 numbers from an older, smaller tree, and the README's "~26 MB" came
-from them; why linux/amd64 is 3.5× that is an open item in TODO.md. For
+from them; [Finding what grew](#finding-what-grew) has where the difference
+came from. For
 context, the same kind of measurement for other orchestrators: k3s is
 81.5 MB, Nomad 150 MB (both embed a web UI, which Legion serves from disk),
 and a Kubernetes control-plane node (apiserver, controller manager,
@@ -222,6 +226,79 @@ Two things to know before reaching for it:
   crash report from a shipped build.
 
 The profile and the reasoning behind each setting live in `Cargo.toml`.
+
+#### What else keeps the binary small
+
+Three things besides the profile, worth 8.2 MB together on the `dist` binary
+(97.3 MB without them, 89.1 MB with). The reasoning, and the levers that were
+measured and left alone, are in
+[`calls/binary-size_calls.md`](calls/binary-size_calls.md).
+
+- **Packed relocations (2.9 MB).** `build.rs` links `legion` with
+  `-z pack-relative-relocs` when the build is native linux-gnu and the host's
+  glibc is 2.36 or newer, the first that can load the result. A binary built
+  that way does not start on an older glibc (`version 'GLIBC_ABI_DT_RELR' not
+  found`). Set `LEGION_PACK_RELATIVE_RELOCS=0` to build without it, or `=1` to
+  force it for a cross build. `readelf -S target/dist/legion | grep relr`
+  shows whether a binary has it.
+- **Cold crates built for size (about 3.3 MB).** Nickel, its bignum library,
+  and CEL are compiled with `opt-level = "s"` in every optimized profile
+  (`[profile.release.package.*]` in `Cargo.toml`). They only run when a config
+  file or a validation rule is read:
+  `legion job validate configs/jobs/maximal.ncl` takes 26 ms against 25 ms.
+  Add a crate there only if it is large and off the scheduler, storage, and
+  network paths, and time what it does before and after.
+- **Dependency features trimmed (about 1.9 MB).** `jsonschema` is built
+  without its default features, which were a CLI and resolvers for remote and
+  on-disk `$ref`s, and with them a second HTTP stack. wasmi's WebAssembly text
+  parser (`wat`) is on only for `legion-worker`'s tests.
+
+The last two were measured one at a time before the crate split; after it
+they are worth 5.3 MB together.
+
+#### Finding what grew
+
+Sizes move a megabyte at a time with ordinary feature work: each RPC costs
+40-100 KB of generated tonic, prost, and serde code. To see where a binary's
+bytes are, build `--release` (it keeps symbols) and rank them:
+
+```bash
+cargo build --release
+nm -S --size-sort -C target/release/legion | tail -50
+```
+
+To attribute growth between two commits, build each one, `strip` a copy, and
+compare file sizes; then group `nm` output by the crate prefix of each symbol
+to see which crate moved. Compare like with like: a `--release` delta is
+roughly 1.3 times the `dist` delta for the same change.
+
+Grouped that way, a `--release` build from 2026-11-08 (one crate, 94.6 MB of
+symbols) is mostly Legion's own code and the generic code instantiated for
+its types, not any one dependency:
+
+| Owner of the symbol | Size |
+| --- | --- |
+| `legion` | 28.2 MB |
+| `core` and `alloc` (generics instantiated for Legion's and other crates' types) | 20.9 MB |
+| Nickel: `nickel_lang_parser`, `nickel_lang_core`, `malachite_nz` | 7.8 MB |
+| `serde_json` | 5.2 MB |
+| `tonic` | 4.3 MB |
+| `tokio` | 2.9 MB |
+| `h2` and `hyper` | 2.6 MB |
+| `wasmi`, `wast`, `wasmparser` | 1.3 MB |
+| `openraft` | 0.9 MB |
+| `object_store`, `cel`, `oci_client`, `jsonschema` | 0.2-0.4 MB each |
+
+The history, stripped `--release` on linux/amd64:
+
+| When | Size | What moved it |
+| --- | --- | --- |
+| 2026-07-28 | 42.8 MB | the `dist` profile lands |
+| 2026-08-03 | 62.7 MB | Nickel replaces Jsonnet, #188 (+15.8 MB) |
+| 2026-09-28 | 68.4 MB | sandbox network handlers, #178 (+4.9 MB) |
+| 2026-10-12 | 85.4 MB | about twenty feature PRs in two days (+14.7 MB); suspend/resume, #15, is the largest (+5.0 MB) |
+| 2026-10-27 | 94.7 MB | the mesh surface, #51 (+4.9 MB) |
+| 2026-11-08 | 120.9 MB | apps, app objects and the autoscaler, #60 (+16.5 MB); the architecture review branch, #68 (+6.3 MB) |
 
 ### The guest binary (`legion-guest`)
 
