@@ -227,7 +227,11 @@ impl Cluster {
         for _ in 0..200 {
             let ready = {
                 let manager = self.task_manager.lock().expect("task manager");
-                manager.session_spec(JOB, "machine").is_some() && manager.has_allocation(web)
+                manager.session_spec(JOB, "machine").is_some()
+                    && manager.has_allocation(web)
+                    // Its process is up, so a later pid comparison is of
+                    // the same launch.
+                    && manager.allocation_pid(web).is_some()
             };
             if ready {
                 return Ok(());
