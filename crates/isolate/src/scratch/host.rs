@@ -135,7 +135,11 @@ impl ScratchCtx<'_> {
         Ok(ino)
     }
 
-    fn push(table: &mut ResourceTable, node: Node, flags: DescriptorFlags) -> FsResult<Resource<Descriptor>> {
+    fn push(
+        table: &mut ResourceTable,
+        node: Node,
+        flags: DescriptorFlags,
+    ) -> FsResult<Resource<Descriptor>> {
         Ok(table.push(Descriptor { node, flags })?)
     }
 }
@@ -182,7 +186,10 @@ impl types::HostDescriptor for ScratchCtx<'_> {
         Ok(self.table.push(stream)?)
     }
 
-    fn append_via_stream(&mut self, fd: Resource<Descriptor>) -> FsResult<Resource<DynOutputStream>> {
+    fn append_via_stream(
+        &mut self,
+        fd: Resource<Descriptor>,
+    ) -> FsResult<Resource<DynOutputStream>> {
         let file = self.descriptor(&fd)?.writable_file()?.clone();
         let stream: DynOutputStream = Box::new(FileWriter {
             file,

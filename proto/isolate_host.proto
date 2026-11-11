@@ -164,6 +164,14 @@ service IsolateHost {
   // (the session may still exist as a checkpoint the worker keeps).
   rpc GetSession (GetSessionRequest) returns (SessionInfo);
 
+  // Change one session isolate's memory ceiling and reservation in place
+  // (docs/resize.md). The ceiling applies to further growth: memory the
+  // instance already holds is never taken back, so a ceiling below its
+  // current size answers FAILED_PRECONDITION. NOT_FOUND when the host does
+  // not hold the session (a hibernated one is resized by the worker, in
+  // its record, and wakes with the new size).
+  rpc ResizeSession (ResizeSessionRequest) returns (ResizeSessionReply);
+
   // Give memory back: page out idle isolates, or hibernate idle session
   // isolates (which the host does by calling `IsolateWorker.SaveCheckpoint`).
   rpc Reclaim (ReclaimRequest) returns (ReclaimReply);
@@ -395,6 +403,10 @@ message OpenSessionRequest {
   string task_name = 2;
   string session_id = 3;
   string tenant = 4;
+  // A ceiling and reservation that differ from the task's (the session was
+  // resized, then hibernated or moved). 0 uses the task's.
+  uint64 memory_max_bytes = 5;
+  uint64 memory_reservation_bytes = 6;
 }
 
 message OpenSessionReply {
@@ -431,6 +443,22 @@ message SessionInfo {
   uint64 state_bytes = 9;
   // An invocation is running in it now.
   bool active = 10;
+}
+
+message ResizeSessionRequest {
+  string session_id = 1;
+  // The new cap on the isolate's linear memory and scratch files. 0 keeps
+  // the current one. At most the host's `slot_bytes`.
+  uint64 memory_max_bytes = 2;
+  // What the isolate is charged against the envelope from now on. 0 keeps
+  // the current one. The worker has already admitted the change.
+  uint64 memory_reservation_bytes = 3;
+}
+
+message ResizeSessionReply {
+  // The ceiling and reservation now in force.
+  uint64 memory_max_bytes = 1;
+  uint64 memory_reservation_bytes = 2;
 }
 
 enum ReclaimLevel {

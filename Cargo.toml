@@ -179,7 +179,9 @@ wasmi_core = { version = "=2.0.0", default-features = false, features = ["std"] 
 # guest-escape regression corpus). No default features: no Winch, no Pulley,
 # no profiling, no on-disk cache.
 wasmtime = { version = "=50.0.1", default-features = false, features = ["runtime", "cranelift", "pooling-allocator", "component-model", "async", "std", "anyhow", "memory-protection-keys", "parallel-compilation"] }
-wasmtime-wasi = { version = "=50.0.1" }
+# WASI 0.2 only: the host has no WASI 0.3 world yet, and `p3` would pull in
+# the engine's component-model-async machinery the host turns off.
+wasmtime-wasi = { version = "=50.0.1", default-features = false, features = ["p2"] }
 wasmtime-wasi-io = { version = "=50.0.1" }
 # No default features: the isolate host sends every outbound request to its
 # worker (`WasiHttpHooks::send_request`), so it links no HTTP/TLS client.
@@ -191,7 +193,7 @@ wasmparser = "0.263.0"
 seccompiler = "0.5.0"
 # The RNG traits wasmtime-wasi 50 takes (rand 0.10), for a per-instance,
 # kernel-seeded generator in the isolate host.
-rand_010 = { package = "rand", version = "0.10.3", default-features = false, features = ["std", "std_rng"] }
+rand_010 = { package = "rand", version = "0.10.3", default-features = false, features = ["std", "std_rng", "sys_rng"] }
 # WebAssembly text, for the isolate host's guest-escape regression corpus.
 wat = "1.263.0"
 # Key material is wiped from memory when dropped.

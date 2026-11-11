@@ -1216,6 +1216,30 @@ impl Worker for WorkerDaemonService {
         .map(Response::new)
     }
 
+    /// This node's isolate aggregates. Placeholder until the isolate
+    /// supervisor answers it.
+    #[instrument(err, skip_all)]
+    async fn get_isolate_stats(
+        &self,
+        request: Request<crate::structs::GetIsolateStatsRequest>,
+    ) -> Result<Response<crate::structs::GetIsolateStatsReply>, Status> {
+        // ACL: worker-plane. Caller class: manager.
+        crate::worker::plane::require_manager(&request, "GetIsolateStats")?;
+        Err(Status::unimplemented("isolate supervisor not wired"))
+    }
+
+    /// One session isolate on this node. Placeholder until the isolate
+    /// supervisor answers it.
+    #[instrument(err, skip_all)]
+    async fn get_isolate(
+        &self,
+        request: Request<crate::structs::GetIsolateRequest>,
+    ) -> Result<Response<crate::structs::GetIsolateReply>, Status> {
+        // ACL: worker-plane. Caller classes: manager, ticket.
+        crate::worker::plane::caller_of(&request, "GetIsolate")?;
+        Err(Status::unimplemented("isolate supervisor not wired"))
+    }
+
     /// End one session from a session ticket.
     #[instrument(err, skip_all, fields(session_id))]
     async fn stop_session(

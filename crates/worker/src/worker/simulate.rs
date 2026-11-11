@@ -898,6 +898,26 @@ impl Worker for SimWorkerService {
             "a simulated node runs no sessions",
         ))
     }
+
+    async fn get_isolate_stats(
+        &self,
+        _request: Request<crate::structs::GetIsolateStatsRequest>,
+    ) -> Result<Response<crate::structs::GetIsolateStatsReply>, Status> {
+        // ACL: worker-plane; a simulated node runs no isolates.
+        Err(Status::failed_precondition(
+            "a simulated node runs no isolates",
+        ))
+    }
+
+    async fn get_isolate(
+        &self,
+        _request: Request<crate::structs::GetIsolateRequest>,
+    ) -> Result<Response<crate::structs::GetIsolateReply>, Status> {
+        // ACL: worker-plane; a simulated node runs no isolates.
+        Err(Status::failed_precondition(
+            "a simulated node runs no isolates",
+        ))
+    }
 }
 
 /// A launched fleet: observability for tests and drivers, plus the point
@@ -1491,6 +1511,8 @@ async fn heartbeat_sim_node(
         exec_keys_version: String::new(),
         // Simulated nodes start nothing, so they refuse nothing.
         runtime_refusals: Vec::new(),
+        isolate_tasks: Vec::new(),
+        isolate_hosts: Vec::new(),
         pressure_actions: Vec::new(),
         net_denials: Vec::new(),
         net_status: Vec::new(),

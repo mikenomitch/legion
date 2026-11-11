@@ -31,7 +31,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 libc.workspace = true
 prost.workspace = true
-rand.workspace = true
+rand_010.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -40,13 +40,24 @@ tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+wasmparser.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 wasmtime-wasi-io.workspace = true
 wasmtime-wasi-http.workspace = true
 
+hyper-util.workspace = true
+tower.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
+seccompiler.workspace = true
+
+[features]
+# A test-only hook: `legion-isolate host --test-attempt <action>` performs a
+# forbidden action after confinement, so tests can assert it is refused.
+confinement-test = []
 
 [dev-dependencies]
 tempfile.workspace = true
+wat.workspace = true

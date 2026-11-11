@@ -12,7 +12,7 @@ interface control {
   /// How long an instance lives (the task's `config.lifetime`).
   enum lifetime { request, tenant, session }
 
-  record info {
+  record isolate-info {
     /// The job and task this isolate belongs to.
     job: string,
     task: string,
@@ -27,7 +27,7 @@ interface control {
     resumed: bool,
   }
 
-  info: func() -> info;
+  info: func() -> isolate-info;
 
   /// Report that the code needs something an isolate cannot do (a
   /// subprocess, a socket, a native package) and stop the run. Language

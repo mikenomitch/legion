@@ -546,6 +546,7 @@ pub async fn run_session(
                 command: prepared.command,
                 wall: prepared.run.wall_text,
                 output_bytes: prepared.run.output,
+                ..Default::default()
             }),
             ..Default::default()
         });

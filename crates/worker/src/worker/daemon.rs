@@ -2836,6 +2836,9 @@ pub async fn heartbeat_tick(
         let runtime_refusals_for_redrive = runtime_refusals.clone();
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
             runtime_refusals,
+            // Filled by the isolate supervisor (docs/task-runtime-isolate.md).
+            isolate_tasks: Vec::new(),
+            isolate_hosts: Vec::new(),
             // What the node holds of its endpoint feed, so the reply carries
             // only what changed (mesh-control-path plan §6.1).
             endpoint_feed: Some(netd.feed_report()),
