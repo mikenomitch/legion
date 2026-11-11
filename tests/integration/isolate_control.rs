@@ -844,7 +844,7 @@ async fn a_session_isolate_is_reached_by_the_tag_in_its_id_test() -> R<()> {
         .expect_err("the node holds no such isolate");
     assert_eq!(err.code(), Code::NotFound, "{err:?}");
 
-    // Promotion: FAILED_PRECONDITION with the calls-entry-24 text, and no
+    // Promotion: FAILED_PRECONDITION with the calls-entry-34 text, and no
     // instance row.
     let err = cluster
         .svc

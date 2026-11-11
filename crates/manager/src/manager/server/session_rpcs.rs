@@ -1159,7 +1159,7 @@ impl ManagerDaemonService {
                 ))
             })?;
         // An isolate session is never a keyed instance (isolate-runtime
-        // calls entry 24): refused before any write.
+        // calls entry 34): refused before any write.
         crate::structs::session::promotable(&task).map_err(Status::failed_precondition)?;
         if !new_id.is_empty() && !crate::structs::session::accepts_names(&task) {
             return Err(Status::invalid_argument(format!(

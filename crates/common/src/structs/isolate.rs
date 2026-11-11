@@ -40,7 +40,7 @@ pub const ISOLATE_RUNTIME: &str = "isolate";
 pub const ISOLATES_CAPABILITY: &str = "isolates";
 
 /// Default `resources.memoryMax` for an isolate, in MiB: the cap on its
-/// linear memory (calls entry 45).
+/// linear memory (calls entry 59).
 pub const DEFAULT_MEMORY_MAX_MIB: u64 = 128;
 
 /// The largest `resources.memoryMax` an isolate may declare, in MiB: a
@@ -503,7 +503,7 @@ impl IsolateTaskConfig {
     }
 }
 
-/// The error for a missing `limits.cpu` or `limits.wall` (calls entry 45).
+/// The error for a missing `limits.cpu` or `limits.wall` (calls entry 59).
 const LIMITS_REQUIRED: &str = "config.limits.cpu and config.limits.wall are required (budgets \
                                differ by orders of magnitude between a webhook and an agent \
                                loop; there is no default)";
@@ -764,7 +764,7 @@ pub fn validate_tenant_key(key: &str) -> Result<(), String> {
 }
 
 /// The error `instance promote` answers for an isolate session (calls entry
-/// 24), when `task` is an isolate task. `legion:isolate/state` is not named:
+/// 34), when `task` is an isolate task. `legion:isolate/state` is not named:
 /// it is checkpointed on the session's node only, so it does not outlive it.
 pub fn promote_refusal(task: &TaskConfig) -> Option<String> {
     is_isolate_task(task).then(|| PROMOTE_REFUSAL.to_string())
@@ -864,7 +864,7 @@ fn validate_isolate_task(config: &JobConfig, task: &TaskConfig) -> Result<(), St
         ));
     }
 
-    // Promotion never applies (calls entry 24).
+    // Promotion never applies (calls entry 34).
     if task
         .stateful
         .as_ref()

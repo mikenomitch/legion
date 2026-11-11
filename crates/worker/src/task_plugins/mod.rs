@@ -1781,6 +1781,8 @@ fn tiny_cpu_warning(task: &TaskConfig) -> Option<String> {
 /// | `container` | `network.mode = "host"`, `security.userNamespace = false`, or `security.seccomp = "unconfined"` |
 /// | `sandbox` | `hypervisor = "dev"` (a container standing in for a VM) |
 /// | `noop` | never: it runs nothing |
+/// | `isolate` | never by runtime: WebAssembly in a self-confining host process |
+/// | `envelope` | never: a session task's generated envelope starts nothing; the session task is classified itself |
 /// | anything else | always: a plugin Legion cannot classify runs code on the host |
 /// | any runtime | an `exec` health check: the worker runs its command on the host |
 /// | any runtime | an artifact (or `image`) is a `file://` source or a local git repository: the root worker copies node files into the task |
@@ -1981,6 +1983,15 @@ fn runtime_host_level_reason(task: &crate::structs::TaskConfig) -> Option<String
         // seccomp, Landlock) and holds no credentials. A `file://` module
         // reads node files, which `node_reaching_reason` reports.
         crate::structs::isolate::ISOLATE_RUNTIME => None,
+        // A session task's generated envelope starts nothing: it holds room
+        // on a node (and, for an isolate task, binds that task's gated
+        // datapath). Parsing generates it from the session task, which is
+        // in the same job and classified on its own, and refuses any other
+        // task on this runtime (`session::normalize_session_tasks`). Read as
+        // an unknown plugin it made every session task host-level, so an
+        // isolate task (always a session task) needed `host = true` even
+        // where this table says the isolate runtime does not.
+        crate::structs::session::ENVELOPE_RUNTIME => None,
         other => Some(format!(
             "{name:?} uses runtime {other:?}, a plugin whose isolation Legion cannot vouch for"
         )),
@@ -2886,6 +2897,41 @@ mod tests {
         };
         let reason = task_host_level_reason(&local).expect("file module");
         assert!(reason.contains("isolate module"), "{reason}");
+        Ok(())
+    }
+
+    /// A session task's generated envelope is not host-level: the session
+    /// task decides. A parsed isolate job (an isolate task is always a
+    /// session task) is host-level only through its `file://` module.
+    #[test]
+    fn a_session_tasks_envelope_is_not_host_level_test() -> R<()> {
+        let job = |source: &str| -> R<crate::structs::job::JobConfig> {
+            Ok(serde_json::from_value(json!({
+                "name": "runner",
+                "task": {
+                    "name": "run",
+                    "runtime": "isolate",
+                    "config": {
+                        "module": { "source": source, "sha256": "a".repeat(64) },
+                        "limits": { "cpu": "50ms", "wall": "5s" },
+                    },
+                    "stateful": {
+                        "mode": "session",
+                        "envelope": { "resources": { "cpu": 1000, "memory": 1024 } },
+                    },
+                },
+            }))?)
+        };
+        let remote = job("https://example.com/handler.wasm")?;
+        assert_eq!(remote.tasks.len(), 2, "the task and its envelope");
+        assert_eq!(remote.tasks.iter().find_map(task_host_level_reason), None);
+        let local = job("file:///srv/handler.wasm")?;
+        let reason = local
+            .tasks
+            .iter()
+            .find_map(task_host_level_reason)
+            .expect("file module");
+        assert!(reason.starts_with("\"run\" fetches its isolate module"), "{reason}");
         Ok(())
     }
 

@@ -626,12 +626,19 @@ pub(crate) mod cluster {
                 config_attrs: json!({
                     "node_id": NODE,
                     "maxAllocations": 50,
-                    "resources": { "memory": 65536, "cpu": 40000 },
                     "workerAddress": format!("https://{address}"),
                 }),
+                // The scheduler sizes a node's `cpu` and `memory` from its
+                // fingerprint (`ResourcePool::from_node`; a `cpu`/`memory`
+                // under `config_attrs.resources` is ignored), so this is
+                // the node's size: 16 cores of 2500 MHz (40000) and
+                // 64 GiB. One core of 2000 MHz held only two 1000-MHz
+                // envelopes, and a job's third session task went unplaced.
                 fingerprint_attrs: json!({
                     "memory_total": "68719476736",
-                    "cpus": { "cpu-1": { "frequency": 2000.0 } },
+                    "cpus": (1..=16)
+                        .map(|core| (format!("cpu-{core}"), json!({ "frequency": 2500.0 })))
+                        .collect::<serde_json::Map<String, Value>>(),
                 }),
                 dynamic_attrs: json!({
                     "capabilities": ["sessions", "isolates"],
@@ -1617,41 +1624,35 @@ mod http_e2e {
     }
 }
 
-// REPRO-ENVELOPES (temporary investigation)
-fn repro_exec_session(name: &str) -> Value {
-    let mut task = machine("exec");
-    task["name"] = json!(name);
-    task
-}
 
-fn repro_placed(cluster: &Cluster) -> Vec<(String, Vec<String>)> {
-    let mut placed: Vec<(String, Vec<String>)> = cluster
+/// Every session task of a job gets its envelope on the node: three isolate
+/// tasks and an `exec` session task, each envelope 1000 MHz.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_session_task_of_a_job_gets_its_envelope() -> legion::prelude::R<()> {
+    let mut tasks = Vec::new();
+    for name in ["a", "b", "c"] {
+        let mut task = isolate_task(json!({ "image": "python", "lifetime": "request" }));
+        task["name"] = json!(name);
+        tasks.push(task);
+    }
+    let mut vm = machine("exec");
+    vm["stateful"]["envelope"]["resources"] = json!({ "cpu": 1000, "memory": 512 });
+    tasks.push(vm);
+    let cluster = Cluster::start(Images::Fixture("runner.wasm"), Value::Array(tasks)).await?;
+    let mut placed: Vec<String> = cluster
         .store()
-        .task_allocation_nodes(&[JOB.to_string()])
-        .unwrap()
+        .task_allocation_nodes(&[JOB.to_string()])?
         .into_iter()
-        .map(|((_, _, task), nodes)| (task, nodes))
+        .map(|((_, _, task), nodes)| format!("{task}@{}", nodes.join(",")))
         .collect();
     placed.sort();
-    placed
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn repro_three_exec_session_tasks() -> legion::prelude::R<()> {
-    let cluster = Cluster::start(
-        Images::Fixture("runner.wasm"),
-        json!([
-            repro_exec_session("a"),
-            repro_exec_session("b"),
-            repro_exec_session("c")
-        ]),
-    )
-    .await?;
-    eprintln!("REPRO placed after submit: {:?}", repro_placed(&cluster));
+    assert_eq!(
+        placed,
+        ["a-envelope@w-iso", "b-envelope@w-iso", "c-envelope@w-iso", "machine-envelope@w-iso"]
+    );
     for task in ["a", "b", "c"] {
-        let r = cluster.wait_for(task, false).await;
-        eprintln!("REPRO wait_for {task}: {r:?}");
+        cluster.wait_for(task, true).await?;
     }
-    eprintln!("REPRO placed at end: {:?}", repro_placed(&cluster));
+    cluster.wait_for("machine", false).await?;
     Ok(())
 }

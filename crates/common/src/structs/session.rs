@@ -464,7 +464,7 @@ fn carry_isolate_datapath(task: &TaskConfig, envelope: &mut TaskConfig) -> R<()>
 }
 
 /// Whether a session of `task` may be promoted to a keyed instance. An
-/// isolate session may not (isolate-runtime calls entry 24): the error is
+/// isolate session may not (isolate-runtime calls entry 34): the error is
 /// the `FAILED_PRECONDITION` text `instance promote` answers.
 pub fn promotable(task: &TaskConfig) -> Result<(), String> {
     match crate::structs::isolate::promote_refusal(task) {

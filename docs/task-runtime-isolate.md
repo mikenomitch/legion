@@ -296,7 +296,8 @@ with --tier vm)")`. It does not stop the run.
 Without `config.entry`, every run brings its code: the file named
 `main.<ext>` (`main.mjs` then `main.js` for `js`, `main.py` for `python`),
 else the first file the run sends. With `config.entry`, the task delivers
-one script through its `artifacts` and a run that sends no files runs it:
+one script through its `artifacts`, and that script is the entry of every
+run:
 
 ```nickel
 config = { image = "python", entry = "main.py", limits = { cpu = "100ms", wall = "5s" } },
@@ -306,9 +307,27 @@ artifacts = [{ source = "https://example.com/handlers/main.py", dest = "main.py"
 `entry` is a path relative to the task directory where the artifacts are
 staged, or `${artifact.<name>}`. Artifacts on an isolate task exist only to
 deliver the entry: an isolate task with artifacts and no `entry` is refused.
-A run that sends files takes its entry from them by the rule above, even
-when the task sets `config.entry`, so send data files only to a task whose
-runs bring their own code.
+
+- **The files a run sends are data.** They are staged beside the entry
+  under `/legion/run` and never picked as the entry. A run file with the
+  entry's own name is refused:
+
+  ```text
+  INVALID_ARGUMENT file main.py has the name of task run's config.entry, which is the entry of every run; the run's files are data
+  Hint: rename the file
+  ```
+
+- **VM-tier runs get the entry too,** staged as the image's VM entry
+  (`/legion/run/main.py` or `/legion/run/main.mjs`).
+- **The node reads the entry without following links.** It opens each
+  path component beneath the staging directory with no symlink followed
+  (`..` and absolute paths refused), and takes only a regular file of at
+  most 3 MiB. Anything else leaves the task unable to run on that node,
+  with a `problem` that runs answer as `FAILED_PRECONDITION`:
+
+  ```text
+  config.entry "src/main.py" cannot be used: main.py is a symlink (or reached through one), which an entry may not be
+  ```
 
 ### Modules
 
@@ -376,7 +395,7 @@ isolates never use more than its envelope holds. `resources.cores` and
 | `network.ports`, an egress policy (`network.egress`), `connect` | Allowed: they are bound for the envelope allocation, gated ([HTTP handlers](#http-handlers), [Outbound HTTP](#outbound-http)). `network.mode` may only be unset, `auto`, or `gated`. `connect.templates` is refused. |
 | `service` | Refused: isolates take requests on `network.ports` through their envelope, which registers no service. |
 | `run` | Refused: an isolate task takes [runs](#runs) without one. Put `run.command` on the VM task. |
-| `suspend` | Only with `lifetime = "session"`. `idle`, `keepFor`, `durability = "local"`, `onWorkerStop`, `onPressure`, `onRestoreFailure`, and `resumeTimeout` are accepted; `checkpoint`, `checkpointEvery`, `archive`, `park`, `onResume`, and `wake` are refused, and so is `durability = "store"` ([Current scope](#current-scope-and-limitations)). |
+| `suspend` | Only with `lifetime = "session"`. `idle`, `keepFor`, `durability = "local"`, `onPressure`, `onRestoreFailure`, and `resumeTimeout` are accepted; `checkpoint`, `checkpointEvery`, `archive`, `park`, `onResume`, `wake`, and `onWorkerStop` are refused (a stopping worker always hibernates its session isolates), and so is `durability = "store"` ([Current scope](#current-scope-and-limitations)). |
 | `children` | Allowed: lists the VM task (required for `vm.task`) and caps [child VMs](#child-vms) with `max`. |
 | `artifacts` | Only to deliver `config.entry`. |
 | `resources.cores`, `resources.devices` | Refused. |
@@ -402,6 +421,8 @@ Hint: remove run; put run.command on the VM task (config.vm.task) instead
 [isolate] code-runner/machine: config.vm.task of code-runner/run names machine, which has no run block; add run.command so tier = "vm" runs know what to execute
 [isolate] code-runner/run: suspend applies to session isolates only, and config.lifetime is "request": only a session isolate has an id to suspend under and wake by
 Hint: set config.lifetime = "session", or remove suspend
+[isolate] code-runner/notebook: suspend.onWorkerStop does not apply to an isolate: a worker that stops always hibernates its session isolates (their state is checkpointed and they wake on their next call on that node)
+Hint: remove suspend.onWorkerStop
 [isolate] code-runner/notebook: suspend.durability = "store" is not available for isolates yet: a session isolate's checkpoint stays on the node that took it, so it wakes only there and is lost with the node
 Hint: remove suspend.durability (the default is "local"), and keep what must outlive the node in an upstream store
 task run is an isolate task and declares a service. Isolates take requests on network.ports through their envelope, which registers no service
@@ -436,6 +457,24 @@ belongs to the task's anonymous tenant. The key picks the warm instance of a
 `tenant` task, and every lifetime uses it for fairness: a node schedules
 turns per tenant, so one tenant's burst does not starve another's.
 
+**A tenant key is a routing key, not an identity.** The caller chooses
+it, and Legion does not check it: anyone who may run code in the task,
+and any HTTP client of a port the task advertises, can name any tenant
+and reach that tenant's warm instance and its `state`. When the tenant
+must follow an authenticated user, put an ingress handler in front that
+removes the client's `Legion-Tenant` and sets its own. A request that
+carries `Legion-Tenant` or `Legion-Session` more than once is refused with
+`400` (`Legion-Tenant may appear at most once in a request`).
+
+A call in a session isolate always uses the session's tenant. A run or
+request that names a session and a different tenant is refused
+(`INVALID_ARGUMENT`, `400` over HTTP); one that names no tenant is fine:
+
+```text
+INVALID_ARGUMENT session isolate notebook-q4n7c2rd.01jc3... belongs to tenant "acme", not tenant "other"; a call in a session uses the session's tenant
+Hint: drop the tenant (Legion-Tenant), or start a session for that tenant
+```
+
 ### Session isolates
 
 A task with `lifetime = "session"` has addressable isolates, started like any
@@ -460,11 +499,22 @@ $ legion instance stop notebook-q4n7c2rd.01jc3...
   `session run` and `isolate get` take `--on-node NODE` for it, and the
   `instance` verbs cannot find it.
 - **Starting one on a task of another lifetime** is refused with
-  `FAILED_PRECONDITION` and a hint to use `legion session run`.
-- **No promotion.** `instance promote` answers `FAILED_PRECONDITION` ("isolate
-  sessions cannot be promoted"). `--id` on `instance create` is refused.
-  For a session that survives a node, keep what matters in an external
-  store: hibernation checkpoints stay on the node that took them.
+  `FAILED_PRECONDITION` and a hint to use `legion session run`, and so is
+  a run with `--session` on such a task.
+- **No promotion.** `instance promote` answers `FAILED_PRECONDITION`:
+
+  ```text
+  isolate sessions cannot be promoted (a keyed instance is an allocation each); give the session a stable id with an idempotency key, and keep what must outlive its node in an upstream store
+  ```
+
+  `--id` on `instance create` is refused. Hibernation checkpoints stay on
+  the node that took them, so `legion.state` does not outlive the node
+  either.
+- **Ids you may not read do not exist for you.** A caller who cannot read
+  the session's job gets the same `NOT_FOUND` from `instance get`,
+  `stop`, `suspend`, `start`, `resize`, `promote`, and `isolate get` as for
+  an id no node holds. A caller who can read the job but lacks the verb's
+  permission gets `PERMISSION_DENIED`.
 - **A keyed start retried through another manager** can start a second
   isolate on another node (each manager remembers the node of a keyed start
   for 10 minutes).
@@ -501,13 +551,15 @@ isolate task with no `run` block. The general rules are in
    in-memory filesystem, with `--input` as `input.json`. The 3 MiB limit on
    files plus input applies. The environment has `LEGION_RUN_DIR`,
    `LEGION_RUN_INPUT` (with input), and `LEGION_RUN_ENTRY` (with an entry).
-2. **Entry.** `main.<ext>` if the run sends one, else the first file, else
-   the task's `config.entry`.
+2. **Entry.** The task's `config.entry` when it has one (the run's files
+   are then data); otherwise `main.<ext>` if the run sends one, else the
+   first file.
 3. **Execute.** Under `config.limits`. `--arg ARG` (repeatable, `args` in the
    API, at most 64 and 64 KiB together) is passed to the code: `sys.argv[1:]`,
    `process.argv.slice(2)`, or the program arguments after the task name for
-   a command component. `--command` is refused: an isolate runs the code the
-   run sends.
+   a command component. In the VM tier the rule is narrower
+   ([The VM task](#the-vm-task)). `--command` is refused: an isolate runs
+   the code the run sends.
 4. **Collect.** stdout and stderr share `limits.output`, then the `--get`
    files take what is left, in request order, each cut and marked
    `truncated` when it does not fit. `result` is the runner's result (an
@@ -598,10 +650,23 @@ listed in the isolate task's `children.tasks`. A `vm` run is a
 [session run](session-runs.md) of it on the same node the router picked for
 the isolate task:
 
-- the entry is staged as `/legion/run/main.py` (`python`) or
-  `/legion/run/main.mjs` (`js`), the other files under their own names, and
-  `--input` as `input.json`;
-- `--arg` values are appended to the VM task's own `run.command`;
+- the entry (the run's, or the task's `config.entry`) is staged as
+  `/legion/run/main.py` (`python`) or `/legion/run/main.mjs` (`js`), the
+  other files under their own names, and `--input` as `input.json`;
+- `--arg` values are appended to the VM task's own `run.command` **only
+  when that command ends with the entry's path**
+  (`["python3", "/legion/run/main.py"]`), so they are always the script's
+  own arguments. A run with arguments that would go to a VM task whose
+  command ends otherwise is refused before anything runs, also when
+  `auto` picked the VM:
+
+  ```text
+  FAILED_PRECONDITION task machine's run.command does not end with /legion/run/main.py, so arguments cannot be passed to it safely; the run carries 2 args
+  Hint: end the VM task's run.command with /legion/run/main.py (e.g. ["python3", "/legion/run/main.py"]), read LEGION_RUN_ARGS in a wrapper, or send the arguments in --input
+  ```
+
+- every VM-tier run gets `LEGION_RUN_ARGS`, the arguments as a JSON array
+  (`[]` without any), for a wrapper command to read;
 - the VM task's `run.wall` and `run.output` apply, not `config.limits`;
 - the reply's `task` and `sessionId` are the VM task's, and `vmMs` is the
   time to the reply minus the command's own run time (the VM's start and the
@@ -638,7 +703,11 @@ m.release()
   id: <session id>}`: they outlive its invocations and its hibernation, and
   a later invocation re-attaches with `legion.vm.attach(id)` (keep the id in
   `state`). A request or tenant isolate owns them as `{kind: "isolate", id:
-  <invocation id>}`: they end when the invocation does.
+  <invocation id>}`: they end when the invocation does. An owner is bound to
+  its job and task, and the node acts on a child only for a session it
+  holds, or an invocation it has in flight, for that job and task in the
+  asking host's cordon. A host, even a compromised one, cannot reach
+  another cordon's children by learning their ids.
 - **Bounds.** The isolate task's `children.max` caps children per owner,
   and the VM task's envelope admits them. A full envelope is
   `resource-exhausted` (retryable).
@@ -840,7 +909,10 @@ task's ports:
   scheme as `http`.
 - `Legion-Tenant` names the tenant and `Legion-Session` the session isolate
   (for `lifetime = "session"`); both are removed before the guest sees the
-  request. A `Legion-Tenant` that is not a valid key is `400`.
+  request. A `Legion-Tenant` that is not a valid key, either header given
+  more than once, or a `Legion-Tenant` that differs from the named
+  session's tenant is `400`. The tenant key is the client's claim, not an
+  identity ([Tenants](#tenants)).
 - Bodies are buffered whole in both directions, up to the worker's
   `isolate.maxBodyBytes` (16 MiB by default); a larger request is `413`.
 - `config.limits` applies to each request.
@@ -875,11 +947,23 @@ envelope allocation's datapath:
   public web roots. A denial reaches the guest as `http-request-denied`.
 - **Limits.** Bodies are buffered whole, both ways, up to
   `isolate.maxBodyBytes` (`http-request-body-size` or
-  `http-response-body-size` past it). A request's
-  timeout is the invocation's remaining wall time, or shorter when the guest
-  sets one. Hop-by-hop headers, `Host`, `Content-Length`, `Legion-Tenant`,
-  and `Legion-Session` are not forwarded. HTTP/1.1 to origins; no connection
-  pooling.
+  `http-response-body-size` past it). At most 8 requests per invocation
+  are in flight; more wait their turn (so `Promise.all` over 100 URLs runs
+  8 at a time within the wall limit). A request's timeout is the
+  invocation's remaining wall time, or shorter when the guest sets one, and
+  a request still pending when its invocation ends fails with "the
+  invocation ended before the response arrived", even in a tenant or
+  session instance that stays warm. Hop-by-hop headers, `Host`,
+  `Content-Length`, `Legion-Tenant`, and `Legion-Session` are not
+  forwarded. HTTP/1.1 to origins; no connection pooling.
+- **What injection does not hide.** The credential never enters the
+  isolate's process, but an upstream that echoes request headers back (a
+  debug endpoint, some error pages) returns it in a response body the
+  guest can read. And a host serves every isolate task of its cordon, so
+  an escape from one isolate could send requests as any of those tasks,
+  through their upstreams and with their credentials, without ever
+  reading one: the cordon is the trust unit
+  ([Cordons](#cordons-who-shares-a-process)).
 - **Attribution.** `legion net denials` names the isolate task (the
   envelope's identity is reported as the task the job declares), not the
   isolate or tenant.

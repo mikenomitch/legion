@@ -351,6 +351,13 @@ worker at it with `isolate.binary` or `LEGION_ISOLATE_BINARY` (that order:
 config, beside the worker, env var). A worker that finds a working binary
 advertises the `isolates` capability. No release ships it yet.
 
+The worker runs `legion-isolate compile --input <file> --output <file>
+--confine <isolate.confine>` once per module; `--confine` is `enforce`,
+`best-effort`, or `off` and defaults to `enforce`, so running the compiler
+by hand on a machine without unprivileged user namespaces or Landlock
+needs `--confine best-effort` (it prints `{"ok":false,"kind":"confinement",
+...}` and exits 3 otherwise).
+
 **The language images** (`js`, `python`) are not checked in and CI does
 not build them:
 
@@ -380,18 +387,24 @@ rebuild. Images ship as `isolate-images/` beside the binary (or
 **Running the isolate tests locally:**
 
 ```bash
-# The host library: run, admission, lifetimes, http, scratch, binary, escape corpus
-cargo test -p legion-isolate -j 3
+# The host library: run, admission, lifetimes, http, scratch, binary, escape corpus.
+# With the feature, binary.rs also runs the confinement tests: forbidden
+# syscalls, each layer alone (--test-skip), stray descriptors, the PID
+# namespace, the compiler's --confine. Without it they are ignored.
+cargo test -p legion-isolate -j 3 --features confinement-test
 
-# Confinement: the binary spawn tests that attempt forbidden syscalls
-cargo test -p legion-isolate -j 3 --features confinement-test --test binary
+# Both images compiled and served by the real confined binary (ignored;
+# build the images first)
+cargo test -p legion-isolate -j 3 --features confinement-test --test binary \
+  -- --ignored both_language_images_run_in_the_confined_binary_test
 
 # The language images (ignored by default; build them first)
 crates/isolate/images/build.sh
 cargo test -p legion-isolate -j 3 --test images -- --ignored --nocapture
 #   LEGION_ISOLATE_IMAGES=<dir> to use images other than target/isolate-images
 
-# The worker side against the real binary, and the control plane
+# The worker side against the real binary, the whole stack through a
+# manager (the `cluster` harness in isolate.rs), and the control plane
 cargo test --test integration -j 3 isolate:: isolate_control::
 
 # The images through manager -> worker -> host (ignored; build images first,
@@ -413,11 +426,16 @@ they fail, never skip, when they cannot get it. The VM-tier tests that
 need a real sandbox session run are ignored ("needs /dev/kvm"); the Linux
 dev sandbox backend takes no exec, so the others use an `exec` session task
 stored straight into the store as a stand-in VM task. Hosts in tests confine
-themselves with `best-effort`. `LEGION_ISOLATE_SECCOMP=log` turns the
-host's seccomp kills into log entries when chasing a missing syscall.
-`scratch::language_images_run_on_scratch_test` is ignored and still points
-at the Phase 0 spike's image components (`runner-py.wasm`,
-`runner-js.wasm`), which are not in the repo.
+themselves with `best-effort`, which in the build container applied all
+eight layers. `LEGION_ISOLATE_SECCOMP=log` turns the host's (and the
+compiler's) seccomp kills into log entries when chasing a missing syscall;
+the allowlists were found with `strace -f --decode-pids=pidns` over the
+binary suite and both images. The test-only `--test-skip
+seccomp,pidns,scopes,mount,landlock` flag on `host` and `compile` exists
+only in a `--features confinement-test` build. The end-to-end timing
+(`isolate_images::hello_world_end_to_end_timing`) prints its numbers with
+`--nocapture`; with a debug `legion-isolate` it measures debug builds, and
+the first Python run then compiles the image for about a minute.
 
 **The guest fixtures** (`crates/isolate/tests/fixtures/{cmd,runner,handler,fs}.wasm`)
 are checked in, because CI has no wasm target. Rebuild them after changing

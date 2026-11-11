@@ -22,7 +22,7 @@ Not built, and why:
   2026-11-11:* built with the [isolate runtime](isolate-runtime-plan.md),
   except `--source`: an isolate run executes the files it is sent
   (`main.<ext>`, else the first). It also added `tenant`, `session_id`, and
-  `args` ([isolate calls entry 27](../calls/isolate-runtime-plan_calls.md#27-runs-gained-tenant-session_id-and-args)).
+  `args` ([isolate calls entry 39](../calls/isolate-runtime-plan_calls.md#39-runs-gained-tenant-session_id-and-args)).
 - **Sibling runs over the API socket.** The call is served, but only the
   child-sessions plan's `children.tasks` can declare that one task may run
   another (calls entry 14).

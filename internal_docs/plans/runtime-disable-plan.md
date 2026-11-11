@@ -24,7 +24,7 @@ What was built, and where it differs from the text below:
   isolate runtime's behavior, and that runtime does not exist. The state it
   needs is delivered: a worker's `RuntimeGate` holds the set. *Update
   2026-11-11:* built with the [isolate runtime](isolate-runtime-plan.md)
-  ([isolate calls entry 31](../calls/isolate-runtime-plan_calls.md#31-disabling-the-isolate-runtime-the-node-decides-when-a-vm-can-take-the-run-and-a-drain-hibernates-only-what-it-covers)),
+  ([isolate calls entry 43](../calls/isolate-runtime-plan_calls.md#43-disabling-the-isolate-runtime-the-node-decides-when-a-vm-can-take-the-run-and-a-drain-hibernates-only-what-it-covers)),
   which also fixed the session-task match in the eval loop and
   `RuntimeRunning`.
 - **§10's version-skew report is built** as `unawareNodes` in `status`.
