@@ -211,7 +211,12 @@ impl EgressProxies {
     /// and can redirect there. A gated sandbox's sockets live in its guest,
     /// which the classifier never sees, so it gets none.
     async fn start_capture(&self, spec: &ProxySpec) -> Option<JoinHandle<()>> {
-        if !self.context.kernel_classifier_active() || spec.attachment.guest_vsock().is_some() {
+        // An isolate envelope has no process whose flows the classifier
+        // could redirect: its only way out is this proxy's socket.
+        if !self.context.kernel_classifier_active()
+            || spec.attachment.guest_vsock().is_some()
+            || spec.attachment.isolate_dir().is_some()
+        {
             return None;
         }
         let listen = spec.attachment.listen(
@@ -270,6 +275,25 @@ impl EgressProxies {
         let listener = listeners.get(&allocation_id)?;
         let running = listener.task.as_ref().is_some_and(|t| !t.is_finished());
         running.then_some(listener.addr).flatten()
+    }
+
+    /// Where an allocation's proxy is serving, when it is: its TCP address
+    /// or its Unix socket. The isolate supervisor dials this on its
+    /// isolates' behalf.
+    pub fn serving_addr(&self, allocation_id: i64) -> Option<ListenAddr> {
+        let listeners = lock(&self.listeners);
+        let listener = listeners.get(&allocation_id)?;
+        if !listener.serving() {
+            return None;
+        }
+        Some(match listener.spec.listen_addr() {
+            // A port picked at bind time (`:0`, tests) is the bound one.
+            ListenAddr::Tcp { netns, addr } => ListenAddr::Tcp {
+                netns,
+                addr: listener.addr.unwrap_or(addr),
+            },
+            other => other,
+        })
     }
 
     /// Whether an allocation's proxy is serving, on a port or a socket.

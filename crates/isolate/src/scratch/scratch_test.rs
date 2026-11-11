@@ -459,6 +459,68 @@ fn set_times_test() {
 
 use super::bindings::wasi::clocks::wall_clock::Datetime;
 
+/// Coarse (whole-millisecond) times an embedder would pass.
+const T1: Datetime = Datetime {
+    seconds: 1_800_000_000,
+    nanoseconds: 123_000_000,
+};
+const T2: Datetime = Datetime {
+    seconds: 1_800_000_001,
+    nanoseconds: 7_000_000,
+};
+
+fn times(stat: &types::DescriptorStat) -> [(u64, u32); 3] {
+    [
+        stat.data_access_timestamp.unwrap(),
+        stat.data_modification_timestamp.unwrap(),
+        stat.status_change_timestamp.unwrap(),
+    ]
+    .map(|t| (t.seconds, t.nanoseconds))
+}
+
+const fn pair(t: Datetime) -> (u64, u32) {
+    (t.seconds, t.nanoseconds)
+}
+
+#[test]
+fn the_tree_never_reads_a_clock_test() {
+    let (mut t, _) = tree(MIB);
+    // Until the embedder sets a time, everything is the Unix epoch.
+    t.write_file(ROOT, "/f", b"x").unwrap();
+    let f = t.lookup(ROOT, "f").unwrap();
+    assert_eq!(times(&t.stat(&f).unwrap()), [(0, 0); 3]);
+    assert_eq!(times(&t.stat(&Node::Dir(ROOT)).unwrap()), [(0, 0); 3]);
+
+    t.set_now(T1);
+    t.create_dir_all(ROOT, "/d/e").unwrap();
+    let e = t.lookup(ROOT, "d/e").unwrap();
+    assert_eq!(times(&t.stat(&e).unwrap()), [pair(T1); 3]);
+    // Writing through a file handle (as a stream does) uses the tree's time.
+    lock(&file(&t, "/f")).write_at(1, b"y").unwrap();
+    let stat = t.stat(&f).unwrap();
+    assert_eq!(times(&stat), [(0, 0), pair(T1), pair(T1)]);
+
+    t.set_now(T2);
+    t.rename(ROOT, "f", ROOT, "d/g").unwrap();
+    let stat = t.stat(&f).unwrap();
+    assert_eq!(times(&stat), [(0, 0), pair(T1), pair(T2)]);
+    let d = t.lookup(ROOT, "d").unwrap();
+    assert_eq!(pair(t.stat(&d).unwrap().data_modification_timestamp.unwrap()), pair(T2));
+    t.set_times(&f, None, None).unwrap();
+    assert_eq!(pair(t.stat(&f).unwrap().status_change_timestamp.unwrap()), pair(T2));
+}
+
+#[test]
+fn scratch_host_staging_uses_set_now_test() {
+    let account = Arc::new(MemoryAccount::new(MIB));
+    let mut s = Scratch::new(account);
+    assert_eq!(pair(s.now()), (0, 0));
+    s.set_now(T1);
+    s.write_file("/legion/run/in.txt", b"in").unwrap();
+    let node = s.tree.lookup(ROOT, "/legion/run/in.txt").unwrap();
+    assert_eq!(times(&s.tree.stat(&node).unwrap()), [pair(T1); 3]);
+}
+
 // ---------------------------------------------------------------- Scratch
 
 #[test]
@@ -514,6 +576,7 @@ impl Ctx {
             scratch: &mut self.scratch,
             table: &mut self.table,
             cwd: RUN_DIR,
+            now: T1,
         }
     }
 }
@@ -592,6 +655,7 @@ fn preopens_without_a_run_dir_offer_only_the_root_test() {
         scratch: &mut scratch,
         table: &mut table,
         cwd: RUN_DIR,
+        now: T1,
     };
     let dirs = preopens::Host::get_directories(&mut v).unwrap();
     assert_eq!(dirs.len(), 1);
@@ -840,5 +904,50 @@ fn bad_handles_trap_test() {
     assert_eq!(
         types::Host::convert_error_code(&mut v, ErrorCode::Exist.into()).unwrap(),
         ErrorCode::Exist
+    );
+}
+
+impl ScratchView for Ctx {
+    fn scratch(&mut self) -> ScratchCtx<'_> {
+        self.view()
+    }
+}
+
+#[test]
+fn guest_calls_stamp_with_the_context_clock_test() {
+    let mut c = Ctx::new(MIB);
+    // What the linker does on every filesystem call.
+    let mut v = super::scratch_ctx(&mut c);
+    let cwd = preopen(&mut v, ".");
+    let rw = DescriptorFlags::READ | DescriptorFlags::WRITE;
+    let f = open(&mut v, &cwd, "f", OpenFlags::CREATE, rw).unwrap();
+    v.write(borrow(&f), b"abc".to_vec(), 0).unwrap();
+    assert_eq!(times(&v.stat(borrow(&f)).unwrap()), [pair(T1); 3]);
+
+    // The next call carries a later turn's time.
+    v.now = T2;
+    let mut v = {
+        let ScratchCtx { scratch, .. } = v;
+        scratch.set_now(T2);
+        ScratchCtx {
+            scratch,
+            table: &mut c.table,
+            cwd: RUN_DIR,
+            now: T2,
+        }
+    };
+    v.set_times(borrow(&f), NewTimestamp::Now, NewTimestamp::NoChange)
+        .unwrap();
+    assert_eq!(
+        times(&v.stat(borrow(&f)).unwrap()),
+        [pair(T2), pair(T1), pair(T2)]
+    );
+    // A stream write after it uses the tree's time too.
+    let w = v.write_via_stream(borrow(&f), 3).unwrap();
+    let mut w: DynOutputStream = v.table.delete(w).unwrap();
+    w.write(Bytes::from_static(b"d")).unwrap();
+    assert_eq!(
+        pair(v.stat(borrow(&f)).unwrap().data_modification_timestamp.unwrap()),
+        pair(T2)
     );
 }

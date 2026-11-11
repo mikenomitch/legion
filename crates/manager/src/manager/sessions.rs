@@ -1991,7 +1991,7 @@ async fn send_start(
 
 /// The worker plane's mTLS client for a node (one cached channel per
 /// address), and the target its errors name.
-fn worker_client(
+pub fn worker_client(
     store: &Store,
     node_id: &str,
 ) -> Result<

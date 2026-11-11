@@ -38,7 +38,7 @@ fn link(l: &mut Linker<Ctx>) -> wasmtime::Result<()> {
     random::random::add_to_linker::<Ctx, WasiRandom>(l, |t| t.wasi.random())?;
     random::insecure::add_to_linker::<Ctx, WasiRandom>(l, |t| t.wasi.random())?;
     random::insecure_seed::add_to_linker::<Ctx, WasiRandom>(l, |t| t.wasi.random())?;
-    cli::exit::add_to_linker::<Ctx, WasiCli>(l, &Default::default(), Ctx::cli)?;
+    cli::exit::add_to_linker::<Ctx, WasiCli>(l, Ctx::cli)?;
     cli::environment::add_to_linker::<Ctx, WasiCli>(l, Ctx::cli)?;
     cli::stdin::add_to_linker::<Ctx, WasiCli>(l, Ctx::cli)?;
     cli::stdout::add_to_linker::<Ctx, WasiCli>(l, Ctx::cli)?;

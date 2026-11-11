@@ -2106,6 +2106,19 @@ impl UpstreamForwarder {
             .collect()
     }
 
+    /// The upstreams serving for one allocation, by key, with where each
+    /// one's primary listener is bound: what the isolate supervisor dials
+    /// for an isolate's request to an upstream (`isolates::egress`).
+    pub fn serving_upstreams(&self, allocation_id: i64) -> Vec<(String, ListenAddr)> {
+        let listeners = lock(&self.listeners);
+        listeners
+            .values()
+            .filter(|listener| listener.spec.allocation_id == allocation_id)
+            .filter(|listener| listener.is_running())
+            .filter_map(|listener| Some((listener.spec.service.clone(), listener.spec.listen()?)))
+            .collect()
+    }
+
     /// Live connection counts per endpoint address for one upstream — exactly
     /// what `least_conn` sees. Empty for an unknown upstream.
     pub fn inflight(&self, allocation_id: i64, service: &str) -> HashMap<String, usize> {

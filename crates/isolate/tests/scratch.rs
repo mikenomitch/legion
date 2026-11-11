@@ -8,7 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use legion_isolate::account::MemoryAccount;
-use legion_isolate::scratch::{self, Scratch, ScratchCtx, ScratchView, RUN_DIR};
+use legion_isolate::scratch::{self, Datetime, Scratch, ScratchCtx, ScratchView, RUN_DIR};
+
+/// The coarse, turn-frozen wall clock an embedder passes: whole
+/// milliseconds, so no file time has a sub-millisecond part.
+const NOW: Datetime = Datetime {
+    seconds: 1_800_000_000,
+    nanoseconds: 123_000_000,
+};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
@@ -69,6 +76,7 @@ impl ScratchView for St {
             scratch: &mut self.scratch,
             table: &mut self.table,
             cwd: RUN_DIR,
+            now: NOW,
         }
     }
 }
@@ -180,6 +188,7 @@ const LIMIT: u64 = 4 << 20;
 
 fn staged(account: &Arc<MemoryAccount>) -> Scratch {
     let mut s = Scratch::new(account.clone());
+    s.set_now(NOW);
     s.create_dir_all(RUN_DIR).unwrap();
     s.write_file("/legion/run/input.json", br#"{"n":1}"#)
         .unwrap();
@@ -209,6 +218,17 @@ async fn rust_std_fs_guest_runs_on_scratch_test() {
         "stdout:\n{}",
         ran.stdout
     );
+    // File times are exactly the clock the embedder passed: nothing finer
+    // reaches the guest. The guest prints them as `secs.nanos`.
+    for what in ["mtime", "staged_mtime"] {
+        let line = format!("info {what}=1800000000.123000000");
+        assert!(
+            ran.stdout.lines().any(|l| l == line),
+            "{line} missing; stdout:\n{}",
+            ran.stdout
+        );
+    }
+    assert_eq!(NOW.nanoseconds % 1_000_000, 0);
     // A `write` past the ceiling: wasi-libc reports every stream failure
     // as EIO (29); `set_len` past it is ENOSPC (checked by the guest).
     assert!(

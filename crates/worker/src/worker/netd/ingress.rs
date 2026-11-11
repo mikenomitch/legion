@@ -66,6 +66,10 @@ pub enum TaskDial {
     /// A TAP-wired sandbox guest: TCP to the address the worker leased it
     /// on its bridge (read from the sandbox dir).
     Bridge { scratch: PathBuf },
+    /// An isolate task's envelope: the Unix socket the isolate supervisor
+    /// serves for the port's label in the envelope's socket dir
+    /// (`attach::isolate_ingress_socket`). Plain HTTP/1.1, no handshake.
+    Isolate { dir: PathBuf },
 }
 
 impl TaskDial {
@@ -74,7 +78,7 @@ impl TaskDial {
     pub fn gated(&self) -> bool {
         matches!(
             self,
-            TaskDial::Loopback { netns: Some(_) } | TaskDial::Vsock { .. }
+            TaskDial::Loopback { netns: Some(_) } | TaskDial::Vsock { .. } | TaskDial::Isolate { .. }
         )
     }
 }
@@ -97,7 +101,7 @@ impl TaskTarget {
     /// listener is already bound.
     pub fn port(&self) -> u16 {
         match &self.dial {
-            TaskDial::Loopback { .. } => self.port,
+            TaskDial::Loopback { .. } | TaskDial::Isolate { .. } => self.port,
             TaskDial::Vsock { scratch } | TaskDial::Bridge { scratch } => {
                 crate::task_plugins::sandbox_guest_port(scratch, &self.label).unwrap_or(self.port)
             }
@@ -122,6 +126,9 @@ impl TaskTarget {
                 Ok(SocketAddr::new(IpAddr::V4(address), port))
             }
             TaskDial::Vsock { .. } => bail!("a gated sandbox guest is reached over vsock, not TCP"),
+            TaskDial::Isolate { .. } => {
+                bail!("an isolate task is reached over its supervisor's socket, not TCP")
+            }
         }
     }
 
@@ -146,6 +153,22 @@ impl TaskTarget {
                 Ok(TaskStream::Unix(
                     vsock::dial(&base, u32::from(self.port())).await?,
                 ))
+            }
+            TaskDial::Isolate { dir } => {
+                let path = crate::worker::netd::attach::isolate_ingress_socket(dir, &self.label);
+                let stream = tokio::time::timeout(
+                    TASK_DIAL_TIMEOUT,
+                    tokio::net::UnixStream::connect(&path),
+                )
+                .await
+                .map_err(|_| anyhow!("connect {}: timed out", path.display()))?
+                .with_context(|| {
+                    format!(
+                        "connect {} (the isolate task is not prepared on this node yet)",
+                        path.display()
+                    )
+                })?;
+                Ok(TaskStream::Unix(stream))
             }
         }
     }

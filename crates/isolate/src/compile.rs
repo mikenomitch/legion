@@ -215,7 +215,7 @@ mod compile_test {
         let c = wat::parse_str(
             r#"(component
                 (import "wasi:nope/thing@0.2.0" (instance))
-                (core module $m (func (export "run")))
+                (core module $m (func (export "run") (result i32) i32.const 0))
                 (core instance $i (instantiate $m))
                 (func $run (result (result)) (canon lift (core func $i "run")))
                 (instance $r (export "run" (func $run)))

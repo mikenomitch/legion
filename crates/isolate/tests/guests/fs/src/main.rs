@@ -178,12 +178,16 @@ fn metadata() -> Check {
     let m = io(fs::metadata("a/b/c/f1"), "metadata f1")?;
     ensure(m.is_file() && m.len() == 3, "f1 is a 3-byte file")?;
     ensure(io(fs::metadata("a"), "metadata a")?.is_dir(), "a is a dir")?;
-    let modified = io(m.modified(), "modified")?;
-    let secs = modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs();
-    ensure(secs > 1_600_000_000, format!("mtime {secs}"))?;
+    // The host stamps files with the wall clock it gives the guest; report
+    // the exact value so the host can check nothing finer leaked.
+    for (what, path) in [("mtime", "a/b/c/f1"), ("staged_mtime", "input.json")] {
+        let modified = io(io(fs::metadata(path), path)?.modified(), "modified")?;
+        let d = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?;
+        println!("info {what}={}.{:09}", d.as_secs(), d.subsec_nanos());
+        ensure(d.as_secs() > 1_600_000_000, format!("{what} {d:?}"))?;
+    }
     expect_err(
         fs::metadata("missing"),
         ErrorKind::NotFound,

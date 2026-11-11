@@ -138,8 +138,34 @@ interface runner {
     args: list<string>,
   }
 
-  /// Run once. `ok` carries an optional JSON result (reported as the
-  /// run's `result`); `err` carries an error message, reported on stderr
-  /// with exit status 1.
-  run: func(req: request) -> result<option<string>, string>;
+  /// How a run ended.
+  record outcome {
+    /// The exit status: 0 for success. A language image reports an uncaught
+    /// error as 1 after writing it to stderr, and `sys.exit(n)` /
+    /// `process.exit(n)` as `n`.
+    exit: s32,
+    /// An optional JSON result, reported as the run's `result`. When unset,
+    /// `result.json` in the run directory is used if the guest wrote one.
+    %result: option<string>,
+  }
+
+  /// Run once.
+  run: func(req: request) -> outcome;
+}
+
+/// What a language image (or any reusable guest) is built against: Legion's
+/// own interfaces plus whatever of WASI 0.2 it uses, exporting `runner`.
+world image {
+  import control;
+  import state;
+  import vm;
+  export runner;
+}
+
+/// Legion's interfaces alone, for a component that exports `wasi:cli/run`
+/// or `wasi:http/incoming-handler` and wants `control`, `state` or `vm`.
+world imports {
+  import control;
+  import state;
+  import vm;
 }

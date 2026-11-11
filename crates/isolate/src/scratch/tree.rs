@@ -10,7 +10,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::bindings::wasi::clocks::wall_clock::Datetime;
 use super::bindings::wasi::filesystem::types::{DescriptorStat, DescriptorType, ErrorCode};
@@ -39,15 +38,28 @@ pub const MAX_FILE_SIZE: u64 = i64::MAX as u64;
 type FsResult<T> = Result<T, ErrorCode>;
 
 /// What the tree and every handle into it share: the account file bytes are
-/// charged to, and the running totals.
+/// charged to, the running totals, and the clock timestamps are taken from.
 #[derive(Debug)]
 pub struct Shared {
     account: Arc<MemoryAccount>,
     bytes: AtomicU64,
     nodes: AtomicUsize,
+    /// The time every timestamp the tree sets is taken from. The tree never
+    /// reads a clock: the embedder sets this (its coarse, turn-frozen wall
+    /// clock), so file times cannot serve a guest as a finer timer than the
+    /// clocks it is given. Starts at the Unix epoch.
+    now: Mutex<Datetime>,
 }
 
 impl Shared {
+    fn now(&self) -> Datetime {
+        *self.now.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn set_now(&self, t: Datetime) {
+        *self.now.lock().unwrap_or_else(|p| p.into_inner()) = t;
+    }
+
     fn charge(&self, bytes: u64) -> FsResult<()> {
         if bytes == 0 {
             return Ok(());
@@ -80,17 +92,11 @@ impl Shared {
     }
 }
 
-/// The wall-clock time now, as WASI's `datetime`. Timestamps on scratch
-/// nodes come from the host's real-time clock.
-pub fn now() -> Datetime {
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    Datetime {
-        seconds: d.as_secs(),
-        nanoseconds: d.subsec_nanos(),
-    }
-}
+/// The Unix epoch, the tree's time until the embedder sets one.
+pub const EPOCH: Datetime = Datetime {
+    seconds: 0,
+    nanoseconds: 0,
+};
 
 /// A node's three timestamps.
 #[derive(Debug, Clone, Copy)]
@@ -101,8 +107,7 @@ pub struct Times {
 }
 
 impl Times {
-    fn new() -> Self {
-        let t = now();
+    fn new(t: Datetime) -> Self {
         Self {
             access: t,
             modify: t,
@@ -110,8 +115,7 @@ impl Times {
         }
     }
 
-    fn touch(&mut self) {
-        let t = now();
+    fn touch(&mut self, t: Datetime) {
         self.modify = t;
         self.change = t;
     }
@@ -177,7 +181,7 @@ impl FileNode {
         }
         let start = offset as usize;
         self.data[start..start + buf.len()].copy_from_slice(buf);
-        self.times.touch();
+        self.times.touch(self.shared.now());
         Ok(buf.len() as u64)
     }
 
@@ -205,7 +209,7 @@ impl FileNode {
             }
             self.shared.give_back(len - size);
         }
-        self.times.touch();
+        self.times.touch(self.shared.now());
         Ok(())
     }
 
@@ -315,14 +319,25 @@ impl Tree {
             account,
             bytes: AtomicU64::new(0),
             nodes: AtomicUsize::new(1),
+            now: Mutex::new(EPOCH),
         });
         let mut dirs = HashMap::new();
-        dirs.insert(ROOT, new_dir(ROOT));
+        dirs.insert(ROOT, new_dir(ROOT, EPOCH));
         Self {
             shared,
             dirs,
             next_ino: ROOT + 1,
         }
+    }
+
+    /// The time timestamps are taken from from now on (file streams
+    /// included).
+    pub fn set_now(&self, t: Datetime) {
+        self.shared.set_now(t);
+    }
+
+    pub fn now(&self) -> Datetime {
+        self.shared.now()
     }
 
     /// File bytes charged to the account, including files that are unlinked
@@ -351,7 +366,7 @@ impl Tree {
                     lock(&f).linked = false;
                 }
             }
-            root.times.touch();
+            root.times.touch(self.shared.now());
         }
     }
 
@@ -482,10 +497,11 @@ impl Tree {
                     return Err(ErrorCode::IsDirectory);
                 }
                 let file = self.new_file()?;
+                let now = self.shared.now();
                 let dir = self.dir_mut(walk.dir)?;
                 dir.entries
                     .insert(name.to_string(), Entry::File(file.clone()));
-                dir.times.touch();
+                dir.times.touch(now);
                 Ok(Node::File(file))
             }
         }
@@ -497,7 +513,7 @@ impl Tree {
         Ok(Arc::new(Mutex::new(FileNode {
             ino,
             data: Vec::new(),
-            times: Times::new(),
+            times: Times::new(self.shared.now()),
             linked: true,
             shared: self.shared.clone(),
         })))
@@ -514,10 +530,11 @@ impl Tree {
         }
         self.shared.take_node()?;
         let ino = self.alloc_ino();
-        self.dirs.insert(ino, new_dir(walk.dir));
+        let now = self.shared.now();
+        self.dirs.insert(ino, new_dir(walk.dir, now));
         let parent = self.dir_mut(walk.dir)?;
         parent.entries.insert(name.to_string(), Entry::Dir(ino));
-        parent.times.touch();
+        parent.times.touch(now);
         Ok(ino)
     }
 
@@ -557,9 +574,10 @@ impl Tree {
         }
         self.dirs.remove(&ino);
         self.shared.free_node();
+        let now = self.shared.now();
         let parent = self.dir_mut(walk.dir)?;
         parent.entries.remove(name);
-        parent.times.touch();
+        parent.times.touch(now);
         Ok(())
     }
 
@@ -570,6 +588,7 @@ impl Tree {
         let Last::Name(name) = walk.last else {
             return Err(ErrorCode::IsDirectory);
         };
+        let now = self.shared.now();
         let parent = self.dir_mut(walk.dir)?;
         match parent.entries.get(name) {
             Some(Entry::Dir(_)) => Err(ErrorCode::IsDirectory),
@@ -578,7 +597,7 @@ impl Tree {
                 if let Some(Entry::File(f)) = parent.entries.remove(name) {
                     lock(&f).linked = false;
                 }
-                parent.times.touch();
+                parent.times.touch(now);
                 Ok(())
             }
             None => Err(ErrorCode::NoEntry),
@@ -637,19 +656,20 @@ impl Tree {
             (Entry::File(_), Some(Entry::File(b))) => lock(b).linked = false,
             (_, None) => {}
         }
+        let now = self.shared.now();
         let from_dir = self.dir_mut(from.dir)?;
         from_dir.entries.remove(from_name);
-        from_dir.times.touch();
+        from_dir.times.touch(now);
         let to_dir = self.dir_mut(to.dir)?;
         to_dir.entries.insert(to_name.to_string(), source.clone());
-        to_dir.times.touch();
+        to_dir.times.touch(now);
         match &source {
             Entry::Dir(ino) => {
                 let moved = self.dir_mut(*ino)?;
                 moved.parent = to.dir;
-                moved.times.change = now();
+                moved.times.change = now;
             }
-            Entry::File(f) => lock(f).times.change = now(),
+            Entry::File(f) => lock(f).times.change = now,
         }
         Ok(())
     }
@@ -700,6 +720,7 @@ impl Tree {
         access: Option<Datetime>,
         modify: Option<Datetime>,
     ) -> FsResult<()> {
+        let now = self.shared.now();
         let apply = |times: &mut Times| {
             if let Some(t) = access {
                 times.access = t;
@@ -707,7 +728,7 @@ impl Tree {
             if let Some(t) = modify {
                 times.modify = t;
             }
-            times.change = now();
+            times.change = now;
         };
         match node {
             Node::File(f) => apply(&mut lock(f).times),
@@ -751,7 +772,7 @@ impl Tree {
         file.data.clear();
         file.data.extend_from_slice(bytes);
         file.data.shrink_to_fit();
-        file.times.touch();
+        file.times.touch(self.shared.now());
         Ok(())
     }
 
@@ -772,11 +793,11 @@ impl Tree {
     }
 }
 
-fn new_dir(parent: Ino) -> DirNode {
+fn new_dir(parent: Ino, now: Datetime) -> DirNode {
     DirNode {
         parent,
         entries: BTreeMap::new(),
-        times: Times::new(),
+        times: Times::new(now),
     }
 }
 

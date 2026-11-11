@@ -112,10 +112,9 @@ pub fn base_config(p: &EngineParams) -> anyhow::Result<Config> {
     // Fibers for every guest; no Component Model async (brief item 14).
     // Also part of the artifact compatibility check.
     c.concurrency_support(false);
-    // No threads, no shared memory: no in-isolate timers to build a
-    // high-resolution clock from (plan §6.10 layer 4).
-    c.wasm_threads(false);
-    c.wasm_shared_everything_threads(false);
+    // No threads and no shared memory (plan §6.10 layer 4): the engine is
+    // built without the `threads` feature, and the compiler's validator
+    // refuses both before Cranelift sees a module.
     c.memory_init_cow(true);
     // Isolates never touch the host's native-code debug interfaces.
     c.debug_info(false);

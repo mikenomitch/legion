@@ -1,0 +1,26 @@
+# A wasm32-wasip2 command (`wasi:cli/run`) whose behavior is picked by its
+# first argument; the isolate host's run tests drive it. Not a workspace
+# member: `tests/guests/build.sh cmd` builds it into `tests/fixtures/cmd.wasm`
+# (checked in; CI has no wasm target). WIT in `wit/` (deps are shared with
+# the other guests through `tests/guests/wit-deps/`).
+[package]
+name = "cmd-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "cmd"
+path = "src/main.rs"
+
+[dependencies]
+wit-bindgen = "0.63"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+
+[workspace]

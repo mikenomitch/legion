@@ -137,6 +137,7 @@ mod extension_rpcs;
 mod fork_rpcs;
 mod governance_rpcs;
 mod idempotency;
+mod isolate_rpcs;
 use idempotency::{claim_idempotency_key, claimed_body};
 mod make_room;
 mod material_rpcs;
@@ -2176,6 +2177,10 @@ pub struct ManagerDaemonService {
     /// the next report rather than anything wrong. Shared with the idle
     /// sweep (see [`Self::usage_handle`]).
     usage: Arc<Mutex<crate::manager::usage::UsageTable>>,
+    /// The latest isolate aggregates per node (docs/task-runtime-isolate.md,
+    /// "Observing"), from `HeartbeatRequest.isolate_tasks`/`isolate_hosts`.
+    /// In memory only, like `usage`; behind `GetIsolateStats`.
+    isolate_stats: Arc<Mutex<crate::manager::isolates::IsolateStatsTable>>,
     /// The manager's configured `evalThreads`. With adaptive scheduler
     /// concurrency enabled this is the CEILING on admitted planners rather
     /// than a target, and `GetSchedulerConcurrency` reports it as such even
@@ -2249,6 +2254,7 @@ impl ManagerDaemonService {
             net_edges: Arc::new(Mutex::new(HashMap::new())),
             stream_reauth_interval: acl::STREAM_REAUTH_INTERVAL,
             usage: Arc::new(Mutex::new(crate::manager::usage::UsageTable::default())),
+            isolate_stats: Arc::default(),
             eval_threads: 1,
             app_nudge: Arc::new(std::sync::OnceLock::new()),
             app_forwarder: Arc::new(crate::manager::app_forward::WorkerPlaneForwarder),
@@ -8687,6 +8693,26 @@ impl Manager for ManagerDaemonService {
         self.run_session_rpc(request).await
     }
 
+    #[instrument(err, skip_all, fields(job_id = %request.get_ref().job_id))]
+    async fn get_isolate_stats(
+        &self,
+        request: Request<crate::structs::GetIsolateStatsRequest>,
+    ) -> Result<Response<crate::structs::GetIsolateStatsReply>, Status> {
+        // ACL: `job:read` on the job, checked before the job is read;
+        // enforced in `get_isolate_stats_rpc`.
+        self.get_isolate_stats_rpc(request).await
+    }
+
+    #[instrument(err, skip_all, fields(session_id = %request.get_ref().session_id))]
+    async fn get_isolate(
+        &self,
+        request: Request<crate::structs::GetIsolateRequest>,
+    ) -> Result<Response<crate::structs::GetIsolateReply>, Status> {
+        // ACL: coarse `job:read` before the node is asked, then `job:read`
+        // on the job the node reports; enforced in `get_isolate_rpc`.
+        self.get_isolate_rpc(request).await
+    }
+
     // === SNAPSHOTS (docs/suspend-and-resume.md) ===
     // The handlers live in `snapshot_rpcs`; each enforces `snapshot` ACLs
     // itself (coarse `AclScope::any()` first, the job scope after lookup).
@@ -9541,6 +9567,22 @@ impl Manager for ManagerDaemonService {
                 usage.ingest(&id, report, now);
             }
             usage.sweep(now);
+        }
+        // Isolate aggregates (docs/task-runtime-isolate.md, "Observing"):
+        // the latest per node, in memory only.
+        {
+            let now = std::time::Instant::now();
+            let mut isolates = self
+                .isolate_stats
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            isolates.ingest(
+                &id,
+                std::mem::take(&mut req.isolate_tasks),
+                std::mem::take(&mut req.isolate_hosts),
+                now,
+            );
+            isolates.sweep(now);
         }
         // Content locality (docs/artifacts.md, "Content locality"): fold the
         // node's content report into the in-memory location index, and ask
@@ -17447,6 +17489,20 @@ mod tests {
             &self,
             _request: Request<crate::structs::RunSessionRequest>,
         ) -> Result<Response<crate::structs::RunSessionResponse>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn get_isolate_stats(
+            &self,
+            _request: Request<crate::structs::GetIsolateStatsRequest>,
+        ) -> Result<Response<crate::structs::GetIsolateStatsReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn get_isolate(
+            &self,
+            _request: Request<crate::structs::GetIsolateRequest>,
+        ) -> Result<Response<crate::structs::GetIsolateReply>, Status> {
             Err(Status::unimplemented("not used in test"))
         }
 

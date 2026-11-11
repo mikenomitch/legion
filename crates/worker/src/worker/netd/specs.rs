@@ -109,6 +109,10 @@ pub fn dns_specs(desired: &[TaskAllocation], alloc_root: &Path) -> Vec<DnsSpec> 
             .resolver_address()
             .and_then(|addr| addr.parse::<std::net::Ipv4Addr>().ok());
         let attachment = Attachment::of(allocation, &network, alloc_root);
+        // An isolate envelope has no resolver: the worker resolves for it.
+        if !attachment.wants_resolver() {
+            continue;
+        }
         // Every gated sandbox gets a resolver on its vsock socket, VIP block
         // or not: without one, a guest with no upstreams has no DNS at all
         // (gated plan §6.5, calls entry 29). Everything else needs an
@@ -447,14 +451,22 @@ pub fn net_status(
             problems.push("gated network namespace does not exist yet".into());
         }
         if gated && !proxy_ready {
-            problems.push(match guest {
+            problems.push(match (guest, attachment.isolate_dir()) {
+                (None, Some(dir)) => format!(
+                    "egress proxy is not bound on the isolate task's socket {}",
+                    crate::worker::netd::attach::isolate_socket(
+                        dir,
+                        crate::worker::netd::proxy::PROXY_PORT
+                    )
+                    .display()
+                ),
                 // A restored guest resumes fail-closed without it (gated
                 // plan §6.3); this is how `net doctor` names the socket.
-                Some(scratch) => format!(
+                (Some(scratch), _) => format!(
                     "egress proxy is not bound on the guest's vsock socket {}",
                     guest_socket(scratch, crate::worker::netd::proxy::PROXY_PORT).display()
                 ),
-                None => match attachment.egress_proxy() {
+                (None, None) => match attachment.egress_proxy() {
                     Some(addr) => format!("egress proxy is not bound on {addr}"),
                     None => "egress proxy is not bound inside the namespace".into(),
                 },
@@ -490,9 +502,14 @@ pub fn net_status(
                 "allocation resolver is not bound on the guest's vsock socket {}",
                 guest_socket(scratch, crate::worker::netd::dns::DNS_PORT).display()
             )),
-            None if network.vip_block.is_some() && !resolver_ready => problems.push(
+            None if network.vip_block.is_some()
+                && attachment.wants_resolver()
+                && !resolver_ready =>
+            {
+                problems.push(
                 "allocation resolver is not bound (port 53 needs CAP_NET_BIND_SERVICE)".into(),
-            ),
+            )
+            }
             _ => {}
         }
         // A gated sandbox's capture is its vsock host sockets: the proxy, the

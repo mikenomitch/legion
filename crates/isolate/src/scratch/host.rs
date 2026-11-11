@@ -241,7 +241,7 @@ impl types::HostDescriptor for ScratchCtx<'_> {
         let node = self.descriptor(&fd)?.node.clone();
         self.scratch
             .tree
-            .set_times(&node, timestamp(access), timestamp(modify))?;
+            .set_times(&node, timestamp(access, self.now), timestamp(modify, self.now))?;
         Ok(())
     }
 
@@ -320,7 +320,7 @@ impl types::HostDescriptor for ScratchCtx<'_> {
         let node = self.scratch.tree.lookup(base, &path)?;
         self.scratch
             .tree
-            .set_times(&node, timestamp(access), timestamp(modify))?;
+            .set_times(&node, timestamp(access, self.now), timestamp(modify, self.now))?;
         Ok(())
     }
 
@@ -505,10 +505,11 @@ impl preopens::Host for ScratchCtx<'_> {
     }
 }
 
-fn timestamp(t: NewTimestamp) -> Option<Datetime> {
+/// `now` is the embedder's clock ([`ScratchCtx::now`](super::ScratchCtx)).
+fn timestamp(t: NewTimestamp, now: Datetime) -> Option<Datetime> {
     match t {
         NewTimestamp::NoChange => None,
-        NewTimestamp::Now => Some(tree::now()),
+        NewTimestamp::Now => Some(now),
         NewTimestamp::Timestamp(t) => Some(t),
     }
 }

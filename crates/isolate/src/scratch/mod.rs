@@ -23,8 +23,12 @@
 //!   file is left as it was.
 //! - **Immediate.** Everything is in memory and nothing blocks; streams are
 //!   always ready.
-//! - **Timestamps** come from the host's real-time clock; reads do not
-//!   update the access time.
+//! - **Timestamps never come from a clock the tree reads.** Every time the
+//!   tree sets is the embedder's: [`ScratchCtx::now`] for guest calls,
+//!   [`Scratch::set_now`] for host-side staging (and for file streams
+//!   between filesystem calls). The embedder passes its coarse, turn-frozen
+//!   wall clock, so `write` then `stat` cannot serve a guest as a timer finer
+//!   than the clocks it is given. Reads do not update the access time.
 
 mod bindings;
 mod host;
@@ -40,9 +44,10 @@ use std::sync::Arc;
 use wasmtime::component::{HasData, Linker, ResourceTable};
 
 use crate::account::MemoryAccount;
+pub use bindings::wasi::clocks::wall_clock::Datetime;
 pub use bindings::wasi::filesystem::types::ErrorCode;
 pub use host::{Descriptor, DirEntries, FsError, StreamFsError};
-pub use tree::{MAX_NODES, NAME_MAX};
+pub use tree::{EPOCH, MAX_NODES, NAME_MAX};
 
 /// The run directory a guest starts in: preopened as `.` and the
 /// working directory a host should give `wasi:cli/environment.initial-cwd`.
@@ -88,12 +93,27 @@ static NEXT_TREE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl Scratch {
     /// An empty tree charging file bytes to `account`; a refused charge is
-    /// `insufficient-space` (ENOSPC) to the guest.
+    /// `insufficient-space` (ENOSPC) to the guest. Its clock starts at the
+    /// Unix epoch ([`EPOCH`]) until [`set_now`](Self::set_now).
     pub fn new(account: Arc<MemoryAccount>) -> Self {
         Self {
             tree: tree::Tree::new(account),
             id: NEXT_TREE_ID.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Set the time timestamps are taken from: host-side staging after this
+    /// call, and file streams' writes until the next guest filesystem call
+    /// (which sets it from [`ScratchCtx::now`]). Pass the same coarse,
+    /// turn-frozen wall clock the guest sees; set it at the start of each
+    /// turn.
+    pub fn set_now(&mut self, now: Datetime) {
+        self.tree.set_now(now);
+    }
+
+    /// The time the tree stamps with now.
+    pub fn now(&self) -> Datetime {
+        self.tree.now()
     }
 
     /// Host-side staging: create parents, write the file (replacing what
@@ -171,6 +191,13 @@ pub struct ScratchCtx<'a> {
     /// The directory preopened as `.`, absolute within the tree; normally
     /// [`RUN_DIR`].
     pub cwd: &'a str,
+    /// The time every timestamp set by this call takes (created, modified,
+    /// accessed, status-changed, and `new-timestamp.now`). The embedder
+    /// passes its coarse, turn-frozen wall clock (the same value the guest's
+    /// `wasi:clocks/wall-clock.now` returns this turn); the tree never reads
+    /// a clock itself. It is also stored on the tree, so file streams' writes
+    /// that follow use it.
+    pub now: Datetime,
 }
 
 struct HasScratch;
@@ -179,11 +206,22 @@ impl HasData for HasScratch {
     type Data<'a> = ScratchCtx<'a>;
 }
 
+/// Every filesystem call starts here: the tree takes its time from the
+/// context's `now`.
+fn scratch_ctx<T: ScratchView>(t: &mut T) -> ScratchCtx<'_> {
+    let ctx = t.scratch();
+    ctx.scratch.set_now(ctx.now);
+    ctx
+}
+
 /// Link `wasi:filesystem/types` and `wasi:filesystem/preopens` (and
 /// nothing else). The functions are synchronous, so the linker serves both
 /// `call` and `call_async`.
 pub fn add_to_linker<T: ScratchView + 'static>(linker: &mut Linker<T>) -> anyhow::Result<()> {
-    bindings::wasi::filesystem::types::add_to_linker::<T, HasScratch>(linker, T::scratch)?;
-    bindings::wasi::filesystem::preopens::add_to_linker::<T, HasScratch>(linker, T::scratch)?;
+    bindings::wasi::filesystem::types::add_to_linker::<T, HasScratch>(linker, scratch_ctx::<T>)?;
+    bindings::wasi::filesystem::preopens::add_to_linker::<T, HasScratch>(
+        linker,
+        scratch_ctx::<T>,
+    )?;
     Ok(())
 }

@@ -395,6 +395,21 @@ impl Denials {
     }
 }
 
+/// The isolate task an envelope allocation carries the datapath of: an
+/// `envelope` allocation with a network payload (only an isolate task's
+/// envelope has one). `None` for everything else.
+pub fn isolate_envelope_serves(allocation: &crate::structs::TaskAllocation) -> Option<&str> {
+    if allocation.task_runtime != crate::structs::session::ENVELOPE_RUNTIME
+        || allocation.network.trim().is_empty()
+    {
+        return None;
+    }
+    allocation
+        .task_name
+        .strip_suffix(crate::structs::session::ENVELOPE_SUFFIX)
+        .filter(|task| !task.is_empty())
+}
+
 /// Build the per-allocation attribution map from a desired-allocation
 /// payload's `task_network` (labels) and identity fields.
 pub fn identities_from_desired(
@@ -409,11 +424,22 @@ pub fn identities_from_desired(
                 .map(|network| network.labels)
                 .unwrap_or_default()
         };
-        let group = if allocation.task_group.is_empty() {
+        let mut group = if allocation.task_group.is_empty() {
             crate::structs::default_task_group()
         } else {
             allocation.task_group.clone()
         };
+        let mut task_name = allocation.task_name.clone();
+        // An isolate task's datapath rides its generated envelope
+        // (`<task>-envelope`, in a group of the same name): attribute its
+        // traffic to the isolate task the job declares, which is what
+        // denials, access logs and a PROXY header's identity should name.
+        if let Some(task) = isolate_envelope_serves(allocation) {
+            if group == task_name {
+                group = task.to_string();
+            }
+            task_name = task.to_string();
+        }
         let ports = if allocation.network.trim().is_empty() {
             BTreeMap::new()
         } else {
@@ -431,7 +457,7 @@ pub fn identities_from_desired(
             allocation.allocation_id,
             AllocIdentity {
                 job_id: allocation.job_id.clone(),
-                task_name: allocation.task_name.clone(),
+                task_name,
                 group,
                 labels,
                 ports,

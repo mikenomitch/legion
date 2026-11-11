@@ -18,7 +18,7 @@ use legion_proto::isolate_host::{
     VmResize,
 };
 use rand_010::rngs::{StdRng, SysRng};
-use rand_010::{Rng as _, SeedableRng};
+use rand_010::{RngExt as _, SeedableRng};
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime::ResourceLimiter;
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
