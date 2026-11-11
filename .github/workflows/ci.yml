@@ -175,6 +175,47 @@ jobs:
           sudo -E env "PATH=$PATH" LEGION_URING_PROBE="$RUNNER_TEMP/uring_connect" \
             cargo test -p legion-worker --lib --locked -- --ignored --test-threads=1 kernel:: capture_kernel
 
+  # The isolate host's confinement (crates/isolate/src/confine.rs: user,
+  # network, PID, and mount namespaces, the mount root, capabilities,
+  # Landlock, seccomp), proved layer by layer by `crates/isolate/tests/binary.rs`
+  # through the `confinement-test` hooks. The Cargo Test job runs the same
+  # tests as the unprivileged `runner` user, where Ubuntu 24.04 refuses user
+  # namespaces (`kernel.apparmor_restrict_unprivileged_userns`): the
+  # namespace layers cannot apply there, and the tests that need them say so
+  # and return. Root may make user namespaces under that restriction, so here
+  # every layer the kernel offers applies, a missing one fails the test, and
+  # the checks that need root themselves (mounting a tmpfs inside a read
+  # directory, a host emptying its bounding set) run in full.
+  isolate-confinement:
+    name: Isolate Confinement Tests
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Build the tests and the test-hook binary
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: cargo test -p legion-isolate --features confinement-test --locked --no-run
+
+      - name: Run the confinement tests as root
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: |
+          sudo -E env "PATH=$PATH" \
+            cargo test -p legion-isolate --features confinement-test --locked --test binary
+
   # For an intentional break, bump PROTOCOL_VERSION and label the PR
   # `proto-breaking-ok` to skip the check.
   proto-breaking:

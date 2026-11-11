@@ -8,6 +8,21 @@ use std::time::{Duration, Instant};
 use common::*;
 use legion_proto::isolate_host::*;
 
+/// Wait until `task`'s stats satisfy `done` (an invocation started in the
+/// background is admitted, or holds its instance).
+async fn wait_until(h: &TestHost, task: &str, done: impl Fn(&TaskStats) -> bool) {
+    let stats = || {
+        h.host
+            .stats()
+            .tasks
+            .into_iter()
+            .find(|t| t.task_name == task)
+            .unwrap_or_default()
+    };
+    let t = wait_for(stats, &done).await;
+    assert!(done(&t), "{task} never got there: {t:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn max_active_refuses_after_the_queue_timeout_test() {
     let h = start(config());
@@ -26,7 +41,7 @@ async fn max_active_refuses_after_the_queue_timeout_test() {
         })
         .await
     });
-    sleep_ms(150).await;
+    wait_until(&h, "cmd", |t| t.active >= 1).await;
     let t = Instant::now();
     let e = h
         .run_with("j", "cmd", "", "", run(&["echo"]))
@@ -58,7 +73,7 @@ async fn a_queued_invocation_runs_when_room_frees_test() {
         })
         .await
     });
-    sleep_ms(50).await;
+    wait_until(&h, "cmd", |t| t.active >= 1).await;
     let r = h
         .run_with("j", "cmd", "", "", run(&["echo"]))
         .await
@@ -85,7 +100,7 @@ async fn max_resident_bounds_live_instances_test() {
         })
         .await
     });
-    sleep_ms(150).await;
+    wait_until(&h, "cmd", |t| t.resident >= 1).await;
     let e = h
         .run_with("j", "cmd", "", "", run(&["echo"]))
         .await
@@ -121,7 +136,7 @@ async fn host_slots_bound_instances_across_tasks_test() {
         })
         .await
     });
-    sleep_ms(150).await;
+    wait_until(&h, "a", |t| t.resident >= 1).await;
     let e = h
         .run_with("j", "b", "", "", run(&["echo"]))
         .await
@@ -138,7 +153,9 @@ async fn epoch_slicing_keeps_a_second_tenant_responsive_test() {
     let mut s = spec("j", "cmd", "cmd");
     let l = s.limits.as_mut().unwrap();
     l.cpu_micros = 1_500_000;
-    l.wall_micros = 5_000_000;
+    // The three hogs need 4.5 s of the one shard's CPU between them: a wall
+    // limit near that would stop them for wall on a loaded machine.
+    l.wall_micros = 30_000_000;
     h.task(s);
     let mut hogs = Vec::new();
     for i in 0..3 {
@@ -155,7 +172,7 @@ async fn epoch_slicing_keeps_a_second_tenant_responsive_test() {
             .await
         }));
     }
-    sleep_ms(200).await;
+    wait_until(&h, "cmd", |t| t.active >= 3).await;
     let mut worst = Duration::ZERO;
     for _ in 0..5 {
         let t = Instant::now();
@@ -167,9 +184,11 @@ async fn epoch_slicing_keeps_a_second_tenant_responsive_test() {
         worst = worst.max(t.elapsed());
     }
     // One shard, three spinning invocations: the small tenant still gets a
-    // turn within a few slices (5 ms each), not after the hogs' 1.5 s.
+    // turn within a few slices (5 ms each), not after the hogs' 1.5 s. The
+    // bound leaves room for a loaded CI machine (each call also makes an
+    // instance, in a debug build) and is still well under one hog's budget.
     assert!(
-        worst < Duration::from_millis(150),
+        worst < Duration::from_millis(500),
         "worst latency {worst:?}"
     );
     for hog in hogs {

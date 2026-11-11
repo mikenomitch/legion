@@ -70,13 +70,7 @@ async fn a_handler_answers_a_request_test() {
     assert!(b.ends_with("] payload"), "{b}");
     assert_eq!(stdout(&r), "echo /echo\n");
     // Handler output also goes to the task's log stream.
-    for _ in 0..50 {
-        if !h.worker.logs.lock().unwrap().is_empty() {
-            break;
-        }
-        sleep_ms(10).await;
-    }
-    let logs = h.worker.logs.lock().unwrap().clone();
+    let logs = wait_for(|| h.worker.logs.lock().unwrap().clone(), |l| !l.is_empty()).await;
     assert_eq!(logs[0].lines[0].line, b"echo /echo");
     assert_eq!(logs[0].origin.as_ref().unwrap().task_name, "web");
 }
@@ -247,24 +241,18 @@ async fn one_invocation_has_at_most_eight_outgoing_requests_in_flight_test() {
 async fn outgoing_requests_end_with_the_invocation_test() {
     let h = start(config());
     *h.worker.egress_delay.lock().unwrap() = Some(std::time::Duration::from_secs(30));
-    // A wall limit cuts a command waiting on three slow requests.
+    // A wall limit cuts a command waiting on three slow requests. (Long
+    // enough that the three reach the worker first on a loaded machine: a
+    // request whose task first runs after the invocation ended never
+    // does.)
     let mut s = spec("j", "cmd", "cmd");
-    s.limits.as_mut().unwrap().wall_micros = 300_000;
+    s.limits.as_mut().unwrap().wall_micros = 1_000_000;
     h.task(s);
     let r = h
         .run("j", "cmd", &["fetch-many", "3", "http://slow/x"])
         .await;
     assert_eq!(stopped(&r).1, "wall");
-    let wait_cancelled = |n: usize| async move {
-        for _ in 0..100 {
-            if in_flight(&h).2 >= n {
-                break;
-            }
-            sleep_ms(10).await;
-        }
-        in_flight(&h)
-    };
-    let (now, _, cancelled) = wait_cancelled(3).await;
+    let (now, _, cancelled) = wait_for(|| in_flight(&h), |s| s.2 >= 3).await;
     assert_eq!((now, cancelled), (0, 3), "the worker calls were dropped");
 }
 
@@ -280,17 +268,32 @@ async fn a_warm_instance_cannot_leave_a_request_running_after_its_call_test() {
         .await
         .unwrap();
     assert_eq!(outcome(&r).result, "\"left\"", "{r:?}");
-    for _ in 0..100 {
-        if in_flight(&h).2 >= 1 {
-            break;
+    // wasmtime runs the request on a task of its own, which may first run
+    // before the call returned (it reaches the worker and is cancelled
+    // there) or after (it is stopped before it reaches the worker: the
+    // invocation's end is checked first). Either way nothing is left in
+    // flight; wait for the worker's side to settle rather than sleep.
+    let settled = |s: &(usize, usize, usize)| s.0 == 0 && s.1 == s.2;
+    let state = wait_for(|| in_flight(&h), settled).await;
+    assert!(
+        state == (0, 0, 0) || state == (0, 1, 1),
+        "cancelled when the call returned: {state:?}"
+    );
+    eprintln!(
+        "the left request {} the worker",
+        if state.1 == 1 {
+            "reached and was cancelled at"
+        } else {
+            "was stopped before it reached"
         }
-        sleep_ms(10).await;
-    }
-    assert_eq!(in_flight(&h), (0, 1, 1), "cancelled when the call returned");
-    // The instance is still warm and usable.
+    );
+    // The instance is still warm and usable, and the request it left is
+    // not running at the worker afterwards either.
     let r = h
         .run_with("j", "t", "acme", "", run(&["count"]))
         .await
         .unwrap();
     assert_eq!(r.start, "warm");
+    let after = wait_for(|| in_flight(&h), settled).await;
+    assert!(settled(&after) && after.1 <= 1, "{after:?}");
 }

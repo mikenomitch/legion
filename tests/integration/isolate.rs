@@ -518,6 +518,96 @@ async fn a_best_effort_confined_host_answers_hello() {
     assert!(!hosts[0].confinement.is_empty(), "{hosts:?}");
 }
 
+/// Whether this machine lets the test's user make the namespaces the host
+/// asks for. Ubuntu 24.04 refuses unprivileged user namespaces
+/// (`kernel.apparmor_restrict_unprivileged_userns`), as does
+/// `user.max_user_namespaces = 0`. Probed in a forked child, which is
+/// single-threaded as `unshare(CLONE_NEWUSER)` requires.
+fn userns_available() -> bool {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("true");
+    // The host's own first steps: unshare, then map our uid and gid to
+    // 65534 (a kernel may allow the unshare and refuse the maps).
+    // SAFETY: getuid/getgid have no preconditions.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let (uid_map, gid_map) = (format!("65534 {uid} 1"), format!("65534 {gid} 1"));
+    // SAFETY: only unshare(2), open(2), write(2), and close(2) on buffers
+    // made before the fork, between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            let flags = libc::CLONE_NEWUSER
+                | libc::CLONE_NEWNET
+                | libc::CLONE_NEWNS
+                | libc::CLONE_NEWIPC
+                | libc::CLONE_NEWUTS;
+            if libc::unshare(flags) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for (path, data) in [
+                (c"/proc/self/setgroups", &b"deny"[..]),
+                (c"/proc/self/uid_map", uid_map.as_bytes()),
+                (c"/proc/self/gid_map", gid_map.as_bytes()),
+            ] {
+                let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let n = libc::write(fd, data.as_ptr().cast(), data.len());
+                libc::close(fd);
+                if n < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// `confine = "enforce"` on whatever node runs the test: where the kernel
+/// and the worker's privileges give every layer, a run succeeds with all
+/// of them; where user namespaces are refused (an unprivileged worker on
+/// Ubuntu 24.04), the run fails promptly, naming what did not apply,
+/// rather than hanging or running less confined than asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_enforced_node_runs_fully_confined_or_says_what_is_missing() {
+    let node = node_confined("cmd.wasm", ConfineMode::Enforce);
+    node.supervisor
+        .sync(vec![envelope("ns/a", task("run", "request", "namespace"))]);
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        node.supervisor.run(run("ns/a", &[]), None),
+    )
+    .await
+    .expect("an enforced run neither hangs nor waits out its whole timeout");
+    if userns_available() {
+        let reply = result.expect("every layer is available here");
+        assert_eq!(reply.exit, Some(0));
+        let (_, hosts) = node.supervisor.stats("", "").await;
+        for layer in [
+            "userns",
+            "netns",
+            "pid-ns",
+            "mount-root",
+            "seccomp",
+            "landlock",
+        ] {
+            assert!(
+                hosts[0].confinement.iter().any(|l| l == layer),
+                "{layer}: {hosts:?}"
+            );
+        }
+    } else {
+        eprintln!("SKIP-REASON: user namespaces are refused here: enforce must refuse");
+        let err = result
+            .expect_err("enforce cannot be met without userns")
+            .to_string();
+        eprintln!("enforce refused: {err}");
+        assert!(err.contains("did not apply"), "{err}");
+        assert!(err.contains("user namespace"), "{err}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Through the whole stack: a manager on raft, a real worker (task manager,
 // worker service on the mTLS worker plane, isolate supervisor), and real

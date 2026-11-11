@@ -196,6 +196,74 @@ fn bin_config(confine: Confine) -> HostConfig {
     c
 }
 
+/// Whether this machine lets the test's user make the namespaces the host
+/// asks for (a user namespace with network, mount, IPC, and UTS ones). Some
+/// do not: Ubuntu 24.04 refuses unprivileged user namespaces
+/// (`kernel.apparmor_restrict_unprivileged_userns`), as does
+/// `user.max_user_namespaces = 0`. Probed in a forked child, which is
+/// single-threaded as `unshare(CLONE_NEWUSER)` requires.
+fn userns_available() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        let mut cmd = Command::new("true");
+        // The host's own first steps: unshare, then map our uid and gid to
+        // 65534 (a kernel may allow the unshare and refuse the maps).
+        // SAFETY: getuid/getgid have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let (uid_map, gid_map) = (format!("65534 {uid} 1"), format!("65534 {gid} 1"));
+        // SAFETY: only unshare(2), open(2), write(2), and close(2) on
+        // buffers made before the fork, between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                let flags = libc::CLONE_NEWUSER
+                    | libc::CLONE_NEWNET
+                    | libc::CLONE_NEWNS
+                    | libc::CLONE_NEWIPC
+                    | libc::CLONE_NEWUTS;
+                if libc::unshare(flags) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                for (path, data) in [
+                    (c"/proc/self/setgroups", &b"deny"[..]),
+                    (c"/proc/self/uid_map", uid_map.as_bytes()),
+                    (c"/proc/self/gid_map", gid_map.as_bytes()),
+                ] {
+                    let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                    if fd < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let n = libc::write(fd, data.as_ptr().cast(), data.len());
+                    libc::close(fd);
+                    if n < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            eprintln!(
+                "SKIP-REASON: user namespaces are refused here; the namespace layers \
+                 (user, network, PID, mount root) are not exercised"
+            );
+        }
+        ok
+    })
+}
+
+/// Where the machine offers user namespaces, the host must have used them:
+/// a test that returns early for a missing namespace layer cannot pass
+/// that way on a machine that has it.
+fn assert_namespace_layers_where_offered(c: &Confinement) {
+    if userns_available() {
+        assert!(
+            c.user_namespace && c.network_namespace && c.pid_namespace && c.mount_root,
+            "user namespaces work here, so every namespace layer must apply: {c:?}"
+        );
+    }
+}
+
 fn stderr_of(child: &mut Child) -> String {
     let mut s = String::new();
     if let Some(mut e) = child.stderr.take() {
@@ -213,7 +281,8 @@ async fn a_confined_host_serves_runs_sessions_and_egress_over_grpc_test() {
     assert_eq!(hello.shards, 2);
     assert_eq!(hello.pid, h.child.id());
     let c = hello.confinement.unwrap();
-    eprintln!("confinement in this container: {c:?}");
+    eprintln!("confinement on this machine: {c:?}");
+    assert_namespace_layers_where_offered(&c);
     // What applies here (kernel 6.18, root in a Firecracker guest) is
     // asserted by `confinement_layers_report_what_the_kernel_offers_test`.
     let info = std::process::Command::new(BIN)
@@ -360,12 +429,20 @@ async fn hello_and_invoke_work_with_confinement_on_test() {
                     level == Confine::Enforce && status.code() == Some(3),
                     "{level:?}: Hello failed: {e}; host {status:?}: {err}"
                 );
+                // Refused with a message naming what is missing, and only
+                // where something is.
+                assert!(err.contains("did not apply"), "{err}");
+                assert!(
+                    !userns_available() || !err.contains("user namespace"),
+                    "user namespaces work here: {err}"
+                );
                 eprintln!("LAYER UNAVAILABLE HERE: enforce refused to start: {err}");
                 continue;
             }
         };
         let c = hello.confinement.unwrap();
         eprintln!("{level:?}: {c:?}");
+        assert_namespace_layers_where_offered(&c);
         client
             .load_module(LoadModuleRequest {
                 module_id: "cmd".into(),
@@ -449,8 +526,10 @@ fn compile_refuses_and_reports_as_json_test() {
     let dir = tempfile::tempdir().unwrap();
     let core = dir.path().join("core.wasm");
     std::fs::write(&core, wat::parse_str("(module)").unwrap()).unwrap();
+    // Best effort: this is about the report, not about which confinement
+    // layers the machine offers (enforce exits 3 where one is missing).
     let out = Command::new(BIN)
-        .args(["compile", "--input"])
+        .args(["compile", "--confine", "best-effort", "--input"])
         .arg(&core)
         .arg("--output")
         .arg(dir.path().join("x.cwasm"))
@@ -461,7 +540,7 @@ fn compile_refuses_and_reports_as_json_test() {
     assert_eq!(v["ok"], false);
     assert_eq!(v["kind"], "invalid");
     let ok = Command::new(BIN)
-        .args(["compile", "--input"])
+        .args(["compile", "--confine", "best-effort", "--input"])
         .arg(fixture("cmd"))
         .arg("--output")
         .arg(dir.path().join("cmd.cwasm"))
@@ -520,7 +599,7 @@ fn attempt_skipping(what: &str, skip: &[&str]) -> (std::process::ExitStatus, Str
 #[cfg(feature = "confinement-test")]
 fn hello_confinement() -> Confinement {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
+    let c = rt.block_on(async {
         let mut h = spawn(bin_config(Confine::BestEffort)).await;
         h.client
             .hello(HelloRequest {})
@@ -529,7 +608,9 @@ fn hello_confinement() -> Confinement {
             .into_inner()
             .confinement
             .unwrap()
-    })
+    });
+    assert_namespace_layers_where_offered(&c);
+    c
 }
 
 #[test]
@@ -673,6 +754,7 @@ async fn the_host_network_namespace_has_no_interface_test() {
         .into_inner()
         .confinement
         .unwrap();
+    assert_namespace_layers_where_offered(&c);
     if !c.network_namespace {
         eprintln!("LAYER UNAVAILABLE HERE: network namespace ({:?})", c.notes);
         return;
@@ -831,7 +913,10 @@ fn landlock_scopes_alone_stop_signals_to_outside_processes_test() {
             &format!("sigio-fcntl:{}", v.pid()),
             &["seccomp", "pidns", "scopes"],
         );
-        std::thread::sleep(Duration::from_millis(200));
+        let t = Instant::now();
+        while v.alive() && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(!v.alive(), "the unconfined route should kill: {out}");
     }
 }
@@ -901,6 +986,7 @@ async fn killing_the_pid_the_worker_knows_kills_the_host_test() {
         "Hello reports the pid the worker spawned"
     );
     let c = hello.confinement.unwrap();
+    assert_namespace_layers_where_offered(&c);
     if !c.pid_namespace {
         eprintln!("LAYER UNAVAILABLE HERE: pid namespace ({:?})", c.notes);
         let _ = child.kill();
@@ -977,6 +1063,12 @@ fn the_compiler_reports_every_layer_and_honours_confine_test() {
     if v["kind"] == "confinement" {
         eprintln!("LAYER UNAVAILABLE HERE: compiler enforce refused: {v}");
         assert_eq!(status.code(), Some(3));
+        let err = v["error"].as_str().unwrap_or_default();
+        assert!(err.contains("did not apply"), "{v}");
+        assert!(
+            !userns_available() || !err.contains("user namespace"),
+            "user namespaces work here: {v}"
+        );
     } else {
         assert_eq!(v["ok"], true, "{v}");
         let c = &v["confinement"];
@@ -1218,6 +1310,22 @@ fn attempt_with(cfg: &HostConfig, what: &str, skip: &[&str]) -> (std::process::E
     )
 }
 
+/// `CAP_SETPCAP` (linux/capability.h).
+#[cfg(feature = "confinement-test")]
+const CAP_SETPCAP: u32 = 8;
+
+/// Whether this process holds `cap` in its effective set.
+#[cfg(feature = "confinement-test")]
+fn has_effective_cap(cap: u32) -> bool {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let eff = status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+        .unwrap_or(0);
+    eff & (1 << cap) != 0
+}
+
 /// A tmpfs mounted at `<dir>/sub` for the test's lifetime.
 #[cfg(feature = "confinement-test")]
 struct SubMount(std::path::PathBuf);
@@ -1260,9 +1368,15 @@ fn a_mount_inside_a_read_dir_is_read_only_for_the_host_test() {
         }
         let dir = tempfile::tempdir().unwrap();
         let Some(_sub) = SubMount::new(dir.path()) else {
+            let err = std::io::Error::last_os_error();
+            // CAP_SYS_ADMIN (21): with it the mount must work.
+            assert!(
+                !has_effective_cap(21),
+                "root could not mount a tmpfs: {err}"
+            );
             eprintln!(
-                "cannot mount a tmpfs here ({}); not tested",
-                std::io::Error::last_os_error()
+                "SKIP-REASON: mounting the test's tmpfs needs root ({err}); not tested \
+                 here, run by the isolate-confinement CI job"
             );
             return;
         };
@@ -1301,11 +1415,19 @@ fn without_a_user_namespace_every_capability_is_dropped_test() {
         let (status, out) = attempt_with(&cfg, "caps", &["userns", "seccomp"]);
         assert!(status.success(), "{status:?} {out}");
         assert!(
-            out.contains(
-                "caps: capget=0 effective=0 permitted=0 inheritable=0 bounding=0 ambient=0"
-            ),
+            out.contains("caps: capget=0 effective=0 permitted=0 inheritable=0 bounding="),
             "{out}"
         );
+        assert!(out.contains(" ambient=0"), "{out}");
+        // Emptying the bounding set takes CAP_SETPCAP: a root worker's host
+        // drops all of it; an unprivileged one's cannot, and has nothing in
+        // its other sets to use it with.
+        if has_effective_cap(CAP_SETPCAP) {
+            assert!(out.contains(" bounding=0 "), "{out}");
+        } else {
+            eprintln!("SKIP-REASON: not privileged, so the bounding set is kept: {out}");
+            assert!(!out.contains(" bounding=0 "), "{out}");
+        }
         // And under enforce the missing namespace still refuses to start.
         let cfg = bin_config(Confine::Enforce);
         let (status, out) = attempt_with(&cfg, "caps", &["userns"]);

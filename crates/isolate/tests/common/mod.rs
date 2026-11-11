@@ -311,6 +311,20 @@ pub fn stopped(r: &InvokeReply) -> (&str, &str, &str) {
     (s.reason.as_str(), s.limit.as_str(), s.detail.as_str())
 }
 
+/// Poll `probe` until `done` holds of what it returns, for up to 10 s (a
+/// loaded CI machine runs many test binaries at once), and return the last
+/// value either way: the caller asserts on it.
+pub async fn wait_for<T>(mut probe: impl FnMut() -> T, done: impl Fn(&T) -> bool) -> T {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let v = probe();
+        if done(&v) || std::time::Instant::now() >= deadline {
+            return v;
+        }
+        sleep_ms(5).await;
+    }
+}
+
 pub async fn sleep_ms(ms: u64) {
     tokio::time::sleep(Duration::from_millis(ms)).await
 }

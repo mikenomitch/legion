@@ -22,7 +22,9 @@
 //!    table lists); one that cannot be is fatal under enforce.
 //! 4. **Capabilities** are all dropped (after the mounts, which need them),
 //!    from every set; also when no user namespace could be made (best
-//!    effort), where the process keeps the worker's uid but no privilege.
+//!    effort), where the process keeps the worker's uid but no privilege
+//!    (an unprivileged worker's host keeps its bounding set, which takes
+//!    `CAP_SETPCAP` to shrink and grants nothing under `no_new_privs`).
 //! 5. **`no_new_privs`.**
 //! 6. **Landlock.** Read-only access beneath `read_dirs`, read-write beneath
 //!    `write_dirs`, nothing else; no TCP bind or connect where the ABI covers
@@ -129,7 +131,13 @@ pub fn confine(
                 in_userns = true;
                 c.network_namespace = true;
             }
-            Err(e) => c.notes.push(format!("namespaces: {e}")),
+            // Name every layer that hangs on the user namespace, so a
+            // reader of the notes (and `confine = "enforce"`'s error) sees
+            // why each is missing.
+            Err(e) => c.notes.push(format!(
+                "namespaces: no user namespace ({e}), so no network namespace, PID \
+                 namespace, or mount root either"
+            )),
         }
     }
     if in_userns && !plan.skips("pidns") {
@@ -155,19 +163,28 @@ pub fn confine(
     }
     if in_userns {
         match drop_capabilities() {
-            Ok(()) => c.user_namespace = true,
+            Ok(_) => c.user_namespace = true,
             Err(e) => c.notes.push(format!("user namespace: {e}")),
         }
     } else if plan.namespaces {
         // No user namespace (best-effort on a kernel that refuses one): the
-        // process is whoever the worker is, usually real root. Its
-        // capabilities are still dropped from every set, so only Landlock
-        // and seccomp stand between it and the node, without root's
-        // privileges behind them.
+        // process is whoever the worker is, real root or an unprivileged
+        // user. Its capabilities are still dropped, so only Landlock and
+        // seccomp stand between it and the node, without root's privileges
+        // behind them. An unprivileged worker cannot shrink the bounding
+        // set (that takes CAP_SETPCAP); it has no capability to keep there,
+        // and no_new_privs stops an exec from gaining one from it.
         match drop_capabilities() {
-            Ok(()) => c.notes.push(
+            Ok(Bounding::Cleared) => c.notes.push(
                 "user namespace: not created, so the host runs with the worker's uid; every \
                  capability was dropped (bounding, permitted, effective, inheritable, ambient)"
+                    .into(),
+            ),
+            Ok(Bounding::Kept) => c.notes.push(
+                "user namespace: not created, so the host runs with the worker's uid; the \
+                 permitted, effective, inheritable, and ambient sets are empty; the bounding set \
+                 is kept (dropping from it needs CAP_SETPCAP, which an unprivileged worker lacks; \
+                 no_new_privs keeps it from granting anything)"
                     .into(),
             ),
             Err(e) => c
@@ -745,10 +762,19 @@ fn submounts_beneath(mountinfo: &str, at: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Whether [`drop_capabilities`] emptied the bounding set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bounding {
+    Cleared,
+    /// The process lacks `CAP_SETPCAP` (an unprivileged worker without a
+    /// user namespace): the other sets are empty all the same.
+    Kept,
+}
+
 /// Drop every capability from the bounding, permitted, effective, and
 /// inheritable sets and clear the ambient set (in the new user namespace,
 /// which grants all of them, or in the worker's when none was made).
-fn drop_capabilities() -> Result<(), String> {
+fn drop_capabilities() -> Result<Bounding, String> {
     #[repr(C)]
     struct Header {
         version: u32,
@@ -767,9 +793,15 @@ fn drop_capabilities() -> Result<(), String> {
         pid: 0,
     };
     let d = [Data::default(); 2];
+    let mut bounding = Bounding::Cleared;
     for cap in 0..64 {
-        // SAFETY: prctl with integer arguments; unknown caps fail harmlessly.
-        unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
+        // SAFETY: prctl with integer arguments; a cap past the kernel's
+        // last answers EINVAL, harmlessly.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        {
+            bounding = Bounding::Kept;
+        }
     }
     // SAFETY: prctl with integer arguments (a kernel before 4.3 has no
     // ambient set and answers EINVAL, which is the same as an empty one).
@@ -787,7 +819,7 @@ fn drop_capabilities() -> Result<(), String> {
     if r != 0 {
         return Err(os_err("capset"));
     }
-    Ok(())
+    Ok(bounding)
 }
 
 // ---------------------------------------------------------------------------

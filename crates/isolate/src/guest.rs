@@ -727,12 +727,18 @@ impl WasiHttpHooks for EgressHooks {
                 send_egress(worker, inv.clone(), max, request, options).await
             };
             tokio::select! {
-                r = work => r,
+                // Checked first: a request whose task first runs after its
+                // invocation ended (wasmtime spawns it when the guest calls
+                // `handle`, and the guest may return at once) never reaches
+                // the worker, rather than half the time (`select!` otherwise
+                // polls its branches in random order).
+                biased;
                 // The invocation ended (returned, hit a limit, was cut) with
                 // this request pending: stop it, worker call included.
                 _ = ended.ended() => Err(HttpErr::InternalError(Some(
                     "the invocation ended before the response arrived".into(),
                 ))),
+                r = work => r,
             }
         })
     }

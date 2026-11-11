@@ -42,6 +42,35 @@ async fn open(h: &TestHost, task: &str, session: &str) {
         .unwrap();
 }
 
+/// Wait until `session` (parked) has hibernated: its checkpoint is saved
+/// and the host has let it go. Hibernation runs after the call returns.
+async fn wait_hibernated(h: &TestHost, session: &str) {
+    let done = wait_for(
+        || {
+            h.worker.checkpoints.lock().unwrap().contains_key(session)
+                && h.host.get_session(session).is_err()
+        },
+        |done| *done,
+    )
+    .await;
+    assert!(done, "{session} did not hibernate");
+}
+
+/// Wait until `session` has a call running.
+async fn wait_running(h: &TestHost, session: &str) {
+    let active = wait_for(
+        || {
+            h.host
+                .get_session(session)
+                .map(|i| i.active)
+                .unwrap_or(false)
+        },
+        |a| *a,
+    )
+    .await;
+    assert!(active, "no call of {session} started");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_lifetime_never_reuses_an_instance_test() {
     let h = host_with(runner_spec("r", Lifetime::Request));
@@ -89,7 +118,9 @@ async fn idle_tenant_instances_are_dropped_test() {
     s.tenant_idle_millis = 100;
     let h = host_with(s);
     call(&h, "t", "a", "", &["count"]).await;
-    sleep_ms(400).await;
+    // Dropped once idle past 100 ms: wait for it rather than sleep.
+    let resident = wait_for(|| h.host.stats().tasks[0].resident, |n| *n == 0).await;
+    assert_eq!(resident, 0, "the idle tenant instance was dropped");
     let r = call(&h, "t", "a", "", &["count"]).await;
     assert_eq!(result(&r), "{\"count\":1}");
     assert_eq!(r.start, "fresh");
@@ -160,16 +191,16 @@ async fn a_session_hibernates_on_park_and_wakes_with_its_state_test() {
     assert_eq!((info.tier.as_str(), info.invocations), ("hot", 2));
     assert_eq!(info.state_bytes, 5);
     call(&h, "s", "acme", "sess-1", &["park"]).await;
-    // Hibernation happens after the call returns.
-    for _ in 0..50 {
-        // Done when the checkpoint is saved and the host has let go.
-        if h.worker.checkpoints.lock().unwrap().contains_key("sess-1")
-            && h.host.get_session("sess-1").is_err()
-        {
-            break;
-        }
-        sleep_ms(10).await;
-    }
+    // Hibernation happens after the call returns. Done when the
+    // checkpoint is saved and the host has let go.
+    wait_for(
+        || {
+            h.worker.checkpoints.lock().unwrap().contains_key("sess-1")
+                && h.host.get_session("sess-1").is_err()
+        },
+        |done| *done,
+    )
+    .await;
     let (header, _) = h.worker.checkpoints.lock().unwrap()["sess-1"].clone();
     assert_eq!(header.module_id, "runner");
     assert!(header.engine_version.starts_with("wasmtime-"));
@@ -191,7 +222,7 @@ async fn a_session_hibernates_on_park_and_wakes_with_its_state_test() {
     assert!(result(&r).contains("\"session\":\"sess-1\""));
     // A fresh wake reports resumed.
     call(&h, "s", "acme", "sess-1", &["park"]).await;
-    sleep_ms(200).await;
+    wait_hibernated(&h, "sess-1").await;
     r = call(&h, "s", "acme", "sess-1", &["info"]).await;
     assert!(result(&r).contains("\"resumed\":true"), "{}", result(&r));
     assert_eq!(h.host.stats().tasks[0].hibernations, 2);
@@ -204,13 +235,18 @@ async fn an_idle_session_hibernates_after_its_idle_time_test() {
     let h = host_with(s);
     open(&h, "s", "sess-idle").await;
     call(&h, "s", "acme", "sess-idle", &["set", "a", "1"]).await;
-    sleep_ms(400).await;
-    assert!(h
-        .worker
-        .checkpoints
-        .lock()
-        .unwrap()
-        .contains_key("sess-idle"));
+    // Hibernated once idle past 100 ms: wait for the checkpoint.
+    assert!(
+        wait_for(
+            || h.worker
+                .checkpoints
+                .lock()
+                .unwrap()
+                .contains_key("sess-idle"),
+            |saved| *saved,
+        )
+        .await
+    );
     let r = call(&h, "s", "acme", "sess-idle", &["get", "a"]).await;
     assert_eq!(
         (result(&r).as_str(), r.start.as_str()),
@@ -316,7 +352,7 @@ async fn drain_cuts_what_outlives_the_grace_test() {
         })
         .await
     });
-    sleep_ms(100).await;
+    wait_running(&h, "busy").await;
     let r = h
         .host
         .drain(DrainRequest {
@@ -360,7 +396,7 @@ async fn closing_a_session_cuts_its_running_call_test() {
         })
         .await
     });
-    sleep_ms(100).await;
+    wait_running(&h, "c2").await;
     assert!(h.host.close_session("c2", "user asked").await);
     let r = spin.await.unwrap().unwrap();
     let (reason, _, detail) = stopped(&r);
@@ -436,7 +472,7 @@ async fn resize_session_grows_shrinks_and_never_takes_memory_back_test() {
     assert_eq!(e.code(), tonic::Code::ResourceExhausted);
     // The size survives hibernation through the checkpoint.
     call(&h, "s", "acme", "rz", &["park"]).await;
-    sleep_ms(200).await;
+    wait_hibernated(&h, "rz").await;
     call(&h, "s", "acme", "rz", &["count"]).await;
     let e = h
         .host
@@ -535,7 +571,7 @@ async fn reclaim_can_name_sessions_and_skips_a_busy_one_test() {
         })
         .await
     });
-    sleep_ms(100).await;
+    wait_running(&h, "busy").await;
     let r = h
         .host
         .reclaim(ReclaimRequest {
@@ -604,12 +640,7 @@ async fn a_session_keeps_its_own_tenant_whatever_a_call_names_test() {
     assert!(result(&r).contains("\"tenant\":\"acme\""), "{}", result(&r));
     // Also after the instance is made again from a checkpoint.
     call(&h, "s", "evil", "sess-t", &["park"]).await;
-    for _ in 0..50 {
-        if h.host.get_session("sess-t").is_err() {
-            break;
-        }
-        sleep_ms(10).await;
-    }
+    wait_hibernated(&h, "sess-t").await;
     let r = call(&h, "s", "evil", "sess-t", &["info"]).await;
     assert!(result(&r).contains("\"tenant\":\"acme\""), "{}", result(&r));
     assert!(result(&r).contains("\"resumed\":true"), "{}", result(&r));
