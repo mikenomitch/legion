@@ -97,17 +97,18 @@ fn text(bytes: &[u8]) -> String {
 async fn the_language_images_run_through_the_manager() -> R<()> {
     let cluster = Cluster::start(
         built_images(),
-        json!([
-            python_task("run", "request", true),
-            python_task("bare", "request", false),
-            machine(),
-        ]),
+        json!([python_task("run", "request", true), machine(),]),
     )
     .await?;
-    for task in ["run", "bare"] {
-        cluster.wait_for(task, true).await?;
-    }
+    cluster.wait_for("run", true).await?;
     cluster.wait_for("machine", false).await?;
+    // The same image without a VM task, in a job of its own.
+    let bare = Cluster::start(
+        built_images(),
+        json!([python_task("bare", "request", false)]),
+    )
+    .await?;
+    bare.wait_for("bare", true).await?;
 
     // Python: stdout, and a top-level `result`.
     let started = Instant::now();
@@ -155,12 +156,12 @@ async fn the_language_images_run_through_the_manager() -> R<()> {
         "{stopped:?}"
     );
     assert_eq!(reply.next_tier, "vm");
-    let reply = run(&cluster, "bare", main_py(source)).await;
+    let reply = run(&bare, "bare", main_py(source)).await;
     assert_eq!(reply.stopped.expect("stopped").reason, "unsupported");
     assert_eq!(reply.next_tier, "", "no VM task, no next tier");
 
     // The dry run's import scan.
-    for (task, tier) in [("run", "vm"), ("bare", "isolate")] {
+    for (cluster, task, tier) in [(&cluster, "run", "vm"), (&bare, "bare", "isolate")] {
         let reply = cluster
             .run(RunSessionRequest {
                 task_name: task.into(),

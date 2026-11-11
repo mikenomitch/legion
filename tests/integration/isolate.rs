@@ -731,7 +731,10 @@ pub(crate) mod cluster {
             anyhow::bail!(
                 "the worker never ran the envelope of {JOB}/{task} (isolate envelopes here: \
                  {held:?}; tasks: {:?})",
-                stats.iter().map(|t| (&t.task_name, &t.problem)).collect::<Vec<_>>()
+                stats
+                    .iter()
+                    .map(|t| (&t.task_name, &t.problem))
+                    .collect::<Vec<_>>()
             )
         }
 
