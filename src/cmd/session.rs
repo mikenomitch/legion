@@ -356,25 +356,15 @@ pub fn config() -> Command {
                      the task's VM task (config.vm.task)",
                 ),
         )
-        .arg(
-            Arg::new("tenant")
-                .long("tenant")
-                .value_name("KEY")
-                .help(
-                    "Isolate tasks only: who the run is for. Keys the warm instance of \
+        .arg(Arg::new("tenant").long("tenant").value_name("KEY").help(
+            "Isolate tasks only: who the run is for. Keys the warm instance of \
                      config.lifetime = \"tenant\" and the node's per-tenant queue (up to 128 \
                      printable ASCII bytes)",
-                ),
-        )
-        .arg(
-            Arg::new("session")
-                .long("session")
-                .value_name("ID")
-                .help(
-                    "Isolate tasks with config.lifetime = \"session\" only: run in this \
+        ))
+        .arg(Arg::new("session").long("session").value_name("ID").help(
+            "Isolate tasks with config.lifetime = \"session\" only: run in this \
                      existing session isolate, on the node its id names, instead of a fresh one",
-                ),
-        )
+        ))
         .arg(
             Arg::new("fallback")
                 .long("fallback")
@@ -803,7 +793,10 @@ async fn run(matches: &ArgMatches) -> R<()> {
             .get_one::<String>("on-node")
             .cloned()
             .unwrap_or_default(),
-        tier: matches.get_one::<String>("tier").cloned().unwrap_or_default(),
+        tier: matches
+            .get_one::<String>("tier")
+            .cloned()
+            .unwrap_or_default(),
         tenant: matches
             .get_one::<String>("tenant")
             .cloned()
@@ -1607,5 +1600,243 @@ mod session_cmd_test {
             ..Default::default()
         };
         assert_eq!(run_reply_json(&dry)["hasRoom"], true);
+        assert!(run_reply_json(&dry).get("tier").is_none());
+    }
+
+    /// A non-isolate reply carries none of the isolate keys, so its shape is
+    /// what it was before the isolate runtime.
+    #[test]
+    fn a_non_isolate_reply_has_no_isolate_keys_test() {
+        let data = run_reply_json(&RunSessionResponse {
+            wall_ms: 412,
+            cpu_ms: 7,
+            cpu_micros: 7_000,
+            ..Default::default()
+        });
+        let mut keys: Vec<&String> = data.as_object().expect("object").keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "cpuMs",
+                "deduplicated",
+                "exit",
+                "files",
+                "node",
+                "result",
+                "runId",
+                "sessionId",
+                "stderr",
+                "stdout",
+                "stopped",
+                "task",
+                "truncated",
+                "wallMs"
+            ]
+        );
+        assert_eq!(data["cpuMs"], 7);
+        assert_eq!(data["wallMs"], 412);
+        assert_eq!(tier_note(&RunSessionResponse::default(), false), None);
+    }
+
+    fn isolate_stop(reason: &str, limit: &str, detail: &str) -> RunSessionResponse {
+        RunSessionResponse {
+            task_name: "run".into(),
+            node_id: "w-17".into(),
+            tier: "isolate".into(),
+            tier_reason: "auto: no imports outside the image".into(),
+            next_tier: "vm".into(),
+            cpu_micros: 1_200,
+            wall_micros: 3_000,
+            cpu_ms: 1,
+            wall_ms: 3,
+            stopped: Some(crate::structs::RunStop {
+                reason: reason.into(),
+                limit: limit.into(),
+                detail: detail.into(),
+                hint: "rerun with --tier vm".into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_isolate_reply_renders_tier_fields_and_fractional_ms_test() {
+        let ran = RunSessionResponse {
+            task_name: "run".into(),
+            tier: "isolate".into(),
+            tier_reason: "auto: no imports outside the image".into(),
+            exit: Some(0),
+            cpu_micros: 3_100,
+            wall_micros: 4_000,
+            cpu_ms: 3,
+            wall_ms: 4,
+            isolate_start: "warm".into(),
+            ..Default::default()
+        };
+        let data = run_reply_json(&ran);
+        assert_eq!(data["tier"], "isolate");
+        assert_eq!(data["tierReason"], "auto: no imports outside the image");
+        assert_eq!(data["nextTier"], Value::Null);
+        assert_eq!(data["cpuMs"], 3.1);
+        assert_eq!(data["wallMs"], 4.0);
+        assert_eq!(data["isolateStart"], "warm");
+        assert!(data.get("vmMs").is_none(), "only for a VM run");
+        assert!(data.get("ranTwice").is_none());
+        assert_eq!(
+            tier_note(&ran, false).as_deref(),
+            Some("legion: ran in the isolate tier (auto: no imports outside the image)")
+        );
+
+        let vm = RunSessionResponse {
+            task_name: "machine".into(),
+            tier: "vm".into(),
+            tier_reason: "auto: import torch is not in image python".into(),
+            next_tier: "vm".into(),
+            exit: Some(0),
+            wall_ms: 1890,
+            vm_ms: 231,
+            ..Default::default()
+        };
+        let data = run_reply_json(&vm);
+        assert_eq!(data["vmMs"], 231);
+        assert_eq!(data["wallMs"], 1890, "a VM run keeps whole milliseconds");
+        assert_eq!(data["nextTier"], "vm");
+        assert!(data.get("isolateStart").is_none());
+        assert!(tier_note(&vm, true).expect("note").ends_with(
+            "your code ran twice, the second time in a VM; run this code with --tier vm next time"
+        ));
+
+        let dry = RunSessionResponse {
+            task_name: "run".into(),
+            dry_run: Some(crate::structs::RunDryRun {
+                node_id: "w-17".into(),
+                has_room: true,
+                tier: "vm".into(),
+                tier_reason: "auto: import torch is not in image python".into(),
+                imports: vec!["json".into(), "torch".into()],
+                missing_imports: vec!["torch".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let data = run_reply_json(&dry);
+        assert_eq!(data["tier"], "vm");
+        assert_eq!(data["imports"], json!(["json", "torch"]));
+        assert_eq!(data["missingImports"], json!(["torch"]));
+    }
+
+    #[test]
+    fn isolate_stops_exit_124_for_wall_and_125_otherwise_test() {
+        assert_eq!(run_exit_code(&isolate_stop("limits", "wall", "")), 124);
+        assert_eq!(run_exit_code(&isolate_stop("limits", "cpu", "")), 125);
+        assert_eq!(run_exit_code(&isolate_stop("unsupported", "", "")), 125);
+        assert_eq!(run_exit_code(&isolate_stop("trap", "", "")), 125);
+    }
+
+    #[test]
+    fn fallback_reruns_only_an_isolate_stop_that_points_at_a_vm_test() {
+        let request = RunSessionRequest {
+            job_id: "code-runner".into(),
+            task_name: "run".into(),
+            idempotency_key: Some("k1".into()),
+            tenant: "acme".into(),
+            ..Default::default()
+        };
+        let unsupported = isolate_stop(
+            "unsupported",
+            "",
+            "subprocess.run: processes are not available in an isolate",
+        );
+        let second = fallback_vm_request(&unsupported, &request).expect("falls back");
+        assert_eq!(second.tier, "vm");
+        assert_eq!(second.idempotency_key.as_deref(), Some("k1:fallback"));
+        assert_eq!(second.tenant, "acme");
+        assert_eq!(
+            fallback_reason(&unsupported),
+            "fallback: stopped in the isolate, unsupported (subprocess.run)"
+        );
+        let limits = isolate_stop("limits", "cpu", "exceeded its 100ms CPU limit (100.4ms)");
+        assert!(fallback_vm_request(&limits, &request).is_some());
+        assert_eq!(
+            fallback_reason(&limits),
+            "fallback: stopped in the isolate, limits (cpu)"
+        );
+        let no_key = RunSessionRequest {
+            idempotency_key: None,
+            ..request.clone()
+        };
+        assert_eq!(
+            fallback_vm_request(&limits, &no_key).and_then(|r| r.idempotency_key),
+            None
+        );
+
+        // No VM to go to, a trap, a run that finished, or a VM run: no rerun.
+        let mut no_vm = limits.clone();
+        no_vm.next_tier.clear();
+        assert!(fallback_vm_request(&no_vm, &request).is_none());
+        assert!(fallback_vm_request(&isolate_stop("trap", "", "boom"), &request).is_none());
+        let finished = RunSessionResponse {
+            stopped: None,
+            ..limits.clone()
+        };
+        assert!(fallback_vm_request(&finished, &request).is_none());
+        let vm_stop = RunSessionResponse {
+            tier: "vm".into(),
+            ..limits
+        };
+        assert!(fallback_vm_request(&vm_stop, &request).is_none());
+    }
+
+    #[test]
+    fn run_parses_the_isolate_flags_test() {
+        let matches = config()
+            .try_get_matches_from([
+                "session",
+                "run",
+                "code-runner",
+                "--file",
+                "snippet.py",
+                "--tier",
+                "isolate",
+                "--tenant",
+                "acme",
+                "--fallback",
+                "vm",
+                "-j",
+            ])
+            .expect("parses");
+        let (_, run) = matches.subcommand().expect("run");
+        assert_eq!(
+            run.get_one::<String>("tier").map(String::as_str),
+            Some("isolate")
+        );
+        assert_eq!(
+            run.get_one::<String>("tenant").map(String::as_str),
+            Some("acme")
+        );
+        assert_eq!(
+            run.get_one::<String>("fallback").map(String::as_str),
+            Some("vm")
+        );
+        for bad in [
+            &["session", "run", "j", "--tier", "gpu"][..],
+            &["session", "run", "j", "--fallback", "isolate"],
+            &[
+                "session",
+                "run",
+                "j",
+                "--fallback",
+                "vm",
+                "--session",
+                "run-x.y",
+            ],
+            &["session", "run", "j", "--fallback", "vm", "--dry-run"],
+        ] {
+            assert!(config().try_get_matches_from(bad).is_err(), "{bad:?}");
+        }
+        assert!(config()
+            .try_get_matches_from(["session", "run", "j", "--session", "run-x.y"])
+            .is_ok());
     }
 }

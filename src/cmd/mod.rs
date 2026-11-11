@@ -19,6 +19,7 @@ pub mod guest_agent;
 pub mod guest_resume;
 pub mod helpers;
 pub mod instance;
+pub mod isolate;
 pub mod job;
 pub mod join;
 pub mod join_token;
@@ -90,6 +91,7 @@ fn base_cli() -> Command {
         .subcommand(boot_ticket::config())
         .subcommand(sandbox::config())
         .subcommand(session::config())
+        .subcommand(isolate::config())
         .subcommand(join::config())
         .subcommand(ledger::config())
         .subcommand(governance::audit_config())

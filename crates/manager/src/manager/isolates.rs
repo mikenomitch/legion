@@ -90,7 +90,12 @@ impl IsolateStatsTable {
     /// One entry per node that reported any of `task_names` of `job_id`,
     /// sorted by node id: the matching task aggregates, the host processes
     /// whose cordon serves them, and how old the report is at `now`.
-    pub fn for_job(&self, job_id: &str, task_names: &[String], now: Instant) -> Vec<IsolateNodeStats> {
+    pub fn for_job(
+        &self,
+        job_id: &str,
+        task_names: &[String],
+        now: Instant,
+    ) -> Vec<IsolateNodeStats> {
         let mut nodes: BTreeMap<&str, IsolateNodeStats> = BTreeMap::new();
         for (node_id, entry) in &self.nodes {
             if let Some(stats) = node_stats(node_id, entry, job_id, task_names, now) {
@@ -145,7 +150,10 @@ pub fn filter_tasks(
 
 /// The host processes among `hosts` whose cordon serves one of `tasks`, by
 /// cordon then replica.
-pub fn hosts_serving(hosts: &[IsolateHostStats], tasks: &[IsolateTaskStats]) -> Vec<IsolateHostStats> {
+pub fn hosts_serving(
+    hosts: &[IsolateHostStats],
+    tasks: &[IsolateTaskStats],
+) -> Vec<IsolateHostStats> {
     let mut found: Vec<IsolateHostStats> = hosts
         .iter()
         .filter(|host| tasks.iter().any(|task| task.cordon == host.cordon))
@@ -158,7 +166,11 @@ pub fn hosts_serving(hosts: &[IsolateHostStats], tasks: &[IsolateTaskStats]) -> 
 /// The isolate tasks a stats request covers: the one `task_name` names, or
 /// every isolate task of the job when it is empty. The error is the
 /// FAILED_PRECONDITION text for a name that is no isolate task of the job.
-pub fn stats_tasks(job_id: &str, tasks: &[TaskConfig], task_name: &str) -> Result<Vec<String>, String> {
+pub fn stats_tasks(
+    job_id: &str,
+    tasks: &[TaskConfig],
+    task_name: &str,
+) -> Result<Vec<String>, String> {
     let isolates: Vec<&TaskConfig> = tasks
         .iter()
         .filter(|task| crate::structs::isolate::is_isolate_task(task))
@@ -196,11 +208,15 @@ pub fn check_run_fields(
 ) -> Result<(), (tonic::Code, String)> {
     let isolate = crate::structs::isolate::is_isolate_task(task);
     if !isolate {
-        let set: Vec<&str> = [("tier", tier), ("tenant", tenant), ("session_id", session_id)]
-            .into_iter()
-            .filter(|(_, value)| !value.trim().is_empty())
-            .map(|(name, _)| name)
-            .collect();
+        let set: Vec<&str> = [
+            ("tier", tier),
+            ("tenant", tenant),
+            ("session_id", session_id),
+        ]
+        .into_iter()
+        .filter(|(_, value)| !value.trim().is_empty())
+        .map(|(name, _)| name)
+        .collect();
         if !set.is_empty() {
             return Err((
                 tonic::Code::InvalidArgument,
@@ -242,8 +258,13 @@ pub fn check_run_fields(
         crate::structs::isolate::validate_tenant_key(tenant)
             .map_err(|err| (tonic::Code::InvalidArgument, format!("tenant: {err}")))?;
     }
-    let config = crate::structs::isolate::IsolateTaskConfig::from_value(&task.config)
-        .map_err(|err| (tonic::Code::FailedPrecondition, format!("task {}: {err}", task.name)))?;
+    let config =
+        crate::structs::isolate::IsolateTaskConfig::from_value(&task.config).map_err(|err| {
+            (
+                tonic::Code::FailedPrecondition,
+                format!("task {}: {err}", task.name),
+            )
+        })?;
     if tier == "vm" && crate::structs::isolate::vm_task_name(task, &config).is_none() {
         return Err((
             tonic::Code::FailedPrecondition,
@@ -299,7 +320,10 @@ pub fn run_wall(tier: &str, isolate_wall: Duration, vm: Option<&TaskConfig>) -> 
 /// tasks: the only one that takes runs. An isolate task wins over its own
 /// VM task (which takes runs too, through its `run` block, but exists to
 /// serve the isolate task). `None` when the choice is ambiguous or empty.
-pub fn default_run_task<'a>(session_tasks: &[&'a TaskConfig], all: &[TaskConfig]) -> Vec<&'a TaskConfig> {
+pub fn default_run_task<'a>(
+    session_tasks: &[&'a TaskConfig],
+    all: &[TaskConfig],
+) -> Vec<&'a TaskConfig> {
     let runnable: Vec<&TaskConfig> = session_tasks
         .iter()
         .copied()
@@ -376,12 +400,25 @@ mod isolates_test {
     fn isolate_stats_ingest_replaces_and_empty_forgets() {
         let mut table = IsolateStatsTable::default();
         let now = Instant::now();
-        table.ingest("w-1", vec![task_stats("j", "run", "default", 3)], vec![host("default", 0)], now);
-        table.ingest("w-1", vec![task_stats("j", "run", "default", 5)], vec![], now);
+        table.ingest(
+            "w-1",
+            vec![task_stats("j", "run", "default", 3)],
+            vec![host("default", 0)],
+            now,
+        );
+        table.ingest(
+            "w-1",
+            vec![task_stats("j", "run", "default", 5)],
+            vec![],
+            now,
+        );
         assert_eq!(table.node("w-1").map(|e| e.tasks[0].resident), Some(5));
         assert!(table.node("w-1").is_some_and(|e| e.hosts.is_empty()));
         table.ingest("w-1", vec![], vec![], now);
-        assert!(table.node("w-1").is_none(), "an empty beat forgets the node");
+        assert!(
+            table.node("w-1").is_none(),
+            "an empty beat forgets the node"
+        );
     }
 
     #[test]
@@ -395,10 +432,20 @@ mod isolates_test {
                 task_stats("j", "other", "job:j", 1),
                 task_stats("k", "run", "default", 9),
             ],
-            vec![host("default", 1), host("default", 0), host("job:j", 0), host("shared", 0)],
+            vec![
+                host("default", 1),
+                host("default", 0),
+                host("job:j", 0),
+                host("shared", 0),
+            ],
             start,
         );
-        table.ingest("w-1", vec![task_stats("k", "run", "default", 2)], vec![host("default", 0)], start);
+        table.ingest(
+            "w-1",
+            vec![task_stats("k", "run", "default", 2)],
+            vec![host("default", 0)],
+            start,
+        );
         let later = start + Duration::from_millis(1_500);
 
         let all = table.for_job("j", &["run".into(), "other".into()], later);
@@ -408,8 +455,16 @@ mod isolates_test {
         assert_eq!(node.age_ms, 1_500);
         let names: Vec<&str> = node.tasks.iter().map(|t| t.task_name.as_str()).collect();
         assert_eq!(names, ["other", "run"]);
-        let hosts: Vec<(&str, u32)> = node.hosts.iter().map(|h| (h.cordon.as_str(), h.replica)).collect();
-        assert_eq!(hosts, [("default", 0), ("default", 1), ("job:j", 0)], "shared serves neither");
+        let hosts: Vec<(&str, u32)> = node
+            .hosts
+            .iter()
+            .map(|h| (h.cordon.as_str(), h.replica))
+            .collect();
+        assert_eq!(
+            hosts,
+            [("default", 0), ("default", 1), ("job:j", 0)],
+            "shared serves neither"
+        );
 
         let one = table.for_job("j", &["other".into()], later);
         assert_eq!(one[0].tasks.len(), 1);
@@ -429,10 +484,18 @@ mod isolates_test {
         assert!(table.sweep(start).is_empty());
         let later = start + ISOLATE_STATS_STALE_AFTER;
         table.ingest("fresh", vec![task_stats("j", "run", "d", 1)], vec![], later);
-        assert_eq!(table.sweep(later + Duration::from_secs(1)), vec!["old".to_string()]);
+        assert_eq!(
+            table.sweep(later + Duration::from_secs(1)),
+            vec!["old".to_string()]
+        );
         assert!(table.node("old").is_none());
         assert!(table.node("fresh").is_some());
-        table.ingest("stale-again", vec![task_stats("j", "run", "d", 1)], vec![], start);
+        table.ingest(
+            "stale-again",
+            vec![task_stats("j", "run", "d", 1)],
+            vec![],
+            start,
+        );
         assert!(table.sweep(later + Duration::from_secs(2)).is_empty());
     }
 
@@ -442,10 +505,19 @@ mod isolates_test {
             task("run", "isolate", isolate_config("request", false)),
             task("web", "exec", json!({})),
         ];
-        assert_eq!(stats_tasks("j", &tasks, "").unwrap(), vec!["run".to_string()]);
-        assert_eq!(stats_tasks("j", &tasks, "run").unwrap(), vec!["run".to_string()]);
+        assert_eq!(
+            stats_tasks("j", &tasks, "").unwrap(),
+            vec!["run".to_string()]
+        );
+        assert_eq!(
+            stats_tasks("j", &tasks, "run").unwrap(),
+            vec!["run".to_string()]
+        );
         let err = stats_tasks("j", &tasks, "web").unwrap_err();
-        assert!(err.contains("not an isolate task") && err.contains("run"), "{err}");
+        assert!(
+            err.contains("not an isolate task") && err.contains("run"),
+            "{err}"
+        );
         let err = stats_tasks("j", &tasks[1..], "web").unwrap_err();
         assert!(err.contains("has no isolate task"), "{err}");
     }
@@ -460,7 +532,10 @@ mod isolates_test {
 
         let (code, message) = check_run_fields("j", &exec, "vm", "t", "", &[]).unwrap_err();
         assert_eq!(code, tonic::Code::InvalidArgument);
-        assert!(message.starts_with("tier, tenant applies only"), "{message}");
+        assert!(
+            message.starts_with("tier, tenant applies only"),
+            "{message}"
+        );
 
         let (code, message) =
             check_run_fields("j", &isolate, "", "", "", &["sh".into()]).unwrap_err();
@@ -487,8 +562,12 @@ mod isolates_test {
     #[test]
     fn isolate_task_is_the_default_run_task_over_its_vm_task() {
         let mut machine = task("machine", "sandbox", json!({}));
-        machine.run = serde_json::from_value(json!({ "command": ["python3", "main.py"], "wall": "5m" })).ok();
-        let all = vec![task("run", "isolate", isolate_config("request", true)), machine];
+        machine.run =
+            serde_json::from_value(json!({ "command": ["python3", "main.py"], "wall": "5m" })).ok();
+        let all = vec![
+            task("run", "isolate", isolate_config("request", true)),
+            machine,
+        ];
         let refs: Vec<&TaskConfig> = all.iter().collect();
         let picked = default_run_task(&refs, &all);
         let names: Vec<&str> = picked.iter().map(|t| t.name.as_str()).collect();
@@ -508,7 +587,10 @@ mod isolates_test {
         let wall = Duration::from_secs(30);
         assert_eq!(run_wall("isolate", wall, Some(&machine)), wall);
         assert_eq!(run_wall("", wall, Some(&machine)), Duration::from_secs(300));
-        assert_eq!(run_wall("vm", wall, Some(&machine)), Duration::from_secs(300));
+        assert_eq!(
+            run_wall("vm", wall, Some(&machine)),
+            Duration::from_secs(300)
+        );
         assert_eq!(run_wall("auto", wall, None), wall);
     }
 

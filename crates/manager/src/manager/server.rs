@@ -9581,10 +9581,7 @@ impl Manager for ManagerDaemonService {
         // the latest per node, in memory only.
         {
             let now = std::time::Instant::now();
-            let mut isolates = self
-                .isolate_stats
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut isolates = self.isolate_stats.lock().unwrap_or_else(|p| p.into_inner());
             isolates.ingest(
                 &id,
                 std::mem::take(&mut req.isolate_tasks),

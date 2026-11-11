@@ -1001,6 +1001,10 @@ pub struct WorkerTaskManager {
     /// Why a child that is being ended is ending, until it is recorded as
     /// gone.
     child_end_reasons: HashMap<String, String>,
+    /// Isolates that own child VMs on this node, by owner label
+    /// (`isolates::vm`): they are not claims, so the child machinery asks
+    /// here whether such an owner is alive.
+    isolate_owners: HashMap<String, children::IsolateOwner>,
     /// The runtime disables this worker holds (docs/runtime-disable.md):
     /// every start path asks it first.
     runtime_gate: Arc<crate::worker::runtime_state::RuntimeGate>,
@@ -1164,6 +1168,7 @@ impl WorkerTaskManager {
             session_owners: HashMap::new(),
             gone_children: HashMap::new(),
             child_end_reasons: HashMap::new(),
+            isolate_owners: HashMap::new(),
             runtime_gate,
             session_pid_starts: HashMap::new(),
             session_checkpoints: HashMap::new(),

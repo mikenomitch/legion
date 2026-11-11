@@ -1,0 +1,11 @@
+# The Python image's toolchain, pinned with hashes (build.sh installs it with
+# `pip install --require-hashes`). To bump: change the version, take the
+# sha256 of every wheel and the sdist from https://pypi.org/pypi/componentize-py/<version>/json,
+# rebuild, and update "runtime" in build.sh and the README.
+componentize-py==0.25.1 \
+    --hash=sha256:8623cd8cab8453cb0cd8bf03f3c7103420d06f2f3d360186a280a70a1ca5e89f \
+    --hash=sha256:7b6a87c520358166843af0daa86d2312d7af4cbcbbf1e598951085cf7f2991ca \
+    --hash=sha256:65fbc4a94df1de8acf7da50a1f5ed1711230188844e53e6332d99029be4e0afa \
+    --hash=sha256:a556991534cc496207a9d2ca733c4b0f17ed38ef56a8d6b5f1847fdf1225dd1b \
+    --hash=sha256:c7fd552fb0849858b0c1e8981543ed5dff4b0cc1597a8ea0bc26a495786dc0c6 \
+    --hash=sha256:e4087e916b06171303f803c8ffdd5f177e2422e87d9bed6ffe55cc41b2248aa8

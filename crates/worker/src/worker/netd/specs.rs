@@ -635,6 +635,65 @@ mod tests {
         );
     }
 
+    /// An isolate envelope (isolate-runtime brief, "Architecture" 5): its
+    /// egress proxy and each `connect` upstream bind Unix sockets in its
+    /// socket dir, with the upstream's credentials carried; no resolver and
+    /// no VIP; every advertised port is fronted and dialed on the
+    /// supervisor's socket by label; and no gated namespace is made for it.
+    #[test]
+    fn an_isolate_envelope_binds_its_datapath_on_its_socket_dir_test() {
+        use crate::worker::netd::ingress::TaskDial;
+        let root = Path::new("/var/lib/legion/allocs");
+        let envelope = TaskAllocation {
+            allocation_id: 9,
+            task_name: "run-envelope".into(),
+            task_runtime: crate::structs::session::ENVELOPE_RUNTIME.into(),
+            task_connect: json!({ "upstreams": [{
+                "name": "openai", "to": "https://api.openai.com",
+                "credentials": [{ "header": "authorization", "prefix": "Bearer ", "from": { "kv": "secrets/openai" } }]
+            }] })
+            .to_string(),
+            network: json!({
+                "mode": "gated",
+                "resolver": "127.42.0.1",
+                "vipBlock": "127.42.0.0/24",
+                "ports": [{ "name": "http", "hostPort": 20000 }],
+                "upstreams": [{ "key": "openai", "localPort": 20001, "vip": "127.42.0.2", "canonicalPort": 443 }],
+            })
+            .to_string(),
+            ..TaskAllocation::default()
+        };
+        let desired = [envelope];
+        let dir = std::path::PathBuf::from("/var/lib/legion/allocs/9/.isolate");
+        let proxies = proxy_specs(&desired, root);
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(
+            proxies[0].listen_addr(),
+            ListenAddr::Unix(dir.join("net.sock_1080"))
+        );
+        let upstreams = upstream_specs(&desired, root);
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(
+            upstreams[0].listen(),
+            Some(ListenAddr::Unix(dir.join("net.sock_20001")))
+        );
+        assert_eq!(upstreams[0].vip, None, "an isolate has no VIPs");
+        assert_eq!(upstreams[0].credentials.len(), 1);
+        assert!(dns_specs(&desired, root).is_empty(), "the worker resolves for it");
+        let ingress = ingress_specs(&desired, root);
+        assert_eq!(ingress.len(), 1);
+        assert_eq!(ingress[0].dial, TaskDial::Isolate { dir: dir.clone() });
+        assert_eq!(ingress[0].label, "http");
+        assert!(gated_namespace_ids(&desired, root).is_empty());
+        assert_eq!(
+            declared_credentials(&desired),
+            vec![(9, "openai".to_string(), "authorization".to_string())]
+        );
+        // Denials and access logs name the isolate task, not its envelope.
+        let identities = crate::worker::netd::policy::identities_from_desired(&desired);
+        assert_eq!(identities[&9].task_name, "run");
+    }
+
     #[test]
     fn upstream_specs_come_from_the_allocation_network() {
         let specs = upstream_specs(&[connect_allocation(11, "db", 20003)], Path::new("/allocs"));

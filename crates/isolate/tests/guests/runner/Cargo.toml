@@ -1,0 +1,25 @@
+# A reactor component exporting `legion:isolate/runner` and importing
+# `control`, `state`, and `vm`; the host's lifetime and session tests drive
+# it. The first request argument picks the behavior. Not a workspace member:
+# built into `tests/fixtures/runner.wasm` (checked in).
+[package]
+name = "runner"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+wit-bindgen = "0.63"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+
+[workspace]

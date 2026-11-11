@@ -1864,10 +1864,10 @@ pub async fn run(
     if crate::manager::isolates::refuse_disabled_up_front(task, &request.tier, has_vm) {
         if let Some(disable) = store.runtime_disables().refusing(&task.runtime, job_id) {
             metrics.session_runs_total.inc(&["runtime_disabled"]);
-            return Err(
-                crate::structs::runtime_state::RuntimeDisabledRefusal::new(disable, job_id)
-                    .to_status(),
-            );
+            return Err(crate::structs::runtime_state::RuntimeDisabledRefusal::new(
+                disable, job_id,
+            )
+            .to_status());
         }
     }
     let key = request.idempotency_key.clone().unwrap_or_default();

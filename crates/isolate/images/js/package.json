@@ -1,0 +1,9 @@
+{
+  "name": "legion-isolate-js-image",
+  "private": true,
+  "description": "The toolchain that builds Legion's js isolate image (crates/isolate/images/build.sh). Pinned exactly; the lockfile pins the rest.",
+  "type": "module",
+  "dependencies": {
+    "@bytecodealliance/componentize-js": "0.23.0"
+  }
+}

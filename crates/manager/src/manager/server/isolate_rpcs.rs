@@ -47,10 +47,7 @@ impl ManagerDaemonService {
         let tasks = isolates::stats_tasks(&config.name, &config.tasks, &request.task_name)
             .map_err(Status::failed_precondition)?;
         let mut nodes = {
-            let table = self
-                .isolate_stats
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let table = self.isolate_stats.lock().unwrap_or_else(|p| p.into_inner());
             table.for_job(&config.name, &tasks, std::time::Instant::now())
         };
         // A node that heartbeats to a peer manager is asked directly, so
@@ -58,8 +55,8 @@ impl ManagerDaemonService {
         // answers. A node that does not answer in time is left out.
         let mut missing: Vec<String> = Vec::new();
         for task in &tasks {
-            for node_id in sessions::envelope_nodes(&self.store, &config.name, task)
-                .unwrap_or_default()
+            for node_id in
+                sessions::envelope_nodes(&self.store, &config.name, task).unwrap_or_default()
             {
                 if !nodes.iter().any(|node| node.node_id == node_id) && !missing.contains(&node_id)
                 {
@@ -90,12 +87,7 @@ impl ManagerDaemonService {
     ) -> Result<Response<GetIsolateReply>, Status> {
         // Coarse first: the isolate's job is known only once its node
         // answers.
-        let ident = self.check_acl(
-            &request,
-            AclResource::Job,
-            AclAction::Read,
-            AclScope::any(),
-        )?;
+        let ident = self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let request = request.into_inner();
         let session_id = request.session_id.trim().to_string();
         if session_id.is_empty() {

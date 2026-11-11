@@ -43,6 +43,17 @@ pub struct ModuleArtifact {
 /// Fetches and compiles modules. Blocking; called on a blocking thread.
 pub trait ModuleSource: Send + Sync + 'static {
     fn compiled(&self, want: &ModuleWant) -> Result<ModuleArtifact, String>;
+
+    /// `config.entry`'s file: its name in the run directory and its bytes,
+    /// staged from the task's artifacts (no allocation exists for an
+    /// isolate task to stage them into).
+    fn entry_file(
+        &self,
+        job_id: &str,
+        task: &crate::structs::TaskConfig,
+        allocation_id: i64,
+        entry: &str,
+    ) -> Result<(String, Vec<u8>), String>;
 }
 
 /// The real source: the artifact stager, the images directory, the node
@@ -231,6 +242,16 @@ impl Compiler {
 }
 
 impl ModuleSource for Compiler {
+    fn entry_file(
+        &self,
+        job_id: &str,
+        task: &crate::structs::TaskConfig,
+        allocation_id: i64,
+        entry: &str,
+    ) -> Result<(String, Vec<u8>), String> {
+        self.stage_entry(job_id, task, allocation_id, entry)
+    }
+
     fn compiled(&self, want: &ModuleWant) -> Result<ModuleArtifact, String> {
         let (input, digest) = self.component(want)?;
         let recipe = self.recipe(&digest);
@@ -271,6 +292,48 @@ impl ModuleSource for Compiler {
                 }
             };
         }
+    }
+}
+
+impl Compiler {
+    fn stage_entry(
+        &self,
+        job_id: &str,
+        task: &crate::structs::TaskConfig,
+        allocation_id: i64,
+        entry: &str,
+    ) -> Result<(String, Vec<u8>), String> {
+        let stager = self
+            .stager
+            .as_ref()
+            .ok_or("this node has no artifact stager to fetch config.entry with")?;
+        let dir = self.fallback_dir.parent().unwrap_or(&self.fallback_dir).join("entries").join(
+            format!(
+                "{}-{}",
+                crate::structs::session::derived_session_id(&task.name, job_id, "entry"),
+                allocation_id
+            ),
+        );
+        std::fs::create_dir_all(&dir).map_err(|err| format!("creating {}: {err}", dir.display()))?;
+        let board = crate::artifacts::status::ArtifactStatusBoard::new();
+        let staged = stager
+            .stage_task_artifacts(allocation_id, &dir, &task.artifacts, &board)
+            .map_err(|err| format!("staging the task's artifacts for config.entry: {err:#}"))?;
+        let path = match crate::structs::isolate::entry_artifact(entry) {
+            Some(name) => staged
+                .iter()
+                .find(|artifact| artifact.name.as_deref() == Some(name))
+                .map(|artifact| artifact.reference_path().to_path_buf())
+                .ok_or_else(|| format!("config.entry names artifact {name:?}, which the task does not declare"))?,
+            None => dir.join(entry.trim()),
+        };
+        let content = std::fs::read(&path)
+            .map_err(|err| format!("reading config.entry {}: {err}", path.display()))?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "main".into());
+        Ok((name, content))
     }
 }
 

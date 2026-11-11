@@ -212,9 +212,7 @@ impl ManagerDaemonService {
                     ))
                 })?
                 .resolve()
-                .map_err(|err| {
-                    Status::failed_precondition(format!("task {}: {err}", task.name))
-                })?;
+                .map_err(|err| Status::failed_precondition(format!("task {}: {err}", task.name)))?;
             if !request.command.is_empty() && !run.allow_command {
                 return Err(Status::failed_precondition(
                     crate::structs::run::command_not_allowed(&task.name),

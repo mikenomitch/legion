@@ -296,7 +296,11 @@ def _forget_run_dir_modules():
         f = getattr(mod, "__file__", None)
         if isinstance(f, str) and f.startswith(prefix):
             del sys.modules[name]
-    importlib.invalidate_caches()
+    # importlib.invalidate_caches() would import importlib.metadata, which
+    # the image does not have; the path finders' caches are what matter.
+    for finder in list(sys.path_importer_cache.values()):
+        if finder is not None and hasattr(finder, "invalidate_caches"):
+            finder.invalidate_caches()
 
 
 def _flush():
@@ -331,66 +335,76 @@ def _result(ns):
 
 class Runner(exports.Runner):
     def run(self, req):
-        global _fresh, _main
-        if _fresh:
-            _first_run()
-            _fresh = False
         try:
-            os.chdir(RUN_DIR)
-        except OSError:
-            pass
-        if RUN_DIR not in sys.path[:1]:
-            if RUN_DIR in sys.path:
-                sys.path.remove(RUN_DIR)
-            sys.path.insert(0, RUN_DIR)
-        _forget_run_dir_modules()
-
-        if req.input:
-            try:
-                legion.input = json.loads(req.input)
-            except ValueError:
-                legion.input = req.input
-        else:
-            legion.input = None
-
-        entry = req.entry
-        if not entry:
-            print("legion: no entry file was given: send the source as a file (main.py)", file=sys.stderr)
+            return _run(req)
+        except BaseException:
+            # A failure in the runner itself, not in the caller's code.
+            traceback.print_exc()
             _flush()
-            return Outcome(2, None)
-        sys.argv = [entry, *req.args]
-        path = entry if entry.startswith("/") else RUN_DIR + "/" + entry
-        try:
-            with open(path, "rb") as f:
-                source = f.read()
-        except OSError as e:
-            print("python: can't open file %r: [Errno %s] %s" % (path, e.errno, e.strerror), file=sys.stderr)
-            _flush()
-            return Outcome(2, None)
+            return Outcome(1, None)
 
-        if _main is None:
-            _main = types.ModuleType("__main__")
-        ns = _main.__dict__
-        ns["__file__"] = path
-        ns["__builtins__"] = builtins
-        ns.pop("result", None)
-        sys.modules["__main__"] = _main
-        text = source.decode("utf-8", errors="replace")
-        linecache.cache[entry] = (len(text), None, text.splitlines(True), entry)
 
-        exit_code = 0
+def _run(req):
+    global _fresh, _main
+    if _fresh:
+        _first_run()
+        _fresh = False
+    try:
+        os.chdir(RUN_DIR)
+    except OSError:
+        pass
+    if RUN_DIR not in sys.path[:1]:
+        if RUN_DIR in sys.path:
+            sys.path.remove(RUN_DIR)
+        sys.path.insert(0, RUN_DIR)
+    _forget_run_dir_modules()
+
+    if req.input:
         try:
-            code = compile(source, entry, "exec")
-            exec(code, ns)
-        except SystemExit as e:
-            exit_code = _exit_code(e.code)
-        except BaseException as e:
-            tb = e.__traceback__
-            # Drop this runner's own frame; a SyntaxError has no caller frames.
-            if tb is not None and tb.tb_frame.f_code is Runner.run.__code__:
-                tb = tb.tb_next
-            traceback.print_exception(type(e), e, tb)
-            exit_code = 1
-        result = _result(ns)
+            legion.input = json.loads(req.input)
+        except ValueError:
+            legion.input = req.input
+    else:
+        legion.input = None
+
+    entry = req.entry
+    if not entry:
+        print("legion: no entry file was given: send the source as a file (main.py)", file=sys.stderr)
         _flush()
-        return Outcome(exit_code, result)
+        return Outcome(2, None)
+    sys.argv = [entry, *req.args]
+    path = entry if entry.startswith("/") else RUN_DIR + "/" + entry
+    try:
+        with open(path, "rb") as f:
+            source = f.read()
+    except OSError as e:
+        print("python: can't open file %r: [Errno %s] %s" % (path, e.errno, e.strerror), file=sys.stderr)
+        _flush()
+        return Outcome(2, None)
+
+    if _main is None:
+        _main = types.ModuleType("__main__")
+    ns = _main.__dict__
+    ns["__file__"] = path
+    ns["__builtins__"] = builtins
+    ns.pop("result", None)
+    sys.modules["__main__"] = _main
+    text = source.decode("utf-8", errors="replace")
+    linecache.cache[entry] = (len(text), None, text.splitlines(True), entry)
+
+    exit_code = 0
+    try:
+        code = compile(source, entry, "exec")
+        exec(code, ns)
+    except SystemExit as e:
+        exit_code = _exit_code(e.code)
+    except BaseException as e:
+        tb = e.__traceback__
+        # Drop this runner's own frame; a SyntaxError has no caller frames.
+        if tb is not None and tb.tb_frame.f_code is _run.__code__:
+            tb = tb.tb_next
+        traceback.print_exception(type(e), e, tb)
+        exit_code = 1
+    result = _result(ns)
+    _flush()
+    return Outcome(exit_code, result)

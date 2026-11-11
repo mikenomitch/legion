@@ -366,6 +366,60 @@ mod tests {
         );
     }
 
+    /// An isolate task's envelope (runtime `envelope`, its gated network
+    /// carried over from the isolate task) gets Unix sockets in its own dir,
+    /// on any node, fails closed, serves no VIPs and needs no resolver, and
+    /// ingress dials the supervisor's socket for the port's label. An
+    /// envelope without a network block stays as it is.
+    #[test]
+    fn an_isolate_envelope_attaches_through_its_socket_dir_test() {
+        let root = Path::new("/allocs");
+        let envelope = |id| allocation(id, crate::structs::session::ENVELOPE_RUNTIME, "{}");
+        let dir = PathBuf::from("/allocs/9/.isolate");
+        let attachment = Attachment::of(&envelope(9), &network(MODE_GATED), root);
+        assert_eq!(attachment, Attachment::Isolate { dir: dir.clone() });
+        assert_eq!(attachment.isolate_dir(), Some(dir.as_path()));
+        assert!(attachment.is_gated());
+        assert!(!attachment.serves_vips());
+        assert!(!attachment.wants_resolver());
+        assert!(attachment.fronts_every_port());
+        assert!(attachment.netns().is_none() && attachment.guest_vsock().is_none());
+        assert_eq!(attachment.egress_proxy(), None);
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            attachment.listen(ip, 1080),
+            ListenAddr::Unix("/allocs/9/.isolate/net.sock_1080".into())
+        );
+        assert_eq!(attachment.task_dial(), TaskDial::Isolate { dir: dir.clone() });
+        assert!(attachment.task_dial().gated());
+        assert_eq!(
+            isolate_ingress_socket(&dir, "http"),
+            PathBuf::from("/allocs/9/.isolate/ingress.sock_http")
+        );
+        // On a node without namespaces too: no assigned proxy port.
+        let confined = AllocNetwork {
+            mode: Some(MODE_GATED.into()),
+            egress_proxy: Some("127.0.0.1:20017".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            Attachment::of(&envelope(9), &confined, root),
+            Attachment::Isolate { dir }
+        );
+        // An envelope with no network (every session task but an isolate
+        // task) and every other runtime are as before.
+        assert_eq!(
+            Attachment::of(&envelope(9), &AllocNetwork::default(), root),
+            Attachment::Host
+        );
+        assert_eq!(
+            Attachment::of(&envelope(9), &network(MODE_HOST), root),
+            Attachment::Host
+        );
+        assert!(Attachment::Host.wants_resolver());
+        assert!(Attachment::GuestVsock { scratch: "/s".into() }.wants_resolver());
+    }
+
     #[test]
     fn only_namespaces_and_vsock_guests_fail_closed_test() {
         let scratch = PathBuf::from("/s");

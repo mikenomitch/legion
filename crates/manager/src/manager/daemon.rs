@@ -4660,6 +4660,53 @@ mod tests {
         Ok(())
     }
 
+    /// The shipped worker config's commented `isolate` block, uncommented,
+    /// loads and validates: every field it documents is a real one with a
+    /// value a node can run with.
+    #[test]
+    fn the_default_worker_config_isolate_block_parses_when_uncommented_test() -> R<()> {
+        let path = concat!(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
+            "/configs/workers/default.ncl"
+        );
+        // Shipped commented out: the defaults apply.
+        assert!(parse_worker_config(path)?.isolate.is_none());
+        let text = std::fs::read_to_string(path)?;
+        let mut inside = false;
+        let mut uncommented = 0;
+        let lines: Vec<String> = text
+            .lines()
+            .map(|line| {
+                if line.trim_start() == "# isolate = {" {
+                    inside = true;
+                }
+                let out = if inside {
+                    uncommented += 1;
+                    line.replacen("# ", "", 1)
+                } else {
+                    line.to_string()
+                };
+                if inside && line.trim_start() == "# }," {
+                    inside = false;
+                }
+                out
+            })
+            .collect();
+        assert!(uncommented > 10, "found the isolate block");
+        let dir = Builder::new().prefix("legion-isolate-config-").tempdir()?;
+        let edited = dir.path().join("default.ncl");
+        std::fs::write(&edited, lines.join("\n"))?;
+        let config = parse_worker_config(edited.to_str().context("utf-8")?)?;
+        let isolate = config.isolate.context("isolate block")?.with_defaults();
+        isolate.validate()?;
+        assert_eq!(
+            isolate.binary.as_deref(),
+            Some("/usr/local/bin/legion-isolate")
+        );
+        assert_eq!(isolate.slots_per_host, 10_000);
+        Ok(())
+    }
+
     /// The shipped worker config's `container.allowCaps` parses, keeps the
     /// whole default set (so default jobs still start), and adds NET_RAW.
     /// A misspelled name fails the load, naming the field.
