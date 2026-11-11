@@ -75,6 +75,20 @@ Plans, roadmaps, to-do lists, and development notes live in
   start and stop with no raft write inside per-node envelopes, the session
   index and its `complete` flag, duplicates, and promotion to a keyed
   instance in place.
+- [Session Runs](session-runs.md): `legion session run`, one call that runs
+  code once in a fresh, single-use session of a task with a `run` block and
+  returns stdout, stderr, the exit status, a JSON result, and named files;
+  stopped runs as data, per-node idempotency, and who may run what.
+- [Child Sessions](child-sessions.md): a session another unit of the job
+  started and owns. Covers the `children` block, the typed owner reference,
+  starting a child with `--owner` or from inside a task with no credential,
+  when an owner's end ends its children, promotion, and the limits.
+- [Resize](resize.md): `legion alloc resize` and `legion instance resize`,
+  which change a running unit's `memory`, `memoryMax`, or `cpu` in place as
+  an override over the spec. Covers what each runtime can change live, the
+  grow and shrink ordering, sessions inside their envelope, the outcomes
+  (`applied`, `deferred`, `refused`, `needs_restart`, `not_supported`), and
+  the limits.
 - [Volumes](volumes.md): persistent storage for stateful tasks. Covers plugins,
   the driver contract, node pinning, and reclaim.
 - [Suspend and Resume](suspend-and-resume.md): suspending a keyed instance to
@@ -169,6 +183,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   isolation boundary), qualified ids, `-n`/`LEGION_NAMESPACE`, delegated
   creation, crossing namespaces in the mesh, and namespace policies (aggregate
   quota per band, counts, allowed pools, runtimes and host volumes).
+- [Runtime Disable](runtime-disable.md): `legion operator runtime disable`,
+  the cluster-wide switch for a task runtime with a published escape: no new
+  placement, session start, edge claim, resume, or restart in scope, an
+  optional drain, and blocked work that places again on `enable`.
 - [The Cluster CA](cluster-ca.md): the CA behind the worker plane, manager
   certificates, join tokens, and the mesh. Built in by default; or an
   intermediate from your own PKI (`file`) or an external signer such as

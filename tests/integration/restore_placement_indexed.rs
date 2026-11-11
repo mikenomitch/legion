@@ -228,6 +228,7 @@ fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::
                     }],
                     removed: Vec::new(),
                     snapshot_budget: None,
+                    derived: None,
                 },
                 now,
             );

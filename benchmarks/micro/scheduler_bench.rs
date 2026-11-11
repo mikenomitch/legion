@@ -928,6 +928,7 @@ fn seed_locality_index(store: &Store, node_count: usize) {
                 added,
                 removed: Vec::new(),
                 snapshot_budget: None,
+                derived: None,
             },
             now,
         );
@@ -1118,6 +1119,7 @@ fn setup_restores(store: &Store, node_count: usize, published: bool) -> anyhow::
                     }],
                     removed: Vec::new(),
                     snapshot_budget: None,
+                    derived: None,
                 },
                 now,
             );
@@ -1223,6 +1225,7 @@ fn setup_budget_placements(
                         min_free_disk_bytes: 5 * GIB,
                         reclaimable_bytes: 0,
                     }),
+                    derived: None,
                 },
                 now,
             );

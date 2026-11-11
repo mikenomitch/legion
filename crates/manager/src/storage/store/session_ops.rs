@@ -31,6 +31,11 @@ pub struct PromoteSession {
     pub node_id: String,
     /// The name to give it. `None` keeps the session id, unnamed.
     pub new_id: Option<String>,
+    /// The owner the session carried, as `kind:id`, when the managers judge
+    /// that owner (`instance` or `allocation`): the promoted instance stays
+    /// its child. `None` for an unowned session and for a child of a
+    /// session, which a promotion detaches (docs/child-sessions.md).
+    pub owner: Option<String>,
 }
 
 impl Store {
@@ -95,8 +100,8 @@ impl Store {
         tx.execute(
             "INSERT INTO instance (instance_id, job_id, group_name, task_name, mode, state, \
              slot_index, current_alloc_id, storage_handle, created_at, updated_at, named, \
-             promoted_from) \
-             VALUES (?1, ?2, ?3, ?4, 'keyed', 'pending', NULL, NULL, NULL, ?5, ?5, ?6, ?7);",
+             promoted_from, owner) \
+             VALUES (?1, ?2, ?3, ?4, 'keyed', 'pending', NULL, NULL, NULL, ?5, ?5, ?6, ?7, ?8);",
             params![
                 instance_id,
                 promote.job_id,
@@ -104,7 +109,8 @@ impl Store {
                 promote.task_name,
                 now,
                 named,
-                promote.session_id
+                promote.session_id,
+                promote.owner
             ],
         )?;
         // Bound to exactly this instance, on the session's node, reserving

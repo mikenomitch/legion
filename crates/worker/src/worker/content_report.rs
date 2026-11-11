@@ -13,7 +13,48 @@ use std::collections::HashMap;
 use crate::content_store::{ContentClass, ContentStore};
 use crate::prelude::*;
 use crate::structs::worker_protocol::MIN_ADVERTISED_BYTES;
-use crate::structs::{ContentLocation, ContentLocationReport, SnapshotBudget};
+use crate::structs::{
+    ContentLocation, ContentLocationReport, DerivedContentEntry, DerivedContentReport,
+    SnapshotBudget,
+};
+
+/// Most derived entries one report lists. A node holds a handful of sandbox
+/// images' bases; this only bounds a heartbeat on a node that holds far
+/// more. `entry_count` carries the real number.
+pub const MAX_REPORTED_DERIVED: usize = 256;
+
+/// The store's derived class, for the report's `derived`
+/// (docs/artifacts.md, "Derived content"): the budget, the totals, and the
+/// entries, most recently used first. `None` when the store cannot be read.
+pub fn derived_report(store: &ContentStore) -> Option<DerivedContentReport> {
+    let usage = store
+        .usage()
+        .ok()?
+        .into_iter()
+        .find(|class| class.class == ContentClass::Derived)?;
+    let entries = store.derived_list().ok()?;
+    Some(DerivedContentReport {
+        budget_bytes: usage.budget,
+        used_bytes: usage.used_bytes,
+        pinned_bytes: usage.pinned_bytes,
+        entry_count: entries.len() as u64,
+        entries: entries
+            .into_iter()
+            .take(MAX_REPORTED_DERIVED)
+            .map(|entry| DerivedContentEntry {
+                kind: entry.kind.as_str().to_string(),
+                key: entry.key,
+                bytes: entry.size,
+                inputs: entry.inputs.into_iter().collect(),
+                builder_version: entry.builder_version,
+                confined: entry.confined,
+                created_at: entry.created_at,
+                last_used_at: entry.last_used_at,
+                pinned: entry.pinned,
+            })
+            .collect(),
+    })
+}
 
 /// What this node advertises right now: every store entry of at least
 /// [`MIN_ADVERTISED_BYTES`], with its size. No store means an empty set.
@@ -60,6 +101,8 @@ pub fn snapshot_budget(store: Option<&ContentStore>) -> Option<SnapshotBudget> {
 pub struct PendingReport {
     pub report: ContentLocationReport,
     snapshot: HashMap<String, u64>,
+    /// The store's derived generation `report.derived` was read at.
+    derived_generation: Option<u64>,
 }
 
 /// The worker half of the epoch protocol.
@@ -68,6 +111,8 @@ pub struct ContentAdvertiser {
     acked: HashMap<String, u64>,
     acked_epoch: u64,
     needs_full: bool,
+    /// The derived generation the manager last acknowledged a listing of.
+    acked_derived: Option<u64>,
 }
 
 impl Default for ContentAdvertiser {
@@ -84,6 +129,28 @@ impl ContentAdvertiser {
             acked: HashMap::new(),
             acked_epoch: 0,
             needs_full: true,
+            acked_derived: None,
+        }
+    }
+
+    /// Adds the store's derived listing to `pending` when the manager needs
+    /// it: on a full report, and whenever the derived set, a size, or a pin
+    /// changed since the listing it last acknowledged. Otherwise the report
+    /// carries none, which the manager reads as "unchanged". Uses of an
+    /// entry do not count as a change, so a steady node sends nothing.
+    pub fn attach_derived(&self, pending: &mut PendingReport, store: Option<&ContentStore>) {
+        let Some(store) = store else {
+            return;
+        };
+        // Read the generation first: a change that lands while the listing
+        // is read is then sent again next beat, never missed.
+        let generation = store.derived_generation();
+        if !pending.report.full && self.acked_derived == Some(generation) {
+            return;
+        }
+        if let Some(report) = derived_report(store) {
+            pending.report.derived = Some(report);
+            pending.derived_generation = Some(generation);
         }
     }
 
@@ -107,8 +174,10 @@ impl ContentAdvertiser {
                     added,
                     removed: Vec::new(),
                     snapshot_budget: None,
+                    derived: None,
                 },
                 snapshot: current,
+                derived_generation: None,
             };
         }
         let mut added: Vec<ContentLocation> = current
@@ -141,8 +210,10 @@ impl ContentAdvertiser {
                 added,
                 removed,
                 snapshot_budget: None,
+                derived: None,
             },
             snapshot: current,
+            derived_generation: None,
         }
     }
 
@@ -152,6 +223,9 @@ impl ContentAdvertiser {
         if resync {
             self.needs_full = true;
             return;
+        }
+        if pending.derived_generation.is_some() {
+            self.acked_derived = pending.derived_generation;
         }
         self.acked = pending.snapshot;
         self.acked_epoch = pending.report.epoch;

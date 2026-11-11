@@ -293,6 +293,7 @@ starts an unnamed session. The reply carries `mode = "session"`,
 | `FAILED_PRECONDITION` "no node runs an envelope" | The envelopes have not been placed yet. Check `legion job status <JOB>`: are there eligible workers with the `sessions` capability? |
 | `RESOURCE_EXHAUSTED` "every envelope ... is full" | No envelope has room. Retryable once sessions end; raise `envelope.resources` or add nodes. When the envelopes are [elastic](#elastic-envelopes), the message says so: they grow within a heartbeat, so retry in a few seconds |
 | `RESOURCE_EXHAUSTED` "no node accepted the session" | The three nodes tried all refused, with each node's reason |
+| `UNAVAILABLE` "runtime ... is disabled" (code `RUNTIME_DISABLED`) | An operator [disabled the task's runtime](runtime-disable.md) for the job's namespace. Retryable once it is enabled. The same refusal answers an edge start and a resume of a suspended session, which stays suspended |
 
 A create that finds no room is refused rather than queued, so size
 envelopes for the peak you want to absorb, or make them
@@ -358,6 +359,8 @@ Sessions also end when:
 
 - **The workload exits.** The node forgets it, and reports nothing as a
   failed allocation: it never had one.
+- **Its owner ends,** when it was started as a
+  [child](child-sessions.md).
 - **Its envelope leaves the node,** because the job stopped, the node was
   drained, or an update moved the envelope. The node ends the session 30
   seconds after its envelope goes, so a job update that replaces the
@@ -860,6 +863,21 @@ lower node id, and the other node is asked to end its copy:
 This is converge-to-one, not at-most-one. A session that needs at most one
 copy at every instant should be promoted (or created with `--id`).
 
+## Resizing a session
+
+A running session's `memory`, `memoryMax`, and `cpu` can be changed in place
+with `legion instance resize <SESSION>` ([Resize](resize.md#a-session)). The
+resize is decided on the session's node: a grow is admitted against the
+envelope's free room, exactly as a start is, and nothing is written to the
+replicated store. A grow the envelope cannot hold is `refused` with the
+room it has, or `deferred` when the envelope is elastic and can grow to
+hold it. The new size survives a suspend and resume, and for a `store`
+session a resume on another node: it travels in the session's manifest. A
+`store` session that does not fit its node's envelope can be resized by
+moving it, `legion instance resize <SESSION> --move`, which suspends it and
+resumes it at the new size on another node whose envelope has room
+([Resize](resize.md#when-it-does-not-fit-move)).
+
 ## Elastic envelopes
 
 A fixed envelope makes you pick one size for the whole day. Sized for the
@@ -968,6 +986,8 @@ fetch at all, until asked, when the job's envelopes could hold more than
 Sessions use the same surfaces as keyed instances: `legion_instance_create`
 (omit `instance_id`), `legion_instance_list`, `legion_instance_get`,
 `legion_instance_stop`, and `legion_instance_promote` over MCP, plus
+`legion_session_run` for [one-shot runs](session-runs.md),
+`owner` on `legion_instance_create` for [child sessions](child-sessions.md),
 `legion_session_nodes` for the edge node list and
 `legion_boot_ticket_create` with `scope = "session"`, and the
 `--json` envelope on the CLI. An agent should always pass an idempotency
@@ -975,6 +995,21 @@ key on create, read `durable` before relying on a unit surviving a node,
 and treat `complete = false` on a listing as "some sessions may be
 missing", not as "these are all of them". See
 [agent readiness](agent-readiness.md).
+
+## Running code once
+
+A session task that declares a `run` block also takes **runs**: `legion
+session run` starts a fresh session, stages the caller's files, executes the
+task's command once, returns its output, and ends the session, in one call
+and with no raft write. See [Session Runs](session-runs.md).
+
+## Sessions that own sessions
+
+A session can be started as a **child** of another unit of its job
+(`legion instance create <job> --task <task> --owner <id>`): it ends when
+its owner ends, goes to its owner's node when that node has room, and is
+listed under its owner. Ending a session ends its children first. See
+[Child Sessions](child-sessions.md).
 
 ## Upgrades
 

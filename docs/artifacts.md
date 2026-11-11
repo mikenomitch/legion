@@ -605,6 +605,124 @@ and a moved tag downloads only the layers the node lacks. The details, and
 how a registry outage is handled, are in
 [docs/task-runtime-container.md](task-runtime-container.md#image-cache).
 
+The store has three budget classes, each with its own byte budget and its own
+least-recently-used order, so one kind of content cannot evict another:
+
+| Class | Holds | Default budget (`content.budgets.<class>`) |
+| --- | --- | --- |
+| `artifacts` | fetched artifacts and image blobs | 50% of the disk, at least 1 GiB |
+| `snapshots` | checkpoint parts | 20% of the disk, clamped to 2 GiB..200 GiB |
+| `derived` | what Legion builds on the node ([derived content](#derived-content)) | 10% of the disk, clamped to 1 GiB..20 GiB |
+
+All three share `content.ttl` (an unpinned entry unused for 72 hours is
+removed), `content.minFreeDisk` (5 GiB), pinning, and a garbage collection
+pass every 10 minutes.
+
+### Derived content
+
+Some of what a worker needs it does not fetch: it builds it, from content it
+has already fetched and verified. A sandbox's base root disk is built from
+its image's layers. Such a thing is expensive to build, the same for every
+unit of its inputs on the node, and safe to throw away, because the node can
+build it again. Legion keeps all of it in one place, the `derived` class of
+the node content store, so there is one budget to size and one order in which
+rebuildable things leave a full disk.
+
+What is kept there today:
+
+| Kind | Built from | Used by |
+| --- | --- | --- |
+| `rootfs` | an image's layers, the guest binary, and the task's `rootfs_headroom_mib` | [sandbox starts](task-runtime-sandbox.md#the-root-disk-cache) |
+
+The class also defines the kinds `cwasm`, `preinit-image`, `preinit-entry`,
+and `vm-base`. Nothing builds them yet.
+
+How it behaves:
+
+- **An entry is named by what it was built from.** Its key is a hash of the
+  kind, every input, and the version of the code that built it (its
+  *recipe*), not of its bytes. Two starts with the same inputs share an
+  entry. A new input, or a new builder, is a new entry.
+- **A burst builds once.** Starts that need an entry while it is being built
+  wait for that build.
+- **A half-built entry never exists.** A build fills a directory under
+  `content/derived/tmp/` and is moved into place with one rename. A crash
+  mid-build leaves only a temp directory, which the worker clears when it
+  starts.
+- **One budget, one order.** The class keeps at most `content.budgets.derived`
+  bytes, counted in disk blocks actually used, and evicts the least recently
+  used unpinned entry first, whatever its kind. An entry larger than the
+  whole budget is built for the start that needs it and never kept.
+- **Rebuildable content goes first.** When the disk is below
+  `content.minFreeDisk`, nothing derived is kept, and a write that needs the
+  room evicts derived entries before it evicts an artifact or a checkpoint
+  part.
+- **Nothing of one allocation is in an entry.** A recipe's inputs are content
+  digests, numbers, and SHA-256 fingerprints, never raw text, so an entry
+  cannot hold an env value, a hostname, or an identity. Whatever is specific
+  to one allocation is written into that allocation's own copy.
+- **It is built here and stays here.** A derived entry is produced on its
+  node by Legion's own builder, from inputs the node verified against their
+  digests. No API puts one, reads one off a node, or publishes one, and
+  derived entries are left out of what a node advertises for
+  [content locality](#content-locality), so no node fetches one from another.
+  A new node builds its own.
+
+Set the budget in the worker type's `content` block:
+
+```nickel
+content = {
+  budgets = {
+    derived = "15%",   # a share of the disk, a size such as "40GiB", or "0"
+  },
+},
+```
+
+| Value | Meaning |
+| --- | --- |
+| unset (default) | 10% of the filesystem holding the content store, clamped to 1 GiB..20 GiB |
+| a size, such as `"40GiB"` | that many bytes |
+| a share, such as `"15%"` | that share of the filesystem, with no clamp |
+| `"0"` or `"off"` | the class is off: nothing derived is kept, and every start builds what it needs |
+
+A share you set counts toward the rule that `artifacts`, `snapshots`, and
+`derived` shares add up to at most 100%. The clamped default does not.
+
+The entries live at `<worker state dir>/content/derived/<kind>/<key>/`, on
+the same filesystem as the allocation directories, so a sandbox's disk can be
+a reflink of its base.
+
+`legion node content <node>` lists a node's derived entries with the class
+budget and bytes used, as do `GetNodeContent`, the MCP tool
+`legion_node_content`, and the worker page's "Content and locality" card:
+
+```console
+$ legion node content w-17
+Node w-17  publish: yes  checkpoint: yes
+Advertises 0 entries, 0 MiB (epoch 3)
+
+Derived content: 2 entries, 1300 of 20480 MiB
+ KIND    KEY           MiB   BUILDER                 PINNED
+ rootfs  7c1e5a0b9d3f  940   legion-0.1.0+rootfs.1   no
+ rootfs  0b9d3f42687c  360   legion-0.1.0+rootfs.1   no
+```
+
+`-j` adds each entry's inputs and its created and last-used times. The
+worker's metrics endpoint has `legion_derived_builds_total{kind,outcome}`,
+`legion_derived_build_seconds{kind}`, `legion_derived_hits_total{kind}`, and
+`legion_derived_bytes` ([metrics](metrics.md)).
+
+What to expect when something is off:
+
+| What you see | Why | What to do |
+| --- | --- | --- |
+| `Sandbox root disk ready ... root_disk=built, not cached: the base is larger than the cache budget` | The entry is larger than `content.budgets.derived` | Raise the budget |
+| `... built, not cached: the disk is below minFreeDisk` | The disk is below `content.minFreeDisk` | Free disk, or lower the floor |
+| `Sandbox root disk cache off (content.budgets.derived is 0)` at worker start | The class is turned off | Remove the `"0"` |
+| `Sandbox root disk cache off (this node has no content store)` | `content.enabled = false`, or the store could not open | Enable the content store |
+| `Derived content` missing from `legion node content` | The node's worker has no content store, or its report has not reached this manager | Check the worker log and `indexReported` |
+| `legion_derived_builds_total{outcome="no_room"}` rising | Pinned entries fill the budget | Raise the budget |
+
 ### ORAS layers
 
 **ORAS artifacts** (`oci://` with a `mediaType`, how model weights usually
@@ -660,6 +778,7 @@ Configure the store per worker type:
     budgets = {
       artifacts = "10%",     # cached artifacts: a share of the disk or a size
       snapshots = "50GiB",   # checkpoint parts
+      derived = "15%",       # what Legion builds on the node (root disk bases). "0" turns it off
     },
     ttl = "72h",             # unpinned content unused this long is removed. "0s" disables
     minFreeDisk = "5GiB",    # evict, then refuse, rather than drop below this
@@ -681,11 +800,14 @@ very small and very large disks still get a sensible budget:
 | --- | --- | --- | --- | --- | --- |
 | `artifacts` | 50% | at least 1 GiB, no ceiling | 4 GiB | 50 GiB | 512 GiB |
 | `snapshots` | 20% | 2 GiB to 200 GiB | 2 GiB | 20 GiB | 200 GiB |
+| `derived` | 10% | 1 GiB to 20 GiB | 1 GiB | 10 GiB | 20 GiB |
 
 The artifact cache has no ceiling because model weights are the largest
 artifacts a node pulls: one 70B checkpoint is around 140 GB, and a miss costs
 a download of that size. (It used to be 10% capped at 20 GiB, which held no
-large model at all.) The snapshot budget caps at 200 GiB so a node with a
+large model at all.) The [derived](#derived-content) budget caps at 20 GiB
+because everything in it can be rebuilt and it only has to hold what is in
+use: that is a dozen or more typical sandbox images. The snapshot budget caps at 200 GiB so a node with a
 multi-terabyte data disk keeps most of it for volumes unless you ask for
 more. A share you set yourself (`snapshots = "40%"`) is not bounded, unless
 you write it as an object with bounds:
@@ -708,7 +830,8 @@ Every field is optional. A malformed size, percentage, or duration fails
 manager startup, not the worker. So do shares that add up past the disk:
 `artifacts = "90%"` beside the default 20% for snapshots fails with
 `content.budgets.artifacts (90%) and content.budgets.snapshots (20%, the
-default) together claim 110% of the disk`. If a worker cannot read the size
+default) together claim 110% of the disk`. A `derived` share you set counts
+toward that sum, and the capped default does not. If a worker cannot read the size
 of its content filesystem, it cannot size a share, so it logs `Cannot size
 the node content store` and runs without a store. Set fixed sizes on such a
 platform. The worker runs garbage collection every 10 minutes (TTL
@@ -802,8 +925,11 @@ node's pool, and snapshot rows also need `snapshot:read` on their job.
 Because the index is soft state, the reply says `index_reported: false`
 when this manager holds no report from the node (it just started, the node
 has no store or an older worker, or the node reports to another manager).
-It lists entries of 1 MiB and up only, and carries no per-class budgets:
-the index records digests and sizes, not classes.
+It lists entries of 1 MiB and up only, and carries no budgets for the
+`artifacts` and `snapshots` classes: the index records digests and sizes,
+not classes. [Derived content](#derived-content) is the exception. It is
+never advertised by digest, so the node reports the class whole and the
+reply carries it in `derived`, with its budget and bytes used.
 
 ### Publishing content
 
@@ -1151,6 +1277,15 @@ Remember the allowlists. Add a custom scheme to the cluster's
   `checksum` fetch from origin for every new allocation. There is
   no TTL-based revalidation of mutable URLs, so a plain URL without a
   checksum is never served from the store. Add a `checksum` to opt in.
+- **Derived content is never shared between nodes.** Each node builds its
+  own entries, and there is no way to fetch one built elsewhere or to publish
+  one. A node that joins builds each base on its first start of that image.
+- **The derived class has one budget for every kind.** There is no per-kind
+  floor, so a kind with large entries can evict another kind's.
+- **Derived content needs the content store.** With `content.enabled = false`
+  nothing derived is kept, and every sandbox start builds its root disk.
+- **At most 256 derived entries are listed per node.** `entryCount` carries
+  the real number.
 - **No pre-warming for artifacts.** The store fills only when an allocation
   stages, or when `snapshot warm` pulls a published snapshot's parts. There
   is no artifact pre-pull and no way to list or clear the store from the CLI.

@@ -3567,6 +3567,10 @@ pub struct WorkerContentBudgets {
     pub artifacts: Option<ContentBudget>,
     /// Checkpoint parts. Default 20% of the disk, clamped to 2..200 GiB.
     pub snapshots: Option<ContentBudget>,
+    /// Derived content: what Legion builds on the node and can rebuild
+    /// (sandbox base root disks). Default 10% of the disk, clamped to
+    /// 1..20 GiB. `"0"` turns the class off.
+    pub derived: Option<ContentBudget>,
 }
 
 /// One `content.budgets` entry: a size or share as text (`"50GiB"`,
@@ -3614,7 +3618,8 @@ impl WorkerContentConfig {
     pub fn resolve(&self) -> R<Option<crate::content_store::ContentStoreSettings>> {
         use crate::content_store::{
             BudgetSpec, ContentBudgetSpecs, ContentStoreSettings, DEF_CONTENT_ARTIFACTS_BUDGET,
-            DEF_CONTENT_MIN_FREE_DISK, DEF_CONTENT_SNAPSHOTS_BUDGET, DEF_CONTENT_TTL,
+            DEF_CONTENT_DERIVED_BUDGET, DEF_CONTENT_MIN_FREE_DISK, DEF_CONTENT_SNAPSHOTS_BUDGET,
+            DEF_CONTENT_TTL,
         };
         if self.enabled == Some(false) {
             return Ok(None);
@@ -3643,6 +3648,15 @@ impl WorkerContentConfig {
             budgets.snapshots.as_ref(),
             DEF_CONTENT_SNAPSHOTS_BUDGET,
         )?;
+        // `"0"` (or `"off"`) turns derived content off; a share is "above 0%".
+        let derived = match budgets.derived.as_ref() {
+            Some(ContentBudget::Text(raw))
+                if raw.trim() == "0" || raw.trim().eq_ignore_ascii_case("off") =>
+            {
+                BudgetSpec::Bytes(0)
+            }
+            raw => budget("derived", raw, DEF_CONTENT_DERIVED_BUDGET)?,
+        };
         // Shares of one disk cannot add up past all of it. Defaults count,
         // so `artifacts = "90%"` beside the default snapshots share fails
         // here rather than on a node whose disk then fills.
@@ -3656,6 +3670,18 @@ impl WorkerContentConfig {
                     origin(budgets.snapshots.is_some()),
                     a + b
                 );
+            }
+            // The default derived share is capped at 20 GiB, so it only
+            // counts when an operator sets one.
+            if let Some(d) = derived.percent().filter(|_| budgets.derived.is_some()) {
+                if a + b + d > 100.0 {
+                    bail!(
+                        "content.budgets.artifacts ({a}%), content.budgets.snapshots ({b}%), \
+                         and content.budgets.derived ({d}%) together claim {}% of the disk. \
+                         Keep their sum at or below 100%",
+                        a + b + d
+                    );
+                }
             }
         }
         let min_free_raw = self
@@ -3672,6 +3698,7 @@ impl WorkerContentConfig {
             budgets: ContentBudgetSpecs {
                 artifacts,
                 snapshots,
+                derived,
             },
             ttl: (!ttl.is_zero()).then(|| *ttl),
             min_free_disk,
@@ -3972,6 +3999,7 @@ mod tests {
                 budgets: Some(WorkerContentBudgets {
                     artifacts: Some("1GiB".into()),
                     snapshots: Some("2GiB".into()),
+                    derived: Some("3GiB".into()),
                 }),
                 ..Default::default()
             }
@@ -4011,6 +4039,7 @@ mod tests {
             budgets: Some(WorkerContentBudgets {
                 artifacts: artifacts.map(Into::into),
                 snapshots: snapshots.map(Into::into),
+                derived: None,
             }),
             ..Default::default()
         };
@@ -4061,6 +4090,51 @@ mod tests {
         let bad: WorkerContentConfig =
             serde_json::from_str(r#"{"budgets":{"artifacts":{"share":"60GiB"}}}"#)?;
         assert!(err(bad).contains("content.budgets.artifacts"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_derived_budget_defaults_to_a_capped_share_and_zero_turns_it_off_test() -> R<()> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let derived = |raw: Option<&str>, disk: u64| -> R<u64> {
+            let config: WorkerContentConfig = match raw {
+                Some(raw) => {
+                    serde_json::from_value(serde_json::json!({ "budgets": { "derived": raw } }))?
+                }
+                None => WorkerContentConfig::default(),
+            };
+            Ok(config
+                .resolve()?
+                .expect("enabled")
+                .config_for(Some(disk))?
+                .budgets
+                .derived)
+        };
+        // The default: 10% of the disk, at least 1 GiB, at most 20 GiB.
+        assert_eq!(derived(None, 100 * GIB)?, 10 * GIB);
+        assert_eq!(derived(None, 4 * GIB)?, GIB);
+        assert_eq!(derived(None, 4000 * GIB)?, 20 * GIB);
+        // An operator's share has no clamp, and a size is a size.
+        assert_eq!(derived(Some("15%"), 1000 * GIB)?, 150 * GIB);
+        assert_eq!(derived(Some("50GiB"), 1000 * GIB)?, 50 * GIB);
+        // "0" turns the class off.
+        assert_eq!(derived(Some("0"), 1000 * GIB)?, 0);
+        assert_eq!(derived(Some("off"), 1000 * GIB)?, 0);
+        let message = format!("{:#}", derived(Some("lots"), GIB).unwrap_err());
+        assert!(message.contains("content.budgets.derived"), "{message}");
+        // An explicit derived share counts toward the disk; the capped
+        // default does not.
+        let config: WorkerContentConfig = serde_json::from_value(
+            serde_json::json!({ "budgets": { "artifacts": "70%", "derived": "15%" } }),
+        )?;
+        let message = format!("{:#}", config.resolve().unwrap_err());
+        assert!(
+            message.contains("content.budgets.derived (15%)") && message.contains("105%"),
+            "{message}"
+        );
+        let config: WorkerContentConfig =
+            serde_json::from_value(serde_json::json!({ "budgets": { "artifacts": "75%" } }))?;
+        assert!(config.resolve().is_ok());
         Ok(())
     }
 

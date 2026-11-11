@@ -1331,6 +1331,7 @@ mod auth_method_test {
             instance: None,
             slot: None,
             epoch: None,
+            owner: None,
         };
         let legion = WorkloadIdentity {
             name: CONTROL_PLANE_IDENTITY_NAME.into(),

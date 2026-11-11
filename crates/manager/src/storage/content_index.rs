@@ -27,7 +27,9 @@
 //!   worker sends a full report on its next heartbeat.
 
 pub use crate::structs::worker_protocol::MIN_ADVERTISED_BYTES;
-use crate::structs::{ContentLocation, ContentLocationReport, SnapshotBudget};
+use crate::structs::{
+    ContentLocation, ContentLocationReport, DerivedContentReport, SnapshotBudget,
+};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -57,6 +59,10 @@ struct IndexInner {
     /// (docs/suspend-and-resume.md, "Capacity for resumes"). Soft state like
     /// the rest: a node missing here is treated as having room.
     snapshot_budgets: HashMap<String, SnapshotBudget>,
+    /// Each node's derived content as last reported (docs/artifacts.md,
+    /// "Derived content"). A listing for `GetNodeContent`: nothing places
+    /// or fetches by it.
+    derived: HashMap<String, DerivedContentReport>,
     last_sweep: Option<Instant>,
 }
 
@@ -79,6 +85,7 @@ impl IndexInner {
 
     fn forget(&mut self, node_id: &str) -> bool {
         self.snapshot_budgets.remove(node_id);
+        self.derived.remove(node_id);
         let Some(node) = self.nodes.remove(node_id) else {
             return false;
         };
@@ -219,6 +226,8 @@ impl ContentLocationIndex {
         now: Instant,
     ) -> IngestOutcome {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        // A full report replaces the derived listing too, so the one a node
+        // without a store no longer sends is dropped with the rest.
         let outcome = if report.full {
             inner.forget(node_id);
             let mut digests = HashMap::with_capacity(report.added.len());
@@ -284,8 +293,23 @@ impl ContentLocationIndex {
                 inner.snapshot_budgets.remove(node_id);
             }
         }
+        // Derived content is sent whole when it changed, and left out when it
+        // did not: only a full report (handled above) clears it.
+        if let Some(derived) = report.derived.as_ref() {
+            inner.derived.insert(node_id.to_string(), derived.clone());
+        }
         Self::sweep_locked(&mut inner, now);
         outcome
+    }
+
+    /// A node's derived content as it last reported it.
+    pub fn derived(&self, node_id: &str) -> Option<DerivedContentReport> {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .derived
+            .get(node_id)
+            .cloned()
     }
 
     /// A node's `snapshots` budget class as it last reported it.
@@ -488,6 +512,7 @@ mod tests {
             added,
             removed: Vec::new(),
             snapshot_budget: None,
+            derived: None,
         }
     }
 
@@ -504,6 +529,7 @@ mod tests {
             added,
             removed: removed.into_iter().map(str::to_string).collect(),
             snapshot_budget: None,
+            derived: None,
         }
     }
 

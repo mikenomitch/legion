@@ -429,6 +429,22 @@ impl TaskPlugin for ExecTaskPlugin {
         crate::task_plugins::ResourceEnforcement::WorkerCgroup
     }
 
+    /// Every resizable resource is a cgroup file, so all three change live
+    /// (docs/resize.md).
+    fn resize_support(&self) -> crate::structs::resize::ResizeSupport {
+        crate::structs::resize::ResizeSupport::ALL
+    }
+
+    fn resize(
+        &self,
+        _allocation: &Allocation,
+        _task: &TaskConfig,
+        instance: &mut TaskInstance,
+        change: &crate::structs::resize::ResizeChange,
+    ) -> R<crate::structs::resize::ResizeAnswer> {
+        crate::worker::resources::resize_instance_cgroup(instance, change, None)
+    }
+
     /// `exec` is the canonical "one host process we spawned" runtime.
     fn supervises_process(&self) -> bool {
         true

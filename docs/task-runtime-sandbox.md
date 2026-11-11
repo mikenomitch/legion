@@ -312,30 +312,48 @@ How it behaves:
   being built wait for that build and then copy it, instead of each
   extracting and formatting the same image at the same time.
 - **A base is shared only when nothing in it differs.** A base is keyed by
-  the image's layer digests, the guest binary, and the task's
-  `rootfs_headroom_mib`. A new guest binary, or a task with different
-  headroom, gets its own base.
+  the image's layer digests, the guest binary, the task's
+  `rootfs_headroom_mib`, and the Legion version that built it. A new guest
+  binary, a task with different headroom, or a new Legion release gets its
+  own base.
 - **Nothing per sandbox is in a base.** Env (which can hold secrets),
   hostname, instance id, and the generated init are written into each
   sandbox's own copy, after it is made. A base is read-only, and a copy
   shares nothing with it that a write can reach.
-- **It is bounded.** The cache keeps at most its budget, counting the blocks
-  each base actually uses, and evicts the least recently used base first. A
-  base larger than the whole budget is never kept, and none is kept while the
-  disk is below the content store's `minFreeDisk`. Evicting a base never
-  touches a running sandbox, whose disk is its own copy.
+- **It is bounded.** Bases are [derived content](artifacts.md#derived-content)
+  in the node content store, and share that class's budget. The class keeps
+  at most its budget, counting the blocks each base actually uses, and evicts
+  the least recently used entry first. A base larger than the whole budget is
+  never kept, and none is kept while the disk is below the content store's
+  `minFreeDisk`. Evicting a base never touches a running sandbox, whose disk
+  is its own copy.
 
-The budget is set per worker with `LEGION_SANDBOX_ROOTFS_CACHE`:
+The budget is `content.budgets.derived` in the worker type's `content` block:
+
+```nickel
+content = {
+  budgets = { derived = "40GiB" },
+},
+```
 
 | Value | Meaning |
 | --- | --- |
-| unset (default) | 10% of the filesystem holding the worker's state dir, clamped to 1 GiB to 20 GiB |
-| a size, such as `40GiB` | that many bytes |
-| a share, such as `15%` | that share of the filesystem |
-| `off` or `0` | no cache: every start builds its disk |
+| unset (default) | 10% of the filesystem holding the content store, clamped to 1 GiB to 20 GiB |
+| a size, such as `"40GiB"` | that many bytes |
+| a share, such as `"15%"` | that share of the filesystem |
+| `"0"` or `"off"` | no cache: every start builds its disk |
 
-The cache lives at `<worker state dir>/rootfs-cache/`, beside the allocation
-dirs, so a copy can be a reflink. Put the data dir on XFS (`reflink=1`, the
+A worker with `content.enabled = false` has no cache either.
+
+The `LEGION_SANDBOX_ROOTFS_CACHE` environment variable that used to set this
+budget is gone, and a worker that still has it set ignores it. A worker's
+first start also deletes the directory the cache used to live in
+(`<worker state dir>/rootfs-cache/`), so each image's base is built once more
+on its first start after the change.
+
+The bases live at `<worker state dir>/content/derived/rootfs/`, on the same
+filesystem as the allocation dirs, so a copy can be a reflink. `legion node
+content <node>` lists them. Put the data dir on XFS (`reflink=1`, the
 default since xfsprogs 5.1) or btrfs to get near-instant copies. On ext4 the
 copy is a byte copy of the blocks the base uses: still much cheaper than a
 build, but it scales with the image. The worker logs where each disk came
@@ -961,6 +979,7 @@ isolated filesystem cannot see the host task dir at all.
 | Identity env / file delivery | ✅ / ✅ (under `/legion/identity`, refreshed with no restart) |
 | Signal delivery | ❌ (needs a guest agent) |
 | Memory / CPU limits, exclusive cores | ✅ with `resourceEnforcement.enabled` on Linux. The VMM runs in the allocation's worker cgroup, with `memory.max` = the [guest size](#guest-size) + the worker's `sandbox.vmmOverheadMiB` (default 64) and `memory.low` = `resources.memory`. `cpu` and `cores` govern the VMM's threads. See [resource-enforcement.md](resource-enforcement.md#sandbox-tasks). |
+| Resize in place (`memory`, `memoryMax`, `cpu`) | ✅ `memory` and `cpu` live on the VMM's cgroup. `memoryMax` moves down and back up to the [guest size](#guest-size) through the balloon; above the guest size, and on a guest booted without a balloon, the answer is `needs_restart`. vCPUs never change while the guest runs. See [resize.md](resize.md#sandboxes) |
 | Measured usage | ✅ with enforcement on: memory, CPU, and idle time in `legion node usage` and `instance list` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
 | Artifacts | ✅ image, file, tree, layers |
 | Exec / interactive PTY | ✅ / ✅ on the microVM path, through the guest agent over vsock ([Exec](#exec)). ✅ / ✅ in macOS dev mode. ❌ in Linux dev mode. |
@@ -1275,6 +1294,20 @@ the VMM starts, and `onRestoreFailure` decides what happens next:
 ```text
 checkpoint snap-dfaf943bf48d859c reopens its disks under /var/lib/legion/vmdev/sbx-…, but this node keeps device links under /opt/legion/vmdev/sbx-…: Firecracker restores a guest's disks only at the paths it captured, so the capturing and restoring nodes need the same data directory (LEGION_DATA_DIR)
 ```
+
+## Resizing a running guest
+
+`legion instance resize` changes a running sandbox's `memory`, `memoryMax`,
+and `cpu` without restarting it ([Resize](resize.md#sandboxes)). The
+reservation and the CPU weight are the VMM cgroup's and change at once. The
+ceiling is the guest's usable memory: the balloon inflates to lower it and
+deflates to raise it again, up to the size the guest booted with. Nothing
+grows a guest past its boot size while it runs; that answer is
+`needs_restart`, and the guest is left as it was. A keyed sandbox with a
+`suspend` block gets past its boot size with `legion instance resize
+--move`: it is suspended to a disk checkpoint and boots fresh at the new
+size on a node with room, keeping its disk and losing its memory
+([Resize](resize.md#when-it-does-not-fit-move)).
 
 ## Guest memory under pressure
 

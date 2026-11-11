@@ -94,6 +94,13 @@ pub fn admit_and_launch(
     } else {
         serde_json::from_str(&payload.task_resources).unwrap_or_else(|_| serde_json::json!({}))
     };
+    // A disabled runtime admits nothing (docs/runtime-disable.md): refused
+    // here, before the claim holds any room, so the caller gets the refusal
+    // as its answer rather than a launch that fails behind it.
+    task_manager
+        .lock()
+        .expect("task manager")
+        .runtime_refusal(payload)?;
     let record = record_from_payload(payload, provisional, resources);
     let gate = record.gate;
     if gate == Gate::Off {
@@ -110,7 +117,14 @@ pub fn admit_and_launch(
     let admitted = {
         let mut guard = task_manager.lock().expect("task manager");
         let admitted = if session {
-            guard.admit_session(record)?
+            // A child is checked against its owner's `children` block
+            // before it holds any room (docs/child-sessions.md).
+            let link = guard.check_child(payload, provisional)?;
+            let admitted = guard.admit_session(record)?;
+            if let Some(link) = link {
+                guard.link_child(&admitted.instance_id, link);
+            }
+            admitted
         } else {
             guard.admit_claim(record)?
         };
@@ -126,6 +140,10 @@ pub fn admit_and_launch(
     // under the claim's negative local key.
     let mut launch_payload = payload.clone();
     launch_payload.allocation_id = admitted.local_key;
+    if session {
+        let guard = task_manager.lock().expect("task manager");
+        guard.stamp_child_link(&admitted.instance_id, &mut launch_payload);
+    }
 
     if !session {
         crate::telemetry::worker_metrics()
@@ -199,11 +217,66 @@ pub fn start_edge_session(
     ticket: &crate::structs::edge_boot::SessionTicketClaims,
     idempotency_key: &str,
     slot: crate::worker::launch_pool::LaunchSlot,
+    owner: Option<crate::structs::OwnerRef>,
 ) -> R<EdgeSession> {
-    let (job_id, task_name) = (ticket.job.as_str(), ticket.task.as_str());
+    start_local_session(
+        task_manager,
+        node_id,
+        LocalStart {
+            job_id: &ticket.job,
+            task_name: &ticket.task,
+            origin: "edge",
+            ticket_jti: &ticket.jti,
+            idempotency_key,
+            owner,
+        },
+        slot,
+    )
+}
+
+/// One session start this node takes without a manager: by a session
+/// ticket (`origin = "edge"`), or from a workload on its API socket
+/// (`origin = "workload"`, always with an owner).
+pub struct LocalStart<'a> {
+    pub job_id: &'a str,
+    pub task_name: &'a str,
+    pub origin: &'a str,
+    pub ticket_jti: &'a str,
+    pub idempotency_key: &'a str,
+    /// The owner the session is a child of (docs/child-sessions.md), which
+    /// must run on this node.
+    pub owner: Option<crate::structs::OwnerRef>,
+}
+
+/// [`start_edge_session`] for any node-local start.
+pub fn start_local_session(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    node_id: &str,
+    start: LocalStart<'_>,
+    slot: crate::worker::launch_pool::LaunchSlot,
+) -> R<EdgeSession> {
+    let LocalStart {
+        job_id,
+        task_name,
+        origin,
+        ticket_jti,
+        idempotency_key,
+        owner,
+    } = start;
     let derived = !idempotency_key.trim().is_empty();
+    // A child's key is its owner's own: two owners retrying the same key
+    // get two children.
+    let scoped_key = match owner.as_ref() {
+        Some(owner) => format!(
+            "child:{}:{}:{}",
+            owner.kind,
+            owner.id,
+            idempotency_key.trim()
+        ),
+        None => idempotency_key.trim().to_string(),
+    };
     let session_id = if derived {
-        edge_derived_session_id(job_id, task_name, idempotency_key.trim())
+        edge_derived_session_id(job_id, task_name, &scoped_key)
     } else {
         crate::structs::mint_session_id(task_name, node_id)
     };
@@ -233,9 +306,10 @@ pub fn start_edge_session(
         job_id,
         &session_id,
         node_id,
-        "edge",
-        &ticket.jti,
+        origin,
+        ticket_jti,
         issued_at,
+        owner,
     )?;
     // An idempotent `store` start creates the session's manifest before its
     // gate opens, so two nodes that derived the same id cannot both run it
@@ -257,6 +331,7 @@ pub fn start_edge_session(
 /// identity in the workload's environment (`LEGION_INSTANCE_ID`,
 /// `LEGION_INSTANCE_MODE=session`), the serve gate, and the lease it was
 /// first issued at (kept across a resume on another node).
+#[allow(clippy::too_many_arguments)]
 pub fn session_payload(
     spec: &crate::worker::task_manager::SessionSpec,
     job_id: &str,
@@ -265,6 +340,7 @@ pub fn session_payload(
     origin: &str,
     ticket_jti: &str,
     issued_at: i64,
+    owner: Option<crate::structs::OwnerRef>,
 ) -> R<(TaskAllocation, ProvisionalAllocation)> {
     let identity = crate::structs::Instance {
         instance_id: session_id.to_string(),
@@ -282,6 +358,7 @@ pub fn session_payload(
         identity_epoch: 0,
         named: false,
         promoted_from: None,
+        owner: None,
     };
     let allocation = crate::structs::Allocation {
         id: 0,
@@ -304,6 +381,8 @@ pub fn session_payload(
         ticket_jti: ticket_jti.to_string(),
         session: Some(crate::structs::SessionStart {
             lease_issued_at_unix_ms: issued_at,
+            owner,
+            ..Default::default()
         }),
     };
     let payload = crate::structs::task_payload::build_task_allocation_with(
@@ -538,6 +617,7 @@ mod worker_edge_test {
             task_lifecycle: String::new(),
             task_restart: String::new(),
             task_speculative_start: String::new(),
+            task_children: String::new(),
             task_group: String::new(),
             task_service: String::new(),
         }

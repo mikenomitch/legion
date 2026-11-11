@@ -770,7 +770,17 @@ pub struct WorkloadIdentityClaims {
     /// Legion's verifiers refuse a token from an earlier epoch
     /// (docs/workload-identity.md, "Forks and snapshots").
     pub epoch: Option<u64>,
+    /// The unit that owns this workload as its child, as `kind:id`
+    /// (`legion.io/owner`, and `legion.io/root`: with children one level
+    /// deep the root of the tree is the owner). `None` for a workload
+    /// nobody owns (docs/child-sessions.md).
+    pub owner: Option<String>,
 }
+
+/// The claim naming the unit that owns the workload as its child.
+pub const OWNER_CLAIM: &str = "legion.io/owner";
+/// The claim naming the root of the workload's ownership tree.
+pub const ROOT_CLAIM: &str = "legion.io/root";
 
 /// The claim carrying an instance's identity epoch.
 pub const EPOCH_CLAIM: &str = "legion.io/epoch";
@@ -895,6 +905,10 @@ impl WorkloadIdentityClaims {
         }
         if let (Some(_), Some(epoch)) = (&self.instance, self.epoch) {
             claims.insert(EPOCH_CLAIM.to_string(), epoch.to_string());
+        }
+        if let Some(owner) = &self.owner {
+            claims.insert(OWNER_CLAIM.to_string(), owner.clone());
+            claims.insert(ROOT_CLAIM.to_string(), owner.clone());
         }
         claims
     }
@@ -1093,6 +1107,7 @@ mod tests {
             instance: None,
             slot: None,
             epoch: None,
+            owner: None,
         }
     }
 
@@ -1156,6 +1171,7 @@ mod tests {
             instance: Some("api-web-0".into()),
             slot: Some(0),
             epoch: Some(3),
+            owner: None,
             ..claims()
         };
         assert!(c.is_stateful());

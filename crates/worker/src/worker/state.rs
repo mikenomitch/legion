@@ -238,9 +238,10 @@ impl WorkerStateStore {
             .unwrap_or_else(|| PathBuf::from("content"))
     }
 
-    /// Root of the sandbox root disk cache (`<state-dir>/rootfs-cache`). It
-    /// must share a filesystem with the allocation dirs, which sit beside
-    /// it, so a sandbox's disk can be a reflink of its cached base.
+    /// Where a worker from before derived content kept sandbox base root
+    /// disks (`<state-dir>/rootfs-cache`). Nothing is written there now:
+    /// bases live in the content store's derived class, and the worker
+    /// deletes this directory when it starts.
     pub fn rootfs_cache_dir(&self) -> PathBuf {
         self.path
             .parent()

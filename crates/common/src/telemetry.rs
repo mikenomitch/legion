@@ -839,13 +839,22 @@ pub struct Metrics {
     /// `legion_session_starts_total{outcome}` (docs/metrics.md, "Sessions";
     /// sandbox-scaling Phase 6)
     pub session_starts_total: Arc<CounterVec>,
+    /// `legion_session_runs_total{outcome}` — session runs this manager
+    /// routed (docs/session-runs.md): `ran`, `deduplicated`, `refused` (no
+    /// node took it), `failed` (the node it ran on failed it), and
+    /// `runtime_disabled`.
+    pub session_runs_total: Arc<CounterVec>,
     /// `legion_session_stops_total{reason}` (docs/metrics.md, "Sessions")
     pub session_stops_total: Arc<CounterVec>,
     /// `legion_session_promotions_total` (docs/metrics.md, "Sessions")
     pub session_promotions_total: Arc<Counter>,
+    /// `legion_keyed_children_ended_total{end}` (docs/metrics.md, "Sessions")
+    pub keyed_children_ended_total: Arc<CounterVec>,
     /// `legion_envelope_resizes_total{direction, outcome}` (docs/metrics.md,
     /// "Sessions"; elastic-session-envelopes plan §6.3)
     pub envelope_resizes_total: Arc<CounterVec>,
+    /// `legion_resizes_total{unit, outcome}` (docs/metrics.md, "Resize")
+    pub resizes_total: Arc<CounterVec>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
     /// `legion_namespace_jobs{namespace}` (docs/metrics.md, "Namespaces")
@@ -1097,7 +1106,7 @@ impl Metrics {
         let evals_blocked = Arc::new(GaugeVec {
             meta: FamilyMeta {
                 name: "legion_evals_blocked",
-                help: "Evals waiting blocked on capacity, by the kind of key they wait under: `class` (a pool and pinned attributes), `node` (a resume pinned to the node holding its checkpoint), `escaped` (no schedulable node at all). Set by the scheduler-lane leader's wake pass; zero elsewhere.",
+                help: "Evals waiting blocked on capacity, by the kind of key they wait under: `class` (a pool and pinned attributes), `node` (a resume pinned to the node holding its checkpoint), `escaped` (no schedulable node at all), `runtime` (the task's runtime is disabled; only enabling it wakes the eval). Set by the scheduler-lane leader's wake pass; zero elsewhere.",
                 labels: &["key_kind"],
             },
             series: Series::new(),
@@ -1137,7 +1146,7 @@ impl Metrics {
         let evals_unblocked_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_evals_unblocked_total",
-                help: "Blocked evals returned to the pending queue, by what woke them: `register` (a node joined), `node` (a node's pool, availability, or attributes changed), `ready` (a node became ready), `freed` (allocations left a node), `missed` (capacity appeared while the eval was running, so it never blocked), `startup` (a manager starting as the scheduler's writer gives every blocked eval one more look).",
+                help: "Blocked evals returned to the pending queue, by what woke them: `register` (a node joined), `node` (a node's pool, availability, or attributes changed), `ready` (a node became ready), `freed` (allocations left a node), `missed` (capacity appeared while the eval was running, so it never blocked), `startup` (a manager starting as the scheduler's writer gives every blocked eval one more look), `runtime_enabled` (the task runtime the eval was blocked on was enabled again).",
                 labels: &["event"],
             },
             series: Series::new(),
@@ -1367,10 +1376,18 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let session_runs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_session_runs_total",
+                help: "Session runs this manager routed, by outcome (ran|deduplicated|refused|failed|runtime_disabled).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
         let session_starts_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_session_starts_total",
-                help: "Session creates this manager's session router answered, by outcome (started|deduplicated|no_envelope|no_room|refused). None writes the replicated store.",
+                help: "Session creates this manager's session router answered, by outcome (started|deduplicated|no_envelope|no_room|refused|runtime_disabled). None writes the replicated store.",
                 labels: &["outcome"],
             },
             series: Series::new(),
@@ -1391,6 +1408,14 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let resizes_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_resizes_total",
+                help: "In-place resizes this manager answered (ResizeAllocation, ResizeInstance), by unit (allocation|instance|session) and outcome (applied|deferred|refused|needs_restart|not_supported|stale|error). Dry runs are not counted. An applied allocation or instance resize is one scheduler-lane write; a session resize writes nothing.",
+                labels: &["unit", "outcome"],
+            },
+            series: Series::new(),
+        });
         let session_promotions_total = Arc::new(Counter {
             meta: FamilyMeta {
                 name: "legion_session_promotions_total",
@@ -1398,6 +1423,14 @@ impl Metrics {
                 labels: &[],
             },
             cell: CounterCell::default(),
+        });
+        let keyed_children_ended_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_keyed_children_ended_total",
+                help: "Keyed children ended by the maintenance sweep because their owner ended some way other than an instance stop or destroy, by what was applied (stopped, destroyed).",
+                labels: &["end"],
+            },
+            series: Series::new(),
         });
         let node_cpu_used_millicores = Arc::new(GaugeVec {
             meta: FamilyMeta {
@@ -2036,9 +2069,12 @@ impl Metrics {
             Arc::clone(&checkpoint_publish_total) as Arc<dyn RenderMetric>,
             Arc::clone(&instance_archived_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_runs_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_stops_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_promotions_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&keyed_children_ended_total) as Arc<dyn RenderMetric>,
             Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
             Arc::clone(&apps) as Arc<dyn RenderMetric>,
@@ -2156,9 +2192,12 @@ impl Metrics {
             checkpoint_publish_total,
             instance_archived_total,
             session_starts_total,
+            session_runs_total,
             envelope_resizes_total,
+            resizes_total,
             session_stops_total,
             session_promotions_total,
+            keyed_children_ended_total,
             allocations,
             namespace_jobs,
             namespace_allocations,
@@ -2300,6 +2339,24 @@ pub struct WorkerMetrics {
     /// `legion_provisional_starts_total{origin,gate}` — provisional
     /// allocations admitted on this node (docs/edge-boot.md).
     pub provisional_starts_total: Arc<CounterVec>,
+    /// `legion_runtime_disabled_refusals_total{runtime}` — starts this
+    /// worker refused because their runtime is disabled.
+    pub runtime_disabled_refusals_total: Arc<CounterVec>,
+    /// `legion_derived_builds_total{kind,outcome}` — derived content builds
+    /// (docs/artifacts.md, "Derived content"): `built` (committed), or the
+    /// reason the output was not kept (`oversized`, `below_min_free`,
+    /// `no_room`, `duplicate`, `disabled`, `error`).
+    pub derived_builds_total: Arc<CounterVec>,
+    /// `legion_derived_build_seconds{kind}` — how long a build took.
+    pub derived_build_seconds: Arc<HistogramVec>,
+    /// `legion_derived_hits_total{kind}` — uses served by an entry already
+    /// on the node.
+    pub derived_hits_total: Arc<CounterVec>,
+    /// `legion_child_handoffs_total` — inbound connections an owner handed
+    /// to one of its children's ports (docs/child-sessions.md).
+    pub child_handoffs_total: Arc<Counter>,
+    /// `legion_derived_bytes` — disk the derived class holds.
+    pub derived_bytes: Arc<Gauge>,
     /// `legion_provisional_refused_total{reason}` — ratifications refused.
     pub provisional_refused_total: Arc<CounterVec>,
     /// `legion_provisional_killed_total{cause}` — provisional work killed
@@ -2324,6 +2381,10 @@ pub struct WorkerMetrics {
     /// `legion_worker_edge_session_starts_total` — sessions started on this
     /// node from a session ticket (`Worker.StartSession`).
     pub edge_session_starts_total: Arc<Counter>,
+    /// `legion_worker_session_runs_total{outcome}` — session runs this node
+    /// drove (docs/session-runs.md): `ran` (the command exited), `stopped`
+    /// (a limit stopped it), `failed` (it could not start or finish).
+    pub session_runs_total: Arc<CounterVec>,
     /// `legion_session_checkpoints_skipped_total` — periodic session
     /// checkpoints (`suspend.checkpointEvery`) a node skipped because its
     /// backlog would not let it capture them within one interval.
@@ -2417,6 +2478,64 @@ impl WorkerMetrics {
             cell: CounterCell::default(),
         });
 
+        let runtime_disabled_refusals_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_runtime_disabled_refusals_total",
+                help: "Starts this worker refused because their task runtime is disabled (`legion operator runtime disable`): placements, session starts, claims, resumes, and restarts.",
+                labels: &["runtime"],
+            },
+            series: Series::new(),
+        });
+        let derived_builds_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_derived_builds_total",
+                help: "Derived content builds on this node, by kind (rootfs|cwasm|preinit-image|preinit-entry|vm-base) and outcome (built|oversized|below_min_free|no_room|duplicate|disabled|error).",
+                labels: &["kind", "outcome"],
+            },
+            series: Series::new(),
+        });
+        let derived_build_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_derived_build_seconds",
+                help: "Time to build one derived content entry, by kind.",
+                labels: &["kind"],
+            },
+            bounds: CHECKPOINT_DURATION_BUCKETS,
+            series: Series::new(),
+        });
+        let child_handoffs_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_child_handoffs_total",
+                help: "Inbound connections an owner handed to one of its children's ports (docs/child-sessions.md).",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let derived_hits_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_derived_hits_total",
+                help: "Uses of derived content served by an entry already on this node, by kind.",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+        });
+        let derived_bytes = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_derived_bytes",
+                help:
+                    "Bytes of disk the node content store's derived class holds (allocated blocks).",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let session_runs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_worker_session_runs_total",
+                help: "Session runs this node drove, by outcome (ran|stopped|failed).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
         let provisional_starts_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_provisional_starts_total",
@@ -2675,6 +2794,7 @@ impl WorkerMetrics {
             Arc::clone(&claim_overload_refusals_total) as Arc<dyn RenderMetric>,
             Arc::clone(&claim_window) as Arc<dyn RenderMetric>,
             Arc::clone(&edge_session_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&session_runs_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_checkpoints_skipped_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_evictions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_superseded_total) as Arc<dyn RenderMetric>,
@@ -2685,6 +2805,12 @@ impl WorkerMetrics {
             Arc::clone(&provisional_ratify_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_refused_total) as Arc<dyn RenderMetric>,
             Arc::clone(&provisional_starts_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&runtime_disabled_refusals_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&derived_builds_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&derived_build_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&derived_hits_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&child_handoffs_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&derived_bytes) as Arc<dyn RenderMetric>,
             Arc::clone(&pressure_actions_total) as Arc<dyn RenderMetric>,
             Arc::clone(&parks_total) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_nodes) as Arc<dyn RenderMetric>,
@@ -2701,6 +2827,12 @@ impl WorkerMetrics {
             pressure_actions_total,
             parks_total,
             provisional_starts_total,
+            runtime_disabled_refusals_total,
+            derived_builds_total,
+            derived_build_seconds,
+            derived_hits_total,
+            child_handoffs_total,
+            derived_bytes,
             provisional_refused_total,
             provisional_killed_total,
             provisional_ratify_seconds,
@@ -2709,6 +2841,7 @@ impl WorkerMetrics {
             claim_overload_refusals_total,
             claim_window,
             edge_session_starts_total,
+            session_runs_total,
             session_checkpoints_skipped_total,
             session_evictions_total,
             session_superseded_total,

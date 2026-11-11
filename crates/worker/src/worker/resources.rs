@@ -986,6 +986,133 @@ fn create_task_cgroup(fs_root: &Path, assignment: &ResourceAssignment) -> R<()> 
     Ok(())
 }
 
+/// The memory a cgroup holds right now (`memory.current`), when readable.
+pub fn cgroup_memory_current(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join("memory.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// What a resize writes into a task's cgroup: `cpu.weight`, `memory.low`
+/// (the reservation), and `memory.max` (the ceiling). Shared by every
+/// runtime whose unit is confined by a cgroup at its assignment's path
+/// (docs/resize.md).
+///
+/// `ceiling_bytes` replaces the ceiling derived from `change.to` for a
+/// runtime whose cgroup holds more than the workload (a sandbox's VMM), and
+/// `Some(None)`-style "leave the ceiling alone" is spelled by passing the
+/// assignment's current ceiling.
+///
+/// A ceiling below what the cgroup holds now is `Refused` unless
+/// `change.force`: the kernel would reclaim and then kill. A grow raises
+/// the ceiling before the reservation and a shrink lowers the reservation
+/// first, so the reservation never sits above the ceiling in between.
+pub fn resize_cgroup(
+    dir: &Path,
+    assignment: &ResourceAssignment,
+    change: &crate::structs::resize::ResizeChange,
+    ceiling_bytes: Option<u64>,
+) -> R<(crate::structs::resize::ResizeAnswer, ResourceAssignment)> {
+    use crate::structs::resize::ResizeAnswer;
+    let mut next = assignment.clone();
+    next.cpu_weight = cpu_weight_shares(&change.to).or(assignment.cpu_weight);
+    next.memory_low_bytes = memory_limit_bytes(&change.to).or(assignment.memory_low_bytes);
+    next.memory_limit_bytes = ceiling_bytes
+        .or_else(|| memory_ceiling_bytes(&change.to))
+        .or(assignment.memory_limit_bytes);
+    let lowers_ceiling = match (assignment.memory_limit_bytes, next.memory_limit_bytes) {
+        (Some(was), Some(now)) => now < was,
+        // A unit that ran unconstrained gains a ceiling.
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    if lowers_ceiling && !change.force {
+        if let (Some(current), Some(ceiling)) =
+            (cgroup_memory_current(dir), next.memory_limit_bytes)
+        {
+            if current > ceiling {
+                const MIB: u64 = 1024 * 1024;
+                return Ok((
+                    ResizeAnswer::Refused(format!(
+                        "the unit uses {} MiB now, above the new {} MiB ceiling; shrinking \
+                         below current use needs --force, which lets the kernel reclaim or \
+                         kill it",
+                        current.div_ceil(MIB),
+                        ceiling / MIB
+                    )),
+                    assignment.clone(),
+                ));
+            }
+        }
+    }
+    if change.dry_run || next == *assignment {
+        return Ok((ResizeAnswer::Applied, assignment.clone()));
+    }
+    let write_ceiling = |next: &ResourceAssignment| -> R<()> {
+        if next.memory_limit_bytes != assignment.memory_limit_bytes {
+            if let Some(bytes) = next.memory_limit_bytes {
+                write_cgroup_file(&dir.join("memory.max"), &bytes.to_string())?;
+                if assignment.memory_limit_bytes.is_none() {
+                    write_cgroup_file(&dir.join("memory.swap.max"), "0")?;
+                }
+            }
+        }
+        Ok(())
+    };
+    let write_reservation = |next: &ResourceAssignment| -> R<()> {
+        if next.memory_low_bytes != assignment.memory_low_bytes {
+            if let Some(bytes) = next.memory_low_bytes {
+                write_cgroup_file(&dir.join("memory.low"), &bytes.to_string())?;
+            }
+        }
+        Ok(())
+    };
+    if lowers_ceiling {
+        write_reservation(&next)?;
+        write_ceiling(&next)?;
+    } else {
+        write_ceiling(&next)?;
+        write_reservation(&next)?;
+    }
+    if next.cpu_weight != assignment.cpu_weight {
+        if let Some(shares) = next.cpu_weight {
+            write_cgroup_file(
+                &dir.join("cpu.weight"),
+                &shares_to_weight(shares).to_string(),
+            )?;
+        }
+    }
+    Ok((ResizeAnswer::Applied, next))
+}
+
+/// [`resize_cgroup`] on a running task's own assignment, updating it in
+/// place when the resize applied.
+///
+/// A task with no assignment (enforcement off, a non-Linux worker), a
+/// label-only leaf, or a leaf that no longer exists has nothing to write:
+/// its `resources` are scheduling-only, exactly as they were at start, and
+/// the resize is `Applied` as an accounting change.
+pub fn resize_instance_cgroup(
+    instance: &mut crate::task_plugins::TaskInstance,
+    change: &crate::structs::resize::ResizeChange,
+    ceiling_bytes: Option<u64>,
+) -> R<crate::structs::resize::ResizeAnswer> {
+    let Some(assignment) = instance.resource_assignment.clone() else {
+        return Ok(crate::structs::resize::ResizeAnswer::Applied);
+    };
+    let dir = assignment.absolute_cgroup_path();
+    if assignment.is_unlimited() || !dir.is_dir() {
+        return Ok(crate::structs::resize::ResizeAnswer::Applied);
+    }
+    let (answer, next) = resize_cgroup(&dir, &assignment, change, ceiling_bytes)?;
+    if answer == crate::structs::resize::ResizeAnswer::Applied && !change.dry_run {
+        instance.resource_assignment = Some(next);
+    }
+    Ok(answer)
+}
+
 /// Remove a task's cgroup. Best-effort: an rmdir that fails because a process
 /// is still leaving is normal during teardown, the next start of the same
 /// allocation reuses the directory, and the startup sweep
@@ -1732,6 +1859,144 @@ mod tests {
         for leaf in ["share", "reserve", ""] {
             let _ = std::fs::remove_dir(PathBuf::from(CGROUP_ROOT).join(&root).join(leaf));
         }
+        Ok(())
+    }
+    fn resize_change(from: Value, to: Value, force: bool) -> crate::structs::resize::ResizeChange {
+        crate::structs::resize::ResizeChange {
+            from,
+            to,
+            force,
+            dry_run: false,
+        }
+    }
+
+    fn resizable_leaf() -> R<(tempfile::TempDir, ResourceAssignment)> {
+        let dir = tempfile::tempdir()?;
+        let assignment = ResourceAssignment {
+            slice: Slice::Share,
+            cgroup_path: PathBuf::from("legion/share/legion-9"),
+            cores: None,
+            cpu_weight: Some(1000),
+            memory_limit_bytes: Some(1024 << 20),
+            memory_low_bytes: Some(1024 << 20),
+        };
+        for (file, value) in [
+            ("cpu.weight", shares_to_weight(1000).to_string()),
+            ("memory.max", (1024u64 << 20).to_string()),
+            ("memory.low", (1024u64 << 20).to_string()),
+            ("memory.current", (300u64 << 20).to_string()),
+        ] {
+            std::fs::write(dir.path().join(file), value)?;
+        }
+        Ok((dir, assignment))
+    }
+
+    /// A resize rewrites the three cgroup files a unit's size lives in:
+    /// `memory.low` (the reservation), `memory.max` (the ceiling), and
+    /// `cpu.weight` (docs/resize.md).
+    #[test]
+    fn a_resize_rewrites_the_reservation_the_ceiling_and_the_weight() -> R<()> {
+        let (dir, assignment) = resizable_leaf()?;
+        let read = |file: &str| std::fs::read_to_string(dir.path().join(file)).unwrap();
+        let (answer, next) = resize_cgroup(
+            dir.path(),
+            &assignment,
+            &resize_change(
+                json!({ "cpu": 1000, "memory": 1024 }),
+                json!({ "cpu": 2000, "memory": 2048, "memoryMax": 4096 }),
+                false,
+            ),
+            None,
+        )?;
+        assert_eq!(answer, crate::structs::resize::ResizeAnswer::Applied);
+        assert_eq!(read("memory.low"), (2048u64 << 20).to_string());
+        assert_eq!(read("memory.max"), (4096u64 << 20).to_string());
+        assert_eq!(read("cpu.weight"), shares_to_weight(2000).to_string());
+        assert_eq!(next.memory_low_bytes, Some(2048 << 20));
+        assert_eq!(next.memory_limit_bytes, Some(4096 << 20));
+        assert_eq!(next.cpu_weight, Some(2000));
+        Ok(())
+    }
+
+    /// A ceiling below what the unit holds now is refused and writes
+    /// nothing; `force` lets it through; a dry run decides without writing.
+    #[test]
+    fn a_shrink_below_current_use_is_refused_unless_forced() -> R<()> {
+        let (dir, assignment) = resizable_leaf()?;
+        let read = |file: &str| std::fs::read_to_string(dir.path().join(file)).unwrap();
+        let below = |force: bool| {
+            resize_change(
+                json!({ "cpu": 1000, "memory": 1024 }),
+                json!({ "cpu": 1000, "memory": 128 }),
+                force,
+            )
+        };
+        let (answer, next) = resize_cgroup(dir.path(), &assignment, &below(false), None)?;
+        match answer {
+            crate::structs::resize::ResizeAnswer::Refused(message) => {
+                assert!(message.contains("uses 300 MiB now"), "{message}");
+                assert!(message.contains("--force"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(next, assignment);
+        assert_eq!(read("memory.max"), (1024u64 << 20).to_string());
+
+        // A dry run of a shrink that fits answers applied and writes nothing.
+        let mut dry = resize_change(
+            json!({ "cpu": 1000, "memory": 1024 }),
+            json!({ "cpu": 1000, "memory": 512 }),
+            false,
+        );
+        dry.dry_run = true;
+        let (answer, _) = resize_cgroup(dir.path(), &assignment, &dry, None)?;
+        assert_eq!(answer, crate::structs::resize::ResizeAnswer::Applied);
+        assert_eq!(read("memory.max"), (1024u64 << 20).to_string());
+
+        let (answer, next) = resize_cgroup(dir.path(), &assignment, &below(true), None)?;
+        assert_eq!(answer, crate::structs::resize::ResizeAnswer::Applied);
+        assert_eq!(read("memory.max"), (128u64 << 20).to_string());
+        assert_eq!(read("memory.low"), (128u64 << 20).to_string());
+        assert_eq!(next.memory_limit_bytes, Some(128 << 20));
+        Ok(())
+    }
+
+    /// A runtime whose cgroup holds more than the workload keeps its own
+    /// ceiling: only the reservation and the weight follow the resize.
+    #[test]
+    fn a_runtimes_own_ceiling_survives_a_resize() -> R<()> {
+        let (dir, assignment) = resizable_leaf()?;
+        let read = |file: &str| std::fs::read_to_string(dir.path().join(file)).unwrap();
+        let (answer, next) = resize_cgroup(
+            dir.path(),
+            &assignment,
+            &resize_change(
+                json!({ "cpu": 1000, "memory": 1024 }),
+                json!({ "cpu": 500, "memory": 512, "memoryMax": 768 }),
+                false,
+            ),
+            Some(1024 << 20),
+        )?;
+        assert_eq!(answer, crate::structs::resize::ResizeAnswer::Applied);
+        assert_eq!(read("memory.max"), (1024u64 << 20).to_string());
+        assert_eq!(read("memory.low"), (512u64 << 20).to_string());
+        assert_eq!(read("cpu.weight"), shares_to_weight(500).to_string());
+        assert_eq!(next.memory_limit_bytes, Some(1024 << 20));
+        Ok(())
+    }
+
+    /// A task with no assignment (enforcement off) has nothing to write: its
+    /// resize is an accounting change, as its resources were at start.
+    #[test]
+    fn a_unit_without_an_assignment_resizes_as_accounting_only() -> R<()> {
+        let mut instance = crate::task_plugins::TaskInstance::default();
+        let answer = resize_instance_cgroup(
+            &mut instance,
+            &resize_change(json!({ "memory": 64 }), json!({ "memory": 128 }), false),
+            None,
+        )?;
+        assert_eq!(answer, crate::structs::resize::ResizeAnswer::Applied);
+        assert!(instance.resource_assignment.is_none());
         Ok(())
     }
 }

@@ -151,8 +151,9 @@ neighbor rules a cause in or out, and which knob to turn), see
   to the pending queue after exhausting their plan-conflict retry budget,
   instead of failing terminally (the requeue backstop).
 - **`legion_evals_blocked{key_kind}`** (gauge): evals waiting blocked on
-  capacity, by the kind of key they wait under: `class`, `node`, or
-  `escaped` (see
+  capacity, by the kind of key they wait under: `class`, `node`,
+  `escaped`, or `runtime` (the task's runtime is
+  [disabled](runtime-disable.md)) (see
   [Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). Set by the
   scheduler-lane leader's wake pass, so it reads 0 on other managers and is
   refreshed when a capacity event arrives. A rising `class` count is a
@@ -175,7 +176,8 @@ neighbor rules a cause in or out, and which knob to turn), see
   availability, or attributes changed), `ready`, `freed` (allocations left a
   node), `recovered` (a changeset projection failed, so every available node
   counted as changed), `missed` (capacity appeared while the eval ran, so it
-  never blocked), `startup`, or `timeout` (a gang past its `placementTimeout`,
+  never blocked), `startup`, `runtime_enabled` (the disabled runtime the eval
+  waited on was enabled), or `timeout` (a gang past its `placementTimeout`,
   woken for its last attempt).
 - **`legion_blocked_wait_seconds`** (histogram): how long a blocked eval
   waited, from the entry that blocked it to the one that woke it. Buckets run
@@ -508,11 +510,18 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
 Counted on the manager that served the request, so with several managers sum
 across them. See [session-mode.md](session-mode.md).
 
+- **`legion_session_runs_total{outcome}`** (counter):
+  [session runs](session-runs.md) this manager routed, by `outcome`: `ran`,
+  `deduplicated` (a node answered from a kept reply), `refused` (no node
+  took it: no envelope, or every one full), `failed` (the node it ran on
+  answered an error), and `runtime_disabled`.
 - **`legion_session_starts_total{outcome}`** (counter): session creates the
   session router answered, by `outcome`: `started`, `deduplicated` (an
   idempotent retry found the session running), `no_envelope` (no node holds
   an envelope for the task yet), `no_room` (every envelope was full by the
-  router's view), or `refused` (the nodes tried all refused). None of them
+  router's view), `refused` (the nodes tried all refused), or
+  `runtime_disabled` (the task's runtime is
+  [disabled](runtime-disable.md)). None of them
   writes the replicated store. A rising `no_room` or `refused` rate means
   the envelopes are too small for the arrival rate.
 - **`legion_session_stops_total{reason}`** (counter): sessions this manager
@@ -520,6 +529,23 @@ across them. See [session-mode.md](session-mode.md).
   later copy of a session id running on two nodes).
 - **`legion_session_promotions_total`** (counter): running sessions promoted
   to keyed instances, one scheduler-lane raft entry each.
+- **`legion_keyed_children_ended_total{end}`** (counter): keyed
+  [children](child-sessions.md#keyed-children) the scheduler lane's leader
+  ended because their owner ended some way other than an instance stop or
+  destroy (an allocation that completed or was lost, a job stop), by what
+  was applied: `stopped` or `destroyed`. An instance owner's own stop and
+  destroy end its children in the same entry and are not counted here.
+- **`legion_child_handoffs_total`** (counter, on workers): inbound
+  connections an owner handed to one of its children's ports
+  ([connection handoff](child-sessions.md#connection-handoff)).
+- **`legion_resizes_total{unit, outcome}`** (counter): in-place
+  [resizes](resize.md) this manager answered, by `unit` (`allocation`,
+  `instance`, `session`, or `task`) and `outcome`: `applied`, `deferred`,
+  `refused`, `needs_restart`, `not_supported`, `stale` (a shrink whose row
+  changed under it), or `error` (the unit's node did not answer). A task
+  resize counts once under `task` (`applied` or `reset`) and once per
+  allocation it touched under `allocation`. Dry runs are not counted. An applied allocation or instance resize is one scheduler-lane
+  write; a session resize writes nothing.
 - **`legion_envelope_resizes_total{direction, outcome}`** (counter): elastic
   envelope resizes nodes asked this manager for
   ([elastic envelopes](session-mode.md#elastic-envelopes)), by `direction`
@@ -988,6 +1014,22 @@ that has never taken a provisional start.
 
 - **`legion_provisional_starts_total{origin,gate}`** (counter): provisional
   allocations admitted, by `origin` (`manager` | `edge`) and gate.
+- **`legion_derived_builds_total{kind,outcome}`** (counter):
+  [derived content](artifacts.md#derived-content) builds on this node, by
+  `kind` (`rootfs` today) and `outcome`: `built` (the entry was kept), or why
+  it was not (`oversized`, `below_min_free`, `no_room`, `duplicate`,
+  `disabled`, `error`). A build that is not kept still served the start that
+  needed it.
+- **`legion_derived_build_seconds{kind}`** (histogram): how long one build
+  took. For `rootfs` this is extracting the image and formatting the disk.
+- **`legion_derived_hits_total{kind}`** (counter): uses served by an entry
+  already on the node. Hits against builds is the class's hit rate.
+- **`legion_derived_bytes`** (gauge): disk the derived class holds, in
+  allocated blocks. Compare it with `content.budgets.derived`.
+- **`legion_runtime_disabled_refusals_total{runtime}`** (counter): starts
+  this worker refused because their runtime is
+  [disabled](runtime-disable.md): placements, session starts, claims,
+  resumes, and restarts. Zero on a node that never held a disable.
 - **`legion_provisional_refused_total{reason}`** (counter): ratifications
   refused. A rising `instance_claimed` rate points to a routing problem (two
   edges racing for one sandbox) rather than a cluster problem. `no_capacity`
@@ -1027,6 +1069,11 @@ Session starts on the node ([session-mode.md](session-mode.md)) add two:
 - **`legion_worker_edge_session_starts_total`** (counter): sessions this
   node started from a session ticket (`Worker.StartSession`), not counting
   deduplicated retries.
+- **`legion_worker_session_runs_total{outcome}`** (counter):
+  [session runs](session-runs.md) this node drove, by `outcome`: `ran` (the
+  command exited, with any status), `stopped` (`run.wall`, memory, or the
+  session ending stopped it), `failed` (the run could not start or finish).
+  A retry answered from a kept reply is not counted.
 
 Every task start on the node adds one histogram:
 

@@ -43,6 +43,7 @@ fn the_snapshot_budget_reports_the_snapshots_class_and_what_is_pinned() -> R<()>
             budgets: ContentBudgets {
                 artifacts: 10 * MIB,
                 snapshots: 8 * MIB,
+                derived: 0,
             },
             ttl: None,
             min_free_disk: 3 * MIB,
@@ -207,5 +208,97 @@ fn the_store_advertises_only_large_entries() -> R<()> {
     assert_eq!(advertised.len(), 1);
     assert_eq!(advertised.get(big.digest.as_str()), Some(&MIB));
     assert!(advertised_set(None)?.is_empty());
+    Ok(())
+}
+
+/// Derived content rides the report whole, and only when it changed
+/// (docs/artifacts.md, "Derived content").
+#[test]
+fn the_derived_listing_is_sent_when_it_changes_and_never_advertised_test() -> R<()> {
+    use legion::content_store::{
+        ContentBudgets, ContentStoreConfig, DerivedKind, PinOwner, Recipe,
+    };
+    let dir = tempfile::tempdir()?;
+    let store = ContentStore::open(
+        dir.path().join("content"),
+        ContentStoreConfig {
+            budgets: ContentBudgets {
+                artifacts: 10 * MIB,
+                snapshots: 8 * MIB,
+                derived: 16 * MIB,
+            },
+            ttl: None,
+            min_free_disk: 0,
+        },
+    )?;
+    let recipe = Recipe::new(DerivedKind::Rootfs, "legion-test+rootfs.1").number("headroomMib", 8);
+    store.ensure_derived(&recipe, |out| {
+        std::fs::write(out.join("rootfs.img"), vec![7u8; 2 * MIB as usize])?;
+        Ok(())
+    })?;
+
+    let manager = ContentLocationIndex::new();
+    let mut worker = ContentAdvertiser::new();
+    let beat = |worker: &mut ContentAdvertiser| {
+        let mut pending = worker.prepare(advertised_set(Some(&store)).unwrap());
+        worker.attach_derived(&mut pending, Some(&store));
+        let sent = pending.report.derived.clone();
+        let outcome = manager.ingest("n1", &pending.report, Instant::now());
+        worker.acknowledge(pending, outcome == IngestOutcome::Resync);
+        sent
+    };
+
+    // The first (full) report carries the listing.
+    let sent = beat(&mut worker).expect("the full report lists derived content");
+    assert_eq!((sent.budget_bytes, sent.entry_count), (16 * MIB, 1));
+    assert!(sent.used_bytes >= 2 * MIB);
+    let entry = &sent.entries[0];
+    assert_eq!(
+        (entry.kind.as_str(), entry.key.as_str()),
+        ("rootfs", recipe.key().as_str())
+    );
+    assert_eq!(entry.inputs["headroomMib"], "8");
+    assert_eq!(entry.builder_version, "legion-test+rootfs.1");
+    // A base is 2 MiB, well over the 1 MiB advertising floor, and still is
+    // not a location: nothing may be steered to fetch it.
+    assert!(advertised_set(Some(&store))?.is_empty());
+    assert_eq!(
+        manager.node_entries("n1").map(|(_, entries)| entries.len()),
+        Some(0)
+    );
+    assert_eq!(manager.derived("n1"), Some(sent.clone()));
+
+    // Nothing changed (a use does not count): nothing is sent, and the
+    // manager keeps what it has.
+    assert!(store.derived_get(&recipe)?.is_some());
+    assert_eq!(beat(&mut worker), None);
+    assert_eq!(manager.derived("n1"), Some(sent));
+
+    // A pin is a change.
+    store.derived_pin(
+        recipe.kind(),
+        &recipe.key(),
+        &PinOwner::new("pool:machine")?,
+    )?;
+    let sent = beat(&mut worker).expect("a change is reported");
+    assert!(sent.entries[0].pinned);
+    assert_eq!(sent.pinned_bytes, sent.used_bytes);
+
+    // A manager that lost its state asks for a full report, which carries
+    // the listing again.
+    manager.clear();
+    assert_eq!(beat(&mut worker), None, "the delta the new manager refuses");
+    assert_eq!(manager.derived("n1"), None);
+    assert!(beat(&mut worker).is_some());
+    assert!(manager.derived("n1").is_some());
+
+    // A node without a store sends none, and a full report from it clears
+    // what the manager held.
+    let bare = ContentAdvertiser::new();
+    let mut pending = bare.prepare(HashMap::new());
+    bare.attach_derived(&mut pending, None);
+    assert_eq!(pending.report.derived, None);
+    manager.ingest("n1", &pending.report, Instant::now());
+    assert_eq!(manager.derived("n1"), None);
     Ok(())
 }

@@ -313,6 +313,11 @@ but must handle `refused` at any point until `ratified`. `--dry-run` verifies
 the ticket and local admission and reports what would happen, without
 holding or booting anything.
 
+A node refuses a ticket for a task whose runtime an operator
+[disabled](runtime-disable.md) with `UNAVAILABLE` (code `RUNTIME_DISABLED`),
+before it holds or boots anything. The ticket is not spent, so the same
+ticket works once the runtime is enabled.
+
 ### Verification on the worker is entirely offline
 
 1. signature against a cached JWKS (fetched on first use, refreshed on a `kid`

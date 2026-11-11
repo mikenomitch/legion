@@ -1,4 +1,5 @@
 import { A, useParams, useSearchParams } from '@solidjs/router'
+import { resizeOverrideNote } from '../../lib/resize'
 import { For, Index, Show, createMemo, createResource, createSignal, type JSX, type Resource } from 'solid-js'
 import type {
   InstanceInfo,
@@ -1381,7 +1382,7 @@ function AllocationDetailContent() {
                     </Show>
 
                     <div>
-                      <p class="eyebrow mb-1.5">Reserved (as declared)</p>
+                      <p class="eyebrow mb-1.5">Reserved (effective)</p>
                       <Show
                         when={reservedResources().length > 0}
                         fallback={
@@ -1401,6 +1402,13 @@ function AllocationDetailContent() {
                             )}
                           </Index>
                         </dl>
+                      </Show>
+                      <Show when={resizeOverrideNote(ledgerEntry()?.resourcesOverride)}>
+                        {(note) => (
+                          <p class="mt-2 text-xs text-muted" title="legion alloc resize set these in place of the spec's amounts; the amounts above are the effective reservation">
+                            {note()}
+                          </p>
+                        )}
                       </Show>
                     </div>
                   </div>

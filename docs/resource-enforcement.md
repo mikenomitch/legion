@@ -146,6 +146,12 @@ then never stopped for node memory pressure. Only tasks above their
 reservation compete for what is left, and they are the ones the [memory
 pressure response](#memory-pressure) acts on.
 
+**Changing them on a running task.** `memory`, `memoryMax`, and `cpu` can
+be changed in place, without a restart or a new job version: `legion alloc
+resize` and `legion instance resize` rewrite `memory.low`, `memory.max`, and
+`cpu.weight` on the task's cgroup, and move a sandbox guest's ceiling with
+its balloon. See [Resize](resize.md).
+
 ## Oversubscription
 
 When nodes are reserved at 90% but use 30%, the scheduler is leaving memory

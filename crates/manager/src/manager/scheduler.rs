@@ -1984,6 +1984,7 @@ impl<'a> Scheduler<'a> {
         // Count overrides apply to dry-run plans too, so `job plan` previews
         // what a submit would actually converge to (job id == job name).
         Self::apply_count_overrides(self.store, &job_config.name, &mut tasks)?;
+        Self::apply_resource_overrides(self.store, &job_config.name, &mut tasks)?;
         // Keyed tasks plan against live instances, not count.num, even for
         // not-yet-submitted configs (a fresh job simply has zero instances).
         Self::apply_keyed_instance_counts(self.store, &job_config.name, &mut tasks)?;
@@ -2739,6 +2740,13 @@ impl<'a> Scheduler<'a> {
     ) -> R<BuiltPlan> {
         tasks.sort_by_key(|a| a.0);
         let mut unplaced: Vec<UnplacedTask> = Vec::new();
+        // Tasks whose runtime an operator disabled for this job's namespace
+        // (docs/runtime-disable.md) place nothing: they leave the plan here
+        // and are reported unplaced, after everything short of room, so the
+        // eval blocks under `runtime_disabled:<runtime>` only when nothing
+        // else is waiting for capacity.
+        let runtime_unplaced =
+            self.withhold_disabled_runtimes(&mut tasks, &required_counts, preemptor.job);
         let mut gang_reports: Vec<GangReport> = Vec::new();
         // Preemption state for the whole plan: floors bind across placements,
         // and the victim index loads at most once (and only if a placement
@@ -3428,6 +3436,7 @@ impl<'a> Scheduler<'a> {
             &task_id_to_group,
             &group_sizes,
         );
+        unplaced.extend(runtime_unplaced);
 
         Ok(BuiltPlan {
             placements,
@@ -4038,6 +4047,31 @@ impl<'a> Scheduler<'a> {
         } else {
             Vec::new()
         };
+        // Keyed children awaiting their first placement prefer their
+        // owner's node (docs/child-sessions.md). A preference, not a pin:
+        // when that node is not eligible the child goes wherever the task
+        // fits. Keyed tasks only, and empty unless a child is pending.
+        let mut owner_preferences: std::collections::VecDeque<(String, String)> = if task_config
+            .stateful
+            .as_ref()
+            .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed)
+        {
+            match plan.positional_job_id.as_deref() {
+                None => self.store.owner_node_preferences_for_task(task_id),
+                Some(job_id) => self.store.owner_node_preferences_for_task_named(
+                    job_id,
+                    &task_config.group,
+                    &task_config.name,
+                ),
+            }
+            .unwrap_or_else(|err| {
+                warn!(task_id, error = ?err, "Failed loading owner preferences; placing without");
+                Vec::new()
+            })
+            .into()
+        } else {
+            std::collections::VecDeque::new()
+        };
         // Score locality after the restore lookup, so a restoring instance's
         // manifest parts count toward the content set.
         let locality = self.locality_scores(task_config, &restores, weights);
@@ -4412,11 +4446,24 @@ impl<'a> Scheduler<'a> {
             };
             // A restore's node was chosen for that instance (its pin, or its
             // `compat` and spread), so the apply must bind that instance.
-            let bind_instance = floating.clone().or_else(|| {
-                pin.as_ref()
-                    .filter(|(instance_id, _)| restore_manifests.contains_key(instance_id))
-                    .map(|(instance_id, _)| instance_id.clone())
-            });
+            // A fresh placement of a keyed child: its owner's node first.
+            let owner_preference = if pin.is_none() && floating.is_none() {
+                owner_preferences.pop_front()
+            } else {
+                None
+            };
+            let bind_instance = floating
+                .clone()
+                .or_else(|| {
+                    pin.as_ref()
+                        .filter(|(instance_id, _)| restore_manifests.contains_key(instance_id))
+                        .map(|(instance_id, _)| instance_id.clone())
+                })
+                .or_else(|| {
+                    owner_preference
+                        .as_ref()
+                        .map(|(instance_id, _)| instance_id.clone())
+                });
             if let Some((instance_id, node_id)) = pin.as_ref() {
                 if let Some(restore) = restore_manifests.get(instance_id) {
                     // A memory checkpoint resumes a running guest, so the
@@ -4434,6 +4481,21 @@ impl<'a> Scheduler<'a> {
                     restore,
                     filter_restore_compat(task_config, restore, eligible)?,
                 ),
+                None => eligible,
+            };
+            let eligible = match owner_preference.as_ref() {
+                Some((_, owner_node)) => {
+                    let beside: Vec<&Node> = eligible
+                        .iter()
+                        .copied()
+                        .filter(|node| node.id == *owner_node)
+                        .collect();
+                    if beside.is_empty() {
+                        eligible
+                    } else {
+                        beside
+                    }
+                }
                 None => eligible,
             };
             // A spread fork never shares a node with a sibling. A hard rule,
@@ -4729,6 +4791,90 @@ impl<'a> Scheduler<'a> {
         }
 
         Ok(())
+    }
+
+    /// Remove from `tasks` every task that needs a placement and whose
+    /// runtime is disabled for `job_id` (docs/runtime-disable.md), and
+    /// return them as unplaced. A task co-placed in a group with a disabled
+    /// one is withheld with it: a group places together or not at all.
+    fn withhold_disabled_runtimes(
+        &self,
+        tasks: &mut Vec<(i64, TaskConfig, u32)>,
+        required_counts: &HashMap<i64, u32>,
+        job_id: &str,
+    ) -> Vec<UnplacedTask> {
+        let disables = self.store.runtime_disables();
+        if disables.is_empty() {
+            return Vec::new();
+        }
+        let namespace = crate::structs::namespace::job_namespace(job_id);
+        let wanted = |task_id: &i64, task: &TaskConfig| {
+            required_counts.get(task_id).copied().unwrap_or(0) > 0 || task.count.per.is_some()
+        };
+        let mut group_sizes: HashMap<&str, usize> = HashMap::new();
+        for (_, task, _) in tasks.iter() {
+            *group_sizes.entry(task.group.as_str()).or_default() += 1;
+        }
+        // group -> (the disabled task's name, the refusal, its runtime) for
+        // multi-task groups holding a disabled task that wants a placement.
+        let mut held_groups: HashMap<String, (String, String, String)> = HashMap::new();
+        for (task_id, task, _) in tasks.iter() {
+            if !wanted(task_id, task) {
+                continue;
+            }
+            if let Some(disable) = disables.refusing(&task.runtime, job_id) {
+                if group_sizes.get(task.group.as_str()).copied().unwrap_or(0) > 1 {
+                    held_groups.entry(task.group.clone()).or_insert_with(|| {
+                        (
+                            task.name.clone(),
+                            disable.refusal(namespace),
+                            task.runtime.clone(),
+                        )
+                    });
+                }
+            }
+        }
+        let mut withheld = Vec::new();
+        tasks.retain(|(task_id, task, _)| {
+            if !wanted(task_id, task) {
+                return true;
+            }
+            let reason = match disables.refusing(&task.runtime, job_id) {
+                Some(disable) => format!(
+                    "Failed to place task {}: {}",
+                    task.name,
+                    disable.refusal(namespace)
+                ),
+                None => match held_groups.get(&task.group) {
+                    Some((other, refusal, _)) => format!(
+                        "Failed to place task {}: it places together with task {other}, and \
+                         {refusal}",
+                        task.name
+                    ),
+                    None => return true,
+                },
+            };
+            // The key names the runtime that is actually disabled, so the
+            // enable of that runtime is what wakes the eval.
+            let mut blocking = task.clone();
+            if disables.refusing(&task.runtime, job_id).is_none() {
+                if let Some((_, _, disabled)) = held_groups.get(&task.group) {
+                    blocking.runtime = disabled.clone();
+                }
+            }
+            withheld.push(UnplacedTask {
+                task_config_id: *task_id,
+                task_name: task.name.clone(),
+                count: required_counts.get(task_id).copied().unwrap_or(0).max(1),
+                reason: reason.clone(),
+                static_port: None,
+                blocked: crate::manager::blocked::PlacementBlocked::runtime_disabled(
+                    &blocking, *task_id, reason,
+                ),
+            });
+            false
+        });
+        withheld
     }
 
     /// Give up on the rest of a task's placements: record them as unplaced
@@ -5453,6 +5599,7 @@ impl<'a> Scheduler<'a> {
             // comes from live instances and must win (scaling keyed tasks
             // is rejected at the ScaleTask RPC anyway).
             Self::apply_count_overrides(self.store, &job_id, &mut ready.ready)?;
+            Self::apply_resource_overrides(self.store, &job_id, &mut ready.ready)?;
             Self::apply_keyed_instance_counts(self.store, &job_id, &mut ready.ready)?;
         }
         Ok(ready)
@@ -5477,6 +5624,41 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
             *desired = store.effective_task_count(job_id, &task.group, &task.name, *desired)?;
+        }
+        Ok(())
+    }
+
+    /// Overlay size overrides (docs/resize.md): a task-level override
+    /// (`legion job resize`) replaces the spec's `memory`, `memoryMax`, and
+    /// `cpu` for everything this plan places, and a keyed task is packed at
+    /// the largest size any of its instances still waiting for an
+    /// allocation carries, so the node chosen has room for whichever one
+    /// binds. The row is written at the unit's exact size by the insert
+    /// (`Store::placement_size_tx`). Session envelopes are never resized
+    /// this way.
+    fn apply_resource_overrides(
+        store: &Store,
+        job_id: &str,
+        tasks: &mut [(i64, TaskConfig, u32)],
+    ) -> R<()> {
+        for (_task_id, task, _desired) in tasks.iter_mut() {
+            if crate::structs::session::envelope_serves(task).is_some() {
+                continue;
+            }
+            let keyed = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed);
+            let effective = store.effective_task_resources(
+                job_id,
+                &task.group,
+                &task.name,
+                &task.resources,
+                keyed,
+            )?;
+            if effective != task.resources {
+                task.resources = effective;
+            }
         }
         Ok(())
     }
@@ -7181,6 +7363,7 @@ mod tests {
                 added,
                 removed: Vec::new(),
                 snapshot_budget: None,
+                derived: None,
             };
             let now = std::time::Instant::now();
             assert_eq!(

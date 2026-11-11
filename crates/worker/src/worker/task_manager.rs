@@ -26,6 +26,9 @@ use std::path::PathBuf;
 
 /// Sessions sleeping on their node: suspend, resume, eviction, periodic and
 /// worker-stop checkpoints (session durability plan §6.6).
+pub mod children;
+pub mod resize;
+pub mod session_runs;
 pub mod session_sleep;
 pub mod session_store;
 
@@ -508,6 +511,12 @@ fn idle_session_status(
                 &row.published_url,
             )
         }),
+        owner: row
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.provisional.as_ref())
+            .and_then(children::start_owner)
+            .cloned(),
     }
 }
 
@@ -962,6 +971,9 @@ pub struct WorkerTaskManager {
     /// without surviving a worker restart, and a warning says so).
     session_log: Option<crate::worker::session_log::SessionLog>,
     session_log_unavailable: bool,
+    /// Session runs in flight and the replies of finished ones
+    /// (docs/session-runs.md).
+    run_registry: Arc<session_runs::RunRegistry>,
     /// Sessions on this node that run nothing: suspended to a local
     /// checkpoint, or evicted and remembered for `suspend.keepFor`. Keyed by
     /// session id; mirrored in the session log.
@@ -972,6 +984,26 @@ pub struct WorkerTaskManager {
     /// The launch payload of each running session, by session id, so a
     /// suspend records what its resume relaunches.
     session_payloads: HashMap<String, TaskAllocation>,
+    /// Room deferred session grows wait for, by `(job, session task)`, with
+    /// when each stops asking (docs/resize.md, "Sessions").
+    resize_demand:
+        HashMap<(String, String), (std::collections::BTreeMap<String, f64>, std::time::Instant)>,
+    /// The committed size each allocation was last converged toward, so a
+    /// resize the runtime cannot make is tried once, not every heartbeat.
+    resize_converged: HashMap<i64, String>,
+    /// The owner of each child session this node holds, running or
+    /// suspended, by the child's id (docs/child-sessions.md). An index over
+    /// the links the launch payloads carry.
+    session_owners: HashMap<String, children::ChildLink>,
+    /// Children that ended in the last ten minutes, so their owner can
+    /// learn why.
+    gone_children: HashMap<String, children::GoneChild>,
+    /// Why a child that is being ended is ending, until it is recorded as
+    /// gone.
+    child_end_reasons: HashMap<String, String>,
+    /// The runtime disables this worker holds (docs/runtime-disable.md):
+    /// every start path asks it first.
+    runtime_gate: Arc<crate::worker::runtime_state::RuntimeGate>,
     /// Each running session's pid and when that process started, by session
     /// id, read off the lock as its launch finished (see
     /// [`UnlockedLaunch::run`]), for its row in the session log.
@@ -1051,6 +1083,10 @@ impl WorkerTaskManager {
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| alloc_root.clone());
+        let runtime_gate = Arc::new(crate::worker::runtime_state::RuntimeGate::beside(
+            state_store.path(),
+        ));
+        let run_registry = session_runs::RunRegistry::new(state_store.sessions_db_path());
         Self {
             devices: Arc::new(crate::devices::plugin::DeviceManager::default()),
             registry: TaskPluginRegistry::new(),
@@ -1116,9 +1152,16 @@ impl WorkerTaskManager {
             stage_waiters: HashMap::new(),
             session_log: None,
             session_log_unavailable: false,
+            run_registry,
             idle_sessions: HashMap::new(),
             session_specs: HashMap::new(),
             session_payloads: HashMap::new(),
+            resize_demand: HashMap::new(),
+            resize_converged: HashMap::new(),
+            session_owners: HashMap::new(),
+            gone_children: HashMap::new(),
+            child_end_reasons: HashMap::new(),
+            runtime_gate,
             session_pid_starts: HashMap::new(),
             session_checkpoints: HashMap::new(),
             session_captures: Default::default(),
@@ -2960,6 +3003,10 @@ impl WorkerTaskManager {
             }
         }
 
+        // A running allocation whose committed size changed is resized in
+        // place, never relaunched (docs/resize.md).
+        self.converge_resized_allocations(allocations);
+
         let pending: Vec<TaskAllocation> = allocations
             .iter()
             .filter(|allocation| {
@@ -3863,6 +3910,9 @@ impl WorkerTaskManager {
         task: &TaskConfig,
         gate: Gate,
     ) -> R<()> {
+        // The last look before anything runs (docs/runtime-disable.md): a
+        // start staged before its runtime was disabled does not run after.
+        self.runtime_gate.check(&task.runtime, &allocation.job_id)?;
         let plugin = self
             .registry
             .plugin(&task.runtime)
@@ -4424,11 +4474,16 @@ impl WorkerTaskManager {
                 continue;
             };
             let session = crate::structs::session::resource_amounts(&spec.task.resources);
-            let used: std::collections::BTreeMap<String, f64> = self
+            let mut used: std::collections::BTreeMap<String, f64> = self
                 .claims
                 .session_usage(&job_id, &task_name)
                 .into_iter()
                 .collect();
+            // A session grow waiting for room counts as held, so the
+            // envelope grows to fit it (docs/resize.md, "Sessions").
+            for (name, extra) in self.resize_demand_for(&job_id, &task_name, now) {
+                *used.entry(name).or_insert(0.0) += extra;
+            }
             let Some(size) = self.envelope_sizes.get_mut(&local) else {
                 continue;
             };
@@ -4574,6 +4629,10 @@ impl WorkerTaskManager {
                             .unwrap_or_default(),
                     )
                 }),
+            owner: self
+                .session_owners
+                .get(&claim.instance_id)
+                .map(|link| link.owner.clone()),
         }
     }
 
@@ -4684,6 +4743,58 @@ impl WorkerTaskManager {
                 self.kill_claim(&claim.claim_id, "its envelope left the node");
             }
         }
+        // Children of sessions that just ended end with them, and children
+        // that ended are forgotten (docs/child-sessions.md).
+        self.reconcile_children();
+    }
+
+    /// The runtime disables this worker holds.
+    pub fn runtime_gate(&self) -> Arc<crate::worker::runtime_state::RuntimeGate> {
+        Arc::clone(&self.runtime_gate)
+    }
+
+    /// The refusal a start of `payload` would get right now, counted, when
+    /// its runtime is disabled for its job.
+    pub fn runtime_refusal(
+        &self,
+        payload: &TaskAllocation,
+    ) -> Result<(), crate::structs::runtime_state::RuntimeDisabledRefusal> {
+        self.runtime_gate
+            .check(&payload.task_runtime, &payload.job_id)
+    }
+
+    /// Running sessions whose runtime a disable drains, by id.
+    pub fn running_sessions_to_drain(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .claims_snapshot()
+            .into_iter()
+            .filter(|claim| claim.is_session() && !claim.is_ratified())
+            .filter(|claim| {
+                self.session_payloads
+                    .get(&claim.instance_id)
+                    .is_some_and(|payload| {
+                        self.runtime_gate
+                            .drains(&payload.task_runtime, &payload.job_id)
+                    })
+            })
+            .map(|claim| claim.instance_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// End one running session. Unlike [`Self::stop_sessions`], a suspended
+    /// session is left alone: its checkpoint is what a drain is keeping.
+    pub fn stop_running_session(&mut self, session_id: &str, reason: &str) -> bool {
+        let claim_id = crate::structs::session::session_claim_id(session_id);
+        let running = self
+            .claims
+            .get(&claim_id)
+            .is_some_and(|claim| claim.is_session() && !claim.is_ratified());
+        if running {
+            self.cascade_before_stop(&[session_id.to_string()], false, reason);
+        }
+        running && self.kill_claim(&claim_id, reason).is_some()
     }
 
     /// End sessions by id. Ids this node does not run as sessions (or that
@@ -4692,6 +4803,8 @@ impl WorkerTaskManager {
     pub fn stop_sessions(&mut self, session_ids: &[String], reason: &str) -> Vec<String> {
         let mut stopped = Vec::new();
         let keep = session_store::reason_keeps_manifest(reason);
+        // Children first, so none outlives the report of its owner's stop.
+        self.cascade_before_stop(session_ids, keep, reason);
         for session_id in session_ids {
             // A suspended (or evicted) session runs nothing: ending it drops
             // its checkpoint and its row.
@@ -4749,6 +4862,13 @@ impl WorkerTaskManager {
                 claim.is_session() && !claim.is_ratified() && claim.job_id == allocation.job_id
             });
             if adoptable {
+                // Its children follow it to the instance it became, and a
+                // promoted child is detached (docs/child-sessions.md).
+                let instance_id = task_from_allocation(allocation)
+                    .ok()
+                    .and_then(|(alloc, _)| alloc.instance_id)
+                    .unwrap_or_else(|| allocation.promoted_from_session.clone());
+                self.session_promoted(&allocation.promoted_from_session, &instance_id);
                 self.ratify_claim(&claim_id, allocation)?;
                 // Delivered by the manager, so the manager lists it already:
                 // no settle window (see `RATIFIED_SETTLE`).
@@ -4763,6 +4883,10 @@ impl WorkerTaskManager {
                 return Ok(BeginOutcome::Adopted);
             }
         }
+        // A disabled runtime starts nothing (docs/runtime-disable.md):
+        // refused before anything is fetched, prepared, or held.
+        self.runtime_gate
+            .check(&allocation.task_runtime, &allocation.job_id)?;
         let (alloc, task) = task_from_allocation(allocation)?;
         // A session keeps the payload it launched from, so a suspend can
         // record what its resume relaunches (docs/session-mode.md, "Idle
@@ -5471,6 +5595,8 @@ impl WorkerTaskManager {
             .task_configs
             .get(&allocation_id)
             .context("Task config missing for restart")?;
+        // A restart is a start (docs/runtime-disable.md).
+        self.runtime_gate.check(&task.runtime, &allocation.job_id)?;
         let instance = self
             .instances
             .get_mut(&allocation_id)
@@ -6081,6 +6207,7 @@ impl WorkerTaskManager {
             self.set_allocation_health(local_key, false, "restored");
             restored.push((process.allocation, process.task));
         }
+        self.restore_child_links();
         info!(
             readopted = restored.len(),
             ended = dropped.len(),
@@ -7370,8 +7497,18 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         .filter(|id| !id.is_empty())
         .map(str::to_string);
 
+    let children = if allocation.task_children.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str(&allocation.task_children)
+                .context("Invalid task children JSON")?,
+        )
+    };
+
     let task = TaskConfig {
         config: task_config,
+        children,
         checks,
         on_unhealthy,
         identities,
@@ -7490,6 +7627,7 @@ mod tests {
             task_lifecycle: String::new(),
             task_restart: String::new(),
             task_speculative_start: String::new(),
+            task_children: String::new(),
             task_group: String::new(),
             task_service: String::new(),
         }
@@ -8939,7 +9077,7 @@ mod tests {
         let pool = crate::worker::launch_pool::LaunchPool::new(4, Duration::from_secs(1));
         let slot = || pool.try_acquire().expect("a launch slot");
         let start = |key: &str| {
-            crate::worker::edge::start_edge_session(&manager, "node-1", &ticket, key, slot())
+            crate::worker::edge::start_edge_session(&manager, "node-1", &ticket, key, slot(), None)
         };
 
         let minted = start("")?;
@@ -9562,6 +9700,146 @@ mod tests {
         Ok(())
     }
 
+    fn exec_disable(drain: bool) -> crate::structs::runtime_state::RuntimeDisableSet {
+        crate::structs::runtime_state::RuntimeDisableSet::new(vec![
+            crate::structs::runtime_state::RuntimeDisable {
+                runtime: "exec".into(),
+                namespaces: Vec::new(),
+                reason: "GHSA-test".into(),
+                since: "2026-11-07T18:04:11Z".into(),
+                by: "anonymous".into(),
+                drain,
+            },
+        ])
+    }
+
+    fn is_runtime_refusal(err: &anyhow::Error) -> bool {
+        crate::structs::runtime_state::RuntimeDisabledRefusal::in_chain(err).is_some()
+    }
+
+    /// docs/runtime-disable.md: once the worker holds a disable, every start
+    /// path refuses (a placement, a session start, a restart, a resume),
+    /// running work is untouched, and each works again after the enable.
+    #[test]
+    fn a_disabled_runtime_refuses_every_start_path_test() -> R<()> {
+        use crate::worker::task_manager::session_sleep::{
+            resume_session, suspend_session, ResumeOutcome,
+        };
+        let temp_dir = TempDir::new()?;
+        let manager = worker_with_store(&temp_dir, None)?;
+        manager
+            .lock()
+            .expect("task manager")
+            .begin_task_allocation(&envelope_payload(100))?;
+        let a = start_sleepy_session(&manager, "workspace-a")?;
+        let gate = manager.lock().expect("task manager").runtime_gate();
+        gate.replace(exec_disable(false));
+
+        // A placement the manager sent in a race with the disable.
+        let err = launch_task_allocation(&manager, &provisional_payload(77)).unwrap_err();
+        assert!(is_runtime_refusal(&err), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("runtime \"exec\" is disabled in namespace default"),
+            "{err:#}"
+        );
+        // A session start: refused, and its claim holds nothing afterwards.
+        let err = start_sleepy_session(&manager, "workspace-c").unwrap_err();
+        assert!(is_runtime_refusal(&err), "{err:#}");
+        {
+            let mut guard = manager.lock().expect("task manager");
+            assert!(guard.session_status("workspace-c").is_none());
+            // Running work is untouched, but a restart is a start.
+            assert_eq!(
+                guard.session_status("workspace-a").expect("listed").state,
+                "running"
+            );
+            let err = guard.restart_allocation(a.local_key).unwrap_err();
+            assert!(is_runtime_refusal(&err), "{err:#}");
+            assert_eq!(
+                guard.session_status("workspace-a").expect("listed").state,
+                "running"
+            );
+        }
+        // A resume is a start too, and the session keeps its checkpoint.
+        suspend_session(&manager, "workspace-a", "manual")?;
+        let err = resume_session(&manager, "workspace-a", false).unwrap_err();
+        assert!(is_runtime_refusal(&err), "{err:#}");
+        assert_eq!(
+            manager
+                .lock()
+                .expect("task manager")
+                .session_status("workspace-a")
+                .expect("listed")
+                .state,
+            "suspended"
+        );
+        assert_eq!(
+            gate.take_refusals()
+                .iter()
+                .map(|entry| entry.count)
+                .sum::<u64>(),
+            4,
+            "the placement, the session start, the restart, and the resume"
+        );
+
+        // Enabled: the refused resume and the refused start both succeed.
+        gate.replace(Default::default());
+        assert!(matches!(
+            resume_session(&manager, "workspace-a", false)?,
+            ResumeOutcome::Resumed { .. }
+        ));
+        start_sleepy_session(&manager, "workspace-c")?;
+        stop_and_reap(&manager);
+        Ok(())
+    }
+
+    /// Phase 2 of the runtime-disable plan: a disable with `drain` suspends
+    /// the node's sessions that can be suspended (their checkpoints kept)
+    /// and stops the rest, and a later pass leaves the suspended ones be.
+    #[test]
+    fn a_drain_suspends_sessions_that_can_and_stops_the_rest_test() -> R<()> {
+        use crate::worker::runtime_state::drain_sessions;
+        let temp_dir = TempDir::new()?;
+        let manager = worker_with_store(&temp_dir, None)?;
+        manager
+            .lock()
+            .expect("task manager")
+            .begin_task_allocation(&envelope_payload(100))?;
+        start_sleepy_session(&manager, "workspace-a")?;
+        start_session(&mut manager.lock().expect("task manager"), "workspace-b")?;
+        // Without a drain nothing running is touched.
+        let gate = manager.lock().expect("task manager").runtime_gate();
+        gate.replace(exec_disable(false));
+        assert_eq!(drain_sessions(&manager), Default::default());
+
+        gate.replace(exec_disable(true));
+        let drained = drain_sessions(&manager);
+        assert_eq!(drained.suspended, ["workspace-a"]);
+        assert_eq!(drained.stopped, ["workspace-b"]);
+        {
+            let guard = manager.lock().expect("task manager");
+            assert_eq!(
+                guard.session_status("workspace-a").expect("listed").state,
+                "suspended"
+            );
+            assert!(guard.session_status("workspace-b").is_none());
+        }
+        // The record stands, so passes keep running; the suspended session
+        // and its checkpoint are not theirs to end.
+        assert_eq!(drain_sessions(&manager), Default::default());
+        assert_eq!(
+            manager
+                .lock()
+                .expect("task manager")
+                .session_status("workspace-a")
+                .expect("listed")
+                .state,
+            "suspended"
+        );
+        stop_and_reap(&manager);
+        Ok(())
+    }
+
     /// Phase 5a: a session suspends into the node's content store, frees
     /// its envelope share, and resumes under the same id; a full envelope
     /// refuses the resume and keeps the checkpoint. An exec session's
@@ -10000,6 +10278,7 @@ mod tests {
             instance_id: "workspace-derived".into(),
             session: Some(crate::structs::SessionStart {
                 lease_issued_at_unix_ms: 1_000,
+                ..Default::default()
             }),
             ..Default::default()
         });
@@ -13084,6 +13363,379 @@ mod tests {
             failures[0].reason,
             "exited with status 2; last stderr: cannot read config"
         );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Child sessions (docs/child-sessions.md)
+    // -----------------------------------------------------------------
+
+    use crate::structs::children::{owner_ref, OWNER_INSTANCE, OWNER_SESSION};
+    use crate::worker::task_manager::children::ChildRefusal;
+
+    /// Start a session through `edge::admit_and_launch`, as a manager's
+    /// push (`origin = "manager"`) or a node-local start does, optionally
+    /// with a `children` block of its own and an owner, and wait for it to
+    /// run. Every session here is of the task `workspace`, sized so the
+    /// envelope holds four.
+    fn start_owned(
+        manager: &Arc<Mutex<WorkerTaskManager>>,
+        session_id: &str,
+        children: Option<Value>,
+        owner: Option<crate::structs::OwnerRef>,
+        origin: &str,
+    ) -> R<ClaimRecord> {
+        let mut payload = provisional_payload(0);
+        payload.task_resources = json!({ "cpu": 250, "memory": 128 }).to_string();
+        payload.task_children = children.map(|block| block.to_string()).unwrap_or_default();
+        let provisional = crate::structs::ProvisionalAllocation {
+            claim_id: crate::structs::session::session_claim_id(session_id),
+            gate: Gate::Serve.to_wire(),
+            instance_id: session_id.to_string(),
+            origin: origin.into(),
+            on_refused: "stop".into(),
+            session: Some(crate::structs::SessionStart {
+                lease_issued_at_unix_ms: 1_000,
+                owner,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        payload.provisional = Some(provisional.clone());
+        let admitted =
+            crate::worker::edge::admit_and_launch(manager, &payload, &provisional, None, None)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let mut guard = manager.lock().expect("task manager");
+                if guard.instances.contains_key(&admitted.local_key) {
+                    guard.set_claim_stage(&admitted.claim_id, ClaimStage::Serving);
+                    return Ok(admitted);
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                bail!("session {session_id} never started");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn child_worker(temp_dir: &TempDir) -> R<Arc<Mutex<WorkerTaskManager>>> {
+        let manager = Arc::new(Mutex::new(manager_in(temp_dir)));
+        manager
+            .lock()
+            .expect("task manager")
+            .begin_task_allocation(&envelope_payload(100))?;
+        Ok(manager)
+    }
+
+    fn owns_workspaces(max: u32) -> Option<Value> {
+        Some(json!({ "tasks": ["workspace"], "max": max }))
+    }
+
+    fn child_refusal(err: anyhow::Error) -> ChildRefusal {
+        err.downcast::<ChildRefusal>()
+            .expect("a typed child refusal")
+    }
+
+    fn end_all(manager: &Arc<Mutex<WorkerTaskManager>>) {
+        let mut guard = manager.lock().expect("task manager");
+        for claim in guard.claims_snapshot() {
+            guard.kill_claim(&claim.claim_id, "test over");
+        }
+    }
+
+    /// Child-sessions plan §6.3 and §6.4: a child is admitted against its
+    /// owner's `children` block, reported with its owner, listed under it,
+    /// and ended with it, before the owner itself.
+    #[test]
+    fn a_child_is_admitted_reported_and_ended_with_its_owner_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = child_worker(&temp_dir)?;
+        start_owned(&manager, "agent-1", owns_workspaces(2), None, "manager")?;
+        let owner = owner_ref(OWNER_SESSION, "agent-1");
+        // The kind is worked out when the caller leaves it empty.
+        start_owned(
+            &manager,
+            "machine-1",
+            None,
+            Some(owner_ref("", "agent-1")),
+            "edge",
+        )?;
+        start_owned(&manager, "machine-2", None, Some(owner.clone()), "manager")?;
+        {
+            let mut guard = manager.lock().expect("task manager");
+            assert_eq!(
+                guard
+                    .session_status("machine-1")
+                    .and_then(|status| status.owner),
+                Some(owner.clone()),
+                "the report carries the resolved owner"
+            );
+            assert_eq!(
+                guard
+                    .session_status("agent-1")
+                    .and_then(|status| status.owner),
+                None
+            );
+            let listed = guard.child_infos(&owner, "node-1");
+            assert_eq!(
+                listed
+                    .iter()
+                    .map(|child| child.session_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["machine-1", "machine-2"]
+            );
+            assert!(listed.iter().all(|child| child.state == "running"));
+        }
+        // Over `max`.
+        let over = start_owned(&manager, "machine-3", None, Some(owner.clone()), "edge")
+            .expect_err("the owner already holds max children");
+        let over = child_refusal(over);
+        assert!(matches!(over, ChildRefusal::AtMax(_)), "{over:?}");
+        assert_eq!(over.to_status().code(), tonic::Code::ResourceExhausted);
+        // A child cannot own (depth 1).
+        let nested = start_owned(
+            &manager,
+            "machine-4",
+            None,
+            Some(owner_ref(OWNER_SESSION, "machine-1")),
+            "edge",
+        )
+        .expect_err("a child cannot own children");
+        assert!(matches!(
+            child_refusal(nested),
+            ChildRefusal::OwnerIsChild(_)
+        ));
+        // Nothing with that id runs here.
+        let missing = start_owned(
+            &manager,
+            "machine-5",
+            None,
+            Some(owner_ref(OWNER_SESSION, "agent-9")),
+            "edge",
+        )
+        .expect_err("no such owner");
+        let missing = child_refusal(missing);
+        assert!(
+            matches!(missing, ChildRefusal::OwnerNotFound(_)),
+            "{missing:?}"
+        );
+        assert_eq!(missing.to_status().code(), tonic::Code::NotFound);
+
+        // Stopping the owner ends its children first.
+        let mut guard = manager.lock().expect("task manager");
+        let stopped = guard.stop_sessions(&["agent-1".to_string()], "stopped");
+        assert_eq!(stopped, ["agent-1"]);
+        assert!(guard.session_status("machine-1").is_none());
+        assert!(guard.session_status("machine-2").is_none());
+        guard.reconcile_children();
+        assert_eq!(
+            guard
+                .gone_child("machine-1")
+                .map(|gone| gone.reason.as_str()),
+            Some("owner ended")
+        );
+        assert!(guard.children_of(&owner).is_empty());
+        let listed = guard.child_infos(&owner, "node-1");
+        assert!(
+            listed.iter().all(|child| child.state == "gone"),
+            "{listed:?}"
+        );
+        Ok(())
+    }
+
+    /// An owner whose task does not declare the child task owns nothing.
+    #[test]
+    fn an_undeclared_child_task_is_refused_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = child_worker(&temp_dir)?;
+        start_owned(&manager, "agent-1", None, None, "manager")?;
+        start_owned(
+            &manager,
+            "agent-2",
+            Some(json!({ "tasks": ["scratch"] })),
+            None,
+            "manager",
+        )?;
+        for owner in ["agent-1", "agent-2"] {
+            let refused = start_owned(
+                &manager,
+                "machine-1",
+                None,
+                Some(owner_ref(OWNER_SESSION, owner)),
+                "manager",
+            )
+            .expect_err("not declared");
+            let refused = child_refusal(refused);
+            assert!(
+                matches!(refused, ChildRefusal::NotDeclared(_)),
+                "{refused:?}"
+            );
+            assert_eq!(refused.to_status().code(), tonic::Code::FailedPrecondition);
+            assert!(refused
+                .to_string()
+                .starts_with(crate::structs::children::REFUSED_FOR_OWNER));
+        }
+        assert_eq!(
+            manager
+                .lock()
+                .expect("task manager")
+                .session_statuses()
+                .len(),
+            2,
+            "a refused child holds nothing"
+        );
+        end_all(&manager);
+        Ok(())
+    }
+
+    /// Child-sessions plan §6.4: the owner's own end is what cascades. An
+    /// owner whose workload exits ends its children at the next settle; an
+    /// owner that moved away (its copy here was superseded) does not, and
+    /// its children wait for the managers' word.
+    #[test]
+    fn an_exited_owner_cascades_and_a_moved_owner_does_not_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = child_worker(&temp_dir)?;
+        let exits = start_owned(&manager, "agent-1", owns_workspaces(1), None, "manager")?;
+        start_owned(
+            &manager,
+            "machine-1",
+            None,
+            Some(owner_ref(OWNER_SESSION, "agent-1")),
+            "manager",
+        )?;
+        start_owned(&manager, "agent-2", owns_workspaces(1), None, "manager")?;
+        start_owned(
+            &manager,
+            "machine-2",
+            None,
+            Some(owner_ref(OWNER_SESSION, "agent-2")),
+            "manager",
+        )?;
+        let mut guard = manager.lock().expect("task manager");
+        // The first owner's process dies on its own.
+        guard.kill_claim(&exits.claim_id, "workload exited");
+        // The second moves: a newer generation runs elsewhere.
+        assert!(guard.end_superseded("agent-2", "test"));
+        let statuses = guard.session_statuses();
+        let ids: Vec<&str> = statuses
+            .iter()
+            .map(|status| status.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["machine-2"], "only the moved owner's child is left");
+        let link = guard
+            .child_link("machine-2")
+            .cloned()
+            .expect("still a child");
+        assert!(link.remote, "its owner is another node's to judge now");
+        assert_eq!(
+            guard
+                .gone_child("machine-1")
+                .map(|gone| gone.reason.as_str()),
+            Some("owner ended")
+        );
+        // The managers say the moved owner ended.
+        let to_suspend = guard.apply_owner_notice(&crate::structs::OwnerNotice {
+            owner: Some(owner_ref(OWNER_SESSION, "agent-2")),
+            event: "stopped".into(),
+            promoted_to: None,
+            detail: "session agent-2 ended".into(),
+        });
+        assert!(to_suspend.is_empty());
+        assert!(guard.session_statuses().is_empty());
+        assert_eq!(
+            guard
+                .gone_child("machine-2")
+                .map(|gone| gone.reason.as_str()),
+            Some("session agent-2 ended")
+        );
+        Ok(())
+    }
+
+    /// Child-sessions plan §6.5: promotion carries ownership. A promoted
+    /// owner's children follow it to the instance it became, and a
+    /// promoted child is detached.
+    #[test]
+    fn promotion_rekeys_an_owners_children_and_detaches_a_child_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = child_worker(&temp_dir)?;
+        start_owned(&manager, "agent-1", owns_workspaces(2), None, "manager")?;
+        let owner = owner_ref(OWNER_SESSION, "agent-1");
+        start_owned(&manager, "machine-1", None, Some(owner.clone()), "manager")?;
+        start_owned(&manager, "machine-2", None, Some(owner.clone()), "manager")?;
+        let mut guard = manager.lock().expect("task manager");
+        // The child is promoted: it is nobody's child any more.
+        guard.session_promoted("machine-2", "machine-2");
+        assert!(guard.child_link("machine-2").is_none());
+        // The owner is promoted under a new name.
+        guard.session_promoted("agent-1", "user-42");
+        let instance = owner_ref(OWNER_INSTANCE, "user-42");
+        assert_eq!(
+            guard.child_link("machine-1").map(|link| link.owner.clone()),
+            Some(instance.clone())
+        );
+        assert_eq!(guard.children_of(&instance), ["machine-1"]);
+        assert_eq!(
+            guard
+                .session_status("machine-1")
+                .and_then(|status| status.owner),
+            Some(instance.clone())
+        );
+        // A raft-owned owner is never judged by the node: the child stays
+        // until the managers say so.
+        guard.reconcile_children();
+        assert!(guard.session_status("machine-1").is_some());
+        guard.apply_owner_notice(&crate::structs::OwnerNotice {
+            owner: Some(instance),
+            event: "stopped".into(),
+            promoted_to: None,
+            detail: String::new(),
+        });
+        assert!(guard.session_status("machine-1").is_none());
+        drop(guard);
+        end_all(&manager);
+        Ok(())
+    }
+
+    /// The owner reference lives in the session log with the child, so a
+    /// restarted worker still knows whose it is.
+    #[test]
+    fn a_restarted_worker_keeps_its_owner_references_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        {
+            let manager = child_worker(&temp_dir)?;
+            let owner = start_owned(&manager, "agent-1", owns_workspaces(1), None, "manager")?;
+            let child = start_owned(
+                &manager,
+                "machine-1",
+                None,
+                Some(owner_ref(OWNER_SESSION, "agent-1")),
+                "manager",
+            )?;
+            let mut guard = manager.lock().expect("task manager");
+            // The launch thread logs a session after it registers it; log
+            // both here so the sync below cannot run ahead of that.
+            guard.log_running_session(owner.local_key);
+            guard.log_running_session(child.local_key);
+            assert!(guard.sync_session_log(Duration::from_secs(5)));
+            drop(guard);
+            // The old worker exits without stopping anything.
+            std::mem::forget(manager);
+        }
+        let mut restarted = manager_in(&temp_dir);
+        restarted.restore_allocations()?;
+        let link = restarted
+            .child_link("machine-1")
+            .cloned()
+            .expect("the owner reference was restored");
+        assert_eq!(link.owner, owner_ref(OWNER_SESSION, "agent-1"));
+        assert!(!link.remote);
+        // And the cascade still works.
+        restarted.begin_task_allocation(&envelope_payload(100))?;
+        restarted.stop_sessions(&["agent-1".to_string()], "stopped");
+        assert!(restarted.session_status("machine-1").is_none());
         Ok(())
     }
 }

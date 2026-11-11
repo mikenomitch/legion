@@ -72,6 +72,7 @@ pub(super) fn build_node_content_reply(
     holder_count: impl Fn(&str) -> usize,
     snapshots: Vec<SnapshotRecord>,
     may_read: impl Fn(&str) -> bool,
+    derived: Option<crate::structs::DerivedContentReport>,
 ) -> GetNodeContentReply {
     let index_reported = entries.is_some();
     let (epoch, advertised) = entries.unwrap_or_default();
@@ -147,6 +148,9 @@ pub(super) fn build_node_content_reply(
         can_publish: crate::structs::snapshot::node_advertises(node, CONTENT_PUBLISH_CAPABILITY),
         can_checkpoint: crate::structs::snapshot::node_advertises(node, CHECKPOINT_CAPABILITY),
         snapshots: rows,
+        // A listing the node sent, shown as sent. Without a content report
+        // there is nothing current to show.
+        derived: derived.filter(|_| index_reported),
     }
 }
 
@@ -286,6 +290,7 @@ impl ManagerDaemonService {
                     &AclScope::job(job_id),
                 )
             },
+            index.derived(&node.id),
         );
         Ok(Response::new(reply))
     }
@@ -416,7 +421,10 @@ mod tests {
             |digest| if digest == "sha256:mem" { 2 } else { 1 },
             snapshots,
             |job| job != "secret",
+            Some(derived_listing()),
         );
+        // The derived listing passes through as the node sent it.
+        assert_eq!(reply.derived, Some(derived_listing()));
 
         assert!(reply.index_reported);
         assert_eq!(reply.epoch, 4);
@@ -461,6 +469,23 @@ mod tests {
 
     /// A node this manager holds no report for says so and lists nothing
     /// from the index, but still lists what it captured.
+    fn derived_listing() -> crate::structs::DerivedContentReport {
+        crate::structs::DerivedContentReport {
+            budget_bytes: 20 * 1024 * MIB,
+            used_bytes: 900 * MIB,
+            pinned_bytes: 0,
+            entry_count: 1,
+            entries: vec![crate::structs::DerivedContentEntry {
+                kind: "rootfs".into(),
+                key: "ab".repeat(32),
+                bytes: 900 * MIB,
+                inputs: [("headroomMib".to_string(), "256".to_string())].into(),
+                builder_version: "legion-0.1.0+rootfs.1".into(),
+                ..Default::default()
+            }],
+        }
+    }
+
     #[test]
     fn node_content_without_a_report_still_lists_captured_snapshots() {
         let w1 = node("w-1", &[]);
@@ -475,7 +500,9 @@ mod tests {
                 &[("sha256:a", "memory", 2 * MIB)],
             )],
             |_| true,
+            Some(derived_listing()),
         );
+        assert_eq!(reply.derived, None, "no report, no current listing");
         assert!(!reply.index_reported);
         assert!(reply.entries.is_empty());
         assert!(!reply.can_publish && !reply.can_checkpoint);

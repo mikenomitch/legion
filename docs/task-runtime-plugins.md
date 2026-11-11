@@ -313,6 +313,46 @@ worker's hierarchy, so the share mask governs it.
 Worker core does not touch a cgroup file for your task. Anything in the
 assignment that you do not apply is not enforced.
 
+### Resize
+
+A runtime that can change a running unit's size implements two more
+methods; both have defaults, so a plugin that predates them keeps compiling
+and answers every [resize](resize.md) `not_supported`.
+
+```rust
+/// What this runtime can change live. The default is nothing.
+fn resize_support(&self) -> ResizeSupport {
+    ResizeSupport::ALL // memory (reservation), memory_max (ceiling), cpu
+}
+
+/// Apply `change.to` to the running unit, or say why not.
+fn resize(
+    &self,
+    allocation: &Allocation,
+    task: &TaskConfig,
+    instance: &mut TaskInstance,
+    change: &ResizeChange,
+) -> R<ResizeAnswer> {
+    // A runtime confined by the cgroup at its assignment's path:
+    legion::worker::resources::resize_instance_cgroup(instance, change, None)
+}
+```
+
+- `change.from` and `change.to` are the unit's full effective `resources`
+  before and after. Worker core has already admitted the change (an
+  envelope's room for a session, the committed row for an allocation) and
+  only calls `resize` for resources `resize_support` claims.
+- Answer `ResizeAnswer::NeedsRestart(why)` for a change the runtime cannot
+  make while the unit runs, and `Refused(why)` for a shrink below current
+  use when `change.force` is false. **Never restart the unit**: the caller
+  decides what to do with the answer.
+- With `change.dry_run`, decide and change nothing.
+- On `Applied`, leave `instance.resource_assignment` describing what you
+  wrote. `resize_instance_cgroup` does all of this for a `WorkerCgroup`
+  runtime and for a `RuntimeApplied` one whose OCI runtime created the
+  cgroup at `cgroup_path`; pass a ceiling of your own as its third argument
+  when your cgroup holds more than the workload.
+
 ## Loading and Resolution
 
 `TaskPluginRegistry` behavior:

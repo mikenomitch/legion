@@ -728,7 +728,8 @@ checkpoint needs.
 
 The budget is not the only limit. The store also keeps `content.minFreeDisk`
 (5 GiB by default) free on its disk: it evicts unpinned content of any class
-to stay above that floor, then refuses the write. So a node whose disk is
+to stay above that floor ([derived content](artifacts.md#derived-content)
+first, because the node can rebuild it), then refuses the write. So a node whose disk is
 filled by something else (volumes, logs, images) has no room for a
 checkpoint even with budget to spare.
 
@@ -2208,7 +2209,7 @@ while the manager's keyring is locked.
 | `snapshot.publish_failed` | warn | A `durability = "store"` snapshot could not be uploaded and stays `local`. The metadata carries `error`, which says whether the manager will retry. |
 | `snapshot.warmed` | info | A node fetched a published snapshot's parts after `snapshot warm`. The metadata carries `fetchedBytes` and `durationMs`. |
 | `snapshot.warm_failed` | warn | A node could not warm a snapshot. The metadata carries `error`. |
-| `instance.suspended` | info | A suspend's capture landed. The instance is `suspended`. The metadata carries `kind`, `totalBytes`, `durationMs`, `reserved` (whether it holds a share of its reservation), and `reason` (`manual`, `idle`, `pressure`, `park`, or `make_room`). |
+| `instance.suspended` | info | A suspend's capture landed. The instance is `suspended`. The metadata carries `kind`, `totalBytes`, `durationMs`, `reserved` (whether it holds a share of its reservation), and `reason` (`manual`, `idle`, `pressure`, `park`, `make_room`, or `runtime_disabled`, a [runtime disable](runtime-disable.md#draining) with a drain). |
 | `instance.archived` | info | A published suspend checkpoint was archived (`suspend.archive`). The metadata carries `snapshotId`, `manifestUrl`, and `manifestOnly` (whether the instance row was dropped too). |
 | `instance.make_room` | info | A resume did not fit on its checkpoint's node, and the manager started suspends to make room. The metadata carries the resume's `instanceId` and the instances it is `suspending`. |
 | `instance.suspend_failed` | warn | A suspend's capture failed. The instance keeps running. The metadata carries `error`. |

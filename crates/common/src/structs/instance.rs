@@ -193,6 +193,21 @@ pub struct Instance {
     /// docs/session-mode.md). Written once, when the row is inserted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promoted_from: Option<String>,
+    /// The unit that owns this instance as its child, as `kind:id`
+    /// (`instance:user-42`, `allocation:88213`; docs/child-sessions.md).
+    /// Written when the row is inserted (a keyed child's create, or the
+    /// promotion of a session child whose owner the managers judge) and
+    /// never changed. `None` for an instance nobody owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+impl Instance {
+    /// The typed reference in [`Instance::owner`].
+    pub fn owner_ref(&self) -> Option<crate::structs::OwnerRef> {
+        let (kind, id) = self.owner.as_deref()?.split_once(':')?;
+        Some(crate::structs::children::owner_ref(kind, id))
+    }
 }
 
 fn named_default() -> bool {
@@ -256,6 +271,11 @@ impl InstanceLastStop {
                     .to_string()
             }
             StopCause::Failed => format!("Failed on node {node_id}."),
+            StopCause::RuntimeDisabled => {
+                "Stopped because its runtime was disabled with a drain; it places again \
+                 when the runtime is enabled."
+                    .to_string()
+            }
             StopCause::Unknown => "Stopped.".to_string(),
         };
         Self {

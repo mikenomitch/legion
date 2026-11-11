@@ -147,6 +147,9 @@ mod node_content_rpcs;
 mod node_group_rpcs;
 mod object_rpcs;
 mod plugin_rpcs;
+mod resize_rpcs;
+pub use resize_rpcs::MOVE_RESUME_TIMEOUT_MS;
+mod runtime_state_rpcs;
 mod scaling_objects;
 mod scaling_rpcs;
 mod session_rpcs;
@@ -943,6 +946,8 @@ fn map_instance_info(
                 .unwrap_or_default(),
         });
     InstanceInfo {
+        owner: instance.owner_ref(),
+        children: Vec::new(),
         cold_boot,
         last_stop,
         checkpoint_support,
@@ -1004,6 +1009,9 @@ fn map_instance_info(
         lease_issued_at: None,
         envelope_alloc_id: None,
         reschedule_backoff,
+        // Filled by GetInstance from the allocation's row (docs/resize.md).
+        resources: String::new(),
+        resources_override: String::new(),
     }
 }
 
@@ -3115,6 +3123,7 @@ impl ManagerDaemonService {
                 .chain(self.gated_egress_submit_warnings(&config))
                 .chain(self.tcp_upstream_submit_warnings(&config))
                 .chain(crate::task_plugins::container_security_warnings(&config))
+                .chain(runtime_state_rpcs::submit_warnings(&self.store, &config))
                 .collect(),
         })
     }
@@ -6648,6 +6657,7 @@ impl Manager for ManagerDaemonService {
                 .chain(self.gated_egress_submit_warnings(&config))
                 .chain(self.tcp_upstream_submit_warnings(&config))
                 .chain(crate::task_plugins::container_security_warnings(&config))
+                .chain(runtime_state_rpcs::submit_warnings(&self.store, &config))
                 .collect(),
             gang_reports: gang_reports
                 .iter()
@@ -6864,6 +6874,22 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::DeleteNamespaceRequest>,
     ) -> Result<Response<crate::structs::DeleteNamespaceReply>, Status> {
         self.delete_namespace_rpc(request).await
+    }
+
+    // Runtime disables live in `runtime_state_rpcs`; each handler states
+    // its ACL check.
+    async fn set_runtime_enabled(
+        &self,
+        request: Request<crate::structs::SetRuntimeEnabledRequest>,
+    ) -> Result<Response<crate::structs::SetRuntimeEnabledReply>, Status> {
+        self.set_runtime_enabled_rpc(request).await
+    }
+
+    async fn list_runtime_states(
+        &self,
+        request: Request<crate::structs::ListRuntimeStatesRequest>,
+    ) -> Result<Response<crate::structs::ListRuntimeStatesReply>, Status> {
+        self.list_runtime_states_rpc(request).await
     }
 
     // Namespace policies live in `namespace_policy_rpcs`; each handler
@@ -7354,17 +7380,43 @@ impl Manager for ManagerDaemonService {
                 .check_namespace_quota_growth(&config.name, config.priority, &task.resources, 1)
                 .map_err(|e| map_store_error("Namespace policy refused the instance", e))?;
         }
-        if crate::structs::session::is_session_task(task) {
-            if requested_id.is_none() {
-                return self.create_session(&identity, &inner, &config, task).await;
+        if crate::structs::session::is_session_task(task) && requested_id.is_none() {
+            return self.create_session(&identity, &inner, &config, task).await;
+        }
+        if crate::structs::session::is_session_task(task)
+            && !crate::structs::session::accepts_names(task)
+        {
+            return Err(Status::invalid_argument(format!(
+                "task {} sets stateful.promote.onName = false: its instances are unnamed \
+                 sessions; omit instance_id",
+                task.name
+            )));
+        }
+
+        // A keyed child of a running unit of this job
+        // (docs/child-sessions.md): the row carries the owner reference,
+        // and the owner's stop or destroy ends it in the owner's own entry.
+        if let Some(requested) = inner.owner.as_ref().filter(|owner| !owner.id.is_empty()) {
+            if inner
+                .from_snapshot
+                .as_deref()
+                .is_some_and(|from| !from.trim().is_empty())
+            {
+                return Err(Status::invalid_argument(
+                    "from_snapshot cannot be combined with owner: a child boots empty",
+                ));
             }
-            if !crate::structs::session::accepts_names(task) {
-                return Err(Status::invalid_argument(format!(
-                    "task {} sets stateful.promote.onName = false: its instances are unnamed \
-                     sessions; omit instance_id",
-                    task.name
-                )));
-            }
+            let resolved =
+                crate::manager::children::resolve_owner(&self.store, &config, requested).await?;
+            return self
+                .create_keyed_child(
+                    &config,
+                    task,
+                    resolved,
+                    requested_id.map(str::to_string),
+                    idempotency_key,
+                )
+                .await;
         }
 
         // Phase 6: restore from a snapshot instead of booting empty.
@@ -7455,7 +7507,99 @@ impl Manager for ManagerDaemonService {
             durable: true,
             node_id: String::new(),
             state: String::new(),
+            owner: None,
         }))
+    }
+
+    /// Create a keyed child for a workload on the calling node. See the
+    /// proto comments on `CreateChildInstance`.
+    #[instrument(skip_all, fields(node_id, allocation_id))]
+    async fn create_child_instance(
+        &self,
+        request: Request<crate::structs::CreateChildInstanceRequest>,
+    ) -> Result<Response<CreateInstanceReply>, Status> {
+        // ACL: worker-plane endpoint. The worker attributed the call to one
+        // of its allocations on that allocation's API socket; node
+        // ownership of the allocation is enforced against the authenticated
+        // principal below, and the jobspec's `children` block is the
+        // authorization.
+        let identity = self.authenticate_acl(&request)?;
+        acl::enforce_worker_plane(&identity)?;
+        let inner = request.into_inner();
+        tracing::Span::current().record("node_id", inner.node_id.as_str());
+        tracing::Span::current().record("allocation_id", inner.allocation_id);
+        let not_here = || {
+            Status::not_found(format!(
+                "allocation {} does not run on node {:?}",
+                inner.allocation_id, inner.node_id
+            ))
+        };
+        let allocation = self
+            .store
+            .get_allocation_by_id(inner.allocation_id)
+            .map_err(|e| map_store_error("Error loading allocation", e))?
+            .filter(|allocation| allocation.node_id == inner.node_id)
+            .ok_or_else(not_here)?;
+        // Bound to the authenticated principal, as IssueWorkloadIdentityToken
+        // is: a worker speaks only for allocations placed on its own node.
+        if !identity.is_management && identity.principal != format!("node:{}", inner.node_id) {
+            return Err(Status::permission_denied(format!(
+                "worker {:?} may not create children for node {:?}",
+                identity.principal, inner.node_id
+            )));
+        }
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "create_child_instance",
+            Some(inner.idempotency_key.as_str()),
+            &inner,
+        );
+        if let Some(recorded) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(create_instance_replay(recorded)));
+        }
+        let config = keyed_job_config(&self.store, &allocation.job_id)?;
+        let resolved = crate::manager::children::resolve_owner(
+            &self.store,
+            &config,
+            &crate::structs::children::owner_ref(
+                crate::structs::children::OWNER_ALLOCATION,
+                &inner.allocation_id.to_string(),
+            ),
+        )
+        .await?;
+        let task_name = inner.task_name.trim();
+        let task = config
+            .tasks
+            .iter()
+            .find(|task| task.name == task_name)
+            .ok_or_else(|| {
+                Status::failed_precondition(crate::structs::children::not_declared(
+                    &config.name,
+                    &resolved.task_name,
+                    task_name,
+                ))
+            })?;
+        if crate::structs::children::child_kind(task) != Some("keyed") {
+            return Err(Status::failed_precondition(format!(
+                "task {task_name} is not a keyed task: CreateChildInstance creates keyed                  children; start a session child with `legion session start {task_name} --owner                  self`"
+            )));
+        }
+        let requested_id = Some(inner.instance_id.trim()).filter(|id| !id.is_empty());
+        if let Some(id) = requested_id {
+            validate_keyed_instance_id(id).map_err(Status::invalid_argument)?;
+        }
+        self.create_keyed_child(
+            &config,
+            task,
+            resolved,
+            requested_id.map(str::to_string),
+            idempotency_key,
+        )
+        .await
     }
 
     /// Create a batch of keyed-mode instances atomically (explicit ids plus
@@ -8400,8 +8544,20 @@ impl Manager for ManagerDaemonService {
                 .locate_session(&identity, &inner.instance_id, AclAction::Read)
                 .await?
             {
+                let mut info = self.session_info(&session);
+                // A session's size is its node's: what its status reports.
+                if let Some(resources) = session
+                    .status
+                    .as_ref()
+                    .and_then(|status| serde_json::from_str::<Value>(&status.resources).ok())
+                {
+                    info.resources = crate::structs::resize::ResourceSize::of(&resources)
+                        .to_json()
+                        .to_string();
+                }
+                self.attach_children(&mut info).await;
                 return Ok(Response::new(GetInstanceReply {
-                    instance: Some(self.session_info(&session)),
+                    instance: Some(info),
                     provisional: None,
                     provisional_node_id: String::new(),
                 }));
@@ -8450,11 +8606,15 @@ impl Manager for ManagerDaemonService {
             .instance_history(&inner.instance_id)
             .map_err(|e| map_store_error("Error loading instance", e))?;
 
-        let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
-        let idle_unmeasured = idle_policy_unmeasured_detail(&self.store, &usage, &instance);
-        let egress_unenforced = instance_egress_unenforced_detail(&self.store, &instance);
-        let mut info = map_instance_info(&self.store, &usage, instance, suspend, history);
-        drop(usage);
+        let current_alloc_id = instance.current_alloc_id;
+        // The usage lock is released before the await below.
+        let (idle_unmeasured, egress_unenforced, mut info) = {
+            let usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+            let idle_unmeasured = idle_policy_unmeasured_detail(&self.store, &usage, &instance);
+            let egress_unenforced = instance_egress_unenforced_detail(&self.store, &instance);
+            let info = map_instance_info(&self.store, &usage, instance, suspend, history);
+            (idle_unmeasured, egress_unenforced, info)
+        };
         attach_guest_address(
             &mut info,
             &guest_addresses(&self.net_status.lock().unwrap_or_else(|p| p.into_inner())),
@@ -8463,6 +8623,8 @@ impl Manager for ManagerDaemonService {
         if info.detail.is_none() {
             info.detail = idle_unmeasured.or(egress_unenforced);
         }
+        self.attach_resources(&mut info, current_alloc_id);
+        self.attach_children(&mut info).await;
         Ok(Response::new(GetInstanceReply {
             instance: Some(info),
             provisional,
@@ -8484,6 +8646,45 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::ListSessionNodesRequest>,
     ) -> Result<Response<crate::structs::ListSessionNodesReply>, Status> {
         self.list_session_nodes_rpc(request).await
+    }
+
+    #[instrument(err, skip_all, fields(allocation_id = request.get_ref().allocation_id))]
+    async fn resize_allocation(
+        &self,
+        request: Request<crate::structs::ResizeAllocationRequest>,
+    ) -> Result<Response<crate::structs::ResizeReply>, Status> {
+        // ACL: `scale:write` on the allocation's job, after a coarse
+        // `scale:write` gate; enforced in `resize_allocation_rpc`.
+        self.resize_allocation_rpc(request).await
+    }
+
+    #[instrument(err, skip_all, fields(instance_id = %request.get_ref().instance_id))]
+    async fn resize_instance(
+        &self,
+        request: Request<crate::structs::ResizeInstanceRequest>,
+    ) -> Result<Response<crate::structs::ResizeReply>, Status> {
+        // ACL: `scale:write` on the instance's job, after a coarse
+        // `scale:write` gate; enforced in `resize_instance_rpc`.
+        self.resize_instance_rpc(request).await
+    }
+
+    #[instrument(err, skip_all, fields(job_id = %request.get_ref().job_id))]
+    async fn resize_task(
+        &self,
+        request: Request<crate::structs::ResizeTaskRequest>,
+    ) -> Result<Response<crate::structs::ResizeTaskReply>, Status> {
+        // ACL: `scale:write` on the job; enforced in `resize_task_rpc`.
+        self.resize_task_rpc(request).await
+    }
+
+    #[instrument(err, skip_all, fields(job_id = %request.get_ref().job_id))]
+    async fn run_session(
+        &self,
+        request: Request<crate::structs::RunSessionRequest>,
+    ) -> Result<Response<crate::structs::RunSessionResponse>, Status> {
+        // ACL: `job:write` on the job, and `exec:write` when the request
+        // replaces the command; enforced in `run_session_rpc`.
+        self.run_session_rpc(request).await
     }
 
     // === SNAPSHOTS (docs/suspend-and-resume.md) ===
@@ -9375,6 +9576,10 @@ impl Manager for ManagerDaemonService {
             }
             None => (false, Vec::new()),
         };
+        // What became of the owners of this node's child sessions, for the
+        // owners only the managers can judge (docs/child-sessions.md).
+        // Empty, and free, for a node that reports no child.
+        let owner_notices = crate::manager::children::owner_notices(&self.store, &id);
         // Service-graph samples: fold into per-(caller, service) windows.
         if !req.net_edges.is_empty() {
             let callers: HashMap<i64, (String, String)> = feed_allocations
@@ -9483,7 +9688,19 @@ impl Manager for ManagerDaemonService {
 
         let (exec_keys, exec_keys_version) = self.exec_keys_for(&req.exec_keys_version);
 
+        // Starts the node refused for a disabled runtime, for
+        // `ListRuntimeStates` (docs/runtime-disable.md).
+        if !req.runtime_refusals.is_empty() {
+            let refusals: Vec<(String, u64)> = req
+                .runtime_refusals
+                .iter()
+                .map(|entry| (entry.runtime.clone(), entry.count))
+                .collect();
+            self.store.note_runtime_refusals(&refusals);
+        }
+
         let reply = HeartbeatReply {
+            owner_notices,
             net_policies,
             message: "ack".into(),
             desired_allocations,
@@ -9507,6 +9724,10 @@ impl Manager for ManagerDaemonService {
             retry_terminated_allocations,
             retry_failed_allocations,
             envelope_resizes,
+            // The whole set on every beat (docs/runtime-disable.md): the
+            // record workers refuse starts from, and the backstop for a
+            // lost `StreamWork` push.
+            runtime_states: Some(self.store.runtime_disables().to_proto()),
         };
 
         Ok(Response::new(reply))
@@ -11096,6 +11317,13 @@ impl Manager for ManagerDaemonService {
             .task_names_for_configs(&task_config_ids)
             .map_err(|e| map_store_error("Error getting task names", e))?;
 
+        // Resize overrides (docs/resize.md): `resources` is already the
+        // effective reservation; this says what differs from the spec.
+        let resource_overrides = self
+            .store
+            .resource_overrides(&allocation_ids)
+            .map_err(|e| map_store_error("Error getting resize overrides", e))?;
+
         let mut nodes: Vec<LedgerNode> = ledger.into_iter().map(Into::into).collect();
         for node in &mut nodes {
             for allocation in &mut node.allocations {
@@ -11104,6 +11332,10 @@ impl Manager for ManagerDaemonService {
                     .and_then(|snapshot| snapshot.artifact_states.clone());
                 allocation.task_name = task_names
                     .get(&allocation.task_config_id)
+                    .cloned()
+                    .unwrap_or_default();
+                allocation.resources_override = resource_overrides
+                    .get(&allocation.id)
                     .cloned()
                     .unwrap_or_default();
             }
@@ -13691,6 +13923,7 @@ fn create_instance_replay(recorded: String) -> CreateInstanceReply {
         .map(|(id, snapshot)| (id.to_string(), snapshot.to_string()))
         .unwrap_or((recorded, String::new()));
     CreateInstanceReply {
+        owner: None,
         instance_id,
         deduplicated: true,
         restoring_from,
@@ -14822,6 +15055,15 @@ fn build_desired_allocations(
     Ok(allocations)
 }
 
+/// The desired set a node's heartbeat reply carries, for integration tests
+/// that drive a worker's reconcile without a heartbeat loop.
+pub fn desired_allocations_for_test(
+    store: &Store,
+    node_id: &str,
+) -> R<Vec<crate::structs::TaskAllocation>> {
+    build_desired_allocations(store, node_id, &[])
+}
+
 /// Task configs by job config, for building many payloads.
 #[derive(Default)]
 pub(crate) struct DesiredTaskCache(HashMap<String, HashMap<i64, TaskConfig>>);
@@ -14863,6 +15105,7 @@ pub(crate) fn desired_payload(
         store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
     let mut payload = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
     crate::manager::dispatcher::attach_gang_env(store, task, allocation, &mut payload)?;
+    crate::manager::dispatcher::attach_resize_override(store, task, allocation, &mut payload);
     let session_task = crate::manager::dispatcher::attach_session_task_spec(
         &mut payload,
         task,
@@ -17158,6 +17401,13 @@ mod tests {
             Err(Status::unimplemented("not used in test"))
         }
 
+        async fn resize_session(
+            &self,
+            _request: Request<crate::structs::ResizeSessionRequest>,
+        ) -> Result<Response<crate::structs::ResizeSessionReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
         async fn get_session(
             &self,
             _request: Request<crate::structs::GetSessionRequest>,
@@ -17190,6 +17440,13 @@ mod tests {
             &self,
             _request: Request<crate::structs::StopSessionRequest>,
         ) -> Result<Response<crate::structs::StopSessionReply>, Status> {
+            Err(Status::unimplemented("not used in test"))
+        }
+
+        async fn run_session(
+            &self,
+            _request: Request<crate::structs::RunSessionRequest>,
+        ) -> Result<Response<crate::structs::RunSessionResponse>, Status> {
             Err(Status::unimplemented("not used in test"))
         }
 
@@ -19877,6 +20134,7 @@ mod tests {
                     instance_id: Some(id.into()),
                     idempotency_key: None,
                     from_snapshot: None,
+                    owner: None,
                 })))
                 .map_err(|err| anyhow!(err))
         };
@@ -20026,6 +20284,7 @@ mod tests {
                 instance_id: Some("user-a".into()),
                 idempotency_key: None,
                 from_snapshot: None,
+                owner: None,
             })))
             .map_err(|err| anyhow!(err))?;
         let get = || -> R<InstanceInfo> {
@@ -21677,6 +21936,7 @@ mod tests {
                 instance_id: Some("user-a".into()),
                 idempotency_key: None,
                 from_snapshot: None,
+                owner: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -21747,6 +22007,7 @@ mod tests {
                 instance_id: Some("user-a".into()),
                 idempotency_key: None,
                 from_snapshot: None,
+                owner: None,
             })))
             .expect_err("tombstoned id must be rejected");
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
@@ -21761,6 +22022,7 @@ mod tests {
                 instance_id: None,
                 idempotency_key: None,
                 from_snapshot: None,
+                owner: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -21792,6 +22054,7 @@ mod tests {
                 instance_id: id.map(String::from),
                 idempotency_key: None,
                 from_snapshot: None,
+                owner: None,
             })))
         };
 
@@ -21891,6 +22154,7 @@ mod tests {
                 instance_id: None,
                 idempotency_key: Some("create-1".into()),
                 from_snapshot: None,
+                owner: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();
@@ -21902,6 +22166,7 @@ mod tests {
                 instance_id: None,
                 idempotency_key: Some("create-1".into()),
                 from_snapshot: None,
+                owner: None,
             })))
             .map_err(|err| anyhow!(err))?
             .into_inner();

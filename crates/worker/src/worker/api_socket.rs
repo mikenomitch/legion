@@ -21,6 +21,13 @@
 //!   a gated allocation has no route out at all; the socket is the
 //!   allocation's own resource, so neither applies.
 //!
+//! **Calls the worker answers itself.** The socket is the workload channel
+//! (apps plan §6.4, calls entry 130): besides proxying the `Manager`
+//! service, the worker serves the `Workload` service on it. Those calls
+//! never leave the node and carry no token; the worker acts for the
+//! socket's allocation, and the jobspec decides what that allocation's task
+//! may ask for ([`AllocationWorkload`]).
+//!
 //! **Who may connect.** Tasks can share a uid, so the file's mode is not
 //! enough. Where every task is guaranteed a cgroup leaf (Linux with cgroup
 //! v2, and the resource governor or the kernel host guard running), every
@@ -53,6 +60,398 @@ pub struct ApiSocketContext {
     pub managers: Option<Arc<crate::worker::managers::ManagerEndpoints>>,
     /// How a connecting process is checked.
     pub peer_check: PeerCheck,
+    /// What the worker answers itself (the `Workload` service). `None`
+    /// answers those calls `Unimplemented`.
+    pub workload: Option<WorkloadChannel>,
+}
+
+/// What the worker needs to answer a workload's node-local calls.
+#[derive(Clone)]
+pub struct WorkloadChannel {
+    pub task_manager: Arc<Mutex<crate::worker::task_manager::WorkerTaskManager>>,
+    /// The node's launch pool. Set once the daemon has built it, which is
+    /// after the sockets of restored allocations are already listening; a
+    /// call that arrives before then is answered `Unavailable`.
+    pub launch_pool: Arc<std::sync::OnceLock<Arc<crate::worker::launch_pool::LaunchPool>>>,
+    pub node_id: String,
+    /// How the worker asks a manager for what only a manager can write (a
+    /// keyed child is a replicated row). `None` refuses those calls
+    /// `Unavailable`.
+    pub manager: Option<ManagerLink>,
+}
+
+/// The worker's own manager channel and the credential it attaches.
+#[derive(Clone)]
+pub struct ManagerLink {
+    pub channel: Channel,
+    pub credentials: Arc<crate::worker::daemon::WorkerCredentials>,
+}
+
+/// The `Workload` service as one allocation's socket serves it: every call
+/// is made for `allocation_id`, the allocation the connection was admitted
+/// to ([`admit`]), whatever the request says.
+pub struct AllocationWorkload {
+    allocation_id: i64,
+    channel: WorkloadChannel,
+}
+
+impl AllocationWorkload {
+    pub fn new(allocation_id: i64, channel: WorkloadChannel) -> Self {
+        Self {
+            allocation_id,
+            channel,
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl crate::structs::workload_server::Workload for AllocationWorkload {
+    #[instrument(err, skip_all, fields(allocation_id = self.allocation_id, task))]
+    async fn run_session(
+        &self,
+        request: tonic::Request<crate::structs::RunSessionRequest>,
+    ) -> Result<tonic::Response<crate::structs::RunSessionResponse>, tonic::Status> {
+        use crate::worker::task_manager::session_runs;
+        use tonic::Status;
+        // ACL: workload channel. The caller is the socket's allocation; the
+        // jobspec decides what its task may run.
+        let mut request = request.into_inner();
+        let lock = || {
+            self.channel
+                .task_manager
+                .lock()
+                .map_err(|_| Status::internal("Task manager lock poisoned"))
+        };
+        let (job_id, caller) = lock()?.allocation_task(self.allocation_id).ok_or_else(|| {
+            Status::not_found("this socket's allocation is no longer running on the node")
+        })?;
+        if !request.job_id.is_empty() && request.job_id != job_id {
+            return Err(Status::permission_denied(format!(
+                "a workload runs tasks of its own job ({job_id}), not {}",
+                request.job_id
+            )));
+        }
+        if !request.command.is_empty() {
+            return Err(Status::permission_denied(format!(
+                "--command needs exec:write on job {job_id}, which a workload's socket does not \
+                 carry; send the run through a manager"
+            )));
+        }
+        if request.task_name.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "task_name is required: the session task to run",
+            ));
+        }
+        tracing::Span::current().record("task", request.task_name.as_str());
+        let target = lock()?
+            .session_spec(&job_id, &request.task_name)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "node holds no envelope for {job_id}/{}; a workload's run happens on its \
+                     own node",
+                    request.task_name
+                ))
+            })?;
+        session_runs::workload_may_run(&caller, &target.task).map_err(Status::permission_denied)?;
+        request.ticket.clear();
+        request.node_id.clear();
+        // A workload's keys are its own: two allocations that pick the same
+        // key are two runs, and neither is answered with the other's reply.
+        if let Some(key) = request.idempotency_key.as_deref().map(str::trim) {
+            if !key.is_empty() {
+                request.idempotency_key = Some(format!("workload:{}:{key}", self.allocation_id));
+            }
+        }
+        let launch_pool = self.channel.launch_pool.get().cloned().ok_or_else(|| {
+            Status::unavailable("the worker is still starting; retry in a moment")
+        })?;
+        session_runs::run_session(
+            self.channel.task_manager.clone(),
+            launch_pool,
+            self.channel.node_id.clone(),
+            session_runs::RunCall {
+                job_id,
+                task_name: request.task_name.clone(),
+                request,
+                ticket_jti: String::new(),
+            },
+        )
+        .await
+        .map(tonic::Response::new)
+    }
+
+    #[instrument(err, skip_all, fields(allocation_id = self.allocation_id, task, session_id))]
+    async fn start_child_session(
+        &self,
+        request: tonic::Request<crate::structs::StartChildSessionRequest>,
+    ) -> Result<tonic::Response<crate::structs::StartSessionReply>, tonic::Status> {
+        use crate::worker::edge;
+        use tonic::Status;
+        // ACL: workload channel. The caller is the socket's allocation, and
+        // the owner of the child whatever the request says; its task's
+        // `children` block decides what it may start.
+        let request = request.into_inner();
+        let task_name = request.task_name.trim().to_string();
+        if task_name.is_empty() {
+            return Err(Status::invalid_argument(
+                "task_name is required: the session task to start a child of",
+            ));
+        }
+        let span = tracing::Span::current();
+        span.record("task", task_name.as_str());
+        let me = self.owner()?;
+        if !me
+            .task
+            .children
+            .as_ref()
+            .is_some_and(|block| block.declares(&task_name))
+        {
+            return Err(Status::failed_precondition(
+                crate::structs::children::not_declared(&me.job_id, &me.task.name, &task_name),
+            ));
+        }
+        let launch_pool = self.channel.launch_pool.get().cloned().ok_or_else(|| {
+            Status::unavailable("the worker is still starting; retry in a moment")
+        })?;
+        let slot = launch_pool
+            .acquire()
+            .await
+            .map_err(|full| Status::resource_exhausted(full.to_string()))?;
+        let task_manager = self.channel.task_manager.clone();
+        let node_id = self.channel.node_id.clone();
+        let key = request.idempotency_key.clone();
+        let (job_id, owner) = (me.job_id.clone(), me.owner.clone());
+        let child_task = task_name.clone();
+        let started = tokio::task::spawn_blocking(move || {
+            edge::start_local_session(
+                &task_manager,
+                &node_id,
+                edge::LocalStart {
+                    job_id: &job_id,
+                    task_name: &child_task,
+                    origin: "workload",
+                    ticket_jti: "",
+                    idempotency_key: &key,
+                    owner: Some(owner),
+                },
+                slot,
+            )
+        })
+        .await
+        .map_err(|err| Status::internal(format!("child start panicked: {err}")))?
+        .map_err(|err| crate::worker::server::admission_status(&err))?;
+        span.record("session_id", started.session_id.as_str());
+        let state = if started.deduplicated || !request.wait.unwrap_or(true) {
+            self.lock()?
+                .session_state(&started.session_id)
+                .unwrap_or_else(|| "starting".to_string())
+        } else {
+            match edge::wait_until_running(
+                &self.channel.task_manager,
+                &started.session_id,
+                crate::worker::server::EDGE_START_WAIT,
+            )
+            .await
+            {
+                Ok(true) => "running".to_string(),
+                Ok(false) => "starting".to_string(),
+                Err(err) => {
+                    return Err(Status::failed_precondition(format!(
+                        "the child failed to start: {err:#}"
+                    )))
+                }
+            }
+        };
+        Ok(tonic::Response::new(crate::structs::StartSessionReply {
+            session_id: started.session_id,
+            node_id: self.channel.node_id.clone(),
+            state,
+            deduplicated: started.deduplicated,
+            resumed_from: String::new(),
+            generation: 1,
+            moved_from: String::new(),
+            owner: Some(me.owner),
+        }))
+    }
+
+    #[instrument(err, skip_all, fields(allocation_id = self.allocation_id))]
+    async fn list_children(
+        &self,
+        _request: tonic::Request<crate::structs::ListChildrenRequest>,
+    ) -> Result<tonic::Response<crate::structs::ListChildrenReply>, tonic::Status> {
+        // ACL: workload channel. A caller lists its own children only.
+        let me = self.owner()?;
+        let children = self.lock()?.child_infos(&me.owner, &self.channel.node_id);
+        Ok(tonic::Response::new(crate::structs::ListChildrenReply {
+            max: me.task.children.as_ref().map_or(0, |block| block.max),
+            owner: Some(me.owner),
+            children,
+        }))
+    }
+
+    #[instrument(err, skip_all, fields(allocation_id = self.allocation_id, session_id))]
+    async fn stop_child_session(
+        &self,
+        request: tonic::Request<crate::structs::StopChildSessionRequest>,
+    ) -> Result<tonic::Response<crate::structs::StopChildSessionReply>, tonic::Status> {
+        use tonic::Status;
+        // ACL: workload channel. Only the caller's own children are
+        // reachable; every other id answers NotFound, whatever it names.
+        let session_id = request.into_inner().session_id;
+        tracing::Span::current().record("session_id", session_id.as_str());
+        let me = self.owner()?;
+        let mut guard = self.lock()?;
+        let not_found = || Status::not_found(format!("no child {session_id} of this workload"));
+        let owned = guard
+            .child_link(&session_id)
+            .is_some_and(|link| link.owner.kind == me.owner.kind && link.owner.id == me.owner.id);
+        if !owned {
+            let gone = guard.gone_child(&session_id).is_some_and(|gone| {
+                gone.owner.kind == me.owner.kind && gone.owner.id == me.owner.id
+            });
+            return if gone {
+                Ok(tonic::Response::new(
+                    crate::structs::StopChildSessionReply { stopped: false },
+                ))
+            } else {
+                Err(not_found())
+            };
+        }
+        let stopped = !guard
+            .stop_sessions(std::slice::from_ref(&session_id), "stopped by its owner")
+            .is_empty();
+        guard.reconcile_children();
+        Ok(tonic::Response::new(
+            crate::structs::StopChildSessionReply { stopped },
+        ))
+    }
+
+    #[instrument(err, skip_all, fields(allocation_id = self.allocation_id, session_id))]
+    async fn resize_child_session(
+        &self,
+        request: tonic::Request<crate::structs::ResizeChildSessionRequest>,
+    ) -> Result<tonic::Response<crate::structs::ResizeSessionReply>, tonic::Status> {
+        use crate::worker::task_manager::resize::{
+            requested_size, resize_status, wire_reply, ResizeTarget,
+        };
+        use tonic::Status;
+        // ACL: workload channel. Only the caller's own children are
+        // reachable; every other id answers NotFound, whatever it names.
+        let request = request.into_inner();
+        tracing::Span::current().record("session_id", request.session_id.as_str());
+        let me = self.owner()?;
+        let mut guard = self.lock()?;
+        let owned = guard
+            .child_link(&request.session_id)
+            .is_some_and(|link| link.owner.kind == me.owner.kind && link.owner.id == me.owner.id);
+        if !owned {
+            return Err(Status::not_found(format!(
+                "no child {} of this workload",
+                request.session_id
+            )));
+        }
+        let size = requested_size(request.to.as_ref());
+        let done = guard
+            .resize_unit(
+                &ResizeTarget::Session(request.session_id.clone()),
+                &size,
+                request.force,
+                request.dry_run,
+            )
+            .map_err(|err| {
+                let status = resize_status(err);
+                // The link is here but the session is not: it runs on
+                // another node, which only a manager can reach.
+                if status.code() == tonic::Code::NotFound {
+                    Status::failed_precondition(format!(
+                        "child {} does not run on this node; resize it through a manager \
+                         (`legion instance resize`)",
+                        request.session_id
+                    ))
+                } else {
+                    status
+                }
+            })?;
+        Ok(tonic::Response::new(wire_reply(
+            &done,
+            &self.channel.node_id,
+        )))
+    }
+
+    #[instrument(err, skip_all, fields(allocation_id = self.allocation_id, task))]
+    async fn create_child_instance(
+        &self,
+        request: tonic::Request<crate::structs::WorkloadCreateChildInstanceRequest>,
+    ) -> Result<tonic::Response<crate::structs::CreateInstanceReply>, tonic::Status> {
+        use tonic::Status;
+        // ACL: workload channel. The caller is the socket's allocation; the
+        // worker vouches for that to a manager, which applies the jobspec's
+        // `children` block. No credential of the caller's is read.
+        let request = request.into_inner();
+        let task_name = request.task_name.trim().to_string();
+        if task_name.is_empty() {
+            return Err(Status::invalid_argument(
+                "task_name is required: the keyed task to create a child of",
+            ));
+        }
+        tracing::Span::current().record("task", task_name.as_str());
+        let me = self.owner()?;
+        if me.owner.kind == crate::structs::children::OWNER_SESSION {
+            return Err(Status::failed_precondition(
+                crate::structs::children::keyed_child_of_session(&me.task.name, &task_name),
+            ));
+        }
+        if !me
+            .task
+            .children
+            .as_ref()
+            .is_some_and(|block| block.declares(&task_name))
+        {
+            return Err(Status::failed_precondition(
+                crate::structs::children::not_declared(&me.job_id, &me.task.name, &task_name),
+            ));
+        }
+        let link = self.channel.manager.clone().ok_or_else(|| {
+            Status::unavailable("this worker has no manager link for keyed children")
+        })?;
+        // The manager knows the allocation by its own id.
+        let allocation_id = self
+            .lock()?
+            .external_allocation_id(self.allocation_id)
+            .unwrap_or(self.allocation_id);
+        let mut client = crate::structs::manager_client::ManagerClient::new(link.channel);
+        let request = link.credentials.attach(tonic::Request::new(
+            crate::structs::CreateChildInstanceRequest {
+                node_id: self.channel.node_id.clone(),
+                allocation_id,
+                task_name,
+                instance_id: request.instance_id,
+                idempotency_key: request.idempotency_key,
+            },
+        ));
+        client.create_child_instance(request).await
+    }
+}
+
+impl AllocationWorkload {
+    fn lock(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, crate::worker::task_manager::WorkerTaskManager>,
+        tonic::Status,
+    > {
+        self.channel
+            .task_manager
+            .lock()
+            .map_err(|_| tonic::Status::internal("Task manager lock poisoned"))
+    }
+
+    /// The socket's allocation as an owner of children.
+    fn owner(&self) -> Result<crate::worker::task_manager::children::LocalOwner, tonic::Status> {
+        self.lock()?.self_owner(self.allocation_id).ok_or_else(|| {
+            tonic::Status::not_found("this socket's allocation is no longer running on the node")
+        })
+    }
 }
 
 /// How the socket decides whether a connecting process belongs to its
@@ -93,6 +492,9 @@ pub struct AllocationSocket {
     path: PathBuf,
     token: Arc<StdRwLock<Option<String>>>,
     task: JoinHandle<()>,
+    /// The handoff socket and its listener, when the node serves the
+    /// workload channel.
+    handoff: Option<(PathBuf, JoinHandle<()>)>,
 }
 
 impl AllocationSocket {
@@ -117,6 +519,12 @@ impl AllocationSocket {
 impl Drop for AllocationSocket {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some((path, task)) = self.handoff.take() {
+            // Handoffs already spliced keep running until their
+            // connections close; only new ones stop.
+            task.abort();
+            let _ = std::fs::remove_file(path);
+        }
         if let Ok(mut current) = self.token.write() {
             *current = None;
         }
@@ -142,18 +550,55 @@ pub fn serve(
     let listener = bind_beneath(host_task_dir, secrets, API_SOCKET_NAME)?;
     let path = host_task_dir.join(secrets).join(API_SOCKET_NAME);
     let token = Arc::new(StdRwLock::new(token));
+    let workload = context.workload.clone().map(|channel| {
+        crate::structs::workload_server::WorkloadServer::new(AllocationWorkload::new(
+            allocation_id,
+            channel,
+        ))
+    });
     let proxy = Arc::new(Proxy {
         allocation_id,
         context,
         token: token.clone(),
+        workload,
     });
+    // Connection handoff has its own socket beside this one, because it
+    // passes a descriptor (see `worker::handoff`). Same directory, same
+    // admission.
+    let handoff = match proxy.context.workload.clone() {
+        Some(channel) => {
+            let listener = bind_beneath(
+                host_task_dir,
+                secrets,
+                crate::worker::handoff::HANDOFF_SOCKET_NAME,
+            )?;
+            let peer_check = proxy.context.peer_check.clone();
+            Some((
+                host_task_dir
+                    .join(secrets)
+                    .join(crate::worker::handoff::HANDOFF_SOCKET_NAME),
+                tokio::spawn(handoff_loop(
+                    listener,
+                    allocation_id,
+                    peer_check,
+                    channel.task_manager,
+                )),
+            ))
+        }
+        None => None,
+    };
     let task = tokio::spawn(accept_loop(listener, proxy));
     info!(
         allocation_id,
         path = %path.display(),
         "Serving the allocation's API socket"
     );
-    Ok(AllocationSocket { path, token, task })
+    Ok(AllocationSocket {
+        path,
+        token,
+        task,
+        handoff,
+    })
 }
 
 /// Bind a unix socket named `name` in `root/relative`, making the
@@ -210,6 +655,8 @@ struct Proxy {
     allocation_id: i64,
     context: ApiSocketContext,
     token: Arc<StdRwLock<Option<String>>>,
+    /// The `Workload` service for this allocation, when the node serves it.
+    workload: Option<crate::structs::workload_server::WorkloadServer<AllocationWorkload>>,
 }
 
 #[instrument(skip_all, fields(allocation_id = proxy.allocation_id))]
@@ -238,7 +685,7 @@ async fn accept_loop(listener: UnixListener, proxy: Arc<Proxy>) {
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |request| {
                 let proxy = proxy.clone();
-                async move { Ok::<_, std::convert::Infallible>(proxy.forward(request).await) }
+                async move { Ok::<_, std::convert::Infallible>(proxy.route(request).await) }
             });
             if let Err(err) =
                 hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -251,7 +698,60 @@ async fn accept_loop(listener: UnixListener, proxy: Arc<Proxy>) {
     }
 }
 
+/// Accept connection handoffs for `allocation_id` (see `worker::handoff`).
+async fn handoff_loop(
+    listener: UnixListener,
+    allocation_id: i64,
+    peer_check: PeerCheck,
+    task_manager: Arc<Mutex<crate::worker::task_manager::WorkerTaskManager>>,
+) {
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                warn!(allocation_id, error = %err, "Handoff socket accept failed");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        if let Err(reason) = admit(&stream, allocation_id, &peer_check) {
+            warn!(allocation_id, "Refused a handoff connection: {reason}");
+            continue;
+        }
+        tokio::spawn(crate::worker::handoff::serve_connection(
+            stream,
+            allocation_id,
+            task_manager.clone(),
+        ));
+    }
+}
+
+/// The path prefix of the calls the worker answers itself.
+const WORKLOAD_SERVICE_PREFIX: &str = "/legion.Workload/";
+
 impl Proxy {
+    /// Answer a `Workload` call on the node; forward everything else to the
+    /// managers.
+    async fn route(
+        &self,
+        request: http::Request<hyper::body::Incoming>,
+    ) -> http::Response<tonic::body::BoxBody> {
+        use tower::Service;
+        if !request.uri().path().starts_with(WORKLOAD_SERVICE_PREFIX) {
+            return self.forward(request).await;
+        }
+        let Some(mut workload) = self.workload.clone() else {
+            return tonic::Status::unimplemented(
+                "this worker does not answer workload calls on the API socket",
+            )
+            .into_http();
+        };
+        match workload.call(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
+    }
+
     /// Forward one request to the managers, with the allocation's token
     /// unless the caller sent a credential of its own.
     async fn forward(
@@ -390,6 +890,73 @@ mod api_socket_test {
             "legion-system",
             7
         ));
+    }
+
+    /// The socket answers `Workload` calls on the node, for the socket's
+    /// own allocation, and still forwards everything else to the managers.
+    #[tokio::test]
+    async fn workload_calls_are_answered_on_the_node_test() -> R<()> {
+        use crate::structs::manager_client::ManagerClient;
+        use crate::structs::workload_client::WorkloadClient;
+        let dir = tempfile::tempdir_in(crate::test_scratch::root())?;
+        let task_manager = Arc::new(Mutex::new(
+            crate::worker::task_manager::WorkerTaskManager::with_state_store(
+                crate::worker::state::WorkerStateStore::new(dir.path().join("worker_state.json")),
+            ),
+        ));
+        let launch_pool = Arc::new(std::sync::OnceLock::new());
+        let context = |workload: bool| ApiSocketContext {
+            // Nothing listens here: a forwarded call fails as Unavailable.
+            channel: tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy(),
+            managers: None,
+            peer_check: PeerCheck::FileMode,
+            workload: workload.then(|| WorkloadChannel {
+                manager: None,
+                task_manager: task_manager.clone(),
+                launch_pool: launch_pool.clone(),
+                node_id: "node-1".into(),
+            }),
+        };
+        let channel = |path: PathBuf| {
+            tonic::transport::Endpoint::from_static("http://legion.sock")
+                .connect_with_connector_lazy(tower::service_fn(move |_: http::Uri| {
+                    let path = path.clone();
+                    async move {
+                        let stream = UnixStream::connect(&path).await?;
+                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                    }
+                }))
+        };
+        let run = crate::structs::RunSessionRequest {
+            task_name: "machine".into(),
+            ..Default::default()
+        };
+
+        let task_dir = dir.path().join("with");
+        let socket = serve(context(true), 7, &task_dir, None)?;
+        let mut workload = WorkloadClient::new(channel(socket.path().to_path_buf()));
+        // Answered by the worker: allocation 7 is not running here.
+        let status = workload
+            .run_session(run.clone())
+            .await
+            .expect_err("no allocation");
+        assert_eq!(status.code(), tonic::Code::NotFound, "{status:?}");
+        assert!(status.message().contains("no longer running"), "{status:?}");
+        // The Manager service still goes to the managers.
+        let mut manager = ManagerClient::new(channel(socket.path().to_path_buf()));
+        let status = manager
+            .run_session(run.clone())
+            .await
+            .expect_err("no manager listens");
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+
+        // A worker that does not serve the workload channel says so.
+        let task_dir = dir.path().join("without");
+        let socket = serve(context(false), 8, &task_dir, None)?;
+        let mut workload = WorkloadClient::new(channel(socket.path().to_path_buf()));
+        let status = workload.run_session(run).await.expect_err("not served");
+        assert_eq!(status.code(), tonic::Code::Unimplemented, "{status:?}");
+        Ok(())
     }
 
     #[test]

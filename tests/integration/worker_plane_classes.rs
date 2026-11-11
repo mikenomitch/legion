@@ -64,6 +64,9 @@ fn worker_table() -> Vec<(&'static str, &'static [Caller])> {
         ("StartClaim", &[Caller::Ticket]),
         ("Probe", &[Caller::Manager]),
         ("StopSessions", &[Caller::Manager]),
+        // A manager routes `ResizeInstance` and `ResizeAllocation` here
+        // after its own `scale:write` check (docs/resize.md).
+        ("ResizeSession", &[Caller::Manager]),
         // Session suspend and resume are routed by a manager, like
         // StopSessions (session durability plan §6.6).
         ("SuspendSessions", &[Caller::Manager]),
@@ -75,6 +78,9 @@ fn worker_table() -> Vec<(&'static str, &'static [Caller])> {
         // PostWork and StopSessions.
         ("StartSession", &[Caller::Ticket]),
         ("StopSession", &[Caller::Ticket]),
+        // A manager certificate (a routed `Manager.RunSession`, authorized
+        // there), or a session ticket for the job and task.
+        ("RunSession", &[Caller::Manager, Caller::Ticket]),
         // App views and actions: the manager authorized the viewer and
         // signed an assertion; the worker only delivers.
         ("ForwardAppRequest", &[Caller::Manager]),
@@ -248,6 +254,18 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
             })
             .await
             .map(|_| ()),
+        // A session this worker does not run: NotFound once admitted.
+        "ResizeSession" => client
+            .resize_session(legion::structs::ResizeSessionRequest {
+                session_id: "workspace-not-running".into(),
+                to: Some(legion::structs::ResizeResources {
+                    memory: Some(64.0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .map(|_| ()),
         "SuspendSessions" => client
             .suspend_sessions(legion::structs::SuspendSessionsRequest {
                 session_ids: vec!["workspace-not-running".into()],
@@ -283,6 +301,15 @@ async fn call(client: &mut WorkerClient<Channel>, rpc: &str) -> Code {
             .stop_session(legion::structs::StopSessionRequest {
                 session_id: "workspace-not-running".into(),
                 ticket: String::new(),
+            })
+            .await
+            .map(|_| ()),
+        // No envelope on this worker: FailedPrecondition once admitted.
+        "RunSession" => client
+            .run_session(legion::structs::RunSessionRequest {
+                job_id: "job".into(),
+                task_name: "workspace".into(),
+                ..Default::default()
             })
             .await
             .map(|_| ()),

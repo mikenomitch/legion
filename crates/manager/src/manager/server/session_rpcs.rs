@@ -103,6 +103,142 @@ impl ManagerDaemonService {
         }))
     }
 
+    /// RunSession: one run in a fresh, single-use session
+    /// (docs/session-runs.md).
+    pub(super) async fn run_session_rpc(
+        &self,
+        request: Request<crate::structs::RunSessionRequest>,
+    ) -> Result<Response<crate::structs::RunSessionResponse>, Status> {
+        let ident = self.authenticate_acl(&request)?;
+        let mut request = request.into_inner();
+        if request.job_id.trim().is_empty() {
+            return Err(Status::invalid_argument("job_id is required"));
+        }
+        let scope = AclScope::job(&request.job_id);
+        acl::enforce(&ident, AclResource::Job, AclAction::Write, &scope)?;
+        if !request.command.is_empty() {
+            // An arbitrary command is an exec, and needs what exec needs.
+            acl::enforce(&ident, AclResource::Exec, AclAction::Write, &scope).map_err(
+                |status| {
+                    if status.code() == tonic::Code::PermissionDenied {
+                        Status::permission_denied(format!(
+                            "--command needs exec:write on job {} (running the task's own \
+                         run.command needs only job:write)",
+                            request.job_id
+                        ))
+                    } else {
+                        status
+                    }
+                },
+            )?;
+        }
+        let config = self
+            .store
+            .get_job_config(&request.job_id)
+            .map_err(|_| Status::not_found(format!("job {} not found", request.job_id)))?;
+        let session_tasks: Vec<&TaskConfig> = config
+            .tasks
+            .iter()
+            .filter(|task| crate::structs::session::is_session_task(task))
+            .collect();
+        let task = match request.task_name.as_str() {
+            "" => {
+                let runnable: Vec<&TaskConfig> = session_tasks
+                    .iter()
+                    .copied()
+                    .filter(|task| task.run.is_some())
+                    .collect();
+                match (runnable.as_slice(), session_tasks.as_slice()) {
+                    ([only], _) => *only,
+                    ([], [only]) => *only,
+                    ([], _) => {
+                        return Err(Status::failed_precondition(format!(
+                            "job {} has no session task with a run block; add one \
+                             (run = {{ command = [...], wall = \"30s\" }})",
+                            request.job_id
+                        )))
+                    }
+                    (several, _) => {
+                        return Err(Status::failed_precondition(format!(
+                            "job {} has {} session tasks that take runs; name one with --task \
+                             (task_name in the API)",
+                            request.job_id,
+                            several.len()
+                        )))
+                    }
+                }
+            }
+            name => session_tasks
+                .iter()
+                .find(|task| task.name == name)
+                .copied()
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "job {} has no session task {name}",
+                        request.job_id
+                    ))
+                })?,
+        };
+        let run = task
+            .run
+            .as_ref()
+            .ok_or_else(|| {
+                Status::failed_precondition(crate::structs::run::no_run_block(
+                    &request.job_id,
+                    &task.name,
+                ))
+            })?
+            .resolve()
+            .map_err(|err| Status::failed_precondition(format!("task {}: {err}", task.name)))?;
+        if !request.command.is_empty() {
+            if !run.allow_command {
+                return Err(Status::failed_precondition(
+                    crate::structs::run::command_not_allowed(&task.name),
+                ));
+            }
+            info!(
+                target: "exec_audit",
+                principal = %ident.principal,
+                accessor_id = ident.accessor_id.as_deref().unwrap_or("-"),
+                job_id = %request.job_id,
+                task = %task.name,
+                command = ?request.command,
+                dry_run = request.dry_run,
+                "session run with a caller's command"
+            );
+        }
+        // The key a node sees is scoped to the caller and the request, as
+        // every recorded idempotency key is: another caller's same key, or
+        // the same key on a different request, is a different run.
+        request.ticket.clear();
+        let scoped = scoped_idempotency_key(
+            &ident,
+            "run_session",
+            request.idempotency_key.as_deref(),
+            &(
+                &request.job_id,
+                &task.name,
+                &request.command,
+                &request.input,
+                &request.get,
+                request
+                    .files
+                    .iter()
+                    .map(|file| {
+                        use sha2::{Digest, Sha256};
+                        (&file.path, format!("{:x}", Sha256::digest(&file.content)))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        request.idempotency_key = (!scoped.is_empty()).then_some(scoped);
+        request.task_name = task.name.clone();
+        request.job_id = config.name.clone();
+        sessions::run(&self.store, &config, task, run.wall, request)
+            .await
+            .map(Response::new)
+    }
+
     /// CreateInstance without an id on a session task: start an unnamed
     /// session through the router. Writes nothing to the replicated store;
     /// an idempotency key derives the id instead of recording it.
@@ -133,7 +269,47 @@ impl ManagerDaemonService {
         let derived_id = (!scoped.is_empty()).then(|| {
             crate::structs::session::derived_session_id(&task.name, &config.name, &scoped)
         });
-        let started = sessions::start(&self.store, config, task, derived_id.as_deref()).await?;
+        // A child of a running unit of this job (docs/child-sessions.md):
+        // `job:write` was enforced by the caller, the owner's jobspec
+        // decides the rest.
+        let child = match request.owner.as_ref().filter(|owner| !owner.id.is_empty()) {
+            Some(requested) => {
+                let resolved =
+                    crate::manager::children::resolve_owner(&self.store, config, requested).await?;
+                let block =
+                    crate::manager::children::declaration(config, &resolved.task_name, task)?;
+                // `max` bounds session and keyed children together: the
+                // node counts the sessions, so it is told what is left.
+                let keyed = if crate::structs::children::raft_owned(&resolved.owner) {
+                    self.store
+                        .keyed_children_of(&crate::structs::children::owner_label(&resolved.owner))
+                        .map_err(|e| map_store_error("Error reading the owner's children", e))?
+                        .len() as u32
+                } else {
+                    0
+                };
+                if keyed >= block.max {
+                    return Err(Status::resource_exhausted(
+                        crate::structs::children::at_max(&resolved.owner, block.max),
+                    ));
+                }
+                Some(sessions::ChildStart {
+                    owner: resolved.owner,
+                    prefer_node: resolved.node_id,
+                    max: block.max - keyed,
+                    suspend_with_owner: block.suspend_with_owner,
+                })
+            }
+            None => None,
+        };
+        let started = sessions::start(
+            &self.store,
+            config,
+            task,
+            derived_id.as_deref(),
+            child.as_ref(),
+        )
+        .await?;
         Ok(Response::new(CreateInstanceReply {
             instance_id: started.session_id,
             deduplicated: started.deduplicated,
@@ -142,7 +318,121 @@ impl ManagerDaemonService {
             durable: false,
             node_id: started.node_id,
             state: started.state,
+            owner: started.owner,
         }))
+    }
+
+    /// Create a keyed instance as a child of `resolved` (docs/child-sessions.md).
+    /// The caller has authorized the create (`job:write`, or a worker
+    /// vouching for one of its allocations); the jobspec decides the rest.
+    /// One scheduler-lane entry: the row with its owner reference, the
+    /// placement eval, and the idempotency record.
+    pub(super) async fn create_keyed_child(
+        &self,
+        config: &JobConfig,
+        task: &TaskConfig,
+        resolved: crate::manager::children::ResolvedOwner,
+        requested_id: Option<String>,
+        idempotency_key: String,
+    ) -> Result<Response<CreateInstanceReply>, Status> {
+        use crate::storage::store::KeyedChildOutcome;
+        use crate::structs::children;
+        let block = crate::manager::children::declaration(config, &resolved.task_name, task)?;
+        // `declaration` refuses a session task owning a keyed child; an
+        // owner that is a session by kind (a promoted task's leftover) is
+        // refused the same way.
+        if !children::raft_owned(&resolved.owner) {
+            return Err(Status::failed_precondition(
+                children::keyed_child_of_session(&resolved.task_name, &task.name),
+            ));
+        }
+        self.store
+            .check_namespace_quota_growth(&config.name, config.priority, &task.resources, 1)
+            .map_err(|e| map_store_error("Namespace policy refused the instance", e))?;
+        // `max` bounds session and keyed children together. The session
+        // count is the index's (soft state); the keyed count is read in the
+        // write.
+        let session_children = crate::manager::children::session_children_of(
+            &self.store,
+            &config.name,
+            &resolved.owner,
+        )
+        .await
+        .len() as u32;
+        let max = block.max;
+        let owner = resolved.owner.clone();
+        let label = children::owner_label(&owner);
+        let job_id = config.name.clone();
+        let group = task.group.clone();
+        let task_name = task.name.clone();
+        let config_id = config.id();
+        let priority = self.store.default_eval_priority;
+        let key = idempotency_key.clone();
+        let outcome = self
+            .store
+            .scheduler_group_commit("create_child_instance", move |s| {
+                claimed_body(s, |s| {
+                    let outcome = s.create_keyed_child_instance(
+                        &job_id,
+                        &group,
+                        &task_name,
+                        requested_id.as_deref(),
+                        &label,
+                        max,
+                        session_children,
+                    )?;
+                    if let KeyedChildOutcome::Created(instance) = &outcome {
+                        s.enqueue_eval(
+                            "job_reschedule",
+                            Some(&job_id),
+                            Some(&config_id),
+                            None,
+                            Some(priority),
+                        )?;
+                        claim_idempotency_key(s, &key, "create_instance", &instance.instance_id)?;
+                    }
+                    Ok(outcome)
+                })
+            });
+        let outcome =
+            match self.claimed_write(&idempotency_key, "Error creating child instance", outcome)? {
+                Ok(outcome) => outcome,
+                Err(recorded) => {
+                    return Ok(Response::new(CreateInstanceReply {
+                        instance_id: recorded,
+                        deduplicated: true,
+                        restoring_from: String::new(),
+                        mode: InstanceMode::Keyed.to_string(),
+                        durable: true,
+                        node_id: String::new(),
+                        state: String::new(),
+                        owner: Some(owner),
+                    }))
+                }
+            };
+        match outcome {
+            KeyedChildOutcome::AtMax { .. } => {
+                Err(Status::resource_exhausted(children::at_max(&owner, max)))
+            }
+            KeyedChildOutcome::Created(instance) => {
+                info!(
+                    instance_id = %instance.instance_id,
+                    job_id = %instance.job_id,
+                    owner = %children::owner_label(&owner),
+                    "Created keyed child instance"
+                );
+                Ok(Response::new(CreateInstanceReply {
+                    instance_id: instance.instance_id,
+                    deduplicated: false,
+                    restoring_from: String::new(),
+                    mode: InstanceMode::Keyed.to_string(),
+                    durable: true,
+                    node_id: String::new(),
+                    state: String::new(),
+                    owner: Some(owner),
+                }))
+            }
+        }
     }
 
     /// The running session with this id, once `action` on its job is
@@ -347,6 +637,7 @@ impl ManagerDaemonService {
             cold,
             force_move,
             skip,
+            None,
         )
         .await?
         {
@@ -435,9 +726,16 @@ impl ManagerDaemonService {
                 ..Default::default()
             }));
         }
-        let resumed =
-            sessions::resume_on_node(&self.store, &found.node_id, session_id, cold, None, false)
-                .await;
+        let resumed = sessions::resume_on_node(
+            &self.store,
+            &found.node_id,
+            session_id,
+            cold,
+            None,
+            false,
+            None,
+        )
+        .await;
         if let Err(status) = resumed.as_ref() {
             // Full, or its local copy went meanwhile: a `store` session
             // resumes from its manifest elsewhere. A node full for this
@@ -489,6 +787,27 @@ impl ManagerDaemonService {
     }
 
     /// A running session's `InstanceInfo`, its group read from the job.
+    /// List what a unit owns (docs/child-sessions.md), for `GetInstance`.
+    /// Skipped for a job whose spec declares no `children` block, which is
+    /// almost every job.
+    pub(super) async fn attach_children(&self, info: &mut InstanceInfo) {
+        let declares = self
+            .store
+            .get_job_config(&info.job_id)
+            .is_ok_and(|config| crate::manager::children::job_declares_children(&config));
+        if !declares {
+            return;
+        }
+        let kind = if info.mode == InstanceMode::Session.to_string() {
+            crate::structs::children::OWNER_SESSION
+        } else {
+            crate::structs::children::OWNER_INSTANCE
+        };
+        let owner = crate::structs::children::owner_ref(kind, &info.instance_id);
+        info.children =
+            crate::manager::children::children_of(&self.store, &info.job_id, &owner).await;
+    }
+
     pub(super) fn session_info(&self, entry: &IndexedSession) -> InstanceInfo {
         let (job_id, task_name) = entry
             .status
@@ -796,6 +1115,15 @@ impl ManagerDaemonService {
             task_name: task.name.clone(),
             node_id: found.node_id.clone(),
             new_id: (!new_id.is_empty()).then(|| new_id.to_string()),
+            // A child of an instance or an allocation stays its child: the
+            // reference moves into the row, in this entry. A child of a
+            // session is detached (a durable child of an ephemeral owner is
+            // not allowed).
+            owner: status
+                .owner
+                .as_ref()
+                .filter(|owner| crate::structs::children::raft_owned(owner))
+                .map(crate::structs::children::owner_label),
         };
         let key = idempotency_key.clone();
         // One scheduler-lane entry: the instance row, its allocation, the

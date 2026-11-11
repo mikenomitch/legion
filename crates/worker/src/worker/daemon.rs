@@ -208,6 +208,10 @@ fn worker_capabilities(publishing: bool, edge_sessions: bool) -> Vec<String> {
         // (docs/session-mode.md). Envelope tasks require it, so a worker
         // that predates sessions is never given one.
         crate::structs::session::SESSIONS_CAPABILITY.to_string(),
+        crate::structs::runtime_state::RUNTIME_DISABLE_CAPABILITY.to_string(),
+        // Answers `Worker.ResizeSession` (docs/resize.md). A manager never
+        // sends a resize to a node without it.
+        crate::structs::resize::RESIZE_CAPABILITY.to_string(),
     ];
     if publishing {
         capabilities.push(crate::structs::snapshot::CONTENT_PUBLISH_CAPABILITY.to_string());
@@ -497,19 +501,15 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     );
     let content_store = open_content_store(&content_dir, content_config);
     // Sandbox base root disks (docs/task-runtime-sandbox.md, "The root disk
-    // cache"). Only a Linux node boots microVMs, so only one keeps them. It
-    // honors the content store's free-disk floor.
-    if cfg!(target_os = "linux") {
-        let min_free = content_store
-            .as_ref()
-            .map(|store| store.config().min_free_disk)
-            .or_else(|| {
-                crate::structs::parse_byte_size(crate::content_store::DEF_CONTENT_MIN_FREE_DISK)
-                    .ok()
-            })
-            .unwrap_or(0);
+    // cache") are derived content in the node store. Only a Linux node boots
+    // microVMs, so only one keeps them. The directory an older worker kept
+    // them in is removed either way.
+    {
+        let store = cfg!(target_os = "linux")
+            .then(|| content_store.clone())
+            .flatten();
         tokio::task::spawn_blocking(move || {
-            crate::task_plugins::rootfs_cache::init(&rootfs_cache_dir, min_free)
+            crate::task_plugins::rootfs_cache::init(store, &rootfs_cache_dir)
         })
         .await
         .ok();
@@ -636,6 +636,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         .expect("task manager")
         .resource_enforcement_enabled()
         || kernel_guard == crate::worker::netd::kernel_guard::Availability::Active;
+    let workload_launch_pool = Arc::new(std::sync::OnceLock::new());
     let api_sockets = crate::worker::api_socket::ApiSocketContext {
         channel: managers.channel(),
         managers: Some(managers.clone()),
@@ -643,6 +644,17 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             leaves_guaranteed,
             &enforcement_config.cgroup_parent,
         ),
+        // The workload channel: node-local calls the worker answers itself
+        // (docs/workload-identity.md, "The API socket").
+        workload: Some(crate::worker::api_socket::WorkloadChannel {
+            manager: Some(crate::worker::api_socket::ManagerLink {
+                channel: managers.channel(),
+                credentials: credentials.clone(),
+            }),
+            task_manager: task_manager.clone(),
+            launch_pool: workload_launch_pool.clone(),
+            node_id: name.clone(),
+        }),
     };
     let identity_manager = Arc::new(
         WorkerIdentityManager::new(Arc::new(ManagerTokenIssuer {
@@ -760,6 +772,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let launch_pool = Arc::new(crate::worker::launch_pool::LaunchPool::from_config(
         &edge_boot_config,
     ));
+    let _ = workload_launch_pool.set(launch_pool.clone());
 
     let mut fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
     // The manager loads no storage drivers of its own, so this is its only
@@ -1229,6 +1242,15 @@ async fn start_session_maintenance(
     let mut last_fence_list = std::time::Instant::now();
     loop {
         tokio::time::sleep(SESSION_MAINTENANCE_INTERVAL).await;
+        // A run's session outlives its driver only across a worker restart
+        // (docs/session-runs.md): end what the session log brought back.
+        {
+            let manager = task_manager.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::worker::task_manager::session_runs::end_orphaned_runs(&manager)
+            })
+            .await;
+        }
         let manifests = task_manager
             .lock()
             .expect("task manager")
@@ -2155,6 +2177,7 @@ fn open_content_store(
         filesystem_bytes = filesystem_bytes.unwrap_or(0),
         artifacts_budget_bytes = config.budgets.artifacts,
         snapshots_budget_bytes = config.budgets.snapshots,
+        derived_budget_bytes = config.budgets.derived,
         min_free_disk_bytes = config.min_free_disk,
         "Sized node content store budgets"
     );
@@ -2742,10 +2765,15 @@ pub async fn heartbeat_tick(
             let store = task_manager.lock().expect("task manager").content_store();
             match crate::worker::content_report::advertised_set(store.as_deref()) {
                 Ok(current) => {
-                    let mut pending = CONTENT_ADVERTISER
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .prepare(current);
+                    let mut pending = {
+                        let advertiser =
+                            CONTENT_ADVERTISER.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut pending = advertiser.prepare(current);
+                        // What the node built and holds as derived content,
+                        // sent only when it changed.
+                        advertiser.attach_derived(&mut pending, store.as_deref());
+                        pending
+                    };
                     // Checkpoint headroom rides every report: the
                     // manager shows it and keeps new memory-checkpoint
                     // instances off a node whose budget is full.
@@ -2801,7 +2829,13 @@ pub async fn heartbeat_tick(
         } else {
             (allocations, allocation_health.clone(), allocation_health)
         };
+        // Starts refused for a disabled runtime since the last acknowledged
+        // beat (docs/runtime-disable.md); put back if this one is lost.
+        let runtime_gate = task_manager.lock().expect("task manager").runtime_gate();
+        let runtime_refusals = runtime_gate.take_refusals();
+        let runtime_refusals_for_redrive = runtime_refusals.clone();
         let req = credentials.attach(tonic::Request::new(HeartbeatRequest {
+            runtime_refusals,
             // What the node holds of its endpoint feed, so the reply carries
             // only what changed (mesh-control-path plan §6.1).
             endpoint_feed: Some(netd.feed_report()),
@@ -2860,6 +2894,7 @@ pub async fn heartbeat_tick(
                 // And the direct exec audit, so a dead connection loses no
                 // record of who opened a shell.
                 crate::worker::direct_exec::restore_audit(exec_audit);
+                runtime_gate.restore_refusals(runtime_refusals_for_redrive);
                 netd.redrive(net_redrive);
                 // Pressure actions too: an eviction the manager never hears
                 // about would leave it waiting on an allocation that is gone.
@@ -2907,6 +2942,17 @@ pub async fn heartbeat_tick(
         }
         crate::worker::direct_exec::apply_revocations(&reply.revoked_exec_sessions);
         crate::worker::direct_exec::apply_exec_keys(&reply.exec_keys_version, &reply.exec_keys);
+        // The runtimes an operator disabled (docs/runtime-disable.md): held
+        // before the reconcile below starts anything from this reply.
+        if let Some(states) = reply.runtime_states.as_ref() {
+            apply_runtime_states(task_manager, states);
+        }
+        // What the managers decided about the owners of this node's child
+        // sessions (docs/child-sessions.md).
+        crate::worker::task_manager::children::apply_owner_notices(
+            task_manager,
+            &reply.owner_notices,
+        );
         // The cluster's manager set, refreshed every beat and persisted when
         // it changes, so failover (and a restart) can reach any manager.
         if let Some(managers) = managers {
@@ -3722,6 +3768,40 @@ pub(crate) fn wake_heartbeat() {
 }
 
 /// Act on one applied work-stream message: start the checkpoint work it
+/// Replace the runtime disables this worker holds with the managers' set
+/// (docs/runtime-disable.md), and, when a disable asks for a drain, take
+/// this node's running sessions of that runtime off it on a blocking
+/// thread. The drain is level-triggered: every set that still asks for one
+/// runs a pass, so a session that was busy, or started in a race with the
+/// disable, is taken by a later one.
+fn apply_runtime_states(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    states: &crate::structs::RuntimeStateSet,
+) {
+    let gate = task_manager.lock().expect("task manager").runtime_gate();
+    gate.replace(crate::structs::runtime_state::RuntimeDisableSet::from_proto(states));
+    if !gate.any_drain() {
+        return;
+    }
+    let task_manager = Arc::clone(task_manager);
+    let drain = move || {
+        let drained = crate::worker::runtime_state::drain_sessions(&task_manager);
+        if !drained.suspended.is_empty() || !drained.stopped.is_empty() {
+            info!(
+                suspended = drained.suspended.len(),
+                stopped = drained.stopped.len(),
+                "Drained sessions of a disabled runtime"
+            );
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn_blocking(drain);
+        }
+        Err(_) => drain(),
+    }
+}
+
 /// pushed and the allocations it added, and wake the heartbeat's reconcile
 /// when it stopped or changed anything. A resync's additions go through the
 /// reconcile too, which knows what a restarted worker restored and what it
@@ -3730,6 +3810,16 @@ fn launch_streamed_work(
     launcher: &Arc<WorkerDaemonService>,
     applied: crate::worker::work_stream::Applied,
 ) {
+    // A pushed set of runtime disables: held now, not at the next beat.
+    if let Some(states) = applied.runtime_states.as_ref() {
+        apply_runtime_states(&launcher.task_manager, states);
+    }
+    // Pushed owner notices: children end with their owner now, not at the
+    // next beat.
+    crate::worker::task_manager::children::apply_owner_notices(
+        &launcher.task_manager,
+        &applied.owner_notices,
+    );
     if applied.reconcile {
         HEARTBEAT_WAKE.notify_one();
     }

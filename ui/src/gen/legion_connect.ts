@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AppExtensionEvent, ApplyNamespacePolicyReply, ApplyNamespacePolicyRequest, ApplyNamespaceReply, ApplyNamespaceRequest, ApplyObjectReply, ApplyObjectRequest, ApplyScalingDefaultsReply, ApplyScalingDefaultsRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateChildTokenReply, CreateChildTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DecideApprovalReply, DecideApprovalRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNamespacePolicyReply, DeleteNamespacePolicyRequest, DeleteNamespaceReply, DeleteNamespaceRequest, DeleteNetPluginReply, DeleteNetPluginRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteObjectReply, DeleteObjectRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForgetNodeReply, ForgetNodeRequest, ForkInstanceReply, ForkInstanceRequest, ForwardAppRequestReply, ForwardAppRequestRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetAppPageReply, GetAppPageRequest, GetAppReply, GetAppRequest, GetApprovalReply, GetApprovalRequest, GetAppViewReply, GetAppViewRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetCallerCapabilitiesReply, GetCallerCapabilitiesRequest, GetCapacityDemandReply, GetCapacityDemandRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSchemaReply, GetJobSchemaRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNamespacePolicyReply, GetNamespacePolicyRequest, GetNamespaceReply, GetNamespaceRequest, GetNetPluginReply, GetNetPluginRequest, GetNetPluginStatusReply, GetNetPluginStatusRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObjectReply, GetObjectRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetScaleHistoryReply, GetScaleHistoryRequest, GetScalingDefaultsReply, GetScalingDefaultsRequest, GetScalingInputsReply, GetScalingInputsRequest, GetScalingStatusReply, GetScalingStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetUsageReply, GetUsageRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, InstallAppReply, InstallAppRequest, InvokeAppActionReply, InvokeAppActionRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListApprovalsReply, ListApprovalsRequest, ListAppsReply, ListAppsRequest, ListAuditEventsReply, ListAuditEventsRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListGrantsReply, ListGrantsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNamespacePoliciesReply, ListNamespacePoliciesRequest, ListNamespacesReply, ListNamespacesRequest, ListNetPluginsReply, ListNetPluginsRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListObjectKindsReply, ListObjectKindsRequest, ListObjectsReply, ListObjectsRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListUiExtensionsReply, ListUiExtensionsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, ObjectEvent, PatchKvReply, PatchKvRequest, PauseScalingReply, PauseScalingRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, RecordScalingActionReply, RecordScalingActionRequest, ReleaseKvLockReply, ReleaseKvLockRequest, ReleaseObjectReply, ReleaseObjectRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ReportScalingStatusReply, ReportScalingStatusRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RevokeGrantReply, RevokeGrantRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, ScalingPolicySet, SchedulerEvent, SetAppConfigReply, SetAppConfigRequest, SetAppEnabledReply, SetAppEnabledRequest, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UninstallAppReply, UninstallAppRequest, UpdateAppSettingsReply, UpdateAppSettingsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpdateObjectStatusReply, UpdateObjectStatusRequest, UpgradeAppReply, UpgradeAppRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPluginReply, UpsertNetPluginRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WatchAppExtensionsRequest, WatchEvent, WatchObjectsRequest, WatchRequest, WatchScalingPoliciesRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, AppExtensionEvent, ApplyNamespacePolicyReply, ApplyNamespacePolicyRequest, ApplyNamespaceReply, ApplyNamespaceRequest, ApplyObjectReply, ApplyObjectRequest, ApplyScalingDefaultsReply, ApplyScalingDefaultsRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateChildInstanceRequest, CreateChildTokenReply, CreateChildTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DecideApprovalReply, DecideApprovalRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNamespacePolicyReply, DeleteNamespacePolicyRequest, DeleteNamespaceReply, DeleteNamespaceRequest, DeleteNetPluginReply, DeleteNetPluginRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteObjectReply, DeleteObjectRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForgetNodeReply, ForgetNodeRequest, ForkInstanceReply, ForkInstanceRequest, ForwardAppRequestReply, ForwardAppRequestRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetAppPageReply, GetAppPageRequest, GetAppReply, GetAppRequest, GetApprovalReply, GetApprovalRequest, GetAppViewReply, GetAppViewRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetCallerCapabilitiesReply, GetCallerCapabilitiesRequest, GetCapacityDemandReply, GetCapacityDemandRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSchemaReply, GetJobSchemaRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNamespacePolicyReply, GetNamespacePolicyRequest, GetNamespaceReply, GetNamespaceRequest, GetNetPluginReply, GetNetPluginRequest, GetNetPluginStatusReply, GetNetPluginStatusRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObjectReply, GetObjectRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetScaleHistoryReply, GetScaleHistoryRequest, GetScalingDefaultsReply, GetScalingDefaultsRequest, GetScalingInputsReply, GetScalingInputsRequest, GetScalingStatusReply, GetScalingStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetUsageReply, GetUsageRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, InstallAppReply, InstallAppRequest, InvokeAppActionReply, InvokeAppActionRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListApprovalsReply, ListApprovalsRequest, ListAppsReply, ListAppsRequest, ListAuditEventsReply, ListAuditEventsRequest, ListBootTicketsReply, ListBootTicketsRequest, ListChildrenReply, ListChildrenRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListGrantsReply, ListGrantsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNamespacePoliciesReply, ListNamespacePoliciesRequest, ListNamespacesReply, ListNamespacesRequest, ListNetPluginsReply, ListNetPluginsRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListObjectKindsReply, ListObjectKindsRequest, ListObjectsReply, ListObjectsRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListRuntimeStatesReply, ListRuntimeStatesRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListUiExtensionsReply, ListUiExtensionsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, ObjectEvent, PatchKvReply, PatchKvRequest, PauseScalingReply, PauseScalingRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, RecordScalingActionReply, RecordScalingActionRequest, ReleaseKvLockReply, ReleaseKvLockRequest, ReleaseObjectReply, ReleaseObjectRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ReportScalingStatusReply, ReportScalingStatusRequest, ResetKeyringReply, ResetKeyringRequest, ResizeAllocationRequest, ResizeChildSessionRequest, ResizeInstanceRequest, ResizeReply, ResizeSessionReply, ResizeSessionRequest, ResizeTaskReply, ResizeTaskRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RevokeGrantReply, RevokeGrantRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, RunSessionRequest, RunSessionResponse, ScaleTaskReply, ScaleTaskRequest, ScalingPolicySet, SchedulerEvent, SetAppConfigReply, SetAppConfigRequest, SetAppEnabledReply, SetAppEnabledRequest, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetRuntimeEnabledReply, SetRuntimeEnabledRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartChildSessionRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopChildSessionReply, StopChildSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UninstallAppReply, UninstallAppRequest, UpdateAppSettingsReply, UpdateAppSettingsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpdateObjectStatusReply, UpdateObjectStatusRequest, UpgradeAppReply, UpgradeAppRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPluginReply, UpsertNetPluginRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WatchAppExtensionsRequest, WatchEvent, WatchObjectsRequest, WatchRequest, WatchScalingPoliciesRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest, WorkloadCreateChildInstanceRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -843,6 +843,60 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
+     * Disables or enables a task runtime, cluster-wide or for the namespaces
+     * matching `namespaces`.
+     *
+     * Disabling (`enabled = false`) writes the record for `runtime`, or widens
+     * the one that exists: a scoped disable adds its globs to a scoped record,
+     * and a cluster-wide disable replaces any scope. `since` is kept from the
+     * first disable; `reason` and `drain` take the newest call's values. With
+     * `drain`, running work of the runtime in scope is also taken off it:
+     * keyed instances whose task has a `suspend` block are suspended (their
+     * checkpoints kept), every other allocation gets a graceful stop, and each
+     * node suspends its sessions that can be suspended and stops the rest.
+     *
+     * Enabling (`enabled = true`) deletes the record, or removes the named
+     * globs from a scoped one (deleting it when none are left). Blocked evals
+     * wake and place without a resubmit, and callers that were refused succeed
+     * on retry. Instances a drain suspended stay suspended until something
+     * resumes them, as any suspended instance does. Enabling a runtime that is
+     * not disabled succeeds and changes nothing (`changed = false`).
+     *
+     * ACL: `operator:write`.
+     *
+     * Errors:
+     * - InvalidArgument: `runtime` is empty or not a runtime name, a glob in
+     *   `namespaces` is not a namespace glob, `runtime` is `envelope` (disable
+     *   the session task's own runtime instead), or `drain` is set on an
+     *   enable.
+     * - FailedPrecondition: an enable names namespaces while the runtime is
+     *   disabled cluster-wide (enable it cluster-wide, then disable the
+     *   namespaces that should stay off), or names a glob the record does not
+     *   hold.
+     *
+     * @generated from rpc legion.Manager.SetRuntimeEnabled
+     */
+    setRuntimeEnabled: {
+      name: "SetRuntimeEnabled",
+      I: SetRuntimeEnabledRequest,
+      O: SetRuntimeEnabledReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists every runtime disable in force, each with what is waiting on it.
+     * Any manager answers from its own replica.
+     *
+     * ACL: `operator:read`.
+     *
+     * @generated from rpc legion.Manager.ListRuntimeStates
+     */
+    listRuntimeStates: {
+      name: "ListRuntimeStates",
+      I: ListRuntimeStatesRequest,
+      O: ListRuntimeStatesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Creates the next immutable version of a named job template.
      *
      * The source must evaluate to a record with an optional `description`,
@@ -1007,11 +1061,52 @@ export const Manager = {
      *   once sessions end or envelopes are added.
      * - FailedPrecondition: no node holds an envelope for the task yet.
      *
+     * With `owner` the new unit is a child (docs/child-sessions.md): a
+     * session child of a session task, or a keyed child of a keyed task,
+     * whose row carries the owner reference and which the owner's stop or
+     * destroy ends in the same replicated entry. See
+     * `CreateInstanceRequest.owner`.
+     *
      * @generated from rpc legion.Manager.CreateInstance
      */
     createInstance: {
       name: "CreateInstance",
       I: CreateInstanceRequest,
+      O: CreateInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates a keyed instance as a child of a unit running on the calling
+     * node: what `Workload.CreateChildInstance` on an allocation's API socket
+     * becomes once the worker has attributed the caller (`legion instance
+     * create <task> --owner self` inside a task; docs/child-sessions.md).
+     *
+     * The node vouches for which of its allocations asked; the manager
+     * checks that the allocation runs on that node, works out the owner (the
+     * allocation's instance when it has one, the allocation otherwise), and
+     * applies the jobspec's rules exactly as `CreateInstance` with `owner`
+     * does: the owner's task must name the child task in `children.tasks`,
+     * the child task must be keyed, and the owner must have fewer than
+     * `children.max` children. The row, its owner reference, and the
+     * placement eval are one scheduler-lane entry.
+     *
+     * ACL: worker-plane. The caller is a registered worker (its node
+     * certificate or join credentials), and `node_id` must be the node the
+     * owning allocation is placed on. No operator token is involved: the
+     * authority is the jobspec's `children` block.
+     *
+     * Errors: NotFound when the allocation does not run on the calling node;
+     * FailedPrecondition when its task does not declare the child task, the
+     * child task is not keyed, or the owner is itself a child (depth 1
+     * only); ResourceExhausted (retryable) at `children.max`; AlreadyExists
+     * when `instance_id` names an existing instance; InvalidArgument for a
+     * malformed `instance_id`.
+     *
+     * @generated from rpc legion.Manager.CreateChildInstance
+     */
+    createChildInstance: {
+      name: "CreateChildInstance",
+      I: CreateChildInstanceRequest,
       O: CreateInstanceReply,
       kind: MethodKind.Unary,
     },
@@ -1524,6 +1619,12 @@ export const Manager = {
      * replacement placed after node loss reserves the task's full resources,
      * like any keyed placement.
      *
+     * Ownership (docs/child-sessions.md): promoting an owner re-keys its
+     * children's references to the new instance. Promoting a child whose
+     * owner is an `instance` or an `allocation` writes the reference into the
+     * new row in this entry, so it stays that owner's (keyed) child;
+     * promoting a child of a `session` detaches it.
+     *
      * ACL: `job:write` on the session's job, checked coarsely before the
      * session lookup and precisely after it.
      *
@@ -1549,6 +1650,113 @@ export const Manager = {
       name: "PromoteInstance",
       I: PromoteInstanceRequest,
       O: PromoteInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resizes one running top-level allocation in place: its `memory`
+     * (reservation), `memoryMax` (ceiling), and `cpu`, as an override over the
+     * task's spec (docs/resize.md). No new job version and no rollout.
+     *
+     * One scheduler-lane compare-and-set on the allocation's row commits the
+     * new size (`from` is the effective size this manager read, `to` the new
+     * one), and the allocation's node applies it through the task runtime. A
+     * grow (a larger `memory` or `cpu`) is reserved first and takes only free
+     * room on the node; it never preempts. A shrink is applied on the node
+     * first and released after. A runtime that cannot make the change live
+     * answers `needs_restart` or `not_supported` and nothing changes: Legion
+     * never restarts a unit to resize it.
+     *
+     * The reply always reports an `outcome`; only `applied` changed anything.
+     * A resize back to the spec's own amounts removes the override. The
+     * override ends with the allocation: a replacement starts at the spec.
+     *
+     * ACL: `scale:write` on the allocation's job (the caller needs
+     * `scale:write` on some job before the allocation is looked up, so its
+     * existence is not probeable).
+     *
+     * Errors:
+     * - NotFound: no live allocation has this id.
+     * - InvalidArgument: no amount given, a non-positive amount, or a ceiling
+     *   below the reservation.
+     * - FailedPrecondition: the allocation is a session envelope (it resizes
+     *   through `stateful.envelope`), is not running, or its row changed under
+     *   this call (`stale`; read it again).
+     * - Unavailable: the allocation's node could not be reached. Nothing was
+     *   committed for a shrink; a grow's reservation is rolled back.
+     *
+     * @generated from rpc legion.Manager.ResizeAllocation
+     */
+    resizeAllocation: {
+      name: "ResizeAllocation",
+      I: ResizeAllocationRequest,
+      O: ResizeReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resizes one instance in place: a keyed or slot instance (its current
+     * allocation, exactly as `ResizeAllocation`) or a running session, named
+     * by its id (docs/resize.md).
+     *
+     * A session's resize is node-local and writes nothing to the replicated
+     * store: the manager routes it to the node the session id's tag names
+     * (`Worker.ResizeSession`), which admits a grow against the session
+     * task's envelope and tells the runtime. A grow the envelope has no room
+     * for answers `refused` with the room it has, or `deferred` when the
+     * envelope is elastic and is growing to make room.
+     *
+     * ACL: `scale:write` on the instance's job, checked after a coarse
+     * `scale:write` gate.
+     *
+     * Errors: as `ResizeAllocation`, plus FailedPrecondition when a keyed
+     * instance is suspended or stopped (it has no running allocation), and
+     * Unavailable when a session's node cannot be reached.
+     *
+     * @generated from rpc legion.Manager.ResizeInstance
+     */
+    resizeInstance: {
+      name: "ResizeInstance",
+      I: ResizeInstanceRequest,
+      O: ResizeReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resizes a task: sets (or, with `reset`, removes) a task-level size
+     * override laid over the task's `resources`, the way `ScaleTask` lays a
+     * count override over `count` (docs/resize.md, "Resizing a task").
+     *
+     * The override is one record per task. While it stands, every new
+     * allocation of the task is placed at the overridden size, and this call
+     * also brings the task's running allocations to it: each one is resized
+     * in place exactly as `ResizeAllocation` would, and the reply lists the
+     * answer for each. An allocation that cannot change in place (no room on
+     * its node, or a runtime that answers `needs_restart` or
+     * `not_supported`) keeps running at its old size and takes the new one
+     * when it is next replaced; with `replace` it is stopped now so the
+     * scheduler places its replacement at the new size. Nothing is ever
+     * restarted without `replace`.
+     *
+     * No job version is created and no rollout starts. A later submit whose
+     * spec changes the task's `resources` drops the override (the author's
+     * new spec wins, the arbitration count overrides follow); a submit that
+     * leaves them alone keeps it. Session tasks are refused: a session's
+     * room is its envelope (`stateful.envelope`), and each session is resized
+     * on its own with `ResizeInstance`.
+     *
+     * ACL: `scale:write` on the job.
+     *
+     * Errors:
+     * - NotFound: the job or task does not exist.
+     * - InvalidArgument: no amount given without `reset`, amounts given with
+     *   `reset`, a non-positive amount, a ceiling below the reservation, or
+     *   `task_name` left empty on a job with more than one task.
+     * - FailedPrecondition: the task is a session task or a session envelope.
+     *
+     * @generated from rpc legion.Manager.ResizeTask
+     */
+    resizeTask: {
+      name: "ResizeTask",
+      I: ResizeTaskRequest,
+      O: ResizeTaskReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -1582,6 +1790,62 @@ export const Manager = {
       name: "ListSessionNodes",
       I: ListSessionNodesRequest,
       O: ListSessionNodesReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Runs once in a fresh, single-use session of a session task and returns
+     * the outcome (docs/session-runs.md): the session router picks a node
+     * with envelope room exactly as it does for an unnamed session start,
+     * and that node starts the session, stages the caller's `files` and
+     * `input` under the run directory, executes the task's `run.command`
+     * once under `run.wall`, collects stdout, stderr, the exit status,
+     * `result.json`, and the files named in `get`, ends the session, and
+     * answers. Nothing is written to the replicated store, and the session
+     * is ended on every path, including a failure in any step.
+     *
+     * A command that ran is a successful call, whatever it exited with: the
+     * reply carries `exit`. A run stopped by a limit is also a successful
+     * call, with `stopped` set and no `exit`. Only a run that could not start
+     * or could not finish is an error.
+     *
+     * Idempotency is per node. With `idempotency_key`, the node derives the
+     * run's id from the key and keeps the reply for 10 minutes, so a retry
+     * that reaches the same node is answered from it (`deduplicated`) without
+     * running again, and a retry that arrives while the first is still
+     * running waits for it. A manager remembers which node it sent a key to
+     * for the same 10 minutes, and `node_id` pins a retry sent through
+     * another manager. A retry that lands on another node runs again.
+     *
+     * ACL: `job:write` on the job runs the task's own `run.command`. A
+     * request that sets `command` also needs `exec:write` on the job, the
+     * permission `ExecAllocation` needs, and `run.allowCommand = true` on the
+     * task.
+     *
+     * Errors:
+     * - InvalidArgument: no `job_id`; a file or `get` path outside the run
+     *   directory; `input` that is not JSON; more than 3 MiB staged.
+     * - NotFound: no such job, or `node_id` names no node.
+     * - PermissionDenied: `command` without `exec:write` ("--command needs
+     *   exec:write on job <job> (running the task's own run.command needs
+     *   only job:write)").
+     * - FailedPrecondition: `task_name` names no session task of the job (or
+     *   is empty and the job has several); the task has no `run` block; the
+     *   task does not allow `command`; no node holds an envelope for the
+     *   task; the pinned node holds none.
+     * - ResourceExhausted: every envelope is full. Retryable.
+     * - Unavailable: the task's runtime is disabled (`runtime_disabled`), the
+     *   node could not be reached, or the session was lost mid-run.
+     *   Retryable; with an idempotency key, a retry to the same node does
+     *   not run the command twice unless the first attempt never finished.
+     * - DeadlineExceeded: the session did not reach `running` within
+     *   `wait_timeout_seconds`. It is ended; nothing ran.
+     *
+     * @generated from rpc legion.Manager.RunSession
+     */
+    runSession: {
+      name: "RunSession",
+      I: RunSessionRequest,
+      O: RunSessionResponse,
       kind: MethodKind.Unary,
     },
     /**
@@ -2394,8 +2658,10 @@ export const Manager = {
      * it, and says so with `index_reported = false`. Only entries of at least
      * 1 MiB are advertised, so small artifacts never appear.
      *
-     * The content store's byte budgets and per-class totals are not part of
-     * this reply: the index carries digests, not classes.
+     * The byte budgets and totals of the `artifacts` and `snapshots` classes
+     * are not part of this reply: the index carries digests, not classes. The
+     * `derived` class is reported whole in `derived`, because its entries are
+     * never advertised by digest.
      *
      * ACL: node:read, scoped to the node's pool (checked unscoped before the
      * lookup, so a caller with no node access cannot probe which nodes exist).
@@ -5317,6 +5583,29 @@ export const Worker = {
       kind: MethodKind.Unary,
     },
     /**
+     * Resizes one unit this node runs, in place (docs/resize.md): a session,
+     * admitted against its task's envelope with nothing written to the
+     * replicated store, or a top-level allocation whose new size a manager
+     * has already committed. The node tells the task runtime, which changes
+     * what it can live and answers `needs_restart` or `not_supported` for
+     * the rest; nothing is restarted.
+     *
+     * Caller class: `manager`. `Manager.ResizeInstance` and
+     * `Manager.ResizeAllocation` are the only callers.
+     *
+     * Errors: NotFound when the node runs no such session or allocation
+     * (with `wrong_node` in the message when a session id's tag names
+     * another node); InvalidArgument for a malformed request.
+     *
+     * @generated from rpc legion.Worker.ResizeSession
+     */
+    resizeSession: {
+      name: "ResizeSession",
+      I: ResizeSessionRequest,
+      O: ResizeSessionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
      * Suspends sessions on this node (session durability plan §6.6,
      * docs/session-mode.md "Idle sessions"). A manager calls it to route
      * `legion instance suspend <session>` to the node the session id's tag
@@ -5419,6 +5708,182 @@ export const Worker = {
       name: "ResumeSession",
       I: ResumeSessionRequest,
       O: ResumeSessionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Runs once in a fresh, single-use session of a session task on this
+     * node and returns the outcome: the edge form of `Manager.RunSession`,
+     * with no manager on the path and nothing written to raft (see that RPC
+     * for the steps, the reply, and idempotency; docs/session-runs.md).
+     *
+     * Caller classes: `ticket` (a session ticket for the job and task, in
+     * `ticket`) and `manager` (a manager's certificate, which routed a
+     * `Manager.RunSession` here after enforcing its ACL).
+     *
+     * A ticket runs the task's own `run.command`. `command` is refused for
+     * the ticket class with PermissionDenied: replacing the command needs
+     * `exec:write`, which only a manager can check.
+     *
+     * Errors: as `Manager.RunSession`, plus Unauthenticated for a missing or
+     * unverifiable ticket, and PermissionDenied when the ticket does not
+     * cover the job and task. ResourceExhausted (`envelope_full`,
+     * `no_envelope`, `overloaded`) is retryable on another node.
+     *
+     * @generated from rpc legion.Worker.RunSession
+     */
+    runSession: {
+      name: "RunSession",
+      I: RunSessionRequest,
+      O: RunSessionResponse,
+      kind: MethodKind.Unary,
+    },
+  }
+} as const;
+
+/**
+ * The workload channel: what a workload asks its own node's worker, over
+ * the per-allocation API socket (`$LEGION_SECRETS_DIR/legion.sock`,
+ * docs/workload-identity.md, "The API socket"). The same socket proxies the
+ * `Manager` service to the managers with the allocation's identity token;
+ * calls to this service never leave the node and carry no token. The worker
+ * attributes every connection to the socket's allocation (by cgroup where
+ * every task has a leaf, by the directory's modes otherwise), so a caller
+ * acts for its own allocation and no other.
+ *
+ * One workload-channel call is not gRPC, because it passes a file
+ * descriptor: connection handoff, on `legion-handoff.sock` beside this
+ * socket (docs/child-sessions.md, "Connection handoff").
+ *
+ * @generated from service legion.Workload
+ */
+export const Workload = {
+  typeName: "legion.Workload",
+  methods: {
+    /**
+     * Runs once in a fresh, single-use session of a session task of the
+     * caller's own job, on the caller's node (see `Manager.RunSession` for
+     * the steps and the reply; docs/session-runs.md).
+     *
+     * Authorization is the jobspec's, not a credential's: the worker admits
+     * the run only when the calling allocation's task is allowed to start
+     * the target task. `job_id` may be empty and must be the caller's job
+     * when set; `ticket`, `node_id`, and `command` are refused (replacing the
+     * command needs `exec:write`, which only a manager checks).
+     *
+     * Errors: as `Worker.RunSession`, plus PermissionDenied for another job,
+     * a `command`, or a task the caller's task may not run, and NotFound when
+     * the socket's allocation is no longer running.
+     *
+     * @generated from rpc legion.Workload.RunSession
+     */
+    runSession: {
+      name: "RunSession",
+      I: RunSessionRequest,
+      O: RunSessionResponse,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Starts a session of a sibling session task as a child of the calling
+     * allocation (docs/child-sessions.md): `legion session start <task>
+     * --owner self` inside a task. The child ends when the caller's unit
+     * ends, is charged to its own task's envelope, and runs under its own
+     * task's resources, network policy, and identity.
+     *
+     * Authorization is the jobspec's: the caller's task must name the task
+     * in `children.tasks`. No credential is read. The owner is the caller,
+     * whatever the request says: its session when it is a session, its
+     * instance when it is a keyed or slot instance, its allocation otherwise.
+     * The child starts on the caller's node; when that node has no room for
+     * it the call is refused, and a start through a manager
+     * (`CreateInstanceRequest.owner`) can place it elsewhere.
+     *
+     * Errors: FailedPrecondition when the caller's task does not declare the
+     * task, the caller is itself a child (depth 1 only), or the node holds
+     * no envelope for the task; ResourceExhausted (retryable) when the
+     * caller already owns `children.max` children or the envelope is full;
+     * Unavailable when the task's runtime is disabled; NotFound when the
+     * socket's allocation is no longer running.
+     *
+     * @generated from rpc legion.Workload.StartChildSession
+     */
+    startChildSession: {
+      name: "StartChildSession",
+      I: StartChildSessionRequest,
+      O: StartSessionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists the children the calling allocation's unit owns on this node:
+     * running and suspended ones, and the ones that ended in the last ten
+     * minutes (`state = "gone"`, with the reason: `stopped`, `evicted`,
+     * `exited`, `owner ended`). This is how an owner learns a child is gone.
+     *
+     * Errors: NotFound when the socket's allocation is no longer running.
+     *
+     * @generated from rpc legion.Workload.ListChildren
+     */
+    listChildren: {
+      name: "ListChildren",
+      I: ListChildrenRequest,
+      O: ListChildrenReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Ends one child of the calling allocation's unit. Only the caller's own
+     * children are reachable: any other id answers NotFound, so the existence
+     * of other units cannot be probed.
+     *
+     * Errors: NotFound when the id is not a child of the caller on this node.
+     *
+     * @generated from rpc legion.Workload.StopChildSession
+     */
+    stopChildSession: {
+      name: "StopChildSession",
+      I: StopChildSessionRequest,
+      O: StopChildSessionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Creates a keyed instance of a sibling keyed task as a child of the
+     * calling allocation's unit: `legion instance create <task> --owner self`
+     * inside a task (docs/child-sessions.md). The worker attributes the call
+     * to the socket's allocation and asks a manager
+     * (`Manager.CreateChildInstance`), since a keyed instance is a replicated
+     * row; no credential is read from the caller.
+     *
+     * The owner is the caller's instance when it is a keyed or slot
+     * instance and its allocation otherwise. A session cannot own a keyed
+     * child, so a caller that is a session is refused.
+     *
+     * Errors: as `Manager.CreateChildInstance`, plus FailedPrecondition when
+     * the caller is a session, Unavailable when no manager can be reached,
+     * and NotFound when the socket's allocation is no longer running.
+     *
+     * @generated from rpc legion.Workload.CreateChildInstance
+     */
+    createChildInstance: {
+      name: "CreateChildInstance",
+      I: WorkloadCreateChildInstanceRequest,
+      O: CreateInstanceReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resizes one of the caller's own child sessions in place
+     * (docs/resize.md): how a child grows after it starts. Admitted against
+     * the child task's envelope on this node, exactly as
+     * `Manager.ResizeInstance` on a session, with no token: the socket's
+     * attribution names the owner, and only its own children are reachable.
+     *
+     * Errors: NotFound when the session is not a child of the caller (so
+     * another owner's child is not probeable); FailedPrecondition when the
+     * child runs on another node (resize it through a manager).
+     *
+     * @generated from rpc legion.Workload.ResizeChildSession
+     */
+    resizeChildSession: {
+      name: "ResizeChildSession",
+      I: ResizeChildSessionRequest,
+      O: ResizeSessionReply,
       kind: MethodKind.Unary,
     },
   }

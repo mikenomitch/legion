@@ -79,6 +79,11 @@ use sha2::{Digest as _, Sha256};
 
 use crate::prelude::*;
 
+mod derived;
+pub use derived::{
+    allocated_bytes, DerivedEnsured, DerivedEntry, DerivedFlight, DerivedKind, DerivedSkip, Recipe,
+};
+
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Default `content.budgets.artifacts`: half the content filesystem, at
@@ -103,6 +108,16 @@ pub const DEF_CONTENT_SNAPSHOTS_BUDGET: BudgetSpec = BudgetSpec::Share {
     min: 2 * GIB,
     max: 200 * GIB,
 };
+/// Default `content.budgets.derived`: 10% of the content filesystem, clamped
+/// to 1 GiB..20 GiB. Derived content is what Legion builds on the node and
+/// can build again (a sandbox image's base root disk), so the budget only
+/// has to hold what is in use: 20 GiB is a dozen or more typical sandbox
+/// images, and 1 GiB still holds a slim one. `"0"` turns the class off.
+pub const DEF_CONTENT_DERIVED_BUDGET: BudgetSpec = BudgetSpec::Share {
+    percent: 10.0,
+    min: GIB,
+    max: 20 * GIB,
+};
 /// Default `content.ttl`: unpinned entries unused this long are removed.
 pub const DEF_CONTENT_TTL: &str = "72h";
 /// Default `content.minFreeDisk`.
@@ -120,16 +135,26 @@ pub enum ContentClass {
     Artifacts,
     /// Checkpoint parts: VMM memory and device-state files, disk images.
     Snapshots,
+    /// What Legion builds on this node from verified inputs and can build
+    /// again (base root disks). Entries are named by their recipe, not by
+    /// their bytes, and are never fetched, published, or advertised; see
+    /// [`Recipe`] and [`ContentStore::ensure_derived`].
+    Derived,
 }
 
 impl ContentClass {
-    pub const ALL: [ContentClass; 2] = [ContentClass::Artifacts, ContentClass::Snapshots];
+    pub const ALL: [ContentClass; 3] = [
+        ContentClass::Artifacts,
+        ContentClass::Snapshots,
+        ContentClass::Derived,
+    ];
 
     /// The name used in config (`content.budgets.<name>`) and the index.
     pub fn as_str(self) -> &'static str {
         match self {
             ContentClass::Artifacts => "artifacts",
             ContentClass::Snapshots => "snapshots",
+            ContentClass::Derived => "derived",
         }
     }
 }
@@ -147,7 +172,10 @@ impl FromStr for ContentClass {
         match raw {
             "artifacts" => Ok(ContentClass::Artifacts),
             "snapshots" => Ok(ContentClass::Snapshots),
-            other => bail!("unknown content class {other:?} (expected artifacts or snapshots)"),
+            "derived" => Ok(ContentClass::Derived),
+            other => {
+                bail!("unknown content class {other:?} (expected artifacts, snapshots, or derived)")
+            }
         }
     }
 }
@@ -354,6 +382,7 @@ impl fmt::Display for BudgetSpec {
 pub struct ContentBudgetSpecs {
     pub artifacts: BudgetSpec,
     pub snapshots: BudgetSpec,
+    pub derived: BudgetSpec,
 }
 
 impl Default for ContentBudgetSpecs {
@@ -361,6 +390,7 @@ impl Default for ContentBudgetSpecs {
         ContentBudgetSpecs {
             artifacts: DEF_CONTENT_ARTIFACTS_BUDGET,
             snapshots: DEF_CONTENT_SNAPSHOTS_BUDGET,
+            derived: DEF_CONTENT_DERIVED_BUDGET,
         }
     }
 }
@@ -393,6 +423,7 @@ impl ContentStoreSettings {
             budgets: ContentBudgets {
                 artifacts: size(ContentClass::Artifacts, self.budgets.artifacts)?,
                 snapshots: size(ContentClass::Snapshots, self.budgets.snapshots)?,
+                derived: size(ContentClass::Derived, self.budgets.derived)?,
             },
             ttl: self.ttl,
             min_free_disk: self.min_free_disk,
@@ -405,6 +436,8 @@ impl ContentStoreSettings {
 pub struct ContentBudgets {
     pub artifacts: u64,
     pub snapshots: u64,
+    /// `0` turns derived content off.
+    pub derived: u64,
 }
 
 impl ContentBudgets {
@@ -412,6 +445,7 @@ impl ContentBudgets {
         match class {
             ContentClass::Artifacts => self.artifacts,
             ContentClass::Snapshots => self.snapshots,
+            ContentClass::Derived => self.derived,
         }
     }
 }
@@ -430,7 +464,7 @@ pub struct ContentStoreConfig {
 }
 
 /// The built-in defaults as they resolve on a 1 TiB filesystem (artifacts
-/// half of it, snapshots at their cap). Fixed numbers, so tests do not
+/// half of it, snapshots and derived content at their caps). Fixed numbers, so tests do not
 /// depend on the disk they run on.
 impl Default for ContentStoreConfig {
     fn default() -> Self {
@@ -438,6 +472,7 @@ impl Default for ContentStoreConfig {
             budgets: ContentBudgets {
                 artifacts: 512 * GIB,
                 snapshots: 200 * GIB,
+                derived: 20 * GIB,
             },
             ttl: Some(Duration::from_secs(72 * 3600)),
             min_free_disk: 5 * GIB,
@@ -500,6 +535,8 @@ pub struct GcReport {
     pub expired: Vec<ContentDigest>,
     /// Removed to bring a class back under its budget.
     pub evicted: Vec<ContentDigest>,
+    /// Derived entries removed, expired or over budget, as `<kind>/<key>`.
+    pub derived_removed: Vec<String>,
     pub bytes_freed: u64,
 }
 
@@ -547,6 +584,10 @@ pub struct ContentStore {
     config: ContentStoreConfig,
     inner: Mutex<Inner>,
     free_space: FreeSpaceProbe,
+    /// Derived builds in flight (single-flight per key).
+    derived_flights: std::sync::Arc<derived::Flights>,
+    /// Moves when the derived set, its sizes, or its pins change.
+    derived_generation: std::sync::atomic::AtomicU64,
 }
 
 struct Inner {
@@ -568,7 +609,8 @@ impl ContentStore {
     /// Opens (or creates) the store rooted at `root`. Clears leftover
     /// in-flight writes, then reconciles the index with the blobs on disk:
     /// rows whose blob is missing or the wrong size are dropped, and blobs
-    /// without a row are deleted.
+    /// without a row are deleted. The derived tree is reconciled the same
+    /// way and trimmed to its budget.
     pub fn open(root: impl Into<PathBuf>, config: ContentStoreConfig) -> R<Self> {
         let root = root.into();
         fs::create_dir_all(root.join(BLOB_DIR))
@@ -576,6 +618,7 @@ impl ContentStore {
         let tmp = root.join(TMP_DIR);
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp)?;
+        fs::create_dir_all(root.join(derived::DERIVED_DIR))?;
 
         let db = Connection::open(root.join(INDEX_FILE))
             .with_context(|| format!("open content index in {}", root.display()))?;
@@ -623,16 +666,22 @@ impl ContentStore {
                PRIMARY KEY(digest, repository));",
         )
         .context("initialize content index")?;
+        db.execute_batch(derived::DERIVED_SCHEMA)
+            .context("initialize the derived content index")?;
         let seq: i64 = db.query_row("SELECT COALESCE(MAX(use_seq), 0) FROM entry", [], |r| {
             r.get(0)
         })?;
+        let seq = seq.max(derived::derived_max_seq(&db)?);
         let store = ContentStore {
             root,
             config,
             inner: Mutex::new(Inner { db, seq }),
             free_space: Box::new(free_bytes),
+            derived_flights: Default::default(),
+            derived_generation: Default::default(),
         };
         store.reconcile()?;
+        store.reconcile_derived()?;
         Ok(store)
     }
 
@@ -803,6 +852,12 @@ impl ContentStore {
         class: ContentClass,
         opts: &PutOptions,
     ) -> R<ContentEntry> {
+        if class == ContentClass::Derived {
+            bail!(
+                "derived content is built on its node from a recipe \
+                 (ContentStore::ensure_derived), never put"
+            );
+        }
         if let Some(expected) = opts.expected.as_ref() {
             if expected != digest {
                 bail!(
@@ -895,8 +950,9 @@ impl ContentStore {
         )
     }
 
-    /// Evicts LRU unpinned entries of any class while the filesystem is below
-    /// `min_free_disk`.
+    /// Evicts LRU unpinned entries while the filesystem is below
+    /// `min_free_disk`: derived content first (it can be rebuilt here), then
+    /// artifacts and checkpoint parts of either class.
     fn ensure_free_disk(&self, inner: &mut Inner, keep: &ContentDigest) -> R<()> {
         let floor = self.config.min_free_disk;
         if floor == 0 {
@@ -904,6 +960,10 @@ impl ContentStore {
         }
         let below =
             |store: &ContentStore| (store.free_space)(&store.root).is_some_and(|free| free < floor);
+        if !below(self) {
+            return Ok(());
+        }
+        self.evict_derived_while(&inner.db, "minFreeDisk", || below(self))?;
         if !below(self) {
             return Ok(());
         }
@@ -1124,6 +1184,9 @@ impl ContentStore {
         ContentClass::ALL
             .iter()
             .map(|&class| {
+                if class == ContentClass::Derived {
+                    return self.derived_usage(&inner.db);
+                }
                 let (entries, used): (i64, i64) = inner.db.query_row(
                     "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM entry WHERE class = ?1",
                     [class.as_str()],
@@ -1278,10 +1341,15 @@ impl ContentStore {
                 }
             }
         }
-        if !report.expired.is_empty() || !report.evicted.is_empty() {
+        self.gc_derived(&inner.db, now, &mut report)?;
+        if !report.expired.is_empty()
+            || !report.evicted.is_empty()
+            || !report.derived_removed.is_empty()
+        {
             info!(
                 expired = report.expired.len(),
                 evicted = report.evicted.len(),
+                derived_removed = report.derived_removed.len(),
                 bytes_freed = report.bytes_freed,
                 "Content store GC"
             );
@@ -1594,6 +1662,7 @@ mod tests {
             budgets: ContentBudgets {
                 artifacts,
                 snapshots,
+                derived: 1 << 30,
             },
             ttl: Some(Duration::from_secs(3600)),
             min_free_disk: 0,

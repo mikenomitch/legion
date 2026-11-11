@@ -48,6 +48,11 @@ workload's token also carries `legion.io/epoch`, the instance's identity
 epoch, which Legion uses to retire tokens copied into a fork or snapshot (see
 [Forks and snapshots](#forks-and-snapshots)).
 
+A [keyed child](child-sessions.md#keyed-children)'s tokens also carry
+`legion.io/owner` and `legion.io/root`, both `kind:id` of the unit that owns
+it (`instance:user-42`, `allocation:88213`), so an upstream can attribute a
+request to the tree that made it. A workload nobody owns has neither claim.
+
 ### The `sub` claim is a security boundary
 
 The default subject is:
@@ -1012,6 +1017,34 @@ worker listens on it and proxies gRPC to the managers:
   to Legion's own ports on a manager's node, and a gated task has no route
   out at all. The socket is the allocation's own resource, so neither
   applies.
+
+**Calls the worker answers itself.** The socket is the one way a workload
+reaches its node's worker, so the worker also serves a second gRPC service
+on it, `Workload`, beside the proxied `Manager` service. A `Workload` call
+never leaves the node and carries no token: the worker acts for the socket's
+allocation, whatever the request says, and the jobspec decides what that
+allocation's task may ask for.
+
+| Call | What it does | Allowed when |
+| --- | --- | --- |
+| `Workload.RunSession` (`legion session run --local`) | A [session run](session-runs.md) of a session task of the caller's own job, on the caller's node | the calling task is the task being run, or names it in `children.tasks` |
+| `Workload.StartChildSession` (`legion session start <task> --owner self`) | Starts a session of a sibling task as a [child](child-sessions.md) of the caller, on the caller's node | the calling task names the task in `children.tasks` |
+| `Workload.ListChildren` (`legion session children`) | Lists the caller's children on its node, with why the recently ended ones ended | always (a caller sees only its own) |
+| `Workload.StopChildSession` (`legion session stop <id> --local`) | Ends one of the caller's children | the id is a child of the caller; any other id is `NOT_FOUND` |
+| `Workload.CreateChildInstance` (`legion instance create <task> --owner self`) | Creates a keyed instance of a sibling keyed task as a [keyed child](child-sessions.md#keyed-children) of the caller. The worker asks a manager, vouching for the calling allocation; no token of the task's is read | the calling task names the task in `children.tasks`, and the caller is not a session |
+
+One more workload-channel call is not gRPC, because it passes a file
+descriptor: [connection handoff](child-sessions.md#connection-handoff), on
+`legion-handoff.sock` beside `legion.sock`, admitted by the same rule.
+
+A call for another job, or one that replaces the run's command, is refused
+with `PERMISSION_DENIED`. The jobspec is the whole authorization: a task
+reaches a sibling task through this service only when its own `children`
+block names it. A session task cannot declare identities and so has no
+socket; its children are started from outside with `--owner`. A workload
+that needs something the block does not grant sends the call through the
+`Manager` service on the same socket, where its `legion` identity needs
+`job:write`.
 
 **Who may connect.** Tasks can share a user, so the file's mode is not enough.
 Where every task is guaranteed a cgroup leaf (Linux with cgroup v2, and either

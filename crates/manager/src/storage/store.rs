@@ -29,7 +29,9 @@ mod keyring_ops;
 mod read_model_check;
 // Phase 6: fork, create-from-snapshot, and snapshot names.
 mod blocked_evals;
+mod child_ops;
 pub use blocked_evals::{BlockedEval, CAPACITY_REPLAY_WINDOW};
+pub use child_ops::{EndedChild, KeyedChildOutcome, OwnerEnd};
 mod eval_claims;
 // What `plan_submission` keeps: rejections and staged plans, id-windowed.
 mod plan_records;
@@ -40,7 +42,11 @@ mod group_commit;
 mod session_ops;
 // Elastic session envelopes: a node's in-place envelope resize.
 mod envelope_ops;
+mod resize_ops;
+mod task_resize_ops;
 pub use envelope_ops::{EnvelopeResizeOutcome, EnvelopeResizeRequest};
+pub use resize_ops::{AllocationResizeOutcome, AllocationResizeRequest, AllocationSize};
+pub use task_resize_ops::{PlacementSizeUnavailable, TaskResize};
 mod snapshot_ops;
 mod suspend_ops;
 // Device assignment at allocation insert (docs/devices.md).
@@ -1626,6 +1632,10 @@ pub struct Store {
     // change nothing is known, so the first freed capacity runs one pass,
     // which clears it if nothing waits.
     capacity_waiters: Arc<AtomicBool>,
+    // This manager's view of the runtime disables
+    // (`storage/runtime_state_store.rs`): the set every plan and heartbeat
+    // reads, reloaded by the changeset projection. Shared across clones.
+    pub(crate) runtime_states: Arc<crate::storage::runtime_state_store::RuntimeStateHub>,
     // The timed read-model scrub's own rotation (`scrub_read_model_slice`):
     // the nodes and job configs still to visit this sweep, each refilled
     // from committed AND cached ids so an entry missing from either side is
@@ -2214,7 +2224,7 @@ const KEYED_BIND_SQL: &str = "SELECT instance.instance_id, instance.job_id, inst
                  instance.task_name, instance.mode, instance.state, instance.slot_index, \
                  instance.current_alloc_id, instance.storage_handle, instance.created_at, \
                  instance.updated_at, instance.restore_from, instance.identity_epoch, \
-                 instance.named, instance.promoted_from \
+                 instance.named, instance.promoted_from, instance.owner \
                  FROM instance \
                  LEFT JOIN volume ON volume.instance_id = instance.instance_id \
                  AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
@@ -2345,6 +2355,7 @@ impl Store {
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             capacity_waiters: Arc::new(AtomicBool::new(true)),
+            runtime_states: Arc::new(Default::default()),
             read_model_scrub_queue: Arc::new(std::sync::Mutex::new(Default::default())),
             external_write_baseline: Arc::new(std::sync::Mutex::new(None)),
             keyring,
@@ -3744,7 +3755,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions, autoscale
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang, pending_extensions, autoscale, run, children
             FROM task_config;
             "#,
         )?;
@@ -3765,6 +3776,8 @@ impl Store {
                 speculative_start: parse_json_column(29, row.get(29)?)?,
                 snapshots: parse_json_column(30, row.get(30)?)?,
                 suspend: parse_json_column(31, row.get(31)?)?,
+                run: parse_json_column(35, row.get(35)?)?,
+                children: parse_json_column(36, row.get(36)?)?,
                 gang: parse_json_column(32, row.get(32)?)?,
                 name: row.get(1)?,
                 runtime: row.get(2)?,
@@ -6514,7 +6527,8 @@ impl Store {
                     Err(error)
                         if error
                             .downcast_ref::<crate::devices::DevicesUnavailable>()
-                            .is_some() =>
+                            .is_some()
+                            || error.downcast_ref::<PlacementSizeUnavailable>().is_some() =>
                     {
                         if first_skip_reason.is_none() {
                             first_skip_reason = Some(format!("{error:#}"));
@@ -7876,6 +7890,8 @@ impl Store {
             gang: parse_json_column(33, row.get(33)?)?,
             pending_extensions: parse_json_column(34, row.get(34)?)?.unwrap_or_default(),
             autoscale: parse_json_column(35, row.get(35)?)?,
+            run: parse_json_column(36, row.get(36)?)?,
+            children: parse_json_column(37, row.get(37)?)?,
         };
 
         Ok(task_config)
@@ -7923,6 +7939,7 @@ impl Store {
             identity_epoch: row.get::<_, i64>(12)?.max(0) as u64,
             named: row.get::<_, i64>(13)? != 0,
             promoted_from: row.get(14)?,
+            owner: row.get(15)?,
         };
 
         Ok(instance)
@@ -10220,6 +10237,7 @@ impl Store {
         tx.execute(delete_sql, [name])?;
         // Count overrides die with the job (control-owned, same capture).
         tx.execute("DELETE FROM task_scale WHERE job_id = ?;", [&job.id])?;
+        tx.execute("DELETE FROM task_resize WHERE job_id = ?;", [&job.id])?;
         // A destroyed job's scaling record goes with it (a recreated job of
         // the same name starts with no history and no pause).
         tx.execute("DELETE FROM scale_history WHERE job_id = ?;", [&job.id])?;
@@ -11711,6 +11729,8 @@ impl Store {
                 .transpose()?;
             let suspend = t.suspend.as_ref().map(serde_json::to_string).transpose()?;
             let gang = t.gang.as_ref().map(serde_json::to_string).transpose()?;
+            let run = t.run.as_ref().map(serde_json::to_string).transpose()?;
+            let children = t.children.as_ref().map(serde_json::to_string).transpose()?;
             let pending_extensions = if t.pending_extensions.is_empty() {
                 None
             } else {
@@ -11758,6 +11778,8 @@ impl Store {
                 ":gang": gang,
                 ":pending_extensions": pending_extensions,
                 ":autoscale": autoscale,
+                ":run": run,
+                ":children": children,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -11928,6 +11950,18 @@ impl Store {
                  AND task_config.name = task_scale.task_name);",
             params![job.id, job_config_id],
         )?;
+        // Size overrides follow the same rule (docs/resize.md): a submit
+        // that changes a task's `resources` drops its override.
+        for (group, task) in
+            self.arbitrate_task_resizes_tx(tx, &job.id, &job_config_id, &config.tasks)?
+        {
+            scale_reset_events.push(drafts::resize_reset(
+                &job.id,
+                &group,
+                &task,
+                "resubmit changed the task's resources; the spec owns the size again",
+            ));
+        }
 
         // Initial task_status rows are seeded by the status-lane half of
         // the submit composite (`seed_task_statuses`, plan §7-C2, C-2) —
@@ -12572,6 +12606,7 @@ impl Store {
         }
         self.work_log.resync_all();
         self.endpoint_index.mark_all();
+        self.runtime_states_changed();
         // Rows changed under the journal too: every watch resyncs.
         self.reset_revisions();
         if keyring {
@@ -12633,6 +12668,9 @@ impl Store {
         // key, a reset): this replica must unwrap the new rows before it can
         // read values written under them.
         let mut keyring_changed = false;
+        // A runtime disable was written or lifted
+        // (`storage/runtime_state_store.rs`).
+        let mut runtime_state_changed = false;
 
         // Column positions come from the live schema (changeset records use
         // the table's declared column order), so this cannot drift from
@@ -12651,6 +12689,7 @@ impl Store {
             let action = op.code();
             match table.as_str() {
                 "keyring_key" => keyring_changed = true,
+                "runtime_state" => runtime_state_changed = true,
                 "node" | "node_health" => {
                     // A node_health change patches the SAME cached Node —
                     // liveness hydrates from the node ⟕ node_health join
@@ -13044,6 +13083,10 @@ impl Store {
 
         if keyring_changed && !read_model_only {
             self.keyring_rows_changed();
+        }
+        // In `local_disk` mode too: the set is part of what plans read.
+        if runtime_state_changed {
+            self.runtime_states_changed();
         }
 
         // Resolve rows whose owning scope was not carried by the update
@@ -15010,8 +15053,39 @@ impl Store {
         // Stateful tasks: pick (or re-materialize) the instance this
         // allocation will fulfill before writing the row, so the binding is
         // atomic with the placement.
-        let instance_id =
-            self.assign_stateful_instance_tx(tx, task_id, node_id, target_instance)?;
+        // The binding can write (a slot re-activated, a keyed instance set
+        // active); a savepoint lets a unit whose own size does not fit this
+        // node be refused with nothing left behind.
+        tx.execute_batch("SAVEPOINT placement_size;")?;
+        let sized = self
+            .assign_stateful_instance_tx(tx, task_id, node_id, target_instance)
+            .and_then(|instance_id| {
+                // Resize overrides (docs/resize.md): the unit's own size
+                // over the task's override over what the caller packed.
+                let (sized, record) =
+                    self.placement_size_tx(tx, task_id, instance_id.as_deref(), resources)?;
+                let grows = crate::structs::resize::ResourceSize::of(resources)
+                    .grows_to(&crate::structs::resize::ResourceSize::of(&sized));
+                if grows && !self.node_fits_tx(tx, node_id, &sized)? {
+                    bail!(PlacementSizeUnavailable(format!(
+                        "node {node_id} has no room for {} at its resized size {}",
+                        instance_id.as_deref().unwrap_or("the task's unit"),
+                        crate::structs::resize::ResourceSize::of(&sized).to_json()
+                    )));
+                }
+                Ok((instance_id, sized, record))
+            });
+        let (instance_id, sized_resources, resize_record) = match sized {
+            Ok(sized) => {
+                tx.execute_batch("RELEASE placement_size;")?;
+                sized
+            }
+            Err(err) => {
+                tx.execute_batch("ROLLBACK TO placement_size; RELEASE placement_size;")?;
+                return Err(err);
+            }
+        };
+        let resources = &sized_resources;
 
         let params = named_params! {
             ":status": "placed",
@@ -15031,6 +15105,10 @@ impl Store {
         let allocation = tx
             .prepare_cached(&INSERT_ALLOCATION)?
             .query_row(params, |row| self.allocation_from_row(row))?;
+        if let Some(record) = resize_record {
+            tx.prepare_cached("UPDATE allocation SET resources_override = ?1 WHERE id = ?2;")?
+                .execute(params![record, allocation.id])?;
+        }
 
         if let Some(instance_id) = allocation.instance_id.as_deref() {
             let now = Self::now_rfc3339()?;
@@ -15984,6 +16062,15 @@ impl Store {
                 tracker.insert_from_node(&row?);
             }
             Some(tracker)
+        };
+
+        // A task-level size override (docs/resize.md) is what the row
+        // will hold, so it is what the capacity recheck packs.
+        let resources = {
+            let (group, name): (String, String) = tx
+                .prepare_cached("SELECT group_name, name FROM task_config WHERE id = ?;")?
+                .query_row([task_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            self.task_resources_with_override_tx(tx, &job_id, &group, &name, resources)?
         };
 
         Ok(AllocationTaskState {
@@ -18835,6 +18922,12 @@ impl Store {
         if instance.state == InstanceState::Terminated {
             return Ok(DestroyInstanceOutcome::AlreadyTerminated);
         }
+        // Its keyed children are destroyed in this entry, before it is
+        // (docs/child-sessions.md).
+        self.cascade_keyed_children_apply(
+            &format!("{}:{instance_id}", crate::structs::children::OWNER_INSTANCE),
+            OwnerEnd::Destroyed,
+        )?;
 
         let now = Self::now_rfc3339()?;
         let mut conn = self.write_connection()?;
@@ -18950,6 +19043,12 @@ impl Store {
             | InstanceState::Rescheduling
             | InstanceState::Suspended => {}
         }
+        // Its keyed children are stopped in this entry, before it is
+        // (docs/child-sessions.md).
+        self.cascade_keyed_children_apply(
+            &format!("{}:{instance_id}", crate::structs::children::OWNER_INSTANCE),
+            OwnerEnd::Stopped,
+        )?;
 
         let now = Self::now_rfc3339()?;
         let mut conn = self.write_connection()?;
@@ -31220,6 +31319,222 @@ mod tests {
             StorageError::from_anyhow(&err),
             Some(StorageError::NotFound { .. })
         ));
+        Ok(())
+    }
+
+    /// A job with a keyed owner task and a keyed child task, the owner
+    /// `agent-a` placed on `node-a`.
+    fn keyed_owner_and_child_job(store: &Store, job_id: &str) -> R<Allocation> {
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        store.insert_node(make_node_msg("node-b", "active"))?;
+        submit_job(
+            store,
+            job_id,
+            vec![
+                stateful_keyed_task("agent", false),
+                stateful_keyed_task("workspace", false),
+            ],
+        )?;
+        store.create_keyed_instance(job_id, "default", "agent", Some("agent-a"))?;
+        let agent_task = task_id_for(store, "agent", job_id)?;
+        store.place_alloc("node-a", agent_task)
+    }
+
+    fn keyed_child(store: &Store, job_id: &str, id: &str, owner: &str, max: u32) -> R<Instance> {
+        match store.create_keyed_child_instance(
+            job_id,
+            "default",
+            "workspace",
+            Some(id),
+            owner,
+            max,
+            0,
+        )? {
+            KeyedChildOutcome::Created(instance) => Ok(*instance),
+            other => bail!("expected a created child, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_keyed_child_stores_its_owner_and_max_bounds_it_test() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-children";
+        keyed_owner_and_child_job(&store, job_id)?;
+
+        let child = keyed_child(&store, job_id, "ws-1", "instance:agent-a", 2)?;
+        assert_eq!(child.owner.as_deref(), Some("instance:agent-a"));
+        let owner = child.owner_ref().context("typed owner")?;
+        assert_eq!(
+            (owner.kind.as_str(), owner.id.as_str()),
+            ("instance", "agent-a")
+        );
+        assert_eq!(
+            store
+                .keyed_children_of("instance:agent-a")?
+                .iter()
+                .map(|child| child.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ws-1"]
+        );
+
+        // `max` counts keyed children and the session children the caller
+        // counted, together.
+        let refused = store.create_keyed_child_instance(
+            job_id,
+            "default",
+            "workspace",
+            Some("ws-2"),
+            "instance:agent-a",
+            2,
+            1,
+        )?;
+        assert_eq!(refused, KeyedChildOutcome::AtMax { children: 2 });
+        assert!(store.get_instance("ws-2")?.is_none(), "nothing was written");
+        keyed_child(&store, job_id, "ws-2", "instance:agent-a", 2)?;
+        assert_eq!(
+            store.create_keyed_child_instance(
+                job_id,
+                "default",
+                "workspace",
+                Some("ws-3"),
+                "instance:agent-a",
+                2,
+                0,
+            )?,
+            KeyedChildOutcome::AtMax { children: 2 }
+        );
+
+        // An owner that has ended owns nothing: the create is NotFound.
+        let err = store
+            .create_keyed_child_instance(
+                job_id,
+                "default",
+                "workspace",
+                Some("ws-9"),
+                "allocation:987654",
+                2,
+                0,
+            )
+            .expect_err("a missing allocation owns nothing");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::NotFound { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_a_keyed_owner_stops_its_keyed_children_in_the_same_write_test() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-cascade-stop";
+        keyed_owner_and_child_job(&store, job_id)?;
+        keyed_child(&store, job_id, "ws-1", "instance:agent-a", 2)?;
+        let workspace_task = task_id_for(&store, "workspace", job_id)?;
+        let child_alloc = store.place_alloc("node-a", workspace_task)?;
+        assert_eq!(child_alloc.instance_id.as_deref(), Some("ws-1"));
+
+        // Suspending the owner is not an end: nothing cascades, and the
+        // sweep finds nothing either.
+        store.set_instance_state("agent-a", InstanceState::Suspended)?;
+        assert!(store.orphaned_keyed_children()?.is_empty());
+        assert_eq!(
+            store.get_instance("ws-1")?.context("child")?.state,
+            InstanceState::Active
+        );
+        store.set_instance_state("agent-a", InstanceState::Active)?;
+
+        store.stop_keyed_instance("agent-a")?;
+        let child = store.get_instance("ws-1")?.context("child row is kept")?;
+        assert_eq!(child.state, InstanceState::Stopped, "the owner's verb");
+        assert!(
+            store.get_allocation_by_id(child_alloc.id)?.is_none(),
+            "the child's allocation went with it"
+        );
+        assert_eq!(
+            child.owner.as_deref(),
+            Some("instance:agent-a"),
+            "a stopped child stays its owner's"
+        );
+        assert!(
+            store.orphaned_keyed_children()?.is_empty(),
+            "the cascade left nothing for the sweep"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn destroying_a_keyed_owner_destroys_its_keyed_children_test() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-cascade-destroy";
+        keyed_owner_and_child_job(&store, job_id)?;
+        keyed_child(&store, job_id, "ws-1", "instance:agent-a", 2)?;
+        // A child stopped earlier is destroyed too.
+        keyed_child(&store, job_id, "ws-2", "instance:agent-a", 2)?;
+        store.stop_keyed_instance("ws-2")?;
+
+        store.destroy_keyed_instance("agent-a")?;
+        for id in ["ws-1", "ws-2"] {
+            assert_eq!(
+                store.get_instance(id)?.context("named tombstone")?.state,
+                InstanceState::Terminated,
+                "{id}"
+            );
+        }
+        assert!(store.keyed_children_of("instance:agent-a")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn the_sweep_ends_keyed_children_of_an_allocation_that_ended_test() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-sweep";
+        let owner_alloc = keyed_owner_and_child_job(&store, job_id)?;
+        let owner = format!("allocation:{}", owner_alloc.id);
+        keyed_child(&store, job_id, "ws-1", &owner, 1)?;
+        assert!(store.orphaned_keyed_children()?.is_empty());
+        assert!(store.end_orphaned_keyed_children()?.is_empty());
+
+        store.remove_allocation_by_id(owner_alloc.id)?;
+        assert_eq!(
+            store.orphaned_keyed_children()?,
+            vec![("ws-1".to_string(), owner.clone())]
+        );
+        let ended = store.end_orphaned_keyed_children()?;
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].instance_id, "ws-1");
+        assert_eq!(ended[0].end, OwnerEnd::Stopped);
+        assert_eq!(
+            store.get_instance("ws-1")?.context("child")?.state,
+            InstanceState::Stopped
+        );
+        assert!(
+            store.orphaned_keyed_children()?.is_empty(),
+            "a stopped child of a stopped owner is settled"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_pending_keyed_child_prefers_its_owners_node_test() -> R<()> {
+        let store = setup_store()?;
+        let job_id = "keyed-affinity";
+        keyed_owner_and_child_job(&store, job_id)?;
+        let workspace_task = task_id_for(&store, "workspace", job_id)?;
+        assert!(store
+            .owner_node_preferences_for_task(workspace_task)?
+            .is_empty());
+        // An unowned pending instance of the task has no preference.
+        store.create_keyed_instance(job_id, "default", "workspace", Some("ws-free"))?;
+        keyed_child(&store, job_id, "ws-1", "instance:agent-a", 2)?;
+        let expected = vec![("ws-1".to_string(), "node-a".to_string())];
+        assert_eq!(
+            store.owner_node_preferences_for_task(workspace_task)?,
+            expected
+        );
+        assert_eq!(
+            store.owner_node_preferences_for_task_named(job_id, "default", "workspace")?,
+            expected
+        );
         Ok(())
     }
 

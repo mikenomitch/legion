@@ -569,6 +569,30 @@ pub async fn run_manager_with(
         }
     });
 
+    // Keyed children whose owner ended some way other than an instance
+    // stop or destroy, which cascade in their own entry
+    // (docs/child-sessions.md, "When an owner ends").
+    let child_store = store.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(crate::manager::children::KEYED_CHILD_SWEEP_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let store = child_store.clone();
+            let swept = tokio::task::spawn_blocking(move || {
+                crate::manager::children::sweep_keyed_children(&store)
+            })
+            .await;
+            match swept {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    debug!(error = ?err, "Keyed child sweep failed; retrying next tick")
+                }
+                Err(join_error) => warn!("Keyed child sweep task failed: {join_error:?}"),
+            }
+        }
+    });
+
     // Read-model maintenance on every manager (each holds its own cache):
     // rebuild after an outside commit to the state database, and reload a
     // rotating slice of nodes so drift from any source heals within one
@@ -3887,7 +3911,15 @@ pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> Eva
         // evals that place work block; a node-scoped pass already queues a
         // per-job reschedule for what it could not place, and a rollout tick
         // keeps failing its rollout.
-        Err(e) if blocks_on_capacity(eval) && PlacementBlocked::in_chain(&e).is_some() => {
+        //
+        // A rollout tick is the one exception: paused on a disabled runtime
+        // (docs/runtime-disable.md), it carries a retry delay and goes back
+        // to the queue to look again, with its rollout not failed.
+        Err(e)
+            if PlacementBlocked::in_chain(&e).is_some_and(|blocked| {
+                blocks_on_capacity(eval) || pauses_on_runtime(eval, blocked)
+            }) =>
+        {
             let blocked = PlacementBlocked::in_chain(&e)
                 .cloned()
                 .expect("matched by the guard");
@@ -3899,8 +3931,9 @@ pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> Eva
                     worker_id,
                     eval_id = %eval.id,
                     kind = %eval.kind,
+                    key = %blocked.key,
                     delay_ms = delay.as_millis() as u64,
-                    "Eval waits for preemption victims to age past victimExemptAge: {}",
+                    "Eval waits and retries on the clock: {}",
                     blocked.message
                 );
                 clear_not_leader_attempts(&eval.id);
@@ -3972,6 +4005,14 @@ fn blocks_on_capacity(eval: &Eval) -> bool {
             eval.kind.as_str(),
             "job_submit" | "job_update" | "job_reschedule" | "job_scale"
         )
+}
+
+/// A rollout tick paused because a task's runtime is disabled: requeued on
+/// the clock instead of failing its rollout.
+fn pauses_on_runtime(eval: &Eval, blocked: &PlacementBlocked) -> bool {
+    eval.kind == "rollout_tick"
+        && blocked.retry_after.is_some()
+        && crate::structs::runtime_state::blocked_key_runtime(&blocked.key).is_some()
 }
 
 /// Pause after a capacity event before the wake pass runs, so a burst (a

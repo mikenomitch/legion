@@ -28,17 +28,24 @@
 //! # Layout
 //!
 //! ```text
-//! <worker state dir>/rootfs-cache/
-//!   <key>/rootfs.img   the base (mode 0444)
-//!   <key>/base.json    what it was built from; its mtime is the last use
-//!   tmp/               fills in progress, cleared when the worker starts
+//! <worker state dir>/content/derived/
+//!   rootfs/<key>/rootfs.img   the base (mode 0444)
+//!   rootfs/<key>/base.json    what it was built from
+//!   tmp/                      fills in progress, cleared when the worker starts
 //! ```
 //!
-//! It sits beside the allocation dirs so a clone can be a reflink. The key is
-//! a hash of everything that decides a base's bytes ([`BaseInputs`]): the
-//! image's layer digests, the guest binary, and the task's
-//! `rootfs_headroom_mib`. Env, hostname, command, and volumes are not in it,
-//! because none of them are in the base.
+//! Bases are **derived content** (docs/artifacts.md, "Derived content"): the
+//! `rootfs` kind of the node content store's `derived` class, which owns the
+//! index, the budget, eviction, and the single-flight claim. This module
+//! holds what is specific to root disks: how one is built, how a start gets
+//! its own copy, and how a miss fills the cache without slowing the start.
+//!
+//! The store sits beside the allocation dirs so a clone can be a reflink.
+//! The key is the recipe's: a hash of everything that decides a base's bytes
+//! ([`BaseInputs`]), which is the image's layer digests, the guest binary,
+//! and the task's `rootfs_headroom_mib`, plus the builder's version. Env,
+//! hostname, command, and volumes are not in it, because none of them are in
+//! the base.
 //!
 //! # Filling it
 //!
@@ -55,47 +62,38 @@
 //!
 //! # Bounds
 //!
-//! The cache holds at most its byte budget (`LEGION_SANDBOX_ROOTFS_CACHE`,
-//! default 10% of the filesystem, clamped to 1 to 20 GiB), counted in blocks
-//! actually allocated. A commit evicts the least recently used bases first,
-//! a base larger than the whole budget is never kept, and none is kept while
-//! the disk is below the content store's `minFreeDisk`. A clone is
-//! independent of its base, so evicting a base never touches a running
-//! sandbox.
+//! Bases share the derived class's byte budget (`content.budgets.derived`,
+//! default 10% of the filesystem, clamped to 1 to 20 GiB, `"0"` for off),
+//! counted in blocks actually allocated. A commit evicts the least recently
+//! used derived entries first, a base larger than the whole budget is never
+//! kept, and none is kept while the disk is below the content store's
+//! `minFreeDisk`. A clone is independent of its base, so evicting a base
+//! never touches a running sandbox.
 
-use crate::content_store::BudgetSpec;
+use crate::content_store::{ContentStore, DerivedFlight, DerivedKind, DerivedSkip, Recipe};
 use crate::prelude::*;
 use crate::task_plugins::microvm::{self, BaseFacts, GuestBinary};
 use crate::task_plugins::oci_bundle;
 use crate::volumes::copy::{self, CopyMethod};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, RwLock};
-use std::time::{Instant, SystemTime};
-
-/// The worker's root disk cache budget: a size (`"20GiB"`), a share of the
-/// filesystem holding the worker state dir (`"10%"`), or `0` / `off` to turn
-/// the cache off.
-pub(crate) const CACHE_ENV: &str = "LEGION_SANDBOX_ROOTFS_CACHE";
-
-const GIB: u64 = 1024 * 1024 * 1024;
-
-/// The default budget: 10% of the filesystem, clamped to 1..20 GiB. A base
-/// costs about its image's unpacked size, so 20 GiB holds a dozen or more
-/// typical sandbox images, and 1 GiB still holds a slim one.
-pub(crate) const DEF_BUDGET: BudgetSpec = BudgetSpec::Share {
-    percent: 10.0,
-    min: GIB,
-    max: 20 * GIB,
-};
+use std::sync::RwLock;
+use std::time::Instant;
 
 /// Bumped whenever what goes into a base changes, so a worker never clones a
 /// base that an older build laid out differently.
 const FORMAT: &str = "1";
 const IMAGE_FILE: &str = "rootfs.img";
 const META_FILE: &str = "base.json";
-const TMP_DIR: &str = "tmp";
+
+/// The derived-content kind bases are kept under.
+const KIND: DerivedKind = DerivedKind::Rootfs;
+
+/// The builder version in a base's recipe: this build of Legion and the
+/// base format. A new release rebuilds each base once, on first use.
+fn builder_version() -> String {
+    format!("legion-{}+rootfs.{FORMAT}", env!("CARGO_PKG_VERSION"))
+}
 
 /// Everything that decides a base's bytes, and so its cache key.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -111,20 +109,22 @@ pub(crate) struct BaseInputs {
 }
 
 impl BaseInputs {
-    /// The cache key: a digest of the inputs and the base format.
-    pub(crate) fn key(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(b"legion-rootfs-base\0");
-        hasher.update(FORMAT.as_bytes());
-        for layer in &self.layers {
-            hasher.update(b"\0layer\0");
-            hasher.update(layer.as_bytes());
+    /// The derived-content recipe for this base. It carries the layer
+    /// digests, a fingerprint of the guest binary's identity, and the
+    /// headroom: nothing of any one sandbox.
+    pub(crate) fn recipe(&self) -> Recipe {
+        let mut recipe = Recipe::new(KIND, builder_version());
+        for (index, layer) in self.layers.iter().enumerate() {
+            recipe = recipe.listed("layer", index, layer);
         }
-        hasher.update(b"\0guest-binary\0");
-        hasher.update(self.guest_binary.as_bytes());
-        hasher.update(b"\0headroom\0");
-        hasher.update(self.headroom_mib.to_string().as_bytes());
-        format!("{:x}", hasher.finalize())
+        recipe
+            .fingerprint("guestBinary", self.guest_binary.as_bytes())
+            .number("headroomMib", self.headroom_mib)
+    }
+
+    /// The cache key: the recipe's.
+    pub(crate) fn key(&self) -> String {
+        self.recipe().key()
     }
 }
 
@@ -215,46 +215,10 @@ pub enum Ensured {
     Disabled,
 }
 
-/// One fill in flight. Waiters block until it is done, whatever happened.
-#[derive(Default)]
-struct Flight {
-    done: Mutex<bool>,
-    finished: Condvar,
-}
-
-impl Flight {
-    fn wait(&self) {
-        let mut done = self.done.lock().unwrap_or_else(|p| p.into_inner());
-        while !*done {
-            done = self.finished.wait(done).unwrap_or_else(|p| p.into_inner());
-        }
-    }
-}
-
-/// The right to fill one key. Dropping it (on success, failure, or a skip)
-/// wakes everyone waiting for that key.
-struct FlightGuard {
-    cache: Arc<RootfsCache>,
-    key: String,
-    flight: Arc<Flight>,
-}
-
-impl Drop for FlightGuard {
-    fn drop(&mut self) {
-        self.cache
-            .flights
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.key);
-        *self.flight.done.lock().unwrap_or_else(|p| p.into_inner()) = true;
-        self.flight.finished.notify_all();
-    }
-}
-
 /// A committed base.
 struct Entry {
+    key: String,
     image: PathBuf,
-    meta_path: PathBuf,
     meta: BaseMeta,
 }
 
@@ -266,16 +230,10 @@ struct BaseMeta {
     facts: BaseFacts,
 }
 
-/// The node's base root disk cache.
+/// The node's base root disk cache: the `rootfs` kind of the content
+/// store's derived class.
 pub(crate) struct RootfsCache {
-    root: PathBuf,
-    budget: u64,
-    min_free: u64,
-    /// Serializes commits and eviction. Lookups and clones do not take it:
-    /// a base evicted between a lookup and its clone fails the clone, and
-    /// the start falls back to a build.
-    commit_lock: Mutex<()>,
-    flights: Mutex<BTreeMap<String, Arc<Flight>>>,
+    store: Arc<ContentStore>,
     /// Keys whose base is larger than the whole budget. Their starts build
     /// side by side instead of queueing behind a fill that cannot succeed.
     oversized: Mutex<BTreeSet<String>>,
@@ -287,9 +245,8 @@ pub(crate) struct RootfsCache {
 impl std::fmt::Debug for RootfsCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RootfsCache")
-            .field("root", &self.root)
-            .field("budget", &self.budget)
-            .field("min_free", &self.min_free)
+            .field("root", &self.store.root())
+            .field("budget", &self.store.derived_budget())
             .finish()
     }
 }
@@ -301,63 +258,51 @@ pub(crate) fn node_cache() -> Option<Arc<RootfsCache>> {
     NODE_CACHE.read().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
-/// Reads [`CACHE_ENV`]: `None` turns the cache off.
-fn budget_spec_from_env() -> Option<BudgetSpec> {
-    let Ok(raw) = std::env::var(CACHE_ENV) else {
-        return Some(DEF_BUDGET);
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Some(DEF_BUDGET);
-    }
-    if raw.eq_ignore_ascii_case("off") || raw == "0" {
-        return None;
-    }
-    match BudgetSpec::parse(raw) {
-        Ok(BudgetSpec::Bytes(0)) => None,
-        Ok(spec) => Some(spec),
-        Err(err) => {
-            warn!(
-                value = raw,
-                error = %format!("{err:#}"),
-                "Invalid {CACHE_ENV} (expected a size such as \"20GiB\", a share such as \
-                 \"10%\", or \"off\"); using the default"
-            );
-            Some(DEF_BUDGET)
+/// Registers the worker's root disk cache on its node content store, and
+/// removes `legacy_dir`: the `rootfs-cache/` directory of a worker from
+/// before bases were derived content. Bases rebuild on first use.
+///
+/// With no store (the content store is disabled or could not open) or a
+/// derived budget of `0`, the cache is off: starts then build every root
+/// disk, as they would without it.
+pub(crate) fn init(store: Option<Arc<ContentStore>>, legacy_dir: &Path) {
+    remove_legacy_cache(legacy_dir);
+    let cache = match store {
+        None => {
+            info!("Sandbox root disk cache off (this node has no content store)");
+            None
         }
-    }
-}
-
-/// Opens the worker's cache at `root` (beside its allocation dirs) and
-/// registers it for sandbox starts. `min_free` is the content store's
-/// `minFreeDisk`. A cache that cannot open is logged and left off: starts
-/// then build every root disk, as they would without it.
-pub(crate) fn init(root: &Path, min_free: u64) {
-    let Some(spec) = budget_spec_from_env() else {
-        info!("Sandbox root disk cache off ({CACHE_ENV})");
-        return;
-    };
-    let _ = std::fs::create_dir_all(root);
-    let budget = match crate::content_store::filesystem_bytes(root) {
-        Some(total) => spec.resolve(total),
-        None => match spec {
-            BudgetSpec::Bytes(bytes) => bytes,
-            BudgetSpec::Share { min, .. } => min,
-        },
-    };
-    match RootfsCache::open(root, budget, min_free) {
-        Ok(cache) => {
+        Some(store) if store.derived_budget() == 0 => {
+            info!("Sandbox root disk cache off (content.budgets.derived is 0)");
+            None
+        }
+        Some(store) => {
             info!(
-                dir = %root.display(),
-                budget_bytes = budget,
+                dir = %store.derived_path(KIND, "").display(),
+                budget_bytes = store.derived_budget(),
                 "Sandbox root disk cache open"
             );
-            *NODE_CACHE.write().unwrap_or_else(|p| p.into_inner()) = Some(cache);
+            Some(RootfsCache::on(store))
         }
+    };
+    *NODE_CACHE.write().unwrap_or_else(|p| p.into_inner()) = cache;
+}
+
+/// Deletes the pre-derived-content cache directory, when one is left.
+fn remove_legacy_cache(legacy_dir: &Path) {
+    if !legacy_dir.is_dir() {
+        return;
+    }
+    match std::fs::remove_dir_all(legacy_dir) {
+        Ok(()) => info!(
+            dir = %legacy_dir.display(),
+            "Removed the old sandbox root disk cache; bases are kept as derived content now \
+             and rebuild on first use"
+        ),
         Err(err) => warn!(
-            dir = %root.display(),
-            error = %format!("{err:#}"),
-            "Could not open the sandbox root disk cache; every sandbox start builds its root disk"
+            dir = %legacy_dir.display(),
+            error = %err,
+            "Could not remove the old sandbox root disk cache; delete it to free its disk"
         ),
     }
 }
@@ -415,16 +360,7 @@ fn build_at(builder: &dyn BaseBuilder, dest: &Path, tree: &Path) -> R<BaseFacts>
 
 /// Blocks actually allocated to `path`: what a sparse image costs the disk.
 fn allocated_bytes(path: &Path) -> u64 {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return 0;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        meta.blocks().saturating_mul(512)
-    }
-    #[cfg(not(unix))]
-    meta.len()
+    crate::content_store::allocated_bytes(path)
 }
 
 fn set_mode(path: &Path, mode: u32) -> R<()> {
@@ -439,69 +375,91 @@ fn set_mode(path: &Path, mode: u32) -> R<()> {
     Ok(())
 }
 
+const OVERSIZED: &str = "the base is larger than the cache budget";
+
+/// Why the store did not keep a base, in this cache's words.
+fn skip_reason(skip: DerivedSkip) -> &'static str {
+    match skip {
+        DerivedSkip::Oversized => OVERSIZED,
+        DerivedSkip::BelowMinFree => "the disk is below minFreeDisk",
+        DerivedSkip::AlreadyPresent => "it was already cached",
+        DerivedSkip::NoRoom => "pinned derived content leaves no room for it",
+        DerivedSkip::Disabled => "the cache is off",
+        DerivedSkip::Failed => "could not record it",
+    }
+}
+
 impl RootfsCache {
-    /// Opens the cache at `root` with a byte budget, clearing fills a
-    /// previous worker left half done and bases this build cannot use.
+    /// The cache on a node content store.
+    pub(crate) fn on(store: Arc<ContentStore>) -> Arc<Self> {
+        Self::on_with(store, true)
+    }
+
+    fn on_with(store: Arc<ContentStore>, reflinks: bool) -> Arc<Self> {
+        Arc::new(RootfsCache {
+            store,
+            oversized: Mutex::new(BTreeSet::new()),
+            reflinks,
+        })
+    }
+
+    /// A cache on its own content store at `root` whose derived budget is
+    /// `budget`: what a worker's cache is, without the worker.
+    #[cfg(test)]
     pub(crate) fn open(root: &Path, budget: u64, min_free: u64) -> R<Arc<Self>> {
         Self::open_with(root, budget, min_free, true)
     }
 
+    #[cfg(test)]
     fn open_with(root: &Path, budget: u64, min_free: u64, reflinks: bool) -> R<Arc<Self>> {
-        std::fs::create_dir_all(root)
-            .with_context(|| format!("create root disk cache {}", root.display()))?;
-        let tmp = root.join(TMP_DIR);
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        let cache = Arc::new(RootfsCache {
-            root: root.to_path_buf(),
-            budget,
-            min_free,
-            commit_lock: Mutex::new(()),
-            flights: Mutex::new(BTreeMap::new()),
-            oversized: Mutex::new(BTreeSet::new()),
-            reflinks,
-        });
-        for entry in std::fs::read_dir(root)?.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == TMP_DIR {
-                continue;
-            }
-            if cache.lookup(&name).is_none() {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-        // The budget may have shrunk since the last run.
-        {
-            let _guard = cache.commit_lock.lock().unwrap_or_else(|p| p.into_inner());
-            cache.evict_to(budget);
-        }
-        Ok(cache)
+        use crate::content_store::{ContentBudgets, ContentStoreConfig};
+        let store = ContentStore::open(
+            root,
+            ContentStoreConfig {
+                budgets: ContentBudgets {
+                    artifacts: 0,
+                    snapshots: 0,
+                    derived: budget,
+                },
+                ttl: None,
+                min_free_disk: min_free,
+            },
+        )?;
+        Ok(Self::on_with(Arc::new(store), reflinks))
     }
 
-    /// A fresh directory under `tmp/`, on the cache's filesystem.
+    fn budget(&self) -> u64 {
+        self.store.derived_budget()
+    }
+
+    /// A fresh directory under the store's `derived/tmp/`, on its filesystem.
     fn stage(&self) -> R<PathBuf> {
-        let dir = self.root.join(TMP_DIR).join(crate::util::random_string(12));
-        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        Ok(dir)
+        self.store.derived_stage()
     }
 
     fn lookup(&self, key: &str) -> Option<Entry> {
-        let dir = self.root.join(key);
-        let meta_path = dir.join(META_FILE);
-        let meta: BaseMeta = serde_json::from_slice(&std::fs::read(&meta_path).ok()?).ok()?;
-        let image = dir.join(IMAGE_FILE);
-        (meta.format == FORMAT && meta.inputs.key() == key && image.is_file()).then_some(Entry {
+        let entry = self.store.derived_lookup(KIND, key, false).ok().flatten()?;
+        let image = entry.path.join(IMAGE_FILE);
+        let meta = std::fs::read(entry.path.join(META_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<BaseMeta>(&bytes).ok())
+            .filter(|meta| meta.format == FORMAT && meta.inputs.key() == key && image.is_file());
+        let Some(meta) = meta else {
+            // Indexed, and not a base this build can use: drop it, so the
+            // next fill can take its place.
+            let _ = self.store.derived_remove(KIND, key);
+            return None;
+        };
+        Some(Entry {
+            key: key.to_string(),
             image,
-            meta_path,
             meta,
         })
     }
 
     /// Marks a base used now: eviction goes by this.
-    fn touch(entry: &Entry) {
-        if let Ok(file) = std::fs::File::options().write(true).open(&entry.meta_path) {
-            let _ = file.set_modified(SystemTime::now());
-        }
+    fn touch(&self, entry: &Entry) {
+        let _ = self.store.derived_lookup(KIND, &entry.key, true);
     }
 
     /// Clones a base to `dest` for one sandbox.
@@ -510,26 +468,17 @@ impl RootfsCache {
         let method = copy::clone_file_with(&entry.image, dest, self.reflinks)?;
         // The base is read-only. The clone is this sandbox's disk.
         set_mode(dest, 0o600)?;
-        Self::touch(entry);
+        self.touch(entry);
+        crate::telemetry::worker_metrics()
+            .derived_hits_total
+            .inc(&[KIND.as_str()]);
         Ok(method)
     }
 
     /// Takes the right to fill `key`, or, when a fill is already in flight,
     /// waits for it to finish and returns `None`.
-    fn claim(self: &Arc<Self>, key: &str) -> Option<FlightGuard> {
-        let mut flights = self.flights.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(flight) = flights.get(key).cloned() {
-            drop(flights);
-            flight.wait();
-            return None;
-        }
-        let flight = Arc::new(Flight::default());
-        flights.insert(key.to_string(), flight.clone());
-        Some(FlightGuard {
-            cache: self.clone(),
-            key: key.to_string(),
-            flight,
-        })
+    fn claim(&self, key: &str) -> Option<DerivedFlight> {
+        self.store.derived_claim(KIND, key)
     }
 
     fn is_oversized(&self, key: &str) -> bool {
@@ -537,6 +486,13 @@ impl RootfsCache {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .contains(key)
+    }
+
+    fn note_oversized(&self, key: &str) {
+        self.oversized
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.to_string());
     }
 
     /// Puts a base root disk at `dest` for a sandbox start: cloned from the
@@ -577,7 +533,7 @@ impl RootfsCache {
         let facts = build_at(&*builder, dest, tree);
         let _ = std::fs::remove_dir_all(tree);
         let reason = if self.is_oversized(&key) {
-            "the base is larger than the cache budget"
+            OVERSIZED
         } else {
             "the concurrent fill did not keep it"
         };
@@ -588,12 +544,13 @@ impl RootfsCache {
     /// start would, then keep a copy for the next one.
     fn build_and_fill(
         self: &Arc<Self>,
-        guard: FlightGuard,
+        guard: DerivedFlight,
         builder: Arc<dyn BaseBuilder>,
         inputs: &BaseInputs,
         dest: &Path,
         tree: &Path,
     ) -> R<(BaseFacts, Outcome)> {
+        let started = Instant::now();
         let facts = match build_at(&*builder, dest, tree) {
             Ok(facts) => facts,
             Err(err) => {
@@ -601,26 +558,26 @@ impl RootfsCache {
                 return Err(err);
             }
         };
+        self.store
+            .derived_observe_build(KIND, started.elapsed().as_secs_f64());
         let fill = self.fill_from_build(guard, builder, inputs, facts, dest, tree);
         Ok((facts, Outcome::Built(fill)))
     }
 
     fn fill_from_build(
         self: &Arc<Self>,
-        guard: FlightGuard,
+        guard: DerivedFlight,
         builder: Arc<dyn BaseBuilder>,
         inputs: &BaseInputs,
         facts: BaseFacts,
         dest: &Path,
         tree: &Path,
     ) -> Fill {
-        if allocated_bytes(dest) > self.budget {
-            self.oversized
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(guard.key.clone());
+        let key = inputs.key();
+        if allocated_bytes(dest) > self.budget() {
+            self.note_oversized(&key);
             let _ = std::fs::remove_dir_all(tree);
-            return Fill::Skipped("the base is larger than the cache budget");
+            return Fill::Skipped(OVERSIZED);
         }
         let staged = match self.stage() {
             Ok(staged) => staged,
@@ -634,7 +591,7 @@ impl RootfsCache {
         // sandbox's own were written: a reflink of it *is* the base.
         if self.reflinks && copy::reflink_file(dest, &staged.join(IMAGE_FILE)) {
             let _ = std::fs::remove_dir_all(tree);
-            return match self.commit(&guard.key, &staged, inputs, facts) {
+            return match self.commit(&staged, inputs, facts) {
                 Ok(()) => Fill::Reflink,
                 Err(reason) => Fill::Skipped(reason),
             };
@@ -658,17 +615,17 @@ impl RootfsCache {
                 let formatted = builder.format(&staged_tree, &image);
                 let _ = std::fs::remove_dir_all(&staged_tree);
                 match formatted {
-                    Ok(()) => match cache.commit(&guard.key, &staged, &inputs, facts) {
+                    Ok(()) => match cache.commit(&staged, &inputs, facts) {
                         Ok(()) => info!(
-                            key = %guard.key,
+                            key = %key,
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "Cached a sandbox root disk base"
                         ),
-                        Err(reason) => debug!(key = %guard.key, reason, "Root disk base not cached"),
+                        Err(reason) => debug!(key = %key, reason, "Root disk base not cached"),
                     },
                     Err(err) => {
                         let _ = std::fs::remove_dir_all(&staged);
-                        warn!(key = %guard.key, error = %format!("{err:#}"), "Could not format a root disk base for the cache");
+                        warn!(key = %key, error = %format!("{err:#}"), "Could not format a root disk base for the cache");
                     }
                 }
                 drop(guard);
@@ -687,11 +644,11 @@ impl RootfsCache {
     ) -> R<Ensured> {
         let key = inputs.key();
         if let Some(entry) = self.lookup(&key) {
-            Self::touch(&entry);
+            self.touch(&entry);
             return Ok(Ensured::Present);
         }
         if self.is_oversized(&key) {
-            return Ok(Ensured::Skipped("the base is larger than the cache budget"));
+            return Ok(Ensured::Skipped(OVERSIZED));
         }
         let Some(guard) = self.claim(&key) else {
             return Ok(match self.lookup(&key) {
@@ -702,6 +659,7 @@ impl RootfsCache {
         let staged = self.stage()?;
         let tree = staged.join("tree");
         let image = staged.join(IMAGE_FILE);
+        let started = Instant::now();
         let built = build_at(&*builder, &image, &tree);
         let _ = std::fs::remove_dir_all(&tree);
         let facts = match built {
@@ -711,15 +669,14 @@ impl RootfsCache {
                 return Err(err);
             }
         };
-        if allocated_bytes(&image) > self.budget {
-            self.oversized
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(key.clone());
+        self.store
+            .derived_observe_build(KIND, started.elapsed().as_secs_f64());
+        if allocated_bytes(&image) > self.budget() {
+            self.note_oversized(&key);
             let _ = std::fs::remove_dir_all(&staged);
-            return Ok(Ensured::Skipped("the base is larger than the cache budget"));
+            return Ok(Ensured::Skipped(OVERSIZED));
         }
-        let result = match self.commit(&key, &staged, inputs, facts) {
+        let result = match self.commit(&staged, inputs, facts) {
             Ok(()) => Ensured::Built,
             Err(reason) => Ensured::Skipped(reason),
         };
@@ -727,30 +684,21 @@ impl RootfsCache {
         Ok(result)
     }
 
-    /// Moves a staged base (`staged/rootfs.img`) into the cache under `key`,
-    /// evicting least recently used bases to make room. The reason it was
-    /// not kept, on failure; `staged` is gone either way.
+    /// Hands a staged base (`staged/rootfs.img`) to the content store, which
+    /// moves it into place under its recipe key and evicts least recently
+    /// used derived content to make room. The reason it was not kept, on
+    /// failure; `staged` is gone either way.
     fn commit(
         &self,
-        key: &str,
         staged: &Path,
         inputs: &BaseInputs,
         facts: BaseFacts,
     ) -> Result<(), &'static str> {
-        let _guard = self.commit_lock.lock().unwrap_or_else(|p| p.into_inner());
         let discard = |reason| {
             let _ = std::fs::remove_dir_all(staged);
             Err(reason)
         };
         let image = staged.join(IMAGE_FILE);
-        let bytes = allocated_bytes(&image);
-        if bytes > self.budget {
-            return discard("the base is larger than the cache budget");
-        }
-        if crate::content_store::free_bytes(&self.root).is_some_and(|free| free < self.min_free) {
-            return discard("the disk is below minFreeDisk");
-        }
-        self.evict_to(self.budget.saturating_sub(bytes));
         let meta = BaseMeta {
             format: FORMAT.to_string(),
             inputs: inputs.clone(),
@@ -763,47 +711,13 @@ impl RootfsCache {
         {
             return discard("could not record it");
         }
-        let dest = self.root.join(key);
-        if dest.exists() {
-            return discard("it was already cached");
-        }
-        if std::fs::rename(staged, &dest).is_err() {
-            return discard("could not move it into place");
-        }
-        Ok(())
-    }
-
-    /// Bases, oldest use first, with their allocated bytes.
-    fn entries_by_age(&self) -> Vec<(PathBuf, u64, SystemTime)> {
-        let mut entries: Vec<(PathBuf, u64, SystemTime)> = std::fs::read_dir(&self.root)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|entry| entry.file_name() != TMP_DIR)
-            .map(|entry| {
-                let dir = entry.path();
-                let used = std::fs::metadata(dir.join(META_FILE))
-                    .and_then(|meta| meta.modified())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                (dir.clone(), allocated_bytes(&dir.join(IMAGE_FILE)), used)
-            })
-            .collect();
-        entries.sort_by_key(|(_, _, used)| *used);
-        entries
-    }
-
-    /// Evicts least recently used bases until the cache holds at most
-    /// `target` bytes. The caller holds `commit_lock`.
-    fn evict_to(&self, target: u64) {
-        let entries = self.entries_by_age();
-        let mut total: u64 = entries.iter().map(|(_, bytes, _)| *bytes).sum();
-        for (dir, bytes, _) in entries {
-            if total <= target {
-                break;
-            }
-            if std::fs::remove_dir_all(&dir).is_ok() {
-                total = total.saturating_sub(bytes);
-                debug!(dir = %dir.display(), bytes, "Evicted a sandbox root disk base");
+        match self.store.derived_commit(&inputs.recipe(), staged) {
+            Ok(_) => Ok(()),
+            Err(skip) => {
+                if skip == DerivedSkip::Oversized {
+                    self.note_oversized(&inputs.key());
+                }
+                Err(skip_reason(skip))
             }
         }
     }
@@ -811,9 +725,11 @@ impl RootfsCache {
     /// Bytes held, for tests and diagnostics.
     #[cfg(test)]
     fn held_bytes(&self) -> u64 {
-        self.entries_by_age()
+        self.store
+            .derived_list()
+            .unwrap_or_default()
             .iter()
-            .map(|(_, bytes, _)| *bytes)
+            .map(|entry| entry.size)
             .sum()
     }
 }
@@ -821,6 +737,7 @@ impl RootfsCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1065,7 +982,7 @@ mod tests {
         assert!(matches!(outcome, Outcome::Hit(_)), "{outcome:?}");
         assert_eq!(base.builds.load(Ordering::SeqCst), 1);
         assert!(
-            std::fs::read_dir(dir.path().join("cache/tmp"))?
+            std::fs::read_dir(dir.path().join("cache/derived/tmp"))?
                 .next()
                 .is_none(),
             "nothing is left staged"
@@ -1084,10 +1001,7 @@ mod tests {
         cache.ensure(FakeBase::new(b"b", size), &b)?;
         // Use `a`, so `b` is the least recently used.
         let entry = cache.lookup(&a.key()).expect("a cached");
-        let file = std::fs::File::options()
-            .write(true)
-            .open(&entry.meta_path)?;
-        file.set_modified(SystemTime::now() + Duration::from_secs(60))?;
+        cache.touch(&entry);
 
         assert_eq!(cache.ensure(FakeBase::new(b"c", size), &c)?, Ensured::Built);
         assert!(cache.lookup(&a.key()).is_some(), "recently used base kept");
@@ -1131,15 +1045,15 @@ mod tests {
             let cache = RootfsCache::open(&root, 64 << 20, 0)?;
             cache.ensure(FakeBase::new(b"a", 4096), &key_inputs)?;
         }
-        std::fs::create_dir_all(root.join("tmp/half-done"))?;
-        std::fs::create_dir_all(root.join("not-a-base"))?;
+        std::fs::create_dir_all(root.join("derived/tmp/half-done"))?;
+        std::fs::create_dir_all(root.join("derived/rootfs/not-a-base"))?;
         let cache = RootfsCache::open(&root, 64 << 20, 0)?;
         assert!(
             cache.lookup(&key_inputs.key()).is_some(),
             "a good base survives"
         );
-        assert!(!root.join("tmp/half-done").exists());
-        assert!(!root.join("not-a-base").exists());
+        assert!(!root.join("derived/tmp/half-done").exists());
+        assert!(!root.join("derived/rootfs/not-a-base").exists());
         // A budget that shrank to nothing empties it.
         drop(cache);
         let cache = RootfsCache::open(&root, 0, 0)?;
@@ -1426,8 +1340,100 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("layer is corrupt"), "{err}");
         assert!(
-            cache.flights.lock().unwrap().is_empty(),
+            cache.store.derived_builds_in_flight() == 0,
             "the claim is released"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bases_are_derived_content_in_the_node_store_test() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = RootfsCache::open(&dir.path().join("content"), 64 << 20, 0)?;
+        let key_inputs = inputs("aaa");
+        cache.ensure(FakeBase::new(b"image bytes", 4096), &key_inputs)?;
+        let listed = cache.store.derived_list()?;
+        assert_eq!(listed.len(), 1);
+        let entry = &listed[0];
+        assert_eq!(entry.kind, DerivedKind::Rootfs);
+        assert_eq!(entry.key, key_inputs.key());
+        assert_eq!(
+            entry.path,
+            dir.path()
+                .join("content/derived/rootfs")
+                .join(key_inputs.key())
+        );
+        assert!(entry.builder_version.contains("rootfs.1"), "{entry:?}");
+        // The recipe names what the base was built from, and holds none of
+        // it verbatim but content digests: the guest binary's path is a
+        // fingerprint.
+        assert_eq!(entry.inputs["headroomMib"], "256");
+        assert!(entry.inputs.contains_key("layer.0000"));
+        let recorded = serde_json::to_string(&entry.inputs)?;
+        assert!(!recorded.contains("/opt/legion-guest"), "{recorded}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_full_budget_takes_the_least_recently_used_entry_of_any_kind_test() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let size = 1 << 20;
+        let cache = RootfsCache::open(&dir.path().join("content"), (5 * size / 2) as u64, 0)?;
+        // Another kind's entry is the oldest thing in the class.
+        let other = Recipe::new(DerivedKind::VmBase, "vmm-1").number("guestMib", 512);
+        cache.store.ensure_derived(&other, |out| {
+            std::fs::write(out.join("memory"), vec![0xCD; size])?;
+            Ok(())
+        })?;
+        let (a, b) = (inputs("aaa"), inputs("bbb"));
+        cache.ensure(FakeBase::new(b"a", size), &a)?;
+        assert_eq!(cache.ensure(FakeBase::new(b"b", size), &b)?, Ensured::Built);
+        assert!(
+            cache
+                .store
+                .derived_lookup(other.kind(), &other.key(), false)?
+                .is_none(),
+            "one budget, one LRU: the other kind's entry went first"
+        );
+        assert!(cache.lookup(&a.key()).is_some());
+        assert!(cache.lookup(&b.key()).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn init_removes_the_old_cache_directory_and_honors_a_zero_budget_test() -> R<()> {
+        use crate::content_store::{ContentBudgets, ContentStoreConfig};
+        let dir = tempfile::tempdir()?;
+        // What a worker from before derived content left behind.
+        let legacy = dir.path().join("rootfs-cache");
+        std::fs::create_dir_all(legacy.join("0123abcd"))?;
+        std::fs::write(legacy.join("0123abcd/rootfs.img"), vec![0u8; 4096])?;
+        std::fs::create_dir_all(legacy.join("tmp"))?;
+        remove_legacy_cache(&legacy);
+        assert!(!legacy.exists(), "the old cache is deleted at first start");
+        // A second start finds nothing to do.
+        remove_legacy_cache(&legacy);
+
+        // The budget decides whether a store carries a cache at all.
+        let store = |derived: u64, name: &str| -> R<Arc<ContentStore>> {
+            Ok(Arc::new(ContentStore::open(
+                dir.path().join(name),
+                ContentStoreConfig {
+                    budgets: ContentBudgets {
+                        artifacts: 0,
+                        snapshots: 0,
+                        derived,
+                    },
+                    ttl: None,
+                    min_free_disk: 0,
+                },
+            )?))
+        };
+        assert_eq!(store(0, "off")?.derived_budget(), 0);
+        let cache = RootfsCache::on(store(64 << 20, "on")?);
+        assert_eq!(
+            cache.ensure(FakeBase::new(b"a", 4096), &inputs("aaa"))?,
+            Ensured::Built
         );
         Ok(())
     }

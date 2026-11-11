@@ -83,6 +83,11 @@ pub(super) fn load_held_payloads(
 const WORK_STREAM_BUFFER: usize = 64;
 
 /// Pause after a failed store read before the resync it queued is built.
+/// How often a stream looks again at the owners of its node's child
+/// sessions (docs/child-sessions.md) when nothing else woke it. Only runs
+/// while some session in the index carries an owner.
+const OWNER_NOTICE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
 const WORK_STREAM_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Build the next message for `node_id` from its log, or `None` when there
@@ -272,9 +277,29 @@ impl ManagerDaemonService {
         );
 
         let endpoint_wake = store.endpoint_index().node_wake(&node_id);
+        // The runtime disables (docs/runtime-disable.md): pushed when the
+        // stream opens while any is in force, and again whenever this
+        // replica's set changes. A stream that opens with nothing disabled
+        // gets no push; the heartbeat reply carries the (empty) set.
+        let mut runtime_states = store.runtime_state_watch();
         tokio::spawn(async move {
             let log = attached.log;
             let session = attached.session;
+            // Ahead of the replay: the node must hold a disable before it
+            // is handed work it could start.
+            let disables = store.runtime_disables();
+            if !disables.is_empty() {
+                let push = StreamWorkReply {
+                    epoch: store.work_log().epoch(),
+                    push_only: true,
+                    runtime_states: Some(disables.to_proto()),
+                    ..Default::default()
+                };
+                if tx.send(Ok(push)).await.is_err() {
+                    work_log.detach(&node_id, session);
+                    return;
+                }
+            }
             for message in attached.replay {
                 if tx.send(Ok(message)).await.is_err() {
                     work_log.detach(&node_id, session);
@@ -284,10 +309,56 @@ impl ManagerDaemonService {
             let mut reauth = tokio::time::interval(credential.interval);
             reauth.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             reauth.tick().await; // the first tick fires immediately
+                                 // Set when the wait below saw the set of runtime disables
+                                 // change (awaiting the change marks it seen).
+            let mut runtime_states_changed = false;
+            // What was last pushed about the owners of this node's child
+            // sessions, so an unchanged set is not pushed again (the
+            // heartbeat reply repeats it until the node acts).
+            let mut last_owner_notices: Vec<crate::structs::OwnerNotice> = Vec::new();
+            let mut owner_tick = tokio::time::interval(OWNER_NOTICE_TICK);
+            owner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 if !WorkLog::is_current(&log, session) {
                     // A newer stream for the node took over.
                     break;
+                }
+                // A changed set of runtime disables, ahead of any work the
+                // node could start: push-only, outside the sequence, never
+                // replayed.
+                if std::mem::take(&mut runtime_states_changed)
+                    || runtime_states.has_changed().unwrap_or(false)
+                {
+                    runtime_states.borrow_and_update();
+                    let push = StreamWorkReply {
+                        epoch: store.work_log().epoch(),
+                        push_only: true,
+                        runtime_states: Some(store.runtime_disables().to_proto()),
+                        ..Default::default()
+                    };
+                    if tx.send(Ok(push)).await.is_err() {
+                        break;
+                    }
+                }
+                // Owner notices for this node's child sessions
+                // (docs/child-sessions.md): pushed whenever the stream
+                // wakes, which any change to the node's own work does, and
+                // on the tick below for owners on other nodes. Only a node
+                // that reports a child is ever looked at.
+                if crate::manager::children::node_has_children(&store, &node_id) {
+                    let owner_notices = crate::manager::children::owner_notices(&store, &node_id);
+                    if !owner_notices.is_empty() && owner_notices != last_owner_notices {
+                        let push = StreamWorkReply {
+                            epoch: store.work_log().epoch(),
+                            push_only: true,
+                            owner_notices: owner_notices.clone(),
+                            ..Default::default()
+                        };
+                        if tx.send(Ok(push)).await.is_err() {
+                            break;
+                        }
+                    }
+                    last_owner_notices = owner_notices;
                 }
                 // Changed endpoint sets first (mesh-control-path plan §6.1):
                 // a backend that went away should leave the node's lists
@@ -346,6 +417,14 @@ impl ManagerDaemonService {
                 tokio::select! {
                     _ = log.wake.notified() => {}
                     _ = endpoint_wake.notified() => {}
+                    // Owners on other nodes change without waking this
+                    // node's log; a node with no child never takes this.
+                    _ = owner_tick.tick(), if store.sessions().any_owned() => {}
+                    // A closed channel means the store is going away.
+                    changed = runtime_states.changed() => match changed {
+                        Ok(()) => runtime_states_changed = true,
+                        Err(_) => break,
+                    },
                     frame = inbound.message() => match frame {
                         Ok(Some(StreamWorkRequest {
                             frame: Some(stream_work_request::Frame::Ack(ack)),

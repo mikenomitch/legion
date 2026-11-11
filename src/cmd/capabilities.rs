@@ -153,6 +153,33 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        // --- Runtime disable (docs/runtime-disable.md) ---
+        // Deliberately not MCP tools: a cluster-wide stop of a runtime is an
+        // incident action for a human holding an `operator` token.
+        Capability {
+            name: "operator.runtime.disable",
+            cli: "legion operator runtime disable <RUNTIME> [--namespace <GLOB>]... [--reason <TEXT>] [--drain]",
+            grpc: Some("Manager/SetRuntimeEnabled"),
+            summary: "Refuse every new start of a task runtime (placements, session starts, edge claims, restarts), cluster-wide or for namespaces matching the globs: the switch for a runtime with a published escape. Running work is untouched unless --drain, which suspends what has a `suspend` block and gracefully stops the rest. Needs operator:write. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "operator.runtime.enable",
+            cli: "legion operator runtime enable <RUNTIME> [--namespace <GLOB>]...",
+            grpc: Some("Manager/SetRuntimeEnabled"),
+            summary: "Enable a disabled runtime again, everywhere or for the named globs of a scoped disable; blocked evals place on their own and refused callers succeed on retry. Needs operator:write. Supports --idempotency-key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "operator.runtime.status",
+            cli: "legion operator runtime status",
+            grpc: Some("Manager/ListRuntimeStates"),
+            summary: "List disabled runtimes with scope, reason, who and since, what is still running on each, the evals blocked on it, and the starts nodes refused. Needs operator:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- App objects (docs/app-objects.md) ---
         Capability {
             name: "object.kinds",
@@ -466,12 +493,18 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "instance.create",
-            cli: "legion instance create <JOB> [--id <KEY>] [--from-snapshot <NAME|ID>]",
+            cli: "legion instance create <JOB> [--id <KEY>] [--from-snapshot <NAME|ID>] [--owner <ID>] | legion instance create <TASK> [--id <KEY>] --owner self",
             grpc: Some("Manager/CreateInstance"),
             summary: "Create a keyed-mode instance (never-recycled id), optionally restored from \
                  a snapshot of the job (needs snapshot:read). On a session task without --id, \
-                 start an unnamed session with no raft write (durable false). Supports \
-                 --idempotency-key.",
+                 start an unnamed session with no raft write (durable false). --owner <ID> \
+                 makes the unit a child of a running session, instance, or allocation of the \
+                 same job whose task names the task in children.tasks: a session child of a \
+                 session task, or a keyed child of a keyed task (an instance or allocation \
+                 owner only), which is stopped when its owner is stopped and destroyed when \
+                 it is destroyed, in the owner's own entry. Inside a task, `--owner self` asks \
+                 the node's worker over the allocation's API socket \
+                 (Workload/CreateChildInstance) with no token. Supports --idempotency-key.",
             mutates: true,
             read_only_safe: false,
         },
@@ -546,6 +579,46 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
+            name: "instance.resize",
+            cli: "legion instance resize <INSTANCE> [--memory <SIZE>] [--memory-max <SIZE>] [--cpu <MHZ>] [--move] [--reason <TEXT>] [--force] [--dry-run]",
+            grpc: Some("Manager/ResizeInstance"),
+            summary: "Resize a running keyed instance or session in place (memory, memoryMax, \
+                 cpu) as an override over the spec: no new job version, no restart. A session's \
+                 resize is node-local and writes nothing to the store. An instance keeps its \
+                 size across suspend and resume. Answers applied, deferred, refused (with the \
+                 free room), needs_restart, or not_supported. --move resizes by suspending the \
+                 unit and resuming it at the new size on a node with room (a keyed instance \
+                 with a suspend block, or a store session; also needs job:write). Needs \
+                 scale:write. Supports --idempotency-key and --dry-run.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "job.resize",
+            cli: "legion job resize <JOB> [--task <TASK>] [--group <GROUP>] [--memory <SIZE>] [--memory-max <SIZE>] [--cpu <MHZ>] [--reset] [--replace] [--reason <TEXT>] [--force] [--dry-run]",
+            grpc: Some("Manager/ResizeTask"),
+            summary: "Resize every allocation of a task without a deploy: a task-level size \
+                 override laid over the spec (no new job version, no rollout). Running \
+                 allocations are resized in place where they can be, with one answer each; \
+                 the rest keep their size until replaced, or are replaced now with --replace. \
+                 New allocations start at the overridden size. --reset returns to the spec. A \
+                 submit that changes the task's resources drops the override. Needs \
+                 scale:write. Supports --idempotency-key and --dry-run.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "alloc.resize",
+            cli: "legion alloc resize <ALLOCATION> [--memory <SIZE>] [--memory-max <SIZE>] [--cpu <MHZ>] [--reason <TEXT>] [--force] [--dry-run]",
+            grpc: Some("Manager/ResizeAllocation"),
+            summary: "Resize one running allocation in place (memory, memoryMax, cpu): one \
+                 compare-and-set on its row, applied by its node's runtime. A grow takes only \
+                 free room and is refused with the room the node has. Needs scale:write. \
+                 Supports --idempotency-key and --dry-run.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "session.nodes",
             cli: "legion session nodes <JOB> [--task <TASK>] [--format envoy-eds|haproxy]",
             grpc: Some("Manager/ListSessionNodes"),
@@ -556,14 +629,54 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "session.run",
+            cli: "legion session run <JOB> [--task <TASK>] [--file <[NAME=]PATH>]... [--input <JSON>] [--get <PATH>]... [--idempotency-key <K>] [--dry-run] [--on-node <NODE>] [--node <ADDR> --ticket <T>] [--command <ARG>...]",
+            grpc: Some("Manager/RunSession"),
+            summary: "Run once in a fresh, single-use session of a session task with a `run` \
+                 block and return stdout, stderr, the exit status, result.json as `result`, and \
+                 the --get files; the session is always ended. A stopped run (run.wall, memory) \
+                 is ok:true with `stopped`. Needs job:write; --command also needs exec:write \
+                 and run.allowCommand. --idempotency-key is per node (reply kept 10 minutes); \
+                 --dry-run runs nothing. With --node and --ticket it is Worker/RunSession, with \
+                 no manager on the path.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "session.start",
-            cli: "legion session start <JOB> --task <TASK> --node <ADDR> --ticket <T>",
+            cli: "legion session start <JOB> --task <TASK> --node <ADDR> --ticket <T> [--owner <ID>] | legion session start <TASK> --owner self",
             grpc: Some("Worker/StartSession"),
             summary: "Start a session on one node with a session ticket, with no manager call \
                  (the edge form, for testing and scripts). Supports --idempotency-key \
-                 (node-local).",
+                 (node-local). --owner <ID> starts it as a child of a unit running on that node \
+                 (it ends with its owner; the owner's task must name the task in \
+                 children.tasks). Inside a task, `--owner self` asks the node's worker over the \
+                 allocation's API socket (Workload/StartChildSession) with no ticket.",
             mutates: true,
             read_only_safe: false,
+        },
+        Capability {
+            name: "session.handoff",
+            cli: "legion session handoff <CHILD> --port <LABEL> --fd <N> [--wait]",
+            grpc: None,
+            summary: "Inside a task: hand an inbound connection the workload accepted (an \
+                 inherited file descriptor) to a port of one of its own session children on \
+                 the same node, over the allocation's handoff socket with no credential. The \
+                 worker moves the bytes with the datapath's splice path and the workload \
+                 leaves the byte path; --wait returns when the connection closed, with the \
+                 bytes moved.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "session.children",
+            cli: "legion session children",
+            grpc: Some("Workload/ListChildren"),
+            summary: "Inside a task: list the child sessions this workload owns on its node \
+                 (running, suspended, and the ones that ended in the last ten minutes with why), \
+                 over the allocation's API socket with no credential.",
+            mutates: false,
+            read_only_safe: true,
         },
         Capability {
             name: "session.get",
@@ -575,9 +688,11 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "session.stop",
-            cli: "legion session stop <SESSION> --node <ADDR> --ticket <T>",
+            cli: "legion session stop <SESSION> --node <ADDR> --ticket <T> | legion session stop <SESSION> --local",
             grpc: Some("Worker/StopSession"),
-            summary: "End a session on its node with a session ticket. Idempotent.",
+            summary: "End a session on its node with a session ticket. Idempotent. Ending a \
+                 session ends its children first. Inside a task, --local ends one of the \
+                 workload's own children over the API socket (Workload/StopChildSession).",
             mutates: true,
             read_only_safe: false,
         },
@@ -800,8 +915,9 @@ pub fn catalog() -> Vec<Capability> {
             cli: "legion node content <ID>",
             grpc: Some("Manager/GetNodeContent"),
             summary: "Show what a node holds for content locality: the content it advertises to \
-                 the manager's location index, which snapshot each entry belongs to, and its \
-                 snapshots with how many of their parts it holds.",
+                 the manager's location index, which snapshot each entry belongs to, its \
+                 snapshots with how many of their parts it holds, and its derived content \
+                 (what Legion built there and can rebuild, such as sandbox base root disks).",
             mutates: false,
             read_only_safe: true,
         },

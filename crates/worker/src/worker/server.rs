@@ -45,18 +45,33 @@ pub trait ClaimRatifier: Send + Sync {
 /// The status a refused provisional start answers with. A session refused
 /// for room is RESOURCE_EXHAUSTED, which the manager's session router reads as
 /// "try the next node"; everything else is FAILED_PRECONDITION, as before.
-fn admission_status(err: &anyhow::Error) -> Status {
+pub(crate) fn admission_status(err: &anyhow::Error) -> Status {
     use crate::worker::task_manager::session_sleep::SessionSleepError;
     use crate::worker::task_manager::SessionRefusal;
+    if let Some(status) = runtime_disabled_status(err) {
+        return status;
+    }
     if let Some(sleep) = err.downcast_ref::<SessionSleepError>() {
         if let Some(status) = store_status(sleep) {
             return status;
         }
     }
+    if let Some(child) = err.downcast_ref::<crate::worker::task_manager::children::ChildRefusal>() {
+        return child.to_status();
+    }
     match err.downcast_ref::<SessionRefusal>() {
         Some(SessionRefusal::EnvelopeFull { .. }) => Status::resource_exhausted(format!("{err:#}")),
         _ => Status::failed_precondition(format!("{err:#}")),
     }
+}
+
+/// The status a start refused because its runtime is disabled answers with
+/// (docs/runtime-disable.md): `UNAVAILABLE`, retryable, tagged
+/// `runtime_disabled`, with the disable's own sentence. `None` for any other
+/// error.
+pub(crate) fn runtime_disabled_status(err: &anyhow::Error) -> Option<Status> {
+    crate::structs::runtime_state::RuntimeDisabledRefusal::in_chain(err)
+        .map(|refusal| refusal.to_status())
 }
 
 /// The status an edge start refused by the claim window answers with:
@@ -104,7 +119,7 @@ fn store_status(
 /// manager round trip), and FAILED_PRECONDITION otherwise, because a start
 /// failure is this node or this task config being unable to run the task,
 /// not a bug in the worker. INTERNAL stays for panics and poisoned locks.
-fn task_start_status(context: &str, err: &anyhow::Error) -> Status {
+pub(crate) fn task_start_status(context: &str, err: &anyhow::Error) -> Status {
     let message = format!("{context}: {err:#}");
     let code = if err
         .chain()
@@ -523,6 +538,20 @@ impl Worker for WorkerDaemonService {
             .map_err(|_| Status::internal("Task manager lock poisoned"))?
             .claim_window();
 
+        // A disabled runtime starts nothing (docs/runtime-disable.md):
+        // refused before the claim takes window room or a launch slot, with
+        // the ticket unspent. A dry run gets the same answer a start would.
+        let refused = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .runtime_gate()
+            .check(&task.runtime, &claims.job);
+        if let Err(refusal) = refused {
+            edge_boot.verifier.unspend(&claims.jti);
+            return Err(refusal.to_status());
+        }
+
         if req.dry_run {
             // Verify and report, hold nothing, boot nothing. The self-correct
             // path an agent or a router wants before it mutates a cluster.
@@ -569,6 +598,7 @@ impl Worker for WorkerDaemonService {
             identity_epoch: 0,
             named: true,
             promoted_from: None,
+            owner: None,
         };
         let payload = crate::structs::task_payload::build_task_allocation_with(
             &task,
@@ -630,7 +660,10 @@ impl Worker for WorkerDaemonService {
             // The start never happened, so the ticket was not really
             // redeemed; let an operator's retry work.
             edge_boot.verifier.unspend(&claims.jti);
-            Status::resource_exhausted(format!("{err:#}"))
+            // A disabled runtime is UNAVAILABLE, with the disable's reason
+            // (docs/runtime-disable.md); anything else is room.
+            runtime_disabled_status(&err)
+                .unwrap_or_else(|| Status::resource_exhausted(format!("{err:#}")))
         })?;
         edge_boot.verifier.spend(&claims, now_unix);
 
@@ -724,6 +757,84 @@ impl Worker for WorkerDaemonService {
             .map_err(|_| Status::internal("Task manager lock poisoned"))?
             .stop_sessions(&request.session_ids, &format!("requested ({reason})"));
         Ok(Response::new(crate::structs::StopSessionsReply { stopped }))
+    }
+
+    /// Resize one unit this node runs, in place (docs/resize.md).
+    /// Manager-only: a manager routes `ResizeInstance` and
+    /// `ResizeAllocation` here after its own ACL check.
+    #[instrument(err, skip_all, fields(session_id, allocation_id))]
+    async fn resize_session(
+        &self,
+        request: Request<crate::structs::ResizeSessionRequest>,
+    ) -> Result<Response<crate::structs::ResizeSessionReply>, Status> {
+        use crate::worker::task_manager::resize::{
+            requested_size, resize_status, wire_reply, ResizeTarget,
+        };
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "ResizeSession")?;
+        let request = request.into_inner();
+        tracing::Span::current().record("session_id", request.session_id.as_str());
+        tracing::Span::current().record("allocation_id", request.allocation_id);
+        let target = match (request.session_id.is_empty(), request.allocation_id) {
+            (false, 0) => ResizeTarget::Session(request.session_id.clone()),
+            (true, id) if id != 0 => ResizeTarget::Allocation(id),
+            _ => {
+                return Err(Status::invalid_argument(
+                    "set exactly one of session_id and allocation_id",
+                ))
+            }
+        };
+        // A keyed session resize this node already applied is answered
+        // from what it kept, not applied again.
+        let keyed = if !request.dry_run && !request.session_id.is_empty() {
+            request.idempotency_key.clone()
+        } else {
+            String::new()
+        };
+        if let Some(kept) =
+            crate::worker::task_manager::resize::recall_resize(&request.session_id, &keyed)
+        {
+            return Ok(Response::new(kept));
+        }
+        let size = requested_size(request.to.as_ref());
+        let task_manager = self.task_manager.clone();
+        let force = request.force;
+        let dry_run = request.dry_run;
+        let resize_target = target.clone();
+        // A runtime's resize talks to a VMM socket or writes cgroup files:
+        // off the async threads.
+        let done = tokio::task::spawn_blocking(move || {
+            let mut manager = task_manager
+                .lock()
+                .map_err(|_| anyhow!("Task manager lock poisoned"))?;
+            manager.resize_unit(&resize_target, &size, force, dry_run)
+        })
+        .await
+        .map_err(|err| Status::internal(format!("resize task failed: {err}")))?;
+        match done {
+            Ok(done) => {
+                let reply = wire_reply(&done, &self.node_id);
+                if done.outcome == crate::structs::resize::ResizeOutcome::Applied {
+                    crate::worker::task_manager::resize::remember_resize(
+                        &request.session_id,
+                        &keyed,
+                        &reply,
+                    );
+                }
+                Ok(Response::new(reply))
+            }
+            Err(err) => {
+                let status = resize_status(err);
+                // A session this node does not hold: say whose it is, as
+                // every session RPC does.
+                if let (tonic::Code::NotFound, ResizeTarget::Session(session_id)) =
+                    (status.code(), &target)
+                {
+                    return Err(self.session_not_here(session_id));
+                }
+                Err(status)
+            }
+        }
     }
 
     /// Suspend sessions on this node (session durability plan §6.6).
@@ -856,6 +967,11 @@ impl Worker for WorkerDaemonService {
             cold,
             origin: "manager".into(),
             ticket_jti: String::new(),
+            resize: request
+                .resize
+                .as_ref()
+                .map(|to| crate::worker::task_manager::resize::requested_size(Some(to)))
+                .filter(|size| !size.is_empty()),
         };
         let outcome = tokio::task::spawn_blocking(move || {
             let _slot = slot;
@@ -911,9 +1027,22 @@ impl Worker for WorkerDaemonService {
         if let Some(ticket) = ticket {
             ticket.allows(&session.job_id, &session.task_name)?;
         }
+        // What the session owns on this node (docs/child-sessions.md).
+        let children = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .child_infos(
+                &crate::structs::children::owner_ref(
+                    crate::structs::children::OWNER_SESSION,
+                    &session.session_id,
+                ),
+                &self.node_id,
+            );
         Ok(Response::new(crate::structs::GetSessionReply {
             session: Some(session),
             node_id: self.node_id.clone(),
+            children,
         }))
     }
 
@@ -957,12 +1086,19 @@ impl Worker for WorkerDaemonService {
                 .map(Response::new);
         }
 
+        // A child of a unit running on this node (docs/child-sessions.md):
+        // the ticket is still the credential, the owner's jobspec decides.
+        let owner = request.owner.clone().filter(|owner| !owner.id.is_empty());
+        if let Some(owner) = owner.as_ref() {
+            crate::structs::children::check_owner_request(owner)
+                .map_err(Status::invalid_argument)?;
+        }
         let slot = self.launch_slot().await?;
         let task_manager = self.task_manager.clone();
         let node_id = self.node_id.clone();
         let key = request.idempotency_key.clone();
         let started = tokio::task::spawn_blocking(move || {
-            edge::start_edge_session(&task_manager, &node_id, &claims, &key, slot)
+            edge::start_edge_session(&task_manager, &node_id, &claims, &key, slot, owner)
         })
         .await
         .map_err(|err| Status::internal(format!("session start panicked: {err}")))?
@@ -992,6 +1128,12 @@ impl Worker for WorkerDaemonService {
             .session_status(&started.session_id)
             .map(|status| status.generation)
             .unwrap_or(1);
+        let owner = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .child_link(&started.session_id)
+            .map(|link| link.owner.clone());
         Ok(Response::new(crate::structs::StartSessionReply {
             session_id: started.session_id,
             node_id: self.node_id.clone(),
@@ -1000,7 +1142,78 @@ impl Worker for WorkerDaemonService {
             resumed_from: String::new(),
             generation,
             moved_from: String::new(),
+            owner,
         }))
+    }
+
+    /// Run once in a fresh, single-use session on this node
+    /// (docs/session-runs.md).
+    #[instrument(err, skip_all, fields(job, task))]
+    async fn run_session(
+        &self,
+        request: Request<crate::structs::RunSessionRequest>,
+    ) -> Result<Response<crate::structs::RunSessionResponse>, Status> {
+        // ACL: worker-plane. Caller classes: a manager's certificate (the
+        // manager enforced `job:write`, and `exec:write` for a replaced
+        // command, before routing the run here), or a session ticket for
+        // the job and task, which runs the task's own command only.
+        let caller = crate::worker::plane::caller_of(&request, "RunSession")?;
+        let mut request = request.into_inner();
+        let (job, task, ticket_jti) = match caller {
+            crate::worker::plane::Caller::Manager(_) => {
+                if request.job_id.trim().is_empty() || request.task_name.trim().is_empty() {
+                    return Err(Status::invalid_argument(
+                        "RunSession from a manager names the job and the task",
+                    ));
+                }
+                (
+                    request.job_id.clone(),
+                    request.task_name.clone(),
+                    String::new(),
+                )
+            }
+            crate::worker::plane::Caller::Ticket => {
+                let ticket = self.verify_session_ticket(&request.ticket, "RunSession")?;
+                let claims = ticket.0.clone();
+                let job = if request.job_id.is_empty() {
+                    claims.job.clone()
+                } else {
+                    request.job_id.clone()
+                };
+                let task = if request.task_name.is_empty() {
+                    claims.task.clone()
+                } else {
+                    request.task_name.clone()
+                };
+                ticket.allows(&job, &task)?;
+                if !request.command.is_empty() {
+                    return Err(Status::permission_denied(format!(
+                        "--command needs exec:write on job {job}, which a session ticket does \
+                         not carry; send the run through a manager (running the task's own \
+                         run.command needs only the ticket)"
+                    )));
+                }
+                (job, task, claims.jti.clone())
+            }
+        };
+        let span = tracing::Span::current();
+        span.record("job", job.as_str());
+        span.record("task", task.as_str());
+        // The ticket is a credential: it goes no further than this check.
+        request.ticket.clear();
+        crate::worker::task_manager::session_runs::run_session(
+            self.task_manager.clone(),
+            self.launch_pool.clone(),
+            self.node_id.clone(),
+            crate::worker::task_manager::session_runs::RunCall {
+                job_id: job,
+                task_name: task,
+                request,
+                ticket_jti,
+            },
+        )
+        .await
+        .map(Response::new)
     }
 
     /// End one session from a session ticket.
@@ -1064,7 +1277,7 @@ impl Worker for WorkerDaemonService {
 
 /// How long `StartSession` waits for a session to be running before it
 /// answers `starting`.
-const EDGE_START_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const EDGE_START_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A verified session ticket.
 pub(crate) struct VerifiedSessionTicket(crate::structs::edge_boot::SessionTicketClaims);
@@ -1112,6 +1325,9 @@ impl WorkerDaemonService {
     pub(crate) fn session_sleep_status(&self, session_id: &str, err: &anyhow::Error) -> Status {
         use crate::worker::task_manager::session_sleep::SessionSleepError;
         use crate::worker::task_manager::SessionRefusal;
+        if let Some(status) = runtime_disabled_status(err) {
+            return status;
+        }
         if let Some(sleep) = err.downcast_ref::<SessionSleepError>() {
             return match sleep {
                 SessionSleepError::NotHere | SessionSleepError::Evicted(_) => {
@@ -1164,6 +1380,7 @@ impl WorkerDaemonService {
             cold: false,
             origin: "edge".into(),
             ticket_jti: claims.jti.clone(),
+            resize: None,
         };
         let mut outcome = self.run_move(move_request.clone(), None).await;
         let elsewhere = outcome.as_ref().err().and_then(running_elsewhere);
@@ -1214,6 +1431,7 @@ impl WorkerDaemonService {
             state,
             deduplicated: moved.from.is_empty(),
             resumed_from: moved.from.to_string(),
+            owner: None,
             generation: moved.generation,
             moved_from: moved.moved_from,
         })
@@ -1353,6 +1571,18 @@ impl WorkerDaemonService {
                  cannot be restored\nHint: start a new session, or set suspend.durability = \
                  \"store\" so idle sessions are kept in the content store",
                 self.node_id, evicted
+            ));
+        }
+        // A child that ended: say why, so its owner can act on it
+        // (docs/child-sessions.md, "When a child is gone").
+        if let Some((owner, reason)) = self.task_manager.lock().ok().and_then(|manager| {
+            manager
+                .gone_child(session_id)
+                .map(|gone| (gone.owner.clone(), gone.reason.clone()))
+        }) {
+            return Status::not_found(format!(
+                "child_gone: session {session_id}, a child of {} {}, ended on {}: {reason}",
+                owner.kind, owner.id, self.node_id
             ));
         }
         let own = crate::structs::node_tag(&self.node_id);

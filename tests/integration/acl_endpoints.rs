@@ -128,6 +128,8 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetNamespacePolicy", Plane::Protected("acl:read")),
         ("ApplyNamespacePolicy", Plane::Protected("acl:write")),
         ("DeleteNamespacePolicy", Plane::Protected("acl:write")),
+        ("SetRuntimeEnabled", Plane::Protected("operator:write")),
+        ("ListRuntimeStates", Plane::Protected("operator:read")),
         ("UpsertJobTemplate", Plane::Protected("template:write")),
         ("ListJobTemplates", Plane::Protected("template:read")),
         ("GetJobTemplate", Plane::Protected("template:read")),
@@ -209,7 +211,17 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         // The session's job is known only after the index lookup, so the
         // coarse gate is `job:write` on any job.
         ("PromoteInstance", Plane::Protected("job:write")),
+        // Resize is the `scale` resource (docs/resize.md): a principal can
+        // resize without redeploy rights. The unit's job is known only
+        // after the lookup, so the coarse gate is `scale:write` on any job.
+        ("ResizeAllocation", Plane::Protected("scale:write")),
+        ("ResizeInstance", Plane::Protected("scale:write")),
+        ("ResizeTask", Plane::Protected("scale:write")),
         ("ListSessionNodes", Plane::Protected("job:read")),
+        // A run of the task's own command; a request that replaces the
+        // command also needs `exec:write` (the matrix is in
+        // `a_run_with_a_callers_command_needs_exec_write_test`).
+        ("RunSession", Plane::Protected("job:write")),
         // Snapshots are their own resource: a memory snapshot holds the
         // workload's in-memory secrets, which `job:write` must not imply.
         // RestoreInstance also needs `job:write` (it replaces an allocation);
@@ -231,6 +243,8 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("DeleteVolume", Plane::Protected("job:write")),
         ("ListVolumeDrivers", Plane::Protected("node:read")),
         ("IssueWorkloadIdentityToken", Plane::Worker),
+        // A worker vouching for one of its allocations (docs/child-sessions.md).
+        ("CreateChildInstance", Plane::Worker),
         ("IssueNodeIdentityToken", Plane::Worker),
         ("IssueNodeCertificate", Plane::Worker),
         ("GetAllocationLogs", Plane::Protected("job:read")),
@@ -907,6 +921,21 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "SetRuntimeEnabled" => svc
+            .set_runtime_enabled(req(
+                SetRuntimeEnabledRequest {
+                    runtime: "acl-probe-runtime".into(),
+                    enabled: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListRuntimeStates" => svc
+            .list_runtime_states(req(ListRuntimeStatesRequest::default(), token))
+            .await
+            .map(|_| ()),
         "UpsertNetPolicy" => svc
             .upsert_net_policy(req(
                 UpsertNetPolicyRequest {
@@ -1374,6 +1403,59 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "RunSession" => svc
+            .run_session(req(
+                legion::structs::RunSessionRequest {
+                    job_id: JOB_NAME.into(),
+                    dry_run: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ResizeAllocation" => svc
+            .resize_allocation(req(
+                legion::structs::ResizeAllocationRequest {
+                    allocation_id: 987_654,
+                    to: Some(legion::structs::ResizeResources {
+                        memory: Some(64.0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ResizeTask" => svc
+            .resize_task(req(
+                legion::structs::ResizeTaskRequest {
+                    job_id: "acl-probe".into(),
+                    to: Some(legion::structs::ResizeResources {
+                        memory: Some(512.0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ResizeInstance" => svc
+            .resize_instance(req(
+                legion::structs::ResizeInstanceRequest {
+                    instance_id: "missing-instance".into(),
+                    to: Some(legion::structs::ResizeResources {
+                        memory: Some(64.0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         "PromoteInstance" => svc
             .promote_instance(req(
                 PromoteInstanceRequest {
@@ -1529,6 +1611,19 @@ async fn call_endpoint(
             .map(|_| ()),
         "ListVolumeDrivers" => svc
             .list_volume_drivers(req(ListVolumeDriversRequest {}, token))
+            .await
+            .map(|_| ()),
+        "CreateChildInstance" => svc
+            .create_child_instance(req(
+                legion::structs::CreateChildInstanceRequest {
+                    node_id: NODE_ID.into(),
+                    allocation_id: 1,
+                    task_name: "workspace".into(),
+                    instance_id: String::new(),
+                    idempotency_key: String::new(),
+                },
+                token,
+            ))
             .await
             .map(|_| ()),
         "IssueWorkloadIdentityToken" => svc
@@ -4286,6 +4381,141 @@ async fn rotate_mesh_ca_requires_cluster_wide_net_write() -> R<()> {
 }
 
 /// Mints a client token carrying one fresh policy with the given rules.
+/// Who may run what (docs/session-runs.md, "Who may run what"): `job:write`
+/// runs the task's own `run.command`; a request that replaces the command
+/// needs `exec:write` on the job as well, and `run.allowCommand` on the
+/// task. Each refusal is given before any node is asked.
+#[tokio::test]
+async fn a_run_with_a_callers_command_needs_exec_write_test() -> R<()> {
+    let (svc, _, _) = setup_enabled()?;
+    for (job, allow) in [("code-runner", false), ("open-runner", true)] {
+        let spec = serde_json::json!({
+            "name": job,
+            "task": {
+                "name": "machine",
+                "runtime": "exec",
+                "config": { "command": ["sleep", "600"] },
+                "resources": { "cpu": 100, "memory": 64 },
+                "stateful": {
+                    "mode": "session",
+                    "envelope": { "resources": { "cpu": 400, "memory": 256 } },
+                },
+                "run": { "command": ["sh", "/legion/run/main.sh"], "wall": "30s", "allowCommand": allow },
+            },
+        });
+        let config: JobConfig = serde_json::from_value(spec.clone())?;
+        svc.store.handle_job_submit(
+            &config,
+            &[Submission {
+                path: format!("{job}.json"),
+                content: spec.to_string(),
+                is_primary: true,
+            }],
+        )?;
+    }
+    let (_, writer) = token_with_rules(
+        &svc,
+        "run-writer",
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
+    )?;
+    let (_, execer) = token_with_rules(
+        &svc,
+        "run-execer",
+        r#"[{"resources": ["job", "exec"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
+    )?;
+    let (_, reader) = token_with_rules(
+        &svc,
+        "run-reader",
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
+    )?;
+    let run = |job: &str, command: &[&str], token: &str| {
+        svc.run_session(req(
+            legion::structs::RunSessionRequest {
+                job_id: job.into(),
+                command: command.iter().map(|arg| arg.to_string()).collect(),
+                ..Default::default()
+            },
+            Some(token),
+        ))
+    };
+
+    // job:read is not enough to run anything.
+    let status = run("code-runner", &[], &reader)
+        .await
+        .expect_err("read-only");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    // job:write runs the task's own command: it gets past every permission
+    // check and is refused only for want of a node holding an envelope.
+    let status = run("code-runner", &[], &writer).await.expect_err("no node");
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    assert!(
+        status.message().contains("no node runs an envelope"),
+        "{status:?}"
+    );
+
+    // A caller's command without exec:write is refused by name, on a task
+    // that allows it and on one that does not: the permission comes first.
+    for job in ["open-runner", "code-runner"] {
+        let status = run(job, &["id"], &writer).await.expect_err("no exec:write");
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(
+            status.message(),
+            format!(
+                "--command needs exec:write on job {job} (running the task's own run.command \
+                 needs only job:write)"
+            )
+        );
+    }
+
+    // With exec:write the task still has to allow it.
+    let status = run("code-runner", &["id"], &execer)
+        .await
+        .expect_err("not allowed");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        "task machine does not allow --command (run.allowCommand = false)"
+    );
+    let status = run("open-runner", &["id"], &execer)
+        .await
+        .expect_err("no node");
+    assert!(
+        status.message().contains("no node runs an envelope"),
+        "{status:?}"
+    );
+
+    // A session task without a run block refuses runs, naming the block.
+    let spec = serde_json::json!({
+        "name": "plain-sessions",
+        "task": {
+            "name": "workspace",
+            "runtime": "exec",
+            "config": { "command": ["sleep", "600"] },
+            "resources": { "cpu": 100, "memory": 64 },
+            "stateful": {
+                "mode": "session",
+                "envelope": { "resources": { "cpu": 400, "memory": 256 } },
+            },
+        },
+    });
+    let config: JobConfig = serde_json::from_value(spec.clone())?;
+    svc.store.handle_job_submit(
+        &config,
+        &[Submission {
+            path: "plain-sessions.json".into(),
+            content: spec.to_string(),
+            is_primary: true,
+        }],
+    )?;
+    let status = run("plain-sessions", &[], &writer)
+        .await
+        .expect_err("no run block");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(status.message().contains("add a run block"), "{status:?}");
+    Ok(())
+}
+
 fn token_with_rules(svc: &ManagerDaemonService, name: &str, rules: &str) -> R<(String, String)> {
     svc.store.upsert_acl_policy(name, "", rules)?;
     let (info, secret) = svc

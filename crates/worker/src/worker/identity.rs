@@ -1665,6 +1665,7 @@ mod tests {
             channel: tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy(),
             managers: None,
             peer_check: crate::worker::api_socket::PeerCheck::FileMode,
+            workload: None,
         };
         let manager =
             Arc::new(WorkerIdentityManager::new(FakeIssuer::new(900)).with_api_sockets(context));

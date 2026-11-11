@@ -178,7 +178,7 @@ are enabled.
 
 | Resource | `write` grants |
 | --- | --- |
-| `exec` | Open an interactive/one-shot exec session. |
+| `exec` | Open an interactive/one-shot exec session, and replace the command of a [session run](session-runs.md#who-may-run-what) (`legion session run --command`, with `job:write`). |
 | `action` | Run a declared action (the command is fixed and server-rendered). |
 
 Rule selectors:

@@ -372,7 +372,7 @@ pub enum Located {
 
 /// What one node answered to `Worker.GetSession`.
 enum NodeAnswer {
-    Holds(SessionStatus),
+    Holds(Box<SessionStatus>),
     Absent,
     Evicted(String),
     /// The id's tag is not this node's (a stale tag map): ask elsewhere.
@@ -401,7 +401,7 @@ async fn ask_node_within(
     request.set_timeout(timeout);
     match client.get_session(request).await {
         Ok(reply) => match reply.into_inner().session {
-            Some(status) => NodeAnswer::Holds(status),
+            Some(status) => NodeAnswer::Holds(Box::new(status)),
             None => NodeAnswer::Absent,
         },
         Err(status) if status.code() == tonic::Code::NotFound => {
@@ -439,7 +439,7 @@ pub async fn locate(store: &Store, session_id: &str) -> Located {
                 NodeAnswer::Holds(status) => {
                     return Located::Found(Box::new(IndexedSession {
                         node_id: node_id.clone(),
-                        status: Some(status),
+                        status: Some(*status),
                         recent: false,
                     }))
                 }
@@ -567,6 +567,7 @@ pub async fn resume_on_node(
     cold: bool,
     from_manifest: Option<(&str, &str)>,
     force_move: bool,
+    resize: Option<crate::structs::ResizeResources>,
 ) -> Result<crate::structs::ResumeSessionReply, Status> {
     let (mut client, target) = worker_client(store, node_id)?;
     let (job_id, task_name) = from_manifest.unwrap_or_default();
@@ -576,6 +577,7 @@ pub async fn resume_on_node(
         job_id: job_id.to_string(),
         task_name: task_name.to_string(),
         force_move,
+        resize,
     });
     request.set_timeout(SLEEP_CALL_TIMEOUT);
     client
@@ -635,7 +637,11 @@ fn node_is_down(store: &Store, node_id: &str) -> bool {
 /// caller passed `force_move`, and otherwise answers UNAVAILABLE.
 ///
 /// `skip` is a node that already refused the resume for room (the session's
-/// own node, asked first), so no attempt is spent on it again.
+/// own node, asked first), so no attempt is spent on it again. `resize`
+/// resumes the session at a new size (a resize by moving, docs/resize.md);
+/// the caller passes `task` with that size already laid over its resources,
+/// so the router reserves the room the session will take.
+#[allow(clippy::too_many_arguments)]
 pub async fn resume_store_session(
     store: &Store,
     job_id: &str,
@@ -644,7 +650,16 @@ pub async fn resume_store_session(
     cold: bool,
     force_move: bool,
     skip: Option<&str>,
+    resize: Option<crate::structs::ResizeResources>,
 ) -> Result<StoreResume, Status> {
+    // A disabled runtime starts no session (docs/runtime-disable.md). The
+    // nodes would refuse it too; refusing here names the reason once
+    // instead of once per node tried.
+    if let Some(disable) = store.runtime_disables().refusing(&task.runtime, job_id) {
+        return Err(
+            crate::structs::runtime_state::RuntimeDisabledRefusal::new(disable, job_id).to_status(),
+        );
+    }
     refresh_room(store, job_id, &task.name).await?;
     let needs = resource_amounts(&task.resources);
     let placement = crate::structs::session::placement(task);
@@ -680,6 +695,7 @@ pub async fn resume_store_session(
                 cold,
                 Some((job_id, &task.name)),
                 force,
+                resize,
             )
             .await;
             let status = match answer {
@@ -841,6 +857,7 @@ pub fn instance_info(entry: &IndexedSession, group: &str) -> InstanceInfo {
         lease_issued_at: Some(started),
         envelope_alloc_id: (status.envelope_allocation_id > 0)
             .then_some(status.envelope_allocation_id),
+        owner: status.owner,
         ..Default::default()
     }
 }
@@ -1424,6 +1441,21 @@ pub struct StartedSession {
     pub node_id: String,
     pub state: String,
     pub deduplicated: bool,
+    /// The owner it was started under (docs/child-sessions.md).
+    pub owner: Option<crate::structs::OwnerRef>,
+}
+
+/// A session start as a child of an owner the manager resolved and
+/// authorized ([`crate::manager::children`]).
+#[derive(Debug, Clone)]
+pub struct ChildStart {
+    pub owner: crate::structs::OwnerRef,
+    /// The owner's node: the child goes there when its envelope has room.
+    pub prefer_node: Option<String>,
+    /// The owner task's `children.max`.
+    pub max: u32,
+    /// The owner task's `children.suspendWithOwner`.
+    pub suspend_with_owner: bool,
 }
 
 /// Start an unnamed session of a session task: pick a node whose envelope
@@ -1438,15 +1470,21 @@ pub async fn start(
     config: &JobConfig,
     task: &TaskConfig,
     derived_id: Option<&str>,
+    child: Option<&ChildStart>,
 ) -> Result<StartedSession, Status> {
     let metrics = crate::manager::telemetry::metrics();
     let job_id = config.name.as_str();
+    let owner = child.map(|child| child.owner.clone());
     if let Some(session_id) = derived_id {
         if let Some(existing) = find(store, session_id).await {
             metrics.session_starts_total.inc(&["deduplicated"]);
             return Ok(StartedSession {
                 session_id: session_id.to_string(),
                 node_id: existing.node_id.clone(),
+                owner: existing
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.owner.clone()),
                 state: existing
                     .status
                     .map(|status| status.state)
@@ -1454,6 +1492,45 @@ pub async fn start(
                 deduplicated: true,
             });
         }
+    }
+    // The owner's children so far, as this manager's index counts them.
+    // The owner's node counts its own again and is the last word.
+    let siblings: Vec<String> = match child {
+        Some(child) => {
+            let siblings: Vec<String> = store
+                .sessions()
+                .children_of(&child.owner.kind, &child.owner.id)
+                .into_iter()
+                .map(|(node_id, _)| node_id)
+                .collect();
+            if siblings.len() as u32 >= child.max {
+                metrics.session_starts_total.inc(&["refused"]);
+                return Err(Status::resource_exhausted(
+                    crate::structs::children::at_max(&child.owner, child.max),
+                ));
+            }
+            siblings
+        }
+        None => Vec::new(),
+    };
+    let session_start = |node_id: &str, issued_at: i64| SessionStart {
+        lease_issued_at_unix_ms: issued_at,
+        owner: owner.clone(),
+        owner_children_elsewhere: siblings
+            .iter()
+            .filter(|node| node.as_str() != node_id)
+            .count() as u32,
+        owner_remote: false,
+        suspend_with_owner: child.is_some_and(|child| child.suspend_with_owner),
+    };
+    // A disabled runtime starts no session (docs/runtime-disable.md). The
+    // nodes would refuse it too; refusing here names the reason once
+    // instead of once per node tried.
+    if let Some(disable) = store.runtime_disables().refusing(&task.runtime, job_id) {
+        metrics.session_starts_total.inc(&["runtime_disabled"]);
+        return Err(
+            crate::structs::runtime_state::RuntimeDisabledRefusal::new(disable, job_id).to_status(),
+        );
     }
     refresh_room(store, job_id, &task.name).await?;
     let needs = resource_amounts(&task.resources);
@@ -1496,12 +1573,41 @@ pub async fn start(
         .unwrap_or_default();
     let mut refusals = Vec::new();
     let mut tried: Vec<String> = Vec::new();
+    // A child goes to its owner's node first, so the owner reaches it
+    // without leaving the node; the router picks another node only when
+    // that one refuses (docs/child-sessions.md, "Placement").
+    let mut preferred = child
+        .and_then(|child| child.prefer_node.clone())
+        .filter(|node| first.as_ref().is_some_and(|first| &first.node_id != node))
+        .filter(|node| {
+            envelope_nodes(store, job_id, &task.name)
+                .is_ok_and(|nodes| nodes.iter().any(|candidate| candidate == node))
+        });
     while tried.len() < ROUTER_ATTEMPTS {
-        let reservation = match first.take() {
-            Some(reservation) => reservation,
-            None => match reserve(store, job_id, &task.name, &needs, &tried, placement) {
-                Ok(reservation) => reservation,
-                Err(_) => break,
+        let reservation = match preferred.take() {
+            Some(node_id) => {
+                let skip: Vec<String> = placed_envelopes(store, job_id, &task.name)
+                    .map(|envelopes| {
+                        envelopes
+                            .into_iter()
+                            .map(|envelope| envelope.node_id)
+                            .filter(|candidate| candidate != &node_id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match reserve(store, job_id, &task.name, &needs, &skip, placement) {
+                    Ok(reservation) => reservation,
+                    // The router thinks the owner's node is full; the loop
+                    // below takes whichever node it would have picked.
+                    Err(_) => continue,
+                }
+            }
+            None => match first.take() {
+                Some(reservation) => reservation,
+                None => match reserve(store, job_id, &task.name, &needs, &tried, placement) {
+                    Ok(reservation) => reservation,
+                    Err(_) => break,
+                },
             },
         };
         let node_id = reservation.node_id.clone();
@@ -1523,12 +1629,13 @@ pub async fn start(
             &band,
             &node_id,
             session_id,
-            issued_at,
+            session_start(&node_id, issued_at),
         )
         .await
         {
             Ok(()) => {
                 let status = SessionStatus {
+                    owner: owner.clone(),
                     session_id: session_id.to_string(),
                     job_id: job_id.to_string(),
                     job_config_id: config.id(),
@@ -1550,6 +1657,7 @@ pub async fn start(
                     node_id,
                     state: "starting".into(),
                     deduplicated: false,
+                    owner,
                 });
             }
             Err(status) => {
@@ -1566,8 +1674,21 @@ pub async fn start(
                             node_id: winner,
                             state: "running".into(),
                             deduplicated: true,
+                            owner,
                         });
                     }
+                }
+                // The owner's node refused the child for the owner's own
+                // sake (not declared, at `max`, the owner is a child): no
+                // other node would answer differently.
+                if child.is_some()
+                    && status
+                        .message()
+                        .contains(crate::structs::children::REFUSED_FOR_OWNER)
+                {
+                    reservation.settle(Settle::Released);
+                    metrics.session_starts_total.inc(&["refused"]);
+                    return Err(status);
                 }
                 reservation.settle(
                     if matches!(
@@ -1597,6 +1718,186 @@ pub async fn start(
     )))
 }
 
+/// Which node this manager sent a keyed run to, so a retry through it
+/// reaches the node that kept the reply (docs/session-runs.md,
+/// "Idempotency"). In memory and per manager: a retry through another
+/// manager names the node itself (`RunSessionRequest.node_id`).
+fn run_nodes() -> &'static Mutex<HashMap<String, (String, Instant)>> {
+    static NODES: std::sync::OnceLock<Mutex<HashMap<String, (String, Instant)>>> =
+        std::sync::OnceLock::new();
+    NODES.get_or_init(Default::default)
+}
+
+fn remembered_run_node(key: &str) -> Option<String> {
+    let mut nodes = run_nodes().lock().unwrap_or_else(|p| p.into_inner());
+    nodes.retain(|_, (_, at)| at.elapsed() < crate::structs::run::RUN_REPLY_TTL);
+    nodes.get(key).map(|(node, _)| node.clone())
+}
+
+fn remember_run_node(key: &str, node_id: &str) {
+    run_nodes()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.to_string(), (node_id.to_string(), Instant::now()));
+}
+
+/// How long the node may take beyond the run's own deadline: starting the
+/// session, staging, collecting, and ending it.
+const RUN_OVERHEAD: Duration = Duration::from_secs(180);
+
+/// Send one run to `node_id` (`Worker.RunSession`).
+async fn send_run(
+    store: &Store,
+    node_id: &str,
+    request: &crate::structs::RunSessionRequest,
+    wall: Duration,
+) -> Result<crate::structs::RunSessionResponse, Status> {
+    let (mut client, target) = worker_client(store, node_id)?;
+    let wait = Duration::from_secs(u64::from(request.wait_timeout_seconds.unwrap_or(60)));
+    let mut call = tonic::Request::new(request.clone());
+    call.set_timeout(if request.dry_run {
+        WORKER_CALL_TIMEOUT
+    } else {
+        wall + wait + RUN_OVERHEAD
+    });
+    client
+        .run_session(call)
+        .await
+        .map(|reply| reply.into_inner())
+        .map_err(|status| {
+            crate::manager::worker_plane::worker_call_error(
+                &target.node_id,
+                &target.address,
+                status,
+            )
+        })
+}
+
+/// Run once in a fresh session of `task` (docs/session-runs.md): pick a
+/// node as [`start`] does and hand it the run. The node starts the session,
+/// runs, and ends it; nothing is written to the store, and the session
+/// index learns of the session only from the node's own reports.
+///
+/// Only a refusal that happened before anything ran (no room, no envelope,
+/// a disabled runtime, an overloaded launch pool) moves on to another node.
+/// Any other failure is the caller's to retry, on the node it names, so an
+/// idempotency key can find the first attempt.
+pub async fn run(
+    store: &Store,
+    config: &JobConfig,
+    task: &TaskConfig,
+    wall: Duration,
+    request: crate::structs::RunSessionRequest,
+) -> Result<crate::structs::RunSessionResponse, Status> {
+    let metrics = crate::manager::telemetry::metrics();
+    let job_id = config.name.as_str();
+    if let Some(disable) = store.runtime_disables().refusing(&task.runtime, job_id) {
+        metrics.session_runs_total.inc(&["runtime_disabled"]);
+        return Err(
+            crate::structs::runtime_state::RuntimeDisabledRefusal::new(disable, job_id).to_status(),
+        );
+    }
+    let key = request.idempotency_key.clone().unwrap_or_default();
+    let pinned = if !request.node_id.trim().is_empty() {
+        Some(request.node_id.trim().to_string())
+    } else if !key.is_empty() {
+        // A node that has left the cluster holds no reply to find: route
+        // the retry afresh rather than fail it for the rest of the window.
+        remembered_run_node(&key).filter(|node_id| store.get_node(node_id).is_ok())
+    } else {
+        None
+    };
+    if let Some(node_id) = pinned {
+        let result = send_run(store, &node_id, &request, wall).await;
+        metrics.session_runs_total.inc(&[match &result {
+            Ok(reply) if reply.deduplicated => "deduplicated",
+            Ok(_) => "ran",
+            Err(_) => "refused",
+        }]);
+        if result.is_ok() && !key.is_empty() && !request.dry_run {
+            remember_run_node(&key, &node_id);
+        }
+        return result;
+    }
+
+    refresh_room(store, job_id, &task.name).await?;
+    let needs = resource_amounts(&task.resources);
+    let placement = crate::structs::session::placement(task);
+    let mut refusals = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
+    let mut envelopes = None;
+    while tried.len() < ROUTER_ATTEMPTS {
+        let reservation = match reserve(store, job_id, &task.name, &needs, &tried, placement) {
+            Ok(reservation) => reservation,
+            Err(NoRoom { envelopes: count }) => {
+                envelopes = Some(count);
+                break;
+            }
+        };
+        let node_id = reservation.node_id.clone();
+        tried.push(node_id.clone());
+        if !key.is_empty() && !request.dry_run {
+            // Before the call: a retry of a call that timed out must reach
+            // the node that may still be running the first attempt.
+            remember_run_node(&key, &node_id);
+        }
+        match send_run(store, &node_id, &request, wall).await {
+            Ok(reply) => {
+                // The run's session has ended: the room is free again.
+                reservation.settle(Settle::Released);
+                metrics.session_runs_total.inc(&[if reply.deduplicated {
+                    "deduplicated"
+                } else {
+                    "ran"
+                }]);
+                return Ok(reply);
+            }
+            Err(status) => {
+                // Refusals the node gives before it starts anything.
+                let before_start = match status.code() {
+                    tonic::Code::ResourceExhausted => true,
+                    tonic::Code::FailedPrecondition => status.message().contains("no envelope"),
+                    tonic::Code::Unavailable => status.message().contains("runtime_disabled"),
+                    _ => false,
+                };
+                if !before_start {
+                    reservation.settle(Settle::Released);
+                    metrics.session_runs_total.inc(&["failed"]);
+                    return Err(status);
+                }
+                reservation.settle(if status.code() == tonic::Code::Unavailable {
+                    Settle::Released
+                } else {
+                    Settle::Full
+                });
+                debug!(node_id = %node_id, code = ?status.code(), "Node refused a run");
+                refusals.push(format!("{node_id}: {}", status.message()));
+            }
+        }
+    }
+    metrics.session_runs_total.inc(&["refused"]);
+    if tried.is_empty() {
+        return Err(match envelopes {
+            Some(0) | None => Status::failed_precondition(format!(
+                "no node runs an envelope for {job_id}/{} yet; the scheduler places one on \
+                 every eligible node that reports the `sessions` capability (see `legion job \
+                 status {job_id}`)",
+                task.name
+            )),
+            Some(count) => Status::resource_exhausted(format!(
+                "every envelope for {job_id}/{} is full ({count} nodes); {}",
+                task.name,
+                full_hint(task),
+            )),
+        });
+    }
+    Err(Status::resource_exhausted(format!(
+        "no node accepted the run ({}); {}",
+        refusals.join("; "),
+        full_hint(task),
+    )))
+}
+
 /// What to do about full envelopes. An elastic envelope below its ceiling
 /// grows on its node's next heartbeat once its sessions fill it
 /// (docs/session-mode.md, "Elastic envelopes"), so a retry a few seconds
@@ -1619,7 +1920,7 @@ async fn send_start(
     band: &str,
     node_id: &str,
     session_id: &str,
-    issued_at: i64,
+    session_start: SessionStart,
 ) -> Result<(), Status> {
     let (mut client, target) = worker_client(store, node_id)?;
     // The session's own identity, for the workload's environment
@@ -1640,6 +1941,7 @@ async fn send_start(
         identity_epoch: 0,
         named: false,
         promoted_from: None,
+        owner: None,
     };
     let allocation = Allocation {
         id: 0,
@@ -1665,9 +1967,7 @@ async fn send_start(
             origin: "manager".into(),
             on_refused: "stop".into(),
             ticket_jti: String::new(),
-            session: Some(SessionStart {
-                lease_issued_at_unix_ms: issued_at,
-            }),
+            session: Some(session_start),
         }),
     )
     .map_err(|err| Status::internal(format!("failed to build the session payload: {err:#}")))?;

@@ -510,18 +510,37 @@ function JobDetailContent() {
                 {(blocked) => (
                   <Note tone="warn">
                     <div class="space-y-1">
-                      <div>
-                        <span class="font-semibold">Waiting for capacity</span> · blocked on{' '}
-                        <code class="font-mono">{blocked().key}</code> since <RelativeTime value={blocked().since} />
-                      </div>
-                      <div>
-                        Task <code class="font-mono">{blocked().task}</code> needs{' '}
-                        {Object.entries(blocked().shortfall)
-                          .sort(([a], [b]) => a.localeCompare(b))
-                          .map(([resource, amount]) => `${resource} ${amount}`)
-                          .join(', ') || 'room'}{' '}
-                        per placement. It places on its own when a node it can run on joins or frees room.
-                      </div>
+                      {/* Blocked on a disabled runtime, not on room: only the
+                          operator's enable helps (docs/runtime-disable.md). */}
+                      <Show
+                        when={blocked().key.startsWith('runtime_disabled:')}
+                        fallback={
+                          <>
+                            <div>
+                              <span class="font-semibold">Waiting for capacity</span> · blocked on{' '}
+                              <code class="font-mono">{blocked().key}</code> since{' '}
+                              <RelativeTime value={blocked().since} />
+                            </div>
+                            <div>
+                              Task <code class="font-mono">{blocked().task}</code> needs{' '}
+                              {Object.entries(blocked().shortfall)
+                                .sort(([a], [b]) => a.localeCompare(b))
+                                .map(([resource, amount]) => `${resource} ${amount}`)
+                                .join(', ') || 'room'}{' '}
+                              per placement. It places on its own when a node it can run on joins or frees room.
+                            </div>
+                          </>
+                        }
+                      >
+                        <div>
+                          <span class="font-semibold">Runtime disabled</span> · blocked on{' '}
+                          <code class="font-mono">{blocked().key}</code> since <RelativeTime value={blocked().since} />
+                        </div>
+                        <div>
+                          Task <code class="font-mono">{blocked().task}</code> cannot start: an operator disabled its
+                          runtime. It places on its own when the runtime is enabled again.
+                        </div>
+                      </Show>
                       {/* A gang waits for its whole quorum, holding nothing
                           (docs/gang-scheduling.md). */}
                       <Show when={blocked().gang}>

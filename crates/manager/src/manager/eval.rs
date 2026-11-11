@@ -220,6 +220,16 @@ impl EvalRun<'_> {
         }
         observe_phase(&self.kind, "prepare", prepare_started.elapsed());
 
+        // An update replaces the previous version's allocations after its
+        // plan. With a task on a disabled runtime the plan could not start
+        // that task's replacements, so the update waits whole, and the
+        // version that is running keeps running (docs/runtime-disable.md).
+        if previous_config_id.is_some() {
+            if let Some(blocked) = self.runtime_disabled_block(store)? {
+                return Err(anyhow::Error::new(blocked));
+            }
+        }
+
         // A first submit's plan is its last write unless a batch follow-up
         // is queued after it; a resubmit removes the previous config's
         // allocations after its plan, so it settles in its own write.
@@ -254,6 +264,59 @@ impl EvalRun<'_> {
         ))
     }
 
+    /// How often a rollout paused on a disabled runtime looks again.
+    const ROLLOUT_RUNTIME_DISABLED_RETRY_SECS: u64 = 15;
+
+    /// The first placed task of the job whose runtime is disabled for it,
+    /// with the disable's refusal sentence (docs/runtime-disable.md). `None`
+    /// when no disable covers the job. Session tasks are left out: they are
+    /// never placed (their envelope is), and their sessions are refused on
+    /// their own.
+    fn runtime_disabled_task(
+        &self,
+        store: &Store,
+    ) -> R<Option<(i64, crate::structs::job::TaskConfig, String)>> {
+        let disables = store.runtime_disables();
+        if disables.is_empty() {
+            return Ok(None);
+        }
+        let namespace = crate::structs::namespace::job_namespace(&self.job_id);
+        for (task_id, task) in store.cached_task_configs_for_job_config(&self.job_config_id)? {
+            let session = task
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Session);
+            if session {
+                continue;
+            }
+            if let Some(disable) = disables.refusing(&task.runtime, &self.job_id) {
+                let refusal = disable.refusal(namespace);
+                return Ok(Some((task_id, task, refusal)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The block for an eval that replaces running work (an update, a
+    /// restart) while one of the job's placed tasks runs on a disabled
+    /// runtime: replacing would stop work that cannot start again, so the
+    /// eval waits whole and the enable wakes it.
+    fn runtime_disabled_block(
+        &self,
+        store: &Store,
+    ) -> R<Option<crate::manager::blocked::PlacementBlocked>> {
+        Ok(self
+            .runtime_disabled_task(store)?
+            .map(|(task_id, task, refusal)| {
+                let message = format!(
+                    "Job {} waits to replace its running work: task {} cannot start because \
+                     {refusal}",
+                    self.job_id, task.name
+                );
+                crate::manager::blocked::PlacementBlocked::runtime_disabled(&task, task_id, message)
+            }))
+    }
+
     fn handle_job_update(&self, store: &Store) -> R<String> {
         if self.job_id.trim().is_empty() {
             bail!("Eval job_update missing job id");
@@ -267,6 +330,14 @@ impl EvalRun<'_> {
         // update that is still wanted.
         if let Some(reason) = store.job_config_unwanted_reason(&self.job_config_id)? {
             return Ok(format!("Job {} update skipped: {reason}", self.job_id));
+        }
+
+        // A restart stops every allocation of the job and starts it again.
+        // With a task on a disabled runtime that task could not start
+        // again, so the restart waits whole for the enable
+        // (docs/runtime-disable.md); the marker stays for it.
+        if let Some(blocked) = self.runtime_disabled_block(store)? {
+            return Err(anyhow::Error::new(blocked));
         }
 
         // Consume the replicated restart marker BEFORE executing the
@@ -345,7 +416,27 @@ impl EvalRun<'_> {
         let rollout_id = store
             .latest_rollout_for_job_config(&self.job_config_id)?
             .map(|rollout| rollout.id);
-        match crate::manager::rollout::handle_rollout_tick(self, store) {
+        // A rollout replaces running allocations step by step. With a task
+        // on a disabled runtime its replacements could not start, so the
+        // rollout pauses here, before it places or retires anything: the
+        // tick goes back to the queue and looks again shortly, and the
+        // rollout is not failed (docs/runtime-disable.md).
+        if let Some((task_id, task, refusal)) = self.runtime_disabled_task(store)? {
+            let message = format!(
+                "Rollout of job {} is paused: task {} cannot start because {refusal}",
+                self.job_id, task.name
+            );
+            return Err(anyhow::Error::new(
+                crate::manager::blocked::PlacementBlocked::runtime_disabled(
+                    &task, task_id, message,
+                )
+                .with_retry_after(Some(Duration::from_secs(
+                    Self::ROLLOUT_RUNTIME_DISABLED_RETRY_SECS,
+                ))),
+            ));
+        }
+        let ticked = crate::manager::rollout::handle_rollout_tick(self, store);
+        match ticked {
             Ok(message) => Ok(message),
             // A typed NotRaftLeader is a TRANSIENT leadership shape, not a
             // rollout failure: stamping `failed` here would be permanent

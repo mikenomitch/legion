@@ -622,6 +622,61 @@ service Manager {
   // ACL: `acl:write`.
   rpc DeleteNamespacePolicy (DeleteNamespacePolicyRequest) returns (DeleteNamespacePolicyReply);
 
+  // === RUNTIME DISABLE (docs/runtime-disable.md) ===
+  //
+  // The incident switch for a task runtime: when a sandbox boundary has a
+  // published escape (a runc CVE, a VMM CVE, a wasmtime advisory), an
+  // operator stops every new start on that runtime, cluster-wide or for
+  // named namespaces, and turns it back on after upgrading. A disable is one
+  // replicated record. Placement treats the runtime as unavailable in scope
+  // (a job that could place nothing is blocked under
+  // `runtime_disabled:<runtime>` and wakes on enable; a rollout or restart
+  // of a job with a task on the runtime waits whole, so the version that is
+  // running keeps running), and every worker holds the current set (from each heartbeat
+  // reply and pushed on `StreamWork`) and refuses starts itself, so session
+  // starts and claims at the edge, with no manager on the path, are refused
+  // within one heartbeat. Running work is untouched unless the disable asks
+  // to drain. Namespace policy (`runtimes`) is separate: it is the standing
+  // rule checked at submit; this is the temporary rule checked at start.
+
+  // Disables or enables a task runtime, cluster-wide or for the namespaces
+  // matching `namespaces`.
+  //
+  // Disabling (`enabled = false`) writes the record for `runtime`, or widens
+  // the one that exists: a scoped disable adds its globs to a scoped record,
+  // and a cluster-wide disable replaces any scope. `since` is kept from the
+  // first disable; `reason` and `drain` take the newest call's values. With
+  // `drain`, running work of the runtime in scope is also taken off it:
+  // keyed instances whose task has a `suspend` block are suspended (their
+  // checkpoints kept), every other allocation gets a graceful stop, and each
+  // node suspends its sessions that can be suspended and stops the rest.
+  //
+  // Enabling (`enabled = true`) deletes the record, or removes the named
+  // globs from a scoped one (deleting it when none are left). Blocked evals
+  // wake and place without a resubmit, and callers that were refused succeed
+  // on retry. Instances a drain suspended stay suspended until something
+  // resumes them, as any suspended instance does. Enabling a runtime that is
+  // not disabled succeeds and changes nothing (`changed = false`).
+  //
+  // ACL: `operator:write`.
+  //
+  // Errors:
+  // - InvalidArgument: `runtime` is empty or not a runtime name, a glob in
+  //   `namespaces` is not a namespace glob, `runtime` is `envelope` (disable
+  //   the session task's own runtime instead), or `drain` is set on an
+  //   enable.
+  // - FailedPrecondition: an enable names namespaces while the runtime is
+  //   disabled cluster-wide (enable it cluster-wide, then disable the
+  //   namespaces that should stay off), or names a glob the record does not
+  //   hold.
+  rpc SetRuntimeEnabled (SetRuntimeEnabledRequest) returns (SetRuntimeEnabledReply);
+
+  // Lists every runtime disable in force, each with what is waiting on it.
+  // Any manager answers from its own replica.
+  //
+  // ACL: `operator:read`.
+  rpc ListRuntimeStates (ListRuntimeStatesRequest) returns (ListRuntimeStatesReply);
+
   // === JOB TEMPLATES ===
   //
   // Job templates are cluster-resident, immutably versioned Nickel
@@ -749,7 +804,40 @@ service Manager {
   // - ResourceExhausted: no node's envelope for the task has room. Retryable
   //   once sessions end or envelopes are added.
   // - FailedPrecondition: no node holds an envelope for the task yet.
+  //
+  // With `owner` the new unit is a child (docs/child-sessions.md): a
+  // session child of a session task, or a keyed child of a keyed task,
+  // whose row carries the owner reference and which the owner's stop or
+  // destroy ends in the same replicated entry. See
+  // `CreateInstanceRequest.owner`.
   rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceReply);
+
+  // Creates a keyed instance as a child of a unit running on the calling
+  // node: what `Workload.CreateChildInstance` on an allocation's API socket
+  // becomes once the worker has attributed the caller (`legion instance
+  // create <task> --owner self` inside a task; docs/child-sessions.md).
+  //
+  // The node vouches for which of its allocations asked; the manager
+  // checks that the allocation runs on that node, works out the owner (the
+  // allocation's instance when it has one, the allocation otherwise), and
+  // applies the jobspec's rules exactly as `CreateInstance` with `owner`
+  // does: the owner's task must name the child task in `children.tasks`,
+  // the child task must be keyed, and the owner must have fewer than
+  // `children.max` children. The row, its owner reference, and the
+  // placement eval are one scheduler-lane entry.
+  //
+  // ACL: worker-plane. The caller is a registered worker (its node
+  // certificate or join credentials), and `node_id` must be the node the
+  // owning allocation is placed on. No operator token is involved: the
+  // authority is the jobspec's `children` block.
+  //
+  // Errors: NotFound when the allocation does not run on the calling node;
+  // FailedPrecondition when its task does not declare the child task, the
+  // child task is not keyed, or the owner is itself a child (depth 1
+  // only); ResourceExhausted (retryable) at `children.max`; AlreadyExists
+  // when `instance_id` names an existing instance; InvalidArgument for a
+  // malformed `instance_id`.
+  rpc CreateChildInstance (CreateChildInstanceRequest) returns (CreateInstanceReply);
 
   // Creates several keyed-mode stateful instances in one atomic call and
   // enqueues a single placement evaluation for the batch.
@@ -1189,6 +1277,12 @@ service Manager {
   // replacement placed after node loss reserves the task's full resources,
   // like any keyed placement.
   //
+  // Ownership (docs/child-sessions.md): promoting an owner re-keys its
+  // children's references to the new instance. Promoting a child whose
+  // owner is an `instance` or an `allocation` writes the reference into the
+  // new row in this entry, so it stays that owner's (keyed) child;
+  // promoting a child of a `session` detaches it.
+  //
   // ACL: `job:write` on the session's job, checked coarsely before the
   // session lookup and precisely after it.
   //
@@ -1208,6 +1302,89 @@ service Manager {
   //   `stateful.promote.onName = false` and `new_id` is set.
   // - FailedPrecondition: the session's job config no longer has its task.
   rpc PromoteInstance (PromoteInstanceRequest) returns (PromoteInstanceReply);
+
+  // Resizes one running top-level allocation in place: its `memory`
+  // (reservation), `memoryMax` (ceiling), and `cpu`, as an override over the
+  // task's spec (docs/resize.md). No new job version and no rollout.
+  //
+  // One scheduler-lane compare-and-set on the allocation's row commits the
+  // new size (`from` is the effective size this manager read, `to` the new
+  // one), and the allocation's node applies it through the task runtime. A
+  // grow (a larger `memory` or `cpu`) is reserved first and takes only free
+  // room on the node; it never preempts. A shrink is applied on the node
+  // first and released after. A runtime that cannot make the change live
+  // answers `needs_restart` or `not_supported` and nothing changes: Legion
+  // never restarts a unit to resize it.
+  //
+  // The reply always reports an `outcome`; only `applied` changed anything.
+  // A resize back to the spec's own amounts removes the override. The
+  // override ends with the allocation: a replacement starts at the spec.
+  //
+  // ACL: `scale:write` on the allocation's job (the caller needs
+  // `scale:write` on some job before the allocation is looked up, so its
+  // existence is not probeable).
+  //
+  // Errors:
+  // - NotFound: no live allocation has this id.
+  // - InvalidArgument: no amount given, a non-positive amount, or a ceiling
+  //   below the reservation.
+  // - FailedPrecondition: the allocation is a session envelope (it resizes
+  //   through `stateful.envelope`), is not running, or its row changed under
+  //   this call (`stale`; read it again).
+  // - Unavailable: the allocation's node could not be reached. Nothing was
+  //   committed for a shrink; a grow's reservation is rolled back.
+  rpc ResizeAllocation (ResizeAllocationRequest) returns (ResizeReply);
+
+  // Resizes one instance in place: a keyed or slot instance (its current
+  // allocation, exactly as `ResizeAllocation`) or a running session, named
+  // by its id (docs/resize.md).
+  //
+  // A session's resize is node-local and writes nothing to the replicated
+  // store: the manager routes it to the node the session id's tag names
+  // (`Worker.ResizeSession`), which admits a grow against the session
+  // task's envelope and tells the runtime. A grow the envelope has no room
+  // for answers `refused` with the room it has, or `deferred` when the
+  // envelope is elastic and is growing to make room.
+  //
+  // ACL: `scale:write` on the instance's job, checked after a coarse
+  // `scale:write` gate.
+  //
+  // Errors: as `ResizeAllocation`, plus FailedPrecondition when a keyed
+  // instance is suspended or stopped (it has no running allocation), and
+  // Unavailable when a session's node cannot be reached.
+  rpc ResizeInstance (ResizeInstanceRequest) returns (ResizeReply);
+
+  // Resizes a task: sets (or, with `reset`, removes) a task-level size
+  // override laid over the task's `resources`, the way `ScaleTask` lays a
+  // count override over `count` (docs/resize.md, "Resizing a task").
+  //
+  // The override is one record per task. While it stands, every new
+  // allocation of the task is placed at the overridden size, and this call
+  // also brings the task's running allocations to it: each one is resized
+  // in place exactly as `ResizeAllocation` would, and the reply lists the
+  // answer for each. An allocation that cannot change in place (no room on
+  // its node, or a runtime that answers `needs_restart` or
+  // `not_supported`) keeps running at its old size and takes the new one
+  // when it is next replaced; with `replace` it is stopped now so the
+  // scheduler places its replacement at the new size. Nothing is ever
+  // restarted without `replace`.
+  //
+  // No job version is created and no rollout starts. A later submit whose
+  // spec changes the task's `resources` drops the override (the author's
+  // new spec wins, the arbitration count overrides follow); a submit that
+  // leaves them alone keeps it. Session tasks are refused: a session's
+  // room is its envelope (`stateful.envelope`), and each session is resized
+  // on its own with `ResizeInstance`.
+  //
+  // ACL: `scale:write` on the job.
+  //
+  // Errors:
+  // - NotFound: the job or task does not exist.
+  // - InvalidArgument: no amount given without `reset`, amounts given with
+  //   `reset`, a non-positive amount, a ceiling below the reservation, or
+  //   `task_name` left empty on a job with more than one task.
+  // - FailedPrecondition: the task is a session task or a session envelope.
+  rpc ResizeTask (ResizeTaskRequest) returns (ResizeTaskReply);
 
   // Lists every node that holds an envelope for a session task, for a
   // picker (Envoy, HAProxy, or a platform's own code) that starts sessions
@@ -1233,6 +1410,54 @@ service Manager {
   // - FailedPrecondition: `task_name` names no session task of the job, or
   //   the job has more than one session task and `task_name` is empty.
   rpc ListSessionNodes (ListSessionNodesRequest) returns (ListSessionNodesReply);
+
+  // Runs once in a fresh, single-use session of a session task and returns
+  // the outcome (docs/session-runs.md): the session router picks a node
+  // with envelope room exactly as it does for an unnamed session start,
+  // and that node starts the session, stages the caller's `files` and
+  // `input` under the run directory, executes the task's `run.command`
+  // once under `run.wall`, collects stdout, stderr, the exit status,
+  // `result.json`, and the files named in `get`, ends the session, and
+  // answers. Nothing is written to the replicated store, and the session
+  // is ended on every path, including a failure in any step.
+  //
+  // A command that ran is a successful call, whatever it exited with: the
+  // reply carries `exit`. A run stopped by a limit is also a successful
+  // call, with `stopped` set and no `exit`. Only a run that could not start
+  // or could not finish is an error.
+  //
+  // Idempotency is per node. With `idempotency_key`, the node derives the
+  // run's id from the key and keeps the reply for 10 minutes, so a retry
+  // that reaches the same node is answered from it (`deduplicated`) without
+  // running again, and a retry that arrives while the first is still
+  // running waits for it. A manager remembers which node it sent a key to
+  // for the same 10 minutes, and `node_id` pins a retry sent through
+  // another manager. A retry that lands on another node runs again.
+  //
+  // ACL: `job:write` on the job runs the task's own `run.command`. A
+  // request that sets `command` also needs `exec:write` on the job, the
+  // permission `ExecAllocation` needs, and `run.allowCommand = true` on the
+  // task.
+  //
+  // Errors:
+  // - InvalidArgument: no `job_id`; a file or `get` path outside the run
+  //   directory; `input` that is not JSON; more than 3 MiB staged.
+  // - NotFound: no such job, or `node_id` names no node.
+  // - PermissionDenied: `command` without `exec:write` ("--command needs
+  //   exec:write on job <job> (running the task's own run.command needs
+  //   only job:write)").
+  // - FailedPrecondition: `task_name` names no session task of the job (or
+  //   is empty and the job has several); the task has no `run` block; the
+  //   task does not allow `command`; no node holds an envelope for the
+  //   task; the pinned node holds none.
+  // - ResourceExhausted: every envelope is full. Retryable.
+  // - Unavailable: the task's runtime is disabled (`runtime_disabled`), the
+  //   node could not be reached, or the session was lost mid-run.
+  //   Retryable; with an idempotency key, a retry to the same node does
+  //   not run the command twice unless the first attempt never finished.
+  // - DeadlineExceeded: the session did not reach `running` within
+  //   `wait_timeout_seconds`. It is ended; nothing ran.
+  rpc RunSession (RunSessionRequest) returns (RunSessionResponse);
 
   // === SNAPSHOTS (see docs/suspend-and-resume.md) ===
 
@@ -1860,8 +2085,10 @@ service Manager {
   // it, and says so with `index_reported = false`. Only entries of at least
   // 1 MiB are advertised, so small artifacts never appear.
   //
-  // The content store's byte budgets and per-class totals are not part of
-  // this reply: the index carries digests, not classes.
+  // The byte budgets and totals of the `artifacts` and `snapshots` classes
+  // are not part of this reply: the index carries digests, not classes. The
+  // `derived` class is reported whole in `derived`, because its entries are
+  // never advertised by digest.
   //
   // ACL: node:read, scoped to the node's pool (checked unscoped before the
   // lookup, so a caller with no node access cannot probe which nodes exist).
@@ -5501,6 +5728,12 @@ message TaskScaleStatus {
   // The override row's version (`ScaleTaskRequest.expected_version`); 0
   // when no row exists.
   uint64 version = 16;
+
+  // The task-level size override `ResizeTask` set (docs/resize.md), as a
+  // JSON object: the overridden amounts (`memory`, `memoryMax`, `cpu`), the
+  // `spec` amounts it was laid over, `reason`, `by`, and `at`. Empty when
+  // the task runs at its spec size.
+  string resources_override = 17;
 }
 
 // A time-boxed pin on an autoscaled task (`legion job scale --for`).
@@ -7215,6 +7448,57 @@ message CreateInstanceRequest {
   // job) instead of booting it empty. Needs `snapshot:read` on the job. See
   // `CreateInstances` for the full contract.
   optional string from_snapshot = 6;
+
+  // Create the unit as a child of this unit (docs/child-sessions.md): it
+  // ends when its owner ends, and is listed under it. The owner must be a
+  // running unit of the same job whose task names this task in
+  // `children.tasks`. Needs `job:write` like any create.
+  //
+  // - On a session task without `instance_id`, the child is an unnamed
+  //   session. It goes to its owner's node when that node's envelope for
+  //   this task has room, and to another node with room otherwise.
+  // - On a keyed task (or a session task with `instance_id`, which makes a
+  //   keyed instance), the child is a keyed instance whose row stores the
+  //   reference. The owner must be an `instance` or an `allocation`: a
+  //   session cannot own a durable child. Stopping the owner stops the
+  //   child and destroying it destroys the child, in the owner's own
+  //   replicated entry; suspending, archiving, or rescheduling the owner
+  //   does neither. The scheduler prefers the owner's node for the child's
+  //   first placement. `from_snapshot` is refused with `owner`.
+  //
+  // `kind` is `session` (a session id), `instance` (a keyed or slot
+  // instance id), or `allocation` (an allocation id, for owners with no
+  // instance identity); empty asks the manager to work it out from `id`.
+  //
+  // Errors: NotFound when no running unit has the id; FailedPrecondition
+  // when the owner's task does not declare this task, when the owner is
+  // itself a child (depth 1 only), or when a session would own a keyed
+  // child; ResourceExhausted (retryable) when the owner already has
+  // `children.max` children (session and keyed children counted together)
+  // or, for a session child, no envelope has room.
+  optional OwnerRef owner = 7;
+}
+
+// Request payload for Manager.CreateChildInstance (worker-plane).
+message CreateChildInstanceRequest {
+  // The calling node: the one the owning allocation runs on.
+  string node_id = 1;
+
+  // The allocation whose workload asked, as the node attributed the
+  // connection on its API socket.
+  int64 allocation_id = 2;
+
+  // The keyed task to create a child of. It must be a task of the
+  // allocation's job that the allocation's task names in `children.tasks`.
+  string task_name = 3;
+
+  // Optional key for the child, as `CreateInstanceRequest.instance_id`.
+  // Empty mints an unnamed id.
+  string instance_id = 4;
+
+  // Optional retry key, scoped to the owning allocation: a repeat returns
+  // the instance the first call created with `deduplicated = true`.
+  string idempotency_key = 5;
 }
 
 // Reply payload for CreateInstance.
@@ -7261,6 +7545,10 @@ message CreateInstanceReply {
   // deduplicated create. Empty for a keyed create (see `GetInstance` for its
   // state).
   string state = 7;
+
+  // The owner the session was started under (`CreateInstanceRequest.owner`),
+  // with its kind resolved. Unset for a create without an owner.
+  optional OwnerRef owner = 8;
 }
 
 // Request payload for CreateInstances (atomic batch create).
@@ -7907,6 +8195,33 @@ message InstanceInfo {
   // and `legion job run <spec> --force-reschedule` lifts every backoff of
   // the job. Replicated, so every manager reports it. Unset otherwise.
   optional RescheduleBackoff reschedule_backoff = 47;
+
+  // The unit that owns this unit as its child (docs/child-sessions.md): a
+  // session child's reference comes from its node's report, a keyed
+  // child's from its row. Unset for a unit nobody owns. A promoted child
+  // keeps the reference when its owner is an `instance` or an `allocation`
+  // and loses it when its owner is a `session`.
+  optional OwnerRef owner = 48;
+
+  // The children this unit owns: its session children as the session index
+  // lists them, then its keyed children from the replicated store
+  // (`ChildInfo.kind` tells them apart). Filled by `GetInstance`; empty in
+  // lists.
+  repeated ChildInfo children = 49;
+
+  // The instance's effective resizable resources, as a JSON object of
+  // `memory` and `memoryMax` (MiB) and `cpu` (MHz): the spec's amounts with
+  // any resize laid over them (docs/resize.md). Set on GetInstance for an
+  // instance with a running allocation and for a running session; empty
+  // otherwise.
+  string resources = 50;
+
+  // The resize override on the instance's current allocation, as a JSON
+  // object: the overridden amounts (`memory`, `memoryMax`, `cpu`), the
+  // spec's amounts under `spec`, and `reason`, `by` (the accessor that
+  // resized), and `at` (RFC 3339). Empty when the instance runs at its
+  // spec, and for sessions, whose node keeps their size.
+  string resources_override = 51;
 }
 
 // A failed allocation's replacement waiting out its task's reschedule
@@ -9769,6 +10084,25 @@ message HeartbeatRequest {
   // Absent (or empty) from a worker that holds nothing yet, which is answered
   // with every set and the bindings.
   EndpointFeedState endpoint_feed = 22;
+
+  // Starts this node refused since its last acknowledged heartbeat because
+  // their runtime is disabled (docs/runtime-disable.md): session starts,
+  // claims, restarts, and placements that raced the disable. One entry per
+  // runtime with a non-zero count. The manager adds them to the count
+  // `ListRuntimeStates` reports as `edge_refusals`.
+  //
+  // Default: empty.
+  repeated RuntimeRefusals runtime_refusals = 23;
+}
+
+// Starts one node refused for one disabled runtime. See
+// `HeartbeatRequest.runtime_refusals`.
+message RuntimeRefusals {
+  // The disabled runtime.
+  string runtime = 1;
+
+  // How many starts were refused since the last acknowledged heartbeat.
+  uint64 count = 2;
 }
 
 // One envelope resize a node asks for. See
@@ -9894,6 +10228,12 @@ message SessionStatus {
   // periodic (`suspend.checkpointEvery`) or worker-stop checkpoint. Absent
   // for a running session that was never checkpointed.
   SessionCheckpointInfo checkpoint = 12;
+  // The unit that owns this session as its child (docs/child-sessions.md).
+  // Unset for a session nobody owns.
+  // The node reports it on every session report, so the managers know
+  // which sessions to end when an `instance` or `allocation` owner reaches
+  // a terminal state.
+  OwnerRef owner = 13;
 }
 
 // A session's checkpoint, as its node reports it in `SessionStatus`.
@@ -10050,6 +10390,15 @@ message StreamWorkReply {
   // and the manager never replays it.
   bool push_only = 9;
 
+  // Every runtime disable in force (docs/runtime-disable.md), pushed on a
+  // `push_only` message when the stream opens while any disable is in force
+  // (ahead of the replay), and the moment the set changes on this manager's
+  // replica. The worker replaces the set it holds.
+  // A hint, like `endpoint_feed`: never replayed and not counted in
+  // `digest`; the heartbeat reply carries the same set on every beat. Unset
+  // on every other message.
+  RuntimeStateSet runtime_states = 10;
+
   // The revision this message reflects: the node's desired set after
   // applying it includes every committed change up to this revision. A
   // worker keeps the revision of the last message it applied and sends it as
@@ -10065,6 +10414,12 @@ message StreamWorkReply {
   // stream and reconnects with no position, which gets a full resync.
   // `digest` is the node's whole desired set after the message, as always.
   string resumed_from = 21;
+
+  // Owner notices for this node's child sessions, pushed as soon as this
+  // manager sees the owner's state change (see
+  // `HeartbeatReply.owner_notices`, which repeats them). Push-only: outside
+  // the sequence and never replayed.
+  repeated OwnerNotice owner_notices = 11;
 }
 
 // One finished (or refused-after-verification) direct exec session.
@@ -10145,6 +10500,103 @@ message ContentLocationReport {
   // checkpoint headroom and keep new memory-checkpoint instances off a node
   // with no room for their checkpoint (see `SnapshotBudget`).
   optional SnapshotBudget snapshot_budget = 6;
+
+  // The node's derived content: what Legion built on it from verified
+  // inputs and can build again (see `DerivedContentReport`). Present on
+  // every full report from a node with a content store, and on a delta only
+  // when the node's derived set, a size in it, or a pin on it changed since
+  // the last report this manager acknowledged. Absent on a delta means
+  // "unchanged": the manager keeps what it holds. Absent on a full report
+  // means the node has no content store, and the manager drops what it held.
+  //
+  // This is a listing for operators, never a location: derived entries are
+  // not in `added`, the scheduler does not score on them, and no node
+  // fetches one from another.
+  optional DerivedContentReport derived = 7;
+}
+
+// The `derived` class of one node's content store, as the node reports it
+// (docs/artifacts.md, "Derived content"). Derived content is everything
+// Legion builds on a node from content the node already verified: today the
+// base root disk of each sandbox image. An entry is expensive to build, the
+// same for every unit of its inputs on the node, and safe to discard, so
+// the class has one byte budget (`content.budgets.derived`) and one
+// least-recently-used order across every kind.
+//
+// Derived content is built on its node and stays there. No RPC puts an
+// entry, reads one off a node, or publishes one.
+message DerivedContentReport {
+  // The class budget in bytes, as sized when the worker opened its store:
+  // `content.budgets.derived`, default 10% of the content filesystem
+  // clamped to 1 GiB..20 GiB. 0 means the class is off on this node, and
+  // every consumer builds what it needs on each start.
+  uint64 budget_bytes = 1;
+
+  // Bytes of disk the class holds, counted in allocated blocks, so a sparse
+  // root disk image counts what it costs and not its apparent size.
+  uint64 used_bytes = 2;
+
+  // The part of `used_bytes` held by pinned entries, which are never
+  // evicted or expired while pinned.
+  uint64 pinned_bytes = 3;
+
+  // The entries, most recently used first. At most 256 are sent; see
+  // `entry_count` for how many the node holds.
+  repeated DerivedContentEntry entries = 4;
+
+  // How many derived entries the node holds. Larger than `entries` only
+  // when the node holds more than 256.
+  uint64 entry_count = 5;
+}
+
+// One derived entry on one node.
+message DerivedContentEntry {
+  // What the entry is: `rootfs` (a sandbox image's base root disk), `cwasm`
+  // (a compiled WebAssembly module), `preinit-image`, `preinit-entry`
+  // (pre-initialized language images and task entries), or `vm-base` (a
+  // base memory snapshot of a booted VM). Only `rootfs` is built today.
+  string kind = 1;
+
+  // The entry's recipe key: 64 lowercase hex characters, the SHA-256 of the
+  // kind, every input, and the builder version. Two entries with the same
+  // kind and key hold the same bytes on any node, but a key is an identity
+  // within a node, not a fetchable address.
+  string key = 2;
+
+  // Bytes of disk the entry uses (allocated blocks).
+  uint64 bytes = 3;
+
+  // What the entry was built from, by input name. Every value is a content
+  // digest (`sha256:<hex>`), a decimal number, or the SHA-256 fingerprint of
+  // an input that is not content (written `sha256:<hex>` too). A recipe
+  // never holds raw text, so nothing here can be a secret or anything of
+  // one allocation. For `rootfs`: `layer.0000`, `layer.0001`, ... (the
+  // image's layer digests, bottom first), `guestBinary` (a fingerprint of
+  // the guest agent binary's identity), and `headroomMib`.
+  map<string, string> inputs = 4;
+
+  // The version of the code that built it. For an in-tree builder this is
+  // the Legion version and the builder's format (`legion-0.1.0+rootfs.1`);
+  // for a compiler, the engine's version. It is part of the key, so a new
+  // builder never reuses an old builder's entry.
+  string builder_version = 5;
+
+  // True when the entry was built by a confined builder process, which is
+  // required for builds that parse or execute untrusted input. Root disks
+  // are built in the worker, so this is false for `rootfs`.
+  bool confined = 6;
+
+  // When the entry was committed, in Unix seconds.
+  int64 created_at = 7;
+
+  // When the entry was last used (cloned for a start, or found by a
+  // prefetch), in Unix seconds. Eviction takes the least recently used
+  // unpinned entry first, and an unpinned entry unused for `content.ttl`
+  // (default 72h) is removed.
+  int64 last_used_at = 8;
+
+  // True while at least one owner pins the entry.
+  bool pinned = 9;
 }
 
 // Content locality. One piece of content a node holds.
@@ -10695,6 +11147,23 @@ message HeartbeatReply {
   // allocation declares upstreams or `proxy` handlers; the manager then
   // reads no catalog at all.
   EndpointFeed endpoint_feed = 25;
+
+  // Every runtime disable in force (docs/runtime-disable.md), as the
+  // answering manager's replica holds it. Sent on every beat, so a disable
+  // reaches every node within one heartbeat interval even when its
+  // `StreamWork` push was lost; the worker replaces the set it holds and
+  // refuses starts of a disabled runtime from then on.
+  //
+  // Unset by a manager that predates runtime disables; a worker then keeps
+  // the set it holds. Set with no `states` when nothing is disabled.
+  RuntimeStateSet runtime_states = 26;
+
+  // What happened to the owners of child sessions this node holds
+  // (docs/child-sessions.md): the managers decide when an `instance` or
+  // `allocation` owner ended, and when a `session` owner on another node
+  // did. Sent on every reply until the node's session report no longer
+  // lists a child of the owner, so a lost notice is repeated.
+  repeated OwnerNotice owner_notices = 27;
 }
 
 // Why one allocation is being stopped.
@@ -10723,6 +11192,9 @@ message StopNotice {
   //   this allocation was surplus.
   // - `restore` — the allocation's instance is being rolled back to a
   //   snapshot (RestoreInstance); a replacement restores from it.
+  // - `runtime_disabled` — the allocation's runtime was disabled with a
+  //   drain (docs/runtime-disable.md); nothing replaces it until the runtime
+  //   is enabled again.
   //
   // Workers treat an unrecognized value as `unknown` and stop the allocation
   // anyway, so the manager may add causes without a coordinated upgrade.
@@ -11463,6 +11935,16 @@ message GetNodeContentReply {
   // (fetched for a restore or a fork, or warmed by WarmSnapshot). Rows on
   // jobs the caller has no `snapshot:read` on are left out.
   repeated NodeSnapshotContent snapshots = 8;
+
+  // The node's derived content as it last reported it: what Legion built on
+  // the node and can build again (sandbox base root disks), with the class
+  // budget and totals. Derived entries are never in `entries` and never
+  // count toward `advertised_bytes`, because no node fetches one.
+  //
+  // Absent when `index_reported` is false, when the node's worker has no
+  // content store, or when it predates derived content. A present report
+  // with `budget_bytes` 0 means the class is turned off on that node.
+  optional DerivedContentReport derived = 9;
 }
 
 // One piece of content a node advertises.
@@ -13480,6 +13962,13 @@ message LedgerAllocation {
   // lookup. Empty only when the task config row is gone, which a live
   // allocation never sees.
   string task_name = 11;
+
+  // The resize override on this allocation, as a JSON object (the
+  // overridden `memory`, `memoryMax`, `cpu`, the spec's amounts under
+  // `spec`, and `reason`, `by`, `at`); empty when the allocation runs at
+  // its spec. `resources` above is always the effective reservation
+  // (docs/resize.md).
+  string resources_override = 12;
 }
 
 // Request payload for UpdateNodeDynamic.
@@ -13976,6 +14465,21 @@ service Worker {
   // the id's tag names another node.
   rpc StopSession (StopSessionRequest) returns (StopSessionReply);
 
+  // Resizes one unit this node runs, in place (docs/resize.md): a session,
+  // admitted against its task's envelope with nothing written to the
+  // replicated store, or a top-level allocation whose new size a manager
+  // has already committed. The node tells the task runtime, which changes
+  // what it can live and answers `needs_restart` or `not_supported` for
+  // the rest; nothing is restarted.
+  //
+  // Caller class: `manager`. `Manager.ResizeInstance` and
+  // `Manager.ResizeAllocation` are the only callers.
+  //
+  // Errors: NotFound when the node runs no such session or allocation
+  // (with `wrong_node` in the message when a session id's tag names
+  // another node); InvalidArgument for a malformed request.
+  rpc ResizeSession (ResizeSessionRequest) returns (ResizeSessionReply);
+
   // Suspends sessions on this node (session durability plan §6.6,
   // docs/session-mode.md "Idle sessions"). A manager calls it to route
   // `legion instance suspend <session>` to the node the session id's tag
@@ -14064,6 +14568,25 @@ service Worker {
   // Caller class: `manager`; anything else is refused with
   // `Unauthenticated`.
   rpc ResumeSession (ResumeSessionRequest) returns (ResumeSessionReply);
+
+  // Runs once in a fresh, single-use session of a session task on this
+  // node and returns the outcome: the edge form of `Manager.RunSession`,
+  // with no manager on the path and nothing written to raft (see that RPC
+  // for the steps, the reply, and idempotency; docs/session-runs.md).
+  //
+  // Caller classes: `ticket` (a session ticket for the job and task, in
+  // `ticket`) and `manager` (a manager's certificate, which routed a
+  // `Manager.RunSession` here after enforcing its ACL).
+  //
+  // A ticket runs the task's own `run.command`. `command` is refused for
+  // the ticket class with PermissionDenied: replacing the command needs
+  // `exec:write`, which only a manager can check.
+  //
+  // Errors: as `Manager.RunSession`, plus Unauthenticated for a missing or
+  // unverifiable ticket, and PermissionDenied when the ticket does not
+  // cover the job and task. ResourceExhausted (`envelope_full`,
+  // `no_envelope`, `overloaded`) is retryable on another node.
+  rpc RunSession (RunSessionRequest) returns (RunSessionResponse);
 }
 
 // Request payload for Worker.StartSession.
@@ -14111,6 +14634,20 @@ message StartSessionRequest {
   // session that is still running leaves two copies until the old one is
   // fenced (docs/session-mode.md, "No split brain").
   bool force_move = 7;
+
+  // Start the session as a child of this owner (docs/child-sessions.md).
+  // The owner must be running on this node: a session id (`kind =
+  // "session"`), a keyed or slot instance id (`"instance"`), or an
+  // allocation id (`"allocation"`); empty `kind` asks the node to work it
+  // out. The owner's task must name the ticket's task in `children.tasks`
+  // and be a task of the ticket's job. The ticket is still the credential.
+  //
+  // Errors: NotFound when the owner is not running on this node (start it
+  // through a manager to place a child on another node);
+  // FailedPrecondition when the owner's task does not declare the task or
+  // the owner is itself a child; ResourceExhausted (retryable) at
+  // `children.max` or a full envelope.
+  OwnerRef owner = 8;
 }
 
 // Reply payload for Worker.StartSession.
@@ -14146,6 +14683,406 @@ message StartSessionReply {
   // With `resume_id`, the node the session ran on before, when it moved
   // here. Empty otherwise.
   string moved_from = 7;
+
+  // The owner the session was started under, with its kind resolved.
+  // Unset for a session nobody owns.
+  OwnerRef owner = 8;
+}
+
+// The workload channel: what a workload asks its own node's worker, over
+// the per-allocation API socket (`$LEGION_SECRETS_DIR/legion.sock`,
+// docs/workload-identity.md, "The API socket"). The same socket proxies the
+// `Manager` service to the managers with the allocation's identity token;
+// calls to this service never leave the node and carry no token. The worker
+// attributes every connection to the socket's allocation (by cgroup where
+// every task has a leaf, by the directory's modes otherwise), so a caller
+// acts for its own allocation and no other.
+//
+// One workload-channel call is not gRPC, because it passes a file
+// descriptor: connection handoff, on `legion-handoff.sock` beside this
+// socket (docs/child-sessions.md, "Connection handoff").
+service Workload {
+  // Runs once in a fresh, single-use session of a session task of the
+  // caller's own job, on the caller's node (see `Manager.RunSession` for
+  // the steps and the reply; docs/session-runs.md).
+  //
+  // Authorization is the jobspec's, not a credential's: the worker admits
+  // the run only when the calling allocation's task is allowed to start
+  // the target task. `job_id` may be empty and must be the caller's job
+  // when set; `ticket`, `node_id`, and `command` are refused (replacing the
+  // command needs `exec:write`, which only a manager checks).
+  //
+  // Errors: as `Worker.RunSession`, plus PermissionDenied for another job,
+  // a `command`, or a task the caller's task may not run, and NotFound when
+  // the socket's allocation is no longer running.
+  rpc RunSession (RunSessionRequest) returns (RunSessionResponse);
+
+  // Starts a session of a sibling session task as a child of the calling
+  // allocation (docs/child-sessions.md): `legion session start <task>
+  // --owner self` inside a task. The child ends when the caller's unit
+  // ends, is charged to its own task's envelope, and runs under its own
+  // task's resources, network policy, and identity.
+  //
+  // Authorization is the jobspec's: the caller's task must name the task
+  // in `children.tasks`. No credential is read. The owner is the caller,
+  // whatever the request says: its session when it is a session, its
+  // instance when it is a keyed or slot instance, its allocation otherwise.
+  // The child starts on the caller's node; when that node has no room for
+  // it the call is refused, and a start through a manager
+  // (`CreateInstanceRequest.owner`) can place it elsewhere.
+  //
+  // Errors: FailedPrecondition when the caller's task does not declare the
+  // task, the caller is itself a child (depth 1 only), or the node holds
+  // no envelope for the task; ResourceExhausted (retryable) when the
+  // caller already owns `children.max` children or the envelope is full;
+  // Unavailable when the task's runtime is disabled; NotFound when the
+  // socket's allocation is no longer running.
+  rpc StartChildSession (StartChildSessionRequest) returns (StartSessionReply);
+
+  // Lists the children the calling allocation's unit owns on this node:
+  // running and suspended ones, and the ones that ended in the last ten
+  // minutes (`state = "gone"`, with the reason: `stopped`, `evicted`,
+  // `exited`, `owner ended`). This is how an owner learns a child is gone.
+  //
+  // Errors: NotFound when the socket's allocation is no longer running.
+  rpc ListChildren (ListChildrenRequest) returns (ListChildrenReply);
+
+  // Ends one child of the calling allocation's unit. Only the caller's own
+  // children are reachable: any other id answers NotFound, so the existence
+  // of other units cannot be probed.
+  //
+  // Errors: NotFound when the id is not a child of the caller on this node.
+  rpc StopChildSession (StopChildSessionRequest) returns (StopChildSessionReply);
+
+  // Creates a keyed instance of a sibling keyed task as a child of the
+  // calling allocation's unit: `legion instance create <task> --owner self`
+  // inside a task (docs/child-sessions.md). The worker attributes the call
+  // to the socket's allocation and asks a manager
+  // (`Manager.CreateChildInstance`), since a keyed instance is a replicated
+  // row; no credential is read from the caller.
+  //
+  // The owner is the caller's instance when it is a keyed or slot
+  // instance and its allocation otherwise. A session cannot own a keyed
+  // child, so a caller that is a session is refused.
+  //
+  // Errors: as `Manager.CreateChildInstance`, plus FailedPrecondition when
+  // the caller is a session, Unavailable when no manager can be reached,
+  // and NotFound when the socket's allocation is no longer running.
+  rpc CreateChildInstance (WorkloadCreateChildInstanceRequest) returns (CreateInstanceReply);
+
+  // Resizes one of the caller's own child sessions in place
+  // (docs/resize.md): how a child grows after it starts. Admitted against
+  // the child task's envelope on this node, exactly as
+  // `Manager.ResizeInstance` on a session, with no token: the socket's
+  // attribution names the owner, and only its own children are reachable.
+  //
+  // Errors: NotFound when the session is not a child of the caller (so
+  // another owner's child is not probeable); FailedPrecondition when the
+  // child runs on another node (resize it through a manager).
+  rpc ResizeChildSession (ResizeChildSessionRequest) returns (ResizeSessionReply);
+}
+
+// `Workload.CreateChildInstance`.
+message WorkloadCreateChildInstanceRequest {
+  // The keyed task to create a child of. It must be a task of the caller's
+  // job that the caller's task names in `children.tasks`.
+  string task_name = 1;
+
+  // Optional key for the child (`[A-Za-z0-9._-]{1,128}`). Empty mints an
+  // unnamed id.
+  string instance_id = 2;
+
+  // Optional retry key: a repeat returns the same instance with
+  // `deduplicated = true`.
+  string idempotency_key = 3;
+}
+
+// A typed reference to the unit that owns a child (docs/child-sessions.md).
+// It is stored with the child, wherever the child's own record lives, and
+// whoever holds that record ends the child when the owner's authority says
+// the owner reached a terminal state.
+message OwnerRef {
+  // What `id` names, which also decides who says the owner ended:
+  //
+  // - `session`: a session id. Its node decides: stopped, destroyed, or
+  //   its workload exited. Suspending or moving it is not an end.
+  // - `instance`: a keyed or slot instance id, the logical unit that
+  //   outlives its allocations. The managers decide: stopped or destroyed.
+  //   Suspended, archived, or rescheduling is not an end.
+  // - `allocation`: an allocation id, for an owner with no instance
+  //   identity (a service replica, a batch run). The managers decide:
+  //   complete, failed, stopped, or lost.
+  string kind = 1;
+
+  // The owner's id: a session id, an instance id, or an allocation id in
+  // decimal.
+  string id = 2;
+}
+
+// What happened to the owner of child sessions a node holds.
+message OwnerNotice {
+  // The owner, as the children's references name it.
+  OwnerRef owner = 1;
+
+  // `stopped` or `destroyed`: the owner reached a terminal state, and the
+  // node ends its children (a session child has no difference between the
+  // two). `suspended`: the owner suspended, and the node suspends the
+  // children whose owner task sets `children.suspendWithOwner`.
+  // `promoted`: the owner session became the instance `promoted_to`, and
+  // the node re-keys its children's references to it.
+  string event = 2;
+
+  // For `promoted`: the reference the children carry from now on.
+  OwnerRef promoted_to = 3;
+
+  // A short reason for the log and the child's `gone` record, e.g.
+  // `instance user-42 stopped`.
+  string detail = 4;
+}
+
+// One child of an owner, as `GetInstance`, `Worker.GetSession`, and
+// `Workload.ListChildren` list it.
+message ChildInfo {
+  // The child's id: a session id for a session child, an instance id for a
+  // keyed child (`kind` says which).
+  string session_id = 1;
+
+  // The child's task.
+  string task_name = 2;
+
+  // The node holding it.
+  string node_id = 3;
+
+  // `starting`, `running`, `suspended`, or `gone` (it ended in the last
+  // ten minutes; only its own node reports this).
+  string state = 4;
+
+  // For `gone`: why, e.g. `stopped`, `exited`, `evicted`, `owner ended`.
+  string reason = 5;
+
+  // `session` for a session child, whose record is its node's, or
+  // `instance` for a keyed child, whose record is a replicated row
+  // (`state` is then the instance state: `pending`, `active`, `suspended`,
+  // `rescheduling`, or `stopped`). Only `GetInstance` lists keyed children:
+  // a node knows the sessions it holds, not the rows.
+  string kind = 6;
+}
+
+// `Workload.StartChildSession`.
+message StartChildSessionRequest {
+  // The session task to start a child of. It must be a task of the
+  // caller's job that the caller's task names in `children.tasks`.
+  string task_name = 1;
+
+  // Node-local retry key: a repeat on the same node returns the same child
+  // with `deduplicated = true`.
+  string idempotency_key = 2;
+
+  // Whether to answer once the child runs (the default) or as soon as it
+  // is admitted (`false`, state `starting`).
+  optional bool wait = 3;
+}
+
+// `Workload.ListChildren`.
+message ListChildrenRequest {}
+
+message ListChildrenReply {
+  // The reference the caller's children carry: the caller's own unit.
+  OwnerRef owner = 1;
+
+  // The caller's children on this node.
+  repeated ChildInfo children = 2;
+
+  // The most children the caller may own at once (`children.max`); 0 when
+  // the caller's task declares no `children` block.
+  uint32 max = 3;
+}
+
+// `Workload.StopChildSession`.
+message StopChildSessionRequest {
+  // The child's session id, as `StartChildSession` returned it.
+  string session_id = 1;
+}
+
+message StopChildSessionReply {
+  // Whether the child was ended by this call (false when it had already
+  // ended and is remembered as `gone`).
+  bool stopped = 1;
+}
+
+// Request payload for Manager.RunSession and Worker.RunSession: one run in
+// a fresh, single-use session (docs/session-runs.md).
+message RunSessionRequest {
+  // The job. Required for `Manager.RunSession`; for `Worker.RunSession`
+  // with a ticket it defaults to the ticket's job and must match it when
+  // set.
+  string job_id = 1;
+
+  // The session task to run in. May be empty when the job has exactly one
+  // session task with a `run` block (a ticket's task, for the ticket
+  // class).
+  string task_name = 2;
+
+  // Files staged in the run directory before the command runs. Together
+  // with `input`, at most 3 MiB.
+  repeated RunFile files = 3;
+
+  // A JSON document staged as `input.json` in the run directory; its path
+  // is in the command's `LEGION_RUN_INPUT`. Must parse as JSON.
+  optional string input = 4;
+
+  // Files to return after the command exits, named relative to the run
+  // directory (or absolute under `/legion/run/`). A file the command did
+  // not write is answered with `missing = true`. Together they return at
+  // most `run.output` bytes; a file that does not fit is `truncated`.
+  repeated string get = 5;
+
+  // Replaces the task's `run.command` for this run. Needs
+  // `run.allowCommand = true` on the task and `exec:write` on the job;
+  // refused for the ticket class.
+  repeated string command = 6;
+
+  // Optional idempotency key, per node (see `Manager.RunSession`). The
+  // reply is kept for 10 minutes.
+  optional string idempotency_key = 7;
+
+  // How long to wait for the session to reach `running` before giving up
+  // (default 60, at most 600). The command's own deadline is `run.wall`.
+  optional uint32 wait_timeout_seconds = 8;
+
+  // Answer which node would take the run and whether its envelope has
+  // room, without starting anything (`RunSessionResponse.dry_run`).
+  bool dry_run = 9;
+
+  // `Worker.RunSession`, ticket class: the session ticket.
+  string ticket = 10;
+
+  // `Manager.RunSession` only: run on this node rather than the one the
+  // router would pick. A retry of a call that named a node in its reply or
+  // error sets it, so an idempotency key finds the first attempt.
+  string node_id = 11;
+}
+
+// One file staged for a run.
+message RunFile {
+  // Where it goes, relative to the run directory (`main.py`,
+  // `data/in.csv`) or absolute under `/legion/run/`. No `..`.
+  string path = 1;
+
+  // Its bytes.
+  bytes content = 2;
+
+  // Make it executable (mode 0755 rather than 0644).
+  bool executable = 3;
+}
+
+// One file returned from a run (`RunSessionRequest.get`).
+message RunOutputFile {
+  // The path as the request named it.
+  string path = 1;
+
+  // Its bytes, cut at the remaining `run.output` budget.
+  bytes content = 2;
+
+  // True when the file was larger than the budget left.
+  bool truncated = 3;
+
+  // True when the command left no readable file at the path.
+  bool missing = 4;
+}
+
+// Why a run was stopped before its command exited by itself. A stopped run
+// is a successful call: the caller's code hit a limit, Legion did not fail.
+message RunStop {
+  // `wall` (the command outlived `run.wall`) or `session_ended` (the
+  // session was ended under the run: stopped by an operator, killed for
+  // memory, or its runtime exited).
+  string reason = 1;
+
+  // The limit that stopped it, as the jobspec wrote it (`"30s"`). Empty
+  // for `session_ended`.
+  string limit = 2;
+
+  // What happened, in a sentence.
+  string detail = 3;
+
+  // What to change.
+  string hint = 4;
+}
+
+// What a dry run answers (`RunSessionRequest.dry_run`).
+message RunDryRun {
+  // The node that would take the run.
+  string node_id = 1;
+
+  // Whether that node's envelope has room for one more session of the
+  // task right now.
+  bool has_room = 2;
+
+  // Why not, when `has_room` is false.
+  string reason = 3;
+
+  // The command the run would execute.
+  repeated string command = 4;
+
+  // `run.wall` and `run.output` as they would apply.
+  string wall = 5;
+  uint64 output_bytes = 6;
+}
+
+// Reply payload for Manager.RunSession and Worker.RunSession.
+message RunSessionResponse {
+  // The node the run happened on. Keep retries there.
+  string node_id = 1;
+
+  // The id of the run's session. It has ended by the time this arrives;
+  // the id is for correlating events and logs.
+  string session_id = 2;
+
+  // The task that ran.
+  string task_name = 3;
+
+  // The command's exit status. Unset when the run was stopped.
+  optional int32 exit = 4;
+
+  // The command's stdout and stderr, together at most `run.output` bytes.
+  bytes stdout = 5;
+  bytes stderr = 6;
+
+  // True when stdout or stderr was cut at `run.output`.
+  bool truncated = 7;
+
+  // The contents of `result.json` in the run directory, when the command
+  // wrote one that parses as JSON and fits `run.output`. Empty otherwise.
+  string result = 8;
+
+  // The files named in `get`, in request order.
+  repeated RunOutputFile files = 9;
+
+  // Wall-clock time the command ran, in milliseconds.
+  uint64 wall_ms = 10;
+
+  // CPU time the run's session used, in milliseconds, where the node
+  // meters it (resource enforcement on); 0 otherwise.
+  uint64 cpu_ms = 11;
+
+  // Set when the run was stopped by a limit rather than exiting.
+  RunStop stopped = 12;
+
+  // True when this reply was kept from an earlier call with the same
+  // idempotency key and nothing ran now.
+  //
+  // Also true for the loser of two concurrent requests carrying the
+  // same key (see "Idempotency keys" in docs/agent-readiness.md for
+  // what each operation hands the loser).
+  bool deduplicated = 13;
+
+  // Set for a dry run; every other field but `node_id` and `task_name` is
+  // then empty.
+  RunDryRun dry_run = 14;
+
+  // The run's id: derived from the idempotency key, or minted.
+  string run_id = 15;
 }
 
 // Request payload for Worker.StopSession.
@@ -14182,6 +15119,11 @@ message GetSessionReply {
 
   // This node's id.
   string node_id = 2;
+
+  // The children this session owns on this node (docs/child-sessions.md):
+  // running and suspended ones, and the ones that ended in the last ten
+  // minutes with `state = "gone"` and why.
+  repeated ChildInfo children = 3;
 }
 
 // Request payload for Worker.StopSessions.
@@ -14288,6 +15230,14 @@ message ResumeSessionRequest {
   // `running_elsewhere`, naming the node and generation, so the manager can
   // probe that node first.
   bool force_move = 5;
+
+  // Resume the session at this size instead of the size it was suspended
+  // at (`ResizeInstanceRequest.move_unit`, docs/resize.md). The amounts are
+  // laid over the session's resources before it is admitted into this
+  // node's envelope, so a size the envelope has no room for refuses with
+  // RESOURCE_EXHAUSTED and the checkpoint stays. Honoured only for a
+  // resume from a manifest (`job_id` set).
+  ResizeResources resize = 6;
 }
 
 // Reply payload for Worker.ResumeSession.
@@ -15119,6 +16069,12 @@ message TaskAllocation {
   // reads `mesh` and `allow` from it to compile the receiving side's
   // `service/allow` check into the allocation's ingress policy.
   string task_service = 35;
+
+  // JSON `ChildrenConfig`: the task's `children` block (`tasks`, `max`,
+  // `suspendWithOwner`, `orphanAfter`; docs/child-sessions.md). Empty when
+  // the task declares none. The node reads it to admit a child started
+  // from inside the allocation, and to count against `max`.
+  string task_children = 36;
 }
 
 // Request payload for PostWork.
@@ -17268,6 +18224,26 @@ message SessionStart {
   // When the router issued the session, unix milliseconds. Breaks a tie
   // between two copies of one session id: the later one is stopped.
   int64 lease_issued_at_unix_ms = 1;
+
+  // The unit that owns the session as its child (docs/child-sessions.md).
+  // The node stores it with the session (`sessions.db`), reports it, ends
+  // the session when a `session` owner on the same node ends, and ends it
+  // on the managers' notice for every other owner.
+  OwnerRef owner = 2;
+
+  // How many children the owner already has on other nodes, as the sending
+  // manager's session index counts them. The node adds the children it
+  // holds itself and refuses the start at the owner task's `children.max`.
+  uint32 owner_children_elsewhere = 3;
+
+  // Set by the node, never read from a caller: the owner is a session
+  // that does not run on this node (the child was placed elsewhere, or the
+  // owner moved away), so the managers say when it ended.
+  bool owner_remote = 4;
+
+  // The owner task's `children.suspendWithOwner`, as whoever resolved the
+  // owner's task read it: the child suspends when its owner does.
+  bool suspend_with_owner = 5;
 }
 
 // One unratified claim a worker is holding, reported on every heartbeat.
@@ -19017,6 +19993,165 @@ message DeleteNamespacePolicyReply {
   bool deduplicated = 2;
 }
 
+// === Runtime disable messages (docs/runtime-disable.md) ===
+
+// One runtime disable: the replicated record `SetRuntimeEnabled` writes,
+// and what managers send workers on every heartbeat reply and push on
+// `StreamWork`.
+message RuntimeState {
+  // The task runtime that may not start: a task's `runtime` value (`exec`,
+  // `container`, `sandbox`, `noop`, or a runtime plugin's name).
+  string runtime = 1;
+
+  // The namespace globs the disable covers (`tenants-*`; `*` stands for any
+  // run of characters). Empty means the whole cluster. As in namespace
+  // policies, a glob that does not itself start with `legion-` never covers
+  // a reserved `legion-` namespace; an empty list covers every namespace,
+  // reserved ones included.
+  repeated string namespaces = 2;
+
+  // Why, as the operator gave it (an advisory id, usually). Shown in every
+  // refusal. Empty when none was given.
+  string reason = 3;
+
+  // When the runtime was first disabled, RFC 3339 UTC. Widening the scope
+  // later does not move it.
+  string since = 4;
+
+  // Who disabled it: `accessor:<token accessor id>`, or the caller's
+  // principal when it has no token accessor (`acl-disabled` on a cluster
+  // running with ACLs off). Never a token secret.
+  string by = 5;
+
+  // True when the disable also drains: each node suspends the sessions of
+  // the runtime in scope that can be suspended and stops the rest, for as
+  // long as the record stands. The managers drain allocations when the
+  // disable is written.
+  bool drain = 6;
+}
+
+// The whole set of runtime disables in force, as one manager sees it. A
+// snapshot, never a delta: a worker replaces the set it holds with this one.
+// A worker that reaches no manager keeps the last set it was given, across
+// its own restarts too.
+message RuntimeStateSet {
+  // Every disable in force, by runtime. Empty when nothing is disabled.
+  repeated RuntimeState states = 1;
+}
+
+// What a `--drain` did when the disable was written.
+message RuntimeDrainSummary {
+  // Keyed instances whose suspend was started (their task has a `suspend`
+  // block). Each finishes as any suspend does; `legion instance get` shows
+  // it.
+  uint32 suspending = 1;
+
+  // Allocations removed for a graceful stop (cause `runtime_disabled`).
+  uint32 stopping = 2;
+
+  // Allocations in scope that could be neither suspended nor stopped, each
+  // as `<allocation id>: <why>`. They keep running; run the disable again
+  // with `drain` to retry.
+  repeated string failed = 3;
+}
+
+// Request payload for SetRuntimeEnabled.
+message SetRuntimeEnabledRequest {
+  // The task runtime to disable or enable.
+  string runtime = 1;
+
+  // False disables the runtime; true enables it again.
+  bool enabled = 2;
+
+  // Namespace globs to scope the call to. Empty means the whole cluster.
+  repeated string namespaces = 3;
+
+  // Why (disable only), at most 512 bytes. Shown in refusals, in
+  // `ListRuntimeStates`, and in the `runtime.disabled` event.
+  string reason = 4;
+
+  // Disable only: also take running work in scope off the runtime (see the
+  // RPC). Refused on an enable.
+  bool drain = 5;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 6;
+}
+
+// Reply payload for SetRuntimeEnabled.
+message SetRuntimeEnabledReply {
+  // The record after a disable, or after an enable that left some
+  // namespaces disabled. Unset when the runtime is now enabled everywhere.
+  RuntimeState state = 1;
+
+  // True when the call changed the record. False for a disable that
+  // repeated what was already in force and for an enable of a runtime that
+  // was not disabled.
+  bool changed = 2;
+
+  // What is running on the runtime in scope right now, as the managers see
+  // it: allocations in the store and sessions in the session index. A
+  // disable without `drain` leaves all of it running.
+  RuntimeRunning running = 3;
+
+  // What the drain started. Unset unless the request set `drain`.
+  RuntimeDrainSummary drained = 4;
+
+  // True when this reply was replayed from an earlier request with the same
+  // `idempotency_key`. A replay carries the record as it stands now and no
+  // `drained` summary: the drain ran once.
+  //
+  // Also true for the loser of two concurrent requests carrying the
+  // same key (see "Idempotency keys" in docs/agent-readiness.md for
+  // what each operation hands the loser).
+  bool deduplicated = 5;
+}
+
+// Work running on a runtime in a disable's scope.
+message RuntimeRunning {
+  // Live allocations (not `complete` or `failed`) whose task uses the
+  // runtime, in scope.
+  uint32 allocations = 1;
+
+  // Sessions of the runtime in scope that nodes report (sandbox sessions;
+  // sessions of other runtimes are not reported to managers and are not
+  // counted).
+  uint32 sessions = 2;
+}
+
+// Request payload for ListRuntimeStates.
+message ListRuntimeStatesRequest {}
+
+// One disable with what waits on it.
+message RuntimeStateStatus {
+  // The disable.
+  RuntimeState state = 1;
+
+  // Evals blocked under `runtime_disabled:<runtime>` right now. Each is a
+  // job that places on its own when the runtime is enabled.
+  uint32 blocked_evals = 2;
+
+  // Starts nodes have refused because of this disable since it was written
+  // (session starts, claims, restarts, and placements that raced it), summed
+  // from heartbeats as the answering manager received them. A count, not a
+  // record: it restarts from zero when that manager restarts.
+  uint64 edge_refusals = 3;
+
+  // What is running on the runtime in scope right now.
+  RuntimeRunning running = 4;
+
+  // Ready nodes whose worker predates runtime disables and so ignores them:
+  // placement still refuses work for them, but a session ticket presented to
+  // one of them starts. Upgrade them, or drain them for the incident.
+  repeated string unaware_nodes = 5;
+}
+
+// Reply payload for ListRuntimeStates.
+message ListRuntimeStatesReply {
+  // Every disable in force, by runtime. Empty when nothing is disabled.
+  repeated RuntimeStateStatus disabled = 1;
+}
+
 // === Agent governance messages (internal_docs/plans/agent-governance-plan.md) ===
 
 // One audit journal record (docs/audit-journal.md).
@@ -19570,4 +20705,334 @@ message JobFieldChange {
   // The value came from a KV key the caller cannot read, so `old_json` and
   // `new_json` are left empty.
   bool redacted = 5;
+}
+
+
+// === RESIZE (docs/resize.md) ===
+
+// The amounts a resize sets. An unset field is left as it is. At least one
+// must be set.
+message ResizeResources {
+  // The reservation in MiB: what the scheduler packs on, and the cgroup's
+  // `memory.low`.
+  optional double memory = 1;
+
+  // The ceiling in MiB: the cgroup's `memory.max`, or the memory a sandbox
+  // guest can use (its balloon). Never below `memory`.
+  optional double memory_max = 2;
+
+  // CPU in MHz: the scheduler's reservation and the cgroup's `cpu.weight`.
+  optional double cpu = 3;
+}
+
+// Request payload for `Manager.ResizeAllocation`.
+message ResizeAllocationRequest {
+  // The allocation to resize. Required.
+  int64 allocation_id = 1;
+
+  // The new amounts. Required; unset amounts keep their current value.
+  ResizeResources to = 2;
+
+  // Why, recorded on the override and the `allocation.resized` event.
+  // Optional.
+  string reason = 3;
+
+  // Allow a shrink of the ceiling below what the unit uses now. The
+  // runtime may reclaim memory or the kernel may kill the task. Default
+  // false: such a shrink is `refused`.
+  bool force = 4;
+
+  // Answer whether the resize would fit and whether the runtime can make
+  // it, without changing anything. The reply's `outcome` is what a real
+  // call would answer.
+  bool dry_run = 5;
+
+  // Optional retry key. A repeat with the same key and request returns the
+  // first reply with `deduplicated = true` and changes nothing.
+  optional string idempotency_key = 6;
+}
+
+// Request payload for `Manager.ResizeInstance`.
+message ResizeInstanceRequest {
+  // A keyed or slot instance id, or a running session's id. Required.
+  string instance_id = 1;
+
+  // The new amounts. Required; unset amounts keep their current value.
+  ResizeResources to = 2;
+
+  // Why, recorded on the override and the `instance.resized` event.
+  string reason = 3;
+
+  // As `ResizeAllocationRequest.force`.
+  bool force = 4;
+
+  // As `ResizeAllocationRequest.dry_run`.
+  bool dry_run = 5;
+
+  // As `ResizeAllocationRequest.idempotency_key`, for a keyed or slot
+  // instance. A session's resize records no key: it sets absolute amounts
+  // on one node, so repeating it is safe and answers `applied` with `from`
+  // equal to `to`. With a key, the session's node keeps the answer for 10
+  // minutes and a retry that reaches the same node gets it back with
+  // `deduplicated` set; the key is per node, as for session runs.
+  optional string idempotency_key = 6;
+
+  // Resize by moving (docs/resize.md, "When it does not fit: move"): the
+  // unit is suspended, its new size is recorded with it, and it is resumed
+  // at that size on a node with room, through the paths a suspend and a
+  // resume already use. Only units that can move take it: a keyed instance
+  // whose task has a `suspend` block, and a session whose task sets
+  // `suspend.durability = "store"`. Any other unit is refused with
+  // FailedPrecondition naming what is missing. A move interrupts the unit
+  // for one suspend and resume; without it nothing is ever interrupted.
+  //
+  // A sandbox's guest size (its `memoryMax`, or its `memory` when it has
+  // none) changes only at boot, and a memory checkpoint restores only into
+  // a guest of its own size. A keyed sandbox moved to a different guest
+  // size is therefore suspended to a disk checkpoint and boots fresh at the
+  // new size, keeping its disk and losing its memory; the reply's `message`
+  // says so. A sandbox session is refused such a move (FailedPrecondition),
+  // because a session resumes only from its memory checkpoint.
+  //
+  // When no node has room for the new size the unit is put back: a session
+  // is resumed at its old size on the node it came from, and a keyed
+  // instance's size record is cleared and it is started again. The reply's
+  // outcome is then `refused`.
+  bool move_unit = 7;
+}
+
+// Request payload for `Manager.ResizeTask`.
+message ResizeTaskRequest {
+  // The job. Required.
+  string job_id = 1;
+
+  // The task's group. Empty means the task's own group when `task_name` is
+  // unique in the job.
+  string task_group = 2;
+
+  // The task to resize. May be left empty when the job has exactly one
+  // task.
+  string task_name = 3;
+
+  // The new amounts for every allocation of the task. Unset amounts keep
+  // the spec's value. Required unless `reset` is set.
+  ResizeResources to = 4;
+
+  // Remove the task-level override and bring the task's allocations back
+  // to the spec's size. Mutually exclusive with `to`.
+  bool reset = 5;
+
+  // Stop each allocation that could not be resized in place, so the
+  // scheduler replaces it at the new size. Without it such an allocation
+  // keeps its old size until something else replaces it.
+  bool replace = 6;
+
+  // Why, recorded on the override, on each allocation's override, and on
+  // the `task.resized` event.
+  string reason = 7;
+
+  // As `ResizeAllocationRequest.force`, for each allocation.
+  bool force = 8;
+
+  // Answer what the call would do, allocation by allocation, without
+  // writing the override or changing anything.
+  bool dry_run = 9;
+
+  // Optional caller-chosen key that makes the call retry-safe: a repeat
+  // with the same key answers the first call's reply with `deduplicated`
+  // set, without touching any allocation again.
+  optional string idempotency_key = 10;
+}
+
+// Reply payload for `Manager.ResizeTask`.
+message ResizeTaskReply {
+  // The job, group, and task the override is on.
+  string job_id = 1;
+  string task_group = 2;
+  string task_name = 3;
+
+  // The task's spec resources (`memory`, `memoryMax`, `cpu`) as a JSON
+  // object, with cluster defaults folded in.
+  string spec = 4;
+
+  // The task-level size before this call, as a JSON object: the previous
+  // override laid over the spec, or the spec when there was none.
+  string from = 5;
+
+  // The task-level size after this call, as a JSON object. Equal to `spec`
+  // after a reset.
+  string to = 6;
+
+  // Whether an override stands after this call. False after a reset, and
+  // after a resize whose amounts equal the spec's.
+  bool override_active = 7;
+
+  // One answer per live allocation of the task, in allocation-id order,
+  // each shaped as a `ResizeAllocation` reply. An allocation this call
+  // stopped for replacement has outcome `replaced`; an allocation that
+  // could not be reached has outcome `error` with the cause in `message`.
+  repeated ResizeReply allocations = 8;
+
+  // How many allocations now run at the new size.
+  uint32 applied = 9;
+
+  // How many allocations kept their old size (refused, deferred,
+  // `needs_restart`, `not_supported`, or unreachable). Each takes the new
+  // size when it is next replaced.
+  uint32 pending = 10;
+
+  // How many allocations were stopped for replacement (`replace`).
+  uint32 replaced = 11;
+
+  // Echo of the request's `dry_run`.
+  bool dry_run = 12;
+
+  // True when this reply repeats an earlier call with the same
+  // idempotency key.
+  bool deduplicated = 13;
+
+  // What to do about the allocations that kept their old size, when there
+  // are any.
+  string hint = 14;
+}
+
+// Reply payload for `Manager.ResizeAllocation` and `Manager.ResizeInstance`.
+message ResizeReply {
+  // What happened: `applied` (the unit runs at the new size), `deferred`
+  // (its elastic envelope is growing to make room; retry), `refused` (it
+  // does not fit, or a shrink would go below current use), `needs_restart`
+  // (the runtime cannot make this change while the unit runs), or
+  // `not_supported` (the runtime, or the node's worker, cannot resize).
+  // Only `applied` changed anything.
+  string outcome = 1;
+
+  // The unit's effective resizable resources before the call, as a JSON
+  // object (`memory`, `memoryMax`, `cpu`).
+  string from = 2;
+
+  // The effective resources the call asked for (and, when `applied`, the
+  // unit now has), as a JSON object.
+  string to = 3;
+
+  // The spec's own amounts for the unit's task, as a JSON object, so a
+  // caller can show "override active; spec 1000".
+  string spec = 4;
+
+  // The node the unit runs on.
+  string node_id = 5;
+
+  // Why, when `outcome` is not `applied`: the runtime's or the scheduler's
+  // own account ("node w-03 has 11264 MiB free; the grow needs 63 GiB more").
+  string message = 6;
+
+  // What to do about it, when there is something ("resize to at most ...,
+  // or move the allocation").
+  string hint = 7;
+
+  // The free room a refused grow was checked against, as a JSON object of
+  // amounts by resource (`memory`, `cpu`): the node's for an allocation,
+  // the envelope's for a session. Empty otherwise.
+  string free = 8;
+
+  // True when this reply was replayed for a repeated `idempotency_key`.
+  bool deduplicated = 9;
+
+  // The allocation resized, when the unit has one (0 for a session).
+  int64 allocation_id = 10;
+
+  // The instance or session id, when the unit has one.
+  string instance_id = 11;
+
+  // The unit's job.
+  string job_id = 12;
+
+  // True when the request was a dry run: nothing changed whatever
+  // `outcome` says.
+  bool dry_run = 13;
+
+  // Whether retrying the same request later may succeed (`deferred`, and a
+  // `refused` grow, which fits once room frees up).
+  bool retryable = 14;
+
+  // Set when the unit was resized by moving (`move_unit`): the node it was
+  // resumed on. Empty for an in-place resize, and for a move that found no
+  // room and put the unit back.
+  string moved_to = 15;
+}
+
+// Request payload for `Worker.ResizeSession`.
+message ResizeSessionRequest {
+  // The session to resize. Set this or `allocation_id`.
+  string session_id = 1;
+
+  // A top-level allocation to resize, when a manager applies a resize it
+  // committed (or, for a shrink, is about to release). 0 with `session_id`.
+  int64 allocation_id = 2;
+
+  // The new amounts; unset amounts keep their current value.
+  ResizeResources to = 3;
+
+  // Allow a shrink below current use.
+  bool force = 4;
+
+  // Decide and answer without changing anything.
+  bool dry_run = 5;
+
+  // Why, for the node's log.
+  string reason = 6;
+
+  // Optional key for a session's resize. The node keeps the answer of an
+  // applied resize for 10 minutes; a repeat with the same key returns it
+  // with `deduplicated` set instead of resizing again. Ignored for an
+  // allocation's resize, whose key the manager records.
+  string idempotency_key = 7;
+}
+
+// Request payload for `Workload.ResizeChildSession`.
+message ResizeChildSessionRequest {
+  // The child session to resize: one this caller owns.
+  string session_id = 1;
+
+  // The new amounts; unset amounts keep their current value.
+  ResizeResources to = 2;
+
+  // Allow a shrink below current use.
+  bool force = 3;
+
+  // Decide and answer without changing anything.
+  bool dry_run = 4;
+}
+
+// Reply payload for `Worker.ResizeSession` and `Workload.ResizeChildSession`.
+message ResizeSessionReply {
+  // As `ResizeReply.outcome`.
+  string outcome = 1;
+
+  // The unit's effective resizable resources before the call (JSON).
+  string from = 2;
+
+  // The effective resources asked for (JSON).
+  string to = 3;
+
+  // Why, when `outcome` is not `applied`.
+  string message = 4;
+
+  // The envelope's free room a refused or deferred session grow was
+  // checked against (JSON amounts by resource). Empty otherwise.
+  string free = 5;
+
+  // This node's id.
+  string node_id = 6;
+
+  // The unit's job and task, so the manager can record the event and
+  // enforce the caller's scope.
+  string job_id = 7;
+  string task_name = 8;
+
+  // The unit's task runtime (`exec`, `container`, `sandbox`, ...).
+  string runtime = 9;
+
+  // True when this answer repeats an earlier call with the same
+  // idempotency key.
+  bool deduplicated = 10;
 }

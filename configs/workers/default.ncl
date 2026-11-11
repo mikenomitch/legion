@@ -46,6 +46,11 @@
             # model weights. Cap a share with an object:
             # artifacts = { share = "50%", max = "2TiB", min = "10GiB" },
             # or set a fixed size: artifacts = "200GiB",
+            # Unset: 10% of the disk, clamped to 1GiB..20GiB. Holds derived
+            # content: what Legion builds on the node and can rebuild, such
+            # as each sandbox image's base root disk (docs/artifacts.md,
+            # "Derived content"). "0" turns it off.
+            # derived = "40GiB",
             # Unset: 20% of the disk, clamped to 2GiB..200GiB. Holds memory
             # checkpoints: local ones pinned until resumed or deleted,
             # published ones (suspend.durability = "store") as evictable

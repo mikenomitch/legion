@@ -202,6 +202,9 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // Namespace policies: cluster governance objects, read by admission
     // inside the control-lane submit and namespace-create entries.
     ("namespace_policy", Owner::Lane(Lane::Control)),
+    // Runtime disables (docs/runtime-disable.md): the operator's incident
+    // switch, written by SetRuntimeEnabled.
+    ("runtime_state", Owner::Lane(Lane::Control)),
     ("net_mesh_ca", Owner::Lane(Lane::Control)),
     // The leader's view of the cluster CA (docs/cluster-ca.md): written
     // when the control-lane leader's provider reports a new CA.
@@ -230,6 +233,10 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // reconciling `job_scale` eval is its own sequential scheduler-lane
     // enqueue, exactly the JC-33 wrapper-sequential shape stop_job uses.
     ("task_scale", Owner::Lane(Lane::Control)),
+    // The task-level size override (`legion job resize`) is arbitrated by
+    // the submit exactly as the count override is, so it is control-owned
+    // for the same reason. The scheduler lane only reads it.
+    ("task_resize", Owner::Lane(Lane::Control)),
     // Task autoscaling's state rides Control beside `task_scale` (plan
     // non-goal: no new lane): every autoscaler write is a `task_scale`
     // write plus its history row in one entry, and the defaults and pauses

@@ -156,6 +156,60 @@ fn jobspec_schema_envelope() -> Value {
                             }
                         }
                     },
+                    "children": {
+                        "type": "object",
+                        "description": "Lets a unit of this task own child sessions of sibling session tasks of the same job (docs/child-sessions.md): a child is started under its owner (`legion instance create <job> --task <child> --owner <id>`, or `legion session start <child> --owner self` inside the task), ends when its owner is stopped, destroyed, or exits, is charged to its own task's envelope, and is listed under its owner. Any task except a child task may declare it (depth 1 only).",
+                        "required": ["tasks"],
+                        "properties": {
+                            "tasks": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Session tasks (stateful.mode = \"session\") or keyed tasks (stateful.mode = \"keyed\") of this job whose units this task's units may own. A session task may not name a keyed task."
+                            },
+                            "max": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "default": 1,
+                                "description": "The most children one owner holds at once. A start past it is refused with RESOURCE_EXHAUSTED."
+                            },
+                            "suspendWithOwner": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Whether an owner's children suspend when it does (those whose task has a suspend block). By default each child follows its own task's idle policy."
+                            },
+                            "orphanAfter": {
+                                "type": "string",
+                                "default": "10m",
+                                "description": "Session owners only: how long a child on another node outlives an owner nobody can reach, e.g. \"10m\". At least 1m."
+                            }
+                        }
+                    },
+                    "run": {
+                        "type": "object",
+                        "description": "Opts a session task (stateful.mode = \"session\") on the exec, container or sandbox runtime into one-shot runs: `legion session run` starts a fresh single-use session, stages the caller's files under /legion/run/, executes `command` once, returns its output, and ends the session. See docs/session-runs.md.",
+                        "required": ["command", "wall"],
+                        "properties": {
+                            "command": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "The argv a run executes. Name staged files under /legion/run/ (rewritten to the session's own run directory on exec)."
+                            },
+                            "wall": {
+                                "type": "string",
+                                "description": "Deadline of one run's command, e.g. \"30s\" or \"5m\". Required; at most 24h. A run past it is stopped and answered with stopped.reason = \"wall\"."
+                            },
+                            "output": {
+                                "type": "string",
+                                "default": "1MiB",
+                                "description": "Most stdout plus stderr returned, e.g. \"256KiB\". Maximum 1MiB; output beyond it is dropped and the reply says truncated."
+                            },
+                            "allowCommand": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Whether a caller may replace command (--command). The caller also needs exec:write on the job."
+                            }
+                        }
+                    },
                     "disruption": {
                         "type": "object",
                         "description": "Floor on how many of this task's allocations VOLUNTARY disruption (preemption) may leave running. Does not bind drain, node loss or job stop. See docs/preemption-and-eviction.md.",

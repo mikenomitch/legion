@@ -18,8 +18,9 @@
 //!
 //! By default only read-only / introspection tools are exposed. Mutating tools
 //! (`legion_job_run`, `legion_job_stop`, `legion_job_scale`, `legion_scaling_pause`,
-//! `legion_job_destroy`, `legion_instance_create`, `legion_instance_stop`,
+//! `legion_job_destroy`, `legion_instance_create`, `legion_session_run`, `legion_instance_stop`,
 //! `legion_instance_start`, `legion_instance_promote`,
+//! `legion_instance_resize`, `legion_alloc_resize`, `legion_job_resize`,
 //! `legion_instance_destroy`) are gated behind `--allow-write`, mirroring the
 //! `read_only_safe` flag in the capabilities catalog. Even with
 //! `--allow-write`, `legion_state_query` always runs in read-only mode (no SQL
@@ -738,7 +739,7 @@ fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_node_content",
-            description: "Show what one node holds for content locality: the content its worker advertises to the manager's location index (digest, bytes, how many nodes hold it, and the snapshot and part role it belongs to when known), whether the worker can publish and checkpoint, and the node's snapshots (captured there, or published elsewhere with parts fetched or warmed there) with `partsHere`/`partsTotal`. `indexReported: false` means no content report reached this manager. Use it to see why placement preferred a node, or whether a node is warm for a snapshot before a resume or fork (docs/artifacts.md, \"Content locality\").",
+            description: "Show what one node holds for content locality: the content its worker advertises to the manager's location index (digest, bytes, how many nodes hold it, and the snapshot and part role it belongs to when known), whether the worker can publish and checkpoint, and the node's snapshots (captured there, or published elsewhere with parts fetched or warmed there) with `partsHere`/`partsTotal`, and its derived content (`derived`: what Legion built on the node and can rebuild, such as sandbox base root disks, with the class budget, bytes used, and each entry's kind, key, inputs, and builder version). `indexReported: false` means no content report reached this manager. Use it to see why placement preferred a node, or whether a node is warm for a snapshot before a resume or fork (docs/artifacts.md, \"Content locality\").",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -1470,6 +1471,8 @@ fn core_tool_defs() -> Vec<ToolDef> {
                     "instance_ids": { "type": "array", "items": { "type": "string" }, "description": "Batch of explicit instance keys, created atomically (all-or-nothing). Mutually exclusive with instance_id." },
                     "count": { "type": "integer", "minimum": 1, "description": "Create this many additional server-minted instances (atomic with instance_ids)." },
                     "from_snapshot": { "type": "string", "description": "Restore the new instance(s) from this snapshot of the job (an id or a name) instead of booting empty. Each gets its own copy of the snapshot's volume and its own identity, on the snapshot's node; at most 64 per call. Needs snapshot:read." },
+                    "owner": { "type": "string", "description": "Create the unit as a child of this running unit of the same job (a session, instance, or allocation id; docs/child-sessions.md). The owner's task must name this task in children.tasks. On a session task without instance_id the child is an unnamed session on its owner's node when that node has room. On a keyed task (or with instance_id) it is a keyed child, which an instance or allocation may own and a session may not: stopping the owner stops it and destroying the owner destroys it, in the owner's own entry. Refused with RESOURCE_EXHAUSTED at children.max (session and keyed children counted together). Not with instance_ids, count, or from_snapshot." },
+                    "owner_kind": { "type": "string", "enum": ["session", "instance", "allocation"], "description": "What owner names. Default: worked out from the id." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["job_id"],
@@ -1492,6 +1495,43 @@ fn core_tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_session_run",
+            description: "Run code once in a fresh, single-use session of a session task that declares a `run` block (exec, container or sandbox runtime), in one call: the node starts the session, stages `files` and `input` under /legion/run/ (input as input.json, its path in LEGION_RUN_INPUT), executes the task's run.command once, and ends the session whatever happens. Returns stdout, stderr, exit, `result` (the JSON the command wrote to /legion/run/result.json, else null), the `get` files, wallMs and cpuMs. Read the reply's structure: `exit` set means your code ran (non-zero is your code failing); `stopped` set (reason wall|memory|session_ended, with a hint) means a limit stopped it and exit is null; an error envelope means Legion could not run it (RESOURCE_EXHAUSTED and UNAVAILABLE are retryable). Pass idempotency_key so a retry does not run the code twice, and keep retries on the node a reply or error named (node_id): idempotency is per node, with the reply kept 10 minutes. dry_run answers which node would take it and whether it has room. `command` replaces run.command and needs run.allowCommand plus exec:write. Mutating; needs job:write.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "The job." },
+                    "namespace": { "type": "string", "description": "Namespace of an unqualified job_id (default: default)." },
+                    "task": { "type": "string", "description": "The session task. Optional when the job has one that takes runs." },
+                    "files": {
+                        "type": "array",
+                        "description": "Files staged in the run directory before the command runs (with input, at most 3 MiB).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Relative to the run directory (main.py, data/in.csv), or absolute under /legion/run/." },
+                                "content": { "type": "string", "description": "The file's text." },
+                                "content_base64": { "type": "string", "description": "The file's bytes, base64, instead of content." },
+                                "executable": { "type": "boolean", "description": "Mode 0755 instead of 0644." }
+                            },
+                            "required": ["path"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "input": { "description": "Any JSON value, staged as input.json." },
+                    "get": { "type": "array", "items": { "type": "string" }, "description": "Files of the run directory to return after the command exits (together at most run.output bytes)." },
+                    "command": { "type": "array", "items": { "type": "string" }, "description": "Replace the task's run.command (needs run.allowCommand = true and exec:write)." },
+                    "idempotency_key": { "type": "string", "description": "Per-node retry key; the reply is kept 10 minutes." },
+                    "node_id": { "type": "string", "description": "Run on this node (a retry names the node the first attempt reported)." },
+                    "wait_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 600, "description": "How long to wait for the session to start (default 60)." },
+                    "dry_run": { "type": "boolean", "description": "Answer the node and its room; run nothing." }
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
             name: "legion_instance_promote",
             description: "Promote a running session (mode=session, durable=false) to a keyed instance in place: one raft entry writes its row and an allocation the node adopts it as, so nothing restarts. From then on it is listed exactly, rescheduled on node loss, and can be suspended or forked. new_id names it (refused when the task sets stateful.promote.onName = false); omit it to keep the session id. A repeat reports the same instance with deduplicated=true. Mutating.",
             input_schema: || json!({
@@ -1502,6 +1542,71 @@ fn core_tool_defs() -> Vec<ToolDef> {
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["instance_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_instance_resize",
+            description: "Resize a running keyed instance or session in place (docs/resize.md): memory (the reservation, MiB), memory_max (the ceiling, MiB), and cpu (MHz), as an override over the spec, with no new job version and no restart. A keyed instance's grow takes only free room on its node; a session's grow is admitted against its task's envelope on its node and writes nothing to the store. The reply's outcome is applied, deferred (an elastic envelope is growing; retry), refused (no room, with `free`, or a shrink below current use without force), needs_restart (the runtime cannot make the change while the unit runs; nothing was restarted), or not_supported. Only applied changed anything. dry_run answers without changing anything. Needs scale:write on the job. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string", "description": "Keyed instance id or session id." },
+                    "memory": { "type": "number", "description": "New reservation in MiB." },
+                    "memory_max": { "type": "number", "description": "New ceiling in MiB (never below memory)." },
+                    "cpu": { "type": "number", "description": "New CPU in MHz." },
+                    "reason": { "type": "string", "description": "Why, recorded on the override and the event." },
+                    "force": { "type": "boolean", "description": "Allow a ceiling below current use (the kernel may reclaim or kill)." },
+                    "dry_run": { "type": "boolean", "description": "Answer what would happen without changing anything." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." },
+                    "move": { "type": "boolean", "description": "Resize by moving: suspend the unit and resume it at the new size on a node with room. Only a keyed instance whose task has a suspend block, or a session with suspend.durability = \"store\"; also needs job:write. The unit is interrupted for one suspend and resume, and is put back at its old size when no node has room (outcome refused)." }
+                },
+                "required": ["instance_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_job_resize",
+            description: "Resize every allocation of a task without a deploy (docs/resize.md, \"Resizing a task\"): sets a task-level size override (memory and memory_max in MiB, cpu in MHz) laid over the task's spec, the way legion_job_scale lays a count over it. No new job version and no rollout. Each running allocation is resized in place where its node and runtime allow, and the reply's `allocations` has one answer per allocation; one that cannot change in place keeps its old size until it is next replaced (`pending`), or with replace is stopped now so its replacement is placed at the new size (`replaced`). New allocations start at the overridden size. reset removes the override and returns the allocations to the spec's size. A later submit that changes the task's resources drops the override. Session tasks are refused (resize each session with legion_instance_resize). dry_run answers allocation by allocation without changing anything. Needs scale:write on the job. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "string", "description": "Job name." },
+                    "task_name": { "type": "string", "description": "Task to resize; optional when the job has one task." },
+                    "task_group": { "type": "string", "description": "The task's group, when the task name is not unique." },
+                    "memory": { "type": "number", "description": "New reservation in MiB." },
+                    "memory_max": { "type": "number", "description": "New ceiling in MiB (never below memory)." },
+                    "cpu": { "type": "number", "description": "New CPU in MHz." },
+                    "reset": { "type": "boolean", "description": "Remove the override (no amounts with it)." },
+                    "replace": { "type": "boolean", "description": "Stop each allocation that cannot be resized in place so it is replaced at the new size." },
+                    "reason": { "type": "string", "description": "Why, recorded on the override and the event." },
+                    "force": { "type": "boolean", "description": "Allow a ceiling below current use on each allocation." },
+                    "dry_run": { "type": "boolean", "description": "Answer what would happen without changing anything." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["job_id"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_alloc_resize",
+            description: "Resize one running top-level allocation in place (docs/resize.md): memory (the reservation, MiB), memory_max (the ceiling, MiB), and cpu (MHz), as an override over its task's spec. One compare-and-set commits the new size and the node's runtime applies it; a grow takes only free room on the node and never preempts. Outcomes as legion_instance_resize; a refused grow carries the node's `free` room. Resizing back to the spec's amounts removes the override, and the override ends with the allocation. Needs scale:write on the job. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "allocation_id": { "type": "integer", "description": "Allocation id." },
+                    "memory": { "type": "number", "description": "New reservation in MiB." },
+                    "memory_max": { "type": "number", "description": "New ceiling in MiB (never below memory)." },
+                    "cpu": { "type": "number", "description": "New CPU in MHz." },
+                    "reason": { "type": "string", "description": "Why, recorded on the override and the event." },
+                    "force": { "type": "boolean", "description": "Allow a ceiling below current use (the kernel may reclaim or kill)." },
+                    "dry_run": { "type": "boolean", "description": "Answer what would happen without changing anything." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "required": ["allocation_id"],
                 "additionalProperties": false
             }),
             mutates: true,
@@ -2554,6 +2659,15 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let count = args.get("count").and_then(Value::as_u64).unwrap_or(0) as u32;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let from_snapshot = opt_str_arg(&args, "from_snapshot");
+            let owner = opt_str_arg(&args, "owner").map(|id| crate::structs::OwnerRef {
+                kind: opt_str_arg(&args, "owner_kind").unwrap_or_default(),
+                id,
+            });
+            if owner.is_some() && (!instance_ids.is_empty() || count > 0) {
+                return Err(
+                    "owner creates one child; do not pass instance_ids or count with it".into(),
+                );
+            }
             let mut client = connect().await?;
             // instance_ids/count select the atomic batch RPC; a lone
             // instance_id keeps the single-create semantics (incl. server
@@ -2584,8 +2698,90 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     instance_id,
                     idempotency_key,
                     from_snapshot,
+                    owner,
                 }))
                 .await
+            }
+        }
+        "legion_session_run" => {
+            use base64::Engine;
+            let job_id = job_arg(&args, "job_id")?;
+            let mut files = Vec::new();
+            for file in args
+                .get("files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let path = str_arg(file, "path")?;
+                let content = match (
+                    file.get("content").and_then(Value::as_str),
+                    file.get("content_base64").and_then(Value::as_str),
+                ) {
+                    (Some(_), Some(_)) => {
+                        return Err(format!(
+                            "file {path}: pass content or content_base64, not both"
+                        ))
+                    }
+                    (Some(text), None) => text.as_bytes().to_vec(),
+                    (None, Some(encoded)) => base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .map_err(|err| {
+                            format!("file {path}: content_base64 is not base64: {err}")
+                        })?,
+                    (None, None) => Vec::new(),
+                };
+                files.push(crate::structs::RunFile {
+                    path,
+                    content,
+                    executable: file
+                        .get("executable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                });
+            }
+            let strings = |key: &str| -> Vec<String> {
+                args.get(key)
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let request = crate::structs::RunSessionRequest {
+                job_id,
+                task_name: opt_str_arg(&args, "task").unwrap_or_default(),
+                files,
+                input: args
+                    .get("input")
+                    .filter(|value| !value.is_null())
+                    .map(Value::to_string),
+                get: strings("get"),
+                command: strings("command"),
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                wait_timeout_seconds: args
+                    .get("wait_timeout_seconds")
+                    .and_then(Value::as_u64)
+                    .map(|seconds| seconds as u32),
+                dry_run: args
+                    .get("dry_run")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                ticket: String::new(),
+                node_id: opt_str_arg(&args, "node_id").unwrap_or_default(),
+            };
+            let mut client = connect().await?;
+            match client.run_session(request).await {
+                Ok(reply) => Ok(crate::cmd::session::run_reply_json(&reply.into_inner())),
+                Err(status) => {
+                    let err = CliError::from_status("run failed", &status);
+                    Err(serde_json::to_string(&err)
+                        .unwrap_or_else(|_| status.message().to_string()))
+                }
             }
         }
         "legion_session_nodes" => {
@@ -2610,6 +2806,66 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 new_id,
                 idempotency_key,
             }))
+            .await
+        }
+        "legion_instance_resize" => {
+            let instance_id = str_arg(&args, "instance_id")?;
+            let mut client = connect().await?;
+            grpc(
+                client.resize_instance(crate::structs::ResizeInstanceRequest {
+                    instance_id,
+                    to: Some(resize_amounts(&args)?),
+                    reason: opt_str_arg(&args, "reason").unwrap_or_default(),
+                    force: bool_flag(&args, "force"),
+                    dry_run: bool_flag(&args, "dry_run"),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                    move_unit: bool_flag(&args, "move"),
+                }),
+            )
+            .await
+        }
+        "legion_job_resize" => {
+            let job_id = str_arg(&args, "job_id")?;
+            let reset = bool_flag(&args, "reset");
+            let to = match resize_amounts(&args) {
+                Ok(_) if reset => {
+                    return Err("reset takes no memory, memory_max, or cpu".to_string())
+                }
+                Ok(to) => Some(to),
+                Err(_) if reset => None,
+                Err(err) => return Err(err),
+            };
+            let mut client = connect().await?;
+            grpc(client.resize_task(crate::structs::ResizeTaskRequest {
+                job_id,
+                task_group: opt_str_arg(&args, "task_group").unwrap_or_default(),
+                task_name: opt_str_arg(&args, "task_name").unwrap_or_default(),
+                to,
+                reset,
+                replace: bool_flag(&args, "replace"),
+                reason: opt_str_arg(&args, "reason").unwrap_or_default(),
+                force: bool_flag(&args, "force"),
+                dry_run: bool_flag(&args, "dry_run"),
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+            }))
+            .await
+        }
+        "legion_alloc_resize" => {
+            let allocation_id = args
+                .get("allocation_id")
+                .and_then(|value| value.as_i64())
+                .ok_or_else(|| "missing required integer argument: allocation_id".to_string())?;
+            let mut client = connect().await?;
+            grpc(
+                client.resize_allocation(crate::structs::ResizeAllocationRequest {
+                    allocation_id,
+                    to: Some(resize_amounts(&args)?),
+                    reason: opt_str_arg(&args, "reason").unwrap_or_default(),
+                    force: bool_flag(&args, "force"),
+                    dry_run: bool_flag(&args, "dry_run"),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
             .await
         }
         "legion_instance_stop" => {
@@ -3879,6 +4135,27 @@ fn object_arg(args: &Value) -> Result<Option<crate::structs::ScalingObjectRef>, 
     }))
 }
 
+/// The amounts a resize tool names: at least one of `memory`, `memory_max`,
+/// and `cpu`.
+fn resize_amounts(args: &Value) -> Result<crate::structs::ResizeResources, String> {
+    let amount = |key: &str| args.get(key).and_then(|value| value.as_f64());
+    let to = crate::structs::ResizeResources {
+        memory: amount("memory"),
+        memory_max: amount("memory_max"),
+        cpu: amount("cpu"),
+    };
+    if to.memory.is_none() && to.memory_max.is_none() && to.cpu.is_none() {
+        return Err("provide at least one of memory, memory_max, and cpu".to_string());
+    }
+    Ok(to)
+}
+
+fn bool_flag(args: &Value, key: &str) -> bool {
+    args.get(key)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 fn opt_str_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key)
         .and_then(Value::as_str)
@@ -4112,6 +4389,9 @@ mod tests {
         assert!(!names.contains(&"legion_instance_stop"));
         assert!(!names.contains(&"legion_instance_start"));
         assert!(!names.contains(&"legion_instance_promote"));
+        assert!(!names.contains(&"legion_instance_resize"));
+        assert!(!names.contains(&"legion_alloc_resize"));
+        assert!(!names.contains(&"legion_job_resize"));
         assert!(!names.contains(&"legion_instance_destroy"));
     }
 
@@ -4209,6 +4489,9 @@ mod tests {
         assert!(names.contains(&"legion_instance_stop"));
         assert!(names.contains(&"legion_instance_start"));
         assert!(names.contains(&"legion_instance_promote"));
+        assert!(names.contains(&"legion_instance_resize"));
+        assert!(names.contains(&"legion_alloc_resize"));
+        assert!(names.contains(&"legion_job_resize"));
         assert!(names.contains(&"legion_instance_destroy"));
     }
 

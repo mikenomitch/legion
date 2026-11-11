@@ -95,6 +95,22 @@ impl PlacementBlocked {
         self
     }
 
+    /// Blocked because `task`'s runtime is disabled for its job
+    /// (docs/runtime-disable.md). Only enabling the runtime wakes it.
+    pub fn runtime_disabled(task: &TaskConfig, task_config_id: i64, message: String) -> Self {
+        PlacementBlocked {
+            key: crate::structs::runtime_state::blocked_key(&task.runtime),
+            detail: json!({
+                "task": task.name,
+                "taskConfigId": task_config_id,
+                "runtime": task.runtime,
+                "message": message,
+            }),
+            message,
+            retry_after: None,
+        }
+    }
+
     /// Blocked with no task to reason about.
     pub fn escaped(message: String) -> Self {
         PlacementBlocked {
@@ -152,7 +168,9 @@ pub fn blocking_key(task: &TaskConfig, pinned_node: Option<&str>) -> String {
 
 /// The kind of a key, for the `legion_evals_blocked{key_kind}` gauge.
 pub fn key_kind(key: &str) -> &'static str {
-    if key.starts_with("node:") {
+    if crate::structs::runtime_state::blocked_key_runtime(key).is_some() {
+        "runtime"
+    } else if key.starts_with("node:") {
         "node"
     } else if key.starts_with("class:") {
         "class"
@@ -171,6 +189,11 @@ pub fn key_kind(key: &str) -> &'static str {
 pub fn node_could_help(key: &str, task: Option<&TaskConfig>, job_id: &str, node: &Node) -> bool {
     if key == ESCAPED_KEY {
         return true;
+    }
+    // Blocked on a disabled runtime: no node helps; the enable wakes it
+    // (`Store::wake_blocked_evals`).
+    if crate::structs::runtime_state::blocked_key_runtime(key).is_some() {
+        return false;
     }
     if let Some(pinned) = key.strip_prefix("node:") {
         return node.id == pinned;
