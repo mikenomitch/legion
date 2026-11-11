@@ -36,6 +36,11 @@ enum Command {
         /// worker passes its `isolate.confine`.
         #[arg(long, default_value = "enforce", value_parser = parse_confine)]
         confine: Confine,
+        /// End the compile (SIGALRM) after this many seconds, whatever its
+        /// parent does: the worker passes its compile timeout, so a compile
+        /// never outlives a worker that died by more than this. 0: none.
+        #[arg(long, default_value_t = 0)]
+        deadline_secs: u32,
         /// Test only: after confinement, try a forbidden action and report.
         #[cfg(feature = "confinement-test")]
         #[arg(long)]
@@ -145,12 +150,17 @@ fn main() -> ExitCode {
             output,
             engine,
             confine: level,
+            deadline_secs,
             #[cfg(feature = "confinement-test")]
             test_attempt,
             #[cfg(feature = "confinement-test")]
             test_skip,
         } => {
             confine::close_fds_except(&[0, 1, 2]);
+            // Before anything that could take long, and before the
+            // PID-namespace fork (the alarm then fires in the parent, whose
+            // death takes the compiling child with it).
+            confine::set_deadline(deadline_secs);
             #[allow(unused_mut)]
             let mut plan = match compiler_plan(&input, &output) {
                 Ok(p) => p,

@@ -1624,7 +1624,6 @@ mod http_e2e {
     }
 }
 
-
 /// Every session task of a job gets its envelope on the node: three isolate
 /// tasks and an `exec` session task, each envelope 1000 MHz.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1648,7 +1647,12 @@ async fn every_session_task_of_a_job_gets_its_envelope() -> legion::prelude::R<(
     placed.sort();
     assert_eq!(
         placed,
-        ["a-envelope@w-iso", "b-envelope@w-iso", "c-envelope@w-iso", "machine-envelope@w-iso"]
+        [
+            "a-envelope@w-iso",
+            "b-envelope@w-iso",
+            "c-envelope@w-iso",
+            "machine-envelope@w-iso"
+        ]
     );
     for task in ["a", "b", "c"] {
         cluster.wait_for(task, true).await?;

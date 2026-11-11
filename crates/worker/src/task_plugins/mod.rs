@@ -2931,7 +2931,10 @@ mod tests {
             .iter()
             .find_map(task_host_level_reason)
             .expect("file module");
-        assert!(reason.starts_with("\"run\" fetches its isolate module"), "{reason}");
+        assert!(
+            reason.starts_with("\"run\" fetches its isolate module"),
+            "{reason}"
+        );
         Ok(())
     }
 

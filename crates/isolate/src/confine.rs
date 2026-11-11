@@ -17,7 +17,12 @@
 //!    compiler's input), and `write_dirs` (the compiler's output directory,
 //!    nosuid, nodev, noexec). There is no `/proc`, `/sys`, or `/dev`: what
 //!    the process needs from them is opened before (`before_root`).
-//! 4. **Capabilities** are all dropped (after the mounts, which need them).
+//!    Every submount inside a bound directory is made read-only too
+//!    (`mount_setattr(AT_RECURSIVE)`, else a remount of each one the mount
+//!    table lists); one that cannot be is fatal under enforce.
+//! 4. **Capabilities** are all dropped (after the mounts, which need them),
+//!    from every set; also when no user namespace could be made (best
+//!    effort), where the process keeps the worker's uid but no privilege.
 //! 5. **`no_new_privs`.**
 //! 6. **Landlock.** Read-only access beneath `read_dirs`, read-write beneath
 //!    `write_dirs`, nothing else; no TCP bind or connect where the ABI covers
@@ -72,7 +77,10 @@ pub struct Plan {
     pub namespaces: bool,
     /// Test only (`--features confinement-test`): layers to leave out so a
     /// test can show that each remaining layer stops an attack on its own.
-    /// Names: `seccomp`, `pidns`, `scopes`, `mount`, `landlock`.
+    /// Names: `seccomp`, `pidns`, `scopes`, `mount`, `landlock`, `userns`
+    /// (no namespaces at all, as on a kernel that refuses them), and
+    /// `setattr` (make submounts read-only by walking the mount table, as on
+    /// a kernel without `mount_setattr`).
     pub skip: Vec<String>,
 }
 
@@ -112,7 +120,10 @@ pub fn confine(
         return Ok(c);
     }
     let mut in_userns = false;
-    if plan.namespaces {
+    if plan.namespaces && plan.skips("userns") {
+        c.notes
+            .push("namespaces: left out by --test-skip userns".into());
+    } else if plan.namespaces {
         match namespaces() {
             Ok(()) => {
                 in_userns = true;
@@ -128,9 +139,17 @@ pub fn confine(
         }
     }
     before_root();
+    // A submount inside a read directory that could not be made read-only
+    // (enforce refuses to start; best-effort says so).
+    let mut writable_submounts = false;
     if in_userns && !plan.skips("mount") {
         match mount_root(plan) {
-            Ok(()) => c.mount_root = true,
+            Ok(None) => c.mount_root = true,
+            Ok(Some(note)) => {
+                c.mount_root = true;
+                writable_submounts = true;
+                c.notes.push(format!("mount root: {note}"));
+            }
             Err(e) => c.notes.push(format!("mount root: {e}")),
         }
     }
@@ -138,6 +157,22 @@ pub fn confine(
         match drop_capabilities() {
             Ok(()) => c.user_namespace = true,
             Err(e) => c.notes.push(format!("user namespace: {e}")),
+        }
+    } else if plan.namespaces {
+        // No user namespace (best-effort on a kernel that refuses one): the
+        // process is whoever the worker is, usually real root. Its
+        // capabilities are still dropped from every set, so only Landlock
+        // and seccomp stand between it and the node, without root's
+        // privileges behind them.
+        match drop_capabilities() {
+            Ok(()) => c.notes.push(
+                "user namespace: not created, so the host runs with the worker's uid; every \
+                 capability was dropped (bounding, permitted, effective, inheritable, ambient)"
+                    .into(),
+            ),
+            Err(e) => c
+                .notes
+                .push(format!("capabilities could not be dropped: {e}")),
         }
     }
     // SAFETY: prctl with integer arguments.
@@ -178,6 +213,7 @@ pub fn confine(
             (plan.namespaces && !c.network_namespace, "network namespace"),
             (plan.namespaces && !c.pid_namespace, "pid namespace"),
             (plan.namespaces && !c.mount_root, "mount root"),
+            (writable_submounts, "read-only submounts"),
             (!c.no_new_privs, "no_new_privs"),
             (!c.landlock, "landlock"),
             (scopes_offered && !c.landlock_scopes, "landlock scopes"),
@@ -460,8 +496,11 @@ fn locked_flags(fd: i32) -> libc::c_ulong {
 }
 
 /// Build an empty root holding only the plan's paths and pivot into it.
-fn mount_root(plan: &Plan) -> Result<(), String> {
+/// `Ok(Some(note))` when the root was built but a submount inside a read
+/// directory could not be made read-only.
+fn mount_root(plan: &Plan) -> Result<Option<String>, String> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut submount_note = None;
     // Nothing we do here propagates back to the node.
     mount(
         None,
@@ -536,10 +575,22 @@ fn mount_root(plan: &Plan) -> Result<(), String> {
         if !b.writable {
             flags |= libc::MS_RDONLY;
         }
-        if b.writable || b.file || READ_DIRS_NOEXEC {
+        let noexec = b.writable || b.file || READ_DIRS_NOEXEC;
+        if noexec {
             flags |= libc::MS_NOEXEC;
         }
         mount(None, &at, None, flags, None)?;
+        // `MS_BIND | MS_REC` brought the source's submounts along, and the
+        // remount above changed only the top one: make every mount beneath
+        // the bind read-only (and nosuid, nodev) as well. The compiler's
+        // output directory is the one writable bind; its submounts get
+        // nosuid, nodev, noexec but stay as writable as the directory.
+        if let Err(e) = restrict_submounts(&at, !b.writable, noexec, plan.skips("setattr")) {
+            submount_note.get_or_insert(format!(
+                "a mount inside {} could not be made read-only ({e})",
+                b.target.display()
+            ));
+        }
     }
     drop(binds);
     // The root itself is read-only.
@@ -567,10 +618,129 @@ fn mount_root(plan: &Plan) -> Result<(), String> {
         return Err(os_err("detaching the old root"));
     }
     std::env::set_current_dir("/").map_err(|e| format!("chdir /: {e}"))?;
+    Ok(submount_note)
+}
+
+/// `mount_setattr(2)`'s syscall number (x86-64 and the generic table).
+const SYS_MOUNT_SETATTR: libc::c_long = 442;
+const MOUNT_ATTR_RDONLY: u64 = 0x1;
+const MOUNT_ATTR_NOSUID: u64 = 0x2;
+const MOUNT_ATTR_NODEV: u64 = 0x4;
+const MOUNT_ATTR_NOEXEC: u64 = 0x8;
+
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
+
+/// Apply read-only (when `rdonly`), nosuid, nodev (and noexec when
+/// `noexec`) to every mount at or beneath `at`: `mount_setattr` with
+/// `AT_RECURSIVE` (Linux 5.12+), else (or when `walk_only`, a test hook)
+/// a remount of each mount the mount table lists beneath `at`.
+fn restrict_submounts(at: &Path, rdonly: bool, noexec: bool, walk_only: bool) -> Result<(), String> {
+    let mut set = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV;
+    if rdonly {
+        set |= MOUNT_ATTR_RDONLY;
+    }
+    if noexec {
+        set |= MOUNT_ATTR_NOEXEC;
+    }
+    if !walk_only {
+        let attr = MountAttr {
+            attr_set: set,
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: 0,
+        };
+        let c = cstr(at)?;
+        // SAFETY: a NUL-terminated path, a valid mount_attr and its size.
+        let r = unsafe {
+            libc::syscall(
+                SYS_MOUNT_SETATTR,
+                libc::AT_FDCWD,
+                c.as_ptr(),
+                (libc::AT_RECURSIVE | libc::AT_SYMLINK_NOFOLLOW) as libc::c_uint,
+                &attr as *const MountAttr,
+                std::mem::size_of::<MountAttr>(),
+            )
+        };
+        if r == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if !matches!(err.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EINVAL)) {
+            return Err(format!("mount_setattr: {err}"));
+        }
+    }
+    // The fallback: every mount point strictly beneath `at`, from the mount
+    // table (`/proc` is still visible here).
+    let table = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("reading /proc/self/mountinfo: {e}"))?;
+    for point in submounts_beneath(&table, at) {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let c = cstr(&point)?;
+        // SAFETY: a NUL-terminated path; the fd is owned below.
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(os_err(&format!("opening {}", point.display())));
+        }
+        // SAFETY: just opened.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut flags = libc::MS_REMOUNT
+            | libc::MS_BIND
+            | libc::MS_NOSUID
+            | libc::MS_NODEV
+            | locked_flags(fd.as_raw_fd());
+        if rdonly {
+            flags |= libc::MS_RDONLY;
+        }
+        if noexec {
+            flags |= libc::MS_NOEXEC;
+        }
+        mount(None, &point, None, flags, None)?;
+    }
     Ok(())
 }
 
-/// Drop every capability (the new user namespace grants all of them).
+/// The mount points `/proc/self/mountinfo` lists strictly beneath `at`
+/// (field 5, with the kernel's octal escapes decoded).
+fn submounts_beneath(mountinfo: &str, at: &Path) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let unescape = |s: &str| -> PathBuf {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\\' && i + 4 <= b.len() {
+                let oct = &b[i + 1..i + 4];
+                if oct.iter().all(|d| (b'0'..=b'7').contains(d)) {
+                    let v = oct.iter().fold(0u32, |acc, d| acc * 8 + u32::from(d - b'0'));
+                    if let Ok(v) = u8::try_from(v) {
+                        out.push(v);
+                        i += 4;
+                        continue;
+                    }
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        PathBuf::from(std::ffi::OsString::from_vec(out))
+    };
+    mountinfo
+        .lines()
+        .filter_map(|line| line.split(' ').nth(4))
+        .map(unescape)
+        .filter(|p| p != at && p.starts_with(at))
+        .collect()
+}
+
+/// Drop every capability from the bounding, permitted, effective, and
+/// inheritable sets and clear the ambient set (in the new user namespace,
+/// which grants all of them, or in the worker's when none was made).
 fn drop_capabilities() -> Result<(), String> {
     #[repr(C)]
     struct Header {
@@ -594,6 +764,17 @@ fn drop_capabilities() -> Result<(), String> {
         // SAFETY: prctl with integer arguments; unknown caps fail harmlessly.
         unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
     }
+    // SAFETY: prctl with integer arguments (a kernel before 4.3 has no
+    // ambient set and answers EINVAL, which is the same as an empty one).
+    unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    };
     // SAFETY: valid header and two data structs, as capset v3 requires.
     let r = unsafe { libc::syscall(libc::SYS_capset, &mut h as *mut Header, d.as_ptr()) };
     if r != 0 {
@@ -925,11 +1106,10 @@ mod filters {
     }
 
     pub fn install(rules: Rules) -> Result<(), String> {
-        // `LEGION_ISOLATE_SECCOMP=log` logs instead of killing (development:
-        // find a missing syscall in the kernel log).
-        let mismatch = match std::env::var("LEGION_ISOLATE_SECCOMP").as_deref() {
-            Ok("log") => SeccompAction::Log,
-            _ => SeccompAction::KillProcess,
+        let mismatch = if super::seccomp_log_only() {
+            SeccompAction::Log
+        } else {
+            SeccompAction::KillProcess
         };
         let allow: BpfProgram =
             SeccompFilter::new(rules, mismatch, SeccompAction::Allow, TargetArch::x86_64)
@@ -948,6 +1128,15 @@ mod filters {
         apply_filter(&allow).map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+/// Whether the seccomp filters only log a forbidden syscall instead of
+/// killing the process: `LEGION_ISOLATE_SECCOMP=log` (development: find a
+/// missing syscall in the kernel log), honoured only in a binary built with
+/// the `confinement-test` feature. A shipping build ignores the variable.
+pub fn seccomp_log_only() -> bool {
+    cfg!(feature = "confinement-test")
+        && std::env::var("LEGION_ISOLATE_SECCOMP").as_deref() == Ok("log")
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -992,5 +1181,52 @@ pub fn limit_address_space(bytes: u64) -> Result<(), String> {
         Ok(())
     } else {
         Err(os_err("RLIMIT_AS"))
+    }
+}
+
+/// Kill this process with SIGALRM after `secs` seconds (`alarm(2)`; the
+/// default action ends the process). Set before confinement: after the
+/// PID-namespace fork it fires in the supervising parent, whose death takes
+/// the child with it (`PR_SET_PDEATHSIG`). A compile whose worker died
+/// therefore never runs longer than its deadline.
+pub fn set_deadline(secs: u32) {
+    if secs > 0 {
+        // SAFETY: alarm takes an integer and has no preconditions.
+        unsafe { libc::alarm(secs) };
+    }
+}
+
+#[cfg(test)]
+mod confine_test {
+    use super::*;
+
+    #[test]
+    fn submounts_beneath_lists_only_strict_descendants_test() {
+        let table = "\
+22 1 0:21 / / rw - ext4 /dev/vda rw
+30 22 0:40 / /tmp/root/data rw - tmpfs t rw
+31 30 0:41 / /tmp/root/data/sub rw - tmpfs t rw
+32 30 0:42 / /tmp/root/data/with\\040space rw - tmpfs t rw
+33 22 0:43 / /tmp/root/database rw - tmpfs t rw
+";
+        let got = submounts_beneath(table, Path::new("/tmp/root/data"));
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/tmp/root/data/sub"),
+                PathBuf::from("/tmp/root/data/with space"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_seccomp_log_switch_needs_the_test_feature_test() {
+        std::env::set_var("LEGION_ISOLATE_SECCOMP", "log");
+        let log_only = seccomp_log_only();
+        std::env::remove_var("LEGION_ISOLATE_SECCOMP");
+        // A shipping build kills on a forbidden syscall whatever the
+        // environment says.
+        assert_eq!(log_only, cfg!(feature = "confinement-test"));
+        assert!(!seccomp_log_only());
     }
 }

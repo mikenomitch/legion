@@ -301,6 +301,7 @@ flag `exec` rules use for exec into host-level runtimes:
 | `exec` | always: it is a process on the host, root unless it sets `user` |
 | `container` | `network.mode = "host"`, `security.userNamespace = false`, or `security.seccomp = "unconfined"` |
 | `sandbox` | `hypervisor = "dev"` (a container standing in for a VM, not a security boundary) |
+| `isolate` | `config.module.source` is a `file://` URL: the worker reads the module from the node's filesystem ([Isolate runtime](task-runtime-isolate.md)) |
 | a runtime plugin other than `noop` | always: Legion cannot vouch for its isolation |
 | any runtime | an `exec` health check: the worker runs its command on the host |
 | any runtime | an artifact or `image` is a `file://` source or a `git::file://` repository: the worker copies node files into the task as root |
@@ -312,6 +313,9 @@ flag `exec` rules use for exec into host-level runtimes:
 # Platform admins may deploy host-level jobs too:
 { resources = ["job"], actions = ["write"], namespaces = ["default"], names = ["*"], host = true },
 ```
+
+A session task is judged by its own row: the `<task>-envelope` task Legion
+generates for it starts nothing and never makes the job host-level.
 
 A refusal names the task and why, and only when the host grant is what is
 missing:

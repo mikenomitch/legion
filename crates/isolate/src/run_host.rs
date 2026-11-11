@@ -72,6 +72,11 @@ pub fn read_config(fd: i32) -> Result<HostConfig, String> {
     Ok(cfg)
 }
 
+/// `path` resolved (symlinks followed), or as given when it cannot be.
+fn canonical(path: &str) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+}
+
 pub fn run(args: Args) -> ExitCode {
     confine::close_fds_except(&[0, 1, 2, args.control_fd, args.worker_fd, args.config_fd]);
     init_tracing();
@@ -83,6 +88,16 @@ pub fn run(args: Args) -> ExitCode {
         }
     };
     let level = Confine::try_from(cfg.confine).unwrap_or(Confine::Enforce);
+    // Canonical, before anything uses them: the mount root binds at the
+    // canonical path, Landlock skips a path it cannot open (a symlink the
+    // mount root no longer shows), and the host checks artifact paths
+    // against them after confinement, when a symlink no longer resolves.
+    let mut cfg = cfg;
+    cfg.read_dirs = cfg
+        .read_dirs
+        .iter()
+        .map(|d| canonical(d).display().to_string())
+        .collect();
     #[allow(unused_mut)]
     let mut plan = confine::Plan {
         read_dirs: cfg.read_dirs.iter().map(PathBuf::from).collect(),
@@ -97,7 +112,8 @@ pub fn run(args: Args) -> ExitCode {
     // Opened in the process that serves (after the PID-namespace fork) and
     // before the mount root hides /proc.
     let mut statm = None;
-    let confinement = match confine::confine(level, &plan, || {
+    #[allow(unused_mut)]
+    let mut confinement = match confine::confine(level, &plan, || {
         statm = std::fs::File::open("/proc/self/statm").ok();
     }) {
         Ok(c) => c,
@@ -110,6 +126,12 @@ pub fn run(args: Args) -> ExitCode {
     if let Some(what) = &args.test_attempt {
         return crate::run_host::attempt(what, &plan);
     }
+    #[cfg(feature = "confinement-test")]
+    confinement.notes.push(
+        "this legion-isolate was built with the confinement-test feature (test hooks, \
+         LEGION_ISOLATE_SECCOMP=log); it is not a shipping build"
+            .into(),
+    );
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("isolate-io")
@@ -242,6 +264,11 @@ pub fn attempt(what: &str, plan: &confine::Plan) -> ExitCode {
             report(format!("kill returned {r} errno {}", errno()))
         }
         "pid" => report(format!("pid {}", std::process::id())),
+        // Sleep `arg` seconds, then report (a deadline test).
+        "sleep" => {
+            std::thread::sleep(std::time::Duration::from_secs(victim.max(0) as u64));
+            report("sleep: woke".into())
+        }
         "open-outside" => match std::fs::File::open("/etc/hostname") {
             Ok(_) => report("open-outside: opened".into()),
             Err(e) => report(format!("open-outside: {} ({:?})", e, e.raw_os_error())),
@@ -276,6 +303,59 @@ pub fn attempt(what: &str, plan: &confine::Plan) -> ExitCode {
                 Ok(_) => report("write-inside: wrote".into()),
                 Err(e) => report(format!("write-inside: {} ({:?})", e, e.raw_os_error())),
             }
+        }
+        // Write `<first read dir>/<arg>/probe`: a path inside a submount of
+        // a read directory (review N6).
+        "write-in" => {
+            let p = first_read().join(arg).join("probe");
+            match std::fs::write(&p, b"x") {
+                Ok(_) => report(format!("write-in: wrote {}", p.display())),
+                Err(e) => report(format!("write-in: {} ({:?})", e, e.raw_os_error())),
+            }
+        }
+        // The capability sets (capget) and how many bounding and ambient
+        // capabilities remain (prctl).
+        "caps" => {
+            #[repr(C)]
+            struct Header {
+                version: u32,
+                pid: i32,
+            }
+            #[repr(C)]
+            #[derive(Default, Clone, Copy)]
+            struct Data {
+                effective: u32,
+                permitted: u32,
+                inheritable: u32,
+            }
+            let mut h = Header {
+                version: 0x2008_0522,
+                pid: 0,
+            };
+            let mut d = [Data::default(); 2];
+            // SAFETY: capget v3 with a header and two data structs.
+            let r = unsafe { libc::syscall(libc::SYS_capget, &mut h as *mut Header, d.as_mut_ptr()) };
+            let (mut bounding, mut ambient) = (0, 0);
+            for cap in 0..64 {
+                // SAFETY: prctl with integer arguments.
+                if unsafe { libc::prctl(libc::PR_CAPBSET_READ, cap, 0, 0, 0) } == 1 {
+                    bounding += 1;
+                }
+                // SAFETY: as above.
+                if unsafe {
+                    libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_IS_SET, cap, 0, 0)
+                } == 1
+                {
+                    ambient += 1;
+                }
+            }
+            let sets = |f: fn(&Data) -> u32| u64::from(f(&d[0])) | (u64::from(f(&d[1])) << 32);
+            report(format!(
+                "caps: capget={r} effective={:x} permitted={:x} inheritable={:x} bounding={bounding} ambient={ambient}",
+                sets(|x| x.effective),
+                sets(|x| x.permitted),
+                sets(|x| x.inheritable),
+            ))
         }
         "write-output" => {
             let dir = plan.write_dirs.first().cloned().unwrap_or_default();

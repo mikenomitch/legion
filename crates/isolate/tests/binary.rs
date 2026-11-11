@@ -1192,3 +1192,225 @@ result = {"read": open("out/deep/note.txt").read(), "caught": caught, "body": bo
         stderr_of(&mut h.child)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Second review: submounts, capabilities without a user namespace, symlinked
+// read dirs, the compile deadline, and the test hooks in shipping builds.
+// ---------------------------------------------------------------------------
+
+/// `host --test-attempt <what>` with `cfg` and some layers left out.
+#[cfg(feature = "confinement-test")]
+fn attempt_with(cfg: &HostConfig, what: &str, skip: &[&str]) -> (std::process::ExitStatus, String) {
+    let mut extra = vec!["--test-attempt", what];
+    let skip = skip.join(",");
+    if !skip.is_empty() {
+        extra.extend(["--test-skip", &skip]);
+    }
+    let (mut cmd, _c, _w, _ends) = command(cfg, &extra);
+    let out = cmd.output().unwrap();
+    (
+        out.status,
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// A tmpfs mounted at `<dir>/sub` for the test's lifetime.
+#[cfg(feature = "confinement-test")]
+struct SubMount(std::path::PathBuf);
+
+#[cfg(feature = "confinement-test")]
+impl SubMount {
+    fn new(dir: &std::path::Path) -> Option<Self> {
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let c = |p: &std::path::Path| {
+            std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap()
+        };
+        let (src, fs, at) = (c("tmpfs".as_ref()), c("tmpfs".as_ref()), c(&sub));
+        // SAFETY: NUL-terminated strings, no data.
+        let r = unsafe {
+            libc::mount(src.as_ptr(), at.as_ptr(), fs.as_ptr(), 0, std::ptr::null())
+        };
+        (r == 0).then(|| SubMount(sub))
+    }
+}
+
+#[cfg(feature = "confinement-test")]
+impl Drop for SubMount {
+    fn drop(&mut self) {
+        let c = std::ffi::CString::new(self.0.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
+fn a_mount_inside_a_read_dir_is_read_only_for_the_host_test() {
+    #[cfg(feature = "confinement-test")]
+    {
+        let c = hello_confinement();
+        if !c.mount_root {
+            eprintln!("LAYER UNAVAILABLE HERE: mount root ({:?})", c.notes);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let Some(_sub) = SubMount::new(dir.path()) else {
+            eprintln!(
+                "cannot mount a tmpfs here ({}); not tested",
+                std::io::Error::last_os_error()
+            );
+            return;
+        };
+        let mut cfg = bin_config(Confine::BestEffort);
+        cfg.read_dirs = vec![dir.path().display().to_string()];
+        // Without the mount root (and Landlock) the submount is writable:
+        // the checks below are not passing by accident.
+        let (_, out) = attempt_with(&cfg, "write-in:sub", &["landlock", "mount"]);
+        assert!(out.contains("write-in: wrote"), "{out}");
+        let erofs = format!("Some({})", libc::EROFS);
+        // The mount root alone (Landlock left out, or it would refuse the
+        // write itself): mount_setattr(AT_RECURSIVE).
+        let (status, out) = attempt_with(&cfg, "write-in:sub", &["landlock"]);
+        assert!(status.success(), "{status:?} {out}");
+        assert!(out.contains(&erofs), "the submount is read-only: {out}");
+        // The fallback that walks the mount table.
+        let (status, out) = attempt_with(&cfg, "write-in:sub", &["landlock", "setattr"]);
+        assert!(status.success(), "{status:?} {out}");
+        assert!(out.contains(&erofs), "the submount is read-only: {out}");
+        // The directory itself stays read-only too.
+        let (_, out) = attempt_with(&cfg, "write-in:.", &["landlock"]);
+        assert!(out.contains(&erofs), "{out}");
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
+fn without_a_user_namespace_every_capability_is_dropped_test() {
+    #[cfg(feature = "confinement-test")]
+    {
+        let cfg = bin_config(Confine::BestEffort);
+        // seccomp would kill capget itself; Landlock does not filter it.
+        let (status, out) = attempt_with(&cfg, "caps", &["userns", "seccomp"]);
+        assert!(status.success(), "{status:?} {out}");
+        assert!(
+            out.contains(
+                "caps: capget=0 effective=0 permitted=0 inheritable=0 bounding=0 ambient=0"
+            ),
+            "{out}"
+        );
+        // And under enforce the missing namespace still refuses to start.
+        let cfg = bin_config(Confine::Enforce);
+        let (status, out) = attempt_with(&cfg, "caps", &["userns"]);
+        assert_eq!(status.code(), Some(3), "{out}");
+        assert!(out.contains("user namespace"), "{out}");
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
+fn a_symlinked_read_dir_stays_readable_test() {
+    #[cfg(feature = "confinement-test")]
+    {
+        artifact("cmd");
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("artifacts-link");
+        std::os::unix::fs::symlink(artifacts(), &link).unwrap();
+        let mut cfg = bin_config(Confine::BestEffort);
+        cfg.read_dirs = vec![link.display().to_string()];
+        // Every layer, then Landlock alone, then the mount root alone.
+        for skip in [&[][..], &["mount"][..], &["landlock"][..]] {
+            let (status, out) = attempt_with(&cfg, "read-inside", skip);
+            assert!(status.success(), "{skip:?}: {status:?} {out}");
+            assert!(out.contains("read-inside: "), "{skip:?}: {out}");
+            assert!(out.contains(" bytes"), "{skip:?}: {out}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_loads_a_module_through_a_symlinked_read_dir_test() {
+    artifact("cmd");
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("artifacts-link");
+    std::os::unix::fs::symlink(artifacts(), &link).unwrap();
+    let mut cfg = bin_config(Confine::BestEffort);
+    cfg.read_dirs = vec![link.display().to_string()];
+    let mut h = spawn(cfg).await;
+    // The worker passes canonical paths (the symlink does not exist in the
+    // host's mount root).
+    let path = std::fs::canonicalize(artifacts().join("cmd.cwasm")).unwrap();
+    h.client
+        .load_module(LoadModuleRequest {
+            module_id: "cmd".into(),
+            artifact_path: path.display().to_string(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{e}: {}", stderr_of(&mut h.child)));
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "confinement-test"),
+    ignore = "needs --features confinement-test"
+)]
+fn a_compile_ends_at_its_deadline_test() {
+    #[cfg(feature = "confinement-test")]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.wasm");
+        std::fs::copy(fixture("cmd"), &input).unwrap();
+        let started = Instant::now();
+        // The compiler's allowlist has no sleep; seccomp is left out.
+        let out = Command::new(BIN)
+            .args(["compile", "--confine", "best-effort", "--deadline-secs", "1"])
+            .arg("--input")
+            .arg(&input)
+            .arg("--output")
+            .arg(dir.path().join("x.cwasm"))
+            .args(["--test-skip", "seccomp", "--test-attempt", "sleep:30"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.signal(), Some(libc::SIGALRM), "{out:?}");
+        assert!(started.elapsed() < Duration::from_secs(20), "{out:?}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("woke"));
+    }
+}
+
+/// A shipping build (no `confinement-test` feature) has no test hooks: the
+/// flags are unknown arguments.
+#[test]
+#[cfg_attr(
+    feature = "confinement-test",
+    ignore = "checks a build without --features confinement-test"
+)]
+fn a_shipping_build_rejects_the_test_hooks_test() {
+    let cfg = bin_config(Confine::BestEffort);
+    for extra in [&["--test-skip", "seccomp"][..], &["--test-attempt", "socket"][..]] {
+        let (mut cmd, _c, _w, _ends) = command(&cfg, extra);
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{extra:?}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unexpected argument"),
+            "{out:?}"
+        );
+    }
+    let out = Command::new(BIN)
+        .args(["compile", "--input", "x", "--output", "y", "--test-attempt", "socket"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
