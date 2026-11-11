@@ -357,6 +357,20 @@ impl Worker for FakeNode {
         Err(Status::unimplemented("fake node"))
     }
 
+    async fn get_isolate_stats(
+        &self,
+        _request: Request<legion::structs::GetIsolateStatsRequest>,
+    ) -> Result<Response<legion::structs::GetIsolateStatsReply>, Status> {
+        Err(Status::unimplemented("fake node"))
+    }
+
+    async fn get_isolate(
+        &self,
+        _request: Request<legion::structs::GetIsolateRequest>,
+    ) -> Result<Response<legion::structs::GetIsolateReply>, Status> {
+        Err(Status::unimplemented("fake node"))
+    }
+
     async fn probe(&self, _request: Request<ProbeRequest>) -> Result<Response<ProbeReply>, Status> {
         Ok(Response::new(ProbeReply::default()))
     }

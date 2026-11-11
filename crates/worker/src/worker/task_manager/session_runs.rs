@@ -429,44 +429,20 @@ struct Prepared {
     start_wait: Duration,
 }
 
-fn prepare(
-    task_manager: &Arc<Mutex<WorkerTaskManager>>,
-    call: &RunCall,
-) -> Result<Prepared, Status> {
-    let spec = task_manager
-        .lock()
-        .map_err(|_| Status::internal("Task manager lock poisoned"))?
-        .session_spec(&call.job_id, &call.task_name)
-        .ok_or_else(|| {
-            Status::failed_precondition(
-                super::SessionRefusal::NoEnvelope {
-                    job_id: call.job_id.clone(),
-                    task_name: call.task_name.clone(),
-                }
-                .to_string(),
-            )
-        })?;
-    let run = spec
-        .task
-        .run
-        .as_ref()
-        .ok_or_else(|| Status::failed_precondition(no_run_block(&call.job_id, &call.task_name)))?
-        .resolve()
-        .map_err(|err| Status::failed_precondition(format!("task {}: {err}", call.task_name)))?;
-    let request = &call.request;
-    let command = if request.command.is_empty() {
-        run.command.clone()
-    } else {
-        if !run.allow_command {
-            return Err(Status::failed_precondition(command_not_allowed(
-                &call.task_name,
-            )));
-        }
-        if request.command[0].trim().is_empty() {
-            return Err(Status::invalid_argument("command's first element is empty"));
-        }
-        request.command.clone()
-    };
+/// A run's files, input, and `get` paths, checked: relative paths with no
+/// `..`, no file staged twice, `input` JSON, at most [`MAX_RUN_STAGED`]
+/// bytes together.
+pub struct StagedFiles {
+    /// (path relative to the run directory, bytes, executable). `input`
+    /// is staged as [`RUN_INPUT_FILE`].
+    pub files: Vec<(String, Vec<u8>, bool)>,
+    /// (path as asked, path relative to the run directory).
+    pub get: Vec<(String, String)>,
+    pub has_input: bool,
+}
+
+/// Check a run request's staging (shared with isolate runs).
+pub fn staged_files(request: &RunSessionRequest) -> Result<StagedFiles, Status> {
     let mut staged = 0u64;
     let mut files = Vec::new();
     let mut seen = HashSet::new();
@@ -507,6 +483,84 @@ fn prepare(
             .map_err(|err| Status::invalid_argument(format!("get {err}")))?;
         get.push((path.clone(), relative));
     }
+    Ok(StagedFiles {
+        files,
+        get,
+        has_input,
+    })
+}
+
+/// The isolate-only field a request sets, if any.
+pub fn isolate_only_field(request: &RunSessionRequest) -> Option<&'static str> {
+    if !request.tier.trim().is_empty() {
+        Some("tier")
+    } else if !request.tenant.is_empty() {
+        Some("tenant")
+    } else if !request.session_id.is_empty() {
+        Some("session_id")
+    } else {
+        None
+    }
+}
+
+fn prepare(
+    task_manager: &Arc<Mutex<WorkerTaskManager>>,
+    call: &RunCall,
+) -> Result<Prepared, Status> {
+    let spec = task_manager
+        .lock()
+        .map_err(|_| Status::internal("Task manager lock poisoned"))?
+        .session_spec(&call.job_id, &call.task_name)
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                super::SessionRefusal::NoEnvelope {
+                    job_id: call.job_id.clone(),
+                    task_name: call.task_name.clone(),
+                }
+                .to_string(),
+            )
+        })?;
+    if crate::structs::isolate::is_isolate_task(&spec.task) {
+        // The server sends isolate tasks to the isolate supervisor; reaching
+        // here means this node has none.
+        return Err(Status::failed_precondition(format!(
+            "task {} runs on the isolate runtime, which this node does not run (no \
+             legion-isolate binary)",
+            call.task_name
+        )));
+    }
+    if let Some(field) = isolate_only_field(&call.request) {
+        return Err(Status::invalid_argument(format!(
+            "{field} applies only to tasks of the isolate runtime; task {} runs on {}",
+            call.task_name, spec.task.runtime
+        )));
+    }
+    let run = spec
+        .task
+        .run
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition(no_run_block(&call.job_id, &call.task_name)))?
+        .resolve()
+        .map_err(|err| Status::failed_precondition(format!("task {}: {err}", call.task_name)))?;
+    let request = &call.request;
+    let command = if request.command.is_empty() {
+        run.command.clone()
+    } else {
+        if !run.allow_command {
+            return Err(Status::failed_precondition(command_not_allowed(
+                &call.task_name,
+            )));
+        }
+        if request.command[0].trim().is_empty() {
+            return Err(Status::invalid_argument("command's first element is empty"));
+        }
+        request.command.clone()
+    };
+    let StagedFiles {
+        files,
+        get,
+        has_input,
+    } = staged_files(request)?;
     let start_wait = request
         .wait_timeout_seconds
         .map(|seconds| Duration::from_secs(u64::from(seconds.max(1))).min(MAX_START_WAIT))
@@ -556,22 +610,73 @@ pub async fn run_session(
         .lock()
         .map_err(|_| Status::internal("Task manager lock poisoned"))?
         .run_registry();
-    let key = call
-        .request
+    let job_id = call.job_id.clone();
+    let task_name = call.task_name.clone();
+    let request = call.request.clone();
+    let driver_node = node_id.clone();
+    let driver_registry = registry.clone();
+    run_keyed(
+        &registry,
+        &job_id,
+        &task_name,
+        &node_id,
+        &request,
+        move |run_id| async move {
+            let result = drive(
+                &task_manager,
+                &launch_pool,
+                &driver_registry,
+                &driver_node,
+                &call,
+                prepared,
+                &run_id,
+            )
+            .await;
+            let metrics = crate::telemetry::worker_metrics();
+            metrics.session_runs_total.inc(&[match &result {
+                Ok(reply) if reply.stopped.is_some() => "stopped",
+                Ok(_) => "ran",
+                Err(_) => "failed",
+            }]);
+            result
+        },
+    )
+    .await
+}
+
+/// Run `run` once per idempotency key (docs/session-runs.md): a request
+/// with no key gets a minted run id; a keyed one derives its id from the
+/// key and the request's content, and a retry is answered from the kept
+/// reply or waits for the attempt in flight. `run` is driven by a detached
+/// task, so a caller that hangs up does not cancel it half way. Shared by
+/// session runs and isolate runs.
+pub async fn run_keyed<F, Fut>(
+    registry: &Arc<RunRegistry>,
+    job_id: &str,
+    task_name: &str,
+    node_id: &str,
+    request: &RunSessionRequest,
+    run: F,
+) -> Result<RunSessionResponse, Status>
+where
+    F: FnOnce(String) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<RunSessionResponse, Status>> + Send + 'static,
+{
+    let key = request
         .idempotency_key
         .as_deref()
         .map(str::trim)
         .unwrap_or_default()
         .to_string();
     let (run_id, ticket) = if key.is_empty() {
-        (crate::structs::mint_session_id("run", &node_id), None)
+        (crate::structs::mint_session_id("run", node_id), None)
     } else {
         // A key names one request, not just one string: the request's own
         // content is part of the id, so another caller of the same job and
         // task who reuses a key with different files or input starts its own
         // run and is never answered with this one's stored reply.
-        let key = format!("{key}\n{}", request_fingerprint(&call.request));
-        let run_id = derived_run_id(&call.job_id, &call.task_name, &key);
+        let key = format!("{key}\n{}", request_fingerprint(request));
+        let run_id = derived_run_id(job_id, task_name, &key);
         match registry.begin(&run_id, crate::util::now_unix_ms()) {
             Begin::Done(reply) => {
                 return Ok(RunSessionResponse {
@@ -605,22 +710,7 @@ pub async fn run_session(
     // Detached: a caller that hangs up must not cancel the run between its
     // start and its end, where the session would be left running.
     let driver = tokio::spawn(async move {
-        let result = drive(
-            &task_manager,
-            &launch_pool,
-            &registry,
-            &node_id,
-            &call,
-            prepared,
-            &run_id,
-        )
-        .await;
-        let metrics = crate::telemetry::worker_metrics();
-        metrics.session_runs_total.inc(&[match &result {
-            Ok(reply) if reply.stopped.is_some() => "stopped",
-            Ok(_) => "ran",
-            Err(_) => "failed",
-        }]);
+        let result = run(run_id).await;
         if let Some(ticket) = ticket {
             ticket.settle(&result, crate::util::now_unix_ms());
         }
@@ -1427,6 +1517,12 @@ fn request_fingerprint(request: &RunSessionRequest) -> String {
     part(&(request.command.len() as u64).to_be_bytes());
     for arg in &request.command {
         part(arg.as_bytes());
+    }
+    // Isolate runs: where and for whom it runs is part of what it is.
+    if !(request.tier.is_empty() && request.tenant.is_empty() && request.session_id.is_empty()) {
+        part(request.tier.as_bytes());
+        part(request.tenant.as_bytes());
+        part(request.session_id.as_bytes());
     }
     hasher
         .finalize()

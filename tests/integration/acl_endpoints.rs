@@ -222,6 +222,11 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         // command also needs `exec:write` (the matrix is in
         // `a_run_with_a_callers_command_needs_exec_write_test`).
         ("RunSession", Plane::Protected("job:write")),
+        // Isolate aggregates from the heartbeats, and a session isolate read
+        // forwarded to its node: `job:read` (GetIsolate checks coarsely
+        // first, then against the job the node reports).
+        ("GetIsolateStats", Plane::Protected("job:read")),
+        ("GetIsolate", Plane::Protected("job:read")),
         // Snapshots are their own resource: a memory snapshot holds the
         // workload's in-memory secrets, which `job:write` must not imply.
         // RestoreInstance also needs `job:write` (it replaces an allocation);
@@ -1408,6 +1413,26 @@ async fn call_endpoint(
                 legion::structs::RunSessionRequest {
                     job_id: JOB_NAME.into(),
                     dry_run: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetIsolateStats" => svc
+            .get_isolate_stats(req(
+                legion::structs::GetIsolateStatsRequest {
+                    job_id: JOB_NAME.into(),
+                    task_name: String::new(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetIsolate" => svc
+            .get_isolate(req(
+                legion::structs::GetIsolateRequest {
+                    session_id: "run-acl-probe".into(),
                     ..Default::default()
                 },
                 token,

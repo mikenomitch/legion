@@ -83,6 +83,16 @@ fn static_rules(policy: &PolicyObject) -> Vec<(&'static str, PolicyObject)> {
         let mut narrowed = PolicyObject {
             name: policy.name.clone(),
             namespaces: policy.namespaces.clone(),
+            // Every cordon kind allowed: without a list, a `shared` cordon
+            // is refused by any copy (it needs a policy that lists it), and
+            // an existing shared-cordon job would read as violating rules
+            // that have nothing to do with cordons.
+            isolate_cordons: Some(
+                crate::structs::isolate::IsolateCordon::ALL
+                    .iter()
+                    .map(|kind| kind.as_str().to_string())
+                    .collect(),
+            ),
             ..Default::default()
         };
         f(&mut narrowed);
@@ -98,6 +108,11 @@ fn static_rules(policy: &PolicyObject) -> Vec<(&'static str, PolicyObject)> {
     if policy.host_volumes.is_some() {
         rules.push(only("hostVolumes", &|p| {
             p.host_volumes = policy.host_volumes.clone()
+        }));
+    }
+    if policy.isolate_cordons.is_some() {
+        rules.push(only("isolateCordons", &|p| {
+            p.isolate_cordons = policy.isolate_cordons.clone()
         }));
     }
     // A dry run lists the existing jobs a new rule would refuse.
@@ -473,5 +488,67 @@ impl ManagerDaemonService {
             deleted: true,
             deduplicated,
         }))
+    }
+}
+
+#[cfg(test)]
+mod namespace_policy_rpcs_test {
+    use super::*;
+
+    fn policy(value: serde_json::Value) -> PolicyObject {
+        PolicyObject::from_json(&value.to_string()).expect("valid policy")
+    }
+
+    fn isolate_job(cordon: &str) -> JobConfig {
+        let mut task = TaskConfig::new("run", crate::structs::isolate::ISOLATE_RUNTIME);
+        task.config = serde_json::json!({
+            "image": "python",
+            "limits": { "cpu": "100ms", "wall": "30s" },
+            "cordon": cordon,
+        });
+        JobConfig {
+            name: "tenants/code-runner".into(),
+            tasks: vec![task],
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            version: None,
+            pending_extensions: Default::default(),
+            extensions: Default::default(),
+        }
+    }
+
+    /// A dry run checks each rule alone: an existing shared-cordon job is
+    /// reported only by `isolateCordons`, never by an unrelated rule.
+    #[test]
+    fn isolate_cordons_dry_run_rule_stands_alone_test() {
+        let open = policy(serde_json::json!({
+            "name": "tenants",
+            "namespaces": ["tenants"],
+            "runtimes": ["isolate", "exec"],
+            "isolateCordons": ["shared", "namespace"],
+        }));
+        let rules = static_rules(&open);
+        let names: Vec<&str> = rules.iter().map(|(rule, _)| *rule).collect();
+        assert_eq!(names, ["runtimes", "isolateCordons"]);
+        for (rule, narrowed) in &rules {
+            admit_job(std::slice::from_ref(narrowed), &mut isolate_job("shared"))
+                .unwrap_or_else(|err| panic!("{rule} refused a shared job it allows: {err}"));
+        }
+
+        let closed = policy(serde_json::json!({
+            "name": "tenants",
+            "namespaces": ["tenants"],
+            "runtimes": ["isolate"],
+            "isolateCordons": ["namespace"],
+        }));
+        let refused: Vec<&str> = static_rules(&closed)
+            .iter()
+            .filter(|(_, narrowed)| {
+                admit_job(std::slice::from_ref(narrowed), &mut isolate_job("shared")).is_err()
+            })
+            .map(|(rule, _)| *rule)
+            .collect();
+        assert_eq!(refused, ["isolateCordons"]);
     }
 }

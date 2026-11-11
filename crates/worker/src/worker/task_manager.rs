@@ -1053,6 +1053,9 @@ pub struct WorkerTaskManager {
     /// Device plugins and the last device report (docs/devices.md). A task
     /// with assigned devices is granted them here before `prepare()`.
     devices: Arc<crate::devices::plugin::DeviceManager>,
+    /// The isolate supervisor (docs/task-runtime-isolate.md), on a node that
+    /// runs the isolate runtime.
+    isolates: Option<Arc<crate::worker::isolates::IsolateSupervisor>>,
 }
 
 /// A session task's spec, as its envelope's payload carried it.
@@ -1175,6 +1178,7 @@ impl WorkerTaskManager {
             pending_manifest_deletes: Vec::new(),
             keep_manifest: std::collections::HashSet::new(),
             envelope_sizes: HashMap::new(),
+            isolates: None,
         }
     }
 
@@ -4349,6 +4353,57 @@ impl WorkerTaskManager {
             .map(|(local, task)| (*local, task))
     }
 
+    /// The isolate supervisor, on a node that runs isolates.
+    pub fn isolates(&self) -> Option<Arc<crate::worker::isolates::IsolateSupervisor>> {
+        self.isolates.clone()
+    }
+
+    pub fn set_isolates(
+        &mut self,
+        supervisor: Option<Arc<crate::worker::isolates::IsolateSupervisor>>,
+    ) {
+        self.isolates = supervisor;
+    }
+
+    /// Every live envelope of an `isolate` task on this node, with the spec
+    /// its payload carried and its room now: what the isolate supervisor
+    /// prepares tasks from.
+    pub fn isolate_envelopes(&self) -> Vec<crate::worker::isolates::IsolateEnvelope> {
+        let mut out: Vec<crate::worker::isolates::IsolateEnvelope> = Vec::new();
+        for (local, spec) in &self.session_specs {
+            if !crate::structs::isolate::is_isolate_task(&spec.task) {
+                continue;
+            }
+            let (Some(allocation), Some(envelope)) =
+                (self.allocations.get(local), self.task_configs.get(local))
+            else {
+                continue;
+            };
+            if !self.instances.contains_key(local) {
+                continue;
+            }
+            // The newest envelope when a job update briefly leaves two.
+            if self
+                .envelope_for(&allocation.job_id, &spec.task.name)
+                .is_some_and(|(newest, _)| newest != *local)
+            {
+                continue;
+            }
+            let room = self
+                .envelope_sizes
+                .get(local)
+                .map(|size| size.room())
+                .unwrap_or_else(|| crate::structs::session::resource_amounts(&envelope.resources));
+            out.push(crate::worker::isolates::IsolateEnvelope {
+                job_id: allocation.job_id.clone(),
+                allocation_id: *local,
+                spec: spec.clone(),
+                room: room.into_iter().collect(),
+            });
+        }
+        out
+    }
+
     /// The spec of a session task this node holds an envelope for, for an
     /// edge start. `None` without a live envelope, or when the envelope's
     /// payload predates carrying it.
@@ -6581,6 +6636,9 @@ fn load_builtin_plugins_into(registry: &mut TaskPluginRegistry) {
     }
     if let Err(err) = registry.load_plugin("noop", true) {
         debug!(?err, "Noop task plugin not available");
+    }
+    if let Err(err) = registry.load_plugin("isolate", true) {
+        error!(?err, "Failed to load isolate task plugin");
     }
 }
 

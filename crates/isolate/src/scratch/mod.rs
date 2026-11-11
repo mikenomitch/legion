@@ -219,9 +219,6 @@ fn scratch_ctx<T: ScratchView>(t: &mut T) -> ScratchCtx<'_> {
 /// `call` and `call_async`.
 pub fn add_to_linker<T: ScratchView + 'static>(linker: &mut Linker<T>) -> anyhow::Result<()> {
     bindings::wasi::filesystem::types::add_to_linker::<T, HasScratch>(linker, scratch_ctx::<T>)?;
-    bindings::wasi::filesystem::preopens::add_to_linker::<T, HasScratch>(
-        linker,
-        scratch_ctx::<T>,
-    )?;
+    bindings::wasi::filesystem::preopens::add_to_linker::<T, HasScratch>(linker, scratch_ctx::<T>)?;
     Ok(())
 }

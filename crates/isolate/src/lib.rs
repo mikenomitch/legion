@@ -17,6 +17,7 @@ pub mod checkpoint;
 pub mod compile;
 pub mod engine;
 pub mod guest;
+pub mod host;
 pub mod module;
 pub mod scratch;
 pub mod shard;

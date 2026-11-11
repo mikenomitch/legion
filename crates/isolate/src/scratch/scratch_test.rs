@@ -505,9 +505,15 @@ fn the_tree_never_reads_a_clock_test() {
     let stat = t.stat(&f).unwrap();
     assert_eq!(times(&stat), [(0, 0), pair(T1), pair(T2)]);
     let d = t.lookup(ROOT, "d").unwrap();
-    assert_eq!(pair(t.stat(&d).unwrap().data_modification_timestamp.unwrap()), pair(T2));
+    assert_eq!(
+        pair(t.stat(&d).unwrap().data_modification_timestamp.unwrap()),
+        pair(T2)
+    );
     t.set_times(&f, None, None).unwrap();
-    assert_eq!(pair(t.stat(&f).unwrap().status_change_timestamp.unwrap()), pair(T2));
+    assert_eq!(
+        pair(t.stat(&f).unwrap().status_change_timestamp.unwrap()),
+        pair(T2)
+    );
 }
 
 #[test]
@@ -940,7 +946,12 @@ fn guest_calls_stamp_with_the_context_clock_test() {
     let mut w: DynOutputStream = v.table.delete(w).unwrap();
     w.write(Bytes::from_static(b"d")).unwrap();
     assert_eq!(
-        pair(v.stat(borrow(&f)).unwrap().data_modification_timestamp.unwrap()),
+        pair(
+            v.stat(borrow(&f))
+                .unwrap()
+                .data_modification_timestamp
+                .unwrap()
+        ),
         pair(T2)
     );
 }

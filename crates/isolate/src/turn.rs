@@ -83,6 +83,16 @@ pub fn cpu_in_turn_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// The guest's wall clock as a WASI datetime (file timestamps use it, so
+/// they cannot serve as a finer timer than the clocks).
+pub fn now_datetime() -> crate::scratch::Datetime {
+    let d = wasmtime_wasi::HostWallClock::now(&FrozenWallClock);
+    crate::scratch::Datetime {
+        seconds: d.as_secs(),
+        nanoseconds: d.subsec_nanos(),
+    }
+}
+
 /// The guest's wall clock: frozen in a turn, 1 ms resolution.
 pub struct FrozenWallClock;
 

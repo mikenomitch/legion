@@ -127,7 +127,7 @@ pub struct LoadedModule {
     /// Present when `exports.http_handler`.
     pub proxy: Option<wasmtime_wasi_http::p2::bindings::ProxyPre<Ctx>>,
     /// Present when `exports.runner`.
-    pub runner: Option<world::HostWorldPre<Ctx>>,
+    pub runner: Option<world::ImagePre<Ctx>>,
 }
 
 impl LoadedModule {
@@ -166,7 +166,7 @@ impl LoadedModule {
             None
         };
         let runner = if exports.runner {
-            Some(world::HostWorldPre::new(pre.clone()).map_err(|e| anyhow::anyhow!("{e:#}"))?)
+            Some(world::ImagePre::new(pre.clone()).map_err(|e| anyhow::anyhow!("{e:#}"))?)
         } else {
             None
         };

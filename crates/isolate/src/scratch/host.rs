@@ -239,9 +239,11 @@ impl types::HostDescriptor for ScratchCtx<'_> {
         modify: NewTimestamp,
     ) -> FsResult<()> {
         let node = self.descriptor(&fd)?.node.clone();
-        self.scratch
-            .tree
-            .set_times(&node, timestamp(access, self.now), timestamp(modify, self.now))?;
+        self.scratch.tree.set_times(
+            &node,
+            timestamp(access, self.now),
+            timestamp(modify, self.now),
+        )?;
         Ok(())
     }
 
@@ -318,9 +320,11 @@ impl types::HostDescriptor for ScratchCtx<'_> {
     ) -> FsResult<()> {
         let base = self.base(&fd, &path)?;
         let node = self.scratch.tree.lookup(base, &path)?;
-        self.scratch
-            .tree
-            .set_times(&node, timestamp(access, self.now), timestamp(modify, self.now))?;
+        self.scratch.tree.set_times(
+            &node,
+            timestamp(access, self.now),
+            timestamp(modify, self.now),
+        )?;
         Ok(())
     }
 

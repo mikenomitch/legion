@@ -6,16 +6,7 @@
 
 wasmtime::component::bindgen!({
     path: "wit/legion-isolate.wit",
-    inline: "
-        package legion:host;
-        world host-world {
-            import legion:isolate/control@0.1.0;
-            import legion:isolate/state@0.1.0;
-            import legion:isolate/vm@0.1.0;
-            export legion:isolate/runner@0.1.0;
-        }
-    ",
-    world: "legion:host/host-world",
+    world: "legion:isolate/image",
     imports: { default: async | trappable },
     exports: { default: async },
     with: {

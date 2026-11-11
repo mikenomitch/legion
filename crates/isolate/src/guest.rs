@@ -553,6 +553,7 @@ impl ScratchView for Ctx {
             scratch: &mut self.scratch,
             table: &mut self.table,
             cwd: RUN_DIR,
+            now: turn::now_datetime(),
         }
     }
 }

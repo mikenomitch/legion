@@ -143,11 +143,11 @@ impl ManagerDaemonService {
             .collect();
         let task = match request.task_name.as_str() {
             "" => {
-                let runnable: Vec<&TaskConfig> = session_tasks
-                    .iter()
-                    .copied()
-                    .filter(|task| task.run.is_some())
-                    .collect();
+                // The tasks that take runs (a `run` block, or the isolate
+                // runtime), with an isolate task's own VM task left out: it
+                // exists to serve the isolate task.
+                let runnable =
+                    crate::manager::isolates::default_run_task(&session_tasks, &config.tasks);
                 match (runnable.as_slice(), session_tasks.as_slice()) {
                     ([only], _) => *only,
                     ([], [only]) => *only,
@@ -179,23 +179,50 @@ impl ManagerDaemonService {
                     ))
                 })?,
         };
-        let run = task
-            .run
-            .as_ref()
-            .ok_or_else(|| {
-                Status::failed_precondition(crate::structs::run::no_run_block(
-                    &request.job_id,
-                    &task.name,
-                ))
-            })?
-            .resolve()
-            .map_err(|err| Status::failed_precondition(format!("task {}: {err}", task.name)))?;
-        if !request.command.is_empty() {
-            if !run.allow_command {
+        // The isolate runtime's own fields, before anything is routed:
+        // refused on other runtimes, checked against the isolate task.
+        crate::manager::isolates::check_run_fields(
+            &request.job_id,
+            task,
+            &request.tier,
+            &request.tenant,
+            &request.session_id,
+            &request.command,
+        )
+        .map_err(|(code, message)| Status::new(code, message))?;
+        let isolate = crate::structs::isolate::is_isolate_task(task);
+        let wall = if isolate {
+            // No `run` block: the budgets are `config.limits`, and a run that
+            // may go to the VM tier gets the VM task's `run.wall` too.
+            let limits = crate::structs::run::run_limits(&request.job_id, task)
+                .map_err(|err| Status::failed_precondition(format!("task {}: {err}", task.name)))?;
+            crate::manager::isolates::run_wall(
+                &request.tier,
+                limits.wall,
+                crate::manager::isolates::vm_task(task, &config.tasks),
+            )
+        } else {
+            let run = task
+                .run
+                .as_ref()
+                .ok_or_else(|| {
+                    Status::failed_precondition(crate::structs::run::no_run_block(
+                        &request.job_id,
+                        &task.name,
+                    ))
+                })?
+                .resolve()
+                .map_err(|err| {
+                    Status::failed_precondition(format!("task {}: {err}", task.name))
+                })?;
+            if !request.command.is_empty() && !run.allow_command {
                 return Err(Status::failed_precondition(
                     crate::structs::run::command_not_allowed(&task.name),
                 ));
             }
+            run.wall
+        };
+        if !request.command.is_empty() {
             info!(
                 target: "exec_audit",
                 principal = %ident.principal,
@@ -229,12 +256,13 @@ impl ManagerDaemonService {
                         (&file.path, format!("{:x}", Sha256::digest(&file.content)))
                     })
                     .collect::<Vec<_>>(),
+                (&request.tier, &request.tenant, &request.session_id),
             ),
         );
         request.idempotency_key = (!scoped.is_empty()).then_some(scoped);
         request.task_name = task.name.clone();
         request.job_id = config.name.clone();
-        sessions::run(&self.store, &config, task, run.wall, request)
+        sessions::run(&self.store, &config, task, wall, request)
             .await
             .map(Response::new)
     }
@@ -1086,19 +1114,33 @@ impl ManagerDaemonService {
             )));
         };
         let status = found.status.clone().unwrap_or_default();
-        let task = self
-            .store
-            .shared_task_configs_for_job_config(&status.job_config_id)
-            .map_err(|e| map_store_error("Error loading job config", e))?
-            .iter()
-            .find(|(_, task)| task.name == status.task_name)
-            .map(|(_, task)| task.clone())
+        // A node that reports no job config (a session isolate's
+        // synthesized status) is read against the job's current one.
+        let tasks: Vec<TaskConfig> = if status.job_config_id.is_empty() {
+            self.store
+                .get_job_config(&status.job_id)
+                .map(|config| config.tasks)
+                .unwrap_or_default()
+        } else {
+            self.store
+                .shared_task_configs_for_job_config(&status.job_config_id)
+                .map_err(|e| map_store_error("Error loading job config", e))?
+                .iter()
+                .map(|(_, task)| task.clone())
+                .collect()
+        };
+        let task = tasks
+            .into_iter()
+            .find(|task| task.name == status.task_name)
             .ok_or_else(|| {
                 Status::failed_precondition(format!(
                     "the session's job config {} no longer has task {}",
                     status.job_config_id, status.task_name
                 ))
             })?;
+        // An isolate session is never a keyed instance (isolate-runtime
+        // calls entry 10): refused before any write.
+        crate::structs::session::promotable(&task).map_err(Status::failed_precondition)?;
         if !new_id.is_empty() && !crate::structs::session::accepts_names(&task) {
             return Err(Status::invalid_argument(format!(
                 "task {} sets stateful.promote.onName = false; promote without new_id to keep \

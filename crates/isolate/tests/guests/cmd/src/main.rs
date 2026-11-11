@@ -9,6 +9,11 @@ use wasi::http::types::{ErrorCode, Fields, Method, OutgoingRequest, Scheme};
 use wasi::io::streams::StreamError;
 
 fn main() {
+    // wasi-libc starts in `/` whatever `initial-cwd` says; the host names
+    // the run directory in LEGION_RUN_DIR.
+    if let Ok(dir) = std::env::var("LEGION_RUN_DIR") {
+        std::env::set_current_dir(dir).expect("chdir to the run directory");
+    }
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("echo");
     let arg = args.get(2).cloned().unwrap_or_default();
