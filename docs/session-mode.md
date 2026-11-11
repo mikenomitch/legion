@@ -337,9 +337,15 @@ dropped from the index, and its sessions disappear from listings.
 `legion instance get <ID>` works on a session id too. The manager gates it
 with a coarse `job:read` check before looking the id up, and enforces
 `job:read` on the session's own job after. A caller who cannot read that
-job gets the same `NOT_FOUND` as for an unknown id, so it cannot learn which
-session ids exist; the other session verbs (stop, suspend, start, resize,
-promote) answer such a caller the same way.
+job gets the same `NOT_FOUND` as for an unknown id; the other session verbs
+(stop, suspend, start, resize, promote) answer such a caller the same way,
+for every runtime's sessions. A caller who can read the job but lacks the
+verb's own permission (`job:write` to stop, `scale:write` to resize) gets
+`PERMISSION_DENIED`. A few answers come before the session's job is known,
+and so can still tell a caller that an id exists or existed: an evicted
+session's `NOT_FOUND` with its node's account of the eviction,
+`UNAVAILABLE` naming a node that does not answer, and `Session <id>
+already ended` for a stop repeated within ten minutes.
 
 ## Ending sessions
 
@@ -1018,6 +1024,8 @@ envelopes; what differs:
   [routing by id](#routing-by-id). An id derived from an idempotency key
   has no tag and is found only with `--on-node` (`session run`, `isolate
   get`). A start on a task of another lifetime is `FAILED_PRECONDITION`.
+  A session isolate's id is also a bearer capability for its task's HTTP
+  ports (`Legion-Session`).
 - **No promotion,** and no `instance create --id`.
 - **The datapath rides the envelope.** An isolate task may declare
   `network.ports`, an egress policy, and `connect` upstreams, which are
@@ -1025,8 +1033,9 @@ envelopes; what differs:
   `gated`/`auto`, `connect.templates`, and `service` are refused.
 - **`suspend`** applies to `lifetime = "session"` only, and an isolate
   hibernates to its own checkpoint (its `state` map): `checkpoint`,
-  `checkpointEvery`, `archive`, `park`, `onResume`, and `wake` are refused,
-  and so is `durability = "store"`.
+  `checkpointEvery`, `archive`, `park`, `onResume`, `wake`, and
+  `onWorkerStop` are refused (a stopping worker always hibernates its
+  session isolates), and so is `durability = "store"`.
 - **The router reserves nothing** for an isolate run or start; the node
   admits it against the envelope.
 

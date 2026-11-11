@@ -192,9 +192,9 @@ $ legion session run code-runner --file main.py --input '{"n": 3}' -j
 | Request field (CLI flag) | Meaning |
 | --- | --- |
 | `tier` (`--tier auto\|isolate\|vm`) | Where the run happens. `auto`, the default, decides before anything runs. |
-| `tenant` (`--tenant KEY`) | Who the run is for: keys a `tenant` isolate's warm instance and the node's per-tenant fairness. 1 to 128 printable ASCII bytes. |
+| `tenant` (`--tenant KEY`) | Who the run is for: keys a `tenant` isolate's warm instance and the node's per-tenant fairness. 1 to 128 printable ASCII bytes. A routing key the caller chooses, not an identity; with `session_id`, it must be empty or the session's own tenant. |
 | `session_id` (`--session ID`) | Run in an existing session isolate, on the node its id names. |
-| `args` (`--arg ARG`, repeatable) | Arguments for the code. At most 64, 64 KiB together. Need only `job:write`. |
+| `args` (`--arg ARG`, repeatable) | Arguments for the code. At most 64, 64 KiB together. Need only `job:write`. In the VM tier they are appended only to a `run.command` that ends with the entry's path (else the run is refused before it runs), and always exported as `LEGION_RUN_ARGS` ([The VM task](task-runtime-isolate.md#the-vm-task)). |
 
 All four are refused (`INVALID_ARGUMENT`) on a task of another runtime, and
 `command` is refused on an isolate task. The reply adds, for isolate tasks

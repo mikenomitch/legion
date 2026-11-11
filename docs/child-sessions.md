@@ -107,7 +107,9 @@ Callers may leave the kind out; Legion works it out from the id. The
 `isolate` kind is set only by the node, when an isolate starts a child VM;
 a session isolate owns its children as an ordinary `session` owner, found
 on the node its id names. Managers keep no record of isolates, so they skip
-`isolate` owners and leave judging them to the node. An
+`isolate` owners and leave judging them to the node. The node binds an
+isolate owner to its job and task, and acts on a child only for an
+isolate it is running for that job and task. An
 allocation that belongs to an instance is always owned through the
 instance, so the reference survives a reschedule.
 

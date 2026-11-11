@@ -510,11 +510,19 @@ $ legion instance stop notebook-q4n7c2rd.01jc3...
   `--id` on `instance create` is refused. Hibernation checkpoints stay on
   the node that took them, so `legion.state` does not outlive the node
   either.
-- **Ids you may not read do not exist for you.** A caller who cannot read
-  the session's job gets the same `NOT_FOUND` from `instance get`,
-  `stop`, `suspend`, `start`, `resize`, `promote`, and `isolate get` as for
-  an id no node holds. A caller who can read the job but lacks the verb's
-  permission gets `PERMISSION_DENIED`.
+- **A caller who cannot read the session's job** gets the same
+  `NOT_FOUND` from `instance get`, `stop`, `suspend`, `start`, `resize`,
+  `promote`, and `isolate get` as for an id no node holds; a caller who
+  can read the job but lacks the verb's permission gets
+  `PERMISSION_DENIED`. A few answers still come before the job is known
+  and can tell a caller that an id exists or existed: a session evicted
+  from its node (`NOT_FOUND` with the node's account of the eviction), a
+  node that does not answer (`UNAVAILABLE` naming it), and a stop of a
+  session that ended in the last ten minutes (`already ended`).
+- **A session id is a bearer capability for HTTP.** Anyone who can reach
+  the task's ports and knows the id can send requests into the session
+  with `Legion-Session`. The id also appears in the prefixes of the job's
+  log lines ([Logs](#logs)).
 - **A keyed start retried through another manager** can start a second
   isolate on another node (each manager remembers the node of a keyed start
   for 10 minutes).
@@ -655,8 +663,12 @@ the isolate task:
   other files under their own names, and `--input` as `input.json`;
 - `--arg` values are appended to the VM task's own `run.command` **only
   when that command ends with the entry's path**
-  (`["python3", "/legion/run/main.py"]`), so they are always the script's
-  own arguments. A run with arguments that would go to a VM task whose
+  (`["python3", "/legion/run/main.py"]`), after that path. What the
+  command does with them is the job author's design: an interpreter passes
+  them to the script, but a tool that takes the entry as an operand (a
+  test runner, a grader) may parse them as its own options, so do not end
+  such a command with the entry path if callers with `job:write` must not
+  choose its options. A run with arguments that would go to a VM task whose
   command ends otherwise is refused before anything runs, also when
   `auto` picked the VM:
 
@@ -877,11 +889,23 @@ process, before the task takes work:
 A compile that fails leaves the task unable to run on that node with a
 `problem` (`the module failed to compile (unsupported-import): ...`) that
 `legion isolate stats` shows and that runs answer as `FAILED_PRECONDITION`.
-The node tries again after 30 seconds. A compile is limited to 300 seconds
-and a 16 GiB address space, and runs in its own network namespace with
-`no_new_privs` and Landlock where the kernel allows. A host never compiles
-and never loads an artifact from outside the directories the worker's
-compiler writes; a user-supplied `.cwasm` is never loaded.
+The node tries again after 30 seconds. A host never compiles and never
+loads an artifact from outside the directories the worker's compiler
+writes; a user-supplied `.cwasm` is never loaded.
+
+The compiler parses untrusted bytes, so it confines itself like a host
+([Confinement](#confinement)): the same namespaces and PID-namespace
+fork, a mount root holding only its one input file (read-only) and its
+output directory (writable, not executable), Landlock on those two paths,
+`no_new_privs`, and its own seccomp allowlist. It honours the worker's
+`isolate.confine` (`legion-isolate compile --confine
+enforce|best-effort|off`, `enforce` by default); under `enforce` a layer
+that cannot apply fails the compile, and the task's `problem` reads `the
+module failed to compile (confinement): ...`. Each compile reads a
+private copy of its input, at most two compiles run at once on a node,
+and a compile is limited to 300 seconds and a 16 GiB address space
+(virtual memory, not a cgroup: the compiler has no memory cgroup of its
+own).
 
 ## HTTP handlers
 
@@ -993,11 +1017,13 @@ A session isolate hibernates when:
 - it has been idle for `suspend.idle.after`;
 - it called `park()` (the hibernation happens when that call returns);
 - the node is short of memory ([pressure](resource-enforcement.md#memory-pressure));
-- `legion instance suspend <id>` asks (a session in the middle of a call
-  answers `FAILED_PRECONDITION`; suspend it again once it is idle);
-- `legion operator runtime disable isolate --drain` covers its job;
+- `legion instance suspend <id>` asks; only that session hibernates, and
+  the host's other sessions stay resident (a session in the middle of a
+  call answers `FAILED_PRECONDITION`; suspend it again once it is idle);
+- `legion operator runtime disable isolate --drain` covers its job; only
+  the covered jobs' sessions hibernate;
 - the worker stops (every session isolate is hibernated after a 5-second
-  grace for running calls; `suspend.onWorkerStop` does not change this).
+  grace for running calls, which is why `suspend.onWorkerStop` is refused).
 
 Checkpoints are kept on the node, in its content store, pinned to the
 session, and deleted when the session stops or after `suspend.keepFor`,
@@ -1044,33 +1070,89 @@ and a session stays on the replica that opened it.
 
 ### Confinement
 
-Each host confines itself before it starts a thread or loads a module:
+Each host confines itself before it starts a thread or loads a module.
+First it closes every descriptor it inherited except stdio and the three
+its worker passed, so it trusts no spawner to have marked the rest
+close-on-exec. Then, in order:
 
 | Layer | What it does | Shown as |
 | --- | --- | --- |
-| User namespace | uid and gid map to 65534; every capability dropped | `userns` |
-| Network namespace | no interface but an unconfigured loopback that is down; new mount, IPC, and UTS namespaces too | `netns` |
+| User namespace | uid and gid map to 65534 inside it, and every capability is dropped. The kernel still sees the worker's uid (normally root) for file permissions; the host does not switch to an unprivileged user. New mount, IPC, and UTS namespaces too | `userns` |
+| Network namespace | no interface but an unconfigured loopback that is down | `netns` |
+| Mount root | `/` is an empty, read-only tmpfs holding only the compiled-artifact directories, bound read-only, `nosuid`, `nodev`, at their own paths. No `/proc`, `/sys`, or `/dev`: every other path on the node does not exist for the host (`ENOENT`, for `open`, `stat`, and `readlink` alike) | `mount-root` |
+| PID namespace | the host is PID 1 of its own namespace and can name no process outside it (below) | `pid-ns` |
 | `no_new_privs` | | `no-new-privs` |
-| Landlock | read-only access beneath the compiled-artifact directories, nothing else on the filesystem | `landlock` |
-| seccomp | an allowlist of the system calls the host needs; anything else kills the process. `clone` for threads only, `socketpair` for Unix pairs only, no `execve`, no `socket`, `connect`, or `bind` | `seccomp` |
+| Landlock | read-only access beneath the artifact directories, nothing else on the filesystem; no TCP bind or connect | `landlock` |
+| Landlock scopes | signals and abstract Unix sockets confined to the host's own domain. Needs Landlock ABI 6 (Linux 6.12); applied and required where the kernel has it, and only a note in the host's log where it does not | `landlock-scopes` |
+| seccomp | an allowlist with argument filters; anything else kills the process (SIGSYS). `clone` for threads only (`clone3` fails with `ENOSYS`), `socketpair` for Unix pairs only, `fcntl` only `F_GETFD`, `F_SETFD`, `F_GETFL`, `F_DUPFD_CLOEXEC`, and `F_SETFL` without `O_ASYNC`, `ioctl` only `FIONBIO` and `FIOCLEX`, `prctl` only `PR_SET_NAME`; no `execve`, `fork`, `socket`, `connect`, `bind`, `kill`, or `ptrace` | `seccomp` |
+
+The full allowlists are in `crates/isolate/src/confine.rs`.
+
+**The PID namespace is a fork.** The process the worker starts unshares a
+PID namespace and forks; the child is the host. The parent stays behind as
+a supervisor: it closes every descriptor, drops its capabilities, sets
+`no_new_privs`, takes a Landlock ruleset with no filesystem access and a
+seccomp filter that leaves it only waiting, signal handling, writing,
+exiting, and `kill` of itself, and then waits for the host and exits with
+its status (or re-raises the signal that killed it, so a seccomp kill
+still reads as SIGSYS). The host dies with its parent, so killing the pid
+the worker knows kills the host. That pid is the supervisor's: it is the
+`pid` in `legion isolate stats`, and `/proc/<pid>` on the node shows the
+supervisor, not the host.
 
 The worker's `isolate.confine` decides what happens when a layer cannot
 apply: `enforce` (the default) makes the host exit before it loads a module,
 `best-effort` runs with what applied, and `off` applies nothing (development
-only). `legion isolate stats` lists the layers in force for every host
-process (`confinement`); a layer missing from the list did not apply.
+only). Under `enforce` every layer above is required except
+`landlock-scopes` on a kernel without them. `legion isolate stats` lists
+the layers in force for every host process (`confinement`); a layer
+missing from the list did not apply.
 
 With resource enforcement on and cgroup v2, each host process also runs in
 its own cgroup (`<cgroupParent>/isolate-hosts/<cordon>-<replica>`, with
 every character of the cordon name other than a letter, digit or `-`
 written as `_`, so `ns:default` is `ns_default-0`), with `memory.max` the
-sum of the cordon's envelopes on the node and `pids.max` 1024. No `cpu.weight` is set on it.
+sum of the cordon's envelopes on the node and `pids.max` 1024. The worker
+creates the cgroup and puts the process in it before `exec`, so the
+forked host starts inside it; if that fails, the worker logs a warning and
+the host runs in the worker's cgroup. `memory.max` follows the cordon:
+it is rewritten when an envelope's memory grows or shrinks and when a task
+joins or leaves. No `cpu.weight` is set on it.
 
 The host holds no credentials, no TLS keys, no tokens, and no KV access. It
 reaches nothing but the two sockets its worker gave it, and every request it
 makes of the worker names a task, which the worker checks against the
-cordon it started that process for: a compromised host can act only as the
-jobs it already serves.
+cordon it started that process for. Child-VM calls must also name an
+isolate the worker issued to that cordon: a session it holds, or an
+invocation it has in flight, for that job and task. A compromised host can
+act only as the jobs and isolates of its own cordon.
+
+### Bounds
+
+What a guest can make its host hold, per invocation or instance:
+
+| Bound | Value |
+| --- | --- |
+| Outbound requests in flight | 8 per invocation; more wait; none outlives the invocation |
+| Request and response bodies | `isolate.maxBodyBytes` each (16 MiB by default) |
+| Resource table (handles, pending requests, header sets) | 4,096 entries per instance |
+| One `wasi:http` header set | 64 KiB |
+| `state` | 1 MiB per tenant or session |
+| Output | `limits.output` per invocation |
+
+What a host can make its worker hold:
+
+| Bound | Value |
+| --- | --- |
+| A hibernation checkpoint | checked before any byte is kept: a session the worker holds for that job and task, at most 1 MiB of state plus 256 KiB |
+| Calls at once | 256 per host connection |
+| A line of the host's own stderr | 4 KiB; the rest of the line is skipped |
+| Guest log lines | 4,096 per batch, 16 KiB per line, 1 MiB/s per host with an 8 MiB burst ([Logs](#logs)) |
+
+Buffered request and response bodies live in the host's memory, outside
+the isolates' accounts: they are **not** counted against `memoryMax`. A
+guest can hold up to 8 × `isolate.maxBodyBytes` of them in each direction
+per invocation.
 
 ### The security model
 
@@ -1085,16 +1167,33 @@ from a determined Spectre attacker. It claims that such an attacker reaches
 only data in that cordon, never a credential, and that an operator decides
 who shares a cordon.
 
-Two more limits a security reviewer should know:
+More limits a security reviewer should know:
 
+- **The kernel uid is the worker's.** The host and the compiler are 65534
+  only inside their user namespace; the kernel checks file permissions
+  against the worker's uid, normally root. Under `enforce` the mount root
+  and Landlock leave that uid nothing but the artifact directories,
+  read-only. A `best-effort` host that lacks both keeps root's access to
+  the node's files.
 - **Per-job memory inside a shared host is the host's accounting, not the
   kernel's.** The kernel limits the host process as a whole (its cgroup);
   how that is split between the jobs and tenants of a cordon is enforced by
   the host itself.
+- **Host-side buffers are not charged to `memoryMax`.** HTTP bodies,
+  `wasi:http` handles and header sets, and what the worker buffers for a
+  host count against the [bounds](#bounds), not against any isolate's
+  `memoryMax`.
 - **Anonymous executable memory is not denied.** seccomp cannot tell an
   anonymous mapping from a file mapping in `mprotect`; denying it outright
   needs an LSM, which Legion does not configure. The host never compiles,
-  and loads only artifacts from directories it can only read.
+  and loads only artifacts from directories it can only read. Those
+  directories are mounted executable, because the engine maps compiled
+  code from them.
+- **Tenant keys and session ids authenticate nothing.** Both are routing
+  keys the caller supplies ([Tenants](#tenants)).
+- **Child-VM calls are checked per cordon, not per host process.** One
+  replica of a cordon can name an invocation in flight on another replica
+  of the same cordon.
 
 ### Engine pinning and the CVE response
 
@@ -1234,7 +1333,7 @@ w-17  run   ns:default  412       3       0          0           0       88.0   
 | `memoryBytes`, `reservationBytes` | linear memory mapped by resident isolates (an upper bound), and one isolate's reservation |
 | `hibernations` | session isolates hibernated since the host started |
 | `problem` | why the node cannot run the task now (the module is compiling or failed, the host is restarting), or `null` |
-| `hosts[]` | each host process of the cordon: `replica`, `pid`, `rssBytes`, `slots`, `slotsUsed`, `shards`, `engine`, `layout`, `confinement`, `restarts`, `startedUnixMs` |
+| `hosts[]` | each host process of the cordon: `replica`, `pid` (the process the worker started, which supervises the host in its PID namespace), `rssBytes`, `slots`, `slotsUsed`, `shards`, `engine`, `layout`, `confinement` (the [layers](#confinement) in force), `restarts`, `startedUnixMs` |
 | `ageMs` | how old the node's report is |
 
 With `-j` the data is `{"task", "nodes"}` for one task, or `{"tasks":
@@ -1283,8 +1382,11 @@ worker's.
 | `problem`: `config.image pins python@sha256:..., but this node has python@sha256:...` | The pinned build is not the node's | Pin the build the nodes run, or write `"python"` |
 | `problem`: `the module failed to compile (<kind>): ...`; runs `FAILED_PRECONDITION` | The component is invalid or imports something the host does not provide | Fix the component ([Compilation](#compilation)) |
 | `UNAVAILABLE` `the module is still compiling on node ...; retry` | First use of a module on a node | Retry; a compile takes seconds for a language image |
-| `UNAVAILABLE` `the isolate host for cordon X exited during the call; the worker is restarting it; retry` | The host process exited (a crash, a seccomp kill shows as SIGSYS) | Retry. The worker restarts it with backoff (200 ms doubling to 30 s), reloads its tasks, and counts `restarts`. Hibernated sessions survive; resident never-hibernated sessions do not |
-| The host exits at once, `confinement` empty or short | A layer cannot apply under `confine = "enforce"` (no unprivileged user namespaces, no Landlock, ...) | Fix the kernel setting, or set `confine = "best-effort"` knowing which layer is missing |
+| `UNAVAILABLE` `the isolate host for cordon X exited during the call; the worker is restarting it; retry` | The host process exited (a crash, a seccomp kill shows as SIGSYS) | Retry. The worker restarts it with backoff (200 ms doubling to 30 s), reloads its tasks, and counts `restarts`; calls that arrive while it reloads answer `UNAVAILABLE` too. Hibernated sessions survive; resident never-hibernated sessions do not |
+| The host exits at once, `confinement` empty or short | A layer cannot apply under `confine = "enforce"` (no unprivileged user namespaces, no Landlock, no `pivot_root` into a tmpfs, ...); the host's stderr in the worker log says `confinement is enforced but these layers did not apply: ...` | Fix the kernel setting, or set `confine = "best-effort"` knowing which layer is missing |
+| `problem`: `the module failed to compile (confinement): ...` | The same, for the compiler | As above |
+| `problem`: `config.entry "..." cannot be used: ...` | The entry is a symlink, is reached through one, is not a regular file, or is over 3 MiB | Deliver a regular file in the artifact |
+| Runs with `--arg` answer `FAILED_PRECONDITION` `... does not end with /legion/run/main.py ...` | The run went to the VM tier, and the VM task's `run.command` does not end with the entry's path | End the command with the entry path, read `LEGION_RUN_ARGS`, or pass the values in `--input` |
 | `RESOURCE_EXHAUSTED` from runs, `refusals` rising | The envelope is full | Raise `stateful.envelope.resources`, lower `resources.memory`, or add nodes |
 | `slotsPerHost ... clamped` in the worker log | `vm.max_map_count` too low | Raise it |
 | `stopped.reason = "limits"`, `limit = "memory"` | The code needs more than `memoryMax` | Raise `resources.memoryMax`, or use the VM tier |
@@ -1309,6 +1411,22 @@ the network and the routing on top.
 | Epoch interruption overhead: call-heavy code; a tight loop | +14% to +25%; +1% to +3% |
 | One await that suspends and resumes a guest | about 480 ns |
 | Compiling the language components (4 threads) | 3.3 s (StarlingMonkey, 12 MB); 2.5 s (CPython, 18 MB) |
+| One invocation through a host shard, in process (`isolate_bench`, optimized build): a fresh command instance; a call on a warm runner; a call whose guest awaits the worker once | 107 µs; 38 µs; 47.5 µs |
+
+**End to end.** `legion session run` through a manager, a worker, and a
+real confined host on the same container, with **debug builds** of the
+worker and the host, p50 of 30 runs after a warm-up:
+
+| What | p50 (min) |
+| --- | --- |
+| A Rust `wasi:cli/run` component | 4.8 ms (4.4 ms) |
+| `python` hello world | 17.6 ms (16.6 ms) |
+| The first `python` run on a node, including the one-time compile by a debug-build compiler | 60.5 s |
+
+The design target for a component run is under 2 ms end to end. This
+measurement does not meet it. No release-build
+end-to-end measurement has been taken, so whether a release build meets
+it is not known.
 
 ## Capability Summary
 
@@ -1361,12 +1479,25 @@ the network and the routing on top.
 - **Exit codes of command components** are 0 or 1.
 - **Replicas only grow** while a cordon has tasks; an uneven load can refuse
   on one replica while another has room.
-- **Host cgroups** are not resized when envelopes change, and have no
-  `cpu.weight`.
+- **Host cgroups have no `cpu.weight`**, and their placement, `memory.max`
+  updates, and page-out have not run on a cgroup v2 node.
 - **No per-isolate attribution** in `legion net denials`.
 - **Engine and memory layout**: MPK is not an operator-validated default;
   anonymous executable memory is not denied (no LSM).
 - **Language images are not pre-initialized with a task's `entry`**: the
   entry is staged and run per call.
 - **Not measured:** density and start-time numbers at fleet scale, and on
-  production hardware.
+  production hardware; end-to-end times with release builds.
+- **The VM tier has not run on a real VM.** The development machine has no
+  `/dev/kvm`, and the sandbox runtime's Linux development backend takes no
+  `exec`, which session runs need. The VM tier and child VMs were tested
+  end to end with an `exec` session task standing in for the sandbox VM
+  task (the tier decision, `nextTier`, `vmMs`, single-use sessions, the
+  `args` rule, child ownership, `children.max`, a child surviving its
+  owner's hibernation, children ending with their owner). Not tested end
+  to end: a sandbox guest running the VM task's command, re-attaching a
+  child with `legion.vm.attach` after hibernation, HTTP through the
+  node's own TCP ingress listener (the test entered at the isolate
+  supervisor's socket), and an upstream credential installed by the
+  heartbeat rather than directly.
+- **The kernel uid is not dropped** ([The security model](#the-security-model)).

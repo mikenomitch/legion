@@ -1095,7 +1095,8 @@ families. None has a `job` or `task` label (per-task numbers are in
   before they finished, by `reason`: `limits`, `unsupported`, `trap`,
   `ended`.
 - **`legion_isolate_limit_total{limit}`** (counter): invocations stopped by
-  a limit, by `limit`: `cpu`, `wall`, `memory`.
+  a limit, by `limit`: `cpu`, `wall`, `memory`. `limits.output` truncates
+  and never stops a run, so it has no value here.
 - **`legion_isolate_vm_runs_total{reason}`** (counter): runs of isolate
   tasks sent to the VM tier, by `reason`: `requested`, `disabled`
   (the runtime is disabled), `import` (the pre-flight scan), `memo`.
@@ -1104,7 +1105,8 @@ families. None has a `job` or `task` label (per-task numbers are in
 - **`legion_isolate_compile_seconds`** (histogram): time to compile one
   isolate module on this node.
 - **`legion_isolate_host_rss_bytes{cordon}`** (gauge): resident set of each
-  cordon's host processes, summed over its replicas.
+  cordon's host processes, summed over its replicas. `cordon` is the
+  cordon's name: `ns:<namespace>`, `job:<job id>`, or `shared`.
 - **`legion_isolate_slots{cordon,state}`** (gauge): memory slots of a
   cordon's host processes, by `state`: `used`, `free`.
 

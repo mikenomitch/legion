@@ -1303,6 +1303,14 @@ interpreters.
 **Trade-off.** A VM task whose command is a wrapper must read
 `LEGION_RUN_ARGS`. An `auto` run with args on such a task is refused even
 when it would have run in an isolate, because the tier is decided first.
+"Script arguments by construction" holds only for an interpreter: the
+verification re-review pointed out that a command such as `["pytest",
+"/legion/run/main.py"]` passes the check and then parses the appended
+values as its own options (getopt permutes). So the public doc says only
+that args are appended after the entry path and that what the command
+does with them is the job author's design: an author whose VM command is
+a tool taking the entry as an operand should not end it with the entry
+path if `job:write` callers must not choose its options.
 
 **Why (security, ease).** The review found that a caller with only
 `job:write` could append arbitrary argv to the VM task's fixed command
@@ -1539,7 +1547,11 @@ debug, and one more ACL evaluation on the denial path. Two answers still
 come before the job scope is known: an evicted session's `NOT_FOUND` with
 its node's account, and `UNAVAILABLE` naming an unreachable node; neither
 carries more than the id the caller sent and the node it names. `--on-node`
-with an unknown node still answers `node X not found`.
+with an unknown node still answers `node X not found`; a stop repeated
+within ten minutes of a session's end answers `Session X already ended`
+before any job check; and the worker's ticket path checks the ticket after
+its lookup. So the public doc does not claim that no caller can learn
+whether a session id exists.
 
 **Why (simplicity).** The oracle lived in the shared helper, not in
 anything isolate-specific, so an isolate-only fix would have left the

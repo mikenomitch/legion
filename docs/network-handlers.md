@@ -1472,7 +1472,10 @@ in the envelope's directory:
 - **Attribution.** Denials, access logs, and the identity string name the
   isolate task, not `<task>-envelope`, and not the isolate or tenant.
 
-Bodies are buffered whole, up to the worker's `isolate.maxBodyBytes`. See
+Bodies are buffered whole, up to the worker's `isolate.maxBodyBytes`, with
+at most 8 outbound requests in flight per invocation. Ingress refuses a
+request that carries `Legion-Tenant` or `Legion-Session` more than once
+(`400`); both are routing keys the client chooses, not identities. See
 [Outbound HTTP](task-runtime-isolate.md#outbound-http) and
 [HTTP handlers](task-runtime-isolate.md#http-handlers).
 
