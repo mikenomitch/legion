@@ -154,10 +154,16 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install protobuf compiler and clang
+      # protoc from the pinned release (setup-protoc), so an Ubuntu mirror
+      # outage cannot fail the job: the runner image already ships clang-18,
+      # so the apt step below downloads nothing on an image that has it.
+      - name: Install protobuf compiler
+        uses: ./.github/actions/setup-protoc
+
+      - name: Install clang
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler clang-18
+          sudo apt-get install -y clang-18
 
       - name: Build the tests and the io_uring probe
         env:
