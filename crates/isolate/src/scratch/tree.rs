@@ -148,10 +148,6 @@ impl FileNode {
         self.data.len() as u64
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
     pub fn bytes(&self) -> &[u8] {
         &self.data
     }

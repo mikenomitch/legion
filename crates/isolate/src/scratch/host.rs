@@ -91,6 +91,16 @@ impl From<ResourceTableError> for FsError {
     }
 }
 
+impl FsError {
+    /// The code a guest sees, or `None` for a trapping host error.
+    pub fn code(&self) -> Option<ErrorCode> {
+        match &self.0 {
+            FsErrorKind::Code(code) => Some(*code),
+            FsErrorKind::Trap(_) => None,
+        }
+    }
+}
+
 type FsResult<T> = Result<T, FsError>;
 
 /// The error a file stream reports as `last-operation-failed`;
